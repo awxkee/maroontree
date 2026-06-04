@@ -193,16 +193,17 @@ pub(crate) fn dct8x8(input: &mut [i32; 64], quant: &impl Dct) {
             Arc::new(dct8x8_scalar)
         }
     });
-    f(input, quant.dc_q(), quant.ac_q());
+    f(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
+/// Shared 2-D integer DCT-8 transform core (no quantization). Output layout is
+/// `out[r*8 + u] = F[row_freq=r][col_freq=u]`, DC at index 0. This is the single
+/// forward transform reused by both the in-place quantizer ([`dct8x8_scalar`])
+/// and the trellis/RDOQ variant ([`dct8x8_t`]).
 #[inline]
-pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
+fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
     let mut tmp = [0i32; 64];
-
     // Pass 1: column-wise DCT-8.
-    // Gather each column, transform it, scatter back to the same column position.
-    // After this pass tmp[r*8 + x] = DCT8_of_col_x[r]  (r = row-freq, x = col).
     for x in 0..8usize {
         let mut col = [0i32; 8];
         for r in 0..8 {
@@ -213,21 +214,25 @@ pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
             tmp[r * 8 + x] = col[r];
         }
     }
-
-    // Pass 2: row-wise DCT-8 + quantize.
-    // Each row of tmp now holds one row-frequency plane across all 8 columns.
-    // After DCT8 the output is stored as input[r*8 + u] = F[row_freq=r][col_freq=u].
-    // DC is at output[0] (r==0, u==0).
-    for (r, out_row) in input.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+    // Pass 2: row-wise DCT-8. Store transposed to the pipeline convention
+    // `out[horiz_freq*8 + vert_freq]` (DC at index 0), matching the scan order,
+    // the integer inverse, and the 16x16/32x32 cores.
+    let mut out = [0i32; 64];
+    for r in 0..8usize {
         let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
         dct1d_8_i32(&mut row);
-        for (u, (dst, src)) in out_row.iter_mut().zip(row.iter()).enumerate() {
-            *dst = if r == 0 && u == 0 {
-                mul_q16(*src, dc_q)
-            } else {
-                mul_q16(*src, ac_q)
-            };
+        for u in 0..8 {
+            out[u * 8 + r] = row[u];
         }
+    }
+    out
+}
+
+#[inline]
+pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
+    let coeffs = dct8x8_coeffs(input);
+    for (i, dst) in input.iter_mut().enumerate() {
+        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -248,13 +253,14 @@ pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
             Arc::new(dct16x16_scalar)
         }
     });
-    f(input, quant.dc_q(), quant.ac_q());
+    f(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
+/// Shared 2-D integer DCT-16 transform core (no quantization). Output layout
+/// `out[u*16 + v]`, DC at index 0. Reused by [`dct16x16_scalar`] and [`dct16x16_t`].
 #[inline]
-pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     let mut tmp = [0i32; 256];
-
     // Column-wise 1D DCT
     for u in 0..16 {
         let mut col = [0i32; 16];
@@ -266,19 +272,24 @@ pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
             tmp[v * 16 + u] = col[v];
         }
     }
-
-    // Row-wise 1D DCT + normalize by 1/256 (>> 8) + quantize
+    // Row-wise 1D DCT
+    let mut out = [0i32; 256];
     for v in 0..16 {
         let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
         dct1d_16_i32(&mut row);
+        // Normalise the integer DCT-16 gain (sqrt(16) per pass -> 16x; the
+        // pipeline expects the orthonormal*8 scale) by 1/2.
         for u in 0..16 {
-            let normalized = row[u];
-            input[u * 16 + v] = if u == 0 && v == 0 {
-                mul_q16(normalized, dc_q)
-            } else {
-                mul_q16(normalized, ac_q)
-            };
+            out[u * 16 + v] = mul_q16(row[u], 32768);
         }
+    }
+    out
+}
+
+pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+    let coeffs = dct16x16_coeffs(input);
+    for (i, dst) in input.iter_mut().enumerate() {
+        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -361,11 +372,13 @@ pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
             Arc::new(dct32x32_scalar)
         }
     });
-    f(input, quant.dc_q(), quant.ac_q());
+    f(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
+/// Shared 2-D integer DCT-32 transform core (no quantization). Output layout
+/// `out[u*32 + v]`, DC at index 0. Reused by [`dct32x32_scalar`] and [`dct32x32_t`].
 #[inline]
-pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     let mut tmp = [0i32; 1024];
     // Column-wise 1D DCT
     for u in 0..32 {
@@ -378,19 +391,23 @@ pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
             tmp[v * 32 + u] = col[v];
         }
     }
-
-    // Row-wise 1D DCT + normalize by 1/1024 (>> 10) + quantize
+    // Row-wise 1D DCT
+    let mut out = [0i32; 1024];
     for v in 0..32 {
         let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
         dct1d_32_i32(&mut row);
+        // Normalise the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
         for u in 0..32 {
-            let normalized = row[u];
-            input[u * 32 + v] = if u == 0 && v == 0 {
-                mul_q16(normalized, dc_q)
-            } else {
-                mul_q16(normalized, ac_q)
-            };
+            out[u * 32 + v] = mul_q16(row[u], 16384);
         }
+    }
+    out
+}
+
+pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+    let coeffs = dct32x32_coeffs(input);
+    for (i, dst) in input.iter_mut().enumerate() {
+        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -410,38 +427,294 @@ pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
             Arc::new(crate::dct::dct8x16_i32_scalar)
         }
     });
-    f(input, quant.dc_q(), quant.ac_q());
+    f(input, quant.q_mult_dc(), quant.q_mult_ac());
+}
+
+/// Shared 2-D integer 8x16 transform core (8 wide x 16 tall; residual read as
+/// `resid[row*8 + col]`). DCT-16 down each of the 8 columns, then DCT-8 across
+/// each of the 16 rows. Output layout `out[horiz_freq*16 + vert_freq]`, DC at
+/// index 0 — matching the float reference, the scan order and the inverse.
+/// Reused by [`dct8x16_i32_scalar`] and [`dct8x16_t`].
+#[inline]
+fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
+    // Pass 1: DCT-16 down each of the 8 columns (vertical).
+    let mut tmp = [0i32; 128]; // tmp[fy*8 + col], fy = vertical freq
+    for col in 0..8usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 8 + col];
+        }
+        dct1d_16_i32(&mut c);
+        for fy in 0..16 {
+            tmp[fy * 8 + col] = c[fy];
+        }
+    }
+    // Pass 2: DCT-8 across each of the 16 rows (horizontal).
+    let mut out = [0i32; 128];
+    for fy in 0..16usize {
+        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut r);
+        // Normalise the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8
+        // by 1/sqrt(2) (round(65536/sqrt2) = 46341).
+        for fx in 0..8 {
+            out[fx * 16 + fy] = mul_q16(r[fx], 46341);
+        }
+    }
+    out
 }
 
 pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
-    let mut tmp = [0i32; 128];
-    // Pass 1: DCT-16 across each of 8 rows
-    for row in 0..8usize {
-        let mut r: [i32; 16] = input[row * 16..row * 16 + 16].try_into().unwrap();
+    let coeffs = dct8x16_coeffs(input);
+    for (i, dst) in input.iter_mut().enumerate() {
+        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
+    }
+}
+
+// ── Trellis / RDOQ variants ───────────────────────────────────────────────────
+// These reuse the very same `*_coeffs` transform cores as the in-place
+// quantizers above (so there is a single integer DCT, no separate float DCT for
+// the trellis). Each returns the quantized levels `cf` — bit-identical to what
+// `dct8x8`/`dct16x16`/… produce in place — together with the *unrounded* level
+// `tf[i] = coeff · q_mult / 2^16 ≈ coeff / step`, which the trellis prices
+// distortion against as `step² · (tf − L)²`.
+
+#[inline]
+fn quant_levels_and_targets<const N: usize>(
+    coeffs: &[i32; N],
+    q_mult_dc: i32,
+    q_mult_ac: i32,
+) -> ([i32; N], [f64; N]) {
+    let mut cf = [0i32; N];
+    let mut tf = [0.0f64; N];
+    for i in 0..N {
+        let m = if i == 0 { q_mult_dc } else { q_mult_ac };
+        cf[i] = mul_q16(coeffs[i], m);
+        tf[i] = coeffs[i] as f64 * m as f64 / 65536.0;
+    }
+    (cf, tf)
+}
+
+// Coefficient-source selectors: on aarch64+neon the trellis reuses the very same
+// SIMD transform as the in-place path (`dct*_neon_coeffs`); elsewhere the scalar
+// `dct*_coeffs`. Both produce bit-identical normalized coefficients, so the
+// trellis levels match the direct path regardless of target.
+#[inline]
+fn dct8x8_coeffs_sel(input: &[i32; 64]) -> [i32; 64] {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::dct8x8_neon_coeffs(input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        dct8x8_coeffs(input)
+    }
+}
+
+#[inline]
+fn dct16x16_coeffs_sel(input: &[i32; 256]) -> [i32; 256] {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::dct16x16_neon_coeffs(input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        dct16x16_coeffs(input)
+    }
+}
+
+#[inline]
+fn dct32x32_coeffs_sel(input: &[i32; 1024]) -> [i32; 1024] {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::dct32x32_neon_coeffs(input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        dct32x32_coeffs(input)
+    }
+}
+
+#[inline]
+fn dct8x16_coeffs_sel(input: &[i32; 128]) -> [i32; 128] {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::dct8x16_neon_coeffs(input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        dct8x16_coeffs(input)
+    }
+}
+
+pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    let coeffs = dct8x8_coeffs_sel(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
+    let coeffs = dct16x16_coeffs_sel(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+pub(crate) fn dct32x32_t(residual: &[i32; 1024], quant: &impl Dct) -> ([i32; 1024], [f64; 1024]) {
+    let coeffs = dct32x32_coeffs_sel(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f64; 128]) {
+    let coeffs = dct8x16_coeffs_sel(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+// ── Small / rectangular sizes without a SIMD path (scalar only) ───────────────
+// Same construction as the larger cores: separable integer 1-D DCTs, canonical
+// `out[horiz*H + vert]` layout (DC at index 0), then a per-size gain
+// normalization to the orthonormal*8 scale (ratio = 8 / sqrt(W*H)).
+
+/// 4x4: residual `resid[row*4+col]`. DCT-4 vertical then DCT-4 horizontal.
+/// Returns native (orthonormal*sqrt(16)=*4) coefficients; the *8/sqrt(W*H) gain
+/// normalization is folded into the trellis multiplier for full precision.
+fn dct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16]; // tmp[fy*4 + col]
+    for col in 0..4 {
+        let mut c = [0i32; 4];
+        for row in 0..4 {
+            c[row] = input[row * 4 + col];
+        }
+        dct1d_4_i32(&mut c);
+        for fy in 0..4 {
+            tmp[fy * 4 + col] = c[fy];
+        }
+    }
+    let mut out = [0i32; 16];
+    for fy in 0..4 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        dct1d_4_i32(&mut r);
+        for fx in 0..4 {
+            out[fx * 4 + fy] = r[fx];
+        }
+    }
+    out
+}
+
+/// 4x8: residual `resid[row*4+col]` (8 tall x 4 wide). DCT-8 vertical, DCT-4
+/// horizontal. Native (orthonormal*sqrt(32)) coefficients.
+fn dct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
+    let mut tmp = [0i32; 32]; // tmp[fy*4 + col], fy in 0..8
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = c[fy];
+        }
+    }
+    let mut out = [0i32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        dct1d_4_i32(&mut r);
+        for fx in 0..4 {
+            out[fx * 8 + fy] = r[fx];
+        }
+    }
+    out
+}
+
+/// 16x32: residual `resid[row*16+col]` (32 tall x 16 wide). DCT-32 vertical,
+/// DCT-16 horizontal. Native (orthonormal*sqrt(512)) coefficients.
+fn dct16x32_coeffs(input: &[i32; 512]) -> [i32; 512] {
+    let mut tmp = [0i32; 512]; // tmp[fy*16 + col], fy in 0..32
+    for col in 0..16 {
+        let mut c = [0i32; 32];
+        for row in 0..32 {
+            c[row] = input[row * 16 + col];
+        }
+        dct1d_32_i32(&mut c);
+        for fy in 0..32 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
+    let mut out = [0i32; 512];
+    for fy in 0..32 {
+        let mut r = [0i32; 16];
+        for col in 0..16 {
+            r[col] = tmp[fy * 16 + col];
+        }
         dct1d_16_i32(&mut r);
-        tmp[row * 16..row * 16 + 16].copy_from_slice(&r);
-    }
-    // Pass 2: DCT-8 down each of 16 columns + normalize + quantize
-    for u in 0..16usize {
-        let mut col = [0i32; 8];
-        for i in 0..8 {
-            col[i] = tmp[i * 16 + u];
-        }
-        dct1d_8_i32(&mut col);
-        for v in 0..8usize {
-            let norm = col[v];
-            input[v * 16 + u] = if u == 0 && v == 0 {
-                mul_q16(norm, dc_q)
-            } else {
-                mul_q16(norm, ac_q)
-            };
+        for fx in 0..16 {
+            out[fx * 32 + fy] = r[fx];
         }
     }
+    out
+}
+
+// Per-size gain ratios `8 / sqrt(W*H)` in Q0.16, folded into the quant
+// multiplier so the native coefficients keep full precision through one rounding:
+//   m = mul_q16(q_mult, ratio_q16);  level = mul_q16(coeff_native, m).
+const RATIO_4X4_Q16: i32 = 131072; // 8/sqrt(16)  = 2
+const RATIO_4X8_Q16: i32 = 92682; //  8/sqrt(32)  = sqrt(2)
+const RATIO_16X32_Q16: i32 = 23170; // 8/sqrt(512) = 1/(2 sqrt2)
+
+pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
+    let coeffs = dct4x4_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
+    let coeffs = dct4x8_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f64; 512]) {
+    let coeffs = dct16x32_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::av1real::Quant;
+
+    fn pat(n: usize) -> Vec<i32> {
+        (0..n).map(|i| ((i * 41 + 7) % 113) as i32 - 56).collect()
+    }
+
+    /// The trellis `_t` variants must emit levels bit-identical to the in-place
+    /// integer DCT (so RDOQ refines exactly the levels the direct path codes).
+    #[test]
+    fn trellis_t_matches_inplace_levels() {
+        let q = Quant::new(48, 8);
+        let r: [i32; 64] = pat(64).try_into().unwrap();
+        let mut inp = r;
+        dct8x8(&mut inp, &q);
+        assert_eq!(dct8x8_t(&r, &q).0, inp, "8x8");
+        let r: [i32; 256] = pat(256).try_into().unwrap();
+        let mut inp = r;
+        dct16x16(&mut inp, &q);
+        assert_eq!(dct16x16_t(&r, &q).0, inp, "16x16");
+        let r: [i32; 1024] = pat(1024).try_into().unwrap();
+        let mut inp = r;
+        dct32x32(&mut inp, &q);
+        assert_eq!(dct32x32_t(&r, &q).0.to_vec(), inp.to_vec(), "32x32");
+        let r: [i32; 128] = pat(128).try_into().unwrap();
+        let mut inp = r;
+        dct8x16_i32(&mut inp, &q);
+        assert_eq!(dct8x16_t(&r, &q).0, inp, "8x16");
+    }
 
     // ── coefficient verifiers ─────────────────────────────────────────────────
     // Ground truth: 1/(2·cos((2k+1)·π/(2N))) computed in f64, rounded to Q0.16.

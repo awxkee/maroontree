@@ -52,7 +52,6 @@ pub mod pixel;
 pub mod predict;
 pub mod rangecoder;
 pub mod transform;
-mod dct_trellis;
 
 pub use decoder::decode_still;
 pub use encoder::{Encoded, PlanarImage, encode_lossy_8x8, encode_still, encode_still_lossy};

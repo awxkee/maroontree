@@ -29,5 +29,8 @@
 mod dct;
 mod wht;
 
-pub(crate) use dct::{dct8x8_neon_i32, dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
+pub(crate) use dct::{
+    dct8x8_neon_coeffs, dct8x8_neon_i32, dct8x16_neon_coeffs, dct8x16_neon_i32,
+    dct16x16_neon_coeffs, dct16x16_neon_i32, dct32x32_neon_coeffs, dct32x32_neon_i32,
+};
 pub(crate) use wht::fwht_raw_neon;

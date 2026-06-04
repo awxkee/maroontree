@@ -11,8 +11,10 @@
 //! (`CDFn(a..) = 32768 - a`). At the single top-left block every context is 0,
 //! so we need only: partition[64x64][0], skip[0], kf_y_mode[0][0], uv_mode[0][0].
 
-use crate::dct::{dct8x8, dct8x16_i32, dct16x16, dct32x32};
-use crate::dct_trellis::forward_dct_quant_8x8_t;
+use crate::dct::{
+    dct4x4_t, dct4x8_t, dct8x8, dct8x8_t, dct8x16_i32, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t,
+    dct32x32, dct32x32_t,
+};
 use crate::obu::{
     frame_header_lossless, frame_header_lossy, frame_header_lossy_tiled, sequence_header_444_8bit,
     temporal_delimiter, wrap_obu_frame,
@@ -737,12 +739,19 @@ fn itx_clips(bd: u8) -> (i32, i32, i32, i32, i32) {
 /// per (base_q_idx, bit_depth) so the transforms read them from `self` instead
 /// of indexing `dav1d_dq_tbl` and recomputing the clips on every block.
 pub trait Dct {
-    /// DC dequant step (`dav1d_dq_tbl[bd][q][0]`).
+    /// DC dequant step (`dav1d_dq_tbl[bd][q][0]`). Used by the inverse transform
+    /// and as the trellis distortion weight.
     fn dc_q(&self) -> i32;
     /// AC dequant step (`dav1d_dq_tbl[bd][q][1]`).
     fn ac_q(&self) -> i32;
     /// Inverse-transform clips `(row_min, row_max, col_min, col_max, cf_max)`.
     fn clips(&self) -> (i32, i32, i32, i32, i32);
+    /// Forward-quantisation multiplier for DC, `round(65536 / dc_q)`, so that the
+    /// integer forward DCT's `mul_q16(coeff, q_mult_dc()) ≈ coeff / dc_q` (the
+    /// inverse multiplies the level back by `dc_q`, so this round-trips).
+    fn q_mult_dc(&self) -> i32;
+    /// Forward-quantisation multiplier for AC, `round(65536 / ac_q)`.
+    fn q_mult_ac(&self) -> i32;
     /// Dequant step for raster/scan position `rc` (DC at 0, AC otherwise).
     #[inline]
     fn step(&self, rc: usize) -> i32 {
@@ -756,6 +765,8 @@ pub trait Dct {
 pub struct Quant {
     dc: i32,
     ac: i32,
+    q_mult_dc: i32,
+    q_mult_ac: i32,
     rmin: i32,
     rmax: i32,
     cmin: i32,
@@ -766,9 +777,13 @@ pub struct Quant {
 impl Quant {
     pub fn new(base_q_idx: u8, bd: u8) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
+        let dc = dc_q(base_q_idx, bd) as i32;
+        let ac = ac_q(base_q_idx, bd) as i32;
         Quant {
-            dc: dc_q(base_q_idx, bd) as i32,
-            ac: ac_q(base_q_idx, bd) as i32,
+            dc,
+            ac,
+            q_mult_dc: (65536.0_f64 / dc as f64).round() as i32,
+            q_mult_ac: (65536.0_f64 / ac as f64).round() as i32,
             rmin,
             rmax,
             cmin,
@@ -790,6 +805,14 @@ impl Dct for Quant {
     #[inline]
     fn clips(&self) -> (i32, i32, i32, i32, i32) {
         (self.rmin, self.rmax, self.cmin, self.cmax, self.cf_max)
+    }
+    #[inline]
+    fn q_mult_dc(&self) -> i32 {
+        self.q_mult_dc
+    }
+    #[inline]
+    fn q_mult_ac(&self) -> i32 {
+        self.q_mult_ac
     }
 }
 
@@ -838,6 +861,12 @@ pub fn quality_to_base_q_idx(quality: u8) -> u8 {
 /// coefficient layout. (Calibrated against dav1d: round-trip max error ~1 at q=16.)
 pub fn forward_dct_quant_8x8(residual: &mut [i32; 64], q: &impl Dct) {
     dct8x8(residual, q)
+}
+
+/// Trellis (RDOQ) forward 8x8: the integer DCT levels plus the unrounded
+/// per-coefficient targets. `.0` is bit-identical to `forward_dct_quant_8x8`.
+pub fn forward_dct_quant_8x8_t(residual: &[i32; 64], q: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    dct8x8_t(residual, q)
 }
 
 /// Encode an 8x8 luma image (`pixels`, 0..=255) as a lossy AV1 still: forward
@@ -3773,43 +3802,7 @@ pub fn forward_dct_quant_16x16(residual: &mut [i32; 256], q: &impl Dct) {
 
 /// As [`forward_dct_quant_16x16`] but also returns the pre-round real targets.
 pub fn forward_dct_quant_16x16_t(residual: &[i32; 256], q: &impl Dct) -> ([i32; 256], [f64; 256]) {
-    const N: usize = 16;
-    const SCALE: f64 = 8.0; // G16=1/128, ortho-DC=16V -> SCALE=128/16=8 (same as 8x8)
-    let mut m = [[0.0f64; N]; N];
-    for k in 0..N {
-        let s: f64 = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / N as f64).sqrt();
-        for n in 0..N {
-            m[k][n] =
-                (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / (2.0 * N as f64)).cos() * s;
-        }
-    }
-    let mut tmp = [[0.0f64; N]; N]; // tmp[v][x] = sum_y M[v][y] * R[y][x]
-    for v in 0..N {
-        for x in 0..N {
-            let mut acc = 0.0;
-            for y in 0..N {
-                acc += m[v][y] * residual[y * N + x] as f64;
-            }
-            tmp[v][x] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 256];
-    let mut tf = [0.0f64; 256];
-    for v in 0..N {
-        for u in 0..N {
-            let mut c = 0.0;
-            for x in 0..N {
-                c += m[u][x] * tmp[v][x];
-            }
-            c *= SCALE;
-            let dq = if v == 0 && u == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[u * N + v] = q;
-            cf[u * N + v] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct16x16_t(residual, q)
 }
 
 /// DC prediction for a 16x16 block (mirror of `dc_pred_8x8`).
@@ -3845,14 +3838,9 @@ fn dc_pred_16x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) ->
     }
 }
 
-/// Forward DCT + quantize a 32x32 residual (`residual[row*32+col]`). `SCALE` is
-/// calibrated so the round-trip through the exact integer inverse (which for
-/// TX_32X32 includes the extra `dq_shift = 1`) recovers the residual. Only the
-/// encoder uses this; recon is the exact inverse, so its precision does not
-/// affect bit-exactness.
-const FDCT32_SCALE: f64 = 8.0;
+/// Forward DCT + quantize a 32x32 residual via the shared integer DCT in
+/// `crate::dct`. Recon is the exact integer inverse.
 pub fn forward_dct_quant_32x32(residual: &mut [i32; 1024], q: &impl Dct) {
-    // forward_dct_quant_32x32_scaled(residual, q, FDCT32_SCALE).0
     dct32x32(residual, q)
 }
 
@@ -3860,49 +3848,7 @@ pub fn forward_dct_quant_32x32_t(
     residual: &[i32; 1024],
     q: &impl Dct,
 ) -> ([i32; 1024], [f64; 1024]) {
-    forward_dct_quant_32x32_scaled(residual, q, FDCT32_SCALE)
-}
-fn forward_dct_quant_32x32_scaled(
-    residual: &[i32; 1024],
-    q: &impl Dct,
-    scale: f64,
-) -> ([i32; 1024], [f64; 1024]) {
-    const N: usize = 32;
-    let mut m = [[0.0f64; N]; N];
-    for k in 0..N {
-        let s: f64 = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / N as f64).sqrt();
-        for n in 0..N {
-            m[k][n] =
-                (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / (2.0 * N as f64)).cos() * s;
-        }
-    }
-    let mut tmp = vec![[0.0f64; N]; N];
-    for v in 0..N {
-        for x in 0..N {
-            let mut acc = 0.0;
-            for y in 0..N {
-                acc += m[v][y] * residual[y * N + x] as f64;
-            }
-            tmp[v][x] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 1024];
-    let mut tf = [0.0f64; 1024];
-    for v in 0..N {
-        for u in 0..N {
-            let mut c = 0.0;
-            for x in 0..N {
-                c += m[u][x] * tmp[v][x];
-            }
-            c *= scale;
-            let dq = if v == 0 && u == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[u * N + v] = q;
-            cf[u * N + v] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct32x32_t(residual, q)
 }
 
 /// DC prediction for a 32x32 block (mirror of `dc_pred_16x16`).
@@ -3948,49 +3894,7 @@ pub fn forward_dct_quant_4x8(residual: &[i32; 32], q: &impl Dct) -> [i32; 32] {
 
 /// As [`forward_dct_quant_4x8`] but also returns the pre-round real targets.
 pub fn forward_dct_quant_4x8_t(residual: &[i32; 32], q: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    // width-4 and height-8 orthonormal DCT bases
-    let mut m4 = [[0.0f64; 4]; 4];
-    for k in 0..4 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 4.0).sqrt();
-        for n in 0..4 {
-            m4[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 8.0).cos() * s;
-        }
-    }
-    let mut m8 = [[0.0f64; 8]; 8];
-    for k in 0..8 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 8.0).sqrt();
-        for n in 0..8 {
-            m8[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 16.0).cos() * s;
-        }
-    }
-    // tmp[fy][col] = sum_row m8[fy][row] * resid[row*4+col]
-    let mut tmp = [[0.0f64; 4]; 8];
-    for fy in 0..8 {
-        for col in 0..4 {
-            let mut acc = 0.0;
-            for row in 0..8 {
-                acc += m8[fy][row] * residual[row * 4 + col] as f64;
-            }
-            tmp[fy][col] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 32];
-    let mut tf = [0.0f64; 32];
-    for fx in 0..4 {
-        for fy in 0..8 {
-            let mut c = 0.0;
-            for col in 0..4 {
-                c += m4[fx][col] * tmp[fy][col];
-            }
-            c *= 8.0; // same overall scale as TX_8X8 (the rect2 *181 in the inverse compensates)
-            let dq = if fx == 0 && fy == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[fx * 8 + fy] = q;
-            cf[fx * 8 + fy] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct4x8_t(residual, q)
 }
 
 /// dav1d's EXACT integer inverse for `RTX_4X8` (4 wide x 8 tall, 8-bit, shift=0,
@@ -4049,50 +3953,7 @@ pub fn forward_dct_quant_8x16(residual: &mut [i32; 128], q: &impl Dct) {
 
 /// As [`forward_dct_quant_8x16`] but also returns the pre-round real targets.
 pub fn forward_dct_quant_8x16_t(residual: &[i32; 128], q: &impl Dct) -> ([i32; 128], [f64; 128]) {
-    const SCALE: f64 = 8.0;
-    // width-8 and height-16 orthonormal DCT bases
-    let mut m8 = [[0.0f64; 8]; 8];
-    for k in 0..8 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 8.0).sqrt();
-        for n in 0..8 {
-            m8[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 16.0).cos() * s;
-        }
-    }
-    let mut m16 = [[0.0f64; 16]; 16];
-    for k in 0..16 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 16.0).sqrt();
-        for n in 0..16 {
-            m16[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 32.0).cos() * s;
-        }
-    }
-    // tmp[fy][col] = sum_row m16[fy][row] * resid[row*8 + col]
-    let mut tmp = [[0.0f64; 8]; 16];
-    for fy in 0..16 {
-        for col in 0..8 {
-            let mut acc = 0.0;
-            for row in 0..16 {
-                acc += m16[fy][row] * residual[row * 8 + col] as f64;
-            }
-            tmp[fy][col] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 128];
-    let mut tf = [0.0f64; 128];
-    for fx in 0..8 {
-        for fy in 0..16 {
-            let mut c = 0.0;
-            for col in 0..8 {
-                c += m8[fx][col] * tmp[fy][col];
-            }
-            c *= SCALE;
-            let dq = if fx == 0 && fy == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[fx * 16 + fy] = q;
-            cf[fx * 16 + fy] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct8x16_t(residual, q)
 }
 
 /// dav1d's EXACT integer inverse for `RTX_8X16` (8 wide x 16 tall, 8-bit,
@@ -4188,60 +4049,11 @@ fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
 /// dav1d coef order `cf[fx*32 + fy]` (fx = horizontal freq 0..16, fy = vertical
 /// freq 0..32). `SCALE` is calibrated so the round-trip through the exact
 /// integer inverse (which includes the `dq_shift = 1`) recovers the residual.
-const FDCT1632_SCALE: f64 = 8.0;
 pub fn forward_dct_quant_16x32(residual: &[i32; 512], q: &impl Dct) -> [i32; 512] {
-    forward_dct_quant_16x32_scaled(residual, q, FDCT1632_SCALE).0
+    forward_dct_quant_16x32_t(residual, q).0
 }
 pub fn forward_dct_quant_16x32_t(residual: &[i32; 512], q: &impl Dct) -> ([i32; 512], [f64; 512]) {
-    forward_dct_quant_16x32_scaled(residual, q, FDCT1632_SCALE)
-}
-fn forward_dct_quant_16x32_scaled(
-    residual: &[i32; 512],
-    q: &impl Dct,
-    scale: f64,
-) -> ([i32; 512], [f64; 512]) {
-    let mut m16 = [[0.0f64; 16]; 16];
-    for k in 0..16 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 16.0).sqrt();
-        for n in 0..16 {
-            m16[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 32.0).cos() * s;
-        }
-    }
-    let mut m32 = [[0.0f64; 32]; 32];
-    for k in 0..32 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 32.0).sqrt();
-        for n in 0..32 {
-            m32[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 64.0).cos() * s;
-        }
-    }
-    // tmp[fy][col] = sum_row m32[fy][row] * resid[row*16 + col]
-    let mut tmp = [[0.0f64; 16]; 32];
-    for fy in 0..32 {
-        for col in 0..16 {
-            let mut acc = 0.0;
-            for row in 0..32 {
-                acc += m32[fy][row] * residual[row * 16 + col] as f64;
-            }
-            tmp[fy][col] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 512];
-    let mut tf = [0.0f64; 512];
-    for fx in 0..16 {
-        for fy in 0..32 {
-            let mut c = 0.0;
-            for col in 0..16 {
-                c += m16[fx][col] * tmp[fy][col];
-            }
-            c *= scale;
-            let dq = if fx == 0 && fy == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[fx * 32 + fy] = q;
-            cf[fx * 32 + fy] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct16x32_t(residual, q)
 }
 
 /// DC predictor for a 16-wide x 32-tall chroma block (4:2:2 `RTX_16X32`).
@@ -4395,41 +4207,7 @@ pub fn forward_dct_quant_4x4(residual: &[i32; 16], q: &impl Dct) -> [i32; 16] {
 
 /// As [`forward_dct_quant_4x4`] but also returns the pre-round real targets.
 pub fn forward_dct_quant_4x4_t(residual: &[i32; 16], q: &impl Dct) -> ([i32; 16], [f64; 16]) {
-    let mut m = [[0.0f64; 4]; 4];
-    for k in 0..4 {
-        let s = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 4.0).sqrt();
-        for n in 0..4 {
-            m[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 8.0).cos() * s;
-        }
-    }
-    // tmp[fy][col] = sum_row m[fy][row] * resid[row*4+col]
-    let mut tmp = [[0.0f64; 4]; 4];
-    for fy in 0..4 {
-        for col in 0..4 {
-            let mut acc = 0.0;
-            for row in 0..4 {
-                acc += m[fy][row] * residual[row * 4 + col] as f64;
-            }
-            tmp[fy][col] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 16];
-    let mut tf = [0.0f64; 16];
-    for fx in 0..4 {
-        for fy in 0..4 {
-            let mut c = 0.0;
-            for col in 0..4 {
-                c += m[fx][col] * tmp[fy][col];
-            }
-            c *= 8.0;
-            let dq = if fx == 0 && fy == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[fx * 4 + fy] = q;
-            cf[fx * 4 + fy] = q.round() as i32;
-        }
-    }
-    (cf, tf)
+    dct4x4_t(residual, q)
 }
 
 /// dav1d's EXACT integer inverse for `TX_4X4` (8-bit, shift=0, square/no rect2):
@@ -6533,27 +6311,24 @@ mod tests {
             }
             r
         };
-        for &scale in &[4.0f64, 5.6569, 8.0, 11.3137, 16.0] {
-            let mut worst = 0.0f64;
-            for kind in 0..3 {
-                let r = make(kind);
-                let (cf, _) = forward_dct_quant_16x32_scaled(&r, &Quant::new(32, 8), scale);
-                let rec = idct_dequant_16x32(&cf, &Quant::new(32, 8));
-                let mut se = 0.0;
-                for i in 0..512 {
-                    let d = (r[i] - rec[i]) as f64;
-                    se += d * d;
-                }
-                worst = worst.max((se / 512.0).sqrt());
-            }
-            eprintln!("RTX_16X32 SCALE={:>8.4} worst RMSE={:.4}", scale, worst);
+        // The 16x32 integer DCT (orthonormal*8 scale) round-trips through the
+        // exact integer inverse `idct_dequant_16x32`. Flat (0) and smooth (1)
+        // residuals — representative of real post-prediction chroma — are within
+        // a couple of quant steps. Kind 2 is an adversarial high-frequency
+        // checkerboard at fine quant (q24): there the fixed-point DCT-32/DCT-16
+        // rounding (vs an exact f64 transform) costs more precision, which the
+        // rect2 inverse prescale amplifies. It is bounded but larger.
+        let bound = |kind: u8| if kind == 2 { 48 } else { 8 };
+        for kind in 0..3 {
+            let r = make(kind);
+            let cf = forward_dct_quant_16x32(&r, &Quant::new(24, 8));
+            let rec = idct_dequant_16x32(&cf, &Quant::new(24, 8));
+            let maxe = (0..512).map(|i| (r[i] - rec[i]).abs()).max().unwrap();
+            assert!(
+                maxe < bound(kind),
+                "16x32 round-trip error too large (kind {kind}): {maxe}"
+            );
         }
-        let r = make(1);
-        let cf = forward_dct_quant_16x32(&r, &Quant::new(24, 8));
-        let rec = idct_dequant_16x32(&cf, &Quant::new(24, 8));
-        let maxe = (0..512).map(|i| (r[i] - rec[i]).abs()).max().unwrap();
-        eprintln!("RTX_16X32 round-trip max abs err (q24) = {}", maxe);
-        assert!(maxe < 8, "16x32 round-trip error too large: {}", maxe);
     }
 
     #[test]
@@ -6685,9 +6460,8 @@ mod tests {
         assert_eq!(
             bytes,
             vec![
-                0x12, 0x00, 0x0a, 0x08, 0x38, 0x08, 0xbf, 0x01, 0x01, 0x0d, 0x00, 0x20, 0x32, 0x10,
-                0x91, 0x00, 0x00, 0x00, 0x00, 0x02, 0x45, 0xd3, 0x3f, 0x99, 0x1b, 0xfe, 0xe3, 0x31,
-                0x06, 0xc7,
+                18, 0, 10, 8, 56, 8, 191, 1, 1, 13, 0, 32, 50, 17, 145, 0, 0, 0, 0, 2, 201, 115,
+                161, 231, 106, 51, 250, 54, 177, 176, 72
             ]
         );
     }
@@ -6708,10 +6482,9 @@ mod tests {
         assert_eq!(
             bytes,
             vec![
-                0x12, 0x00, 0x0a, 0x08, 0x38, 0x08, 0xbf, 0x01, 0x01, 0x0d, 0x00, 0x20, 0x32, 0x1e,
-                0x91, 0x00, 0x00, 0x00, 0x00, 0x02, 0x45, 0xd3, 0x3f, 0x99, 0x1b, 0xfe, 0xe3, 0x31,
-                0x06, 0xc4, 0x83, 0xdc, 0x95, 0x87, 0xee, 0x9a, 0x45, 0xd5, 0xad, 0x58, 0x17, 0xbb,
-                0xc9, 0x70,
+                18, 0, 10, 8, 56, 8, 191, 1, 1, 13, 0, 32, 50, 30, 145, 0, 0, 0, 0, 2, 201, 115,
+                161, 231, 106, 51, 250, 54, 177, 176, 60, 188, 101, 15, 178, 13, 70, 92, 47, 145,
+                239, 71, 218, 192
             ]
         );
     }
@@ -6746,9 +6519,9 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(bytes.len(), 47, "4:2:0 stream length drifted");
+        assert_eq!(bytes.len(), 48, "4:2:0 stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
-        assert_eq!(sum, 4358, "4:2:0 stream bytes drifted");
+        assert_eq!(sum, 4401, "4:2:0 stream bytes drifted");
     }
 
     #[test]
@@ -6782,9 +6555,9 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(bytes.len(), 267, "4:2:0 8x8-leaves stream length drifted");
+        assert_eq!(bytes.len(), 264, "4:2:0 8x8-leaves stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
-        assert_eq!(sum, 33620, "4:2:0 8x8-leaves stream bytes drifted");
+        assert_eq!(sum, 34928, "4:2:0 8x8-leaves stream bytes drifted");
     }
 
     #[test]
@@ -6817,9 +6590,9 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(bytes.len(), 48, "4:2:2 stream length drifted");
+        assert_eq!(bytes.len(), 50, "4:2:2 stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
-        assert_eq!(sum, 4399, "4:2:2 stream bytes drifted");
+        assert_eq!(sum, 4912, "4:2:2 stream bytes drifted");
     }
 
     #[test]
@@ -6853,9 +6626,9 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(bytes.len(), 321, "4:2:2 8x8-leaves stream length drifted");
+        assert_eq!(bytes.len(), 315, "4:2:2 8x8-leaves stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
-        assert_eq!(sum, 40775, "4:2:2 8x8-leaves stream bytes drifted");
+        assert_eq!(sum, 40504, "4:2:2 8x8-leaves stream bytes drifted");
     }
 
     #[test]
@@ -6871,7 +6644,7 @@ mod tests {
             bytes,
             vec![
                 18, 0, 10, 9, 56, 21, 127, 252, 4, 4, 52, 0, 128, 50, 17, 17, 0, 0, 0, 0, 180, 77,
-                152, 109, 246, 233, 28, 168, 147, 66, 231, 172
+                147, 213, 182, 233, 28, 168, 147, 20, 229, 172
             ]
         );
     }
@@ -6896,7 +6669,7 @@ mod tests {
             bytes,
             vec![
                 18, 0, 10, 9, 56, 25, 127, 254, 2, 2, 26, 0, 64, 50, 19, 16, 128, 0, 0, 0, 180, 77,
-                152, 109, 246, 233, 28, 168, 147, 66, 231, 169, 14, 144
+                147, 213, 182, 233, 28, 168, 147, 20, 229, 169, 14, 144
             ]
         );
     }
@@ -6918,7 +6691,7 @@ mod tests {
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
         assert_eq!(p.len(), 40);
-        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 3212);
+        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 3199);
         assert_eq!(&p[..6], &[18, 0, 10, 9, 56, 25]);
     }
 
@@ -6940,7 +6713,7 @@ mod tests {
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
         assert_eq!(p.len(), 37);
-        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 2873);
+        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 2860);
         assert_eq!(&p[..6], &[18, 0, 10, 9, 56, 25]);
     }
 
@@ -6969,10 +6742,10 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(p.len(), 170, "TX_32X32 gradient stream length drifted");
+        assert_eq!(p.len(), 186, "TX_32X32 gradient stream length drifted");
         assert_eq!(
             p.iter().map(|&x| x as u64).sum::<u64>(),
-            19690,
+            21511,
             "TX_32X32 gradient stream bytes drifted"
         );
     }
@@ -7006,10 +6779,10 @@ mod tests {
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
         );
-        assert_eq!(p.len(), 132, "32x32 4:2:0 stream length drifted");
+        assert_eq!(p.len(), 141, "32x32 4:2:0 stream length drifted");
         assert_eq!(
             p.iter().map(|&x| x as u64).sum::<u64>(),
-            15824,
+            17360,
             "32x32 4:2:0 stream bytes drifted"
         );
     }
@@ -7045,12 +6818,12 @@ mod tests {
         );
         assert_eq!(
             p.len(),
-            151,
+            162,
             "32x32 4:2:2 (RTX_16X32) stream length drifted"
         );
         assert_eq!(
             p.iter().map(|&x| x as u64).sum::<u64>(),
-            17284,
+            19503,
             "32x32 4:2:2 (RTX_16X32) stream bytes drifted"
         );
     }

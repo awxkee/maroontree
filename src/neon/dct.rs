@@ -329,42 +329,6 @@ fn load16_i32(ptr: &[i32], stride: usize) -> [I32x8; 16] {
     }
 }
 
-/// Shift right by N and store 8 rows × 8 columns into a flat [i32; 64].
-#[inline]
-#[target_feature(enable = "neon")]
-fn shr_and_store<const N: i32>(cols: &[I32x8; 8], out: &mut [i32; 64]) {
-    for (k, col) in cols.iter().enumerate() {
-        unsafe {
-            vst1q_s32(out[k * 8..].as_mut_ptr(), vshrq_n_s32(col.lo, N));
-            vst1q_s32(out[k * 8 + 4..].as_mut_ptr(), vshrq_n_s32(col.hi, N));
-        }
-    }
-}
-
-/// Quantize (shift + mul_q16) and store into [i32; 64].
-/// DC at (0,0) uses dc_q, everything else uses ac_q.
-#[inline]
-#[target_feature(enable = "neon")]
-fn quant_and_store(cols: &[I32x8; 8], dc_q: i32, ac_q: i32, out: &mut [i32; 64]) {
-    let q_ac_mul = vdupq_n_s32(ac_q);
-    let q_dc_mul = vsetq_lane_s32::<0>(dc_q, q_ac_mul);
-
-    for k in 0..8 {
-        let col = cols[k];
-        let norm_lo = col.lo;
-        let norm_hi = col.hi;
-
-        // Q0.16 multiply each lane by its quantizer
-        let q_lo = mul_q16_vec(norm_lo, if k == 0 { q_dc_mul } else { q_ac_mul });
-        let q_hi = mul_q16_vec(norm_hi, q_ac_mul);
-
-        unsafe {
-            vst1q_s32(out[k * 8..].as_mut_ptr(), q_lo);
-            vst1q_s32(out[k * 8 + 4..].as_mut_ptr(), q_hi);
-        }
-    }
-}
-
 /// Vectorized mul_q16: (data * coeff_vec) >> 16, lane-wise.
 #[inline]
 #[target_feature(enable = "neon")]
@@ -375,21 +339,51 @@ fn mul_q16_vec(data: int32x4_t, coeff: int32x4_t) -> int32x4_t {
     )
 }
 
+/// Scalar quantize a flat coefficient array in place: `level[i] = mul_q16(coeff[i], q)`,
+/// with `q = dc_q` at index 0 (DC) and `ac_q` elsewhere. Mirrors the scalar
+/// quantizer exactly so the NEON in-place result matches `dct*_scalar`.
+#[inline]
+fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut [i32; N]) {
+    let mq = |a: i32, b: i32| (((a as i64) * (b as i64)) >> 16) as i32;
+    out[0] = mq(coeffs[0], dc_q);
+    for i in 1..N {
+        out[i] = mq(coeffs[i], ac_q);
+    }
+}
+
+/// Forward 2-D integer DCT-8 (NEON), returning the normalized coefficients in
+/// the canonical `out[horiz*8 + vert]` layout (DC at index 0), pre-quantization.
+/// Shared by the in-place quantizer and the trellis (RDOQ), mirroring the scalar
+/// `dct8x8_coeffs`.
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x8_neon_coeffs(input: &[i32; 64]) -> [i32; 64] {
+    let mut cols = load8_i32(input, 8);
+    dct1d_8_v_i32(&mut cols);
+    transpose_8x8_i32(&mut cols);
+    dct1d_8_v_i32(&mut cols);
+    // cols[u].lane[j] = coeff(horiz=u, vert=j) -> out[horiz*8 + vert].
+    let mut out = [0i32; 64];
+    for (k, col) in cols.iter().enumerate() {
+        unsafe {
+            vst1q_s32(out[k * 8..].as_mut_ptr(), col.lo);
+            vst1q_s32(out[k * 8 + 4..].as_mut_ptr(), col.hi);
+        }
+    }
+    out
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x8_neon_i32(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
-    let mut cols = load8_i32(input.as_slice(), 8);
-    dct1d_8_v_i32(&mut cols);
-    transpose_8x8_i32(&mut cols);
-    dct1d_8_v_i32(&mut cols);
-    transpose_8x8_i32(&mut cols);
-    quant_and_store(&cols, dc_q, ac_q, input);
+    let coeffs = dct8x8_neon_coeffs(input);
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
-/// 16×16 DCT with quantization. Normalizes by 1/256 (>> 8).
+/// Forward 2-D integer DCT-16 (NEON) -> normalized coefficients `out[u*16+v]`
+/// (DC at index 0), pre-quantization. Mirrors scalar `dct16x16_coeffs`.
 #[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
     unsafe {
         // Column-wise DCT-16 on left half (cols 0-7) and right half (cols 8-15)
-        let mut c_l = load16_i32(input.as_slice(), 16);
+        let mut c_l = load16_i32(input, 16);
         let mut c_r = load16_i32(&input[8..], 16);
 
         dct1d_16_v_i32(&mut c_l);
@@ -417,42 +411,26 @@ pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
         dct1d_16_v_i32(&mut d_a);
         dct1d_16_v_i32(&mut d_b);
 
-        // FIX 2: build q_dc_mul without a dangling temporary pointer.
-        // vsetq_lane_s32 replaces lane 0 of an all-ac_q vector with dc_q.
-        let q_ac_mul = vdupq_n_s32(ac_q);
-        let q_dc_mul = vsetq_lane_s32::<0>(dc_q, q_ac_mul);
-
+        let mut out = [0i32; 256];
         for u in 0..16usize {
-            let va = &d_a[u];
-            let vb = &d_b[u];
-
-            let norm = |v: int32x4_t| v;
-
-            let q_a_lo = mul_q16_vec(norm(va.lo), if u == 0 { q_dc_mul } else { q_ac_mul });
-            let q_a_hi = mul_q16_vec(norm(va.hi), q_ac_mul);
-            let q_b_lo = mul_q16_vec(norm(vb.lo), q_ac_mul);
-            let q_b_hi = mul_q16_vec(norm(vb.hi), q_ac_mul);
-
-            let base = &mut input[u * 16..];
-            vst1q_s32(base.as_mut_ptr().cast(), q_a_lo);
-            vst1q_s32(base[4..].as_mut_ptr().cast(), q_a_hi);
-            vst1q_s32(base[8..].as_mut_ptr().cast(), q_b_lo);
-            vst1q_s32(base[12..].as_mut_ptr().cast(), q_b_hi);
+            // Normalise the integer DCT-16 gain (sqrt(16) per pass -> 16x) to the
+            // orthonormal*8 scale by 1/2; matches scalar `mul_q16(_, 32768)`.
+            let na = d_a[u].shr::<1>();
+            let nb = d_b[u].shr::<1>();
+            let base = &mut out[u * 16..];
+            vst1q_s32(base.as_mut_ptr(), na.lo);
+            vst1q_s32(base[4..].as_mut_ptr(), na.hi);
+            vst1q_s32(base[8..].as_mut_ptr(), nb.lo);
+            vst1q_s32(base[12..].as_mut_ptr(), nb.hi);
         }
+        out
     }
 }
 
-#[inline]
 #[target_feature(enable = "neon")]
-fn wc32_vecs() -> [int32x4_t; 4] {
-    unsafe {
-        [
-            vld1q_s32(WC32[0..4].as_ptr()),   // k=0..3
-            vld1q_s32(WC32[4..8].as_ptr()),   // k=4..7
-            vld1q_s32(WC32[8..12].as_ptr()),  // k=8..11
-            vld1q_s32(WC32[12..16].as_ptr()), // k=12..15
-        ]
-    }
+pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+    let coeffs = dct16x16_neon_coeffs(input);
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 #[inline]
@@ -533,14 +511,13 @@ fn transpose_32x8_to_8x32(c: &mut [I32x8; 32]) {
     c[24..32].copy_from_slice(&q3);
 }
 
+/// Forward 2-D integer DCT-32 (NEON) -> normalized coefficients `out[u*32+v]`
+/// (DC at index 0), pre-quantization. Mirrors scalar `dct32x32_coeffs`.
 #[target_feature(enable = "neon")]
-pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     let mut tmp = [0i32; 1024];
 
-    // ── Pass 1: column-wise DCT-32 ────────────────────────────────────────────
-    // Process 4 groups of 8 columns (col_start = 0, 8, 16, 24).
-    // load32_i32 reads 32 rows × 8 cols at stride=32 from input[col_start..].
-    // Bounds: max index = col_start + 31*32 + 7 = col_start + 999 ≤ 24+999 = 1023 ✓
+    // ── Pass 1: column-wise DCT-32 (4 groups of 8 columns) ───────────────────
     for group in 0..4usize {
         let col_start = group * 8;
         let mut cols = load32_i32(&input[col_start..], 32);
@@ -554,36 +531,22 @@ pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
         }
     }
 
-    // ── Pass 2: row-wise DCT-32 + quantize ───────────────────────────────────
-    // Process 4 groups of 8 rows (row_start = 0, 8, 16, 24).
-    //
-    // FIX: use load8_i32 (stride=32) instead of load32_i32 to read only the
-    // 8 rows in this group.  load8_i32 reads 8 rows × 8 cols at stride=32.
-    // Bounds for each segment: max index = row_start*32 + col_offset + 7*32 + 7
-    //   = row_start*32 + col_offset + 231
-    //   worst case (group=3, col_offset=24): 768 + 24 + 231 = 1023 ✓
-    //
-    // After load8_i32 + transpose_8x8, seg[u].lane[y] = tmp[(row_start+y)*32 + col_offset+u]
-    // for u=0..8, y=0..8, which is what we want for the row DCT.
-    let q_ac = vdupq_n_s32(ac_q);
-    let q_dc = vsetq_lane_s32::<0>(dc_q, q_ac);
-
+    // ── Pass 2: row-wise DCT-32 (4 groups of 8 rows) + 1/4 normalization ──────
+    let mut out = [0i32; 1024];
     for group in 0..4usize {
         let row_start = group * 8;
         let base_off = row_start * 32;
 
-        let mut seg_a = load8_i32(&tmp[base_off..], 32); // cols  0- 7
-        let mut seg_b = load8_i32(&tmp[base_off + 8..], 32); // cols  8-15
-        let mut seg_c = load8_i32(&tmp[base_off + 16..], 32); // cols 16-23
-        let mut seg_d = load8_i32(&tmp[base_off + 24..], 32); // cols 24-31
+        let mut seg_a = load8_i32(&tmp[base_off..], 32);
+        let mut seg_b = load8_i32(&tmp[base_off + 8..], 32);
+        let mut seg_c = load8_i32(&tmp[base_off + 16..], 32);
+        let mut seg_d = load8_i32(&tmp[base_off + 24..], 32);
 
-        // Transpose: seg[u].lane[y] = tmp[(row_start+y)*32 + col_offset+u]
         transpose_8x8_i32(&mut seg_a);
         transpose_8x8_i32(&mut seg_b);
         transpose_8x8_i32(&mut seg_c);
         transpose_8x8_i32(&mut seg_d);
 
-        // Reassemble: rows[col_freq].lane[y] = tmp[(row_start+y)*32 + col_freq]
         let mut rows = [I32x8::zero(); 32];
         rows[0..8].copy_from_slice(&seg_a);
         rows[8..16].copy_from_slice(&seg_b);
@@ -592,95 +555,69 @@ pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
 
         dct1d_32_v_i32(&mut rows);
 
-        // rows[u].lane[y] = DCT32(row row_start+y)[u]
-        // Store to input[u * 32 + row_start + y]
-        // DC: u==0 and group==0 (row_start==0), lane 0 only
+        // rows[u].lane[y] = coeff(horiz=u, vert=row_start+y) -> out[u*32 + row].
+        // Normalise the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
         for u in 0..32usize {
-            let (ql, qh) = if u == 0 && group == 0 {
-                (mul_q16_vec(rows[u].lo, q_dc), mul_q16_vec(rows[u].hi, q_ac))
-            } else {
-                (mul_q16_vec(rows[u].lo, q_ac), mul_q16_vec(rows[u].hi, q_ac))
-            };
+            let n = rows[u].shr::<2>();
             unsafe {
-                let base = &mut input[u * 32 + row_start..];
-                vst1q_s32(base.as_mut_ptr(), ql);
-                vst1q_s32(base[4..].as_mut_ptr(), qh);
+                let base = &mut out[u * 32 + row_start..];
+                vst1q_s32(base.as_mut_ptr(), n.lo);
+                vst1q_s32(base[4..].as_mut_ptr(), n.hi);
             }
         }
     }
+    out
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+    let coeffs = dct32x32_neon_coeffs(input);
+    quant_flat(&coeffs, dc_q, ac_q, input);
+}
+
+/// Forward 2-D integer 8x16 DCT (NEON) -> normalized coefficients
+/// `out[fx*16 + fy]` (horiz freq fx 0..8, vert freq fy 0..16; DC at index 0),
+/// pre-quantization. Mirrors scalar `dct8x16_coeffs`.
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
+    // 8 wide x 16 tall: residual read as input[row*8 + col], row 0..16, col 0..8.
+    // Pass 1: DCT-16 down each of the 8 columns (vertical).
+    let mut rows = load16_i32(input, 8); // rows[r].lane[c] = input[r*8 + c]
+    dct1d_16_v_i32(&mut rows); // rows[fy].lane[c] = vertical DCT-16 freq fy, col c
+
+    // Pass 2: DCT-8 across each of the 16 rows (horizontal). Bring the 8 columns
+    // onto the vector axis via two 8x8 transposes (vert-freq groups 0..8, 8..16).
+    let mut a: [I32x8; 8] = rows[0..8].try_into().unwrap();
+    let mut b: [I32x8; 8] = rows[8..16].try_into().unwrap();
+    transpose_8x8_i32(&mut a);
+    transpose_8x8_i32(&mut b);
+    dct1d_8_v_i32(&mut a); // a[fx].lane[fy]  = coeff(horiz fx, vert fy   0..8)
+    dct1d_8_v_i32(&mut b); // b[fx].lane[fy'] = coeff(horiz fx, vert fy'+8 8..16)
+
+    // Normalise the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8 by
+    // 1/sqrt(2) (round(65536/sqrt2) = 46341), matching scalar.
+    let nrm = unsafe { vdupq_n_s32(46341) };
+    let mut out = [0i32; 128];
+    for fx in 0..8usize {
+        let a_lo = mul_q16_vec(a[fx].lo, nrm);
+        let a_hi = mul_q16_vec(a[fx].hi, nrm);
+        let b_lo = mul_q16_vec(b[fx].lo, nrm);
+        let b_hi = mul_q16_vec(b[fx].hi, nrm);
+        unsafe {
+            let base = &mut out[fx * 16..];
+            vst1q_s32(base.as_mut_ptr(), a_lo);
+            vst1q_s32(base[4..].as_mut_ptr(), a_hi);
+            vst1q_s32(base[8..].as_mut_ptr(), b_lo);
+            vst1q_s32(base[12..].as_mut_ptr(), b_hi);
+        }
+    }
+    out
 }
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon_i32(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
-    // Load left half (cols 0-7) and right half (cols 8-15), stride 16.
-    let mut left: [I32x8; 8] = std::array::from_fn(|row| {
-        let p = &input[row * 16..];
-        unsafe {
-            I32x8 {
-                lo: vld1q_s32(p.as_ptr()),
-                hi: vld1q_s32(p[4..].as_ptr()),
-            }
-        }
-    });
-    let mut right: [I32x8; 8] = std::array::from_fn(|row| {
-        let p = &input[row * 16 + 8..];
-        unsafe {
-            I32x8 {
-                lo: vld1q_s32(p.as_ptr()),
-                hi: vld1q_s32(p[4..].as_ptr()),
-            }
-        }
-    });
-
-    transpose_8x8_i32(&mut left);
-    transpose_8x8_i32(&mut right);
-
-    let mut c = [I32x8::zero(); 16];
-    c[..8].copy_from_slice(&left);
-    c[8..16].copy_from_slice(&right);
-    dct1d_16_v_i32(&mut c);
-
-    let mut cl: [I32x8; 8] = c[0..8].try_into().unwrap();
-    let mut cr: [I32x8; 8] = c[8..16].try_into().unwrap();
-    transpose_8x8_i32(&mut cl);
-    transpose_8x8_i32(&mut cr);
-
-    dct1d_8_v_i32(&mut cl);
-    dct1d_8_v_i32(&mut cr);
-
-    // Quantize helpers.
-    let q_ac = vdupq_n_s32(ac_q);
-    let q_dc = vsetq_lane_s32::<0>(dc_q, q_ac);
-
-    // Store: output[v*16 + u], v = DCT-8 freq (0..7), u = DCT-16 freq (0..15).
-    // For v=0: DC at lane 0 of cl[0].lo.
-    for v in 0usize..8 {
-        let norm = |x: int32x4_t| x;
-
-        let (ql_lo, ql_hi, qr_lo, qr_hi) = if v == 0 {
-            (
-                mul_q16_vec(norm(cl[0].lo), q_dc),
-                mul_q16_vec(norm(cl[0].hi), q_ac),
-                mul_q16_vec(norm(cr[0].lo), q_ac),
-                mul_q16_vec(norm(cr[0].hi), q_ac),
-            )
-        } else {
-            (
-                mul_q16_vec(norm(cl[v].lo), q_ac),
-                mul_q16_vec(norm(cl[v].hi), q_ac),
-                mul_q16_vec(norm(cr[v].lo), q_ac),
-                mul_q16_vec(norm(cr[v].hi), q_ac),
-            )
-        };
-
-        unsafe {
-            let base = &mut input[v * 16..];
-            vst1q_s32(base.as_mut_ptr(), ql_lo);
-            vst1q_s32(base[4..].as_mut_ptr(), ql_hi);
-            vst1q_s32(base[8..].as_mut_ptr(), qr_lo);
-            vst1q_s32(base[12..].as_mut_ptr(), qr_hi);
-        }
-    }
+    let coeffs = dct8x16_neon_coeffs(input);
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -691,11 +628,13 @@ mod neon_vs_scalar {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
-    /// Simple 32-bit LCG for deterministic pseudo-random inputs.
-    /// Returns values in ±511 to stay well within the safe range for WC32[15] ≈ 10×.
+    /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
+    /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
+    /// values is required so these tests actually exercise the transform LAYOUT
+    /// (a flat/constant block is symmetric and hides transpose/orientation bugs).
     fn lcg(state: &mut u32) -> i32 {
         *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (((*state >> 16) as i32 & 0x3FF) - 256).min(-2048).max(2048)
+        ((*state >> 16) as i32 & 0x3FF) - 512
     }
 
     fn fill_lcg(buf: &mut [i32], seed: u32) {
