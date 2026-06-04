@@ -12,6 +12,7 @@
 //! so we need only: partition[64x64][0], skip[0], kf_y_mode[0][0], uv_mode[0][0].
 
 use crate::dct::{dct8x8, dct8x16_i32, dct16x16, dct32x32};
+use crate::dct_trellis::forward_dct_quant_8x8_t;
 use crate::obu::{
     frame_header_lossless, frame_header_lossy, frame_header_lossy_tiled, sequence_header_444_8bit,
     temporal_delimiter, wrap_obu_frame,
@@ -837,46 +838,6 @@ pub fn quality_to_base_q_idx(quality: u8) -> u8 {
 /// coefficient layout. (Calibrated against dav1d: round-trip max error ~1 at q=16.)
 pub fn forward_dct_quant_8x8(residual: &mut [i32; 64], q: &impl Dct) {
     dct8x8(residual, q)
-}
-
-/// As [`forward_dct_quant_8x8`] but also returns the pre-round real targets
-/// (`c/dq` per coefficient) for the trellis quantizer. `.0` is bit-identical to
-/// the wrapper above.
-pub fn forward_dct_quant_8x8_t(residual: &[i32; 64], q: &impl Dct) -> ([i32; 64], [f64; 64]) {
-    let mut m = [[0.0f64; 8]; 8];
-    for k in 0..8 {
-        let s: f64 = ((if k == 0 { 0.5f64 } else { 1.0 }) * 2.0 / 8.0).sqrt();
-        for n in 0..8 {
-            m[k][n] = (std::f64::consts::PI * (2 * n + 1) as f64 * k as f64 / 16.0).cos() * s;
-        }
-    }
-    let mut tmp = [[0.0f64; 8]; 8]; // tmp[v][x] = sum_y M[v][y] * R[y][x]
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut acc = 0.0;
-            for y in 0..8 {
-                acc += m[v][y] * residual[y * 8 + x] as f64;
-            }
-            tmp[v][x] = acc;
-        }
-    }
-    let (dc_q, ac_q) = (q.dc_q() as f64, q.ac_q() as f64);
-    let mut cf = [0i32; 64];
-    let mut tf = [0.0f64; 64];
-    for v in 0..8 {
-        for u in 0..8 {
-            let mut c = 0.0;
-            for x in 0..8 {
-                c += m[u][x] * tmp[v][x];
-            }
-            c *= 8.0;
-            let dq = if v == 0 && u == 0 { dc_q } else { ac_q };
-            let q = c / dq;
-            tf[u * 8 + v] = q;
-            cf[u * 8 + v] = q.round() as i32;
-        }
-    }
-    (cf, tf)
 }
 
 /// Encode an 8x8 luma image (`pixels`, 0..=255) as a lossy AV1 still: forward
