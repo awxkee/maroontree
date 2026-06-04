@@ -197,34 +197,35 @@ pub(crate) fn dct8x8(input: &mut [i32; 64], quant: &impl Dct) {
 }
 
 #[inline]
-fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
+pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
     let mut tmp = [0i32; 64];
 
-    // Row-wise 1D DCT
-    for (src_row, tmp_row) in input
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(tmp.as_chunks_mut::<8>().0.iter_mut())
-    {
-        let mut row: [i32; 8] = (*src_row).try_into().unwrap();
-        dct1d_8_i32(&mut row);
-        tmp_row.copy_from_slice(&row);
-    }
-
-    // Column-wise 1D DCT + normalize by 1/64 (>> 6)
-    for (x, out_row) in input.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+    // Pass 1: column-wise DCT-8.
+    // Gather each column, transform it, scatter back to the same column position.
+    // After this pass tmp[r*8 + x] = DCT8_of_col_x[r]  (r = row-freq, x = col).
+    for x in 0..8usize {
         let mut col = [0i32; 8];
-        for (col_slot, tmp_row) in col.iter_mut().zip(tmp.chunks_exact(8)) {
-            *col_slot = tmp_row[x];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
         }
         dct1d_8_i32(&mut col);
-        for (row_idx, (dst, src)) in out_row.iter_mut().zip(col.iter()).enumerate() {
-            let normalized = src >> 6;
-            *dst = if x == 0 && row_idx == 0 {
-                mul_q16(normalized, dc_q)
+        for r in 0..8 {
+            tmp[r * 8 + x] = col[r];
+        }
+    }
+
+    // Pass 2: row-wise DCT-8 + quantize.
+    // Each row of tmp now holds one row-frequency plane across all 8 columns.
+    // After DCT8 the output is stored as input[r*8 + u] = F[row_freq=r][col_freq=u].
+    // DC is at output[0] (r==0, u==0).
+    for (r, out_row) in input.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut row);
+        for (u, (dst, src)) in out_row.iter_mut().zip(row.iter()).enumerate() {
+            *dst = if r == 0 && u == 0 {
+                mul_q16(*src, dc_q)
             } else {
-                mul_q16(normalized, ac_q)
+                mul_q16(*src, ac_q)
             };
         }
     }
@@ -271,7 +272,7 @@ pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
         let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
         dct1d_16_i32(&mut row);
         for u in 0..16 {
-            let normalized = row[u] >> 8;
+            let normalized = row[u];
             input[u * 16 + v] = if u == 0 && v == 0 {
                 mul_q16(normalized, dc_q)
             } else {
@@ -364,7 +365,7 @@ pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
 }
 
 #[inline]
-fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     let mut tmp = [0i32; 1024];
     // Column-wise 1D DCT
     for u in 0..32 {
@@ -383,7 +384,7 @@ fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
         let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
         dct1d_32_i32(&mut row);
         for u in 0..32 {
-            let normalized = row[u] >> 10;
+            let normalized = row[u];
             input[u * 32 + v] = if u == 0 && v == 0 {
                 mul_q16(normalized, dc_q)
             } else {
@@ -412,7 +413,7 @@ pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
     f(input, quant.dc_q(), quant.ac_q());
 }
 
-fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
+pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let mut tmp = [0i32; 128];
     // Pass 1: DCT-16 across each of 8 rows
     for row in 0..8usize {
@@ -428,7 +429,7 @@ fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
         }
         dct1d_8_i32(&mut col);
         for v in 0..8usize {
-            let norm = col[v] >> 7;
+            let norm = col[v];
             input[v * 16 + u] = if u == 0 && v == 0 {
                 mul_q16(norm, dc_q)
             } else {

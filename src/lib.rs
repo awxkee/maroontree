@@ -44,6 +44,7 @@ mod color;
 mod dct;
 pub mod decoder;
 pub mod encoder;
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
 pub mod obu;
 pub mod odec;
@@ -51,6 +52,7 @@ pub mod pixel;
 pub mod predict;
 pub mod rangecoder;
 pub mod transform;
+mod dct_trellis;
 
 pub use decoder::decode_still;
 pub use encoder::{Encoded, PlanarImage, encode_lossy_8x8, encode_still, encode_still_lossy};
