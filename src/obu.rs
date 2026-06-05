@@ -147,7 +147,7 @@ pub fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8> {
 /// stream parsed from aomenc (`base_q=128, lf=0, qm=0, txfm_mode=LARGEST`).
 pub fn frame_header_lossy(base_q_idx: u8) -> Vec<u8> {
     // Isolated single-block demo APIs encode with static CDFs.
-    frame_header_lossy_impl(base_q_idx, 1, 1, true)
+    frame_header_lossy_impl(base_q_idx, 1, 1, true, 0, 0, false)
 }
 
 /// Like [`frame_header_lossy`] but emits the tile-count increment bits required
@@ -157,7 +157,68 @@ pub fn frame_header_lossy(base_q_idx: u8) -> Vec<u8> {
 /// count at zero (minLog2TileCols is 0 for frames up to 4096px wide). The
 /// full-image path codes with **adaptive** CDFs (`disable_cdf_update = 0`).
 pub fn frame_header_lossy_tiled(base_q_idx: u8, sb_cols: u32, sb_rows: u32) -> Vec<u8> {
-    frame_header_lossy_impl(base_q_idx, sb_cols, sb_rows, false)
+    frame_header_lossy_impl(base_q_idx, sb_cols, sb_rows, false, 0, 0, false)
+}
+
+/// Multi-tile lossy frame header. Frames wider than `MAX_TILE_WIDTH` (4096 px)
+/// or larger than `MAX_TILE_AREA` (4096*2304 px) cannot be coded as a single
+/// tile; the decoder's `tile_info()` starts `TileColsLog2`/`TileRowsLog2` at the
+/// spec minimum (not zero), so it expects multiple tiles. `tile_cols_log2` /
+/// `tile_rows_log2` are the chosen (== minimum) values; when their sum is > 0
+/// the header additionally codes `context_update_tile_id` and
+/// `tile_size_bytes_minus_1` (here `TileSizeBytes = 4`). The increment bits are
+/// unchanged — emitting `0` stops the decoder at the minimum it already assumes.
+pub fn frame_header_lossy_multitile(
+    base_q_idx: u8,
+    sb_cols: u32,
+    sb_rows: u32,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Vec<u8> {
+    frame_header_lossy_impl(
+        base_q_idx,
+        sb_cols,
+        sb_rows,
+        false,
+        tile_cols_log2,
+        tile_rows_log2,
+        false,
+    )
+}
+
+/// Like [`frame_header_lossy_multitile`] but terminates with AV1 `trailing_bits()`
+/// (a `1` bit then zero pad) instead of plain zero `byte_alignment`. Use this
+/// when the header is carried in a standalone `OBU_FRAME_HEADER` (type 3): the
+/// spec requires trailing_bits there, and strict parsers (ffmpeg's cbs_av1)
+/// enforce it. (A combined `OBU_FRAME` uses zero byte_alignment instead.)
+pub fn frame_header_lossy_multitile_th(
+    base_q_idx: u8,
+    sb_cols: u32,
+    sb_rows: u32,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Vec<u8> {
+    frame_header_lossy_impl(
+        base_q_idx,
+        sb_cols,
+        sb_rows,
+        false,
+        tile_cols_log2,
+        tile_rows_log2,
+        true,
+    )
+}
+
+/// Emit a frame as a separate `OBU_FRAME_HEADER` (type 3) followed by an
+/// `OBU_TILE_GROUP` (type 4), rather than a combined `OBU_FRAME` (type 6). This
+/// is the layout libaom/rav1e use for tiled frames; ffmpeg's `av1_frame_merge`
+/// bitstream filter handles it cleanly, whereas a multi-tile combined
+/// `OBU_FRAME` trips its parser in some versions. `frame_header` must already be
+/// terminated with `trailing_bits()` (see [`frame_header_lossy_multitile_th`]).
+pub fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Vec<u8> {
+    let mut out = wrap_obu(ObuType::FrameHeader, frame_header);
+    out.extend_from_slice(&wrap_obu(ObuType::TileGroup, tile_group));
+    out
 }
 
 fn frame_header_lossy_impl(
@@ -165,18 +226,29 @@ fn frame_header_lossy_impl(
     sb_cols: u32,
     sb_rows: u32,
     disable_cdf_update: bool,
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+    trailing: bool,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
     w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive image path, 1 = static isolated APIs)
     w.flag(false); // allow_screen_content_tools
     w.flag(false); // render_and_frame_size_different
-    w.flag(true); // uniform_tile_spacing_flag (single tile)
+    w.flag(true); // uniform_tile_spacing_flag
     if sb_cols > 1 {
-        w.flag(false); // increment_tile_cols_log2 = 0 -> TileColsLog2 = 0
+        // increment_tile_cols_log2 = 0 -> stop at minLog2TileCols (the decoder's
+        // starting point), i.e. TileColsLog2 = tile_cols_log2.
+        w.flag(false);
     }
     if sb_rows > 1 {
-        w.flag(false); // increment_tile_rows_log2 = 0 -> TileRowsLog2 = 0
+        w.flag(false); // increment_tile_rows_log2 = 0 -> TileRowsLog2 = minLog2TileRows
+    }
+    if tile_cols_log2 + tile_rows_log2 > 0 {
+        // NumTiles > 1: context_update_tile_id (TileRowsLog2+TileColsLog2 bits)
+        // selects which tile's CDFs persist; irrelevant for a still frame -> 0.
+        w.f(0, (tile_rows_log2 + tile_cols_log2) as u8);
+        w.f(3, 2); // tile_size_bytes_minus_1 = 3 -> TileSizeBytes = 4
     }
     // quantization_params()
     w.f(base_q_idx as u32, 8); // base_q_idx (non-zero -> lossy)
@@ -201,6 +273,9 @@ fn frame_header_lossy_impl(
     // FrameIsIntra => reference/skip-mode/global-motion skipped
     w.flag(false); // reduced_tx_set = 0
     // film_grain_params_present = 0 (seq) => none
+    if trailing {
+        w.trailing_bits(); // OBU_FRAME_HEADER (type 3): 1 bit + zero pad
+    }
     w.into_bytes()
 }
 

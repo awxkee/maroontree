@@ -16,8 +16,9 @@ use crate::dct::{
     dct32x32, dct32x32_t,
 };
 use crate::obu::{
-    frame_header_lossless, frame_header_lossy, frame_header_lossy_tiled, sequence_header_444_8bit,
-    temporal_delimiter, wrap_obu_frame,
+    frame_header_lossless, frame_header_lossy, frame_header_lossy_multitile,
+    frame_header_lossy_multitile_th, sequence_header_444_8bit, temporal_delimiter, wrap_obu_frame,
+    wrap_obu_frame_split,
 };
 use crate::odec::OdEcEncoder;
 
@@ -1340,16 +1341,38 @@ fn trellis_optimize(
     }
 }
 
+/// Probability -> bit-cost table. `COST_Q[p]` holds `-log2(p / 32768)` in
+/// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in
+/// `[1, 32768]`. Built once; replaces a per-call `log2()` (a libm transcendental
+/// that dominated the trellis) with a single array load. Q22 keeps the rounding
+/// error ~1e-7 bits, far below anything the R-D comparison can resolve, so the
+/// chosen levels are identical to the float version.
+const COST_Q_FRAC: u32 = 22;
+const COST_Q_SCALE_INV: f64 = 1.0 / (1u32 << COST_Q_FRAC) as f64;
+
+fn cost_q_table() -> &'static [u32; 32769] {
+    static TABLE: std::sync::OnceLock<Box<[u32; 32769]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = Box::new([0u32; 32769]);
+        for (p, slot) in t.iter_mut().enumerate().skip(1) {
+            let bits = -((p as f64) * (1.0 / 32768.0)).log2();
+            *slot = (bits * (1u32 << COST_Q_FRAC) as f64).round() as u32;
+        }
+        t
+    })
+}
+
 /// Bits to code symbol `s` against an (inverse-form) CDF: `-log2(p)` where the
 /// probability is `(cdf[s-1] - cdf[s]) / 32768` (with `cdf[-1] = 32768`). This
 /// matches the MSAC's symbol partition (ignoring the negligible `EC_MIN_PROB`
-/// term), so it is the same rate libaom's cost tables approximate.
+/// term), so it is the same rate libaom's cost tables approximate. The `-log2`
+/// is a precomputed fixed-point table lookup (see [`cost_q_table`]).
 #[inline]
 fn cdf_cost(cdf: &[u16], s: usize) -> f64 {
     let fl = if s > 0 { cdf[s - 1] as i32 } else { 32768 };
     let fh = cdf[s] as i32;
-    let p = (fl - fh).max(1) as f64;
-    -(p * (1.0 / 32768.0)).log2()
+    let p = (fl - fh).max(1) as usize;
+    cost_q_table()[p] as f64 * COST_Q_SCALE_INV
 }
 
 /// Bypass bits for the Exp-Golomb tail coding `v` (level ≥ 15 carries `v=L-15`).
@@ -1409,28 +1432,105 @@ fn trellis_optimize_ctx(
     let lambda = lambda0 * ac_q * ac_q;
     let log2w = w.trailing_zeros() as usize;
     let stride = w;
-    let dqf = |rc: usize| if rc == 0 { dc_q } else { ac_q };
+    // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
+    // re-walking the nested arrays on every coefficient).
+    let base_tok = &cdfs.base_tok[cls][plane];
+    let br_tok = &cdfs.br_tok[cls][plane];
+    let eob_hi = &cdfs.eob_hi[cls][plane];
+    let eob_base = &cdfs.eob_base[cls][plane];
+    let dc_sign = &cdfs.dc_sign[plane];
+    let dq2_dc = dc_q * dc_q;
+    let dq2_ac = ac_q * ac_q;
     let dist = |rc: usize, lev: i32| {
-        let dq = dqf(rc);
-        (dq * dq) * (tf[rc].abs() - (lev.abs() as f64)).powi(2)
+        let dq2 = if rc == 0 { dq2_dc } else { dq2_ac };
+        let e = tf[rc].abs() - (lev.abs() as f64);
+        dq2 * (e * e)
     };
 
-    let mut eob: i32 = -1;
-    for i in 0..n {
-        if cf[scan[i]] != 0 {
-            eob = i as i32;
+    // Precompute the base-range (hi_tok) ladder cost for every br context and
+    // every total_br in 0..=12, once per call. `hi_tok_cost` otherwise reruns a
+    // 4-step `cdf_cost` ladder for every level-3+ coefficient (hot at high
+    // quality). Only worth the ~0.5us setup for the larger transforms (n >= 256),
+    // where it is called hundreds of times; small blocks use the direct path.
+    // Accumulation order matches `hi_tok_cost` exactly, so the chosen levels are
+    // identical either way.
+    let use_br_table = n >= 256;
+    let mut br_cum = [[0f64; 13]; 21];
+    if use_br_table {
+        for (bc, row) in br_cum.iter_mut().enumerate() {
+            let br = &br_tok[bc];
+            let c = [
+                cdf_cost(br, 0),
+                cdf_cost(br, 1),
+                cdf_cost(br, 2),
+                cdf_cost(br, 3),
+            ];
+            for (j, slot) in row.iter_mut().enumerate() {
+                let mut coded = 0i32;
+                let mut bits = 0.0;
+                for _ in 0..(COEFF_BASE_RANGE / 3) {
+                    let s = (j as i32 - coded).min(3);
+                    bits += c[s as usize];
+                    coded += s;
+                    if s < 3 {
+                        break;
+                    }
+                }
+                *slot = bits;
+            }
         }
     }
+    // Base-range tail cost for magnitude `m` (>= 3) in br context `bc`.
+    let hi_cost = |m: u32, bc: usize| -> f64 {
+        if use_br_table {
+            let total_br = (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE);
+            let mut bits = br_cum[bc][total_br as usize];
+            if m >= 15 {
+                bits += golomb_cost(m - 15);
+            }
+            bits
+        } else {
+            hi_tok_cost(m, &br_tok[bc])
+        }
+    };
+
+    // Last nonzero in scan order. `rposition` scans from the end and stops at the
+    // first hit, and iterating `scan` drops its bounds check (only `cf[rc]` is a
+    // random access). Same value as the forward max-index scan.
+    let eob: i32 = scan
+        .iter()
+        .rposition(|&rc| cf[rc] != 0)
+        .map_or(-1, |i| i as i32);
     if eob < 0 {
         return;
     }
+    let eu = eob as usize;
 
-    let mut levels = vec![0u8; w * (w + 4)];
+    // Reuse scratch allocations across calls (this runs once per coded transform
+    // block, so per-call alloc+zero+free of `levels`/`pre`/`suf0`/`irate` shows
+    // up in profiles). Buffers are taken from a thread-local pool and returned at
+    // the single exit below. Entries are fully overwritten before use except the
+    // cumulative seed (`suf0[n]`) and `levels` (a sparse magnitude map
+    // that must start zeroed), which are reset explicitly.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<f64>, Vec<f64>, Vec<f64>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+    }
+    let (mut levels, mut pre, mut suf0, mut irate) = SCRATCH.with(|s| {
+        let mut b = s.borrow_mut();
+        (
+            std::mem::take(&mut b.0),
+            std::mem::take(&mut b.1),
+            std::mem::take(&mut b.2),
+            std::mem::take(&mut b.3),
+        )
+    });
+    levels.clear();
+    levels.resize(w * (w + 4), 0);
     let set_level = |levels: &mut [u8], rc: usize, m: u32| {
         levels[(rc >> log2w) * stride + (rc & (w - 1))] = level_byte(m);
     };
-    for i in 0..=(eob as usize) {
-        let rc = scan[i];
+    for &rc in &scan[..eu + 1] {
         set_level(&mut levels, rc, cf[rc].unsigned_abs());
     }
 
@@ -1453,12 +1553,12 @@ fn trellis_optimize_ctx(
     // Rate of an interior coefficient at level k (base_tok + br + AC sign).
     let interior_rate = |ctx: usize, bc: usize, k: u32| -> f64 {
         if k == 0 {
-            return cdf_cost(&cdfs.base_tok[cls][plane][ctx], 0);
+            return cdf_cost(&base_tok[ctx], 0);
         }
         let tok = k.min(3);
-        let mut b = cdf_cost(&cdfs.base_tok[cls][plane][ctx], tok as usize);
+        let mut b = cdf_cost(&base_tok[ctx], tok as usize);
         if tok == 3 {
-            b += hi_tok_cost(k, &cdfs.br_tok[cls][plane][bc]);
+            b += hi_cost(k, bc);
         }
         b + 1.0 // AC sign (bypass)
     };
@@ -1471,10 +1571,33 @@ fn trellis_optimize_ctx(
             continue;
         }
         let (ctx, bc) = interior_ctx(&levels, rc);
+        // Hoist the four base-token costs (tok 0..=3) out of the k-loop; only the
+        // br/Golomb tail (k >= 3) and distortion vary per candidate. Float-op
+        // order matches `interior_rate` exactly so the choice is unchanged.
+        let bt = &base_tok[ctx];
+        let bt0 = cdf_cost(bt, 0);
+        let bt1 = cdf_cost(bt, 1);
+        let bt2 = cdf_cost(bt, 2);
+        let bt3 = cdf_cost(bt, 3);
+        let rate_k = |k: u32| -> f64 {
+            match k {
+                0 => bt0,
+                1 => bt1 + 1.0,
+                2 => bt2 + 1.0,
+                _ => (bt3 + hi_cost(k, bc)) + 1.0,
+            }
+        };
         let mut best_k = l;
-        let mut best_c = dist(rc, l as i32) + lambda * interior_rate(ctx, bc, l);
+        let mut best_c = dist(rc, l as i32) + lambda * rate_k(l);
         for k in (0..l).rev() {
-            let c = dist(rc, k as i32) + lambda * interior_rate(ctx, bc, k);
+            let dk = dist(rc, k as i32);
+            // dist grows monotonically as k falls below l (l <= |tf|), and the
+            // rate is non-negative, so once dist alone reaches best_c no smaller
+            // level can win. Exact, just stops the scan early.
+            if dk >= best_c {
+                break;
+            }
+            let c = dk + lambda * rate_k(k);
             if c < best_c {
                 best_c = c;
                 best_k = k;
@@ -1497,19 +1620,23 @@ fn trellis_optimize_ctx(
             let sgn = (cf[rc] < 0) as usize;
             let dc_rate = |k: u32| -> f64 {
                 if k == 0 {
-                    return cdf_cost(&cdfs.base_tok[cls][plane][0], 0);
+                    return cdf_cost(&base_tok[0], 0);
                 }
                 let tok = k.min(3);
-                let mut b = cdf_cost(&cdfs.base_tok[cls][plane][0], tok as usize);
+                let mut b = cdf_cost(&base_tok[0], tok as usize);
                 if tok == 3 {
-                    b += hi_tok_cost(k, &cdfs.br_tok[cls][plane][bc]);
+                    b += hi_cost(k, bc);
                 }
-                b + cdf_cost(&cdfs.dc_sign[plane][dcs_ctx], sgn)
+                b + cdf_cost(&dc_sign[dcs_ctx], sgn)
             };
             let mut best_k = l;
             let mut best_c = dist(rc, l as i32) + lambda * dc_rate(l);
             for k in (0..l).rev() {
-                let c = dist(rc, k as i32) + lambda * dc_rate(k);
+                let dk = dist(rc, k as i32);
+                if dk >= best_c {
+                    break;
+                }
+                let c = dk + lambda * dc_rate(k);
                 if c < best_c {
                     best_c = c;
                     best_k = k;
@@ -1536,7 +1663,7 @@ fn trellis_optimize_ctx(
         let mut c = cdf_cost(eob_bin_cdf, bin);
         if bin > 1 {
             let nbits = bin - 2;
-            c += cdf_cost(&cdfs.eob_hi[cls][plane][bin], (e >> nbits) & 1);
+            c += cdf_cost(&eob_hi[bin], (e >> nbits) & 1);
             c += nbits as f64; // remaining eob offset bits (bypass)
         }
         c
@@ -1544,12 +1671,12 @@ fn trellis_optimize_ctx(
     let eob_coeff_cost = |e: usize, m: u32| -> f64 {
         let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
         let tok = m.min(3);
-        let mut c = cdf_cost(&cdfs.eob_base[cls][plane][ctx_e], tok as usize - 1);
+        let mut c = cdf_cost(&eob_base[ctx_e], tok as usize - 1);
         if tok == 3 {
             let rc = scan[e];
             let (ex, ey) = (rc >> log2w, rc & (w - 1));
             let bc = if (ex | ey) > 1 { 14 } else { 7 };
-            c += hi_tok_cost(m, &cdfs.br_tok[cls][plane][bc]);
+            c += hi_cost(m, bc);
         }
         c + 1.0 // sign
     };
@@ -1557,37 +1684,48 @@ fn trellis_optimize_ctx(
     // Interior (base_tok) rate of each position at its current level, for the
     // running prefix; positions are priced as interior even if they will end up
     // being the EOB (corrected by swapping in eob_coeff_cost at the candidate).
-    let mut pre = vec![0f64; n + 1]; // sum over positions [1, i) of (rate + dist)
-    for i in 1..n {
-        let rc = scan[i];
-        let (rate, d) = if i <= eob as usize {
-            let (ctx, bc) = interior_ctx(&levels, rc);
-            (
-                interior_rate(ctx, bc, cf[rc].unsigned_abs()),
-                dist(rc, cf[rc]),
-            )
-        } else {
-            (0.0, dist(rc, 0))
-        };
-        pre[i + 1] = pre[i] + lambda * rate + d;
+    // Driven by zipped slice iterators so the sequential index checks drop out;
+    // accumulation order (`acc + lambda*r + d`) matches the indexed form exactly.
+    pre.resize(n + 1, 0.0);
+    irate.resize(n, 0.0);
+    let mut acc = 0.0f64; // pre[1]: empty prefix
+    // Interior positions [1, eob]: priced with neighbour context.
+    for ((&rc, ir), p) in scan[1..eu + 1]
+        .iter()
+        .zip(irate[1..eu + 1].iter_mut())
+        .zip(pre[2..eu + 2].iter_mut())
+    {
+        let (ctx, bc) = interior_ctx(&levels, rc);
+        let r = interior_rate(ctx, bc, cf[rc].unsigned_abs());
+        *ir = r;
+        acc = (acc + lambda * r) + dist(rc, cf[rc]);
+        *p = acc;
     }
-    let mut suf0 = vec![0f64; n + 1]; // distortion of zeroing positions [i, n)
-    for i in (1..n).rev() {
-        suf0[i] = suf0[i + 1] + dist(scan[i], 0);
+    // Trailing positions (eob, n): coded as zeros, distortion only.
+    for (&rc, p) in scan[eu + 1..n].iter().zip(pre[eu + 2..n + 1].iter_mut()) {
+        acc = acc + dist(rc, 0);
+        *p = acc;
+    }
+    suf0.resize(n + 1, 0.0);
+    suf0[n] = 0.0; // suffix seed (read as suf0[n]; not written by the loop below)
+    let mut sacc = 0.0f64;
+    for (&rc, s) in scan[1..n].iter().rev().zip(suf0[1..n].iter_mut().rev()) {
+        sacc = sacc + dist(rc, 0);
+        *s = sacc;
     }
     // DC contribution (rate + distortion), constant across EOB choices ≥ 1.
     let dc_rc = scan[0];
     let dc_m = cf[dc_rc].unsigned_abs();
     let dc_cost = if dc_m == 0 {
-        lambda * cdf_cost(&cdfs.base_tok[cls][plane][0], 0)
+        lambda * cdf_cost(&base_tok[0], 0)
     } else {
         let bc = dc_brc(&levels);
         let tok = dc_m.min(3);
-        let mut b = cdf_cost(&cdfs.base_tok[cls][plane][0], tok as usize);
+        let mut b = cdf_cost(&base_tok[0], tok as usize);
         if tok == 3 {
-            b += hi_tok_cost(dc_m, &cdfs.br_tok[cls][plane][bc]);
+            b += hi_cost(dc_m, bc);
         }
-        b += cdf_cost(&cdfs.dc_sign[plane][dcs_ctx], (cf[dc_rc] < 0) as usize);
+        b += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
         lambda * b
     } + dist(dc_rc, cf[dc_rc]);
 
@@ -1599,8 +1737,9 @@ fn trellis_optimize_ctx(
             continue; // EOB must land on a nonzero
         }
         // pre[e] prices position e as interior; replace with eob_coeff cost.
-        let (ctx, bc) = interior_ctx(&levels, rc);
-        let interior_e = lambda * interior_rate(ctx, bc, cf[rc].unsigned_abs());
+        // A nonzero at `e` implies `e <= eob`, so `irate[e]` was filled above
+        // (identical value to interior_rate here, just cached).
+        let interior_e = lambda * irate[e];
         let c = dc_cost
             + (pre[e + 1] - interior_e)
             + lambda * (eob_pt_cost(e) + eob_coeff_cost(e, cf[rc].unsigned_abs()))
@@ -1614,12 +1753,11 @@ fn trellis_optimize_ctx(
     if dc_m != 0 {
         let ctx_e = 1usize; // e == 0
         let tok = dc_m.min(3);
-        let mut c0 = cdf_cost(eob_bin_cdf, 0)
-            + cdf_cost(&cdfs.eob_base[cls][plane][ctx_e], tok as usize - 1);
+        let mut c0 = cdf_cost(eob_bin_cdf, 0) + cdf_cost(&eob_base[ctx_e], tok as usize - 1);
         if tok == 3 {
-            c0 += hi_tok_cost(dc_m, &cdfs.br_tok[cls][plane][dc_brc(&levels)]);
+            c0 += hi_cost(dc_m, dc_brc(&levels));
         }
-        c0 += cdf_cost(&cdfs.dc_sign[plane][dcs_ctx], (cf[dc_rc] < 0) as usize);
+        c0 += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
         let total0 = lambda * c0 + dist(dc_rc, cf[dc_rc]) + suf0[1];
         if total0 < best_cost {
             best_cost = total0;
@@ -1631,11 +1769,18 @@ fn trellis_optimize_ctx(
         for &rc in scan.iter() {
             cf[rc] = 0;
         }
-        return;
+    } else {
+        for i in (best_e as usize + 1)..n {
+            cf[scan[i]] = 0;
+        }
     }
-    for i in (best_e as usize + 1)..n {
-        cf[scan[i]] = 0;
-    }
+    SCRATCH.with(|s| {
+        let mut b = s.borrow_mut();
+        b.0 = std::mem::take(&mut levels);
+        b.1 = std::mem::take(&mut pre);
+        b.2 = std::mem::take(&mut suf0);
+        b.3 = std::mem::take(&mut irate);
+    });
 }
 /// directional modes (V/H and the diagonals, 1..=8) are intentionally omitted
 /// from this set: they would also require the `angle_delta` symbol on >= 8x8
@@ -5992,6 +6137,193 @@ pub(crate) fn pad_to_mult8<T: Copy>(src: &[T], w: usize, h: usize, w8: usize, h8
     out
 }
 
+/// Smallest `k` such that `(blk << k) >= target` (AV1 spec `tile_log2`).
+fn tile_log2(blk: u32, target: u32) -> u32 {
+    let mut k = 0;
+    while (blk << k) < target {
+        k += 1;
+    }
+    k
+}
+
+/// Choose `(TileColsLog2, TileRowsLog2)` for a frame of `sb_cols` x `sb_rows`
+/// 64x64 superblocks, picking the spec **minimum** tiling. AV1 caps a tile at
+/// `MAX_TILE_WIDTH = 4096` px wide and `MAX_TILE_AREA = 4096*2304` px; the
+/// decoder derives these minimums itself, so matching them here makes the
+/// single-tile case (`(0, 0)`) byte-identical to the old path while larger
+/// frames get the tiling the decoder already expects.
+fn choose_tiling(sb_cols: u32, sb_rows: u32) -> (u32, u32) {
+    const MAX_TILE_WIDTH_SB: u32 = 4096 / 64; // 64
+    const MAX_TILE_AREA_SB: u32 = (4096 * 2304) / (64 * 64); // 2304
+    let min_log2_tile_cols = tile_log2(MAX_TILE_WIDTH_SB, sb_cols);
+    let max_log2_tile_cols = tile_log2(1, sb_cols.min(64));
+    let max_log2_tile_rows = tile_log2(1, sb_rows.min(64));
+    let min_log2_tiles = min_log2_tile_cols.max(tile_log2(MAX_TILE_AREA_SB, sb_rows * sb_cols));
+    let tile_cols_log2 = min_log2_tile_cols.min(max_log2_tile_cols);
+    let tile_rows_log2 = min_log2_tiles
+        .saturating_sub(tile_cols_log2)
+        .min(max_log2_tile_rows);
+    (tile_cols_log2, tile_rows_log2)
+}
+
+/// Uniform-spacing tile start offsets (in SB units), matching the decoder's
+/// `for (startSb = 0; startSb < sbs; startSb += sizeSb)` loop. The returned vec
+/// has one entry per tile; the implied end of tile `i` is `starts[i+1]` (or
+/// `sbs` for the last). The tile count may be **less** than `1 << log2`.
+fn tile_starts_sb(sbs: u32, log2: u32) -> Vec<u32> {
+    let size_sb = sbs.div_ceil(1 << log2);
+    let mut starts = Vec::new();
+    let mut s = 0;
+    while s < sbs {
+        starts.push(s);
+        s += size_sb;
+    }
+    starts
+}
+
+fn crop_plane(src: &[i32], full_w: usize, x0: usize, y0: usize, tw: usize, th: usize) -> Vec<i32> {
+    let mut out = vec![0i32; tw * th];
+    for r in 0..th {
+        let s = (y0 + r) * full_w + x0;
+        out[r * tw..(r + 1) * tw].copy_from_slice(&src[s..s + tw]);
+    }
+    out
+}
+
+fn stitch_plane(
+    dst: &mut [i32],
+    full_w: usize,
+    x0: usize,
+    y0: usize,
+    tile: &[i32],
+    tw: usize,
+    th: usize,
+) {
+    for r in 0..th {
+        let d = (y0 + r) * full_w + x0;
+        dst[d..d + tw].copy_from_slice(&tile[r * tw..(r + 1) * tw]);
+    }
+}
+
+/// Encode `src` (already padded to `w8` x `h8`, chroma subsampled by
+/// `sub_x`/`sub_y`) as one or more AV1 tiles and return the **tile-group
+/// payload** (everything that follows the frame header inside `OBU_FRAME`), the
+/// stitched full-frame reconstruction, and the chosen `(TileColsLog2,
+/// TileRowsLog2)`.
+///
+/// Each tile is encoded as an independent sub-frame: the source is cropped to
+/// the tile's pixel rectangle and handed to a fresh [`LossyTile`] whose origin
+/// is the tile's top-left, so tile boundaries become frame boundaries and all
+/// the existing prediction/availability/context logic applies unchanged (intra
+/// prediction and entropy contexts never cross a tile edge, as the spec
+/// requires). For a single tile the payload is just that tile's bytes —
+/// byte-identical to the previous single-tile path.
+fn encode_lossy_tilegroup(
+    base_q_idx: u8,
+    bd: u8,
+    w8: usize,
+    h8: usize,
+    src: &[Vec<i32>; 3],
+    sub_x: usize,
+    sub_y: usize,
+) -> (Vec<u8>, [Vec<i32>; 3], u32, u32) {
+    let sb_cols = w8.div_ceil(64) as u32;
+    let sb_rows = h8.div_ceil(64) as u32;
+    let (tcl, trl) = choose_tiling(sb_cols, sb_rows);
+    let col_starts = tile_starts_sb(sb_cols, tcl);
+    let row_starts = tile_starts_sb(sb_rows, trl);
+
+    let (cw8, ch8) = (w8 >> sub_x, h8 >> sub_y);
+    let mut recon = [
+        vec![0i32; w8 * h8],
+        vec![0i32; cw8 * ch8],
+        vec![0i32; cw8 * ch8],
+    ];
+
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(col_starts.len() * row_starts.len());
+    for (ti, &rsb) in row_starts.iter().enumerate() {
+        let y0 = rsb as usize * 64;
+        let y1 = (row_starts.get(ti + 1).map_or(sb_rows, |&n| n) as usize * 64).min(h8);
+        let th = y1 - y0;
+        for (tj, &csb) in col_starts.iter().enumerate() {
+            let x0 = csb as usize * 64;
+            let x1 = (col_starts.get(tj + 1).map_or(sb_cols, |&n| n) as usize * 64).min(w8);
+            let tw = x1 - x0;
+
+            let (cx0, cy0) = (x0 >> sub_x, y0 >> sub_y);
+            let (ctw, cth) = (tw >> sub_x, th >> sub_y);
+            let tsrc = [
+                crop_plane(&src[0], w8, x0, y0, tw, th),
+                crop_plane(&src[1], cw8, cx0, cy0, ctw, cth),
+                crop_plane(&src[2], cw8, cx0, cy0, ctw, cth),
+            ];
+
+            let mut tile = match (sub_x, sub_y) {
+                (0, 0) => LossyTile::new(base_q_idx, bd, tw, th, &tsrc),
+                (1, 0) => LossyTile::new_422(base_q_idx, bd, tw, th, &tsrc),
+                _ => LossyTile::new_420(base_q_idx, bd, tw, th, &tsrc),
+            };
+            for sb_y in (0..th).step_by(64) {
+                for sb_x in (0..tw).step_by(64) {
+                    tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+                }
+            }
+            stitch_plane(&mut recon[0], w8, x0, y0, &tile.recon[0], tw, th);
+            stitch_plane(&mut recon[1], cw8, cx0, cy0, &tile.recon[1], ctw, cth);
+            stitch_plane(&mut recon[2], cw8, cx0, cy0, &tile.recon[2], ctw, cth);
+            payloads.push(tile.enc.done());
+        }
+    }
+
+    let tilegroup = assemble_tilegroup(payloads);
+    (tilegroup, recon, tcl, trl)
+}
+
+/// Concatenate per-tile payloads into a tile-group. A single tile is returned
+/// verbatim (no header byte, no size prefix). For `NumTiles > 1` the spec
+/// `tile_group_obu` prepends `tile_start_and_end_present_flag = 0` followed by
+/// `byte_alignment()` (one `0x00` byte), then every tile except the last is
+/// prefixed with `tile_size_minus_1` as `TileSizeBytes = 4` little-endian bytes.
+fn assemble_tilegroup(payloads: Vec<Vec<u8>>) -> Vec<u8> {
+    if payloads.len() == 1 {
+        return payloads.into_iter().next().unwrap();
+    }
+    let mut out = Vec::new();
+    out.push(0u8); // tile_start_and_end_present_flag=0 + byte_alignment
+    let last = payloads.len() - 1;
+    for (i, p) in payloads.iter().enumerate() {
+        if i != last {
+            let sz_minus_1 = (p.len() - 1) as u32; // TileSizeBytes = 4
+            out.extend_from_slice(&sz_minus_1.to_le_bytes());
+        }
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Build the frame OBU(s) that follow the sequence header. A single tile is
+/// emitted as one combined `OBU_FRAME` (type 6) — byte-identical to the previous
+/// output. Multi-tile frames are emitted as a separate `OBU_FRAME_HEADER`
+/// (type 3) + `OBU_TILE_GROUP` (type 4), which strict parsers (ffmpeg's
+/// `av1_frame_merge` BSF) handle reliably where a multi-tile combined
+/// `OBU_FRAME` does not.
+fn assemble_frame_obus(
+    base_q_idx: u8,
+    sb_cols: u32,
+    sb_rows: u32,
+    tcl: u32,
+    trl: u32,
+    tilegroup: &[u8],
+) -> Vec<u8> {
+    if tcl + trl > 0 {
+        let fh = frame_header_lossy_multitile_th(base_q_idx, sb_cols, sb_rows, tcl, trl);
+        wrap_obu_frame_split(&fh, tilegroup)
+    } else {
+        let fh = frame_header_lossy_multitile(base_q_idx, sb_cols, sb_rows, 0, 0);
+        wrap_obu_frame(&fh, tilegroup)
+    }
+}
+
 pub fn encode_av1_lossy_image(
     base_q_idx: u8,
     bd: u8,
@@ -6031,14 +6363,7 @@ pub fn encode_av1_lossy_image_cs(
         pad_to_mult8(u, w, h, w8, h8),
         pad_to_mult8(v, w, h, w8, h8),
     ];
-    let mut tile = LossyTile::new(base_q_idx, bd, w8, h8, &src);
-    // superblock raster order; partial edge superblocks are split by decode_sb
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let payload = tile.enc.done();
+    let (payload, _recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0);
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let mut bytes = Vec::new();
@@ -6048,9 +6373,8 @@ pub fn encode_av1_lossy_image_cs(
     bytes.extend_from_slice(&crate::obu::sequence_header_mc(
         w as u32, h as u32, profile, bd, mc, 0, 0,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, sb_cols, sb_rows),
-        &payload,
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx, sb_cols, sb_rows, tcl, trl, &payload,
     ));
     bytes
 }
@@ -6074,14 +6398,7 @@ pub fn encode_av1_lossy_image_recon_dbg(
         pad_to_mult8(u, w, h, w8, h8),
         pad_to_mult8(v, w, h, w8, h8),
     ];
-    let mut tile = LossyTile::new(base_q_idx, bd, w8, h8, &src);
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let recon = tile.recon.clone();
-    let payload = tile.enc.done();
+    let (payload, recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0);
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let mut bytes = Vec::new();
@@ -6090,9 +6407,8 @@ pub fn encode_av1_lossy_image_recon_dbg(
     bytes.extend_from_slice(&crate::obu::sequence_header_mc(
         w as u32, h as u32, profile, bd, 0, 0, 0,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, sb_cols, sb_rows),
-        &payload,
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx, sb_cols, sb_rows, tcl, trl, &payload,
     ));
     (bytes, recon, w8, h8)
 }
@@ -6116,14 +6432,7 @@ pub fn encode_av1_lossy_image_420_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| pad_to_mult8(p, cw, ch, cw8, ch8);
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let mut tile = LossyTile::new_420(base_q_idx, bd, w8, h8, &src);
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let recon = tile.recon.clone();
-    let payload = tile.enc.done();
+    let (payload, recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 1);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mc(
@@ -6135,8 +6444,12 @@ pub fn encode_av1_lossy_image_420_recon_dbg(
         1,
         1,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, w8.div_ceil(64) as u32, h8.div_ceil(64) as u32),
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        w8.div_ceil(64) as u32,
+        h8.div_ceil(64) as u32,
+        tcl,
+        trl,
         &payload,
     ));
     (bytes, recon, w8, h8, cw8, ch8)
@@ -6160,21 +6473,18 @@ pub fn encode_av1_lossy_image_422_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| pad_to_mult8(p, cw, h, cw8, h8);
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let mut tile = LossyTile::new_422(base_q_idx, bd, w8, h8, &src);
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let recon = tile.recon.clone();
-    let payload = tile.enc.done();
+    let (payload, recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 0);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mc(
         w as u32, h as u32, 2, bd, 6, 1, 0,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, w8.div_ceil(64) as u32, h8.div_ceil(64) as u32),
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        w8.div_ceil(64) as u32,
+        h8.div_ceil(64) as u32,
+        tcl,
+        trl,
         &payload,
     ));
     (bytes, recon, w8, h8, cw8)
@@ -6203,13 +6513,7 @@ pub fn encode_av1_lossy_image_422(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let mut tile = LossyTile::new_422(base_q_idx, bd, w8, h8, &src);
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let payload = tile.enc.done();
+    let (payload, _recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 0);
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let mut bytes = Vec::new();
@@ -6218,9 +6522,8 @@ pub fn encode_av1_lossy_image_422(
     bytes.extend_from_slice(&crate::obu::sequence_header_mc(
         w as u32, h as u32, 2, bd, 6, 1, 0,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, sb_cols, sb_rows),
-        &payload,
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx, sb_cols, sb_rows, tcl, trl, &payload,
     ));
     bytes
 }
@@ -6248,13 +6551,7 @@ pub fn encode_av1_lossy_image_420(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let mut tile = LossyTile::new_420(base_q_idx, bd, w8, h8, &src);
-    for sb_y in (0..h8).step_by(64) {
-        for sb_x in (0..w8).step_by(64) {
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    let payload = tile.enc.done();
+    let (payload, _recon, tcl, trl) = encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 1);
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let mut bytes = Vec::new();
@@ -6269,9 +6566,8 @@ pub fn encode_av1_lossy_image_420(
         1,
         1,
     ));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &frame_header_lossy_tiled(base_q_idx, sb_cols, sb_rows),
-        &payload,
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx, sb_cols, sb_rows, tcl, trl, &payload,
     ));
     bytes
 }
@@ -6294,6 +6590,120 @@ pub fn encode_av1_lossy_image_64x64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiling_matches_decoder_minimums() {
+        // (w8, h8) -> (sb_cols, sb_rows, tcl, trl, num_tiles)
+        // Single tile for frames within MAX_TILE_WIDTH (4096) and MAX_TILE_AREA.
+        let sb = |n: usize| (n as u32).div_ceil(64);
+        let layout = |w8: usize, h8: usize| {
+            let (sc, sr) = (sb(w8), sb(h8));
+            let (tcl, trl) = choose_tiling(sc, sr);
+            let nt = tile_starts_sb(sc, tcl).len() * tile_starts_sb(sr, trl).len();
+            (tcl, trl, nt)
+        };
+        assert_eq!(layout(1920, 1080), (0, 0, 1)); // typical photo, 1 tile
+        assert_eq!(layout(4096, 2304), (0, 0, 1)); // exactly at the area cap
+        assert_eq!(layout(4160, 128), (1, 0, 2)); // width>4096 -> 2 cols
+        assert_eq!(layout(3104, 3104), (0, 1, 2)); // area>9.44MP -> 2 rows
+        assert_eq!(layout(5000, 4000), (1, 1, 4)); // 2x2
+        assert_eq!(layout(6000, 5000), (1, 1, 4)); // 2x2
+    }
+
+    #[test]
+    fn tile_starts_uniform_spacing() {
+        // sb_cols=79, tcl=1 -> sizeSb=ceil(79/2)=40 -> starts [0, 40]
+        assert_eq!(tile_starts_sb(79, 1), vec![0, 40]);
+        // sb_cols=5, log2=2 -> sizeSb=ceil(5/4)=2 -> starts [0,2,4] (3 < 4 tiles)
+        assert_eq!(tile_starts_sb(5, 2), vec![0, 2, 4]);
+        assert_eq!(tile_starts_sb(1, 0), vec![0]);
+    }
+
+    #[test]
+    fn multitile_assembles_tile_group_framing() {
+        // A frame past MAX_TILE_WIDTH must emit >1 tile with the tile-group
+        // header byte + 4-byte LE size prefixes (verified bit-exact vs dav1d in
+        // the verify_tiles binary; here we just check the structure is built).
+        let (w, h) = (4160usize, 64usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let luma = vec![512i32; w * h];
+        let u = vec![512i32; cw * ch];
+        let v = vec![512i32; cw * ch];
+        let (bytes, recon, w8, _h8, _cw8, _ch8) =
+            encode_av1_lossy_image_420_recon_dbg(80, 10, w, h, &luma, &u, &v);
+        assert!(!bytes.is_empty());
+        assert_eq!(recon[0].len(), w8 * align8(h));
+        // Sanity: the chosen layout is genuinely multi-tile.
+        let (tcl, trl) = choose_tiling((w8 as u32).div_ceil(64), align8(h) as u32 / 64);
+        assert!(tcl + trl > 0, "4160-wide frame should be multi-tile");
+    }
+
+    #[test]
+    fn multitile_emits_frame_header_plus_tile_group_obus() {
+        fn obu_types(buf: &[u8]) -> Vec<u8> {
+            let mut p = 0;
+            let mut out = Vec::new();
+            while p < buf.len() {
+                let hb = buf[p];
+                let typ = (hb >> 3) & 0xf;
+                let ext = (hb >> 2) & 1;
+                let has_size = (hb >> 1) & 1;
+                let mut q = p + 1 + ext as usize;
+                let mut sz = buf.len() - q;
+                if has_size == 1 {
+                    let (mut v, mut s) = (0usize, 0u32);
+                    loop {
+                        let x = buf[q];
+                        q += 1;
+                        v |= ((x & 0x7f) as usize) << s;
+                        if x & 0x80 == 0 {
+                            break;
+                        }
+                        s += 7;
+                    }
+                    sz = v;
+                }
+                out.push(typ);
+                p = q + sz;
+            }
+            out
+        }
+        // Single tile -> combined OBU_FRAME (type 6), unchanged from before.
+        let small =
+            encode_av1_lossy_image_cs(80, 8, 64, 64, &[64; 4096], &[64; 4096], &[64; 4096], false);
+        let st = obu_types(&small);
+        assert!(
+            st.contains(&6),
+            "single tile should use OBU_FRAME (type 6): {st:?}"
+        );
+        assert!(
+            !st.contains(&4),
+            "single tile should not emit a separate tile group"
+        );
+
+        // Multi tile (width > 4096) -> OBU_FRAME_HEADER (3) + OBU_TILE_GROUP (4).
+        let (w, h) = (4160usize, 64usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let big = encode_av1_lossy_image_420_recon_dbg(
+            80,
+            10,
+            w,
+            h,
+            &vec![512; w * h],
+            &vec![512; cw * ch],
+            &vec![512; cw * ch],
+        )
+        .0;
+        let bt = obu_types(&big);
+        assert!(
+            bt.contains(&3) && bt.contains(&4),
+            "multi-tile must emit type 3 + type 4: {bt:?}"
+        );
+        assert!(
+            !bt.contains(&6),
+            "multi-tile must not use combined OBU_FRAME: {bt:?}"
+        );
+    }
 
     #[test]
     fn dct16x32_roundtrip_and_scale_calibration() {
