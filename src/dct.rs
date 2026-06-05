@@ -489,7 +489,7 @@ fn quant_levels_and_targets<const N: usize>(
     for i in 0..N {
         let m = if i == 0 { q_mult_dc } else { q_mult_ac };
         cf[i] = mul_q16(coeffs[i], m);
-        tf[i] = coeffs[i] as f64 * m as f64 / 65536.0;
+        tf[i] = coeffs[i] as f64 * m as f64 * (1. / 65536.0);
     }
     (cf, tf)
 }
