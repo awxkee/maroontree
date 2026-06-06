@@ -3,8 +3,8 @@
 //! stream using real AV1 entropy coding (od_ec MSAC, dav1d-compatible CDFs,
 //! WHT-4x4 with DC_PRED, TX_4X4 throughout).
 
-use crate::color::{Cicp, ImageMetadata};
-use crate::obu::{metadata_obus, temporal_delimiter, wrap_obu_frame};
+use crate::color::ColorEncoding;
+use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
 
 /// A planar image. `planes[0..3]` are full-resolution (4:4:4).
@@ -22,13 +22,18 @@ impl<T: Pixel> PlanarImage<T> {
     pub fn from_interleaved_rgb(width: usize, height: usize, bit_depth: u8, rgb: &[T]) -> Self {
         assert_eq!(rgb.len(), width * height * 3);
         let n = width * height;
-        let mut g = Vec::with_capacity(n);
-        let mut b = Vec::with_capacity(n);
-        let mut r = Vec::with_capacity(n);
-        for px in rgb.chunks_exact(3) {
-            r.push(px[0]);
-            g.push(px[1]);
-            b.push(px[2]);
+        let mut g = vec![T::default(); n];
+        let mut b = vec![T::default(); n];
+        let mut r = vec![T::default(); n];
+        for (((px, g), b), r) in rgb
+            .chunks_exact(3)
+            .zip(g.iter_mut())
+            .zip(b.iter_mut())
+            .zip(r.iter_mut())
+        {
+            *r = px[0];
+            *g = px[1];
+            *b = px[2];
         }
         PlanarImage {
             width,
@@ -41,15 +46,16 @@ impl<T: Pixel> PlanarImage<T> {
     /// Reconstruct interleaved RGB from the GBR planes.
     pub fn to_interleaved_rgb(&self) -> Vec<T> {
         let n = self.width * self.height;
-        let mut out = Vec::with_capacity(n * 3);
-        for ((&r, &g), &b) in self.planes[2]
-            .iter()
+        let mut out = vec![T::default(); n * 3];
+        for (((dst, &r), &g), &b) in out
+            .chunks_exact_mut(3)
+            .zip(self.planes[2].iter())
             .zip(self.planes[0].iter())
             .zip(self.planes[1].iter())
         {
-            out.push(r); // R
-            out.push(g); // G
-            out.push(b); // B
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
         }
         out
     }
@@ -71,8 +77,12 @@ pub struct Encoded {
 /// reconstruction loop runs inside the encoder so each block's DC prediction
 /// matches the decoder's, including across superblock boundaries. Verified to
 /// decode in dav1d 1.4.1 and ffmpeg/libdav1d from 64x64 to 256x192 (gradient
-/// PSNR ~49-57 dB at q=16; flat colour is exact).
-pub fn encode_still_lossy<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Encoded {
+/// PSNR ~49-57 dB at q=16; flat color is exact).
+pub fn encode_still_lossy<T: Pixel>(
+    img: &PlanarImage<T>,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
     assert!(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
@@ -123,7 +133,7 @@ pub fn encode_still_lossy<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Enc
             .clamp(0.0, mx) as i32;
     }
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
-        base_q_idx, bd, img.width, img.height, &y, &cb, &cr, true,
+        base_q_idx, bd, img.width, img.height, &y, &cb, &cr, true, threads,
     );
     Encoded {
         bytes,
@@ -135,10 +145,14 @@ pub fn encode_still_lossy<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Enc
 /// the chroma planes are horizontally subsampled by 2 (BT.601 full-range YCbCr,
 /// `RTX_4X8` chroma transforms). The decoder reconstructs full-resolution RGB.
 /// Bit-exact reconstruction was verified against dav1d 1.4.1. On the PSNR
-/// metric this is roughly neutral-to-slightly-better on colourful content and
+/// metric this is roughly neutral-to-slightly-better on colorful content and
 /// slightly worse on very smooth content (where 4:4:4 chroma is already
 /// skip-dominated and nearly free), so 4:4:4 remains the default.
-pub fn encode_still_lossy_422<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Encoded {
+pub fn encode_still_lossy_422<T: Pixel>(
+    img: &PlanarImage<T>,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
     assert!(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
@@ -195,7 +209,8 @@ pub fn encode_still_lossy_422<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) ->
                 .clamp(0.0, mx) as i32;
         }
     }
-    let bytes = crate::av1real::encode_av1_lossy_image_422(base_q_idx, bd, w, h, &y, &cb, &cr);
+    let bytes =
+        crate::av1real::encode_av1_lossy_image_422(base_q_idx, bd, w, h, &y, &cb, &cr, threads);
     Encoded {
         bytes,
         lossless_verified: false,
@@ -209,7 +224,11 @@ pub fn encode_still_lossy_422<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) ->
 /// 1.4.1. As with 4:2:2 this does *not* improve RGB-PSNR R-D over the default
 /// 4:4:4 path (slimav's chroma skip already makes smooth chroma nearly free), so
 /// it exists mainly for pipeline compatibility; **4:4:4 remains the default.**
-pub fn encode_still_lossy_420<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Encoded {
+pub fn encode_still_lossy_420<T: Pixel>(
+    img: &PlanarImage<T>,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
     assert!(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
@@ -264,43 +283,44 @@ pub fn encode_still_lossy_420<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) ->
             cr[row * cw + c] = avg(&fcr).round().clamp(0.0, mx) as i32;
         }
     }
-    let bytes = crate::av1real::encode_av1_lossy_image_420(base_q_idx, bd, w, h, &y, &cb, &cr);
+    let bytes =
+        crate::av1real::encode_av1_lossy_image_420(base_q_idx, bd, w, h, &y, &cb, &cr, threads);
     Encoded {
         bytes,
         lossless_verified: false,
     }
 }
 
-/// Encode a **lossy** 8×8 8-bit 4:4:4 still to a conformant AV1 OBU stream.
-///
-/// Uses one `TX_8X8` (DCT_DCT) per plane with quantizer `base_q_idx` (keep
-/// `<= 20` to stay in coefficient qctx 0). Verified to decode in dav1d 1.4.1
-/// **and** ffmpeg/libdav1d (round-trip max error ~1 at q=16). This is the lossy
-/// counterpart to `encode_still`'s lossless path; extending it to 64×64
-/// requires the partition tree + per-block reconstruction documented in the
-/// repo (lossy frames cannot use the `TX_4X4_ONLY` mode the lossless tile
-/// relies on, so they must split the superblock into coded sub-blocks).
-pub fn encode_lossy_8x8<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Encoded {
-    assert_eq!(img.width, 8, "encode_lossy_8x8 expects 8×8");
-    assert_eq!(img.height, 8, "encode_lossy_8x8 expects 8×8");
-    assert_eq!(
-        img.bit_depth, 8,
-        "only 8-bit supported (lossy 10/12-bit pending)"
+/// Encode a single grayscale plane as a **monochrome** AV1 still
+/// (`mono_chrome = 1`, one luma plane). This is the form AVIF uses for an alpha
+/// auxiliary image — alpha in AV1/AVIF is not a 4th channel but a separate
+/// monochrome image the container references as the alpha aux item. `plane` is
+/// the `width*height` grayscale (e.g. alpha) raster; `full_range` sets
+/// `color_range` (alpha is normally full range). `base_q_idx` controls quality;
+/// `threads`: `0` = all cores, `1` = serial, `N` = up to N (the plane is tiled
+/// toward the thread count, and large planes tile by size, exactly like the
+/// color encoders). For exact alpha, use a small `base_q_idx`.
+pub fn encode_still_mono<T: Pixel>(
+    plane: &[T],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    base_q_idx: u8,
+    full_range: bool,
+    threads: usize,
+) -> Encoded {
+    assert!(width > 0 && height > 0, "width/height must be non-zero");
+    assert!(
+        matches!(bit_depth, 8 | 10 | 12),
+        "only 8/10/12-bit supported"
     );
-    let to_px = |p: &Vec<T>| {
-        let mut a = [0u8; 64];
-        for (i, v) in p.iter().enumerate() {
-            a[i] = v.to_i32().clamp(0, 255) as u8;
-        }
-        a
-    };
-    let (g, b, r) = (
-        to_px(&img.planes[0]),
-        to_px(&img.planes[1]),
-        to_px(&img.planes[2]),
+    assert!(base_q_idx != 0, "monochrome lossless is not yet supported");
+    assert_eq!(plane.len(), width * height, "plane must be width*height");
+    let maxv = (1i32 << bit_depth) - 1;
+    let luma: Vec<i32> = plane.iter().map(|v| v.to_i32().clamp(0, maxv)).collect();
+    let bytes = crate::av1real::encode_av1_mono_image(
+        base_q_idx, bit_depth, width, height, &luma, full_range, threads,
     );
-    // planes are [G, B, R]; the encoder takes (luma=G, U=B, V=R) order.
-    let bytes = crate::av1real::encode_av1_lossy_color_image_8x8(base_q_idx, &g, &b, &r);
     Encoded {
         bytes,
         lossless_verified: false,
@@ -314,20 +334,22 @@ pub fn encode_lossy_8x8<T: Pixel>(img: &PlanarImage<T>, base_q_idx: u8) -> Encod
 /// (Arbitrary-size / higher-bit-depth support requires multi-superblock tiling
 /// and quantizer changes that are not yet implemented.)
 pub fn encode_still<T: Pixel>(img: &PlanarImage<T>) -> Encoded {
-    encode_still_with(img, &ImageMetadata::new(Cicp::identity_rgb()))
+    encode_still_with(img, &ColorEncoding::identity_rgb(), 1)
 }
 
-/// Encode a lossless 4:4:4 still with explicit colour/metadata signalling.
+/// Encode a lossless 4:4:4 still with explicit color signaling.
 ///
-/// `meta.cicp` is written into the sequence-header `color_config` (primaries /
-/// transfer / matrix / range). The coded planes are emitted verbatim: this
-/// encoder does **not** apply any colour transform — feeding it RGB with an
-/// identity matrix, or pre-decorrelated planes with the matching matrix
-/// (e.g. user-applied YCgCo), is the caller's choice. HDR `cll` / `mdcv` and
-/// `t35` user data are emitted as metadata OBUs after the sequence header; the
-/// ICC profile is carried for the (future) AVIF muxer and is *not* placed in the
-/// AV1 OBU stream.
-pub fn encode_still_with<T: Pixel>(img: &PlanarImage<T>, meta: &ImageMetadata) -> Encoded {
+/// `color` is written verbatim into the AV1 sequence-header `color_config()`
+/// (primaries / transfer / matrix / range). The coded planes are emitted
+/// without any color transform — pass RGB planes with
+/// [`ColorEncoding::identity_rgb()`], or pre-converted YCgCo/etc. with the
+/// matching matrix. For HDR metadata OBUs (CLL, MDCV, T.35) append them
+/// manually using the helpers in [`crate::obu`] before passing to a muxer.
+pub fn encode_still_with<T: Pixel>(
+    img: &PlanarImage<T>,
+    color: &ColorEncoding,
+    threads: usize,
+) -> Encoded {
     assert!(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
@@ -337,26 +359,14 @@ pub fn encode_still_with<T: Pixel>(img: &PlanarImage<T>, meta: &ImageMetadata) -
         "only 8/10/12-bit supported"
     );
     let profile: u32 = if img.bit_depth == 12 { 2 } else { 1 };
-
     let (w, h) = (img.width, img.height);
     let (w8, h8) = (crate::av1real::align8(w), crate::av1real::align8(h));
-
     let to_i16 = |p: &[T]| p.iter().map(|p| p.to_i32() as i16).collect::<Vec<i16>>();
     let planes_i16: [Vec<i16>; 3] = [
         crate::av1real::pad_to_mult8(&to_i16(&img.planes[0]), w, h, w8, h8),
         crate::av1real::pad_to_mult8(&to_i16(&img.planes[1]), w, h, w8, h8),
         crate::av1real::pad_to_mult8(&to_i16(&img.planes[2]), w, h, w8, h8),
     ];
-
-    let tile_payload = crate::av1_tile::encode_tile_lossless(
-        w8,
-        h8,
-        img.bit_depth,
-        [&planes_i16[0], &planes_i16[1], &planes_i16[2]],
-    );
-
-    let sb_cols = w8.div_ceil(64) as u32;
-    let sb_rows = h8.div_ceil(64) as u32;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp(
@@ -364,17 +374,133 @@ pub fn encode_still_with<T: Pixel>(img: &PlanarImage<T>, meta: &ImageMetadata) -
         h as u32,
         profile,
         img.bit_depth,
-        &meta.cicp,
+        color,
     ));
-    bytes.extend_from_slice(&metadata_obus(meta));
-    bytes.extend_from_slice(&wrap_obu_frame(
-        &crate::obu::frame_header_lossless_tiled(sb_cols, sb_rows),
-        &tile_payload,
+    bytes.extend_from_slice(&crate::av1real::encode_lossless_frame_obus(
+        img.bit_depth,
+        w8,
+        h8,
+        &planes_i16,
+        threads,
     ));
-
     Encoded {
         bytes,
         lossless_verified: true,
+    }
+}
+
+/// Encode a pre-converted 4:4:4 YCbCr still.
+///
+/// Y, Cb, Cr are full-resolution (`width × height`) samples. The AV1 bitstream
+/// carries full-range BT.601 YCbCr signaling (profile 1 for ≤10-bit, 2 for 12-bit).
+pub fn encode_yuv444<T: Pixel>(
+    y: &[T],
+    cb: &[T],
+    cr: &[T],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
+    assert!(base_q_idx != 0, "use encode_still for lossless");
+    assert_eq!(y.len(), width * height, "y plane must be width×height");
+    assert_eq!(cb.len(), width * height, "cb plane must be width×height");
+    assert_eq!(cr.len(), width * height, "cr plane must be width×height");
+    let maxv = (1i32 << bit_depth) - 1;
+    let to_i = |p: &[T]| {
+        p.iter()
+            .map(|v| v.to_i32().clamp(0, maxv))
+            .collect::<Vec<i32>>()
+    };
+    let bytes = crate::av1real::encode_av1_lossy_image_cs(
+        base_q_idx,
+        bit_depth,
+        width,
+        height,
+        &to_i(y),
+        &to_i(cb),
+        &to_i(cr),
+        true,
+        threads,
+    );
+    Encoded {
+        bytes,
+        lossless_verified: false,
+    }
+}
+
+/// Encode a pre-subsampled 4:2:2 YCbCr still.
+///
+/// `cb` and `cr` must each be `ceil(width/2) × height` samples. The AV1 bitstream
+/// uses AV1 profile 2 (4:2:2 / 12-bit profile).
+pub fn encode_yuv422<T: Pixel>(
+    y: &[T],
+    cb: &[T],
+    cr: &[T],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
+    assert!(base_q_idx != 0, "use encode_still for lossless");
+    let maxv = (1i32 << bit_depth) - 1;
+    let to_i = |p: &[T]| {
+        p.iter()
+            .map(|v| v.to_i32().clamp(0, maxv))
+            .collect::<Vec<i32>>()
+    };
+    let bytes = crate::av1real::encode_av1_lossy_image_422(
+        base_q_idx,
+        bit_depth,
+        width,
+        height,
+        &to_i(y),
+        &to_i(cb),
+        &to_i(cr),
+        threads,
+    );
+    Encoded {
+        bytes,
+        lossless_verified: false,
+    }
+}
+
+/// Encode a pre-subsampled 4:2:0 YCbCr still.
+///
+/// `cb` and `cr` must each be `ceil(width/2) × ceil(height/2)` samples. The AV1
+/// bitstream uses AV1 profile 0 (4:2:0 main profile).
+pub fn encode_yuv420<T: Pixel>(
+    y: &[T],
+    cb: &[T],
+    cr: &[T],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    base_q_idx: u8,
+    threads: usize,
+) -> Encoded {
+    assert!(base_q_idx != 0, "use encode_still for lossless");
+    let maxv = (1i32 << bit_depth) - 1;
+    let to_i = |p: &[T]| {
+        p.iter()
+            .map(|v| v.to_i32().clamp(0, maxv))
+            .collect::<Vec<i32>>()
+    };
+    let bytes = crate::av1real::encode_av1_lossy_image_420(
+        base_q_idx,
+        bit_depth,
+        width,
+        height,
+        &to_i(y),
+        &to_i(cb),
+        &to_i(cr),
+        threads,
+    );
+    Encoded {
+        bytes,
+        lossless_verified: false,
     }
 }
 
@@ -442,6 +568,91 @@ mod tests {
         }
     }
 
+    /// Lossless frames must tile like the lossy path: a small frame stays a
+    /// single combined `OBU_FRAME` (type 6), while a frame wider than 4096px is
+    /// forced to multiple tile columns and emitted as `OBU_FRAME_HEADER` (3) +
+    /// `OBU_TILE_GROUP` (4). (The previous single-tile lossless path mis-signalled
+    /// the wide case, so the decoder, deriving a non-zero minimum tile count,
+    /// could not parse it.)
+    #[test]
+    fn lossless_wide_frame_is_multitile() {
+        fn obu_types(buf: &[u8]) -> Vec<u8> {
+            let mut p = 0;
+            let mut out = Vec::new();
+            while p < buf.len() {
+                let hb = buf[p];
+                let typ = (hb >> 3) & 0xf;
+                let ext = (hb >> 2) & 1;
+                let has_size = (hb >> 1) & 1;
+                let mut q = p + 1 + ext as usize;
+                let mut sz = buf.len() - q;
+                if has_size == 1 {
+                    let (mut v, mut s) = (0usize, 0u32);
+                    loop {
+                        let x = buf[q];
+                        q += 1;
+                        v |= ((x & 0x7f) as usize) << s;
+                        if x & 0x80 == 0 {
+                            break;
+                        }
+                        s += 7;
+                    }
+                    sz = v;
+                }
+                out.push(typ);
+                p = q + sz;
+            }
+            out
+        }
+        let mk = |w: usize, h: usize| {
+            let mut rgb = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 3;
+                    rgb[i] = ((x * 7 + y * 3) % 256) as u8;
+                    rgb[i + 1] = ((x ^ y) % 256) as u8;
+                    rgb[i + 2] = ((x + y * 5) % 256) as u8;
+                }
+            }
+            encode_still(&PlanarImage::from_interleaved_rgb(w, h, 8, &rgb)).bytes
+        };
+
+        let small = obu_types(&mk(96, 64));
+        assert!(
+            small.contains(&6),
+            "small lossless -> OBU_FRAME (6): {small:?}"
+        );
+        assert!(
+            !small.contains(&4),
+            "small lossless -> no tile group: {small:?}"
+        );
+
+        let wide = obu_types(&mk(4160, 64));
+        assert!(
+            wide.contains(&3) && wide.contains(&4),
+            "wide lossless -> frame header + tile group (3,4): {wide:?}"
+        );
+        assert!(
+            !wide.contains(&6),
+            "wide lossless must not use OBU_FRAME: {wide:?}"
+        );
+
+        // Threading is deterministic for a fixed tiling: a >4096px-wide frame is
+        // 2 tile columns at both 1 and 2 threads, so the bytes must be identical.
+        let color = ColorEncoding::identity_rgb();
+        let mut rgb = vec![0u8; 4160 * 64 * 3];
+        for (i, b) in rgb.iter_mut().enumerate() {
+            *b = (i * 31 % 256) as u8;
+        }
+        let img = PlanarImage::from_interleaved_rgb(4160, 64, 8, &rgb);
+        let s1 = encode_still_with(&img, &color, 1).bytes;
+        let s2 = encode_still_with(&img, &color, 2).bytes;
+        assert_eq!(
+            s1, s2,
+            "lossless threaded bytes must match serial (same tiling)"
+        );
+    }
+
     /// Lossy 10/12-bit guard across 4:4:4 / 4:2:2 / 4:2:0 (40×24, q80). Byte
     /// lengths + sums captured after verifying the encoder's reconstruction is
     /// bit-exact against dav1d 1.4.1 (`recon == decode`, maxdiff 0) at both
@@ -451,8 +662,8 @@ mod tests {
     fn lossy_high_bitdepth_stable() {
         let (w, h) = (40usize, 24usize);
         for (bd, exp) in [
-            (10u8, [(107usize, 12279u64), (100, 10915), (94, 10724)]),
-            (12u8, [(64, 5905), (60, 6088), (55, 5790)]),
+            (10u8, [(107usize, 12279u64), (98, 10933), (92, 10597)]),
+            (12u8, [(64, 5905), (60, 6492), (54, 5411)]),
         ] {
             let m = (1u32 << bd) as u16;
             let mut rgb = vec![0u16; w * h * 3];
@@ -466,9 +677,9 @@ mod tests {
             }
             let img = PlanarImage::from_interleaved_rgb(w, h, bd, &rgb);
             let outs = [
-                encode_still_lossy(&img, 80),
-                encode_still_lossy_422(&img, 80),
-                encode_still_lossy_420(&img, 80),
+                encode_still_lossy(&img, 80, 1),
+                encode_still_lossy_422(&img, 80, 1),
+                encode_still_lossy_420(&img, 80, 1),
             ];
             for (k, o) in outs.iter().enumerate() {
                 assert!(!o.lossless_verified);
@@ -492,7 +703,7 @@ mod tests {
             let rgb = vec![100u8; w * h * 3];
             let img = PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
             assert!(!encode_still(&img).bytes.is_empty());
-            assert!(!encode_still_lossy(&img, 16).bytes.is_empty());
+            assert!(!encode_still_lossy(&img, 16, 0).bytes.is_empty());
         }
     }
 }

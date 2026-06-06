@@ -3,19 +3,19 @@
 //! These are simple and I'm confident they're correct; tested below.
 
 #[derive(Default)]
-pub struct BitWriter {
+pub(crate) struct BitWriter {
     bytes: Vec<u8>,
     cur: u8,
     nbits: u8, // bits filled in `cur`, 0..8
 }
 
 impl BitWriter {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Write `n` bits of `value`, most-significant bit first (AV1 `f(n)`).
-    pub fn f(&mut self, value: u32, n: u8) {
+    pub(crate) fn f(&mut self, value: u32, n: u8) {
         for i in (0..n).rev() {
             let bit = ((value >> i) & 1) as u8;
             self.cur = (self.cur << 1) | bit;
@@ -29,12 +29,12 @@ impl BitWriter {
     }
 
     /// Single flag bit.
-    pub fn flag(&mut self, b: bool) {
+    pub(crate) fn flag(&mut self, b: bool) {
         self.f(b as u32, 1);
     }
 
     /// Byte-align by padding with zero bits.
-    pub fn byte_align(&mut self) {
+    pub(crate) fn byte_align(&mut self) {
         if self.nbits > 0 {
             self.cur <<= 8 - self.nbits;
             self.bytes.push(self.cur);
@@ -45,19 +45,19 @@ impl BitWriter {
 
     /// AV1 `trailing_bits()`: a single `1` bit then zero-pad to byte alignment.
     /// Terminates an OBU payload.
-    pub fn trailing_bits(&mut self) {
+    pub(crate) fn trailing_bits(&mut self) {
         self.f(1, 1);
         self.byte_align();
     }
 
-    pub fn into_bytes(mut self) -> Vec<u8> {
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         self.byte_align();
         self.bytes
     }
 }
 
 /// Encode an unsigned LEB128 value (AV1 `leb128()`), little-endian, 7 bits/byte.
-pub fn leb128(mut value: u64) -> Vec<u8> {
+pub(crate) fn leb128(mut value: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -75,7 +75,7 @@ pub fn leb128(mut value: u64) -> Vec<u8> {
 
 /// Decode a LEB128 value from the front of `buf`.
 /// Returns `(value, bytes_consumed)`.
-pub fn read_leb128(buf: &[u8]) -> (u64, usize) {
+pub(crate) fn read_leb128(buf: &[u8]) -> (u64, usize) {
     let mut value = 0u64;
     let mut i = 0;
     loop {

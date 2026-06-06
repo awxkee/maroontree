@@ -23,8 +23,8 @@ const EC_MIN_PROB: u32 = 4;
 const WINDOW_SIZE: i16 = 32; // ec_window = u32
 const LOTS_OF_BITS: i16 = 0x4000;
 
-/// Build a uniform inverse CDF for `n` symbols (length `n + 1`, counter = 0).
-pub fn uniform_icdf(n: usize) -> Vec<u16> {
+#[allow(unused)]
+pub(crate) fn uniform_icdf(n: usize) -> Vec<u16> {
     assert!(n >= 2);
     let mut cdf = vec![0u16; n + 1];
     for (i, slot) in cdf.iter_mut().take(n).enumerate() {
@@ -36,16 +36,16 @@ pub fn uniform_icdf(n: usize) -> Vec<u16> {
 }
 
 /// AV1 / dav1d CDF adaptation. `cdf` is the inverse-form array (counter last).
-pub fn update_cdf(cdf: &mut [u16], val: usize) {
+pub(crate) fn update_cdf(cdf: &mut [u16], val: usize) {
     let nsymbs = cdf.len();
     let count = cdf[nsymbs - 1] as u32;
-    let rate = 3 + ((nsymbs >> 1).min(2)) as u32 + (count >> 4);
+    let rate = 3 + (nsymbs >> 1).min(2) as u32 + (count >> 4);
     cdf[nsymbs - 1] = (count + 1 - (count >> 5)) as u16; // saturating counter
-    for i in 0..nsymbs - 1 {
+    for (i, dst) in cdf[..nsymbs - 1].iter_mut().enumerate() {
         if (i as u32) >= val as u32 {
-            cdf[i] -= cdf[i] >> rate;
+            *dst -= *dst >> rate;
         } else {
-            cdf[i] += (32768 - cdf[i]) >> rate;
+            *dst += (32768 - *dst) >> rate;
         }
     }
 }
@@ -54,7 +54,7 @@ pub fn update_cdf(cdf: &mut [u16], val: usize) {
 // Encoder
 // ----------------------------------------------------------------------------
 
-pub struct OdEcEncoder {
+pub(crate) struct OdEcEncoder {
     low: u32,
     rng: u16,
     cnt: i16,
@@ -68,7 +68,7 @@ impl Default for OdEcEncoder {
 }
 
 impl OdEcEncoder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         OdEcEncoder {
             low: 0,
             rng: 0x8000,
@@ -115,11 +115,11 @@ impl OdEcEncoder {
         self.cnt = s;
     }
 
-    /// Encode a boolean with probability-of-true `f` in Q15 (0 < f < 32768).
-    pub fn enc_rng(&self) -> u16 {
+    #[allow(unused)]
+    pub(crate) fn enc_rng(&self) -> u16 {
         self.rng
     }
-    pub fn encode_bool(&mut self, val: bool, f: u16) {
+    pub(crate) fn encode_bool(&mut self, val: bool, f: u16) {
         // equivalent to symbol(val, [f, 0]) with nms = 2 - val
         let s = val as u32;
         let cdf = [f as u32, 0u32];
@@ -130,14 +130,15 @@ impl OdEcEncoder {
     }
 
     /// Encode `bits` raw bits of `value`, MSB first, with flat probability.
-    pub fn encode_literal(&mut self, value: u32, bits: u32) {
+    #[allow(unused)]
+    pub(crate) fn encode_literal(&mut self, value: u32, bits: u32) {
         for i in (0..bits).rev() {
             self.encode_bool((value >> i) & 1 == 1, 16384);
         }
     }
 
     /// Encode symbol `s` against an inverse-form `cdf` (NOT adapted).
-    pub fn encode_symbol_noupdate(&mut self, s: usize, cdf: &[u16]) {
+    pub(crate) fn encode_symbol_noupdate(&mut self, s: usize, cdf: &[u16]) {
         let nms = (cdf.len() - s) as u32;
         let fl = if s > 0 { cdf[s - 1] as u32 } else { 32768 };
         let fh = cdf[s] as u32;
@@ -145,13 +146,13 @@ impl OdEcEncoder {
     }
 
     /// Encode symbol `s`, then adapt `cdf` (dav1d-compatible).
-    pub fn encode_symbol(&mut self, s: usize, cdf: &mut [u16]) {
+    pub(crate) fn encode_symbol(&mut self, s: usize, cdf: &mut [u16]) {
         self.encode_symbol_noupdate(s, cdf);
         update_cdf(cdf, s);
     }
 
     /// Flush and return the coded bytes.
-    pub fn done(mut self) -> Vec<u8> {
+    pub(crate) fn done(mut self) -> Vec<u8> {
         let l = self.low;
         let mut c = self.cnt;
         let mut s = 10i16;
@@ -185,11 +186,8 @@ impl OdEcEncoder {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Decoder (matches the encoder; lets us round-trip and will mirror dav1d)
-// ----------------------------------------------------------------------------
-
-pub struct OdEcDecoder<'a> {
+#[allow(unused)]
+pub(crate) struct OdEcDecoder<'a> {
     buf: &'a [u8],
     bptr: usize,
     dif: u32,
@@ -197,8 +195,9 @@ pub struct OdEcDecoder<'a> {
     cnt: i16,
 }
 
+#[allow(unused)]
 impl<'a> OdEcDecoder<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         let mut r = OdEcDecoder {
             buf,
             bptr: 0,
@@ -233,10 +232,11 @@ impl<'a> OdEcDecoder<'a> {
         }
     }
 
-    pub fn rng_dbg(&self) -> u16 {
+    #[allow(unused)]
+    pub(crate) fn rng_dbg(&self) -> u16 {
         self.rng
     }
-    pub fn decode_bool(&mut self, f: u16) -> bool {
+    pub(crate) fn decode_bool(&mut self, f: u16) -> bool {
         let r = self.rng as u32;
         let v = (((r >> 8) * (f as u32 >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
         let vw = v << ((WINDOW_SIZE - 16) as u32);
@@ -249,7 +249,7 @@ impl<'a> OdEcDecoder<'a> {
         ret
     }
 
-    pub fn decode_literal(&mut self, bits: u32) -> u32 {
+    pub(crate) fn decode_literal(&mut self, bits: u32) -> u32 {
         let mut v = 0u32;
         for _ in 0..bits {
             v = (v << 1) | self.decode_bool(16384) as u32;
@@ -257,7 +257,7 @@ impl<'a> OdEcDecoder<'a> {
         v
     }
 
-    pub fn decode_symbol_noupdate(&mut self, cdf: &[u16]) -> usize {
+    pub(crate) fn decode_symbol_noupdate(&mut self, cdf: &[u16]) -> usize {
         let r = self.rng as u32;
         let n = cdf.len() as u32 - 1;
         let c = self.dif >> ((WINDOW_SIZE - 16) as u32);
@@ -276,7 +276,7 @@ impl<'a> OdEcDecoder<'a> {
         ret
     }
 
-    pub fn decode_symbol(&mut self, cdf: &mut [u16]) -> usize {
+    pub(crate) fn decode_symbol(&mut self, cdf: &mut [u16]) -> usize {
         let s = self.decode_symbol_noupdate(cdf);
         update_cdf(cdf, s);
         s

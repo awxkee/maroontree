@@ -1,15 +1,4 @@
-//! Decoder — the other half that makes the codec *work*.
-//!
-//! It parses our OBU framing (real: header byte + LEB128 size), locates the
-//! tile-group payload, strips its inner length prefix, and range-decodes every
-//! plane with the same models, predictor, and inverse transform the encoder
-//! used. Because encoding is lossless, the decoded pixels equal the source
-//! exactly (proved by the round-trip tests).
-//!
-//! NOTE: image dimensions and bit depth are passed in here. In real AV1 they
-//! come from the sequence header; wiring them through our (still-sketch) header
-//! is a separate, small step and is intentionally not relied on yet.
-
+#![allow(unused)]
 use crate::PlanarImage;
 use crate::bitwriter::read_leb128;
 use crate::coeff::{CoeffCdfs, decode_block};
@@ -48,7 +37,7 @@ fn find_frame_payload(bytes: &[u8]) -> Option<&[u8]> {
 }
 
 /// Decode a still image previously produced by `encode_still`.
-pub fn decode_still<T: Pixel>(
+pub(crate) fn decode_still<T: Pixel>(
     bytes: &[u8],
     width: usize,
     height: usize,

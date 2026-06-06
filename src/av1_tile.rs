@@ -410,6 +410,7 @@ struct LlState {
 /// info (skip=0, y_mode=DC, uv_mode) then `(size/4)²` TX_4×4 WHT per plane.
 /// uv_mode is non-CfL `UV_DC` at 64×64 (CfL not allowed) and the CfL DC symbol
 /// otherwise.
+#[allow(clippy::too_many_arguments)]
 fn code_leaf(
     wr: &mut Writer,
     planes: [&[i16]; 3],
@@ -487,7 +488,7 @@ fn icdf7(raw: &[u16; 6]) -> [u16; 7] {
 /// crossing the frame edge is split (4-way, or the constrained split-or-horz /
 /// split-or-vert bool, or an implicit split) down to 8×8 leaves, all square.
 /// Partition CDF for a node at level `bl` and the given context.
-fn part_cdf<'a>(st: &'a LlState, bl: usize, x8: usize, y8: usize) -> &'a [u16] {
+fn part_cdf(st: &LlState, bl: usize, x8: usize, y8: usize) -> &[u16] {
     let ctx = get_partition_ctx(&st.a_part, &st.l_part, bl, x8, y8);
     match bl {
         1 => &C::PART_SPLIT_64[ctx],
@@ -507,6 +508,7 @@ fn part_byte(sz8: usize) -> u8 {
 }
 
 /// Encode a fully-in-frame block following its adaptive `plan`.
+#[allow(clippy::too_many_arguments)]
 fn encode_plan(
     wr: &mut Writer,
     planes: [&[i16]; 3],
@@ -607,7 +609,7 @@ pub fn encode_tile_64(planes: [&[i16]; 3]) -> Vec<u8> {
 /// raster.
 pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 3]) -> Vec<u8> {
     assert!(
-        w % 8 == 0 && h % 8 == 0,
+        w.is_multiple_of(8) && h.is_multiple_of(8),
         "width/height must be multiples of 8"
     );
     let mut wr = Writer::new();

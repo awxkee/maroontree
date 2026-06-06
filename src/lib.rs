@@ -32,27 +32,42 @@ pub mod av1_coefs;
 pub mod av1_tables;
 pub mod av1_tile;
 pub mod av1_wht;
-pub mod cdf_tables;
-pub mod msac_enc;
-
-// Existing infrastructure
 pub mod av1real;
+mod avif;
 pub mod bitwriter;
+pub mod cdf_tables;
 mod coef_q;
 pub mod coeff;
 mod color;
 mod dct;
 pub mod decoder;
 pub mod encoder;
+mod err;
+mod idct;
+mod isobmff;
+mod metadata;
+mod msac_enc;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
-pub mod obu;
-pub mod odec;
-pub mod pixel;
-pub mod predict;
-pub mod rangecoder;
-pub mod transform;
+mod obu;
+mod odec;
+mod pixel;
+mod predict;
+mod rangecoder;
+mod transform;
 
-pub use decoder::decode_still;
-pub use encoder::{Encoded, PlanarImage, encode_lossy_8x8, encode_still, encode_still_lossy};
+pub use avif::{
+    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
+    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
+    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
+    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
+};
+pub use color::{
+    ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
+};
+pub use encoder::{
+    Encoded, PlanarImage, encode_still, encode_still_lossy, encode_still_lossy_420,
+    encode_still_lossy_422, encode_still_mono, encode_still_with, encode_yuv420, encode_yuv422,
+    encode_yuv444,
+};
 pub use pixel::{BitDepth, Pixel};

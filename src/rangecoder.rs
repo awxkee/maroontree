@@ -16,30 +16,30 @@
 //! `cdf[N-1] == 32768`; `cdf[N]` is the adaptation counter. Symbol `s` owns the
 //! interval `[b(s), b(s+1))` where `b(0)=0`, `b(k)=cdf[k-1]`, `b(N)=32768`.
 
-pub const CDF_TOTAL: u32 = 1 << 15; // 32768
+pub(crate) const CDF_TOTAL: u32 = 1 << 15; // 32768
 
 const TOP: u32 = 1 << 24;
 const BOT: u32 = 1 << 16;
 
 /// An adaptive CDF model. Construct with [`Cdf::uniform`] or [`Cdf::from_cumulative`].
 #[derive(Clone, Debug)]
-pub struct Cdf {
+pub(crate) struct Cdf {
     /// length N+1: cumulative[0..N-1], cumulative[N-1]==32768, [N]=count
     c: Vec<u16>,
 }
 
 impl Cdf {
-    pub fn nsyms(&self) -> usize {
+    pub(crate) fn nsyms(&self) -> usize {
         self.c.len() - 1
     }
 
     /// Uniform initial distribution over `n` symbols.
-    pub fn uniform(n: usize) -> Self {
+    pub(crate) fn uniform(n: usize) -> Self {
         assert!(n >= 2);
         let mut c = vec![0u16; n + 1];
-        for i in 0..n {
+        for (i, dst) in c[..n].iter_mut().enumerate() {
             // cumulative upper bound of symbol i
-            c[i] = (((i as u64 + 1) * CDF_TOTAL as u64) / n as u64) as u16;
+            *dst = (((i as u64 + 1) * CDF_TOTAL as u64) / n as u64) as u16;
         }
         c[n - 1] = CDF_TOTAL as u16;
         c[n] = 0; // adaptation count
@@ -47,7 +47,8 @@ impl Cdf {
     }
 
     /// Build from explicit cumulative upper bounds (length N, last must be 32768).
-    pub fn from_cumulative(cum: &[u16]) -> Self {
+    #[allow(unused)]
+    pub(crate) fn from_cumulative(cum: &[u16]) -> Self {
         let n = cum.len();
         assert!(n >= 2);
         assert_eq!(
@@ -122,11 +123,7 @@ fn floor_log2(mut x: u32) -> u32 {
     r
 }
 
-// ----------------------------------------------------------------------------
-// Encoder
-// ----------------------------------------------------------------------------
-
-pub struct RangeEncoder {
+pub(crate) struct RangeEncoder {
     low: u32,
     range: u32,
     out: Vec<u8>,
@@ -139,7 +136,7 @@ impl Default for RangeEncoder {
 }
 
 impl RangeEncoder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         RangeEncoder {
             low: 0,
             range: 0xFFFF_FFFF,
@@ -167,7 +164,7 @@ impl RangeEncoder {
     }
 
     /// Encode `symbol` against `cdf`, then adapt the model.
-    pub fn encode_symbol(&mut self, symbol: usize, cdf: &mut Cdf) {
+    pub(crate) fn encode_symbol(&mut self, symbol: usize, cdf: &mut Cdf) {
         debug_assert!(symbol < cdf.nsyms());
         let lo = cdf.eff_boundary(symbol);
         let hi = cdf.eff_boundary(symbol + 1);
@@ -176,7 +173,7 @@ impl RangeEncoder {
     }
 
     /// Encode `nbits` raw bits (MSB first) with a uniform model (bypass-style).
-    pub fn encode_literal(&mut self, value: u32, nbits: u32) {
+    pub(crate) fn encode_literal(&mut self, value: u32, nbits: u32) {
         for i in (0..nbits).rev() {
             let bit = (value >> i) & 1;
             // uniform 2-symbol: each bit owns half the interval
@@ -184,7 +181,8 @@ impl RangeEncoder {
         }
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    #[allow(unused)]
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         for _ in 0..4 {
             self.out.push((self.low >> 24) as u8);
             self.low <<= 8;
@@ -193,11 +191,7 @@ impl RangeEncoder {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Decoder (exists to prove the engine round-trips; mirrors the encoder exactly)
-// ----------------------------------------------------------------------------
-
-pub struct RangeDecoder<'a> {
+pub(crate) struct RangeDecoder<'a> {
     low: u32,
     range: u32,
     code: u32,
@@ -206,7 +200,7 @@ pub struct RangeDecoder<'a> {
 }
 
 impl<'a> RangeDecoder<'a> {
-    pub fn new(input: &'a [u8]) -> Self {
+    pub(crate) fn new(input: &'a [u8]) -> Self {
         let mut d = RangeDecoder {
             low: 0,
             range: 0xFFFF_FFFF,
@@ -242,7 +236,7 @@ impl<'a> RangeDecoder<'a> {
         }
     }
 
-    pub fn decode_symbol(&mut self, cdf: &mut Cdf) -> usize {
+    pub(crate) fn decode_symbol(&mut self, cdf: &mut Cdf) -> usize {
         let tot = cdf.eff_total();
         let r = self.range / tot;
         let dv = (self.code.wrapping_sub(self.low) / r).min(tot - 1);
@@ -261,7 +255,7 @@ impl<'a> RangeDecoder<'a> {
         s
     }
 
-    pub fn decode_literal(&mut self, nbits: u32) -> u32 {
+    pub(crate) fn decode_literal(&mut self, nbits: u32) -> u32 {
         let mut v = 0u32;
         for _ in 0..nbits {
             let r = self.range / CDF_TOTAL;

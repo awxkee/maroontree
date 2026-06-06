@@ -1,22 +1,10 @@
-//! Walsh–Hadamard 4x4 transform — the *only* transform AV1 uses in lossless
-//! mode (qindex 0). Lossless mode forces TX_4X4 + WHT and disables the loop
-//! filters, which is exactly why it is the smallest valid AV1 path.
-//!
-//! These two functions mirror libaom's `av1_fwht4x4_c` / `av1_iwht4x4_*_add_c`
-//! integer butterflies. The forward pass scales the result by
-//! `UNIT_QUANT_FACTOR` (= 1 << UNIT_QUANT_SHIFT); the inverse shifts it back.
-//! With no quantization in between, `iwht(fwht(x)) == x` exactly — the lossless
-//! property, which `transform_roundtrip` proves by exhaustive-ish random test.
-//!
-//! Blocks are flat row-major `[i32; 16]` (stride 4). All math is `i32`; the
-//! intermediate butterfly products fit comfortably (see the bit-width analysis
-//! we discussed — residuals are <=13-bit signed, products <=~26-bit).
-
+#![allow(unused)]
 const UNIT_QUANT_SHIFT: i32 = 2;
 const UNIT_QUANT_FACTOR: i32 = 1 << UNIT_QUANT_SHIFT; // = 4
 
 /// Forward Walsh–Hadamard. Input is a residual block; output are coefficients.
-pub fn fwht4x4(input: &[i32; 16]) -> [i32; 16] {
+///
+pub(crate) fn fwht4x4(input: &[i32; 16]) -> [i32; 16] {
     let mut mid = [0i32; 16];
 
     // Pass 0: operate on columns, write column-wise.
@@ -66,7 +54,7 @@ pub fn fwht4x4(input: &[i32; 16]) -> [i32; 16] {
 }
 
 /// Inverse Walsh–Hadamard. Input are coefficients; output is the residual.
-pub fn iwht4x4(input: &[i32; 16]) -> [i32; 16] {
+pub(crate) fn iwht4x4(input: &[i32; 16]) -> [i32; 16] {
     let mut mid = [0i32; 16];
 
     // Pass 0: rows, undo the forward scale up front.

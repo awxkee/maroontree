@@ -6,7 +6,7 @@
 
 /// Simple left-neighbor DC predictor on reconstructed samples for the 4x4
 /// block at block-coords `(bx, by)`. Leftmost column falls back to mid-grey.
-pub fn left_predictor(
+pub(crate) fn left_predictor(
     recon: &[i32],
     width: usize,
     height: usize,
