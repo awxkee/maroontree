@@ -750,8 +750,6 @@ pub(crate) fn wrap_av1_image_with_alpha(
     Ok(f)
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
