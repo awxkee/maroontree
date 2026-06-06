@@ -16,6 +16,22 @@ pub struct PlanarImage<T: Pixel> {
     pub planes: [Vec<T>; 3],
 }
 
+// Q0.13 coefficients  (value = round(f * 8192))
+const Q: i32 = 13;
+const HALF: i32 = 1 << (Q - 1); // 0.5 rounding bias
+
+const Y_R: i32 = 2449; // round( 0.299    * 8192)
+const Y_G: i32 = 4809; // round( 0.587    * 8192)
+const Y_B: i32 = 934; // round( 0.114    * 8192)
+
+const CB_R: i32 = -1382; // round(-0.168736 * 8192)
+const CB_G: i32 = -2714; // round(-0.331264 * 8192)
+const CB_B: i32 = 4096; // round( 0.5      * 8192)
+
+const CR_R: i32 = 4096; // round( 0.5      * 8192)
+const CR_G: i32 = -3430; // round(-0.418688 * 8192)
+const CR_B: i32 = -666; // round(-0.081312 * 8192)
+
 impl<T: Pixel> PlanarImage<T> {
     /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
     /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
@@ -96,41 +112,27 @@ pub fn encode_still_lossy<T: Pixel>(
     let maxv = (1i32 << bd) - 1;
     let off = (1i32 << (bd - 1)) as f32;
     let mx = maxv as f32;
-    let to_px = |p: &Vec<T>| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
-    let (g, b, r) = (
-        to_px(&img.planes[0]),
-        to_px(&img.planes[1]),
-        to_px(&img.planes[2]),
-    );
-    // Decorrelate via full-range BT.601 (JFIF) RGB->YCbCr. The sequence header
-    // signals MC_BT_601 so the decoder inverts this back to RGB on output; the
-    // near-flat chroma planes cost far fewer bits than coding G/B/R directly.
-    // The matrix coefficients are bit-depth-independent ratios; only the chroma
-    // offset (2^(bd-1)) and the clamp ceiling (2^bd-1) scale with depth.
-    let n = r.len();
+    let n = img.planes[0].len();
+
+    // Pre-scale the DC offsets into Q0.13 domain
+    let off_q = (off as i32) << Q; // e.g. 128 << 13  for 8-bit
+    let mx_i = mx as i32;
+
     let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+
     for (((((yv, cbv), crv), &rr), &gg), &bb) in y
         .iter_mut()
         .zip(cb.iter_mut())
         .zip(cr.iter_mut())
-        .zip(r.iter())
-        .zip(g.iter())
-        .zip(b.iter())
+        .zip(img.planes[2].iter())
+        .zip(img.planes[0].iter())
+        .zip(img.planes[1].iter())
     {
-        let (rf, gf, bf) = (rr as f32, gg as f32, bb as f32);
-        *yv = (0.299 * rf + 0.587 * gf + 0.114 * bf)
-            .round()
-            .clamp(0.0, mx) as i32;
-        *cbv = (-0.168736 * rf - 0.331264 * gf + 0.5 * bf + off)
-            .round()
-            .clamp(0.0, mx) as i32;
-        *crv = (0.5 * rf - 0.418688 * gf - 0.081312 * bf + off)
-            .round()
-            .clamp(0.0, mx) as i32;
+        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
+
+        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
+        *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
+        *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
     }
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
         base_q_idx, bd, img.width, img.height, &y, &cb, &cr, true, threads,
@@ -167,46 +169,46 @@ pub fn encode_still_lossy_422<T: Pixel>(
     let maxv = (1i32 << bd) - 1;
     let off = (1i32 << (bd - 1)) as f32;
     let mx = maxv as f32;
-    let to_px = |p: &Vec<T>| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
-    let (g, b, r) = (
-        to_px(&img.planes[0]),
-        to_px(&img.planes[1]),
-        to_px(&img.planes[2]),
-    );
     let cw = w.div_ceil(2);
     let mut y = vec![0i32; w * h];
-    let (mut cb, mut cr) = (vec![0i32; cw * h], vec![0i32; cw * h]);
-    // full-res Cb/Cr, then horizontal box-average to half width
-    let (mut fcb, mut fcr) = (vec![0f32; w * h], vec![0f32; w * h]);
+
+    let off_q = (off as i32) << Q;
+    let mx_i = mx as i32;
+
+    let mut fcb_q = vec![0i32; w * h];
+    let mut fcr_q = vec![0i32; w * h];
+
     for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
         .iter_mut()
-        .zip(fcb.iter_mut())
-        .zip(fcr.iter_mut())
-        .zip(r.iter())
-        .zip(g.iter())
-        .zip(b.iter())
+        .zip(fcb_q.iter_mut())
+        .zip(fcr_q.iter_mut())
+        .zip(img.planes[2].iter())
+        .zip(img.planes[0].iter())
+        .zip(img.planes[1].iter())
     {
-        let (rf, gf, bf) = (rr as f32, gg as f32, bb as f32);
-        *yv = (0.299 * rf + 0.587 * gf + 0.114 * bf)
-            .round()
-            .clamp(0.0, mx) as i32;
-        *fcbv = -0.168736 * rf - 0.331264 * gf + 0.5 * bf + off;
-        *fcrv = 0.5 * rf - 0.418688 * gf - 0.081312 * bf + off;
+        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
+
+        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
+
+        *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
+        *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
     }
+    const HALF_AVG: i32 = 1 << Q;
+
+    let (mut cb, mut cr) = (vec![0i32; cw * h], vec![0i32; cw * h]);
+
     for row in 0..h {
         for c in 0..cw {
             let x0 = 2 * c;
             let x1 = (2 * c + 1).min(w - 1);
-            cb[row * cw + c] = ((fcb[row * w + x0] + fcb[row * w + x1]) * 0.5)
-                .round()
-                .clamp(0.0, mx) as i32;
-            cr[row * cw + c] = ((fcr[row * w + x0] + fcr[row * w + x1]) * 0.5)
-                .round()
-                .clamp(0.0, mx) as i32;
+
+            let cb0 = fcb_q[row * w + x0];
+            let cb1 = fcb_q[row * w + x1];
+            let cr0 = fcr_q[row * w + x0];
+            let cr1 = fcr_q[row * w + x1];
+
+            cb[row * cw + c] = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
+            cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
         }
     }
     let bytes =
@@ -243,44 +245,44 @@ pub fn encode_still_lossy_420<T: Pixel>(
     let maxv = (1i32 << bd) - 1;
     let off = (1i32 << (bd - 1)) as f32;
     let mx = maxv as f32;
-    let to_px = |p: &Vec<T>| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
-    let (g, b, r) = (
-        to_px(&img.planes[0]),
-        to_px(&img.planes[1]),
-        to_px(&img.planes[2]),
-    );
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+
+    let off_q = (off as i32) << Q;
+    let mx_i = mx as i32;
+
     let mut y = vec![0i32; w * h];
-    let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
-    let (mut fcb, mut fcr) = (vec![0f32; w * h], vec![0f32; w * h]);
+    let mut fcb_q = vec![0i32; w * h];
+    let mut fcr_q = vec![0i32; w * h];
+
     for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
         .iter_mut()
-        .zip(fcb.iter_mut())
-        .zip(fcr.iter_mut())
-        .zip(r.iter())
-        .zip(g.iter())
-        .zip(b.iter())
+        .zip(fcb_q.iter_mut())
+        .zip(fcr_q.iter_mut())
+        .zip(img.planes[2].iter())
+        .zip(img.planes[0].iter())
+        .zip(img.planes[1].iter())
     {
-        let (rf, gf, bf) = (rr as f32, gg as f32, bb as f32);
-        *yv = (0.299 * rf + 0.587 * gf + 0.114 * bf)
-            .round()
-            .clamp(0.0, mx) as i32;
-        *fcbv = -0.168736 * rf - 0.331264 * gf + 0.5 * bf + off;
-        *fcrv = 0.5 * rf - 0.418688 * gf - 0.081312 * bf + off;
+        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
+
+        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
+        *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
+        *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
     }
+
+    const HALF_AVG: i32 = 1 << (Q + 1); // rounding bias for >> (Q+2)
+
+    let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
+
     for row in 0..ch {
         for c in 0..cw {
             let (x0, x1) = (2 * c, (2 * c + 1).min(w - 1));
             let (y0, y1) = (2 * row, (2 * row + 1).min(h - 1));
-            let avg = |f: &Vec<f32>| {
-                (f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1]) * 0.25
-            };
-            cb[row * cw + c] = avg(&fcb).round().clamp(0.0, mx) as i32;
-            cr[row * cw + c] = avg(&fcr).round().clamp(0.0, mx) as i32;
+
+            let avg_q =
+                |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
+
+            cb[row * cw + c] = ((avg_q(&fcb_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+            cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
         }
     }
     let bytes =

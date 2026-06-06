@@ -66,8 +66,7 @@ pub use color::{
     ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
 };
 pub use encoder::{
-    Encoded, PlanarImage, encode_still, encode_still_lossy, encode_still_lossy_420,
-    encode_still_lossy_422, encode_still_mono, encode_still_with, encode_yuv420, encode_yuv422,
-    encode_yuv444,
+    Encoded, PlanarImage, encode_still, encode_still_mono, encode_still_with, encode_yuv420,
+    encode_yuv422, encode_yuv444,
 };
 pub use pixel::{BitDepth, Pixel};

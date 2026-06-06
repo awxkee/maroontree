@@ -56,6 +56,7 @@
 //! ```
 
 use crate::color::{ColorEncoding, ColorMetadata};
+use crate::encoder::{encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422};
 use crate::err::EncodeError;
 use crate::isobmff;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
@@ -354,14 +355,12 @@ fn dispatch_lossy<T: crate::Pixel>(
 ) -> Vec<u8> {
     match chroma {
         ChromaFormat::Yuv420 | ChromaFormat::Monochrome => {
-            crate::encode_still_lossy_420(img, q, threads).bytes
+            encode_still_lossy_420(img, q, threads).bytes
         }
-        ChromaFormat::Yuv422 => crate::encode_still_lossy_422(img, q, threads).bytes,
-        ChromaFormat::Yuv444 => crate::encode_still_lossy(img, q, threads).bytes,
+        ChromaFormat::Yuv422 => encode_still_lossy_422(img, q, threads).bytes,
+        ChromaFormat::Yuv444 => encode_still_lossy(img, q, threads).bytes,
     }
 }
-
-// ─── 8-bit RGB entry points ───────────────────────────────────────────────────
 
 /// Encode an 8-bit RGB image to AVIF.
 ///

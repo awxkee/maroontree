@@ -560,11 +560,6 @@ pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128],
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-// ── Small / rectangular sizes without a SIMD path (scalar only) ───────────────
-// Same construction as the larger cores: separable integer 1-D DCTs, canonical
-// `out[horiz*H + vert]` layout (DC at index 0), then a per-size gain
-// normalization to the orthonormal*8 scale (ratio = 8 / sqrt(W*H)).
-
 /// 4x4: residual `resid[row*4+col]`. DCT-4 vertical then DCT-4 horizontal.
 /// Returns native (orthonormal*sqrt(16)=*4) coefficients; the *8/sqrt(W*H) gain
 /// normalization is folded into the trellis multiplier for full precision.
@@ -763,13 +758,6 @@ mod tests {
         let e = q16(std::f64::consts::SQRT_2);
         assert_eq!(SQRT2, e, "SQRT2: expected {e} got {SQRT2}");
     }
-
-    // ── float Loeffler reference ──────────────────────────────────────────────
-    //
-    // IMPORTANT: the Loeffler factorization is a fast DCT-II but its output
-    // has bin-specific implicit scale factors — it is NOT the same as a plain
-    // unnormalized DCT-II. The fixed-point functions must be tested against
-    // a float Loeffler reference, not against a naive sum-of-cosines DCT.
 
     fn fmla_f64(a: f64, b: f64) -> f64 {
         a * std::f64::consts::SQRT_2 + b
