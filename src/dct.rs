@@ -407,6 +407,7 @@ fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     out
 }
 
+#[allow(unused)]
 pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     let coeffs = dct32x32_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
@@ -414,6 +415,7 @@ pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     }
 }
 
+#[allow(unused)]
 pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
     pub(crate) type Dct = dyn Fn(&mut [i32; 128], i32, i32) + Send + Sync;
     static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
