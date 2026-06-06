@@ -92,16 +92,15 @@ pub fn encode_coefs(
         let ctx = 1 + (eob > 2) as usize + (eob > 4) as usize;
         let eob_tok = m.min(3) - 1; // 0..2
         w.symbol(eob_tok, &C::EOB_BASE[ci][ctx]);
-        let level_byte: u8;
-        if eob_tok == 2 {
+        let level_byte: u8 = if eob_tok == 2 {
             let hi_ctx = if (x | y) > 1 { 14 } else { 7 };
             let lvl = m.min(15);
             encode_hi_tok(w, &C::BR_TOK[ci][hi_ctx], lvl);
-            level_byte = (lvl + (3 << 6)) as u8;
+            (lvl + (3 << 6)) as u8
         } else {
             let tok = eob_tok + 1; // 1 or 2
-            level_byte = tok.wrapping_mul(0x41) as u8;
-        }
+            tok.wrapping_mul(0x41) as u8
+        };
         levels[x * STRIDE + y] = level_byte;
 
         // ---- AC loop i = eob-1 .. 1 ----
@@ -175,8 +174,7 @@ pub fn encode_coefs(
     }
 
     // AC signs in increasing scan-index order (i = 1..=eob, nonzero only)
-    for i in 1..=eob {
-        let rc = SCAN_4X4[i];
+    for &rc in SCAN_4X4[1..=eob].iter() {
         let v = lev[rc];
         if v == 0 {
             continue;

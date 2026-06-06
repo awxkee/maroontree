@@ -310,7 +310,7 @@ fn load8_i32(ptr: &[i32], stride: usize) -> [I32x8; 8] {
                 hi: vld1q_s32(p.get_unchecked(4..).as_ptr()),
             }
         };
-        std::array::from_fn(|i| row(i))
+        std::array::from_fn(row)
     }
 }
 
@@ -325,7 +325,7 @@ fn load16_i32(ptr: &[i32], stride: usize) -> [I32x8; 16] {
                 hi: vld1q_s32(p.get_unchecked(4..).as_ptr()),
             }
         };
-        std::array::from_fn(|i| row(i))
+        std::array::from_fn(row)
     }
 }
 
@@ -492,25 +492,6 @@ fn load32_i32(ptr: &[i32], stride: usize) -> [I32x8; 32] {
     }
 }
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn transpose_32x8_to_8x32(c: &mut [I32x8; 32]) {
-    let mut q0: [I32x8; 8] = c[0..8].try_into().unwrap();
-    let mut q1: [I32x8; 8] = c[8..16].try_into().unwrap();
-    let mut q2: [I32x8; 8] = c[16..24].try_into().unwrap();
-    let mut q3: [I32x8; 8] = c[24..32].try_into().unwrap();
-
-    transpose_8x8_i32(&mut q0);
-    transpose_8x8_i32(&mut q1);
-    transpose_8x8_i32(&mut q2);
-    transpose_8x8_i32(&mut q3);
-
-    c[0..8].copy_from_slice(&q0);
-    c[8..16].copy_from_slice(&q1);
-    c[16..24].copy_from_slice(&q2);
-    c[24..32].copy_from_slice(&q3);
-}
-
 /// Forward 2-D integer DCT-32 (NEON) -> normalized coefficients `out[u*32+v]`
 /// (DC at index 0), pre-quantization. Mirrors scalar `dct32x32_coeffs`.
 #[target_feature(enable = "neon")]
@@ -596,7 +577,7 @@ pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
 
     // Normalise the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8 by
     // 1/sqrt(2) (round(65536/sqrt2) = 46341), matching scalar.
-    let nrm = unsafe { vdupq_n_s32(46341) };
+    let nrm = vdupq_n_s32(46341);
     let mut out = [0i32; 128];
     for fx in 0..8usize {
         let a_lo = mul_q16_vec(a[fx].lo, nrm);
@@ -614,15 +595,16 @@ pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
     out
 }
 
+#[allow(unused)]
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon_i32(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_neon_coeffs(input);
     quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 mod neon_vs_scalar {
-    use super::*;
+
     use crate::dct::{dct8x8_scalar, dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
     use crate::neon::{dct8x8_neon_i32, dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
 
@@ -664,8 +646,6 @@ mod neon_vs_scalar {
         (65536, 46341), // DC full-scale, AC √2/2
         (32768, 32768), // both halved
     ];
-
-    // ── dct8x8 ────────────────────────────────────────────────────────────
 
     fn run_8x8(input: [i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [i32; 64]) {
         let mut scalar = input;
@@ -868,11 +848,6 @@ mod neon_vs_scalar {
             assert_eq!(sc, n, "32x32 rand(12345678) dc_q={dc_q} ac_q={ac_q}");
         }
     }
-
-    // ── dct8x16 ───────────────────────────────────────────────────────────
-    //
-    // NEON and scalar apply operations in the same order (DCT-16 on rows,
-    // DCT-8 on columns) and produce bit-exact results.
 
     fn run_8x16(input: [i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [i32; 128]) {
         let mut scalar = input;

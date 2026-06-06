@@ -14,6 +14,12 @@ pub struct Writer {
     precarry: Vec<u16>,
 }
 
+impl Default for Writer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Writer {
     pub fn new() -> Self {
         Writer {
@@ -58,7 +64,7 @@ impl Writer {
             low &= m;
         }
         self.low = low << d;
-        self.rng = (r as u16) << d;
+        self.rng = r << d;
         self.cnt = s;
     }
 

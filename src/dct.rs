@@ -130,14 +130,14 @@ pub(crate) fn dct1d_8_i32(buf: &mut [i32; 8]) {
 // 1.0606777  -> 69496
 // 1.7224471  -> 112863
 // 5.1011486  -> 334233
-pub(crate) const WC16_0: i32 = 32927; // k=0: 0.5024193  WAS 32924 ✗
-pub(crate) const WC16_1: i32 = 34242; // k=1: 0.5224986  WAS 34236 ✗
-pub(crate) const WC16_2: i32 = 37155; // k=2: 0.5669440  WAS 37144 ✗
-pub(crate) const WC16_3: i32 = 42390; // k=3: 0.6468218  WAS 42391 ✗
-pub(crate) const WC16_4: i32 = 51653; // k=4: 0.7881546  WAS 51638 ✗
-pub(crate) const WC16_5: i32 = 69513; // k=5: 1.0606777  WAS 69496 ✗
-pub(crate) const WC16_6: i32 = 112882; // k=6: 1.7224471  WAS 112863 ✗
-pub(crate) const WC16_7: i32 = 334309; // k=7: 5.1011486  WAS 334233 ✗
+pub(crate) const WC16_0: i32 = 32927; 
+pub(crate) const WC16_1: i32 = 34242; 
+pub(crate) const WC16_2: i32 = 37155; 
+pub(crate) const WC16_3: i32 = 42390; 
+pub(crate) const WC16_4: i32 = 51653; 
+pub(crate) const WC16_5: i32 = 69513; 
+pub(crate) const WC16_6: i32 = 112882;
+pub(crate) const WC16_7: i32 = 334309;
 
 #[inline(always)]
 pub(crate) fn dct1d_16_i32(buf: &mut [i32; 16]) {
@@ -178,8 +178,8 @@ pub(crate) fn dct1d_16_i32(buf: &mut [i32; 16]) {
 }
 
 pub(crate) fn dct8x8(input: &mut [i32; 64], quant: &impl Dct) {
-    pub(crate) type WHT = dyn Fn(&mut [i32; 64], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<WHT>> = OnceLock::new();
+    pub(crate) type Dct = dyn Fn(&mut [i32; 64], i32, i32) + Send + Sync;
+    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
     let f = WHT.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
@@ -229,6 +229,7 @@ fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
 }
 
 #[inline]
+#[allow(unused)]
 pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x8_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
@@ -238,8 +239,8 @@ pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
 
 #[inline]
 pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
-    pub(crate) type WHT = dyn Fn(&mut [i32; 256], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<WHT>> = OnceLock::new();
+    pub(crate) type Dct = dyn Fn(&mut [i32; 256], i32, i32) + Send + Sync;
+    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
     let f = WHT.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
@@ -259,6 +260,7 @@ pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
 /// Shared 2-D integer DCT-16 transform core (no quantization). Output layout
 /// `out[u*16 + v]`, DC at index 0. Reused by [`dct16x16_scalar`] and [`dct16x16_t`].
 #[inline]
+#[allow(unused)]
 fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     let mut tmp = [0i32; 256];
     // Column-wise 1D DCT
@@ -277,7 +279,7 @@ fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     for v in 0..16 {
         let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
         dct1d_16_i32(&mut row);
-        // Normalise the integer DCT-16 gain (sqrt(16) per pass -> 16x; the
+        // Normalize the integer DCT-16 gain (sqrt(16) per pass -> 16x; the
         // pipeline expects the orthonormal*8 scale) by 1/2.
         for u in 0..16 {
             out[u * 16 + v] = mul_q16(row[u], 32768);
@@ -286,6 +288,7 @@ fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     out
 }
 
+#[allow(unused)]
 pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
     let coeffs = dct16x16_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
@@ -357,8 +360,8 @@ pub(crate) fn dct1d_32_i32(buf: &mut [i32; 32]) {
 
 #[inline]
 pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
-    pub(crate) type WHT = dyn Fn(&mut [i32; 1024], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<WHT>> = OnceLock::new();
+    pub(crate) type Dct = dyn Fn(&mut [i32; 1024], i32, i32) + Send + Sync;
+    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
     let f = WHT.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
@@ -396,7 +399,7 @@ fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     for v in 0..32 {
         let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
         dct1d_32_i32(&mut row);
-        // Normalise the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
+        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
         for u in 0..32 {
             out[u * 32 + v] = mul_q16(row[u], 16384);
         }
@@ -412,8 +415,8 @@ pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
 }
 
 pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
-    pub(crate) type WHT = dyn Fn(&mut [i32; 128], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<WHT>> = OnceLock::new();
+    pub(crate) type Dct = dyn Fn(&mut [i32; 128], i32, i32) + Send + Sync;
+    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
     let f = WHT.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
@@ -454,7 +457,7 @@ fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     for fy in 0..16usize {
         let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
         dct1d_8_i32(&mut r);
-        // Normalise the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8
+        // Normalize the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8
         // by 1/sqrt(2) (round(65536/sqrt2) = 46341).
         for fx in 0..8 {
             out[fx * 16 + fy] = mul_q16(r[fx], 46341);
@@ -463,20 +466,13 @@ fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     out
 }
 
+#[allow(unused)]
 pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
         *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
-
-// ── Trellis / RDOQ variants ───────────────────────────────────────────────────
-// These reuse the very same `*_coeffs` transform cores as the in-place
-// quantizers above (so there is a single integer DCT, no separate float DCT for
-// the trellis). Each returns the quantized levels `cf` — bit-identical to what
-// `dct8x8`/`dct16x16`/… produce in place — together with the *unrounded* level
-// `tf[i] = coeff · q_mult / 2^16 ≈ coeff / step`, which the trellis prices
-// distortion against as `step² · (tf − L)²`.
 
 #[inline]
 fn quant_levels_and_targets<const N: usize>(
@@ -494,10 +490,6 @@ fn quant_levels_and_targets<const N: usize>(
     (cf, tf)
 }
 
-// Coefficient-source selectors: on aarch64+neon the trellis reuses the very same
-// SIMD transform as the in-place path (`dct*_neon_coeffs`); elsewhere the scalar
-// `dct*_coeffs`. Both produce bit-identical normalized coefficients, so the
-// trellis levels match the direct path regardless of target.
 #[inline]
 fn dct8x8_coeffs_sel(input: &[i32; 64]) -> [i32; 64] {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]

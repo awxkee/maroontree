@@ -1,26 +1,13 @@
-//! Compact, self-consistent coefficient coding for a 4x4 WHT block.
-//!
-//! Per coefficient: an adaptive binary "is non-zero" flag; then for non-zero
-//! values an adaptive *bit-length* symbol (Exp-Golomb-style prefix) plus raw
-//! mantissa bits and a sign bit. Small magnitudes — the common case after
-//! prediction — get short codes, so this actually compresses, while staying
-//! exactly invertible.
-//!
-//! This is NOT AV1's coefficient syntax (no EOB / base-range / golomb level
-//! maps, no scan-position contexts). It is a real, compact, decodable scheme
-//! that makes the codec *work* end to end. Swapping in AV1's syntax is the
-//! remaining step for on-the-wire compatibility.
-
 use crate::rangecoder::{Cdf, RangeDecoder, RangeEncoder};
 
 /// Max coefficient bit-length we model. 12-bit input through the WHT (scaled by
 /// 4) stays well under 2^24, so 24 is safe; encode asserts this.
-pub const MAX_LEN: usize = 24;
+pub(crate) const MAX_LEN: usize = 24;
 
 /// Adaptive models reused across an entire image (one shared instance).
-pub struct CoeffCdfs {
-    pub nz: Cdf,
-    pub len: Cdf,
+pub(crate) struct CoeffCdfs {
+    pub(crate) nz: Cdf,
+    pub(crate) len: Cdf,
 }
 
 impl Default for CoeffCdfs {
@@ -32,7 +19,8 @@ impl Default for CoeffCdfs {
     }
 }
 
-pub fn encode_block(enc: &mut RangeEncoder, coeffs: &[i32; 16], cdfs: &mut CoeffCdfs) {
+#[allow(unused)]
+pub(crate) fn encode_block(enc: &mut RangeEncoder, coeffs: &[i32; 16], cdfs: &mut CoeffCdfs) {
     for &c in coeffs.iter() {
         let nz = (c != 0) as usize;
         enc.encode_symbol(nz, &mut cdfs.nz);
@@ -50,7 +38,7 @@ pub fn encode_block(enc: &mut RangeEncoder, coeffs: &[i32; 16], cdfs: &mut Coeff
     }
 }
 
-pub fn decode_block(dec: &mut RangeDecoder, cdfs: &mut CoeffCdfs) -> [i32; 16] {
+pub(crate) fn decode_block(dec: &mut RangeDecoder, cdfs: &mut CoeffCdfs) -> [i32; 16] {
     let mut coeffs = [0i32; 16];
     for slot in coeffs.iter_mut() {
         let nz = dec.decode_symbol(&mut cdfs.nz);

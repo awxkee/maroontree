@@ -1,0 +1,930 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+//! ISO Base Media File Format writer for AVIF still images.
+//!
+//! Adapted from the HEIC isobmff writer. The box hierarchy is identical; the
+//! only structural differences from HEIC are:
+//!
+//! * `ftyp` major brand `avif` instead of `heic`.
+//! * Item type `av01` instead of `hvc1`.
+//! * Codec configuration box `av1C` instead of `hvcC` (much simpler: a 4-byte
+//!   header plus the raw AV1 sequence header OBU as `configOBUs`).
+//! * Alpha auxiliary URN `urn:mpeg:mpegB:cicp:systems:auxiliary:alpha` instead
+//!   of the HEVC variant.
+//! * The `mdat` payload is raw AV1 OBU bytes straight from the encoder (no
+//!   HEVC-style length-prefixed NALU framing needed).
+//!
+//! Box hierarchy (single-item path):
+//! ```text
+//!   ftyp
+//!   meta  (fullbox version=0)
+//!     hdlr
+//!     pitm
+//!     iloc  (version=1, offset_size=4, length_size=4, base_offset_size=0)
+//!     iinf → infe
+//!     [iref → cdsc]   (only when EXIF item present)
+//!     iprp → ipco → { av1C, ispe, pixi, colr, [irot], [imir], [clli] }
+//!            ipma
+//!   mdat  ← iloc extent_offset patched after mdat is laid out
+//! ```
+
+use crate::color::ColorMetadata;
+use crate::err::EncodeError;
+use crate::metadata::Metadata;
+
+#[inline]
+fn w32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+#[inline]
+fn w16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Write a FullBox header: size placeholder (0), 4-char code, version, flags.
+fn write_fullbox(buf: &mut Vec<u8>, cc: &[u8; 4], ver: u8, flags: u32) {
+    w32(buf, 0);
+    buf.extend_from_slice(cc);
+    buf.push(ver);
+    buf.push((flags >> 16) as u8);
+    buf.push((flags >> 8) as u8);
+    buf.push(flags as u8);
+}
+
+/// Write a plain Box header: size placeholder (0) + 4-char code.
+fn write_box(buf: &mut Vec<u8>, cc: &[u8; 4]) {
+    w32(buf, 0);
+    buf.extend_from_slice(cc);
+}
+
+/// Back-patch the size field at `start` with the current `buf.len() - start`.
+fn patch(buf: &mut [u8], start: usize) {
+    let size = (buf.len() - start) as u32;
+    buf[start..start + 4].copy_from_slice(&size.to_be_bytes());
+}
+
+/// Write a `colr` box: either an enumerated CICP `nclx` payload or an embedded
+/// ICC profile `prof` payload.
+fn write_colr(f: &mut Vec<u8>, color: &ColorMetadata) {
+    let sh = f.len();
+    write_box(f, b"colr");
+    match color {
+        ColorMetadata::Cicp(enc) => f.extend_from_slice(&enc.nclx_payload()),
+        ColorMetadata::Icc(icc) => {
+            f.extend_from_slice(b"prof");
+            f.extend_from_slice(icc);
+        }
+    }
+    patch(f, sh);
+}
+
+// ─── AV1 codec config (av1C) ─────────────────────────────────────────────────
+
+/// Parameters for building an `av1C` (AV1 Codec Configuration Record) box.
+///
+/// Derived from the known encode parameters; the raw AV1 sequence header OBU is
+/// extracted from the encoder's output and embedded as `configOBUs` so that
+/// decoders can use it without parsing the item data.
+pub(crate) struct Av1cParams {
+    /// AV1 sequence profile: 0 (main 4:2:0/4:0:0), 1 (high 4:4:4 ≤10-bit),
+    /// 2 (professional 4:2:2 or 12-bit).
+    pub seq_profile: u8,
+    /// `seq_level_idx_0`: computed from image size (see [`level_for`]).
+    pub seq_level_idx: u8,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub monochrome: bool,
+    pub chroma_sub_x: bool,
+    pub chroma_sub_y: bool,
+    /// The raw sequence header OBU bytes (type 1) from the encoder's output.
+    pub seq_header_obu: Vec<u8>,
+}
+
+/// Select an AV1 `seq_level_idx_0` large enough for the given picture size.
+/// Uses the max-luma-picture-size thresholds from AV1 spec Table A.2.
+pub(crate) fn level_for(width: u32, height: u32) -> u8 {
+    let pixels = (width as u64) * (height as u64);
+    match pixels {
+        0..=147_456 => 0,    // 2.0
+        ..=278_784 => 1,     // 2.1
+        ..=737_280 => 4,     // 3.0
+        ..=2_228_224 => 8,   // 4.0
+        ..=8_912_896 => 12,  // 5.0
+        ..=35_651_584 => 16, // 6.0
+        _ => 19,             // 6.3  (max defined for still images)
+    }
+}
+
+/// Read a LEB128-encoded integer from `buf` starting at `pos`.
+/// Returns `(value, bytes_consumed)`.
+fn leb128(buf: &[u8], mut pos: usize) -> (usize, usize) {
+    let start = pos;
+    let mut val = 0usize;
+    let mut shift = 0u32;
+    while pos < buf.len() {
+        let b = buf[pos];
+        pos += 1;
+        val |= ((b & 0x7f) as usize) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (val, pos - start)
+}
+
+/// Return a slice of the first OBU whose type matches `obu_type` in an AV1
+/// bitstream. Returns an empty slice if the type is not found.
+pub(crate) fn first_obu_of_type(buf: &[u8], obu_type: u8) -> &[u8] {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let obu_start = pos;
+        let hb = buf[pos];
+        let typ = (hb >> 3) & 0xf;
+        let ext_flag = (hb >> 2) & 1;
+        let has_size = (hb >> 1) & 1;
+        let header_bytes = 1 + ext_flag as usize;
+        if pos + header_bytes > buf.len() {
+            break;
+        }
+        pos += header_bytes;
+        let (payload_len, leb_bytes) = if has_size != 0 {
+            leb128(buf, pos)
+        } else {
+            (buf.len() - pos, 0)
+        };
+        pos += leb_bytes + payload_len;
+        if typ == obu_type {
+            return &buf[obu_start..pos.min(buf.len())];
+        }
+    }
+    &[]
+}
+
+/// Build the raw `av1C` box payload (without the box header).
+///
+/// The 4-byte header encodes profile, level, tier, bit-depth flags, and chroma
+/// subsampling per ISO/IEC 23000-22 §2.3.3. The sequence header OBU (if
+/// non-empty) follows as `configOBUs`.
+fn build_av1c(p: &Av1cParams) -> Vec<u8> {
+    let mut r = Vec::new();
+    // Byte 0: marker=1 (bit 7), version=1 (bits 6-0)
+    r.push(0x81);
+    // Byte 1: seq_profile(3) | seq_level_idx_0(5)
+    r.push(((p.seq_profile & 0x7) << 5) | (p.seq_level_idx & 0x1f));
+    // Byte 2: seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) | monochrome(1) |
+    //         chroma_sub_x(1) | chroma_sub_y(1) | chroma_sample_position(2)=0
+    #[allow(clippy::identity_op)]
+    let b2: u8 = 0 // seq_tier_0 = 0 (main tier)
+        | (if p.high_bitdepth { 0x40 } else { 0 })
+        | (if p.twelve_bit    { 0x20 } else { 0 })
+        | (if p.monochrome    { 0x10 } else { 0 })
+        | (if p.chroma_sub_x  { 0x08 } else { 0 })
+        | (if p.chroma_sub_y  { 0x04 } else { 0 });
+    r.push(b2);
+    // Byte 3: reserved(3) | initial_presentation_delay_present(1) = 0 | reserved(4) = 0
+    r.push(0x00);
+    // configOBUs: the sequence header OBU so decoders don't have to scan the item data.
+    r.extend_from_slice(&p.seq_header_obu);
+    r
+}
+
+/// Wrap a single AV1 image into an AVIF file.
+///
+/// `av1_obu` is the raw AV1 bitstream (temporal delimiter + sequence header +
+/// frame OBU(s)) produced by the encoder. `channels` is 3 for color, 1 for
+/// grayscale/monochrome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_av1_image(
+    av1_obu: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    channels: u8,
+    av1c: &Av1cParams,
+    color_meta: &ColorMetadata,
+    metadata: &Metadata,
+) -> Result<Vec<u8>, EncodeError> {
+    let av1c_data = build_av1c(av1c);
+
+    // EXIF item payload: 4-byte offset prefix (always 0 for us) + raw TIFF bytes.
+    let has_exif = metadata.exif.is_some();
+    let exif_payload: Vec<u8> = metadata
+        .exif
+        .as_ref()
+        .map(|e| {
+            let mut p = Vec::with_capacity(e.len() + 4);
+            p.extend_from_slice(&0u32.to_be_bytes()); // exif_tiff_header_offset = 0
+            p.extend_from_slice(e);
+            p
+        })
+        .unwrap_or_default();
+
+    let mut f: Vec<u8> = Vec::new();
+
+    // ── ftyp ──────────────────────────────────────────────────────────────────
+    {
+        let s = f.len();
+        write_box(&mut f, b"ftyp");
+        f.extend_from_slice(b"avif"); // major brand
+        w32(&mut f, 0); // minor version
+        f.extend_from_slice(b"avif"); // AVIF still image
+        f.extend_from_slice(b"mif1"); // HEIF base
+        f.extend_from_slice(b"miaf"); // Multi-Image Application Format
+        patch(&mut f, s);
+    }
+
+    // ── meta ──────────────────────────────────────────────────────────────────
+    let meta_start = f.len();
+    write_fullbox(&mut f, b"meta", 0, 0);
+
+    // hdlr
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"hdlr", 0, 0);
+        w32(&mut f, 0); // pre_defined
+        f.extend_from_slice(b"pict"); // handler_type
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        w32(&mut f, 0); // reserved
+        f.push(0); // name (empty)
+        patch(&mut f, s);
+    }
+
+    // pitm — primary item is ID 1
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"pitm", 0, 0);
+        w16(&mut f, 1);
+        patch(&mut f, s);
+    }
+
+    // iloc — version=1; construction_method field present.
+    let iloc_offset_patch_pos;
+    let mut iloc_exif_patch_pos = 0usize;
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iloc", 1, 0);
+        f.push(0x44); // offset_size=4, length_size=4
+        f.push(0x00); // base_offset_size=0, index_size=0
+        w16(&mut f, if has_exif { 2 } else { 1 }); // item_count
+        // item 1: AV1 image
+        w16(&mut f, 1); // item_ID
+        w16(&mut f, 0); // construction_method = 0
+        w16(&mut f, 0); // data_reference_index
+        w16(&mut f, 1); // extent_count
+        iloc_offset_patch_pos = f.len();
+        w32(&mut f, 0); // extent_offset — patched later
+        w32(&mut f, av1_obu.len() as u32); // extent_length
+        if has_exif {
+            w16(&mut f, 2); // item_ID
+            w16(&mut f, 0);
+            w16(&mut f, 0);
+            w16(&mut f, 1);
+            iloc_exif_patch_pos = f.len();
+            w32(&mut f, 0);
+            w32(&mut f, exif_payload.len() as u32);
+        }
+        patch(&mut f, s);
+    }
+
+    // iinf
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        w16(&mut f, if has_exif { 2 } else { 1 }); // entry_count
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, 1); // item_ID
+            w16(&mut f, 0); // item_protection_index
+            f.extend_from_slice(b"av01"); // item_type — AV1 image
+            f.push(0); // item_name (empty)
+            patch(&mut f, si);
+        }
+        if has_exif {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, 2);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"Exif");
+            f.push(0);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iref — EXIF item (2) describes primary image (1) via 'cdsc'.
+    if has_exif {
+        let s = f.len();
+        write_fullbox(&mut f, b"iref", 0, 0);
+        {
+            let si = f.len();
+            write_box(&mut f, b"cdsc");
+            w16(&mut f, 2); // from_item_ID = EXIF
+            w16(&mut f, 1); // reference_count
+            w16(&mut f, 1); // to_item_ID = image
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iprp
+    {
+        let extra_props;
+        let s = f.len();
+        write_box(&mut f, b"iprp");
+
+        // ipco — property container. 1-based indices:
+        //   1 av1C (essential)  2 ispe  3 pixi  4 colr
+        //   5+ optional: irot, imir, clli
+        {
+            let si = f.len();
+            write_box(&mut f, b"ipco");
+
+            // prop 1: av1C (essential — AV1 decoder configuration)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"av1C");
+                f.extend_from_slice(&av1c_data);
+                patch(&mut f, sh);
+            }
+            // prop 2: ispe (image spatial extents)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"ispe", 0, 0);
+                w32(&mut f, width);
+                w32(&mut f, height);
+                patch(&mut f, sh);
+            }
+            // prop 3: pixi (pixel information)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"pixi", 0, 0);
+                f.push(channels);
+                for _ in 0..channels {
+                    f.push(bit_depth);
+                }
+                patch(&mut f, sh);
+            }
+            // prop 4: colr (color metadata)
+            write_colr(&mut f, color_meta);
+
+            // Optional transform + HDR properties (5+)
+            let mut next_prop: u8 = 5;
+            let mut irot_idx = 0u8;
+            let mut imir_idx = 0u8;
+            let mut clli_idx = 0u8;
+
+            if metadata.orientation.irot_steps() != 0 {
+                let sh = f.len();
+                write_box(&mut f, b"irot");
+                f.push(metadata.orientation.irot_steps() & 0x03);
+                patch(&mut f, sh);
+                irot_idx = next_prop;
+                next_prop += 1;
+            }
+            if let Some(horizontal_axis) = metadata.orientation.imir_axis() {
+                let sh = f.len();
+                write_box(&mut f, b"imir");
+                f.push(if horizontal_axis { 1 } else { 0 });
+                patch(&mut f, sh);
+                imir_idx = next_prop;
+                next_prop += 1;
+            }
+            if let Some(cll) = metadata.content_light_level {
+                let sh = f.len();
+                write_box(&mut f, b"clli");
+                f.extend_from_slice(&cll.clli_payload());
+                patch(&mut f, sh);
+                clli_idx = next_prop;
+                next_prop += 1;
+            }
+            let _ = next_prop;
+            extra_props = (irot_idx, imir_idx, clli_idx);
+            patch(&mut f, si);
+        }
+
+        // ipma — associations for item 1
+        {
+            let (irot_idx, imir_idx, clli_idx) = extra_props;
+            // av1C(1, essential), ispe(2), pixi(3), colr(4)
+            let mut assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            if irot_idx != 0 {
+                assoc.push(0x80 | irot_idx);
+            } // essential
+            if imir_idx != 0 {
+                assoc.push(0x80 | imir_idx);
+            } // essential
+            if clli_idx != 0 {
+                assoc.push(clli_idx);
+            } // descriptive only
+
+            let si = f.len();
+            write_fullbox(&mut f, b"ipma", 0, 0);
+            w32(&mut f, 1); // entry_count
+            w16(&mut f, 1); // item_ID
+            f.push(assoc.len() as u8); // association_count
+            f.extend_from_slice(&assoc);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    patch(&mut f, meta_start);
+
+    // ── mdat ──────────────────────────────────────────────────────────────────
+    let mdat_start = f.len();
+    write_box(&mut f, b"mdat");
+    let av1_abs_offset = f.len() as u32;
+    f.extend_from_slice(av1_obu);
+    let exif_abs_offset = f.len() as u32;
+    if has_exif {
+        f.extend_from_slice(&exif_payload);
+    }
+    patch(&mut f, mdat_start);
+
+    // Patch iloc extent_offsets with real absolute file offsets.
+    f[iloc_offset_patch_pos..iloc_offset_patch_pos + 4]
+        .copy_from_slice(&av1_abs_offset.to_be_bytes());
+    if has_exif {
+        f[iloc_exif_patch_pos..iloc_exif_patch_pos + 4]
+            .copy_from_slice(&exif_abs_offset.to_be_bytes());
+    }
+
+    Ok(f)
+}
+
+/// Wrap a color AV1 image plus a monochrome alpha auxiliary image into an AVIF file.
+///
+/// * Item 1 = color (primary, type `av01`)
+/// * Item 2 = alpha (auxiliary, type `av01`)
+/// * `iref auxl`: alpha (2) → color (1)
+/// * Alpha item carries an `auxC` property with the AVIF alpha URN.
+/// * `ipma` associates {av1C,ispe,pixi,colr} to color and {av1C,ispe,pixi,auxC} to alpha.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_av1_image_with_alpha(
+    color_obu: &[u8],
+    alpha_obu: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    av1c_color: &Av1cParams,
+    av1c_alpha: &Av1cParams,
+    color_meta: &ColorMetadata,
+    metadata: &Metadata,
+) -> Result<Vec<u8>, EncodeError> {
+    let color_av1c = build_av1c(av1c_color);
+    let alpha_av1c = build_av1c(av1c_alpha);
+
+    // AVIF alpha auxiliary URN (ISO/IEC 23000-22:2019 Annex D)
+    const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+
+    let mut f: Vec<u8> = Vec::new();
+
+    // ── ftyp ──────────────────────────────────────────────────────────────────
+    {
+        let s = f.len();
+        write_box(&mut f, b"ftyp");
+        f.extend_from_slice(b"avif");
+        w32(&mut f, 0);
+        f.extend_from_slice(b"avif");
+        f.extend_from_slice(b"mif1");
+        f.extend_from_slice(b"miaf");
+        patch(&mut f, s);
+    }
+
+    // ── meta ──────────────────────────────────────────────────────────────────
+    let meta_start = f.len();
+    write_fullbox(&mut f, b"meta", 0, 0);
+
+    // hdlr
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"hdlr", 0, 0);
+        w32(&mut f, 0);
+        f.extend_from_slice(b"pict");
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        f.push(0);
+        patch(&mut f, s);
+    }
+
+    // pitm → primary (color) item is ID 1
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"pitm", 0, 0);
+        w16(&mut f, 1);
+        patch(&mut f, s);
+    }
+
+    // iloc — two items; offsets patched after mdat.
+    let color_offset_patch_pos;
+    let alpha_offset_patch_pos;
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iloc", 1, 0);
+        f.push(0x44); // offset_size=4, length_size=4
+        f.push(0x00); // base_offset_size=0, index_size=0
+        w16(&mut f, 2); // item_count = 2
+        // item 1: color
+        w16(&mut f, 1);
+        w16(&mut f, 0);
+        w16(&mut f, 0);
+        w16(&mut f, 1);
+        color_offset_patch_pos = f.len();
+        w32(&mut f, 0);
+        w32(&mut f, color_obu.len() as u32);
+        // item 2: alpha
+        w16(&mut f, 2);
+        w16(&mut f, 0);
+        w16(&mut f, 0);
+        w16(&mut f, 1);
+        alpha_offset_patch_pos = f.len();
+        w32(&mut f, 0);
+        w32(&mut f, alpha_obu.len() as u32);
+        patch(&mut f, s);
+    }
+
+    // iinf — two infe entries
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        w16(&mut f, 2); // entry_count
+        for id in [1u16, 2u16] {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, id);
+            w16(&mut f, 0);
+            f.extend_from_slice(b"av01");
+            f.push(0);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iref — alpha (2) is auxiliary-for color (1): 'auxl' 2 → 1
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iref", 0, 0);
+        {
+            let sr = f.len();
+            write_box(&mut f, b"auxl");
+            w16(&mut f, 2); // from_item_ID = alpha
+            w16(&mut f, 1); // reference_count
+            w16(&mut f, 1); // to_item_ID = color
+            patch(&mut f, sr);
+        }
+        patch(&mut f, s);
+    }
+
+    // iprp
+    {
+        let s = f.len();
+        write_box(&mut f, b"iprp");
+
+        // ipco — property container (1-based):
+        //   1 av1C(color)  2 ispe  3 pixi(3ch)  4 colr
+        //   5 av1C(alpha)   6 pixi(1ch)  7 auxC   8+ optional (irot/imir/clli)
+        let mut irot_idx = 0u8;
+        let mut imir_idx = 0u8;
+        let mut clli_idx = 0u8;
+        {
+            let si = f.len();
+            write_box(&mut f, b"ipco");
+
+            // 1: av1C (color)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"av1C");
+                f.extend_from_slice(&color_av1c);
+                patch(&mut f, sh);
+            }
+            // 2: ispe (shared dimensions)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"ispe", 0, 0);
+                w32(&mut f, width);
+                w32(&mut f, height);
+                patch(&mut f, sh);
+            }
+            // 3: pixi (color, 3 channels)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"pixi", 0, 0);
+                f.push(3);
+                f.push(bit_depth);
+                f.push(bit_depth);
+                f.push(bit_depth);
+                patch(&mut f, sh);
+            }
+            // 4: colr
+            write_colr(&mut f, color_meta);
+
+            // 5: av1C (alpha)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"av1C");
+                f.extend_from_slice(&alpha_av1c);
+                patch(&mut f, sh);
+            }
+            // 6: pixi (alpha, 1 channel)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"pixi", 0, 0);
+                f.push(1);
+                f.push(bit_depth);
+                patch(&mut f, sh);
+            }
+            // 7: auxC (alpha auxiliary type URN)
+            {
+                let sh = f.len();
+                write_fullbox(&mut f, b"auxC", 0, 0);
+                f.extend_from_slice(ALPHA_URN);
+                patch(&mut f, sh);
+            }
+
+            // Optional transform + HDR properties (8+), color item only.
+            let mut next_prop: u8 = 8;
+            if metadata.orientation.irot_steps() != 0 {
+                let sh = f.len();
+                write_box(&mut f, b"irot");
+                f.push(metadata.orientation.irot_steps() & 0x03);
+                patch(&mut f, sh);
+                irot_idx = next_prop;
+                next_prop += 1;
+            }
+            if let Some(horizontal_axis) = metadata.orientation.imir_axis() {
+                let sh = f.len();
+                write_box(&mut f, b"imir");
+                f.push(if horizontal_axis { 1 } else { 0 });
+                patch(&mut f, sh);
+                imir_idx = next_prop;
+                next_prop += 1;
+            }
+            if let Some(cll) = metadata.content_light_level {
+                let sh = f.len();
+                write_box(&mut f, b"clli");
+                f.extend_from_slice(&cll.clli_payload());
+                patch(&mut f, sh);
+                clli_idx = next_prop;
+                next_prop += 1;
+            }
+            let _ = next_prop;
+            patch(&mut f, si);
+        }
+
+        // ipma — associations for both items
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"ipma", 0, 0);
+            w32(&mut f, 2); // entry_count
+            // color item 1: av1C(1,essential), ispe(2), pixi(3), colr(4) + optionals
+            let mut c_assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            if irot_idx != 0 {
+                c_assoc.push(0x80 | irot_idx);
+            }
+            if imir_idx != 0 {
+                c_assoc.push(0x80 | imir_idx);
+            }
+            if clli_idx != 0 {
+                c_assoc.push(clli_idx);
+            }
+            w16(&mut f, 1);
+            f.push(c_assoc.len() as u8);
+            f.extend_from_slice(&c_assoc);
+            // alpha item 2: av1C(5,essential), ispe(2), pixi(6), auxC(7)
+            w16(&mut f, 2);
+            f.push(4);
+            f.push(0x80 | 5); // av1C essential
+            f.push(2); // ispe
+            f.push(6); // pixi
+            f.push(7); // auxC
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    patch(&mut f, meta_start);
+
+    // ── mdat ──────────────────────────────────────────────────────────────────
+    let mdat_start = f.len();
+    write_box(&mut f, b"mdat");
+    let color_abs = f.len() as u32;
+    f.extend_from_slice(color_obu);
+    let alpha_abs = f.len() as u32;
+    f.extend_from_slice(alpha_obu);
+    patch(&mut f, mdat_start);
+
+    f[color_offset_patch_pos..color_offset_patch_pos + 4].copy_from_slice(&color_abs.to_be_bytes());
+    f[alpha_offset_patch_pos..alpha_offset_patch_pos + 4].copy_from_slice(&alpha_abs.to_be_bytes());
+
+    Ok(f)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::ColorMetadata;
+
+    fn dummy_av1c() -> Av1cParams {
+        Av1cParams {
+            seq_profile: 0,
+            seq_level_idx: 12,
+            high_bitdepth: false,
+            twelve_bit: false,
+            monochrome: false,
+            chroma_sub_x: true,
+            chroma_sub_y: true,
+            seq_header_obu: vec![],
+        }
+    }
+
+    #[test]
+    fn ftyp_brand_avif() {
+        let b = wrap_av1_image(
+            &[0xAB, 0xCD],
+            16,
+            16,
+            8,
+            3,
+            &dummy_av1c(),
+            &ColorMetadata::default(),
+            &Metadata::default(),
+        )
+        .unwrap();
+        let ftyp_start = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&b[4..8], b"ftyp", "first box must be ftyp");
+        assert_eq!(&b[8..12], b"avif", "major brand must be avif");
+        // meta follows ftyp
+        assert_eq!(
+            &b[ftyp_start + 4..ftyp_start + 8],
+            b"meta",
+            "meta must follow ftyp"
+        );
+    }
+
+    #[test]
+    fn av01_item_type() {
+        let b = wrap_av1_image(
+            &[0x00],
+            8,
+            8,
+            8,
+            3,
+            &dummy_av1c(),
+            &ColorMetadata::default(),
+            &Metadata::default(),
+        )
+        .unwrap();
+        assert!(
+            b.windows(4).any(|w| w == b"av01"),
+            "av01 item type must be present"
+        );
+        assert!(!b.windows(4).any(|w| w == b"hvc1"), "hvc1 must not appear");
+    }
+
+    #[test]
+    fn av1c_box_present() {
+        let b = wrap_av1_image(
+            &[0x00],
+            8,
+            8,
+            8,
+            3,
+            &dummy_av1c(),
+            &ColorMetadata::default(),
+            &Metadata::default(),
+        )
+        .unwrap();
+        assert!(
+            b.windows(4).any(|w| w == b"av1C"),
+            "av1C box must be present"
+        );
+        assert!(!b.windows(4).any(|w| w == b"hvcC"), "hvcC must not appear");
+    }
+
+    #[test]
+    fn alpha_container_structure() {
+        let b = wrap_av1_image_with_alpha(
+            &[0x10],
+            &[0x20],
+            16,
+            16,
+            8,
+            &dummy_av1c(),
+            &dummy_av1c(),
+            &ColorMetadata::default(),
+            &Metadata::default(),
+        )
+        .unwrap();
+        let s = b.as_slice();
+        assert!(s.windows(4).any(|w| w == b"iref"), "iref box required");
+        assert!(
+            s.windows(4).any(|w| w == b"auxl"),
+            "auxl reference required"
+        );
+        assert!(s.windows(4).any(|w| w == b"auxC"), "auxC property required");
+        assert!(
+            s.windows(ALPHA_URN.len() - 1)
+                .any(|w| w == &ALPHA_URN[..ALPHA_URN.len() - 1]),
+            "AVIF alpha URN must be present"
+        );
+        let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
+        let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
+        assert_eq!(entry_count, 2, "ipma must have 2 entries (color + alpha)");
+    }
+
+    #[test]
+    fn iloc_offset_points_into_mdat() {
+        let payload = b"hello av1";
+        let b = wrap_av1_image(
+            payload,
+            8,
+            8,
+            8,
+            3,
+            &dummy_av1c(),
+            &ColorMetadata::default(),
+            &Metadata::default(),
+        )
+        .unwrap();
+        // Find mdat start
+        let mut pos = 0;
+        let mut mdat_payload_start = 0u32;
+        while pos + 8 <= b.len() {
+            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            if &b[pos + 4..pos + 8] == b"mdat" {
+                mdat_payload_start = (pos + 8) as u32;
+                break;
+            }
+            pos += sz;
+        }
+        assert!(mdat_payload_start > 0);
+        // Locate the av1 extent_offset in iloc
+        let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
+        // iloc: 8(box) + 4(fullbox) + 2(fields) + 2(item_count) = 16 bytes before first item
+        // first item: 2(id)+2(meth)+2(ref)+2(cnt) = 8, then extent_offset (4)
+        let off_pos = iloc_pos + 16 + 8;
+        let extent_off = u32::from_be_bytes(b[off_pos..off_pos + 4].try_into().unwrap());
+        assert_eq!(
+            extent_off, mdat_payload_start,
+            "iloc extent_offset must point into mdat"
+        );
+        // Payload at that offset must match
+        let data_at_offset = &b[extent_off as usize..extent_off as usize + payload.len()];
+        assert_eq!(data_at_offset, payload);
+    }
+
+    #[test]
+    fn av1c_header_bytes() {
+        let p = Av1cParams {
+            seq_profile: 1,
+            seq_level_idx: 12,
+            high_bitdepth: true,
+            twelve_bit: false,
+            monochrome: false,
+            chroma_sub_x: false,
+            chroma_sub_y: false,
+            seq_header_obu: vec![],
+        };
+        let av1c = build_av1c(&p);
+        assert_eq!(av1c[0], 0x81, "marker=1, version=1");
+        assert_eq!((av1c[1] >> 5) & 0x7, 1, "seq_profile=1");
+        assert_eq!(av1c[1] & 0x1f, 12, "seq_level_idx=12");
+        assert_ne!(av1c[2] & 0x40, 0, "high_bitdepth must be set");
+        assert_eq!(av1c[2] & 0x20, 0, "twelve_bit must be clear");
+    }
+
+    const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+}
