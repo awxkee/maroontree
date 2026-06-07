@@ -344,7 +344,18 @@ fn mul_q16_vec(data: int32x4_t, coeff: int32x4_t) -> int32x4_t {
 /// quantizer exactly so the NEON in-place result matches `dct*_scalar`.
 #[inline]
 fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut [i32; N]) {
-    let mq = |a: i32, b: i32| (((a as i64) * (b as i64)) >> 16) as i32;
+    // Round-to-nearest (magnitude-symmetric) so the quant error is zero-mean,
+    // matching the scalar `quant_q16`. A bare `>> 16` truncates toward -inf and
+    // the bias accumulates into a dark dot at the block's top-left corner.
+    let mq = |a: i32, b: i32| {
+        let prod = (a as i64) * (b as i64);
+        let mag = prod.unsigned_abs();
+        if mag < 65536 {
+            return 0;
+        }
+        let lvl = ((mag + 32768) >> 16) as i32;
+        if prod >= 0 { lvl } else { -lvl }
+    };
     out[0] = mq(coeffs[0], dc_q);
     for i in 1..N {
         out[i] = mq(coeffs[i], ac_q);

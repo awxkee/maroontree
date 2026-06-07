@@ -55,6 +55,20 @@ fn mul_q16(data: i32, coeff: i32) -> i32 {
     (((data as i64) * (coeff as i64)) >> 16) as i32
 }
 
+/// Quantize a transform coefficient: `round(data * coeff / 65536)` with
+/// magnitude-symmetric round-to-nearest. Unlike a bare `>> 16` (truncation
+/// toward -inf), this keeps the reconstruction error zero-mean, so per-
+/// coefficient error does not accumulate at the block's top-left corner (where
+/// every DCT basis function is positive and in phase) into a dark dot.
+#[inline(always)]
+fn quant_q16(data: i32, coeff: i32) -> i32 {
+    let prod = (data as i64) * (coeff as i64);
+    let mag = prod.unsigned_abs();
+    if mag < 65536 { return 0; } // dead-zone: |coeff/step| < 1.0 -> zero (preserves compression)
+    let lvl = ((mag + 32768) >> 16) as i32; // round-to-nearest for kept coefficients (de-biases the corner)
+    if prod >= 0 { lvl } else { -lvl }
+}
+
 /// fmla equivalent: a * SQRT2 + b, all in Q15 domain
 #[inline(always)]
 fn fmla_sqrt2(a: i32, b: i32) -> i32 {
@@ -130,12 +144,12 @@ pub(crate) fn dct1d_8_i32(buf: &mut [i32; 8]) {
 // 1.0606777  -> 69496
 // 1.7224471  -> 112863
 // 5.1011486  -> 334233
-pub(crate) const WC16_0: i32 = 32927; 
-pub(crate) const WC16_1: i32 = 34242; 
-pub(crate) const WC16_2: i32 = 37155; 
-pub(crate) const WC16_3: i32 = 42390; 
-pub(crate) const WC16_4: i32 = 51653; 
-pub(crate) const WC16_5: i32 = 69513; 
+pub(crate) const WC16_0: i32 = 32927;
+pub(crate) const WC16_1: i32 = 34242;
+pub(crate) const WC16_2: i32 = 37155;
+pub(crate) const WC16_3: i32 = 42390;
+pub(crate) const WC16_4: i32 = 51653;
+pub(crate) const WC16_5: i32 = 69513;
 pub(crate) const WC16_6: i32 = 112882;
 pub(crate) const WC16_7: i32 = 334309;
 
@@ -228,12 +242,133 @@ fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
     out
 }
 
+/// Forward ADST8 (1-D), Q12 matrix derived as the gain-matched transpose of
+/// dav1d's integer inverse ADST8 (`inv_adst8_1d`). Calibrated so the forward/
+/// inverse round-trip gain equals the DCT pair's, so the same quant multipliers
+/// and TX_8X8 inverse shifts apply unchanged. Used only as the encoder's
+/// analysis transform; reconstruction is dav1d-exact via `iadst_dequant_8x8`.
+static ADST8_FWD_Q12: [[i32; 8]; 8] = [
+    [567, 1682, 2730, 3675, 4477, 5109, 5544, 5766],
+    [1682, 4480, 5766, 5109, 2732, -569, -3675, -5545],
+    [2732, 5766, 3675, -1682, -5544, -4479, 569, 5109],
+    [3675, 5108, -1681, -5764, -569, 5542, 2732, -4479],
+    [4479, 2732, -5542, -569, 5764, -1681, -5108, 3675],
+    [5109, -569, -4479, 5544, -1682, -3675, 5766, -2732],
+    [5545, -3675, 569, 2732, -5109, 5766, -4480, 1682],
+    [5766, -5544, 5109, -4477, 3675, -2730, 1682, -567],
+];
+
+#[inline]
+fn fwd_adst8_1d(inp: &[i32; 8]) -> [i32; 8] {
+    let mut out = [0i32; 8];
+    for i in 0..8 {
+        let mut acc = 0i64;
+        for j in 0..8 {
+            acc += ADST8_FWD_Q12[i][j] as i64 * inp[j] as i64;
+        }
+        out[i] = ((acc + 2048) >> 12) as i32;
+    }
+    out
+}
+
+/// Forward 2-D ADST_ADST for an 8x8 residual, same output layout as
+/// `dct8x8_coeffs` (`out[horiz_freq*8 + vert_freq]`, DC at 0).
+pub(crate) fn adst8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 { col[r] = input[r * 8 + x]; }
+        let c = fwd_adst8_1d(&col);
+        for r in 0..8 { tmp[r * 8 + x] = c[r]; }
+    }
+    let mut out = [0i32; 64];
+    for r in 0..8usize {
+        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let rr = fwd_adst8_1d(&row);
+        for u in 0..8 { out[u * 8 + r] = rr[u]; }
+    }
+    out
+}
+
+/// Trellis (RDOQ) forward ADST8: levels + unrounded targets, mirroring
+/// `dct8x8_t`. Ratio is 1.0 for 8x8, so the quant multipliers apply directly.
+pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    let coeffs = adst8x8_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+/// Forward ADST16 (1-D), Q12 matrix: gain-matched transpose of dav1d's integer
+/// inverse ADST16 (`inv_adst16_1d`), calibrated to the DCT16 pair's round-trip
+/// gain so the 16x16 quant multipliers and inverse shifts apply unchanged.
+static ADST16_FWD_Q12: [[i32; 16]; 16] = [
+    [284, 850, 1408, 1951, 2477, 2978, 3451, 3891, 4294, 4653, 4969, 5236, 5455, 5619, 5731, 5788],
+    [850, 2479, 3892, 4970, 5619, 5788, 5457, 4654, 3452, 1951, 284, -1409, -2978, -4294, -5239, -5732],
+    [1408, 3892, 5455, 5731, 4653, 2477, -284, -2979, -4970, -5788, -5237, -3451, -850, 1952, 4294, 5621],
+    [1952, 4970, 5731, 3891, 286, -3451, -5621, -5239, -2477, 1408, 4654, 5786, 4294, 852, -2979, -5457],
+    [2477, 5621, 4654, 284, -4294, -5731, -2979, 1952, 5455, 4970, 852, -3891, -5788, -3451, 1408, 5239],
+    [2979, 5788, 2477, -3452, -5731, -1951, 3891, 5621, 1408, -4294, -5454, -850, 4654, 5237, 284, -4970],
+    [3452, 5457, -284, -5621, -2979, 3891, 5239, -850, -5731, -2477, 4294, 4970, -1408, -5788, -1952, 4654],
+    [3892, 4654, -2979, -5239, 1952, 5621, -850, -5788, -284, 5731, 1408, -5455, -2477, 4970, 3452, -4294],
+    [4294, 3452, -4970, -2477, 5455, 1408, -5731, -284, 5788, -850, -5621, 1952, 5239, -2979, -4654, 3892],
+    [4654, 1952, -5788, 1408, 4970, -4294, -2477, 5731, -850, -5239, 3891, 2979, -5621, 284, 5457, -3452],
+    [4970, 284, -5237, 4654, 850, -5454, 4294, 1408, -5621, 3891, 1951, -5731, 3452, 2477, -5788, 2979],
+    [5239, -1408, -3451, 5788, -3891, -852, 4970, -5455, 1952, 2979, -5731, 4294, 284, -4654, 5621, -2477],
+    [5457, -2979, -852, 4294, -5786, 4654, -1408, -2477, 5239, -5621, 3451, 286, -3891, 5731, -4970, 1952],
+    [5621, -4294, 1952, 850, -3451, 5237, -5788, 4970, -2979, 284, 2477, -4653, 5731, -5455, 3892, -1408],
+    [5732, -5239, 4294, -2978, 1409, 284, -1951, 3452, -4654, 5457, -5788, 5619, -4970, 3892, -2479, 850],
+    [5788, -5731, 5619, -5455, 5236, -4969, 4653, -4294, 3891, -3451, 2978, -2477, 1951, -1408, 850, -284],
+];
+
+#[inline]
+fn fwd_adst16_1d(inp: &[i32; 16]) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    for i in 0..16 {
+        let mut acc = 0i64;
+        for j in 0..16 {
+            acc += ADST16_FWD_Q12[i][j] as i64 * inp[j] as i64;
+        }
+        out[i] = ((acc + 2048) >> 12) as i32;
+    }
+    out
+}
+
+/// Forward 2-D ADST_ADST for a 16x16 residual. Mirrors `dct16x16_coeffs`
+/// exactly (column pass, row pass, then the same `*0.5` gain normalization),
+/// so coefficients land at the DCT16 scale that the quant multipliers expect.
+pub(crate) fn adst16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        let c = fwd_adst16_1d(&col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = c[v];
+        }
+    }
+    let mut out = [0i32; 256];
+    for v in 0..16 {
+        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let rr = fwd_adst16_1d(&row);
+        for u in 0..16 {
+            out[u * 16 + v] = mul_q16(rr[u], 32768);
+        }
+    }
+    out
+}
+
+pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
+    let coeffs = adst16x16_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
 #[inline]
 #[allow(unused)]
 pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x8_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
-        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
+        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -292,7 +427,7 @@ fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
 pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
     let coeffs = dct16x16_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
-        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
+        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -411,7 +546,7 @@ fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
 pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     let coeffs = dct32x32_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
-        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
+        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -472,7 +607,7 @@ fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
 pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_coeffs(input);
     for (i, dst) in input.iter_mut().enumerate() {
-        *dst = mul_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
+        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
     }
 }
 
@@ -486,7 +621,7 @@ fn quant_levels_and_targets<const N: usize>(
     let mut tf = [0.0f64; N];
     for i in 0..N {
         let m = if i == 0 { q_mult_dc } else { q_mult_ac };
-        cf[i] = mul_q16(coeffs[i], m);
+        cf[i] = quant_q16(coeffs[i], m);
         tf[i] = coeffs[i] as f64 * m as f64 * (1. / 65536.0);
     }
     (cf, tf)
@@ -1026,6 +1161,55 @@ mod tests {
                 got[k],
                 (got[k] - exp).abs()
             );
+        }
+    }
+}
+
+
+/// aarch64+neon ONLY consistency guard. The scalar transforms are the
+/// bit-exact reference (validated against dav1d on x86); the NEON forward path
+/// is only trustworthy if it is bit-identical to scalar for every input. This
+/// test enforces that invariant end-to-end (forward coeffs + dead-zone+round
+/// quant). It cannot be built or run on x86; run it on real aarch64 hardware
+/// (`cargo test --features neon neon_matches_scalar`) before shipping NEON.
+#[cfg(all(target_arch = "aarch64", feature = "neon", test))]
+mod neon_consistency {
+    use super::*;
+    use crate::neon::{dct8x8_neon_i32, dct16x16_neon_i32};
+    fn next(seed: &mut u64) -> i32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as i32).rem_euclid(960) - 480
+    }
+    #[test]
+    fn neon_matches_scalar_8x8() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for &(dcq, acq) in &[(26i32, 30i32), (52, 58), (210, 240)] {
+            for _ in 0..128 {
+                let mut a = [0i32; 64];
+                for v in a.iter_mut() {
+                    *v = next(&mut seed);
+                }
+                let mut b = a;
+                unsafe { dct8x8_neon_i32(&mut a, dcq, acq) };
+                dct8x8_scalar(&mut b, dcq, acq);
+                assert_eq!(a, b, "NEON 8x8 forward+quant diverges from scalar");
+            }
+        }
+    }
+    #[test]
+    fn neon_matches_scalar_16x16() {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        for &(dcq, acq) in &[(26i32, 30i32), (52, 58), (210, 240)] {
+            for _ in 0..64 {
+                let mut a = [0i32; 256];
+                for v in a.iter_mut() {
+                    *v = next(&mut seed);
+                }
+                let mut b = a;
+                unsafe { dct16x16_neon_i32(&mut a, dcq, acq) };
+                dct16x16_scalar(&mut b, dcq, acq);
+                assert_eq!(a, b, "NEON 16x16 forward+quant diverges from scalar");
+            }
         }
     }
 }
