@@ -251,7 +251,7 @@ fn av1_profile(bit_depth: u8, chroma: ChromaFormat) -> u8 {
 /// Build the [`isobmff::Av1cParams`] for a given encode. Extracts the sequence
 /// header OBU from the encoder output and embeds it as `configOBUs`.
 fn make_av1c(
-    obu: &[u8],
+    _obu: &[u8],
     bit_depth: u8,
     width: u32,
     height: u32,

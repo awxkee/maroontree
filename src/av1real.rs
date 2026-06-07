@@ -1,15 +1,31 @@
-//! Minimal *real-AV1* still-image encoder for a single 64x64 intra keyframe.
-//!
-//! This is the first path that targets actual dav1d decodability (distinct from
-//! the self-consistent codec in `encoder.rs`). The tile codes exactly one
-//! 64x64 block: PARTITION_NONE, skip=1 (no residual), DC_PRED luma and chroma.
-//! With skip and no neighbors, the decoded image is flat mid-grey — not our
-//! input, but a genuine AV1 frame that proves the whole stack (framing, headers,
-//! `od_ec`, mode syntax, default CDFs) is decoder-valid.
-//!
-//! CDF values are the AV1 spec defaults, taken from dav1d's `cdf.c`
-//! (`CDFn(a..) = 32768 - a`). At the single top-left block every context is 0,
-//! so we need only: partition[64x64][0], skip[0], kf_y_mode[0][0], uv_mode[0][0].
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 use crate::dct::{
     adst8x8_t, adst16x16_t, dct4x4_t, dct4x8_t, dct8x8, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t,
@@ -25,17 +41,12 @@ use crate::obu::{
 };
 use crate::odec::OdEcEncoder;
 
-/// Build a length-N inverse CDF (rav1e/od_ec layout) from dav1d's `CDFn` args.
-/// `args` are the N-1 direct cumulative boundaries of an N-symbol model; the
-/// returned array is `[32768-a_0, .., 32768-a_{N-2}, count=0]`.
 fn icdf(args: &[u16]) -> Vec<u16> {
     let mut v: Vec<u16> = args.iter().map(|&a| 32768 - a).collect();
     v.push(0); // adaptation counter (also acts as the terminal, since 0>>6==0)
     v
 }
 
-/// Block-level skip flag CDF, indexed by ctx = above_skip + left_skip (0..2).
-/// (dav1d `default_cdf.m.skip`.)
 static SKIP_CDF: [u16; 3] = [31671, 16515, 4576];
 
 /// Per-frame adaptive CDF state. dav1d adapts every symbol's CDF as it decodes
@@ -689,7 +700,6 @@ pub(crate) fn coef_rate_bits(level: u32) -> f64 {
 /// negligible PSNR cost, beating the naive "raise q" baseline.
 const TRELLIS_LAMBDA0: f64 = 0.05;
 
-/// Current trellis lambda0.
 thread_local! {
     static ADST8: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
@@ -764,13 +774,22 @@ fn trellis_optimize(
         }
     }
 
-    // Step B: choose the last-nonzero (EOB) position that minimises total cost,
-    // dropping every coefficient after it.
-    let mut suf0 = vec![0f64; n + 1]; // distortion of zeroing coeffs from i..n
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<f64>, Vec<f64>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    let (mut suf0, mut pre) = SCRATCH.with(|s| {
+        let mut b = s.borrow_mut();
+        (std::mem::take(&mut b.0), std::mem::take(&mut b.1))
+    });
+
+    suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
+    suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
     for i in (0..n).rev() {
         suf0[i] = suf0[i + 1] + d(scan[i], 0);
     }
-    let mut pre = vec![0f64; n + 1]; // interior cost of coeffs strictly before i
+    pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
+    pre[0] = 0.0; // empty-prefix seed
     for i in 0..n {
         let rc = scan[i];
         pre[i + 1] = pre[i] + d(rc, cf[rc]) + lambda * coef_rate_bits(cf[rc].unsigned_abs());
@@ -803,11 +822,17 @@ fn trellis_optimize(
         for &rc in scan.iter() {
             cf[rc] = 0;
         }
-        return;
+    } else {
+        for i in (best_e as usize + 1)..n {
+            cf[scan[i]] = 0;
+        }
     }
-    for i in (best_e as usize + 1)..n {
-        cf[scan[i]] = 0;
-    }
+
+    SCRATCH.with(|s| {
+        let mut b = s.borrow_mut();
+        b.0 = std::mem::take(&mut suf0);
+        b.1 = std::mem::take(&mut pre);
+    });
 }
 
 /// Probability -> bit-cost table. `COST_Q[p]` holds `-log2(p / 32768)` in
@@ -1783,6 +1808,7 @@ fn encode_dc_tail(
 /// **Adaptive** `TX_8X8` coefficient encoder (dav1d-compatible CDF adaptation):
 /// every symbol is coded against the persistent CDF in `cdfs` and adapts it.
 /// Used by the full-image path. TX_8X8 is coef class 1.
+#[allow(clippy::too_many_arguments)]
 fn encode_tx8_coeffs_adapt(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,
@@ -1913,6 +1939,7 @@ fn encode_tx8_coeffs_adapt(
 /// 256>>2=64, and the 2D coeff-base context reuses `LO_CTX_OFF` + `get_lo_ctx_2d`
 /// at stride 16 (the libaom 16x16 offset table equals that 5x5 region). Used for
 /// 4:4:4 luma (chroma=false) and 4:4:4 chroma (chroma=true).
+#[allow(clippy::too_many_arguments)]
 fn encode_tx16_coeffs_adapt(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,
@@ -3537,7 +3564,7 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    /// 4:4:4: chroma is also 16x16 (one TX_16X16 per plane).
+    #[allow(clippy::too_many_arguments)]
     fn code_block16_444(
         &mut self,
         x8: usize,
@@ -3718,10 +3745,8 @@ impl<'a> LossyTile<'a> {
                 }
             }
             if sse_sv <= sse_cur {
-                for ci in 0..2 {
-                    ccf[ci] = sv_ccf16[ci];
-                    cpred16[ci] = sv_preds16[ci];
-                }
+                ccf[..2].copy_from_slice(&sv_ccf16[..2]);
+                cpred16[..2].copy_from_slice(&sv_preds16[..2]);
                 cfl_opt = None; // SMOOTH_V overrides CfL if it wins
                 chosen_uv_16 = SMOOTH_V_PRED;
             }
@@ -3777,11 +3802,7 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    /// 4:2:0: a 16x16 luma region maps to an 8x8 chroma region per plane, coded
-    /// with the existing `TX_8X8` chroma path (coef-CDF class 1). The chroma tx
-    /// equals the chroma block size, so the txb_skip ctx offset is 7 — identical
-    /// to the 4:4:4 8x8 chroma case but indexed on the chroma 4-unit grid (which,
-    /// in 4:2:0, lands at `bx4c = x8`, `by4c = y8`, a 2-unit footprint).
+    #[allow(clippy::too_many_arguments)]
     fn code_block16_420(
         &mut self,
         x8: usize,
@@ -3932,6 +3953,7 @@ impl<'a> LossyTile<'a> {
     /// plane (`RTX_8X16`, coef-CDF class 2). Chroma is full-height, half-width, so
     /// the chroma block sits at `(cx, py)` with `cx = px/2` and spans 2 coef units
     /// horizontally and 4 vertically on the chroma grid.
+    #[allow(clippy::too_many_arguments)]
     fn code_block16_422(
         &mut self,
         x8: usize,
@@ -4311,8 +4333,8 @@ impl<'a> LossyTile<'a> {
                 let dc = cpred[ci];
                 for ry in 0..4 {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    for j in 0..4 {
-                        let d = srow[j] - dc;
+                    for &sr in srow[..4].iter() {
+                        let d = sr - dc;
                         sse_cur += (d * d) as i64;
                     }
                 }
@@ -4352,9 +4374,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             if sse_sv < sse_cur {
-                for ci in 0..2 {
-                    ccf44[ci] = sv_ccf44_2[ci];
-                }
+                ccf44[..2].copy_from_slice(&sv_ccf44_2[..2]);
                 chosen_uv_block = SMOOTH_V_PRED;
             }
         }
@@ -4959,14 +4979,14 @@ impl<'a> LossyTile<'a> {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     if use_cfl {
                         let prow = &cfl_pred[ci][ry * 32..];
-                        for j in 0..32 {
-                            let d = srow[j] - prow[j];
+                        for (&sr, &pr) in srow[..32].iter().zip(prow[..32].iter()) {
+                            let d = sr - pr;
                             sse_cur += (d * d) as i64;
                         }
                     } else {
                         let dc = pred_dc[ci];
-                        for j in 0..32 {
-                            let d = srow[j] - dc;
+                        for &s in srow[..32].iter() {
+                            let d = s - dc;
                             sse_cur += (d * d) as i64;
                         }
                     }
@@ -6123,7 +6143,7 @@ pub(crate) fn encode_av1_lossy_image_422(
     encode_av1_lossy_image_422_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads).0
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     base_q_idx: u8,
     bd: u8,
@@ -6178,7 +6198,7 @@ pub(crate) fn encode_av1_lossy_image_420(
 /// Debug variant of [`encode_av1_lossy_image_420`] also returning the encoder's
 /// padded reconstruction `[Y, U, V]` and the padded dims `(w8, h8, cw8, ch8)`,
 /// for bit-exactness verification against the decoder.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     base_q_idx: u8,
     bd: u8,

@@ -1,22 +1,31 @@
-//! AV1 `od_ec` entropy engine (encoder + decoder).
-//!
-//! This is a faithful port of the reference range coder used by rav1e / libaom
-//! / dav1d — the *real* AV1 symbol coder, not the placeholder Subbotin coder in
-//! `rangecoder.rs`. The arithmetic (`lr_compute`, `store`, `done`, decoder
-//! `normalize`/`symbol`/`bool`) is copied operation-for-operation from the
-//! reference so the byte output is AV1-compatible.
-//!
-//! Two facts make this trustworthy rather than hopeful:
-//!   1. The encoder and a matching decoder round-trip (tests below).
-//!   2. The CDF adaptation `update_cdf` here is bit-identical to dav1d's — the
-//!      `rate` formula `3 + min(len>>1, 2) + (count>>4)` equals dav1d's
-//!      `4 + (count>>4) + (n_symbols>2)` for every alphabet size (verified for
-//!      N = 2,3,4,8,16). So adaptive coding stays in lockstep with dav1d.
-//!
-//! CDF convention (AV1 inverse form): an N-symbol model is a `[u16]` of length
-//! N+1. Entries `0..N-1` are inverse cumulative frequencies (monotonically
-//! decreasing, entry `N-1 == 0`); entry `N` is the adaptation counter. Symbol
-//! `s` is encoded from `fl = (s>0 ? cdf[s-1] : 32768)`, `fh = cdf[s]`.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 const EC_PROB_SHIFT: u32 = 6;
 const EC_MIN_PROB: u32 = 4;
