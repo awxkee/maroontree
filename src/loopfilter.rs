@@ -111,18 +111,72 @@ fn loop_filter(
         };
 
         if wd >= 16 && flat8out && flat8in {
-            put(dst, -6, (p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) >> 4);
-            put(dst, -5, (p6 * 5 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8) >> 4);
-            put(dst, -4, (p6 * 4 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4);
-            put(dst, -3, (p6 * 3 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8) >> 4);
-            put(dst, -2, (p6 * 2 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8) >> 4);
-            put(dst, -1, (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8) >> 4);
-            put(dst, 0, (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8) >> 4);
-            put(dst, 1, (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 + q6 + 8) >> 4);
-            put(dst, 2, (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 + q6 + q6 + 8) >> 4);
-            put(dst, 3, (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 + q6 + q6 + q6 + 8) >> 4);
-            put(dst, 4, (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 * 5 + 8) >> 4);
-            put(dst, 5, (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 7 + 8) >> 4);
+            put(
+                dst,
+                -6,
+                (p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) >> 4,
+            );
+            put(
+                dst,
+                -5,
+                (p6 * 5 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8) >> 4,
+            );
+            put(
+                dst,
+                -4,
+                (p6 * 4 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4,
+            );
+            put(
+                dst,
+                -3,
+                (p6 * 3 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8) >> 4,
+            );
+            put(
+                dst,
+                -2,
+                (p6 * 2 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                -1,
+                (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                0,
+                (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                1,
+                (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 + q6 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                2,
+                (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                3,
+                (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
+            put(
+                dst,
+                4,
+                (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 * 5 + 8) >> 4,
+            );
+            put(
+                dst,
+                5,
+                (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 7 + 8) >> 4,
+            );
         } else if wd >= 8 && flat8in {
             put(dst, -3, (p3 * 3 + 2 * p2 + p1 + p0 + q0 + 4) >> 3);
             put(dst, -2, (p3 * 2 + p2 + 2 * p1 + p0 + q0 + q1 + 4) >> 3);
@@ -173,11 +227,7 @@ fn luma_cls(dim4: u8) -> u8 {
 #[inline]
 fn chroma_cls(dim4: u8) -> u8 {
     // chroma supports wd4 (cls0) and wd6 (cls>=1)
-    if dim4 >= 2 {
-        1
-    } else {
-        0
-    }
+    if dim4 >= 2 { 1 } else { 0 }
 }
 
 /// Filter one plane in place. `bw4`/`bh4` give the block width/height (in 4-sample

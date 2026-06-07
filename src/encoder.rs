@@ -100,8 +100,14 @@ pub fn encode_still_lossy<T: Pixel>(
     color: &crate::color::ColorEncoding,
     threads: usize,
 ) -> Encoded {
-    assert!(img.width > 0 && img.height > 0, "width/height must be non-zero");
-    assert!(matches!(img.bit_depth, 8 | 10 | 12), "only 8/10/12-bit supported");
+    assert!(
+        img.width > 0 && img.height > 0,
+        "width/height must be non-zero"
+    );
+    assert!(
+        matches!(img.bit_depth, 8 | 10 | 12),
+        "only 8/10/12-bit supported"
+    );
     assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
     let bd = img.bit_depth;
     let maxv = (1i32 << bd) - 1;
@@ -120,14 +126,17 @@ pub fn encode_still_lossy<T: Pixel>(
         .zip(img.planes[1].iter())
     {
         let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-        *yv  = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
+        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
         *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
         *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
     }
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
         base_q_idx, bd, img.width, img.height, &y, &cb, &cr, color, threads,
     );
-    Encoded { bytes, lossless_verified: false }
+    Encoded {
+        bytes,
+        lossless_verified: false,
+    }
 }
 
 /// Encode a **lossy 4:2:2** still (profile 2). Like [`encode_still_lossy`] but
@@ -199,8 +208,9 @@ pub fn encode_still_lossy_422<T: Pixel>(
             cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
         }
     }
-    let bytes =
-        crate::av1real::encode_av1_lossy_image_422(base_q_idx, bd, w, h, &y, &cb, &cr, color, threads);
+    let bytes = crate::av1real::encode_av1_lossy_image_422(
+        base_q_idx, bd, w, h, &y, &cb, &cr, color, threads,
+    );
     Encoded {
         bytes,
         lossless_verified: false,
@@ -274,8 +284,9 @@ pub fn encode_still_lossy_420<T: Pixel>(
             cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
         }
     }
-    let bytes =
-        crate::av1real::encode_av1_lossy_image_420(base_q_idx, bd, w, h, &y, &cb, &cr, color, threads);
+    let bytes = crate::av1real::encode_av1_lossy_image_420(
+        base_q_idx, bd, w, h, &y, &cb, &cr, color, threads,
+    );
     Encoded {
         bytes,
         lossless_verified: false,
@@ -498,7 +509,6 @@ pub fn encode_yuv420<T: Pixel>(
         bytes,
         lossless_verified: false,
     }
-
 }
 
 #[cfg(test)]
@@ -702,9 +712,11 @@ mod tests {
             let rgb = vec![100u8; w * h * 3];
             let img = PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
             assert!(!encode_still(&img).bytes.is_empty());
-            assert!(!encode_still_lossy(&img, 16, &crate::color::ColorEncoding::srgb_ycbcr(), 0).bytes.is_empty());
+            assert!(
+                !encode_still_lossy(&img, 16, &crate::color::ColorEncoding::srgb_ycbcr(), 0)
+                    .bytes
+                    .is_empty()
+            );
         }
     }
-    }
-
-
+}

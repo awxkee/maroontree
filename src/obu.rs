@@ -156,7 +156,6 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
-    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -167,7 +166,6 @@ pub(crate) fn frame_header_lossy_multitile(
         tile_rows_log2,
         false,
         mono,
-        cdef,
     )
 }
 
@@ -183,7 +181,6 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
-    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -194,7 +191,6 @@ pub(crate) fn frame_header_lossy_multitile_th(
         tile_rows_log2,
         true,
         mono,
-        cdef,
     )
 }
 
@@ -230,7 +226,6 @@ fn frame_header_lossy_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
-    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -277,18 +272,7 @@ fn frame_header_lossy_impl(
     }
     w.f(0, 3); // loop_filter_sharpness = 0
     w.flag(false); // loop_filter_delta_enabled = 0
-    // cdef_params(): enable_cdef = 1. CodedLossless = 0 and allow_intrabc = 0
-    // here, so the block is always present. Single preset (cdef_bits = 0) so the
-    // per-superblock cdef_idx reads 0 bits in the tile data (syntax unchanged).
-    if crate::cdef::cdef_enabled() {
-        let cd = *cdef;
-        w.f((cd.damping - 3) as u32, 2); // cdef_damping_minus_3
-        w.f(0, 2); // cdef_bits = 0 => 1 strength preset
-        w.f(crate::cdef::encode_strength(cd.y_pri, cd.y_sec), 6); // y_strength[0]
-        if !mono {
-            w.f(crate::cdef::encode_strength(cd.uv_pri, cd.uv_sec), 6); // uv_strength[0]
-        }
-    }
+    // cdef_params(): omitted — CDEF disabled at sequence level (enable_cdef = 0).
     // lr_params(): sequence enable_restoration = 0 => skipped
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
@@ -391,7 +375,7 @@ pub(crate) fn sequence_header_mono(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(crate::cdef::cdef_enabled()); // enable_cdef
+    w.flag(false); // enable_cdef (CDEF removed)
     w.flag(false); // enable_restoration
 
     // color_config() — monochrome branch.
@@ -444,7 +428,7 @@ fn seq_header_ss(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(crate::cdef::cdef_enabled()); // enable_cdef
+    w.flag(false); // enable_cdef (CDEF removed)
     w.flag(false); // enable_restoration
 
     // color_config()
