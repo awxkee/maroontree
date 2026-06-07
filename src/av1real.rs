@@ -12,12 +12,12 @@
 //! so we need only: partition[64x64][0], skip[0], kf_y_mode[0][0], uv_mode[0][0].
 
 use crate::dct::{
-    adst8x8_t, adst16x16_t, dct4x4_t, dct4x8_t, dct8x8, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32,
-    dct32x32_t,
+    adst8x8_t, adst16x16_t, dct4x4_t, dct4x8_t, dct8x8, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t,
+    dct16x32_t, dct32x32, dct32x32_t,
 };
 use crate::idct::{
-    iadst_dequant_8x8, iadst_dequant_16x16, idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x8, idct_dequant_8x16, idct_dequant_16x16,
-    idct_dequant_16x32, idct_dequant_32x32,
+    iadst_dequant_8x8, iadst_dequant_16x16, idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x8,
+    idct_dequant_8x16, idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x32,
 };
 use crate::obu::{
     frame_header_lossy_multitile, frame_header_lossy_multitile_th, temporal_delimiter,
@@ -691,24 +691,17 @@ const TRELLIS_LAMBDA0: f64 = 0.05;
 
 /// Current trellis lambda0.
 thread_local! {
-    static FORCE_8X8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-/// Restrict luma partitioning to 8x8 blocks only (disables the 16x16 and 32x32
-/// PARTITION_NONE paths). Simpler and faster, and it eliminates both the
-/// block-corner dark dots and smooth-region banding that the larger transforms
-/// can introduce, at some cost in compression on textured content. Off by
-/// default; per-thread, like the CDEF toggle.
-pub fn set_force_8x8(on: bool) { FORCE_8X8.with(|c| c.set(on)); }
-pub fn force_8x8() -> bool { FORCE_8X8.with(|c| c.get()) }
-
-thread_local! {
     static ADST8: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 /// Per-block RD selection of ADST_ADST vs DCT_DCT for 8x8 and 16x16 luma intra
 /// residuals (the libaom/rav1e behavior). On by default; `set_adst8(false)`
 /// forces DCT_DCT everywhere (the pre-ADST encoder).
-pub fn set_adst8(on: bool) { ADST8.with(|c| c.set(on)); }
-pub fn adst8() -> bool { ADST8.with(|c| c.get()) }
+pub fn set_adst8(on: bool) {
+    ADST8.with(|c| c.set(on));
+}
+pub fn adst8() -> bool {
+    ADST8.with(|c| c.get())
+}
 /// dav1d DTT4_IDTX_1DDCT set index for ADST_ADST at TX_8X8 intra.
 const ADST_ADST_TX8_IDX: usize = 4;
 /// dav1d DTT4_IDTX set index for ADST_ADST at TX_16X16 intra (5-type set).
@@ -3016,8 +3009,8 @@ struct LossyTile<'a> {
     l_skip: Vec<u8>,      // block skip flag per 4x4 row, absolute by4
     a_mode: Vec<u8>,      // luma intra mode per 4x4 col (for kf y-mode context)
     l_mode: Vec<u8>,      // luma intra mode per 4x4 row
-    blk4: Vec<u8>,        // luma block size (in 4-sample units, square) per 4x4 luma unit; for the deblock filter
-    skip8: Vec<bool>,    // per-8x8-luma-unit block skip flag (true = no coded coeffs); for CDEF
+    blk4: Vec<u8>, // luma block size (in 4-sample units, square) per 4x4 luma unit; for the deblock filter
+    skip8: Vec<bool>, // per-8x8-luma-unit block skip flag (true = no coded coeffs); for CDEF
     enc: OdEcEncoder,
     cdfs: Cdfs,
 }
@@ -3205,15 +3198,18 @@ impl<'a> LossyTile<'a> {
         for ry in 0..dim {
             let base = (py + ry) * self.w + px;
             for &s in &self.src[0][base..base + dim] {
-                if s < lo { lo = s; }
-                if s > hi { hi = s; }
+                if s < lo {
+                    lo = s;
+                }
+                if s > hi {
+                    hi = s;
+                }
             }
         }
         hi - lo
     }
 
     fn prefer_16x16(&self, x8: usize, y8: usize) -> bool {
-        if force_8x8() { return false; }
         if self.mono {
             return false; // monochrome codes 8x8 luma blocks only
         }
@@ -3278,6 +3274,8 @@ impl<'a> LossyTile<'a> {
         let mut lpred_arr = [0i32; 256];
         let mut lcf = [0i32; 256];
         let mut best_eff = f64::INFINITY;
+        let mut best_dct_sse = 0i64;
+        let mut best_dct_bits = 0f64;
         for &m in nd_modes() {
             let mut pred = [0i32; 256];
             if m == DC_PRED {
@@ -3313,7 +3311,8 @@ impl<'a> LossyTile<'a> {
             }
             let blk_sse16 = |rr: &[i32; 256]| -> i64 {
                 let mut sse = 0i64;
-                for (ry, (prow, rrow)) in pred.chunks_exact(16).zip(rr.chunks_exact(16)).enumerate() {
+                for (ry, (prow, rrow)) in pred.chunks_exact(16).zip(rr.chunks_exact(16)).enumerate()
+                {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
                         let r = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -3325,44 +3324,104 @@ impl<'a> LossyTile<'a> {
             };
             let (mut cf, tf) = forward_dct_quant_16x16_t(&resid, &self.quant);
             trellis_optimize_ctx(
-                &mut cf, &tf, dcq, acq, &SCAN_16X16, lam, 16, &self.cdfs, 2, 0,
-                &self.cdfs.eob_bin_256_l, dcs16,
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_16X16,
+                lam,
+                16,
+                &self.cdfs,
+                2,
+                0,
+                &self.cdfs.eob_bin_256_l,
+                dcs16,
             );
-            let mut sse = blk_sse16(&idct_dequant_16x16(&cf, &self.quant));
-            let mut bits = block_rate_bits(&cf, &SCAN_16X16);
-            let mut is_adst = false;
-            if adst8() {
-                let (mut acf, atf) = adst16x16_t(&resid, &self.quant);
-                trellis_optimize_ctx(
-                    &mut acf, &atf, dcq, acq, &SCAN_16X16, lam, 16, &self.cdfs, 2, 0,
-                    &self.cdfs.eob_bin_256_l, dcs16,
-                );
-                let asse = blk_sse16(&iadst_dequant_16x16(&acf, &self.quant));
-                let abits = block_rate_bits(&acf, &SCAN_16X16);
-                if asse as f64 + mlam * abits < sse as f64 + mlam * bits {
-                    cf = acf;
-                    sse = asse;
-                    bits = abits;
-                    is_adst = true;
-                }
-            }
-            let bits = bits + mode_signal_bits(m);
-            let cost = sse as f64 + mlam * bits;
+            let sse = blk_sse16(&idct_dequant_16x16(&cf, &self.quant));
+            let bits = block_rate_bits(&cf, &SCAN_16X16);
+            let cost = sse as f64 + mlam * (bits + mode_signal_bits(m));
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
-                best_is_adst16 = is_adst;
                 lpred_arr = pred;
                 lcf = cf;
+                best_dct_sse = sse;
+                best_dct_bits = bits;
+            }
+        }
+        // Winner-only ADST_ADST refinement (see code_block for rationale).
+        if adst8() {
+            let mut resid = [0i32; 256];
+            for (ry, rrow) in resid.chunks_exact_mut(16).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 16..ry * 16 + 16];
+                for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
+                    *r = s - p;
+                }
+            }
+            let (mut acf, atf) = adst16x16_t(&resid, &self.quant);
+            trellis_optimize_ctx(
+                &mut acf,
+                &atf,
+                dcq,
+                acq,
+                &SCAN_16X16,
+                lam,
+                16,
+                &self.cdfs,
+                2,
+                0,
+                &self.cdfs.eob_bin_256_l,
+                dcs16,
+            );
+            let rr = iadst_dequant_16x16(&acf, &self.quant);
+            let mut asse = 0i64;
+            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 16..ry * 16 + 16];
+                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
+                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
+                    let d = s - r;
+                    asse += (d * d) as i64;
+                }
+            }
+            let abits = block_rate_bits(&acf, &SCAN_16X16);
+            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+                lcf = acf;
+                best_is_adst16 = true;
             }
         }
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
-            self.code_block16_420(x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, best_is_adst16);
+            self.code_block16_420(
+                x8,
+                y8,
+                &lcf,
+                &lpred_arr,
+                best_mode,
+                luma_zero,
+                best_is_adst16,
+            );
         } else if self.ss422 {
-            self.code_block16_422(x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, best_is_adst16);
+            self.code_block16_422(
+                x8,
+                y8,
+                &lcf,
+                &lpred_arr,
+                best_mode,
+                luma_zero,
+                best_is_adst16,
+            );
         } else {
-            self.code_block16_444(x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, best_is_adst16);
+            self.code_block16_444(
+                x8,
+                y8,
+                &lcf,
+                &lpred_arr,
+                best_mode,
+                luma_zero,
+                best_is_adst16,
+            );
         }
     }
 
@@ -3423,14 +3482,14 @@ impl<'a> LossyTile<'a> {
         block_skip: bool,
         uv_mode: usize,
         cfl: Option<[i32; 2]>,
-            is_adst16: bool,
+        is_adst16: bool,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (bx4, by4) = (px / 4, py / 4);
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
-            self.mark_skip8(x8, y8, 2, block_skip);
+        self.mark_skip8(x8, y8, 2, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
@@ -3450,7 +3509,16 @@ impl<'a> LossyTile<'a> {
         } else {
             let sk = self.skip_ctx_16(0, bx4, by4, false);
             let ds = self.dc_sign_ctx_16(0, bx4, by4);
-            encode_tx16_coeffs_adapt(&mut self.enc, &mut self.cdfs, lcf, false, sk, ds, y_mode, if is_adst16 { ADST_ADST_TX16_IDX } else { 1 })
+            encode_tx16_coeffs_adapt(
+                &mut self.enc,
+                &mut self.cdfs,
+                lcf,
+                false,
+                sk,
+                ds,
+                y_mode,
+                if is_adst16 { ADST_ADST_TX16_IDX } else { 1 },
+            )
         };
         self.a_coef[0][bx4..bx4 + 4].fill(lres_ctx);
         self.l_coef[0][by4..by4 + 4].fill(lres_ctx);
@@ -3591,23 +3659,47 @@ impl<'a> LossyTile<'a> {
         // At higher quality DC/CfL suffice and SMOOTH_V's <= tie-break causes
         // block-boundary colour mismatches across the whole image.
         if self.quant.ac_q() > 300 {
-            let (dcq, acq, lam) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64, trellis_lambda());
+            let (dcq, acq, lam) = (
+                self.quant.dc_q() as f64,
+                self.quant.ac_q() as f64,
+                trellis_lambda(),
+            );
             let mut sv_ccf16 = [[0i32; 256]; 2];
             let mut sv_preds16 = [[0i32; 256]; 2];
-            let mut sse_cur = 0i64; let mut sse_sv = 0i64;
+            let mut sse_cur = 0i64;
+            let mut sse_sv = 0i64;
             for ci in 0..2 {
                 let plane = ci + 1;
                 for ry in 0..16 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &cpred16[ci][ry * 16..];
-                    for j in 0..16 { let d = srow[j] - prow[j]; sse_cur += (d*d) as i64; }
+                    for j in 0..16 {
+                        let d = srow[j] - prow[j];
+                        sse_cur += (d * d) as i64;
+                    }
                 }
-                intra_predict_nd(SMOOTH_V_PRED, &self.recon[plane], self.w, px, py, 16, 16, false, false, self.w, self.h, &mut sv_preds16[ci], self.bd);
+                intra_predict_nd(
+                    SMOOTH_V_PRED,
+                    &self.recon[plane],
+                    self.w,
+                    px,
+                    py,
+                    16,
+                    16,
+                    false,
+                    false,
+                    self.w,
+                    self.h,
+                    &mut sv_preds16[ci],
+                    self.bd,
+                );
                 let mut resid = [0i32; 256];
                 for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds16[ci][ry * 16..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) { *dv = s - p; }
+                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                        *dv = s - p;
+                    }
                 }
                 let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.quant);
                 sv_ccf16[ci] = q;
@@ -3619,18 +3711,34 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..16 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds16[ci][ry * 16..];
-                    for j in 0..16 { let d = srow[j] - prow[j]; sse_sv += (d*d) as i64; }
+                    for j in 0..16 {
+                        let d = srow[j] - prow[j];
+                        sse_sv += (d * d) as i64;
+                    }
                 }
             }
             if sse_sv <= sse_cur {
-                for ci in 0..2 { ccf[ci] = sv_ccf16[ci]; cpred16[ci] = sv_preds16[ci]; }
+                for ci in 0..2 {
+                    ccf[ci] = sv_ccf16[ci];
+                    cpred16[ci] = sv_preds16[ci];
+                }
                 cfl_opt = None; // SMOOTH_V overrides CfL if it wins
                 chosen_uv_16 = SMOOTH_V_PRED;
             }
         } // end if ac_q > 300 (SMOOTH_V)
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
-        self.code_header_luma16(x8, y8, lcf, lpred, y_mode, block_skip, chosen_uv_16, cfl_opt, is_adst16);
+        self.code_header_luma16(
+            x8,
+            y8,
+            lcf,
+            lpred,
+            y_mode,
+            block_skip,
+            chosen_uv_16,
+            cfl_opt,
+            is_adst16,
+        );
         for ci in 0..2 {
             let plane = ci + 1;
             let res_ctx = if block_skip {
@@ -3638,7 +3746,16 @@ impl<'a> LossyTile<'a> {
             } else {
                 let sk = self.skip_ctx_16(plane, bx4, by4, true);
                 let ds = self.dc_sign_ctx_16(plane, bx4, by4);
-                encode_tx16_coeffs_adapt(&mut self.enc, &mut self.cdfs, &ccf[ci], true, sk, ds, 0, 1)
+                encode_tx16_coeffs_adapt(
+                    &mut self.enc,
+                    &mut self.cdfs,
+                    &ccf[ci],
+                    true,
+                    sk,
+                    ds,
+                    0,
+                    1,
+                )
             };
             self.a_coef[plane][bx4..bx4 + 4].fill(res_ctx);
             self.l_coef[plane][by4..by4 + 4].fill(res_ctx);
@@ -3694,7 +3811,9 @@ impl<'a> LossyTile<'a> {
             let mut resid = [0i32; 64];
             for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) { *dv = s - dc; }
+                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                    *dv = s - dc;
+                }
             }
             let (q, qt) = forward_dct_quant_8x8_t(&resid, &self.quant);
             ccf_dc[ci] = q;
@@ -3708,29 +3827,41 @@ impl<'a> LossyTile<'a> {
         let smooth_v_active = acq > 300.0;
         let mut ccf_sv = [[0i32; 64]; 2];
         let mut sv_preds = [[0i32; 64]; 2];
-        if smooth_v_active { for ci in 0..2 {
-            let plane = ci + 1;
-            intra_predict_nd(
-                SMOOTH_V_PRED, &self.recon[plane], self.cw,
-                cx, cy, 8, 8, false, false, self.cw, self.h,
-                &mut sv_preds[ci], self.bd,
-            );
-            let mut resid = [0i32; 64];
-            for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                let prow = &sv_preds[ci][ry * 8..];
-                for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
-                    *dv = s - p;
+        if smooth_v_active {
+            for ci in 0..2 {
+                let plane = ci + 1;
+                intra_predict_nd(
+                    SMOOTH_V_PRED,
+                    &self.recon[plane],
+                    self.cw,
+                    cx,
+                    cy,
+                    8,
+                    8,
+                    false,
+                    false,
+                    self.cw,
+                    self.h,
+                    &mut sv_preds[ci],
+                    self.bd,
+                );
+                let mut resid = [0i32; 64];
+                for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
+                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                    let prow = &sv_preds[ci][ry * 8..];
+                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                        *dv = s - p;
+                    }
+                }
+                let (q, qt) = forward_dct_quant_8x8_t(&resid, &self.quant);
+                ccf_sv[ci] = q;
+                trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_8X8, lam);
+                let mean_resid_sv = resid.iter().sum::<i32>() / 64;
+                if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
+                    ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
                 }
             }
-            let (q, qt) = forward_dct_quant_8x8_t(&resid, &self.quant);
-            ccf_sv[ci] = q;
-            trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_8X8, lam);
-            let mean_resid_sv = resid.iter().sum::<i32>() / 64;
-            if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
-            }
-        }} // end if smooth_v_active
+        } // end if smooth_v_active
         // RD: reconstruct both and compare SSE; cache inverse-transform for winner reuse
         let mut rr_dc = [[0i32; 64]; 2];
         let mut rr_sv = [[0i32; 64]; 2];
@@ -3741,7 +3872,11 @@ impl<'a> LossyTile<'a> {
             rr_dc[ci] = idct_dequant_8x8(&ccf_dc[ci], &self.quant);
             rr_sv[ci] = idct_dequant_8x8(&ccf_sv[ci], &self.quant);
             let dc = dc_preds[ci];
-            for (ry, (rd_row, rs_row)) in rr_dc[ci].chunks_exact(8).zip(rr_sv[ci].chunks_exact(8)).enumerate() {
+            for (ry, (rd_row, rs_row)) in rr_dc[ci]
+                .chunks_exact(8)
+                .zip(rr_sv[ci].chunks_exact(8))
+                .enumerate()
+            {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 let prow = &sv_preds[ci][ry * 8..];
                 for j in 0..8 {
@@ -3761,7 +3896,9 @@ impl<'a> LossyTile<'a> {
         };
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
-        self.code_header_luma16(x8, y8, lcf, lpred, y_mode, block_skip, chosen_uv, None, is_adst16);
+        self.code_header_luma16(
+            x8, y8, lcf, lpred, y_mode, block_skip, chosen_uv, None, is_adst16,
+        );
         for ci in 0..2 {
             let plane = ci + 1;
             let res_ctx = if block_skip {
@@ -3834,7 +3971,9 @@ impl<'a> LossyTile<'a> {
         }
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
-        self.code_header_luma16(x8, y8, lcf, lpred, y_mode, block_skip, DC_PRED, None, is_adst16);
+        self.code_header_luma16(
+            x8, y8, lcf, lpred, y_mode, block_skip, DC_PRED, None, is_adst16,
+        );
         for ci in 0..2 {
             let plane = ci + 1;
             let res_ctx = if block_skip {
@@ -3884,6 +4023,9 @@ impl<'a> LossyTile<'a> {
         let mut lpred_arr = [0i32; 64];
         let mut lcf = [0i32; 64];
         let mut best_eff = f64::INFINITY;
+        let mut best_dct_sse = 0i64;
+        let mut best_dct_bits = 0f64;
+        let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
         for &m in nd_modes() {
             let mut pred = [0i32; 64];
             if m == DC_PRED {
@@ -3917,10 +4059,8 @@ impl<'a> LossyTile<'a> {
                     *r = s - p;
                 }
             }
-            // Evaluate DCT_DCT, and (when ADST is enabled) ADST_ADST, then keep
-            // whichever transform is cheaper for this prediction mode — the
-            // per-block RD transform choice that libaom/rav1e make.
-            let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
+            // Mode decision uses DCT_DCT only (cheap); the ADST_ADST transform
+            // choice is refined once for the winning mode after the loop.
             let blk_sse = |rr: &[i32; 64]| -> i64 {
                 let mut sse = 0i64;
                 for (ry, (prow, rrow)) in pred.chunks_exact(8).zip(rr.chunks_exact(8)).enumerate() {
@@ -3935,35 +4075,74 @@ impl<'a> LossyTile<'a> {
             };
             let (mut cf, tf) = forward_dct_quant_8x8_t(&resid, &self.quant);
             trellis_optimize_ctx(
-                &mut cf, &tf, dcq, acq, &SCAN_8X8, lam, 8, &self.cdfs, 1, 0,
-                &self.cdfs.eob_bin_64_l, dc_sgn,
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_8X8,
+                lam,
+                8,
+                &self.cdfs,
+                1,
+                0,
+                &self.cdfs.eob_bin_64_l,
+                dc_sgn,
             );
-            let mut sse = blk_sse(&idct_dequant_8x8(&cf, &self.quant));
-            let mut bits = block_rate_bits(&cf, &SCAN_8X8);
-            let mut is_adst = false;
-            if adst8() {
-                let (mut acf, atf) = adst8x8_t(&resid, &self.quant);
-                trellis_optimize_ctx(
-                    &mut acf, &atf, dcq, acq, &SCAN_8X8, lam, 8, &self.cdfs, 1, 0,
-                    &self.cdfs.eob_bin_64_l, dc_sgn,
-                );
-                let asse = blk_sse(&iadst_dequant_8x8(&acf, &self.quant));
-                let abits = block_rate_bits(&acf, &SCAN_8X8);
-                if asse as f64 + mlam * abits < sse as f64 + mlam * bits {
-                    cf = acf;
-                    sse = asse;
-                    bits = abits;
-                    is_adst = true;
-                }
-            }
-            let bits = bits + mode_signal_bits(m);
-            let cost = sse as f64 + mlam * bits;
+            let sse = blk_sse(&idct_dequant_8x8(&cf, &self.quant));
+            let bits = block_rate_bits(&cf, &SCAN_8X8);
+            let cost = sse as f64 + mlam * (bits + mode_signal_bits(m));
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
-                best_is_adst = is_adst;
                 lpred_arr = pred;
                 lcf = cf;
+                best_dct_sse = sse;
+                best_dct_bits = bits;
+            }
+        }
+        // Per-block transform refinement: try ADST_ADST on the winning
+        // prediction only and keep it if cheaper than that mode's DCT. This is
+        // one extra transform+trellis per block instead of one per candidate
+        // mode, which is where the encode-time regression came from.
+        if adst8() {
+            let mut resid = [0i32; 64];
+            for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+                for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
+                    *r = s - p;
+                }
+            }
+            let (mut acf, atf) = adst8x8_t(&resid, &self.quant);
+            trellis_optimize_ctx(
+                &mut acf,
+                &atf,
+                dcq,
+                acq,
+                &SCAN_8X8,
+                lam,
+                8,
+                &self.cdfs,
+                1,
+                0,
+                &self.cdfs.eob_bin_64_l,
+                dc_sgn,
+            );
+            let rr = iadst_dequant_8x8(&acf, &self.quant);
+            let mut asse = 0i64;
+            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
+                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
+                    let d = s - r;
+                    asse += (d * d) as i64;
+                }
+            }
+            let abits = block_rate_bits(&acf, &SCAN_8X8);
+            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+                lcf = acf;
+                best_is_adst = true;
             }
         }
         let mut ccf8 = [[0i32; 64]; 2];
@@ -4105,7 +4284,7 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
-            self.mark_skip8(x8, y8, 1, block_skip);
+        self.mark_skip8(x8, y8, 1, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(best_mode, &mut self.cdfs.kf_y[yctx]);
@@ -4119,23 +4298,46 @@ impl<'a> LossyTile<'a> {
         let mut sv_preds_420 = [[0i32; 16]; 2];
         let mut chosen_uv_block = DC_PRED;
         if !self.mono && self.ss420 && smooth_v_active_ss420 {
-            let (dcq2, acq2, lam2) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64, trellis_lambda());
+            let (dcq2, acq2, lam2) = (
+                self.quant.dc_q() as f64,
+                self.quant.ac_q() as f64,
+                trellis_lambda(),
+            );
             let mut sv_ccf44_2 = [[0i32; 16]; 2];
-            let mut sse_cur = 0i64; let mut sse_sv = 0i64;
+            let mut sse_cur = 0i64;
+            let mut sse_sv = 0i64;
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = cpred[ci];
                 for ry in 0..4 {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    for j in 0..4 { let d = srow[j] - dc; sse_cur += (d*d) as i64; }
+                    for j in 0..4 {
+                        let d = srow[j] - dc;
+                        sse_cur += (d * d) as i64;
+                    }
                 }
-                intra_predict_nd(SMOOTH_V_PRED, &self.recon[plane], self.cw, cx, cy, 4, 4,
-                                  false, false, self.cw, self.h, &mut sv_preds_420[ci], self.bd);
+                intra_predict_nd(
+                    SMOOTH_V_PRED,
+                    &self.recon[plane],
+                    self.cw,
+                    cx,
+                    cy,
+                    4,
+                    4,
+                    false,
+                    false,
+                    self.cw,
+                    self.h,
+                    &mut sv_preds_420[ci],
+                    self.bd,
+                );
                 let mut resid = [0i32; 16];
                 for (ry, drow) in resid.chunks_exact_mut(4).enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds_420[ci][ry * 4..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) { *dv = s - p; }
+                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                        *dv = s - p;
+                    }
                 }
                 let (q, qt) = forward_dct_quant_4x4_t(&resid, &self.quant);
                 sv_ccf44_2[ci] = q;
@@ -4143,11 +4345,16 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..4 {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds_420[ci][ry * 4..];
-                    for j in 0..4 { let d = srow[j] - prow[j]; sse_sv += (d*d) as i64; }
+                    for j in 0..4 {
+                        let d = srow[j] - prow[j];
+                        sse_sv += (d * d) as i64;
+                    }
                 }
             }
             if sse_sv < sse_cur {
-                for ci in 0..2 { ccf44[ci] = sv_ccf44_2[ci]; }
+                for ci in 0..2 {
+                    ccf44[ci] = sv_ccf44_2[ci];
+                }
                 chosen_uv_block = SMOOTH_V_PRED;
             }
         }
@@ -4155,7 +4362,11 @@ impl<'a> LossyTile<'a> {
         // not added here — it introduces too many DC↔SV mode transitions at 8-row
         // boundaries that are visible as faint lines at quality 50-75.
         if !self.mono {
-            self.emit_uv_mode(best_mode, chosen_uv_block, if use_cfl { Some(cfl_alpha_uv) } else { None });
+            self.emit_uv_mode(
+                best_mode,
+                chosen_uv_block,
+                if use_cfl { Some(cfl_alpha_uv) } else { None },
+            );
         }
         let sv = block_skip as u8;
         self.a_skip[bx4] = sv;
@@ -4413,7 +4624,6 @@ impl<'a> LossyTile<'a> {
     /// is 4:4:4-only so far); 4:2:0/4:2:2 always split. The decoder follows the
     /// signalled partition, so this affects compression only, never correctness.
     fn prefer_32x32(&self, x8: usize, y8: usize) -> bool {
-        if force_8x8() { return false; }
         if self.mono {
             return false; // monochrome codes 8x8 luma blocks only
         }
@@ -4582,7 +4792,7 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
-            self.mark_skip8(x8, y8, 4, block_skip);
+        self.mark_skip8(x8, y8, 4, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
@@ -4714,11 +4924,15 @@ impl<'a> LossyTile<'a> {
             4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
         // Gate CfL on low quality: at high quality DC prediction is accurate and CfL
         // alpha varying block-to-block creates visible colour stripes at boundaries.
-        let use_cfl = acq > 300.0 && (cfl_a[0] != 0 || cfl_a[1] != 0)
+        let use_cfl = acq > 300.0
+            && (cfl_a[0] != 0 || cfl_a[1] != 0)
             && cfl_cost[0] + cfl_cost[1] + mlam * cfl_sig < dc_cost[0] + dc_cost[1];
         #[allow(unused_mut)] // cfl_opt mutated in 'sv block when SMOOTH_V wins
-        let (cf_use, pred_dc, mut cfl_opt): (&[[i32; 1024]; 2], [i32; 2], Option<[i32; 2]>) = if use_cfl
-        {
+        let (cf_use, pred_dc, mut cfl_opt): (
+            &[[i32; 1024]; 2],
+            [i32; 2],
+            Option<[i32; 2]>,
+        ) = if use_cfl {
             (&cfl_ccf, cdc, Some(cfl_a))
         } else {
             (&ccf, cdc, None)
@@ -4733,8 +4947,11 @@ impl<'a> LossyTile<'a> {
                 break 'sv (cf_use, DC_PRED);
             }
             let mut sv_ccf32 = [[0i32; 1024]; 2];
-            let mut sse_cur = 0i64; let mut sse_sv = 0i64;
-            let dcq2 = self.quant.dc_q() as f64; let acq2 = self.quant.ac_q() as f64; let lam2 = trellis_lambda();
+            let mut sse_cur = 0i64;
+            let mut sse_sv = 0i64;
+            let dcq2 = self.quant.dc_q() as f64;
+            let acq2 = self.quant.ac_q() as f64;
+            let lam2 = trellis_lambda();
             for ci in 0..2 {
                 let plane = ci + 1;
                 // sse_cur: raw source vs current winner prediction (DC scalar or CfL pixels)
@@ -4742,18 +4959,40 @@ impl<'a> LossyTile<'a> {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     if use_cfl {
                         let prow = &cfl_pred[ci][ry * 32..];
-                        for j in 0..32 { let d = srow[j] - prow[j]; sse_cur += (d*d) as i64; }
+                        for j in 0..32 {
+                            let d = srow[j] - prow[j];
+                            sse_cur += (d * d) as i64;
+                        }
                     } else {
                         let dc = pred_dc[ci];
-                        for j in 0..32 { let d = srow[j] - dc; sse_cur += (d*d) as i64; }
+                        for j in 0..32 {
+                            let d = srow[j] - dc;
+                            sse_cur += (d * d) as i64;
+                        }
                     }
                 }
-                intra_predict_nd(SMOOTH_V_PRED, &self.recon[plane], self.w, px, py, 32, 32, false, false, self.w, self.h, &mut sv_preds32[ci], self.bd);
+                intra_predict_nd(
+                    SMOOTH_V_PRED,
+                    &self.recon[plane],
+                    self.w,
+                    px,
+                    py,
+                    32,
+                    32,
+                    false,
+                    false,
+                    self.w,
+                    self.h,
+                    &mut sv_preds32[ci],
+                    self.bd,
+                );
                 let mut resid = [0i32; 1024];
                 for (ry, drow) in resid.chunks_exact_mut(32).enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds32[ci][ry * 32..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) { *dv = s - p; }
+                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                        *dv = s - p;
+                    }
                 }
                 let (q, qt) = forward_dct_quant_32x32_t(&resid, &self.quant);
                 sv_ccf32[ci] = q;
@@ -4765,7 +5004,10 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..32 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds32[ci][ry * 32..];
-                    for j in 0..32 { let d = srow[j] - prow[j]; sse_sv += (d*d) as i64; }
+                    for j in 0..32 {
+                        let d = srow[j] - prow[j];
+                        sse_sv += (d * d) as i64;
+                    }
                 }
             }
             if sse_sv < sse_cur {
@@ -4777,7 +5019,16 @@ impl<'a> LossyTile<'a> {
         };
         let block_skip =
             luma_zero && final_cf[0].iter().all(|&c| c == 0) && final_cf[1].iter().all(|&c| c == 0);
-        self.code_header_luma32(x8, y8, lcf, lpred, y_mode, block_skip, chosen_uv_32, cfl_opt);
+        self.code_header_luma32(
+            x8,
+            y8,
+            lcf,
+            lpred,
+            y_mode,
+            block_skip,
+            chosen_uv_32,
+            cfl_opt,
+        );
         for ci in 0..2 {
             let plane = ci + 1;
             let cres = if block_skip {
@@ -4789,15 +5040,28 @@ impl<'a> LossyTile<'a> {
             };
             self.a_coef[plane][bx4..bx4 + 8].fill(cres);
             self.l_coef[plane][by4..by4 + 8].fill(cres);
-            let crr = if block_skip { [0i32; 1024] } else { idct_dequant_32x32(&final_cf[ci], &self.quant) };
+            let crr = if block_skip {
+                [0i32; 1024]
+            } else {
+                idct_dequant_32x32(&final_cf[ci], &self.quant)
+            };
             for (ry, rrow) in crr.chunks_exact(32).enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                 if chosen_uv_32 == SMOOTH_V_PRED {
                     let prow = &sv_preds32[ci][ry * 32..];
-                    for (j, (dv, &rv)) in drow[..32].iter_mut().zip(rrow.iter()).enumerate() { *dv = (prow[j] + rv).clamp(0, (1 << self.bd) - 1); }
+                    for (j, (dv, &rv)) in drow[..32].iter_mut().zip(rrow.iter()).enumerate() {
+                        *dv = (prow[j] + rv).clamp(0, (1 << self.bd) - 1);
+                    }
                 } else {
-                    let base = if use_cfl { cfl_pred[ci][ry * 32..][0] } else { pred_dc[ci] };
-                    for (dv, (&cp, &rv)) in drow[..32].iter_mut().zip(cfl_pred[ci][ry*32..].iter().zip(rrow.iter())) {
+                    let base = if use_cfl {
+                        cfl_pred[ci][ry * 32..][0]
+                    } else {
+                        pred_dc[ci]
+                    };
+                    for (dv, (&cp, &rv)) in drow[..32]
+                        .iter_mut()
+                        .zip(cfl_pred[ci][ry * 32..].iter().zip(rrow.iter()))
+                    {
                         let b = if use_cfl { cp } else { base };
                         *dv = (b + rv).clamp(0, (1 << self.bd) - 1);
                     }
@@ -4821,7 +5085,11 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         let (cx, cy) = (px / 2, py / 2);
         let (bx4c, by4c) = (cx / 4, cy / 4);
-        let (dcq, acq, lam) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64, trellis_lambda());
+        let (dcq, acq, lam) = (
+            self.quant.dc_q() as f64,
+            self.quant.ac_q() as f64,
+            trellis_lambda(),
+        );
         let maxval = (1 << self.bd) - 1;
         let mut ccf_dc = [[0i32; 256]; 2];
         let mut dc_preds = [0i32; 2];
@@ -4832,7 +5100,9 @@ impl<'a> LossyTile<'a> {
             let mut resid = [0i32; 256];
             for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) { *dv = s - dc; }
+                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                    *dv = s - dc;
+                }
             }
             let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.quant);
             ccf_dc[ci] = q;
@@ -4845,63 +5115,112 @@ impl<'a> LossyTile<'a> {
         let smooth_v_active_32 = dcq > 300.0;
         let mut ccf_sv = [[0i32; 256]; 2];
         let mut sv_preds = [[0i32; 256]; 2];
-        if smooth_v_active_32 { for ci in 0..2 {
-            let plane = ci + 1;
-            intra_predict_nd(SMOOTH_V_PRED, &self.recon[plane], self.cw, cx, cy, 16, 16, false, false, self.cw, self.h, &mut sv_preds[ci], self.bd);
-            let mut resid = [0i32; 256];
-            for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                let prow = &sv_preds[ci][ry * 16..];
-                for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) { *dv = s - p; }
+        if smooth_v_active_32 {
+            for ci in 0..2 {
+                let plane = ci + 1;
+                intra_predict_nd(
+                    SMOOTH_V_PRED,
+                    &self.recon[plane],
+                    self.cw,
+                    cx,
+                    cy,
+                    16,
+                    16,
+                    false,
+                    false,
+                    self.cw,
+                    self.h,
+                    &mut sv_preds[ci],
+                    self.bd,
+                );
+                let mut resid = [0i32; 256];
+                for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                    let prow = &sv_preds[ci][ry * 16..];
+                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                        *dv = s - p;
+                    }
+                }
+                let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.quant);
+                ccf_sv[ci] = q;
+                trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_16X16, lam);
+                let mean_resid_sv = resid.iter().sum::<i32>() / 256;
+                if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
+                    ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
+                }
             }
-            let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.quant);
-            ccf_sv[ci] = q;
-            trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_16X16, lam);
-            let mean_resid_sv = resid.iter().sum::<i32>() / 256;
-            if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
-            }
-        }} // end if smooth_v_active_32
-        let mut rr_dc = [[0i32; 256]; 2]; let mut rr_sv = [[0i32; 256]; 2];
-        let mut sse_dc = 0i64; let mut sse_sv = 0i64;
+        } // end if smooth_v_active_32
+        let mut rr_dc = [[0i32; 256]; 2];
+        let mut rr_sv = [[0i32; 256]; 2];
+        let mut sse_dc = 0i64;
+        let mut sse_sv = 0i64;
         for ci in 0..2 {
             let plane = ci + 1;
             rr_dc[ci] = idct_dequant_16x16(&ccf_dc[ci], &self.quant);
             rr_sv[ci] = idct_dequant_16x16(&ccf_sv[ci], &self.quant);
             let dc = dc_preds[ci];
-            for (ry, (rd_row, rs_row)) in rr_dc[ci].chunks_exact(16).zip(rr_sv[ci].chunks_exact(16)).enumerate() {
+            for (ry, (rd_row, rs_row)) in rr_dc[ci]
+                .chunks_exact(16)
+                .zip(rr_sv[ci].chunks_exact(16))
+                .enumerate()
+            {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 let prow = &sv_preds[ci][ry * 16..];
                 for j in 0..16 {
                     let s = srow[j];
                     let d = s - (dc + rd_row[j]).clamp(0, maxval);
                     let v = s - (prow[j] + rs_row[j]).clamp(0, maxval);
-                    sse_dc += (d * d) as i64; sse_sv += (v * v) as i64;
+                    sse_dc += (d * d) as i64;
+                    sse_sv += (v * v) as i64;
                 }
             }
         }
         let use_sv = smooth_v_active_32 && sse_sv <= sse_dc;
-        let (chosen_uv, ccf, rr_cache) = if use_sv { (SMOOTH_V_PRED, ccf_sv, rr_sv) } else { (DC_PRED, ccf_dc, rr_dc) };
-        let block_skip = luma_zero && ccf[0].iter().all(|&c|c==0) && ccf[1].iter().all(|&c|c==0);
+        let (chosen_uv, ccf, rr_cache) = if use_sv {
+            (SMOOTH_V_PRED, ccf_sv, rr_sv)
+        } else {
+            (DC_PRED, ccf_dc, rr_dc)
+        };
+        let block_skip =
+            luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma32(x8, y8, lcf, lpred, y_mode, block_skip, chosen_uv, None);
         for ci in 0..2 {
             let plane = ci + 1;
-            let res_ctx = if block_skip { 0x40 } else {
+            let res_ctx = if block_skip {
+                0x40
+            } else {
                 let sk = self.skip_ctx_16(plane, bx4c, by4c, true);
                 let ds = self.dc_sign_ctx_16(plane, bx4c, by4c);
-                encode_tx16_coeffs_adapt(&mut self.enc, &mut self.cdfs, &ccf[ci], true, sk, ds, 0, 1)
+                encode_tx16_coeffs_adapt(
+                    &mut self.enc,
+                    &mut self.cdfs,
+                    &ccf[ci],
+                    true,
+                    sk,
+                    ds,
+                    0,
+                    1,
+                )
             };
             self.a_coef[plane][bx4c..bx4c + 4].fill(res_ctx);
             self.l_coef[plane][by4c..by4c + 4].fill(res_ctx);
-            let rr = if block_skip { [0i32; 256] } else { rr_cache[ci] };
+            let rr = if block_skip {
+                [0i32; 256]
+            } else {
+                rr_cache[ci]
+            };
             for (ry, rrow) in rr.chunks_exact(16).enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
                     let prow = &sv_preds[ci][ry * 16..];
-                    for (j, (dv, &rv)) in drow[..16].iter_mut().zip(rrow.iter()).enumerate() { *dv = (prow[j] + rv).clamp(0, maxval); }
+                    for (j, (dv, &rv)) in drow[..16].iter_mut().zip(rrow.iter()).enumerate() {
+                        *dv = (prow[j] + rv).clamp(0, maxval);
+                    }
                 } else {
                     let dc = dc_preds[ci];
-                    for (dv, &rv) in drow[..16].iter_mut().zip(rrow.iter()) { *dv = (dc + rv).clamp(0, maxval); }
+                    for (dv, &rv) in drow[..16].iter_mut().zip(rrow.iter()) {
+                        *dv = (dc + rv).clamp(0, maxval);
+                    }
                 }
             }
         }
@@ -5449,7 +5768,7 @@ fn encode_lossy_tilegroup(
     sub_y: usize,
     mono: bool,
     threads: usize,
-) -> (Vec<u8>, [Vec<i32>; 3], Tiling, crate::cdef::CdefParams) {
+) -> (Vec<u8>, [Vec<i32>; 3], Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
 
@@ -5565,22 +5884,8 @@ fn encode_lossy_tilegroup(
         payloads.push(out.payload);
     }
 
-    // Frame-level CDEF: RD-search the strength against the source, then apply
-    // (a no-op preset is always in the search, so this never hurts fidelity).
-    let cdef = if mono || !crate::cdef::cdef_enabled() {
-        // CDEF off (default) or mono/alpha: no-op preset, no search (fast path).
-        crate::cdef::CdefParams { damping: 3, y_pri: 0, y_sec: 0, uv_pri: 0, uv_sec: 0 }
-    } else {
-        crate::cdef::search_params(
-            &recon, src, w8, h8, cw8, ch8, sub_x, sub_y, mono, &skip8, sb8w, bd,
-        )
-    };
-    crate::cdef::apply_cdef(
-        &mut recon, w8, h8, cw8, ch8, sub_x, sub_y, mono, &skip8, sb8w, &cdef, bd,
-    );
-
     let tilegroup = assemble_tilegroup(payloads);
-    (tilegroup, recon, plan, cdef)
+    (tilegroup, recon, plan)
 }
 
 /// Concatenate per-tile payloads into a tile-group. A single tile is returned
@@ -5611,13 +5916,7 @@ fn assemble_tilegroup(payloads: Vec<Vec<u8>>) -> Vec<u8> {
 /// (type 3) + `OBU_TILE_GROUP` (type 4), which strict parsers (ffmpeg's
 /// `av1_frame_merge` BSF) handle reliably where a multi-tile combined
 /// `OBU_FRAME` does not.
-fn assemble_frame_obus(
-    base_q_idx: u8,
-    plan: &Tiling,
-    tilegroup: &[u8],
-    mono: bool,
-    cdef: &crate::cdef::CdefParams,
-) -> Vec<u8> {
+fn assemble_frame_obus(base_q_idx: u8, plan: &Tiling, tilegroup: &[u8], mono: bool) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = frame_header_lossy_multitile_th(
             base_q_idx,
@@ -5626,12 +5925,11 @@ fn assemble_frame_obus(
             plan.tcl,
             plan.trl,
             mono,
-            cdef,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
         let fh =
-            frame_header_lossy_multitile(base_q_idx, &plan.cols_incr, &plan.rows_incr, 0, 0, mono, cdef);
+            frame_header_lossy_multitile(base_q_idx, &plan.cols_incr, &plan.rows_incr, 0, 0, mono);
         wrap_obu_frame(&fh, tilegroup)
     }
 }
@@ -5794,7 +6092,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
         pad_to_mult8(u, w, h, w8, h8),
         pad_to_mult8(v, w, h, w8, h8),
     ];
-    let (payload, recon, plan, cdef) =
+    let (payload, recon, plan) =
         encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, false, threads);
     let profile = if bd == 12 { 2 } else { 1 };
     let mut bytes = Vec::new();
@@ -5802,7 +6100,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp(
         w as u32, h as u32, profile, bd, color,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, &cdef));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
     (bytes, recon, (w8, h8))
 }
 
@@ -5847,14 +6145,14 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan, cdef) =
+    let (payload, recon, plan) =
         encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 0, false, threads);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, 2, bd, color, 1, 0,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, &cdef));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
     (bytes, recon, (w8, h8, cw8))
 }
 
@@ -5902,7 +6200,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan, cdef) =
+    let (payload, recon, plan) =
         encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 1, false, threads);
     let profile = if bd == 12 { 2 } else { 0 };
     let mut bytes = Vec::new();
@@ -5910,10 +6208,9 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, profile, bd, color, 1, 1,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, &cdef));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
     (bytes, recon, (w8, h8, cw8, ch8))
 }
-
 
 /// Encode a **monochrome** (single luma plane) AV1 still — the form AVIF uses
 /// for an alpha auxiliary image. `luma` is the `w*h` grayscale plane (e.g. the
@@ -5953,14 +6250,14 @@ pub(crate) fn encode_av1_mono_image_recon_dbg(
     assert!(w > 0 && h > 0, "width/height must be non-zero");
     let (w8, h8) = (align8(w), align8(h));
     let src = [pad_to_mult8(luma, w, h, w8, h8), Vec::new(), Vec::new()];
-    let (payload, recon, plan, cdef) =
+    let (payload, recon, plan) =
         encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, true, threads);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mono(
         w as u32, h as u32, bd, full_range,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, true, &cdef));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, true));
     let [luma_recon, _, _] = recon;
     (bytes, luma_recon, w8, h8)
 }
@@ -5975,72 +6272,106 @@ mod tests {
         let mut y = vec![0i32; w * h];
         let mut u = vec![0i32; w * h];
         let mut v = vec![0i32; w * h];
-        for j in 0..h { for i in 0..w {
-            let t = j as f32 / h as f32;
-            let n = ((i*13+j*7)%17) as i32 - 8;
-            y[j*w+i] = ((180.0 - 40.0*t) as i32 + n*3/5).clamp(0,255);
-            u[j*w+i] = ((128.0 - 16.0*t) as i32 + n/2).clamp(0,255);
-            v[j*w+i] = ((140.0 - 20.0*t) as i32).clamp(0,255);
-        }}
+        for j in 0..h {
+            for i in 0..w {
+                let t = j as f32 / h as f32;
+                let n = ((i * 13 + j * 7) % 17) as i32 - 8;
+                y[j * w + i] = ((180.0 - 40.0 * t) as i32 + n * 3 / 5).clamp(0, 255);
+                u[j * w + i] = ((128.0 - 16.0 * t) as i32 + n / 2).clamp(0, 255);
+                v[j * w + i] = ((140.0 - 20.0 * t) as i32).clamp(0, 255);
+            }
+        }
         let color = ColorEncoding::srgb_ycbcr();
         let q = 65u8; // quality ~75
-        let (_b, recon, (w8,_h8)) =
+        let (_b, recon, (w8, _h8)) =
             super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
         // Count chroma row-mean boundary jumps (>=1 count at 16/32 multiples)
-        let mut bj = 0; let mut maxj = 0.0f64;
+        let mut bj = 0;
+        let mut maxj = 0.0f64;
         for r in 1..h {
-            if r % 16 != 0 && r % 32 != 0 { continue; }
-            let m0: f64 = (0..w).map(|c| recon[2][(r-1)*w8+c] as f64).sum::<f64>() / w as f64;
-            let m1: f64 = (0..w).map(|c| recon[2][r*w8+c] as f64).sum::<f64>() / w as f64;
+            if r % 16 != 0 && r % 32 != 0 {
+                continue;
+            }
+            let m0: f64 = (0..w)
+                .map(|c| recon[2][(r - 1) * w8 + c] as f64)
+                .sum::<f64>()
+                / w as f64;
+            let m1: f64 = (0..w).map(|c| recon[2][r * w8 + c] as f64).sum::<f64>() / w as f64;
             let d = (m1 - m0).abs();
-            if d >= 1.0 { bj += 1; }
-            if d > maxj { maxj = d; }
+            if d >= 1.0 {
+                bj += 1;
+            }
+            if d > maxj {
+                maxj = d;
+            }
         }
         eprintln!("BANDTEST 444 q{q}: chroma boundary_jumps={bj} max={maxj:.2}");
         // Without the deblock filter this image showed ~22 jumps (max ~2.2);
         // the filter must keep boundary banding small.
-        assert!(maxj <= 1.5, "deblock filter should suppress chroma banding (max={maxj})");
+        assert!(
+            maxj <= 1.5,
+            "deblock filter should suppress chroma banding (max={maxj})"
+        );
     }
 
     #[test]
     fn loop_filter_bit_exact_422() {
-        if !dav1d_available() { eprintln!("skip 422: no dav1d"); return; }
-        crate::cdef::set_cdef_enabled(true); // exercise CDEF in this test
+        if !dav1d_available() {
+            eprintln!("skip 422: no dav1d");
+            return;
+        }
         use crate::color::ColorEncoding;
         let (w, h) = (128usize, 96usize);
         let cw = w / 2;
         let mut y = vec![0i32; w * h];
         let mut u = vec![0i32; cw * h];
         let mut v = vec![0i32; cw * h];
-        for j in 0..h { for i in 0..w {
-            let t = j as f32 / h as f32;
-            let n = ((i*13+j*7)%17) as i32 - 8;
-            y[j*w+i] = ((180.0 - 40.0*t) as i32 + n).clamp(0,255);
-        }}
-        for j in 0..h { for i in 0..cw {
-            let t = j as f32 / h as f32;
-            u[j*cw+i] = (128.0 - 10.0*t) as i32;
-            v[j*cw+i] = (140.0 - 12.0*t) as i32;
-        }}
+        for j in 0..h {
+            for i in 0..w {
+                let t = j as f32 / h as f32;
+                let n = ((i * 13 + j * 7) % 17) as i32 - 8;
+                y[j * w + i] = ((180.0 - 40.0 * t) as i32 + n).clamp(0, 255);
+            }
+        }
+        for j in 0..h {
+            for i in 0..cw {
+                let t = j as f32 / h as f32;
+                u[j * cw + i] = (128.0 - 10.0 * t) as i32;
+                v[j * cw + i] = (140.0 - 12.0 * t) as i32;
+            }
+        }
         let color = ColorEncoding::srgb_ycbcr();
         for &q in &[52u8, 129] {
-            let (bytes, recon, (w8,_h8,cw8)) =
+            let (bytes, recon, (w8, _h8, cw8)) =
                 super::encode_av1_lossy_image_422_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
             std::fs::write("/tmp/lf422.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i","/tmp/lf422.obu","-o","/tmp/lf422.y4m","--quiet"]).status().unwrap();
+                .args(["-i", "/tmp/lf422.obu", "-o", "/tmp/lf422.y4m", "--quiet"])
+                .status()
+                .unwrap();
             assert!(st.success(), "dav1d decode failed q{q}");
             let d = std::fs::read("/tmp/lf422.y4m").unwrap();
-            let nl = d.iter().position(|&b| b==b'\n').unwrap();
-            let fnl = d[nl+1..].iter().position(|&b| b==b'\n').unwrap();
-            let p = &d[nl+1+fnl+1..];
-            let (dy,du,dv) = (&p[0..w*h], &p[w*h..w*h+cw*h], &p[w*h+cw*h..w*h+2*cw*h]);
-            let mut md=0i32; let mut mdc=0i32;
-            for j in 0..h { for i in 0..w { md = md.max((recon[0][j*w8+i]-dy[j*w+i] as i32).abs()); }}
-            for j in 0..h { for i in 0..cw {
-                mdc = mdc.max((recon[1][j*cw8+i]-du[j*cw+i] as i32).abs());
-                mdc = mdc.max((recon[2][j*cw8+i]-dv[j*cw+i] as i32).abs());
-            }}
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let (dy, du, dv) = (
+                &p[0..w * h],
+                &p[w * h..w * h + cw * h],
+                &p[w * h + cw * h..w * h + 2 * cw * h],
+            );
+            let mut md = 0i32;
+            let mut mdc = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    md = md.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                }
+            }
+            for j in 0..h {
+                for i in 0..cw {
+                    mdc = mdc.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                    mdc = mdc.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                }
+            }
             eprintln!("LF422 q{q}: luma_maxdiff={md} chroma_maxdiff={mdc}");
             assert_eq!(md, 0, "422 luma not bit-exact q{q}");
             assert_eq!(mdc, 0, "422 chroma not bit-exact q{q}");
@@ -6049,39 +6380,48 @@ mod tests {
 
     #[test]
     fn loop_filter_bit_exact_444() {
-        if !dav1d_available() { eprintln!("skip loop_filter_bit_exact_444: no dav1d"); return; }
-        crate::cdef::set_cdef_enabled(true); // exercise CDEF in this test
+        if !dav1d_available() {
+            eprintln!("skip loop_filter_bit_exact_444: no dav1d");
+            return;
+        }
         use crate::color::ColorEncoding;
         let (w, h) = (128usize, 96usize);
         let mut y = vec![0i32; w * h];
         let mut u = vec![0i32; w * h];
         let mut v = vec![0i32; w * h];
-        for j in 0..h { for i in 0..w {
-            let t = j as f32 / h as f32;
-            let n = ((i*13+j*7)%17) as i32 - 8;
-            y[j*w+i] = ((180.0 - 40.0*t) as i32 + n).clamp(0,255);
-            u[j*w+i] = ((128.0 - 10.0*t) as i32 + n/2).clamp(0,255);
-            v[j*w+i] = ((140.0 - 12.0*t) as i32).clamp(0,255);
-        }}
+        for j in 0..h {
+            for i in 0..w {
+                let t = j as f32 / h as f32;
+                let n = ((i * 13 + j * 7) % 17) as i32 - 8;
+                y[j * w + i] = ((180.0 - 40.0 * t) as i32 + n).clamp(0, 255);
+                u[j * w + i] = ((128.0 - 10.0 * t) as i32 + n / 2).clamp(0, 255);
+                v[j * w + i] = ((140.0 - 12.0 * t) as i32).clamp(0, 255);
+            }
+        }
         let color = ColorEncoding::srgb_ycbcr();
         for &q in &[52u8, 129] {
-            let (bytes, recon, (w8,_h8)) =
+            let (bytes, recon, (w8, _h8)) =
                 super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
             std::fs::write("/tmp/lf444.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i","/tmp/lf444.obu","-o","/tmp/lf444.y4m","--quiet"]).status().unwrap();
+                .args(["-i", "/tmp/lf444.obu", "-o", "/tmp/lf444.y4m", "--quiet"])
+                .status()
+                .unwrap();
             assert!(st.success(), "dav1d decode failed q{q}");
             let d = std::fs::read("/tmp/lf444.y4m").unwrap();
-            let nl = d.iter().position(|&b| b==b'\n').unwrap();
-            let fnl = d[nl+1..].iter().position(|&b| b==b'\n').unwrap();
-            let p = &d[nl+1+fnl+1..];
-            let (dy,du,dv) = (&p[0..w*h], &p[w*h..2*w*h], &p[2*w*h..3*w*h]);
-            let mut md=0i32; let mut mdc=0i32;
-            for j in 0..h { for i in 0..w {
-                md = md.max((recon[0][j*w8+i]-dy[j*w+i] as i32).abs());
-                mdc = mdc.max((recon[1][j*w8+i]-du[j*w+i] as i32).abs());
-                mdc = mdc.max((recon[2][j*w8+i]-dv[j*w+i] as i32).abs());
-            }}
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let (dy, du, dv) = (&p[0..w * h], &p[w * h..2 * w * h], &p[2 * w * h..3 * w * h]);
+            let mut md = 0i32;
+            let mut mdc = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    md = md.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                    mdc = mdc.max((recon[1][j * w8 + i] - du[j * w + i] as i32).abs());
+                    mdc = mdc.max((recon[2][j * w8 + i] - dv[j * w + i] as i32).abs());
+                }
+            }
             eprintln!("LF444 q{q}: luma_maxdiff={md} chroma_maxdiff={mdc}");
             assert_eq!(md, 0, "444 luma not bit-exact q{q}");
             assert_eq!(mdc, 0, "444 chroma not bit-exact q{q}");
@@ -6094,241 +6434,267 @@ mod tests {
 
     #[test]
     fn compare_banding_across_formats() {
-        if !dav1d_available() { eprintln!("skip: no dav1d"); return; }
+        if !dav1d_available() {
+            eprintln!("skip: no dav1d");
+            return;
+        }
         use crate::color::ColorEncoding;
         let (w, h) = (256usize, 256usize);
         // Gentle sky: small gradient + faint texture (closer to a real photo).
-        let mut fy = vec![0i32; w*h]; let mut fu = vec![0i32; w*h]; let mut fv = vec![0i32; w*h];
-        for j in 0..h { for i in 0..w {
-            let t = j as f32 / h as f32;
-            let nn = (((i*13+j*7)%11) as i32 - 5) as f32 * 0.5;
-            fy[j*w+i]=((200.0-18.0*t+nn) as i32).clamp(0,255);
-            fu[j*w+i]=((124.0-7.0*t) as i32).clamp(0,255);
-            fv[j*w+i]=((134.0-9.0*t) as i32).clamp(0,255);
-        }}
+        let mut fy = vec![0i32; w * h];
+        let mut fu = vec![0i32; w * h];
+        let mut fv = vec![0i32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let t = j as f32 / h as f32;
+                let nn = (((i * 13 + j * 7) % 11) as i32 - 5) as f32 * 0.5;
+                fy[j * w + i] = ((200.0 - 18.0 * t + nn) as i32).clamp(0, 255);
+                fu[j * w + i] = ((124.0 - 7.0 * t) as i32).clamp(0, 255);
+                fv[j * w + i] = ((134.0 - 9.0 * t) as i32).clamp(0, 255);
+            }
+        }
         let color = ColorEncoding::srgb_ycbcr();
         let q = 65u8;
         // helper: low-freq profile p2p + max block step of (recon-src) for a plane
-        fn analyze(recon: &[i32], rw: usize, src: &[i32], sw: usize, w: usize, h: usize) -> (f64,f64) {
+        fn analyze(
+            recon: &[i32],
+            rw: usize,
+            src: &[i32],
+            sw: usize,
+            w: usize,
+            h: usize,
+        ) -> (f64, f64) {
             let mut prof = vec![0.0f64; h];
-            for j in 0..h { let mut e=0.0; for i in 0..w { e += (recon[j*rw+i]-src[j*sw+i]) as f64; } prof[j]=e/w as f64; }
-            let lo=prof.iter().cloned().fold(f64::INFINITY,f64::min);
-            let hi=prof.iter().cloned().fold(f64::NEG_INFINITY,f64::max);
-            let mut ms=0.0f64; for j in 1..h { if j%8==0 { ms=ms.max((prof[j]-prof[j-1]).abs()); } }
-            (hi-lo, ms)
+            for j in 0..h {
+                let mut e = 0.0;
+                for i in 0..w {
+                    e += (recon[j * rw + i] - src[j * sw + i]) as f64;
+                }
+                prof[j] = e / w as f64;
+            }
+            let lo = prof.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = prof.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mut ms = 0.0f64;
+            for j in 1..h {
+                if j % 8 == 0 {
+                    ms = ms.max((prof[j] - prof[j - 1]).abs());
+                }
+            }
+            (hi - lo, ms)
         }
         let p444;
         {
-            let (_b,r,(w8,_))=super::encode_av1_lossy_image_cs_recon_dbg(q,8,w,h,&fy,&fu,&fv,&color,1);
-            let (yp,ys)=analyze(&r[0],w8,&fy,w,w,h);
-            let (up,us)=analyze(&r[1],w8,&fu,w,w,h);
+            let (_b, r, (w8, _)) =
+                super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &fy, &fu, &fv, &color, 1);
+            let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
+            let (up, us) = analyze(&r[1], w8, &fu, w, w, h);
             eprintln!("FMT 444: luma p2p={yp:.2} step={ys:.2} | U p2p={up:.2} step={us:.2}");
             p444 = yp;
         }
         // 4:2:0 (subsample chroma 2x2)
         let p420;
         {
-            let (cw,ch)=(w/2,h/2);
-            let mut u=vec![0i32;cw*ch]; let mut v=vec![0i32;cw*ch];
-            for j in 0..ch { for i in 0..cw {
-                u[j*cw+i]=(fu[2*j*w+2*i]+fu[2*j*w+2*i+1]+fu[(2*j+1)*w+2*i]+fu[(2*j+1)*w+2*i+1]+2)/4;
-                v[j*cw+i]=(fv[2*j*w+2*i]+fv[2*j*w+2*i+1]+fv[(2*j+1)*w+2*i]+fv[(2*j+1)*w+2*i+1]+2)/4;
-            }}
-            let (_b,r,(w8,_,cw8,_))=super::encode_av1_lossy_image_420_recon_dbg(q,8,w,h,&fy,&u,&v,&color,1);
-            let (yp,ys)=analyze(&r[0],w8,&fy,w,w,h);
-            let (up,us)=analyze(&r[1],cw8,&u,cw,cw,ch);
+            let (cw, ch) = (w / 2, h / 2);
+            let mut u = vec![0i32; cw * ch];
+            let mut v = vec![0i32; cw * ch];
+            for j in 0..ch {
+                for i in 0..cw {
+                    u[j * cw + i] = (fu[2 * j * w + 2 * i]
+                        + fu[2 * j * w + 2 * i + 1]
+                        + fu[(2 * j + 1) * w + 2 * i]
+                        + fu[(2 * j + 1) * w + 2 * i + 1]
+                        + 2)
+                        / 4;
+                    v[j * cw + i] = (fv[2 * j * w + 2 * i]
+                        + fv[2 * j * w + 2 * i + 1]
+                        + fv[(2 * j + 1) * w + 2 * i]
+                        + fv[(2 * j + 1) * w + 2 * i + 1]
+                        + 2)
+                        / 4;
+                }
+            }
+            let (_b, r, (w8, _, cw8, _)) =
+                super::encode_av1_lossy_image_420_recon_dbg(q, 8, w, h, &fy, &u, &v, &color, 1);
+            let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
+            let (up, us) = analyze(&r[1], cw8, &u, cw, cw, ch);
             eprintln!("FMT 420: luma p2p={yp:.2} step={ys:.2} | U p2p={up:.2} step={us:.2}");
             p420 = yp;
         }
         // 4:2:2 (subsample chroma horizontally)
         let p422;
         {
-            let cw=w/2;
-            let mut u=vec![0i32;cw*h]; let mut v=vec![0i32;cw*h];
-            for j in 0..h { for i in 0..cw {
-                u[j*cw+i]=(fu[j*w+2*i]+fu[j*w+2*i+1]+1)/2;
-                v[j*cw+i]=(fv[j*w+2*i]+fv[j*w+2*i+1]+1)/2;
-            }}
-            let (_b,r,(w8,_,cw8))=super::encode_av1_lossy_image_422_recon_dbg(q,8,w,h,&fy,&u,&v,&color,1);
-            let (yp,ys)=analyze(&r[0],w8,&fy,w,w,h);
-            let (up,us)=analyze(&r[1],cw8,&u,cw,cw,h);
+            let cw = w / 2;
+            let mut u = vec![0i32; cw * h];
+            let mut v = vec![0i32; cw * h];
+            for j in 0..h {
+                for i in 0..cw {
+                    u[j * cw + i] = (fu[j * w + 2 * i] + fu[j * w + 2 * i + 1] + 1) / 2;
+                    v[j * cw + i] = (fv[j * w + 2 * i] + fv[j * w + 2 * i + 1] + 1) / 2;
+                }
+            }
+            let (_b, r, (w8, _, cw8)) =
+                super::encode_av1_lossy_image_422_recon_dbg(q, 8, w, h, &fy, &u, &v, &color, 1);
+            let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
+            let (up, us) = analyze(&r[1], cw8, &u, cw, cw, h);
             eprintln!("FMT 422: luma p2p={yp:.2} step={ys:.2} | U p2p={up:.2} step={us:.2}");
             p422 = yp;
         }
         // The smoothness gate must keep 4:4:4 / 4:2:0 luma banding in line with
         // 4:2:2 (which never used large transforms): no format may band much
         // worse than the 8x8-only baseline.
-        assert!(p444 <= p422 + 0.5, "4:4:4 luma bands worse than 4:2:2: {p444} vs {p422}");
-        assert!(p420 <= p422 + 0.5, "4:2:0 luma bands worse than 4:2:2: {p420} vs {p422}");
-    }
-
-    #[test]
-    fn adst8_bit_exact_and_corner() {
-        if !dav1d_available() { eprintln!("skip: no dav1d"); return; }
-        use crate::color::ColorEncoding;
-        let (w,h)=(128usize,128usize);
-        let mut y=vec![0i32;w*h]; let mut u=vec![0i32;w*h]; let mut v=vec![0i32;w*h];
-        for j in 0..h { for i in 0..w {
-            let base=70+(i as i32)/6+(j as i32)/9;
-            let tex=(((i*7+j*13)%11) as i32-5)+(((i/3+j/5)%4) as i32-1)*3;
-            let win=if ((i+5)%23)<11 && ((j+2)%19)<10 {26} else {0};
-            let edge=if (i as i32 - j as i32).rem_euclid(31) < 3 {-18} else {0};
-            y[j*w+i]=(base+win+edge+tex).clamp(0,255);
-            u[j*w+i]=(118+(((i*3+j)%7) as i32-3)).clamp(0,255);
-            v[j*w+i]=(138+(((i+j*3)%7) as i32-3)).clamp(0,255);
-        }}
-        let color=ColorEncoding::srgb_ycbcr();
-        super::set_force_8x8(true);
-        let measure = |adst: bool| -> (i32, f64, f64) {
-            super::set_adst8(adst);
-            let (bytes,recon,(w8,_))=super::encode_av1_lossy_image_cs_recon_dbg(70,8,w,h,&y,&u,&v,&color,1);
-            std::fs::write("/tmp/adst.obu", &bytes).unwrap();
-            let st=std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i","/tmp/adst.obu","-o","/tmp/adst.y4m","--quiet"]).status().unwrap();
-            assert!(st.success(), "dav1d decode failed (adst={adst})");
-            let d=std::fs::read("/tmp/adst.y4m").unwrap();
-            let nl=d.iter().position(|&b| b==b'\n').unwrap();
-            let fnl=d[nl+1..].iter().position(|&b| b==b'\n').unwrap();
-            let p=&d[nl+1+fnl+1..];
-            let dy=&p[0..w*h];
-            // bit-exactness vs dav1d
-            let mut md=0i32;
-            for j in 0..h { for i in 0..w { md=md.max((recon[0][j*w8+i]-dy[j*w+i] as i32).abs()); } }
-            // corner-vs-interior error vs SOURCE (8x8 grid since force_8x8)
-            let (mut cs,mut ca,mut cc,mut is_,mut ia,mut ic)=(0i64,0i64,0i64,0i64,0i64,0i64);
-            for j in 0..h { for i in 0..w {
-                let e=(recon[0][j*w8+i]-y[j*w+i]) as i64;
-                if i%8==0 && j%8==0 { cs+=e; ca+=e.abs(); cc+=1; } else { is_+=e; ia+=e.abs(); ic+=1; }
-            }}
-            eprintln!("   corner signed={:.2} interior signed={:.2}", cs as f64/cc as f64, is_ as f64/ic as f64);
-            (md, ca as f64/cc as f64, ia as f64/ic as f64)
-        };
-        let (md_dct, corner_dct, interior_dct)=measure(false);
-        let (md_adst, corner_adst, interior_adst)=measure(true);
-        super::set_force_8x8(false); super::set_adst8(false);
-        eprintln!("DCT_DCT   maxdiff={md_dct} corner|err|={corner_dct:.2} interior|err|={interior_dct:.2}");
-        eprintln!("ADST_ADST maxdiff={md_adst} corner|err|={corner_adst:.2} interior|err|={interior_adst:.2}");
-        assert_eq!(md_dct, 0, "DCT path not bit-exact with dav1d");
-        assert_eq!(md_adst, 0, "ADST RD path not bit-exact with dav1d (wrong txtp idx or inverse)");
+        assert!(
+            p444 <= p422 + 0.5,
+            "4:4:4 luma bands worse than 4:2:2: {p444} vs {p422}"
+        );
+        assert!(
+            p420 <= p422 + 0.5,
+            "4:2:0 luma bands worse than 4:2:2: {p420} vs {p422}"
+        );
     }
 
     #[test]
     fn adst16_bit_exact() {
-        if !dav1d_available() { eprintln!("skip: no dav1d"); return; }
+        if !dav1d_available() {
+            eprintln!("skip: no dav1d");
+            return;
+        }
         use crate::color::ColorEncoding;
-        let (w,h)=(128usize,96usize);
-        let mut y=vec![0i32;w*h]; let mut u=vec![0i32;w*h]; let mut v=vec![0i32;w*h];
+        let (w, h) = (128usize, 96usize);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; w * h];
+        let mut v = vec![0i32; w * h];
         // smooth gradients + gentle features -> 16x16 partitions, many ADST-favorable
-        for j in 0..h { for i in 0..w {
-            let g=120 - (i as i32)/3 - (j as i32)/5;
-            let soft=(((i/7+j/9)%3) as i32-1)*4;
-            y[j*w+i]=(g+soft).clamp(0,255);
-            u[j*w+i]=(128 - (j as i32)/6).clamp(0,255);
-            v[j*w+i]=(132 + (i as i32)/9).clamp(0,255);
-        }}
-        let color=ColorEncoding::srgb_ycbcr();
+        for j in 0..h {
+            for i in 0..w {
+                let g = 120 - (i as i32) / 3 - (j as i32) / 5;
+                let soft = (((i / 7 + j / 9) % 3) as i32 - 1) * 4;
+                y[j * w + i] = (g + soft).clamp(0, 255);
+                u[j * w + i] = (128 - (j as i32) / 6).clamp(0, 255);
+                v[j * w + i] = (132 + (i as i32) / 9).clamp(0, 255);
+            }
+        }
+        let color = ColorEncoding::srgb_ycbcr();
         super::set_adst8(true);
-        let mut worst=0i32;
+        let mut worst = 0i32;
         for &q in &[60u8, 120] {
-            let (bytes,recon,(w8,_))=super::encode_av1_lossy_image_cs_recon_dbg(q,8,w,h,&y,&u,&v,&color,1);
+            let (bytes, recon, (w8, _)) =
+                super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
             std::fs::write("/tmp/adst16.obu", &bytes).unwrap();
-            let st=std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i","/tmp/adst16.obu","-o","/tmp/adst16.y4m","--quiet"]).status().unwrap();
+            let st = std::process::Command::new("/usr/bin/dav1d")
+                .args(["-i", "/tmp/adst16.obu", "-o", "/tmp/adst16.y4m", "--quiet"])
+                .status()
+                .unwrap();
             assert!(st.success(), "dav1d decode failed q{q}");
-            let d=std::fs::read("/tmp/adst16.y4m").unwrap();
-            let nl=d.iter().position(|&b| b==b'\n').unwrap();
-            let fnl=d[nl+1..].iter().position(|&b| b==b'\n').unwrap();
-            let p=&d[nl+1+fnl+1..];
-            let (dy,du,dv)=(&p[0..w*h],&p[w*h..2*w*h],&p[2*w*h..3*w*h]);
-            let mut md=0i32;
-            for j in 0..h { for i in 0..w {
-                md=md.max((recon[0][j*w8+i]-dy[j*w+i] as i32).abs());
-                md=md.max((recon[1][j*w8+i]-du[j*w+i] as i32).abs());
-                md=md.max((recon[2][j*w8+i]-dv[j*w+i] as i32).abs());
-            }}
+            let d = std::fs::read("/tmp/adst16.y4m").unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let (dy, du, dv) = (&p[0..w * h], &p[w * h..2 * w * h], &p[2 * w * h..3 * w * h]);
+            let mut md = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    md = md.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                    md = md.max((recon[1][j * w8 + i] - du[j * w + i] as i32).abs());
+                    md = md.max((recon[2][j * w8 + i] - dv[j * w + i] as i32).abs());
+                }
+            }
             eprintln!("ADST16 q{q}: maxdiff={md}");
-            worst=worst.max(md);
+            worst = worst.max(md);
         }
         super::set_adst8(false);
-        assert_eq!(worst, 0, "16x16 ADST RD not bit-exact with dav1d (check txtp idx 2 / iadst16)");
-    }
-
-    #[test]
-    fn force_8x8_round_trips_bit_exact() {
-        if !dav1d_available() { eprintln!("skip: no dav1d"); return; }
-        use crate::color::ColorEncoding;
-        let (w,h)=(64usize,64usize);
-        let mut y=vec![0i32;w*h]; let mut u=vec![0i32;w*h]; let mut v=vec![0i32;w*h];
-        for j in 0..h { for i in 0..w {
-            y[j*w+i]=(70+(i as i32)/4+(j as i32)/6+(((i*7+j*13)%11) as i32-5)
-                + if (i%16)<9 && (j%16)<9 {26} else {0}).clamp(0,255);
-            u[j*w+i]=120; v[j*w+i]=140;
-        }}
-        let color=ColorEncoding::srgb_ycbcr();
-        super::set_force_8x8(true);
-        let (bytes,recon,(w8,_))=super::encode_av1_lossy_image_cs_recon_dbg(65,8,w,h,&y,&u,&v,&color,1);
-        super::set_force_8x8(false);
-        std::fs::write("/tmp/f8.obu",&bytes).unwrap();
-        assert!(std::process::Command::new("/usr/bin/dav1d").args(["-i","/tmp/f8.obu","-o","/tmp/f8.y4m","--quiet"]).status().unwrap().success());
-        let d=std::fs::read("/tmp/f8.y4m").unwrap();
-        let nl=d.iter().position(|&b|b==b'\n').unwrap();
-        let fnl=d[nl+1..].iter().position(|&b|b==b'\n').unwrap();
-        let p=&d[nl+1+fnl+1..]; let dy=&p[0..w*h];
-        let mut maxd=0i32; for j in 0..h{for i in 0..w{ maxd=maxd.max((recon[0][j*w8+i]-dy[j*w+i] as i32).abs()); }}
-        assert_eq!(maxd,0,"8x8-only reconstruction must be bit-exact with dav1d");
+        assert_eq!(
+            worst, 0,
+            "16x16 ADST RD not bit-exact with dav1d (check txtp idx 2 / iadst16)"
+        );
     }
 
     #[test]
     fn loop_filter_bit_exact_420() {
-        if !dav1d_available() { eprintln!("skip loop_filter_bit_exact_420: no dav1d"); return; }
-        crate::cdef::set_cdef_enabled(true); // exercise CDEF in this test
+        if !dav1d_available() {
+            eprintln!("skip loop_filter_bit_exact_420: no dav1d");
+            return;
+        }
         use crate::color::ColorEncoding;
         let (w, h) = (128usize, 96usize);
         let (cw, ch) = (w / 2, h / 2);
         let mut y = vec![0i32; w * h];
         let mut u = vec![0i32; cw * ch];
         let mut v = vec![0i32; cw * ch];
-        for j in 0..h { for i in 0..w {
-            let t = j as f32 / h as f32;
-            let n = ((i*13+j*7)%17) as i32 - 8;
-            y[j*w+i] = ((180.0 - 40.0*t) as i32 + n).clamp(0,255);
-        }}
-        for j in 0..ch { for i in 0..cw {
-            let t = j as f32 / ch as f32;
-            u[j*cw+i] = (128.0 - 10.0*t) as i32;
-            v[j*cw+i] = (140.0 - 12.0*t) as i32;
-        }}
+        for j in 0..h {
+            for i in 0..w {
+                let t = j as f32 / h as f32;
+                let n = ((i * 13 + j * 7) % 17) as i32 - 8;
+                y[j * w + i] = ((180.0 - 40.0 * t) as i32 + n).clamp(0, 255);
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                let t = j as f32 / ch as f32;
+                u[j * cw + i] = (128.0 - 10.0 * t) as i32;
+                v[j * cw + i] = (140.0 - 12.0 * t) as i32;
+            }
+        }
         let color = ColorEncoding::srgb_ycbcr();
         for &q in &[52u8, 129, 167] {
-            let (bytes, recon, (w8,_h8,cw8,_ch8)) =
+            let (bytes, recon, (w8, _h8, cw8, _ch8)) =
                 super::encode_av1_lossy_image_420_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
             std::fs::write("/tmp/lf_v.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i","/tmp/lf_v.obu","-o","/tmp/lf_v.y4m","--quiet"]).status().unwrap();
+                .args(["-i", "/tmp/lf_v.obu", "-o", "/tmp/lf_v.y4m", "--quiet"])
+                .status()
+                .unwrap();
             assert!(st.success(), "dav1d decode failed q{q}");
             let d = std::fs::read("/tmp/lf_v.y4m").unwrap();
-            let nl = d.iter().position(|&b| b==b'\n').unwrap();
-            let fnl = d[nl+1..].iter().position(|&b| b==b'\n').unwrap();
-            let p = &d[nl+1+fnl+1..];
-            let dy = &p[0..w*h];
-            let du = &p[w*h..w*h+cw*ch];
-            let dv = &p[w*h+cw*ch..w*h+2*cw*ch];
-            let mut maxd = 0i32; let mut mx=0; let mut my=0;
-            for j in 0..h { for i in 0..w {
-                let dd = (recon[0][j*w8+i] - dy[j*w+i] as i32).abs();
-                if dd > maxd { maxd = dd; mx=i; my=j; }
-            }}
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let dy = &p[0..w * h];
+            let du = &p[w * h..w * h + cw * ch];
+            let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+            let mut maxd = 0i32;
+            let mut mx = 0;
+            let mut my = 0;
+            for j in 0..h {
+                for i in 0..w {
+                    let dd = (recon[0][j * w8 + i] - dy[j * w + i] as i32).abs();
+                    if dd > maxd {
+                        maxd = dd;
+                        mx = i;
+                        my = j;
+                    }
+                }
+            }
             if maxd > 0 {
-                eprintln!("  worst luma @ (x={mx},y={my}) x%4={} y%4={} x%8={} x%16={} x%32={} y%8={} y%16={}",
-                    mx%4, my%4, mx%8, mx%16, mx%32, my%8, my%16);
-                eprintln!("  recon row: {:?}", (mx.saturating_sub(3)..=(mx+3).min(w-1)).map(|i| recon[0][my*w8+i]).collect::<Vec<_>>());
-                eprintln!("  dav1d row: {:?}", (mx.saturating_sub(3)..=(mx+3).min(w-1)).map(|i| dy[my*w+i] as i32).collect::<Vec<_>>());
+                eprintln!(
+                    "  worst luma @ (x={mx},y={my}) x%4={} y%4={} x%8={} x%16={} x%32={} y%8={} y%16={}",
+                    mx % 4,
+                    my % 4,
+                    mx % 8,
+                    mx % 16,
+                    mx % 32,
+                    my % 8,
+                    my % 16
+                );
+                eprintln!(
+                    "  recon row: {:?}",
+                    (mx.saturating_sub(3)..=(mx + 3).min(w - 1))
+                        .map(|i| recon[0][my * w8 + i])
+                        .collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "  dav1d row: {:?}",
+                    (mx.saturating_sub(3)..=(mx + 3).min(w - 1))
+                        .map(|i| dy[my * w + i] as i32)
+                        .collect::<Vec<_>>()
+                );
             }
             let mut maxdc = 0i32;
-            for j in 0..ch { for i in 0..cw {
-                maxdc = maxdc.max((recon[1][j*cw8+i] - du[j*cw+i] as i32).abs());
-                maxdc = maxdc.max((recon[2][j*cw8+i] - dv[j*cw+i] as i32).abs());
-            }}
+            for j in 0..ch {
+                for i in 0..cw {
+                    maxdc = maxdc.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                    maxdc = maxdc.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                }
+            }
             eprintln!("LFTEST q{q}: luma_maxdiff={maxd} chroma_maxdiff={maxdc}");
             // q52/q129 exercise qctx 0..2 (the deblock-relevant range); the decode
             // path itself is bit-exact there, so the filter must be too.
@@ -6459,9 +6825,39 @@ mod tests {
                 .collect()
         };
         let (luma, u, v) = (gen_data(w * h), gen_data(cw * ch), gen_data(cw * ch));
-        let serial = encode_av1_lossy_image_420(80, 10, w, h, &luma, &u, &v, &crate::color::ColorEncoding::srgb(), 1);
-        let par2a = encode_av1_lossy_image_420(80, 10, w, h, &luma, &u, &v, &crate::color::ColorEncoding::srgb(), 2);
-        let par2b = encode_av1_lossy_image_420(80, 10, w, h, &luma, &u, &v, &crate::color::ColorEncoding::srgb(), 2);
+        let serial = encode_av1_lossy_image_420(
+            80,
+            10,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            &crate::color::ColorEncoding::srgb(),
+            1,
+        );
+        let par2a = encode_av1_lossy_image_420(
+            80,
+            10,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            &crate::color::ColorEncoding::srgb(),
+            2,
+        );
+        let par2b = encode_av1_lossy_image_420(
+            80,
+            10,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            &crate::color::ColorEncoding::srgb(),
+            2,
+        );
         assert_eq!(
             serial, par2a,
             "parallel (2 threads) must match serial encode"
@@ -6505,14 +6901,34 @@ mod tests {
         let (luma, u, v) = (vec![512; w * h], vec![512; cw * ch], vec![512; cw * ch]);
 
         // threads=1 -> one OBU_FRAME (type 6), byte-identical to the untiled path.
-        let serial = encode_av1_lossy_image_420(80, 10, w, h, &luma, &u, &v, &crate::color::ColorEncoding::srgb(), 1);
+        let serial = encode_av1_lossy_image_420(
+            80,
+            10,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            &crate::color::ColorEncoding::srgb(),
+            1,
+        );
         assert!(
             obu_types(&serial).contains(&6),
             "serial small frame should be a single OBU_FRAME"
         );
 
         // threads=4 -> subdivided into tiles -> OBU_FRAME_HEADER (3) + TILE_GROUP (4).
-        let threaded = encode_av1_lossy_image_420(80, 10, w, h, &luma, &u, &v, &crate::color::ColorEncoding::srgb(), 4);
+        let threaded = encode_av1_lossy_image_420(
+            80,
+            10,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            &crate::color::ColorEncoding::srgb(),
+            4,
+        );
         let tt = obu_types(&threaded);
         assert!(
             tt.contains(&3) && tt.contains(&4) && !tt.contains(&6),
@@ -6629,9 +7045,9 @@ mod tests {
             &crate::color::ColorEncoding::srgb_ycbcr(),
             1,
         );
-        assert_eq!(bytes.len(), 73, "4:2:2 stream length drifted");
+        assert_eq!(bytes.len(), 74, "4:2:2 stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
-        assert_eq!(sum, 7832, "4:2:2 stream bytes drifted");
+        assert_eq!(sum, 8181, "4:2:2 stream bytes drifted");
     }
 
     #[test]
