@@ -27,7 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Coefficients in Q0.16 fixed-point (multiply float by 65536 and round)
+// Coefficients in Q0.16 fixed-point
 // WC4[0] = 0.5411961  -> 35468
 // WC4[1] = 1.3065630  -> 85627
 // WC8[0] = 0.5097956  -> 33410

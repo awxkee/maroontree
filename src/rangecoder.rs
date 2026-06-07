@@ -1,20 +1,31 @@
-//! Multisymbol range coder with 15-bit (Q15) CDFs.
-//!
-//! ## Honesty note — read this before trusting the bytes
-//! The *arithmetic engine* here is a clean, self-consistent carryless range
-//! coder (Subbotin form). It is NOT verified bit-exact against libaom's `od_ec`
-//! carry/normalize bookkeeping. The architecture is deliberately AV1-shaped —
-//! Q15 CDFs, per-symbol `encode_symbol`, and the exact AV1 *CDF adaptation* rule
-//! (`update_cdf`, faithful to spec §8.3.2) — so a verified `od_ec` engine can be
-//! dropped in behind this same interface without touching callers.
-//!
-//! What IS proven (see tests): encoder and decoder are exact inverses for
-//! arbitrary symbol/CDF streams, and adaptive coding round-trips.
-//!
-//! CDF layout matches the AV1 spec representation: for an N-ary symbol, `cdf`
-//! has length `N + 1`. `cdf[0..N-1]` are increasing cumulative frequencies with
-//! `cdf[N-1] == 32768`; `cdf[N]` is the adaptation counter. Symbol `s` owns the
-//! interval `[b(s), b(s+1))` where `b(0)=0`, `b(k)=cdf[k-1]`, `b(N)=32768`.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 pub(crate) const CDF_TOTAL: u32 = 1 << 15; // 32768
 

@@ -1,16 +1,34 @@
-//! OBU framing and *sketched* sequence/frame headers.
-//!
-//! ## Status: STRUCTURAL, NOT SPEC-COMPLETE
-//! OBU framing (header byte + LEB128 size) and the field *order* below follow
-//! AV1, but the sequence/frame headers are intentionally a reduced sketch:
-//! many conditional fields (operating points, decoder model, timing,
-//! `frame_size_override`, segmentation, etc.) are stubbed to their
-//! "absent/default" path. This is enough to show the framing shape and to be
-//! the place real header coding gets finished — it is NOT yet a header a
-//! conformant decoder will accept. The gaps are called out inline.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
-use crate::bitwriter::{BitWriter, leb128};
-use crate::color::{ChromaSamplePosition, MasteringDisplay};
+use crate::bitwriter::{leb128, BitWriter};
+use crate::color::MasteringDisplay;
 use crate::metadata::ContentLightLevel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +235,7 @@ pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
     (lvl_y, lvl_uv)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn frame_header_lossy_impl(
     base_q_idx: u8,
     cols_incr: &[bool],
@@ -291,29 +310,6 @@ pub(crate) fn wrap_obu_frame(frame_header: &[u8], tile_data: &[u8]) -> Vec<u8> {
     payload.extend_from_slice(frame_header);
     payload.extend_from_slice(tile_data);
     wrap_obu(ObuType::Frame, &payload)
-}
-
-/// Bit-depth-aware still sequence header built from a `matrix_coefficients` code
-/// (0 = MC_IDENTITY / GBR, 6 = MC_BT_601 full-range YCbCr) with BT.709 primaries
-/// + sRGB transfer + full range, for `profile` and `bit_depth` (8/10/12).
-pub(crate) fn sequence_header_mc(
-    width: u32,
-    height: u32,
-    profile: u32,
-    bit_depth: u8,
-    matrix_coefficients: u32,
-    ss_x: u32,
-    ss_y: u32,
-) -> Vec<u8> {
-    use crate::color::{ColorEncoding, MatrixCoefficients, Primaries, TransferFunction};
-    let color = ColorEncoding {
-        primaries: Primaries::Bt709,
-        transfer: TransferFunction::Srgb,
-        matrix: MatrixCoefficients::from_u8(matrix_coefficients as u8),
-        full_range: true,
-        chroma_sample_position: ChromaSamplePosition::Unknown,
-    };
-    seq_header_ss(width, height, profile, bit_depth, &color, ss_x, ss_y)
 }
 
 /// Still sequence header with explicit color encoding and selectable `bit_depth`

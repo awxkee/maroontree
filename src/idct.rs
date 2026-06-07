@@ -437,8 +437,8 @@ pub(crate) fn inv_adst16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     let mut t13 = ((in3 * (3857 - 4096) - in12 * 1380 + 2048) >> 12) + in3;
     let mut t14 = ((in1 * 601 + in14 * (4052 - 4096) + 2048) >> 12) + in14;
     let mut t15 = ((in1 * (4052 - 4096) - in14 * 601 + 2048) >> 12) + in1;
-    let mut t0a = clip(t0 + t8);
-    let mut t1a = clip(t1 + t9);
+    let  t0a = clip(t0 + t8);
+    let  t1a = clip(t1 + t9);
     let mut t2a = clip(t2 + t10);
     let mut t3a = clip(t3 + t11);
     let mut t4a = clip(t4 + t12);

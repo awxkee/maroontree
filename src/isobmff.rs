@@ -129,6 +129,7 @@ pub(crate) struct Av1cParams {
 
 /// Select an AV1 `seq_level_idx_0` large enough for the given picture size.
 /// Uses the max-luma-picture-size thresholds from AV1 spec Table A.2.
+#[allow(clippy::match_overlapping_arm)]
 pub(crate) fn level_for(width: u32, height: u32) -> u8 {
     let pixels = (width as u64) * (height as u64);
     match pixels {
@@ -140,52 +141,6 @@ pub(crate) fn level_for(width: u32, height: u32) -> u8 {
         ..=35_651_584 => 16, // 6.0
         _ => 19,             // 6.3  (max defined for still images)
     }
-}
-
-/// Read a LEB128-encoded integer from `buf` starting at `pos`.
-/// Returns `(value, bytes_consumed)`.
-fn leb128(buf: &[u8], mut pos: usize) -> (usize, usize) {
-    let start = pos;
-    let mut val = 0usize;
-    let mut shift = 0u32;
-    while pos < buf.len() {
-        let b = buf[pos];
-        pos += 1;
-        val |= ((b & 0x7f) as usize) << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    (val, pos - start)
-}
-
-/// Return a slice of the first OBU whose type matches `obu_type` in an AV1
-/// bitstream. Returns an empty slice if the type is not found.
-pub(crate) fn first_obu_of_type(buf: &[u8], obu_type: u8) -> &[u8] {
-    let mut pos = 0;
-    while pos < buf.len() {
-        let obu_start = pos;
-        let hb = buf[pos];
-        let typ = (hb >> 3) & 0xf;
-        let ext_flag = (hb >> 2) & 1;
-        let has_size = (hb >> 1) & 1;
-        let header_bytes = 1 + ext_flag as usize;
-        if pos + header_bytes > buf.len() {
-            break;
-        }
-        pos += header_bytes;
-        let (payload_len, leb_bytes) = if has_size != 0 {
-            leb128(buf, pos)
-        } else {
-            (buf.len() - pos, 0)
-        };
-        pos += leb_bytes + payload_len;
-        if typ == obu_type {
-            return &buf[obu_start..pos.min(buf.len())];
-        }
-    }
-    &[]
 }
 
 /// Build the raw `av1C` box payload (without the box header).
