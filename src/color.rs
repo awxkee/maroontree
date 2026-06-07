@@ -219,6 +219,21 @@ impl ColorEncoding {
         }
     }
 
+    /// BT.709 primaries, sRGB transfer, **BT.601 (Smpte170m) matrix**, full range.
+    /// This is the encoding the lossy RGB→YCbCr path actually uses internally and
+    /// what the AV1 bitstream signals by default when no custom color is passed.
+    /// Use this when you want the container `colr` and OBU `color_config` to both
+    /// agree with the encoder's actual YCbCr coefficients.
+    pub const fn srgb_ycbcr() -> Self {
+        ColorEncoding {
+            primaries: Primaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            matrix: MatrixCoefficients::Smpte170m,
+            full_range: true,
+            chroma_sample_position: ChromaSamplePosition::Unknown,
+        }
+    }
+
     /// BT.709 video: BT.709 primaries/transfer/matrix, full range.
     pub const fn bt709() -> Self {
         ColorEncoding {

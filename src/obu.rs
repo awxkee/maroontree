@@ -156,6 +156,7 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -166,6 +167,7 @@ pub(crate) fn frame_header_lossy_multitile(
         tile_rows_log2,
         false,
         mono,
+        cdef,
     )
 }
 
@@ -181,6 +183,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -191,6 +194,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         tile_rows_log2,
         true,
         mono,
+        cdef,
     )
 }
 
@@ -207,6 +211,16 @@ pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Ve
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Deblocking filter levels (luma, chroma) derived from the base quantizer.
+/// Gentle at high quality, stronger at low quality. The encoder applies exactly
+/// these levels to its reconstruction so the output matches the decoder.
+pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
+    let q = base_q_idx as i32;
+    let lvl_y = (q / 8).clamp(0, 40);
+    let lvl_uv = (q / 10).clamp(0, 32);
+    (lvl_y, lvl_uv)
+}
+
 fn frame_header_lossy_impl(
     base_q_idx: u8,
     cols_incr: &[bool],
@@ -216,6 +230,7 @@ fn frame_header_lossy_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
+    cdef: &crate::cdef::CdefParams,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -252,12 +267,28 @@ fn frame_header_lossy_impl(
     // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded)
     w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
     // CodedLossless = 0 => loop_filter_params():
-    w.f(0, 6); // loop_filter_level[0] = 0
-    w.f(0, 6); // loop_filter_level[1] = 0
-    // (both levels 0 => u/v levels not coded)
+    let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
+    w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
+    w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
+    if lvl_y != 0 && !mono {
+        // u/v levels coded only when (level[0] || level[1]) and NumPlanes > 1
+        w.f(lvl_uv as u32, 6); // loop_filter_level[2] (U)
+        w.f(lvl_uv as u32, 6); // loop_filter_level[3] (V)
+    }
     w.f(0, 3); // loop_filter_sharpness = 0
     w.flag(false); // loop_filter_delta_enabled = 0
-    // cdef_params(): sequence enable_cdef = 0 => skipped
+    // cdef_params(): enable_cdef = 1. CodedLossless = 0 and allow_intrabc = 0
+    // here, so the block is always present. Single preset (cdef_bits = 0) so the
+    // per-superblock cdef_idx reads 0 bits in the tile data (syntax unchanged).
+    if crate::cdef::cdef_enabled() {
+        let cd = *cdef;
+        w.f((cd.damping - 3) as u32, 2); // cdef_damping_minus_3
+        w.f(0, 2); // cdef_bits = 0 => 1 strength preset
+        w.f(crate::cdef::encode_strength(cd.y_pri, cd.y_sec), 6); // y_strength[0]
+        if !mono {
+            w.f(crate::cdef::encode_strength(cd.uv_pri, cd.uv_sec), 6); // uv_strength[0]
+        }
+    }
     // lr_params(): sequence enable_restoration = 0 => skipped
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
@@ -316,6 +347,20 @@ pub(crate) fn sequence_header_cicp(
     seq_header_ss(width, height, profile, bit_depth, color, 0, 0)
 }
 
+/// Like [`sequence_header_cicp`] but with explicit chroma subsampling flags:
+/// `(ss_x, ss_y)` = `(0,0)` → 4:4:4, `(1,0)` → 4:2:2, `(1,1)` → 4:2:0.
+pub(crate) fn sequence_header_cicp_ss(
+    width: u32,
+    height: u32,
+    profile: u32,
+    bit_depth: u8,
+    color: &crate::color::ColorEncoding,
+    ss_x: u32,
+    ss_y: u32,
+) -> Vec<u8> {
+    seq_header_ss(width, height, profile, bit_depth, color, ss_x, ss_y)
+}
+
 /// Monochrome (`mono_chrome = 1`, `NumPlanes = 1`) sequence header — a single
 /// luma plane, used to encode an AVIF alpha auxiliary image (alpha in AV1 is a
 /// separate grayscale image, not a 4th channel). `mono_chrome` is only coded
@@ -346,7 +391,7 @@ pub(crate) fn sequence_header_mono(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(false); // enable_cdef
+    w.flag(crate::cdef::cdef_enabled()); // enable_cdef
     w.flag(false); // enable_restoration
 
     // color_config() — monochrome branch.
@@ -399,7 +444,7 @@ fn seq_header_ss(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(false); // enable_cdef
+    w.flag(crate::cdef::cdef_enabled()); // enable_cdef
     w.flag(false); // enable_restoration
 
     // color_config()

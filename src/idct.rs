@@ -184,6 +184,46 @@ pub(crate) fn inv_dct8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[7 * s] = clip(t0 - t7);
 }
 
+/// dav1d's exact integer 1-D inverse ADST8 (`inv_adst8_1d_internal_c`). All
+/// inputs are read before any output is written, so it is safe in place.
+pub(crate) fn inv_adst8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
+    let clip = |x: i32| x.clamp(min, max);
+    let (in0, in1, in2, in3) = (c[0], c[s], c[2 * s], c[3 * s]);
+    let (in4, in5, in6, in7) = (c[4 * s], c[5 * s], c[6 * s], c[7 * s]);
+    let t0a = (((4076 - 4096) * in7 + 401 * in0 + 2048) >> 12) + in7;
+    let t1a = ((401 * in7 - (4076 - 4096) * in0 + 2048) >> 12) - in0;
+    let t2a = (((3612 - 4096) * in5 + 1931 * in2 + 2048) >> 12) + in5;
+    let t3a = ((1931 * in5 - (3612 - 4096) * in2 + 2048) >> 12) - in2;
+    let t4a = (1299 * in3 + 1583 * in4 + 1024) >> 11;
+    let t5a = (1583 * in3 - 1299 * in4 + 1024) >> 11;
+    let t6a = ((1189 * in1 + (3920 - 4096) * in6 + 2048) >> 12) + in6;
+    let t7a = (((3920 - 4096) * in1 - 1189 * in6 + 2048) >> 12) + in1;
+    let t0 = clip(t0a + t4a);
+    let t1 = clip(t1a + t5a);
+    let mut t2 = clip(t2a + t6a);
+    let mut t3 = clip(t3a + t7a);
+    let t4 = clip(t0a - t4a);
+    let t5 = clip(t1a - t5a);
+    let mut t6 = clip(t2a - t6a);
+    let mut t7 = clip(t3a - t7a);
+    let t4a = (((3784 - 4096) * t4 + 1567 * t5 + 2048) >> 12) + t4;
+    let t5a = ((1567 * t4 - (3784 - 4096) * t5 + 2048) >> 12) - t5;
+    let t6a = (((3784 - 4096) * t7 - 1567 * t6 + 2048) >> 12) + t7;
+    let t7a = ((1567 * t7 + (3784 - 4096) * t6 + 2048) >> 12) + t6;
+    c[0] = clip(t0 + t2);
+    c[7 * s] = -clip(t1 + t3);
+    t2 = clip(t0 - t2);
+    t3 = clip(t1 - t3);
+    c[s] = -clip(t4a + t6a);
+    c[6 * s] = clip(t5a + t7a);
+    t6 = clip(t4a - t6a);
+    t7 = clip(t5a - t7a);
+    c[3 * s] = -(((t2 + t3) * 181 + 128) >> 8);
+    c[4 * s] = ((t2 - t3) * 181 + 128) >> 8;
+    c[2 * s] = ((t6 + t7) * 181 + 128) >> 8;
+    c[5 * s] = -(((t6 - t7) * 181 + 128) >> 8);
+}
+
 /// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
 /// inverse transform (TX_8X8 DCT_DCT, 8-bit, shift=1), so the encoder's
 /// reconstruction is bit-identical to the decoder's. This eliminates DC-pred
@@ -218,6 +258,47 @@ pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     }
     for x in 0..8 {
         inv_dct8_1d(&mut tmp[x..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
+/// inverse for TX_8X8 **ADST_ADST**. Same per-size orchestration as
+/// `idct_dequant_8x8` (dequant, transpose, row pass, `(t+1)>>1` clip, col pass,
+/// `(t+8)>>4`); only the 1-D kernel changes to `inv_adst8_1d`. Because the shifts
+/// and clip ranges are per transform-size (not per type), this is bit-identical
+/// to dav1d's TX_8X8 ADST_ADST inverse.
+pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    for y in 0..8 {
+        inv_adst8_1d(&mut tmp[y * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for x in 0..8 {
+        inv_adst8_1d(&mut tmp[x..], 8, cmin, cmax);
     }
     for t in tmp.iter_mut() {
         *t = (*t + 8) >> 4;
@@ -325,6 +406,142 @@ pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256
     }
     for x in 0..16 {
         inv_dct16_1d(&mut tmp[x..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// dav1d's exact integer 1-D inverse ADST16 (`inv_adst16_1d_internal_c`). Reads
+/// all 16 inputs before writing, so safe in place.
+pub(crate) fn inv_adst16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
+    let clip = |x: i32| x.clamp(min, max);
+    let (in0, in1, in2, in3) = (c[0], c[s], c[2 * s], c[3 * s]);
+    let (in4, in5, in6, in7) = (c[4 * s], c[5 * s], c[6 * s], c[7 * s]);
+    let (in8, in9, in10, in11) = (c[8 * s], c[9 * s], c[10 * s], c[11 * s]);
+    let (in12, in13, in14, in15) = (c[12 * s], c[13 * s], c[14 * s], c[15 * s]);
+    let mut t0 = ((in15 * (4091 - 4096) + in0 * 201 + 2048) >> 12) + in15;
+    let mut t1 = ((in15 * 201 - in0 * (4091 - 4096) + 2048) >> 12) - in0;
+    let mut t2 = ((in13 * (3973 - 4096) + in2 * 995 + 2048) >> 12) + in13;
+    let mut t3 = ((in13 * 995 - in2 * (3973 - 4096) + 2048) >> 12) - in2;
+    let mut t4 = ((in11 * (3703 - 4096) + in4 * 1751 + 2048) >> 12) + in11;
+    let mut t5 = ((in11 * 1751 - in4 * (3703 - 4096) + 2048) >> 12) - in4;
+    let mut t6 = (in9 * 1645 + in6 * 1220 + 1024) >> 11;
+    let mut t7 = (in9 * 1220 - in6 * 1645 + 1024) >> 11;
+    let mut t8 = ((in7 * 2751 + in8 * (3035 - 4096) + 2048) >> 12) + in8;
+    let mut t9 = ((in7 * (3035 - 4096) - in8 * 2751 + 2048) >> 12) + in7;
+    let mut t10 = ((in5 * 2106 + in10 * (3513 - 4096) + 2048) >> 12) + in10;
+    let mut t11 = ((in5 * (3513 - 4096) - in10 * 2106 + 2048) >> 12) + in5;
+    let mut t12 = ((in3 * 1380 + in12 * (3857 - 4096) + 2048) >> 12) + in12;
+    let mut t13 = ((in3 * (3857 - 4096) - in12 * 1380 + 2048) >> 12) + in3;
+    let mut t14 = ((in1 * 601 + in14 * (4052 - 4096) + 2048) >> 12) + in14;
+    let mut t15 = ((in1 * (4052 - 4096) - in14 * 601 + 2048) >> 12) + in1;
+    let mut t0a = clip(t0 + t8);
+    let mut t1a = clip(t1 + t9);
+    let mut t2a = clip(t2 + t10);
+    let mut t3a = clip(t3 + t11);
+    let mut t4a = clip(t4 + t12);
+    let mut t5a = clip(t5 + t13);
+    let mut t6a = clip(t6 + t14);
+    let mut t7a = clip(t7 + t15);
+    let mut t8a = clip(t0 - t8);
+    let mut t9a = clip(t1 - t9);
+    let mut t10a = clip(t2 - t10);
+    let mut t11a = clip(t3 - t11);
+    let mut t12a = clip(t4 - t12);
+    let mut t13a = clip(t5 - t13);
+    let mut t14a = clip(t6 - t14);
+    let mut t15a = clip(t7 - t15);
+    t8 = ((t8a * (4017 - 4096) + t9a * 799 + 2048) >> 12) + t8a;
+    t9 = ((t8a * 799 - t9a * (4017 - 4096) + 2048) >> 12) - t9a;
+    t10 = ((t10a * 2276 + t11a * (3406 - 4096) + 2048) >> 12) + t11a;
+    t11 = ((t10a * (3406 - 4096) - t11a * 2276 + 2048) >> 12) + t10a;
+    t12 = ((t13a * (4017 - 4096) - t12a * 799 + 2048) >> 12) + t13a;
+    t13 = ((t13a * 799 + t12a * (4017 - 4096) + 2048) >> 12) + t12a;
+    t14 = ((t15a * 2276 - t14a * (3406 - 4096) + 2048) >> 12) - t14a;
+    t15 = ((t15a * (3406 - 4096) + t14a * 2276 + 2048) >> 12) + t15a;
+    t0 = clip(t0a + t4a);
+    t1 = clip(t1a + t5a);
+    t2 = clip(t2a + t6a);
+    t3 = clip(t3a + t7a);
+    t4 = clip(t0a - t4a);
+    t5 = clip(t1a - t5a);
+    t6 = clip(t2a - t6a);
+    t7 = clip(t3a - t7a);
+    t8a = clip(t8 + t12);
+    t9a = clip(t9 + t13);
+    t10a = clip(t10 + t14);
+    t11a = clip(t11 + t15);
+    t12a = clip(t8 - t12);
+    t13a = clip(t9 - t13);
+    t14a = clip(t10 - t14);
+    t15a = clip(t11 - t15);
+    t4a = ((t4 * (3784 - 4096) + t5 * 1567 + 2048) >> 12) + t4;
+    t5a = ((t4 * 1567 - t5 * (3784 - 4096) + 2048) >> 12) - t5;
+    t6a = ((t7 * (3784 - 4096) - t6 * 1567 + 2048) >> 12) + t7;
+    t7a = ((t7 * 1567 + t6 * (3784 - 4096) + 2048) >> 12) + t6;
+    t12 = ((t12a * (3784 - 4096) + t13a * 1567 + 2048) >> 12) + t12a;
+    t13 = ((t12a * 1567 - t13a * (3784 - 4096) + 2048) >> 12) - t13a;
+    t14 = ((t15a * (3784 - 4096) - t14a * 1567 + 2048) >> 12) + t15a;
+    t15 = ((t15a * 1567 + t14a * (3784 - 4096) + 2048) >> 12) + t14a;
+    c[0] = clip(t0 + t2);
+    c[15 * s] = -clip(t1 + t3);
+    t2a = clip(t0 - t2);
+    t3a = clip(t1 - t3);
+    c[3 * s] = -clip(t4a + t6a);
+    c[12 * s] = clip(t5a + t7a);
+    t6 = clip(t4a - t6a);
+    t7 = clip(t5a - t7a);
+    c[s] = -clip(t8a + t10a);
+    c[14 * s] = clip(t9a + t11a);
+    t10 = clip(t8a - t10a);
+    t11 = clip(t9a - t11a);
+    c[2 * s] = clip(t12 + t14);
+    c[13 * s] = -clip(t13 + t15);
+    t14a = clip(t12 - t14);
+    t15a = clip(t13 - t15);
+    c[7 * s] = -(((t2a + t3a) * 181 + 128) >> 8);
+    c[8 * s] = ((t2a - t3a) * 181 + 128) >> 8;
+    c[4 * s] = ((t6 + t7) * 181 + 128) >> 8;
+    c[11 * s] = -(((t6 - t7) * 181 + 128) >> 8);
+    c[6 * s] = ((t10 + t11) * 181 + 128) >> 8;
+    c[9 * s] = -(((t10 - t11) * 181 + 128) >> 8);
+    c[5 * s] = -(((t14a + t15a) * 181 + 128) >> 8);
+    c[10 * s] = ((t14a - t15a) * 181 + 128) >> 8;
+}
+
+/// TX_16X16 ADST_ADST reconstruction (dav1d-exact). Same orchestration as
+/// `idct_dequant_16x16` (dequant, transpose, row pass, `(t+2)>>2` clip, col
+/// pass, `(t+8)>>4`); only the 1-D kernel changes to `inv_adst16_1d`.
+pub(crate) fn iadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 256];
+    for rc in 0..256 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            tmp[y * 16 + x] = coeff[y + x * 16];
+        }
+    }
+    for y in 0..16 {
+        inv_adst16_1d(&mut tmp[y * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 2) >> 2).clamp(cmin, cmax);
+    }
+    for x in 0..16 {
+        inv_adst16_1d(&mut tmp[x..], 16, cmin, cmax);
     }
     for t in tmp.iter_mut() {
         *t = (*t + 8) >> 4;

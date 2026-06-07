@@ -49,6 +49,10 @@ mod metadata;
 mod msac_enc;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
+mod loopfilter;
+mod cdef;
+pub use cdef::{set_cdef_enabled, cdef_enabled};
+pub use av1real::{set_force_8x8, force_8x8};
 mod obu;
 mod odec;
 mod pixel;

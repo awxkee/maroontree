@@ -258,6 +258,7 @@ pub(crate) fn wrap_av1_image(
         f.extend_from_slice(b"avif"); // AVIF still image
         f.extend_from_slice(b"mif1"); // HEIF base
         f.extend_from_slice(b"miaf"); // Multi-Image Application Format
+
         patch(&mut f, s);
     }
 
@@ -286,18 +287,17 @@ pub(crate) fn wrap_av1_image(
         patch(&mut f, s);
     }
 
-    // iloc — version=1; construction_method field present.
+    // iloc — version=0; no construction_method field (matches libavif).
     let iloc_offset_patch_pos;
     let mut iloc_exif_patch_pos = 0usize;
     {
         let s = f.len();
-        write_fullbox(&mut f, b"iloc", 1, 0);
+        write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
         w16(&mut f, if has_exif { 2 } else { 1 }); // item_count
         // item 1: AV1 image
         w16(&mut f, 1); // item_ID
-        w16(&mut f, 0); // construction_method = 0
         w16(&mut f, 0); // data_reference_index
         w16(&mut f, 1); // extent_count
         iloc_offset_patch_pos = f.len();
@@ -305,8 +305,7 @@ pub(crate) fn wrap_av1_image(
         w32(&mut f, av1_obu.len() as u32); // extent_length
         if has_exif {
             w16(&mut f, 2); // item_ID
-            w16(&mut f, 0);
-            w16(&mut f, 0);
+            w16(&mut f, 0); // data_reference_index
             w16(&mut f, 1);
             iloc_exif_patch_pos = f.len();
             w32(&mut f, 0);
@@ -362,21 +361,14 @@ pub(crate) fn wrap_av1_image(
         let s = f.len();
         write_box(&mut f, b"iprp");
 
-        // ipco — property container. 1-based indices:
-        //   1 av1C (essential)  2 ispe  3 pixi  4 colr
+        // ipco — property container. 1-based indices (matching libavif order):
+        //   1 ispe  2 pixi  3 av1C (essential)  4 colr
         //   5+ optional: irot, imir, clli
         {
             let si = f.len();
             write_box(&mut f, b"ipco");
 
-            // prop 1: av1C (essential — AV1 decoder configuration)
-            {
-                let sh = f.len();
-                write_box(&mut f, b"av1C");
-                f.extend_from_slice(&av1c_data);
-                patch(&mut f, sh);
-            }
-            // prop 2: ispe (image spatial extents)
+            // prop 1: ispe (image spatial extents)
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"ispe", 0, 0);
@@ -384,7 +376,7 @@ pub(crate) fn wrap_av1_image(
                 w32(&mut f, height);
                 patch(&mut f, sh);
             }
-            // prop 3: pixi (pixel information)
+            // prop 2: pixi (pixel information)
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
@@ -392,6 +384,13 @@ pub(crate) fn wrap_av1_image(
                 for _ in 0..channels {
                     f.push(bit_depth);
                 }
+                patch(&mut f, sh);
+            }
+            // prop 3: av1C (essential — AV1 decoder configuration)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"av1C");
+                f.extend_from_slice(&av1c_data);
                 patch(&mut f, sh);
             }
             // prop 4: colr (color metadata)
@@ -435,8 +434,8 @@ pub(crate) fn wrap_av1_image(
         // ipma — associations for item 1
         {
             let (irot_idx, imir_idx, clli_idx) = extra_props;
-            // av1C(1, essential), ispe(2), pixi(3), colr(4)
-            let mut assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            // ispe(1), pixi(2), av1C(3, essential), colr(4)  — libavif order
+            let mut assoc: Vec<u8> = vec![1, 2, 0x80 | 3, 4];
             if irot_idx != 0 {
                 assoc.push(0x80 | irot_idx);
             } // essential
@@ -518,6 +517,7 @@ pub(crate) fn wrap_av1_image_with_alpha(
         f.extend_from_slice(b"avif");
         f.extend_from_slice(b"mif1");
         f.extend_from_slice(b"miaf");
+
         patch(&mut f, s);
     }
 
@@ -546,27 +546,25 @@ pub(crate) fn wrap_av1_image_with_alpha(
         patch(&mut f, s);
     }
 
-    // iloc — two items; offsets patched after mdat.
+    // iloc — two items; offsets patched after mdat. Version=0 (no construction_method).
     let color_offset_patch_pos;
     let alpha_offset_patch_pos;
     {
         let s = f.len();
-        write_fullbox(&mut f, b"iloc", 1, 0);
+        write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
         w16(&mut f, 2); // item_count = 2
         // item 1: color
         w16(&mut f, 1);
-        w16(&mut f, 0);
-        w16(&mut f, 0);
+        w16(&mut f, 0); // data_reference_index
         w16(&mut f, 1);
         color_offset_patch_pos = f.len();
         w32(&mut f, 0);
         w32(&mut f, color_obu.len() as u32);
         // item 2: alpha
         w16(&mut f, 2);
-        w16(&mut f, 0);
-        w16(&mut f, 0);
+        w16(&mut f, 0); // data_reference_index
         w16(&mut f, 1);
         alpha_offset_patch_pos = f.len();
         w32(&mut f, 0);
@@ -611,9 +609,9 @@ pub(crate) fn wrap_av1_image_with_alpha(
         let s = f.len();
         write_box(&mut f, b"iprp");
 
-        // ipco — property container (1-based):
-        //   1 av1C(color)  2 ispe  3 pixi(3ch)  4 colr
-        //   5 av1C(alpha)   6 pixi(1ch)  7 auxC   8+ optional (irot/imir/clli)
+        // ipco — property container (1-based, libavif order):
+        //   1 ispe  2 pixi(3ch)  3 av1C(color,essential)  4 colr
+        //   5 av1C(alpha)  6 pixi(1ch)  7 auxC   8+ optional (irot/imir/clli)
         let mut irot_idx = 0u8;
         let mut imir_idx = 0u8;
         let mut clli_idx = 0u8;
@@ -621,14 +619,7 @@ pub(crate) fn wrap_av1_image_with_alpha(
             let si = f.len();
             write_box(&mut f, b"ipco");
 
-            // 1: av1C (color)
-            {
-                let sh = f.len();
-                write_box(&mut f, b"av1C");
-                f.extend_from_slice(&color_av1c);
-                patch(&mut f, sh);
-            }
-            // 2: ispe (shared dimensions)
+            // 1: ispe (shared dimensions)
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"ispe", 0, 0);
@@ -636,7 +627,7 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 w32(&mut f, height);
                 patch(&mut f, sh);
             }
-            // 3: pixi (color, 3 channels)
+            // 2: pixi (color, 3 channels)
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
@@ -644,6 +635,13 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 f.push(bit_depth);
                 f.push(bit_depth);
                 f.push(bit_depth);
+                patch(&mut f, sh);
+            }
+            // 3: av1C (color, essential)
+            {
+                let sh = f.len();
+                write_box(&mut f, b"av1C");
+                f.extend_from_slice(&color_av1c);
                 patch(&mut f, sh);
             }
             // 4: colr
@@ -707,8 +705,8 @@ pub(crate) fn wrap_av1_image_with_alpha(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 2); // entry_count
-            // color item 1: av1C(1,essential), ispe(2), pixi(3), colr(4) + optionals
-            let mut c_assoc: Vec<u8> = vec![0x80 | 1, 2, 3, 4];
+            // color item 1: ispe(1), pixi(2), av1C(3,essential), colr(4) + optionals
+            let mut c_assoc: Vec<u8> = vec![1, 2, 0x80 | 3, 4];
             if irot_idx != 0 {
                 c_assoc.push(0x80 | irot_idx);
             }
@@ -721,11 +719,11 @@ pub(crate) fn wrap_av1_image_with_alpha(
             w16(&mut f, 1);
             f.push(c_assoc.len() as u8);
             f.extend_from_slice(&c_assoc);
-            // alpha item 2: av1C(5,essential), ispe(2), pixi(6), auxC(7)
+            // alpha item 2: ispe(1), av1C(5,essential), pixi(6), auxC(7)
             w16(&mut f, 2);
             f.push(4);
-            f.push(0x80 | 5); // av1C essential
-            f.push(2); // ispe
+            f.push(1); // ispe
+            f.push(0x80 | 5); // av1C alpha essential
             f.push(6); // pixi
             f.push(7); // auxC
             patch(&mut f, si);
@@ -892,8 +890,8 @@ mod tests {
         // Locate the av1 extent_offset in iloc
         let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
         // iloc: 8(box) + 4(fullbox) + 2(fields) + 2(item_count) = 16 bytes before first item
-        // first item: 2(id)+2(meth)+2(ref)+2(cnt) = 8, then extent_offset (4)
-        let off_pos = iloc_pos + 16 + 8;
+        // first item v0: 2(id)+2(ref)+2(cnt) = 6, then extent_offset (4)
+        let off_pos = iloc_pos + 16 + 6;
         let extent_off = u32::from_be_bytes(b[off_pos..off_pos + 4].try_into().unwrap());
         assert_eq!(
             extent_off, mdat_payload_start,

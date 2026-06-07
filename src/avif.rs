@@ -232,8 +232,6 @@ fn checked_buffer_size(w: usize, h: usize, ch: usize) -> Result<usize, EncodeErr
         })
 }
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
-
 /// Map quality 1..=100 → AV1 base_q_idx 1..=255.
 /// quality 100 → q = 1 (near-lossless), quality 1 → q = 255.
 fn quality_to_q(quality: u8) -> u8 {
@@ -272,7 +270,11 @@ fn make_av1c(
         monochrome: matches!(chroma, ChromaFormat::Monochrome),
         chroma_sub_x: sub_x,
         chroma_sub_y: sub_y,
-        seq_header_obu: isobmff::first_obu_of_type(obu, 1).to_vec(),
+        // avifenc / libavif leave configOBUs empty; the decoder reads the
+        // sequence header from the sample data.  Embedding it here is valid
+        // per spec but Apple's profile-2 path is stricter and rejects when
+        // configOBUs is present, so we omit it to match the reference encoder.
+        seq_header_obu: vec![],
     }
 }
 
@@ -351,14 +353,15 @@ fn dispatch_lossy<T: crate::Pixel>(
     img: &crate::PlanarImage<T>,
     q: u8,
     chroma: ChromaFormat,
+    color: &crate::color::ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     match chroma {
         ChromaFormat::Yuv420 | ChromaFormat::Monochrome => {
-            encode_still_lossy_420(img, q, threads).bytes
+            encode_still_lossy_420(img, q, color, threads).bytes
         }
-        ChromaFormat::Yuv422 => encode_still_lossy_422(img, q, threads).bytes,
-        ChromaFormat::Yuv444 => encode_still_lossy(img, q, threads).bytes,
+        ChromaFormat::Yuv422 => encode_still_lossy_422(img, q, color, threads).bytes,
+        ChromaFormat::Yuv444 => encode_still_lossy(img, q, color, threads).bytes,
     }
 }
 
@@ -375,7 +378,14 @@ pub fn encode_rgb8(
     cfg.validate()?;
     validate_buf_u8(rgb, width, height, 3)?;
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    println!("working q {}", quality_to_q(cfg.quality));
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
 }
 
@@ -396,7 +406,13 @@ pub fn encode_rgba8(
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, &rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
 }
 
@@ -425,7 +441,13 @@ pub fn encode_rgba8_with_alpha(
         alpha.push(px[3]);
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu = crate::encode_still_mono(&alpha, w, h, 8, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
 }
@@ -443,7 +465,13 @@ pub fn encode_rgb10(
     cfg.validate()?;
     validate_buf_u16(rgb, width, height, 3)?;
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 10, rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
 }
 
@@ -464,7 +492,13 @@ pub fn encode_rgba10(
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 10, &rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
 }
 
@@ -489,7 +523,13 @@ pub fn encode_rgba10_with_alpha(
         alpha.push(px[3]);
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 10, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu = crate::encode_still_mono(&alpha, w, h, 10, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
 }
@@ -510,7 +550,13 @@ pub fn encode_rgb12(
     cfg.validate()?;
     validate_buf_u16(rgb, width, height, 3)?;
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 12, rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
 }
 
@@ -532,7 +578,13 @@ pub fn encode_rgba12(
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 12, &rgb);
-    let obu = dispatch_lossy(&img, quality_to_q(cfg.quality), cfg.chroma, cfg.threads);
+    let obu = dispatch_lossy(
+        &img,
+        quality_to_q(cfg.quality),
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
 }
 
@@ -560,7 +612,13 @@ pub fn encode_rgba12_with_alpha(
         alpha.push(px[3]);
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 12, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu = crate::encode_still_mono(&alpha, w, h, 12, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
 }
@@ -673,7 +731,18 @@ pub fn encode_yuv8(
     cfg.validate()?;
     validate_yuv_u8(y, cb, cr, width, height, cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
-    let obu = dispatch_yuv_u8(y, cb, cr, width, height, 8, q, cfg.chroma, cfg.threads);
+    let obu = dispatch_yuv_u8(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        8,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
 }
 
@@ -692,7 +761,18 @@ pub fn encode_yuv10(
     cfg.validate()?;
     validate_yuv_u16(y, cb, cr, width, height, cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
-    let obu = dispatch_yuv_u16(y, cb, cr, width, height, 10, q, cfg.chroma, cfg.threads);
+    let obu = dispatch_yuv_u16(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        10,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
 }
 
@@ -711,7 +791,18 @@ pub fn encode_yuv12(
     cfg.validate()?;
     validate_yuv_u16(y, cb, cr, width, height, cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
-    let obu = dispatch_yuv_u16(y, cb, cr, width, height, 12, q, cfg.chroma, cfg.threads);
+    let obu = dispatch_yuv_u16(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        12,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
 }
 
@@ -732,7 +823,18 @@ pub fn encode_yuva8_with_alpha(
     validate_yuv_u8(y, cb, cr, width, height, cfg.chroma)?;
     validate_buf_u8(a, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = dispatch_yuv_u8(y, cb, cr, width, height, 8, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_yuv_u8(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        8,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu =
         crate::encode_still_mono(a, width as usize, height as usize, 8, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
@@ -753,7 +855,18 @@ pub fn encode_yuva10_with_alpha(
     validate_yuv_u16(y, cb, cr, width, height, cfg.chroma)?;
     validate_buf_u16(a, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = dispatch_yuv_u16(y, cb, cr, width, height, 10, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_yuv_u16(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        10,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu =
         crate::encode_still_mono(a, width as usize, height as usize, 10, q, true, cfg.threads)
             .bytes;
@@ -775,7 +888,18 @@ pub fn encode_yuva12_with_alpha(
     validate_yuv_u16(y, cb, cr, width, height, cfg.chroma)?;
     validate_buf_u16(a, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = dispatch_yuv_u16(y, cb, cr, width, height, 12, q, cfg.chroma, cfg.threads);
+    let color_obu = dispatch_yuv_u16(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        12,
+        q,
+        cfg.chroma,
+        &cfg.color.color_encoding(),
+        cfg.threads,
+    );
     let alpha_obu =
         crate::encode_still_mono(a, width as usize, height as usize, 12, q, true, cfg.threads)
             .bytes;
@@ -792,14 +916,15 @@ fn dispatch_yuv_u8(
     bd: u8,
     q: u8,
     chroma: ChromaFormat,
+    color: &crate::color::ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
     match chroma {
-        ChromaFormat::Yuv420 => crate::encode_yuv420(y, cb, cr, w, h, bd, q, threads).bytes,
-        ChromaFormat::Yuv422 => crate::encode_yuv422(y, cb, cr, w, h, bd, q, threads).bytes,
+        ChromaFormat::Yuv420 => crate::encode_yuv420(y, cb, cr, w, h, bd, q, color, threads).bytes,
+        ChromaFormat::Yuv422 => crate::encode_yuv422(y, cb, cr, w, h, bd, q, color, threads).bytes,
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            crate::encode_yuv444(y, cb, cr, w, h, bd, q, threads).bytes
+            crate::encode_yuv444(y, cb, cr, w, h, bd, q, color, threads).bytes
         }
     }
 }
@@ -814,14 +939,15 @@ fn dispatch_yuv_u16(
     bd: u8,
     q: u8,
     chroma: ChromaFormat,
+    color: &crate::color::ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
     match chroma {
-        ChromaFormat::Yuv420 => crate::encode_yuv420(y, cb, cr, w, h, bd, q, threads).bytes,
-        ChromaFormat::Yuv422 => crate::encode_yuv422(y, cb, cr, w, h, bd, q, threads).bytes,
+        ChromaFormat::Yuv420 => crate::encode_yuv420(y, cb, cr, w, h, bd, q, color, threads).bytes,
+        ChromaFormat::Yuv422 => crate::encode_yuv422(y, cb, cr, w, h, bd, q, color, threads).bytes,
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            crate::encode_yuv444(y, cb, cr, w, h, bd, q, threads).bytes
+            crate::encode_yuv444(y, cb, cr, w, h, bd, q, color, threads).bytes
         }
     }
 }
