@@ -6,6 +6,8 @@
 //! always promotes to `i32` (see `transform.rs`); the trait only governs
 //! storage and clipping back to the valid range.
 
+use crate::err::EncodeError;
+
 pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug {
     /// Promote a stored sample to the signed working type used by the transform.
     fn to_i32(self) -> i32;
@@ -76,6 +78,15 @@ impl BitDepth {
             BitDepth::Eight => 8,
             BitDepth::Ten => 10,
             BitDepth::Twelve => 12,
+        }
+    }
+
+    pub fn from_u8(bit_depth: u8) -> Result<Self, EncodeError> {
+        match bit_depth {
+            8 => Ok(BitDepth::Eight),
+            10 => Ok(BitDepth::Ten),
+            12 => Ok(BitDepth::Twelve),
+            _ => Err(EncodeError::InvalidInput),
         }
     }
 }

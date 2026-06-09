@@ -58,8 +58,8 @@
 use crate::color::{ColorEncoding, ColorMetadata};
 use crate::encoder::{encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422};
 use crate::err::EncodeError;
-use crate::isobmff;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
+use crate::{BitDepth, isobmff};
 
 const MIN_DIM: u32 = 1;
 /// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
@@ -205,7 +205,7 @@ fn validate_quality(quality: u8) -> Result<(), EncodeError> {
 }
 
 fn validate_buf_u8(buf: &[u8], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
-    let needed = checked_buffer_size(w as usize, h as usize, ch)?;
+    let needed = checked_buffer_size::<u8>(w as usize, h as usize, ch)?;
     if buf.len() != needed {
         return Err(EncodeError::InvalidInput);
     }
@@ -213,14 +213,24 @@ fn validate_buf_u8(buf: &[u8], w: u32, h: u32, ch: usize) -> Result<(), EncodeEr
 }
 
 fn validate_buf_u16(buf: &[u16], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
-    let needed = checked_buffer_size(w as usize, h as usize, ch)?;
+    let needed = checked_buffer_size::<u16>(w as usize, h as usize, ch)?;
     if buf.len() != needed {
         return Err(EncodeError::InvalidInput);
     }
     Ok(())
 }
 
-fn checked_buffer_size(w: usize, h: usize, ch: usize) -> Result<usize, EncodeError> {
+pub(crate) fn checked_buffer_size<T>(w: usize, h: usize, ch: usize) -> Result<usize, EncodeError> {
+    _ = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(ch))
+        .and_then(|n| n.checked_mul(size_of::<T>()))
+        .and_then(|n| isize::try_from(n).ok())
+        .ok_or(EncodeError::DimensionTooLarge {
+            width: w,
+            height: h,
+        })?;
+
     w.checked_mul(h)
         .and_then(|n| n.checked_mul(ch))
         .ok_or(EncodeError::DimensionTooLarge {
@@ -374,7 +384,12 @@ pub fn encode_rgb8(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u8(rgb, width, height, 3)?;
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Eight,
+        rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -398,10 +413,17 @@ pub fn encode_rgba8(
     cfg.validate()?;
     validate_buf_u8(rgba, width, height, 4)?;
     let rgb: Vec<u8> = rgba
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Eight,
+        &rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -442,7 +464,7 @@ pub fn encode_rgba8_with_alpha(
         dst_rgb[2] = px[2];
         *alpha = px[3];
     }
-    let img = crate::PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
     let color_obu = dispatch_lossy(
         &img,
         q,
@@ -450,7 +472,8 @@ pub fn encode_rgba8_with_alpha(
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu = crate::encode_still_mono(&alpha, w, h, 8, q, true, cfg.threads).bytes;
+    let alpha_obu =
+        crate::encode_still_mono(&alpha, w, h, BitDepth::Eight, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
 }
 
@@ -466,7 +489,12 @@ pub fn encode_rgb10(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u16(rgb, width, height, 3)?;
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 10, rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Ten,
+        rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -490,10 +518,17 @@ pub fn encode_rgba10(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 10, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Ten,
+        &rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -530,7 +565,7 @@ pub fn encode_rgba10_with_alpha(
         dst_rgb[2] = px[2];
         *alpha = px[3];
     }
-    let img = crate::PlanarImage::from_interleaved_rgb(w, h, 10, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Ten, &rgb);
     let color_obu = dispatch_lossy(
         &img,
         q,
@@ -538,7 +573,8 @@ pub fn encode_rgba10_with_alpha(
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu = crate::encode_still_mono(&alpha, w, h, 10, q, true, cfg.threads).bytes;
+    let alpha_obu =
+        crate::encode_still_mono(&alpha, w, h, BitDepth::Ten, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
 }
 
@@ -555,7 +591,12 @@ pub fn encode_rgb12(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u16(rgb, width, height, 3)?;
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 12, rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Twelve,
+        rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -580,10 +621,17 @@ pub fn encode_rgba12(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 12, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(
+        width as usize,
+        height as usize,
+        BitDepth::Twelve,
+        &rgb,
+    );
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -623,7 +671,7 @@ pub fn encode_rgba12_with_alpha(
         dst_rgb[2] = px[2];
         *alpha = px[3];
     }
-    let img = crate::PlanarImage::from_interleaved_rgb(w, h, 12, &rgb);
+    let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
     let color_obu = dispatch_lossy(
         &img,
         q,
@@ -631,7 +679,8 @@ pub fn encode_rgba12_with_alpha(
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu = crate::encode_still_mono(&alpha, w, h, 12, q, true, cfg.threads).bytes;
+    let alpha_obu =
+        crate::encode_still_mono(&alpha, w, h, BitDepth::Twelve, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
 }
 
@@ -653,7 +702,7 @@ pub fn encode_gray8(
         gray,
         width as usize,
         height as usize,
-        8,
+        BitDepth::Eight,
         q,
         true,
         cfg.threads,
@@ -679,7 +728,7 @@ pub fn encode_gray10(
         gray,
         width as usize,
         height as usize,
-        10,
+        BitDepth::Ten,
         q,
         true,
         cfg.threads,
@@ -705,7 +754,7 @@ pub fn encode_gray12(
         gray,
         width as usize,
         height as usize,
-        12,
+        BitDepth::Twelve,
         q,
         true,
         cfg.threads,
@@ -746,7 +795,7 @@ pub fn encode_yuv8(
         cr,
         width,
         height,
-        8,
+        BitDepth::Eight,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
@@ -776,7 +825,7 @@ pub fn encode_yuv10(
         cr,
         width,
         height,
-        10,
+        BitDepth::Ten,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
@@ -806,7 +855,7 @@ pub fn encode_yuv12(
         cr,
         width,
         height,
-        12,
+        BitDepth::Twelve,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
@@ -838,14 +887,22 @@ pub fn encode_yuva8_with_alpha(
         cr,
         width,
         height,
-        8,
+        BitDepth::Eight,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu =
-        crate::encode_still_mono(a, width as usize, height as usize, 8, q, true, cfg.threads).bytes;
+    let alpha_obu = crate::encode_still_mono(
+        a,
+        width as usize,
+        height as usize,
+        BitDepth::Eight,
+        q,
+        true,
+        cfg.threads,
+    )
+    .bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
 }
 
@@ -870,15 +927,22 @@ pub fn encode_yuva10_with_alpha(
         cr,
         width,
         height,
-        10,
+        BitDepth::Ten,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu =
-        crate::encode_still_mono(a, width as usize, height as usize, 10, q, true, cfg.threads)
-            .bytes;
+    let alpha_obu = crate::encode_still_mono(
+        a,
+        width as usize,
+        height as usize,
+        BitDepth::Ten,
+        q,
+        true,
+        cfg.threads,
+    )
+    .bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
 }
 
@@ -903,15 +967,22 @@ pub fn encode_yuva12_with_alpha(
         cr,
         width,
         height,
-        12,
+        BitDepth::Twelve,
         q,
         cfg.chroma,
         &cfg.color.color_encoding(),
         cfg.threads,
     );
-    let alpha_obu =
-        crate::encode_still_mono(a, width as usize, height as usize, 12, q, true, cfg.threads)
-            .bytes;
+    let alpha_obu = crate::encode_still_mono(
+        a,
+        width as usize,
+        height as usize,
+        BitDepth::Twelve,
+        q,
+        true,
+        cfg.threads,
+    )
+    .bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
 }
 
@@ -922,7 +993,7 @@ fn dispatch_yuv_u8(
     cr: &[u8],
     w: u32,
     h: u32,
-    bd: u8,
+    bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
     color: &ColorEncoding,
@@ -945,7 +1016,7 @@ fn dispatch_yuv_u16(
     cr: &[u16],
     w: u32,
     h: u32,
-    bd: u8,
+    bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
     color: &ColorEncoding,
