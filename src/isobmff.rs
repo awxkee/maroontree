@@ -743,7 +743,6 @@ pub(crate) fn wrap_av1_image_with_alpha(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::ColorMetadata;
 
     fn dummy_av1c() -> Av1cParams {
         Av1cParams {

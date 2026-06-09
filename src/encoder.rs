@@ -398,16 +398,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     )
 }
 
-/// Encode a single grayscale plane as a **monochrome** AV1 still
-/// (`mono_chrome = 1`, one luma plane). This is the form AVIF uses for an alpha
-/// auxiliary image — alpha in AV1/AVIF is not a 4th channel but a separate
-/// monochrome image the container references as the alpha aux item. `plane` is
-/// the `width*height` grayscale (e.g. alpha) raster; `full_range` sets
-/// `color_range` (alpha is normally full range). `base_q_idx` controls quality;
-/// `threads`: `0` = all cores, `1` = serial, `N` = up to N (the plane is tiled
-/// toward the thread count, and large planes tile by size, exactly like the
-/// color encoders). For exact alpha, use a small `base_q_idx`.
-pub fn encode_lossy_gray<T: Pixel>(
+pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
@@ -480,7 +471,7 @@ pub fn encode_lossless_with<T: Pixel>(
 ///
 /// Y, Cb, Cr are full-resolution (`width × height`) samples. The AV1 bitstream
 /// carries full-range BT.601 YCbCr signaling (profile 1 for ≤10-bit, 2 for 12-bit).
-pub fn encode_yuv444<T: Pixel>(
+pub(crate) fn encode_yuv444_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
@@ -513,7 +504,7 @@ pub fn encode_yuv444<T: Pixel>(
 ///
 /// `cb` and `cr` must each be `ceil(width/2) × height` samples. The AV1 bitstream
 /// uses AV1 profile 2 (4:2:2 / 12-bit profile).
-pub fn encode_yuv422<T: Pixel>(
+pub(crate) fn encode_yuv422_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
@@ -546,7 +537,7 @@ pub fn encode_yuv422<T: Pixel>(
 ///
 /// `cb` and `cr` must each be `ceil(width/2) × ceil(height/2)` samples. The AV1
 /// bitstream uses AV1 profile 0 (4:2:0 main profile).
-pub fn encode_yuv420<T: Pixel>(
+pub(crate) fn encode_yuv420_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,

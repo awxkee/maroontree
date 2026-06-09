@@ -3206,8 +3206,8 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..16 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &cpred16[ci][ry * 16..];
-                    for j in 0..16 {
-                        let d = srow[j] - prow[j];
+                    for (&srow, &prow) in srow[..16].iter().zip(prow[..16].iter()) {
+                        let d = srow - prow;
                         sse_cur += (d * d) as i64;
                     }
                 }
@@ -3244,8 +3244,8 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..16 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds16[ci][ry * 16..];
-                    for j in 0..16 {
-                        let d = srow[j] - prow[j];
+                    for (&srow, &prow) in srow[..16].iter().zip(prow[..16].iter()) {
+                        let d = srow - prow;
                         sse_sv += (d * d) as i64;
                     }
                 }
@@ -3406,10 +3406,14 @@ impl<'a> LossyTile<'a> {
             {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 let prow = &sv_preds[ci][ry * 8..];
-                for j in 0..8 {
-                    let s = srow[j];
-                    let d = s - (dc + rd_row[j]).clamp(0, maxval);
-                    let v = s - (prow[j] + rs_row[j]).clamp(0, maxval);
+                for (((&s, &prow), &rd), &rs) in srow[..8]
+                    .iter()
+                    .zip(prow[..8].iter())
+                    .zip(rd_row[..8].iter())
+                    .zip(rs_row[..8].iter())
+                {
+                    let d = s - (dc + rd).clamp(0, maxval);
+                    let v = s - (prow + rs).clamp(0, maxval);
                     sse_dc += (d * d) as i64;
                     sse_sv += (v * v) as i64;
                 }
