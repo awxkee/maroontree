@@ -619,12 +619,6 @@ fn decode_sb_ll(
     }
 }
 
-/// Encode a 64×64 lossless AV1 tile (single superblock). Convenience wrapper
-/// over [`encode_tile_lossless`].
-pub fn encode_tile_64(planes: [&[i16]; 3]) -> Vec<u8> {
-    encode_tile_lossless(64, 64, 8, planes)
-}
-
 /// Encode a lossless AV1 tile for an arbitrary frame whose width and height are
 /// multiples of 8. The frame is tiled into 64×64 superblocks (raster order,
 /// single tile). Fully-in-frame superblocks are one `PARTITION_NONE` 64×64
@@ -660,19 +654,6 @@ pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `encode_tile_64` must remain byte-identical to the single-superblock path
-    /// of `encode_tile_lossless` (backward compatibility).
-    #[test]
-    fn tile_64_matches_lossless_64() {
-        let g: Vec<i16> = (0..4096).map(|i| (i % 37) as i16).collect();
-        let b: Vec<i16> = (0..4096).map(|i| (i % 53) as i16).collect();
-        let r: Vec<i16> = (0..4096).map(|i| (i % 41) as i16).collect();
-        assert_eq!(
-            encode_tile_64([&g, &b, &r]),
-            encode_tile_lossless(64, 64, 8, [&g, &b, &r])
-        );
-    }
 
     /// Arbitrary-size (non-multiple-of-64) lossless regression guard. 72×64 has
     /// one full superblock plus an 8px-wide edge column split to 8×8 leaves via

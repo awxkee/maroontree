@@ -48,9 +48,9 @@
 //! shape as the project's `isobmff.rs` so this drops into that file as a sibling
 //! of `wrap_av1_image`.
 use crate::ColorEncoding;
-use crate::av2::AvFrame;
+use crate::av2::Av2Frame;
 
-/// Colour information for the `colr` box: either enumerated CICP (`nclx`) or an
+/// Color information for the `colr` box: either enumerated CICP (`nclx`) or an
 /// embedded ICC profile (`prof`). An ICC profile can only live in the container
 /// — the AV2 bitstream carries CICP indices only, no place for a profile blob.
 pub enum Av2Color {
@@ -168,6 +168,8 @@ pub fn wrap_av2_image(
     obu: &[u8],
     width: u32,
     height: u32,
+    disp_width: u32,
+    disp_height: u32,
     fmt: &Av2Format,
     color: &Av2Color,
     exif: Option<&[u8]>,
@@ -346,6 +348,26 @@ pub fn wrap_av2_image(
             }
         }
         let _ = next_prop;
+        // Optional clap (clean aperture): crop the coded (ispe) image down to the
+        // display size. Required for padded lossy frames so every reader — not just
+        // ispe-aware ones — shows the real dimensions. Center-relative per ISO 14496-12:
+        // horizOff = (disp - coded)/2 with denominator 2; numerators are signed.
+        let mut clap_prop: Option<u8> = None;
+        if disp_width != width || disp_height != height {
+            let p = write_box(&mut f, b"clap");
+            w32(&mut f, disp_width); // cleanApertureWidthN
+            w32(&mut f, 1); // cleanApertureWidthD
+            w32(&mut f, disp_height); // cleanApertureHeightN
+            w32(&mut f, 1); // cleanApertureHeightD
+            w32(&mut f, (disp_width as i32 - width as i32) as u32); // horizOffN (signed)
+            w32(&mut f, 2); // horizOffD
+            w32(&mut f, (disp_height as i32 - height as i32) as u32); // vertOffN (signed)
+            w32(&mut f, 2); // vertOffD
+            patch(&mut f, p);
+            clap_prop = Some(next_prop);
+            next_prop += 1;
+        }
+        let _ = next_prop;
         patch(&mut f, ipco);
         // ipma — associate item 1 with ispe(1), pixi(2), av2C(3, essential), and
         // each colr property. (None of the colr boxes are marked essential.)
@@ -353,12 +375,17 @@ pub fn wrap_av2_image(
             let p = write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 1); // entry_count
             w16(&mut f, 1); // item_ID
-            f.push(3 + colr_props.len() as u8); // association_count
+            let assoc = 3 + colr_props.len() as u8 + clap_prop.is_some() as u8;
+            f.push(assoc); // association_count
             f.push(1); // ispe
             f.push(2); // pixi
             f.push(0x80 | 3); // av2C (essential)
             for &idx in &colr_props {
                 f.push(idx); // colr (non-essential)
+            }
+            // clap is transformative -> essential (applied after ispe to crop).
+            if let Some(idx) = clap_prop {
+                f.push(0x80 | idx);
             }
             patch(&mut f, p);
         }
@@ -387,13 +414,15 @@ pub fn wrap_av2_image(
 
 /// Wrap an `Encoded` result into an AVIF-style file with explicit colour info.
 pub fn to_avif_color(
-    enc: &AvFrame,
+    enc: &Av2Frame,
     fmt: &Av2Format,
     color: &Av2Color,
     exif: Option<&[u8]>,
 ) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
+        enc.coded_width as u32,
+        enc.coded_height as u32,
         enc.width as u32,
         enc.height as u32,
         fmt,
@@ -403,17 +432,17 @@ pub fn to_avif_color(
 }
 
 /// Convenience: wrap an `Encoded` result using its CICP colour metadata (`nclx`).
-pub fn to_avif(enc: &AvFrame, fmt: &Av2Format) -> Vec<u8> {
+pub fn to_avif(enc: &Av2Frame, fmt: &Av2Format) -> Vec<u8> {
     to_avif_color(enc, fmt, &Av2Color::Cicp(enc.color.clone()), None)
 }
 
 /// Convenience: wrap an `Encoded` result embedding an ICC profile (`prof`).
-pub fn to_avif_icc(enc: &AvFrame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
+pub fn to_avif_icc(enc: &Av2Frame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
     to_avif_color(enc, fmt, &Av2Color::Icc(icc), None)
 }
 
 /// Convenience: wrap an `Encoded` result with both CICP (`nclx`) and ICC (`prof`).
-pub fn to_avif_cicp_icc(enc: &AvFrame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
+pub fn to_avif_cicp_icc(enc: &Av2Frame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
     to_avif_color(
         enc,
         fmt,
@@ -428,15 +457,15 @@ pub fn to_avif_cicp_icc(enc: &AvFrame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8>
 /// Convenience: wrap an `Encoded` result with CICP plus an optional ICC profile
 /// and/or an EXIF metadata item.
 pub fn to_avif_full(
-    enc: &AvFrame,
+    enc: &Av2Frame,
     fmt: &Av2Format,
-    icc: Option<Vec<u8>>,
+    icc: Option<&[u8]>,
     exif: Option<&[u8]>,
 ) -> Vec<u8> {
     let color = match icc {
         Some(icc) => Av2Color::Both {
             cicp: enc.color,
-            icc,
+            icc: icc.to_vec(),
         },
         None => Av2Color::Cicp(enc.color),
     };

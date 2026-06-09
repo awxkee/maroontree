@@ -35,6 +35,7 @@ mod headers;
 mod helpers;
 mod layout;
 mod lossless;
+mod partition;
 mod proj;
 mod quant;
 mod tables;
@@ -75,9 +76,7 @@ const CR_R: i32 = 4096; // round( 0.5 * 8192)
 const CR_G: i32 = -3430; // round(-0.418688 * 8192)
 const CR_B: i32 = -666; // round(-0.081312 * 8192)
 
-/// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
-/// samples; with both axes capped here the largest possible frame is ~268 MP.
-const MAX_DIM: u32 = 16_383;
+const MAX_DIM: u32 = 65535;
 
 pub fn get_q_ctx(q: u8) -> usize {
     if q <= 90 {
@@ -92,21 +91,31 @@ pub fn get_q_ctx(q: u8) -> usize {
 }
 
 /// Result of an encode: the AV2 bitstream plus the metadata needed to interpret it.
-pub struct AvFrame {
-    pub data: Vec<u8>,
-    pub width: usize,
-    pub height: usize,
-    pub bit_depth: u8,
-    pub base_q_idx: u8,
-    pub color: ColorEncoding,
-    pub chroma_format: ChromaFormat,
+pub struct Av2Frame {
+    data: Vec<u8>,
+    width: usize,
+    height: usize,
+    /// Coded (decoder-output) dimensions = the size signaled in the OBU. Equal to
+    /// width/height for lossless and SB-aligned lossy; for padded lossy they are the
+    /// 64-aligned size, and the AVIF muxer adds a `clap` box cropping to width/height.
+    coded_width: usize,
+    coded_height: usize,
+    bit_depth: u8,
+    color: ColorEncoding,
+    chroma_format: ChromaFormat,
+}
+
+impl Av2Frame {
+    pub fn view(&self) -> &[u8] {
+        self.data.as_slice()
+    }
 }
 
 /// A reusable still-image encoder configured for one quality.
 ///
 /// `Av2Encoder::new(q)` loads the bundled q120 bases and rescales them to the target
 /// `base_q_idx` once (see [`proj::Bases::rescaled_to_q`]); the per-superblock encode
-/// then reuses that precomputed set. Lower `base_q_idx` → finer quantiser → larger,
+/// then reuses that precomputed set. Lower `base_q_idx` → finer quantizer → larger,
 /// higher-quality output; higher → coarser/smaller.
 pub struct Av2Encoder {
     bases: proj::Bases,
@@ -166,6 +175,18 @@ impl Av2Encoder {
         (1u32 << (self.bit_depth - 1)) as f32
     }
 
+    /// Resolve a caller-supplied thread budget: `0` = use all available cores,
+    /// `1` = serial, `N` = up to N threads. Replaces the old `SLIMAV_THREADS` env.
+    fn resolve_threads(threads: usize) -> usize {
+        if threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            threads
+        }
+    }
+
     /// Encode a 4:4:4 YCbCr still. `y`, `cb`, `cr` are full-resolution
     /// (`width × height`). Luma is four 32x32 transform units per 64x64 superblock;
     /// each chroma plane is one 64x64 transform per superblock.
@@ -173,25 +194,16 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
-    ) -> Result<AvFrame, EncodeError> {
+        threads: usize,
+    ) -> Result<Av2Frame, EncodeError> {
+        planar_image.validate_444()?;
         let width = planar_image.width;
         let height = planar_image.height;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
-        assert_eq!(y.len(), width * height, "Y plane size mismatch");
-        assert_eq!(
-            cb.len(),
-            width * height,
-            "Cb plane must be full-resolution (4:4:4)"
-        );
-        assert_eq!(
-            cr.len(),
-            width * height,
-            "Cr plane must be full-resolution (4:4:4)"
-        );
         if self.base_q_idx == 0 {
-            return Ok(self.encode_yuv444_lossless(y, cb, cr, width, height, color));
+            return Ok(self.encode_yuv444_lossless(y, cb, cr, width, height, color, threads));
         }
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
@@ -293,27 +305,17 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
-    ) -> AvFrame {
+        threads: usize,
+    ) -> Result<Av2Frame, EncodeError> {
+        // Lossy 4:2:x is reconstruction-sequential (intra prediction reads the
+        // running reconstruction), so it codes serially regardless of `threads`.
+        let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
-        assert!(
-            width % 2 == 0 && height % 2 == 0,
-            "4:2:0 requires even width and height"
-        );
-        assert_eq!(y.len(), width * height, "Y plane size mismatch");
-        assert_eq!(
-            cb.len(),
-            (width / 2) * (height / 2),
-            "Cb plane must be width/2 x height/2 (4:2:0)"
-        );
-        assert_eq!(
-            cr.len(),
-            (width / 2) * (height / 2),
-            "Cr plane must be width/2 x height/2 (4:2:0)"
-        );
+        planar_image.validate_420()?;
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (pw, ph) = (sb_align(width), sb_align(height));
@@ -406,7 +408,7 @@ impl Av2Encoder {
                 v_has[row * sb_cols + col] = vcoeffs.iter().any(|&(_, l)| l != 0) as i32;
             }
         }
-        self.finish(enc, &config, pw, ph, width, height, color)
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
     /// Encode a 4:2:2 YCbCr still. `y` is `width × height`; `cb`/`cr` are
@@ -419,24 +421,17 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
-    ) -> AvFrame {
+        threads: usize,
+    ) -> Result<Av2Frame, EncodeError> {
+        // Lossy 4:2:x is reconstruction-sequential (intra prediction reads the
+        // running reconstruction), so it codes serially regardless of `threads`.
+        let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
-        assert!(width % 2 == 0, "4:2:2 requires even width");
-        assert_eq!(y.len(), width * height, "Y plane size mismatch");
-        assert_eq!(
-            cb.len(),
-            (width / 2) * height,
-            "Cb plane must be width/2 x height (4:2:2)"
-        );
-        assert_eq!(
-            cr.len(),
-            (width / 2) * height,
-            "Cr plane must be width/2 x height (4:2:2)"
-        );
+        planar_image.validate_422()?;
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (pw, ph) = (sb_align(width), sb_align(height));
@@ -532,7 +527,7 @@ impl Av2Encoder {
                 v_has[row * sb_cols + col] = vcoeffs.iter().any(|&(_, l)| l != 0) as i32;
             }
         }
-        self.finish(enc, &config, pw, ph, width, height, color)
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
     /// Encode a 4:0:0 (monochrome / luma-only) still. `y` is `width × height`.
@@ -542,11 +537,12 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
-    ) -> AvFrame {
+        threads: usize,
+    ) -> Result<Av2Frame, EncodeError> {
+        planar_image.validate_400()?;
         let width = planar_image.width;
         let height = planar_image.height;
         let y = &planar_image.planes[0];
-        assert_eq!(y.len(), width * height, "Y plane size mismatch");
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (pw, ph) = (sb_align(width), sb_align(height));
@@ -556,7 +552,9 @@ impl Av2Encoder {
         let config = self.config(layout);
 
         if config.lossless {
-            return self.encode_yuv400_lossless(&yp, pw, ph, width, height, &config, color);
+            return Ok(
+                self.encode_yuv400_lossless(&yp, pw, ph, width, height, &config, color, threads)
+            );
         }
 
         let mut recy = vec![0f32; pw * ph];
@@ -595,7 +593,7 @@ impl Av2Encoder {
                 encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, false);
             }
         }
-        self.finish(enc, &config, pw, ph, width, height, color)
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
     /// Lossless (base_q=0) monochrome encode: each 64x64 superblock is coded as 256
@@ -611,7 +609,8 @@ impl Av2Encoder {
         height: usize,
         config: &Config,
         color: &ColorEncoding,
-    ) -> AvFrame {
+        threads: usize,
+    ) -> Av2Frame {
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx); // base_q=0 -> q-context 0
         let neutral = self.dc_neutral();
@@ -619,20 +618,99 @@ impl Av2Encoder {
         let sb_rows = ph / 64;
         let mut above = vec![0x40u8; pw / 4 + 16];
         let mut left = vec![0x40u8; ph / 4 + 16];
+        // mi grid is 8px-aligned (avm dec_set_mb_mi); the recursive forced-split coder
+        // handles every boundary geometry, so we always code the real (8-aligned) grid.
+        let code_mc = ((width + 7) & !7) / 4;
+        let code_mr = ((height + 7) & !7) / 4;
+
+        // Phase A: per-SB TU generation is independent in lossless (recon == source),
+        // so generate the clipped SB TU grids in parallel across `threads`.
+        let nsb = sb_rows * sb_cols;
+        let mut sbtus: Vec<Vec<Vec<Coeff>>> = (0..nsb).map(|_| Vec::new()).collect();
+        let nthreads = Self::resolve_threads(threads);
+        if nthreads <= 1 || nsb < 8 {
+            for (idx, slot) in sbtus.iter_mut().enumerate() {
+                let (row, col) = (idx / sb_cols, idx % sb_cols);
+                let (rr, rc) = ((code_mr - row * 16).min(16), (code_mc - col * 16).min(16));
+                *slot = lossless_sb_tus(yp, pw, row * 64, col * 64, neutral, rr, rc);
+            }
+        } else {
+            let chunk = nsb.div_ceil(nthreads);
+            let (code_mc, code_mr) = (code_mc, code_mr);
+            std::thread::scope(|sc| {
+                for (ci, slice) in sbtus.chunks_mut(chunk).enumerate() {
+                    let base = ci * chunk;
+                    sc.spawn(move || {
+                        for (k, slot) in slice.iter_mut().enumerate() {
+                            let (row, col) = ((base + k) / sb_cols, (base + k) % sb_cols);
+                            let rr = (code_mr - row * 16).min(16);
+                            let rc = (code_mc - col * 16).min(16);
+                            *slot = lossless_sb_tus(yp, pw, row * 64, col * 64, neutral, rr, rc);
+                        }
+                    });
+                }
+            });
+        }
+
+        let mut above_pctx = vec![0u8; code_mc + 16];
 
         for row in 0..sb_rows {
+            let mut left_pctx = [0u8; 16];
             for col in 0..sb_cols {
                 let (sb_y, sb_x) = (row * 64, col * 64);
-                // 16x16 grid of 4x4 transform units, raster order within the superblock.
-                // Lossless reconstruction == source, so DC prediction reads `yp` directly.
-                let tus = lossless_sb_tus(yp, pw, sb_y, sb_x, neutral);
-                let (skip_ctx, dc_sign_ctxs) =
-                    sb_tu4_contexts(&tus, sb_y, sb_x, &mut above, &mut left);
-                let skip_cdfs: Vec<u32> = skip_ctx
-                    .iter()
-                    .map(|&c| TXB_SKIP_TX4_Q0[c] as u32)
-                    .collect();
-                encode_lossless_luma_sb(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, false);
+                let rr = (code_mr - row * 16).min(16);
+                let rc = (code_mc - col * 16).min(16);
+                // SB grid of in-frame 4x4 TUs (precomputed in Phase A).
+                let tus = &sbtus[row * sb_cols + col];
+                let ops = crate::av2::partition::sb_partition_ops(
+                    row,
+                    col,
+                    code_mr,
+                    code_mc,
+                    &mut above_pctx,
+                    &mut left_pctx,
+                );
+                for op in &ops {
+                    match *op {
+                        crate::av2::partition::Op::RectType { cdf, val } => {
+                            enc.encode_bool(cdf, val);
+                        }
+                        crate::av2::partition::Op::Leaf {
+                            mi_row,
+                            mi_col,
+                            bw_mi,
+                            bh_mi,
+                            part_cdf,
+                        } => {
+                            let lr = mi_row - row * 16;
+                            let lc = mi_col - col * 16;
+                            let lrows = bh_mi.min(rr - lr);
+                            let lcols = bw_mi.min(rc - lc);
+                            let mut ltus = Vec::with_capacity(lrows * lcols);
+                            for i in 0..lrows {
+                                for j in 0..lcols {
+                                    ltus.push(tus[(lr + i) * rc + (lc + j)].clone());
+                                }
+                            }
+                            let (ly, lx) = (sb_y + lr * 4, sb_x + lc * 4);
+                            let (skip_ctx, dc_sign_ctxs) =
+                                sb_tu4_contexts(&ltus, ly, lx, &mut above, &mut left, lrows, lcols);
+                            let skip_cdfs: Vec<u32> = skip_ctx
+                                .iter()
+                                .map(|&c| TXB_SKIP_TX4_Q0[c] as u32)
+                                .collect();
+                            encode_lossless_luma_sb(
+                                &mut enc,
+                                &ltus,
+                                &skip_cdfs,
+                                &dc_sign_ctxs,
+                                0,
+                                false,
+                                part_cdf,
+                            );
+                        }
+                    }
+                }
             }
         }
         self.finish(enc, config, pw, ph, width, height, color)
@@ -649,7 +727,8 @@ impl Av2Encoder {
         width: usize,
         height: usize,
         color: &ColorEncoding,
-    ) -> AvFrame {
+        threads: usize,
+    ) -> Av2Frame {
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (pw, ph) = (sb_align(width), sb_align(height));
         let yp = pad_plane(&to_plane(y), width, height, pw, ph);
@@ -660,6 +739,12 @@ impl Av2Encoder {
         enc.qc = get_q_ctx(self.base_q_idx);
         let neutral = self.dc_neutral();
         let (sb_cols, sb_rows) = (pw / 64, ph / 64);
+        // mi grid is 8px-aligned; recursion handles every boundary -> always exact.
+        let code_mc = ((width + 7) & !7) / 4;
+        let code_mr = ((height + 7) & !7) / 4;
+        let rem = |row: usize, col: usize| -> (usize, usize) {
+            ((code_mr - row * 16).min(16), (code_mc - col * 16).min(16))
+        };
         // luma ctx grids (0x40 = neutral DC-sign packing); chroma grids store cul (init 0).
         let mut ya = vec![0x40u8; pw / 4 + 16];
         let mut yl = vec![0x40u8; ph / 4 + 16];
@@ -677,21 +762,14 @@ impl Av2Encoder {
         let gen_val =
             |idx: usize, slot: &mut (Vec<Vec<Coeff>>, Vec<Vec<Coeff>>, Vec<Vec<Coeff>>)| {
                 let (sb_y, sb_x) = ((idx / sb_cols) * 64, (idx % sb_cols) * 64);
+                let (rr, rc) = rem(idx / sb_cols, idx % sb_cols);
                 *slot = (
-                    lossless_sb_tus(&yp, pw, sb_y, sb_x, neutral),
-                    lossless_sb_tus(&up, pw, sb_y, sb_x, neutral),
-                    lossless_sb_tus(&vp, pw, sb_y, sb_x, neutral),
+                    lossless_sb_tus(&yp, pw, sb_y, sb_x, neutral, rr, rc),
+                    lossless_sb_tus(&up, pw, sb_y, sb_x, neutral, rr, rc),
+                    lossless_sb_tus(&vp, pw, sb_y, sb_x, neutral, rr, rc),
                 );
             };
-        let nthreads = std::env::var("SLIMAV_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            });
+        let nthreads = Self::resolve_threads(threads);
         if nthreads <= 1 || nsb < 8 {
             for (idx, slot) in sbtus.iter_mut().enumerate() {
                 gen_val(idx, slot);
@@ -699,17 +777,20 @@ impl Av2Encoder {
         } else {
             let chunk = nsb.div_ceil(nthreads);
             let (yp, up, vp) = (&yp, &up, &vp);
+            let (code_mc, code_mr) = (code_mc, code_mr);
             std::thread::scope(|sc| {
                 for (ci, slice) in sbtus.chunks_mut(chunk).enumerate() {
                     let base = ci * chunk;
                     sc.spawn(move || {
                         for (k, slot) in slice.iter_mut().enumerate() {
-                            let (sb_y, sb_x) =
-                                (((base + k) / sb_cols) * 64, ((base + k) % sb_cols) * 64);
+                            let (row, col) = ((base + k) / sb_cols, (base + k) % sb_cols);
+                            let (sb_y, sb_x) = (row * 64, col * 64);
+                            let rr = (code_mr - row * 16).min(16);
+                            let rc = (code_mc - col * 16).min(16);
                             *slot = (
-                                lossless_sb_tus(yp, pw, sb_y, sb_x, neutral),
-                                lossless_sb_tus(up, pw, sb_y, sb_x, neutral),
-                                lossless_sb_tus(vp, pw, sb_y, sb_x, neutral),
+                                lossless_sb_tus(yp, pw, sb_y, sb_x, neutral, rr, rc),
+                                lossless_sb_tus(up, pw, sb_y, sb_x, neutral, rr, rc),
+                                lossless_sb_tus(vp, pw, sb_y, sb_x, neutral, rr, rc),
                             );
                         }
                     });
@@ -717,26 +798,92 @@ impl Av2Encoder {
             });
         }
         // Phase B: serial context derivation (cross-SB grids) + entropy coding.
+        // Partition context arrays (av2 update_partition_context): `above` persists
+        // down columns frame-wide; `left` is len-16 and zeroed per SB row.
+        let mut above_pctx = vec![0u8; code_mc + 16];
         for row in 0..sb_rows {
+            let mut left_pctx = [0u8; 16];
             for col in 0..sb_cols {
                 let (sb_y, sb_x) = (row * 64, col * 64);
+                let (rr, rc) = rem(row, col);
                 let (ytus, utus, vtus) = &sbtus[row * sb_cols + col];
-                let (yskip, ydcs) = sb_tu4_contexts(ytus, sb_y, sb_x, &mut ya, &mut yl);
-                let yskip_cdfs: Vec<u32> =
-                    yskip.iter().map(|&c| TXB_SKIP_TX4_Q0[c] as u32).collect();
-                let uskip = sb_tu4_chroma_skip(utus, sb_y, sb_x, &mut ua, &mut ul, false, false);
-                // avm's eob_u_flag is the LAST U TU of the block, applied to every V TU.
-                let u_last_nz = utus
-                    .last()
-                    .map_or(false, |t| t.iter().any(|&(_, l)| l != 0));
-                let vskip = sb_tu4_chroma_skip(vtus, sb_y, sb_x, &mut va, &mut vl, true, u_last_nz);
-                // modes (incl. uv) + luma coeffs, then U, then V (avm shared-tree order)
-                encode_lossless_luma_sb(&mut enc, ytus, &yskip_cdfs, &ydcs, 0, true);
-                for (i, tu) in utus.iter().enumerate() {
-                    encode_chroma_tu4(&mut enc, tu, TXB_SKIP_TX4_Q0[uskip[i]] as u32, false);
-                }
-                for (i, tu) in vtus.iter().enumerate() {
-                    encode_chroma_tu4(&mut enc, tu, V_TXB_SKIP_TX4_Q0[vskip[i]] as u32, true);
+                let ops = crate::av2::partition::sb_partition_ops(
+                    row,
+                    col,
+                    code_mr,
+                    code_mc,
+                    &mut above_pctx,
+                    &mut left_pctx,
+                );
+                for op in &ops {
+                    match *op {
+                        crate::av2::partition::Op::RectType { cdf, val } => {
+                            enc.encode_bool(cdf, val);
+                        }
+                        crate::av2::partition::Op::Leaf {
+                            mi_row,
+                            mi_col,
+                            bw_mi,
+                            bh_mi,
+                            part_cdf,
+                        } => {
+                            let lr = mi_row - row * 16;
+                            let lc = mi_col - col * 16;
+                            let lrows = bh_mi.min(rr - lr);
+                            let lcols = bw_mi.min(rc - lc);
+                            let slice = |g: &[Vec<Coeff>]| -> Vec<Vec<Coeff>> {
+                                let mut v = Vec::with_capacity(lrows * lcols);
+                                for i in 0..lrows {
+                                    for j in 0..lcols {
+                                        v.push(g[(lr + i) * rc + (lc + j)].clone());
+                                    }
+                                }
+                                v
+                            };
+                            let (lytus, lutus, lvtus) = (slice(ytus), slice(utus), slice(vtus));
+                            let (ly, lx) = (sb_y + lr * 4, sb_x + lc * 4);
+                            let (yskip, ydcs) =
+                                sb_tu4_contexts(&lytus, ly, lx, &mut ya, &mut yl, lrows, lcols);
+                            let yskip_cdfs: Vec<u32> =
+                                yskip.iter().map(|&c| TXB_SKIP_TX4_Q0[c] as u32).collect();
+                            let uskip = sb_tu4_chroma_skip(
+                                &lutus, ly, lx, &mut ua, &mut ul, false, false, lrows, lcols,
+                            );
+                            // avm's eob_u_flag is the LAST U TU of the block, used by every V TU.
+                            let u_last_nz = lutus
+                                .last()
+                                .map_or(false, |t| t.iter().any(|&(_, l)| l != 0));
+                            let vskip = sb_tu4_chroma_skip(
+                                &lvtus, ly, lx, &mut va, &mut vl, true, u_last_nz, lrows, lcols,
+                            );
+                            // modes (incl. uv) + luma coeffs, then U, then V (shared-tree order)
+                            encode_lossless_luma_sb(
+                                &mut enc,
+                                &lytus,
+                                &yskip_cdfs,
+                                &ydcs,
+                                0,
+                                true,
+                                part_cdf,
+                            );
+                            for (i, tu) in lutus.iter().enumerate() {
+                                encode_chroma_tu4(
+                                    &mut enc,
+                                    tu,
+                                    TXB_SKIP_TX4_Q0[uskip[i]] as u32,
+                                    false,
+                                );
+                            }
+                            for (i, tu) in lvtus.iter().enumerate() {
+                                encode_chroma_tu4(
+                                    &mut enc,
+                                    tu,
+                                    V_TXB_SKIP_TX4_Q0[vskip[i]] as u32,
+                                    true,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -752,7 +899,7 @@ impl Av2Encoder {
         img: &PlanarImage<T>,
         color: &ColorEncoding,
         threads: usize,
-    ) -> Result<AvFrame, EncodeError> {
+    ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
         let bd = img.bit_depth;
@@ -782,6 +929,7 @@ impl Av2Encoder {
                 planes: [y, cb, cr],
             },
             color,
+            threads,
         )
     }
 
@@ -797,7 +945,7 @@ impl Av2Encoder {
         base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
-    ) -> Result<AvFrame, EncodeError> {
+    ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
         if base_q_idx == 0 {
@@ -837,7 +985,7 @@ impl Av2Encoder {
                 cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
             }
         }
-        Ok(self.encode_yuv420(
+        self.encode_yuv420(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -845,7 +993,8 @@ impl Av2Encoder {
                 planes: [y, cb, cr],
             },
             color,
-        ))
+            threads,
+        )
     }
 
     /// Encode an RGB image to 4:2:2 AV2. Converts RGB→YCbCr and downsamples
@@ -860,7 +1009,7 @@ impl Av2Encoder {
         base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
-    ) -> Result<AvFrame, EncodeError> {
+    ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
         if base_q_idx == 0 {
@@ -902,7 +1051,7 @@ impl Av2Encoder {
                 cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
             }
         }
-        Ok(self.encode_yuv422(
+        self.encode_yuv422(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -910,7 +1059,8 @@ impl Av2Encoder {
                 planes: [y, cb, cr],
             },
             color,
-        ))
+            threads,
+        )
     }
 
     /// Encode a luma-only (4:0:0 / monochrome) image to AV2.
@@ -922,11 +1072,11 @@ impl Av2Encoder {
         img: &PlanarImage<T>,
         color: &ColorEncoding,
         threads: usize,
-    ) -> Result<AvFrame, EncodeError> {
+    ) -> Result<Av2Frame, EncodeError> {
         img.validate_400()?;
         validate_dims(img.width as u32, img.height as u32)?;
         let plane = img.planes[0].to_vec();
-        Ok(self.encode_yuv400(
+        self.encode_yuv400(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -934,7 +1084,8 @@ impl Av2Encoder {
                 planes: [plane, vec![], vec![]],
             },
             color,
-        ))
+            threads,
+        )
     }
 
     fn finish(
@@ -946,7 +1097,7 @@ impl Av2Encoder {
         width: usize,
         height: usize,
         color: &ColorEncoding,
-    ) -> AvFrame {
+    ) -> Av2Frame {
         let tile = enc.finish();
         // AV2 derives its mode-info grid by rounding the frame to 4px
         // (ALIGN_POWER_OF_TWO(dim, MI_SIZE_LOG2)); superblocks are 64px (16 mi).
@@ -955,14 +1106,15 @@ impl Av2Encoder {
         // is_partition_implied_at_boundary. When >32px is in-frame, every SB stays
         // PARTITION_NONE exactly as in the padded encode, so we can signal the real
         // size and let the decoder crop: the coded tile is byte-identical.
-        let mi_cols = (width + 3) / 4;
-        let mi_rows = (height + 3) / 4;
+        // mi grid is 8px-aligned (avm dec_set_mb_mi); superblocks are 64px (16 mi).
+        let mi_cols = ((width + 7) & !7) / 4;
+        let mi_rows = ((height + 7) & !7) / 4;
         const MIB: usize = 16; // 64px superblock in 4px mode-info units
-        let sb_cols = (mi_cols + MIB - 1) / MIB;
-        let sb_rows = (mi_rows + MIB - 1) / MIB;
-        let safe_w = (sb_cols - 1) * MIB + 8 < mi_cols;
-        let safe_h = (sb_rows - 1) * MIB + 8 < mi_rows;
-        let exact = safe_w && safe_h && !config.lossless; // lossless can't code boundary SBs -> pad
+        // Lossless now codes every boundary geometry via the recursive forced-split
+        // partition coder, so it always signals the real size (decoder crops to W x H).
+        // Lossy doesn't clip its tx blocks at boundaries, so it pads unless SB-aligned.
+        let aligned = mi_cols % MIB == 0 && mi_rows % MIB == 0;
+        let exact = if config.lossless { true } else { aligned };
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
         let mut frame = frame_header(config, sw as u32, sh as u32);
@@ -971,14 +1123,17 @@ impl Av2Encoder {
         data.extend(obu(2, &[]));
         data.extend(obu(1, &sequence_header(config, sw as u32, sh as u32)));
         data.extend(obu(4, &frame));
-        AvFrame {
+        Av2Frame {
             data,
             width,
             height,
+            // Coded size = the OBU-signaled size (decoder output). The muxer crops to
+            // width/height via `clap` when this is larger (padded lossy).
+            coded_width: sw,
+            coded_height: sh,
             // Coded bit depth signaled in the sequence header (8/10/12). av2C/pixi in
             // the AVIF muxer must use this.
             bit_depth: self.bit_depth,
-            base_q_idx: self.base_q_idx,
             color: *color,
             chroma_format: match config.layout {
                 Layout::Monochrome => ChromaFormat::Monochrome,
@@ -990,16 +1145,29 @@ impl Av2Encoder {
     }
 
     /// Finish wrapping a color AV1 OBU stream in an AVIF container.
-    pub fn wrap_avif(frame: &AvFrame) -> Result<Vec<u8>, EncodeError> {
-        Ok(avif::to_avif(
-            frame,
-            &Av2Format {
-                bit_depth: frame.bit_depth,
-                monochrome: frame.chroma_format == ChromaFormat::Monochrome,
-                chroma_sub_x: frame.chroma_format == ChromaFormat::Yuv422
-                    || frame.chroma_format == ChromaFormat::Yuv420,
-                chroma_sub_y: frame.chroma_format == ChromaFormat::Yuv420,
-            },
-        ))
+    pub fn wrap_avif(
+        frame: &Av2Frame,
+        icc_profile: Option<Vec<u8>>,
+        exif: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let format = Av2Format {
+            bit_depth: frame.bit_depth,
+            monochrome: frame.chroma_format == ChromaFormat::Monochrome,
+            chroma_sub_x: frame.chroma_format == ChromaFormat::Yuv422
+                || frame.chroma_format == ChromaFormat::Yuv420,
+            chroma_sub_y: frame.chroma_format == ChromaFormat::Yuv420,
+        };
+        if let (Some(exif), Some(icc_profile)) = (exif, icc_profile.as_ref()) {
+            return Ok(avif::to_avif_full(
+                frame,
+                &format,
+                Some(icc_profile),
+                Some(&exif),
+            ));
+        }
+        if let Some(icc_profile) = icc_profile.as_ref() {
+            return Ok(avif::to_avif_cicp_icc(frame, &format, icc_profile.to_vec()));
+        }
+        Ok(avif::to_avif(frame, &format))
     }
 }
