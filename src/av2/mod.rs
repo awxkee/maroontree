@@ -957,13 +957,12 @@ impl Av2Encoder {
     pub fn encode_image_420<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
-        base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
-        if base_q_idx == 0 {
+        if self.base_q_idx == 0 {
             return Err(EncodeError::InvalidQuality);
         }
         let (w, h) = (img.width, img.height);
@@ -1021,13 +1020,12 @@ impl Av2Encoder {
     pub fn encode_image_422<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
-        base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
-        if base_q_idx == 0 {
+        if self.base_q_idx == 0 {
             return Err(EncodeError::InvalidQuality);
         }
         let (w, h) = (img.width, img.height);
