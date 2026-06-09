@@ -111,7 +111,7 @@ impl Bases {
 
 fn need(b: &[u8], o: usize, n: usize, what: &str) {
     assert!(
-        o.checked_add(n).map_or(false, |e| e <= b.len()),
+        o.checked_add(n).is_some_and(|e| e <= b.len()),
         "bases file truncated/mismatched while reading {what}: need {n} bytes at offset {o}, file is {} bytes (is proj.rs in sync with the .bin?)",
         b.len()
     );

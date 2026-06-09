@@ -702,18 +702,6 @@ pub(crate) fn coef_rate_bits(level: u32) -> f64 {
 /// negligible PSNR cost, beating the naive "raise q" baseline.
 const TRELLIS_LAMBDA0: f64 = 0.05;
 
-thread_local! {
-    static ADST8: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-/// Per-block RD selection of ADST_ADST vs DCT_DCT for 8x8 and 16x16 luma intra
-/// residuals (the libaom/rav1e behavior). On by default; `set_adst8(false)`
-/// forces DCT_DCT everywhere (the pre-ADST encoder).
-pub fn set_adst8(on: bool) {
-    ADST8.with(|c| c.set(on));
-}
-pub fn adst8() -> bool {
-    ADST8.with(|c| c.get())
-}
 /// dav1d DTT4_IDTX_1DDCT set index for ADST_ADST at TX_8X8 intra.
 const ADST_ADST_TX8_IDX: usize = 4;
 /// dav1d DTT4_IDTX set index for ADST_ADST at TX_16X16 intra (5-type set).
@@ -2896,47 +2884,45 @@ impl<'a> LossyTile<'a> {
                 best_dct_bits = bits;
             }
         }
-        // Winner-only ADST_ADST refinement (see code_block for rationale).
-        if adst8() {
-            let mut resid = [0i32; 256];
-            for (ry, rrow) in resid.chunks_exact_mut(16).enumerate() {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                let prow = &lpred_arr[ry * 16..ry * 16 + 16];
-                for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
-                    *r = s - p;
-                }
+        // Winner-only ADST_ADST refinement
+        let mut resid = [0i32; 256];
+        for (ry, rrow) in resid.chunks_exact_mut(16).enumerate() {
+            let srow = &self.src[0][(py + ry) * self.w + px..];
+            let prow = &lpred_arr[ry * 16..ry * 16 + 16];
+            for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
+                *r = s - p;
             }
-            let (mut acf, atf) = adst16x16_t(&resid, &self.quant);
-            trellis_optimize_ctx(
-                &mut acf,
-                &atf,
-                dcq,
-                acq,
-                &SCAN_16X16,
-                lam,
-                16,
-                &self.cdfs,
-                2,
-                0,
-                &self.cdfs.eob_bin_256_l,
-                dcs16,
-            );
-            let rr = iadst_dequant_16x16(&acf, &self.quant);
-            let mut asse = 0i64;
-            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                let prow = &lpred_arr[ry * 16..ry * 16 + 16];
-                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
-                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
-                    let d = s - r;
-                    asse += (d * d) as i64;
-                }
+        }
+        let (mut acf, atf) = adst16x16_t(&resid, &self.quant);
+        trellis_optimize_ctx(
+            &mut acf,
+            &atf,
+            dcq,
+            acq,
+            &SCAN_16X16,
+            lam,
+            16,
+            &self.cdfs,
+            2,
+            0,
+            &self.cdfs.eob_bin_256_l,
+            dcs16,
+        );
+        let rr = iadst_dequant_16x16(&acf, &self.quant);
+        let mut asse = 0i64;
+        for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+            let srow = &self.src[0][(py + ry) * self.w + px..];
+            let prow = &lpred_arr[ry * 16..ry * 16 + 16];
+            for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
+                let r = (p + rv).clamp(0, (1 << self.bd) - 1);
+                let d = s - r;
+                asse += (d * d) as i64;
             }
-            let abits = block_rate_bits(&acf, &SCAN_16X16);
-            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
-                lcf = acf;
-                best_is_adst16 = true;
-            }
+        }
+        let abits = block_rate_bits(&acf, &SCAN_16X16);
+        if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+            lcf = acf;
+            best_is_adst16 = true;
         }
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
@@ -3648,46 +3634,44 @@ impl<'a> LossyTile<'a> {
         // prediction only and keep it if cheaper than that mode's DCT. This is
         // one extra transform+trellis per block instead of one per candidate
         // mode, which is where the encode-time regression came from.
-        if adst8() {
-            let mut resid = [0i32; 64];
-            for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
-                for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
-                    *r = s - p;
-                }
+        let mut resid = [0i32; 64];
+        for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+            let srow = &self.src[0][(py + ry) * self.w + px..];
+            let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+            for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
+                *r = s - p;
             }
-            let (mut acf, atf) = adst8x8_t(&resid, &self.quant);
-            trellis_optimize_ctx(
-                &mut acf,
-                &atf,
-                dcq,
-                acq,
-                &SCAN_8X8,
-                lam,
-                8,
-                &self.cdfs,
-                1,
-                0,
-                &self.cdfs.eob_bin_64_l,
-                dc_sgn,
-            );
-            let rr = iadst_dequant_8x8(&acf, &self.quant);
-            let mut asse = 0i64;
-            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
-                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
-                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
-                    let d = s - r;
-                    asse += (d * d) as i64;
-                }
+        }
+        let (mut acf, atf) = adst8x8_t(&resid, &self.quant);
+        trellis_optimize_ctx(
+            &mut acf,
+            &atf,
+            dcq,
+            acq,
+            &SCAN_8X8,
+            lam,
+            8,
+            &self.cdfs,
+            1,
+            0,
+            &self.cdfs.eob_bin_64_l,
+            dc_sgn,
+        );
+        let rr = iadst_dequant_8x8(&acf, &self.quant);
+        let mut asse = 0i64;
+        for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+            let srow = &self.src[0][(py + ry) * self.w + px..];
+            let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+            for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
+                let r = (p + rv).clamp(0, (1 << self.bd) - 1);
+                let d = s - r;
+                asse += (d * d) as i64;
             }
-            let abits = block_rate_bits(&acf, &SCAN_8X8);
-            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
-                lcf = acf;
-                best_is_adst = true;
-            }
+        }
+        let abits = block_rate_bits(&acf, &SCAN_8X8);
+        if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+            lcf = acf;
+            best_is_adst = true;
         }
         let mut ccf8 = [[0i32; 64]; 2];
         let mut ccf48 = [[0i32; 32]; 2];
@@ -6095,62 +6079,6 @@ mod tests {
         assert!(
             p420 <= p422 + 0.5,
             "4:2:0 luma bands worse than 4:2:2: {p420} vs {p422}"
-        );
-    }
-
-    #[test]
-    fn adst16_bit_exact() {
-        if !dav1d_available() {
-            eprintln!("skip: no dav1d");
-            return;
-        }
-        use crate::color::ColorEncoding;
-        let (w, h) = (128usize, 96usize);
-        let mut y = vec![0i32; w * h];
-        let mut u = vec![0i32; w * h];
-        let mut v = vec![0i32; w * h];
-        // smooth gradients + gentle features -> 16x16 partitions, many ADST-favorable
-        for j in 0..h {
-            for i in 0..w {
-                let g = 120 - (i as i32) / 3 - (j as i32) / 5;
-                let soft = (((i / 7 + j / 9) % 3) as i32 - 1) * 4;
-                y[j * w + i] = (g + soft).clamp(0, 255);
-                u[j * w + i] = (128 - (j as i32) / 6).clamp(0, 255);
-                v[j * w + i] = (132 + (i as i32) / 9).clamp(0, 255);
-            }
-        }
-        let color = ColorEncoding::srgb_ycbcr();
-        super::set_adst8(true);
-        let mut worst = 0i32;
-        for &q in &[60u8, 120] {
-            let (bytes, recon, (w8, _)) =
-                super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, &color, 1);
-            std::fs::write("/tmp/adst16.obu", &bytes).unwrap();
-            let st = std::process::Command::new("/usr/bin/dav1d")
-                .args(["-i", "/tmp/adst16.obu", "-o", "/tmp/adst16.y4m", "--quiet"])
-                .status()
-                .unwrap();
-            assert!(st.success(), "dav1d decode failed q{q}");
-            let d = std::fs::read("/tmp/adst16.y4m").unwrap();
-            let nl = d.iter().position(|&b| b == b'\n').unwrap();
-            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
-            let p = &d[nl + 1 + fnl + 1..];
-            let (dy, du, dv) = (&p[0..w * h], &p[w * h..2 * w * h], &p[2 * w * h..3 * w * h]);
-            let mut md = 0i32;
-            for j in 0..h {
-                for i in 0..w {
-                    md = md.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
-                    md = md.max((recon[1][j * w8 + i] - du[j * w + i] as i32).abs());
-                    md = md.max((recon[2][j * w8 + i] - dv[j * w + i] as i32).abs());
-                }
-            }
-            eprintln!("ADST16 q{q}: maxdiff={md}");
-            worst = worst.max(md);
-        }
-        super::set_adst8(false);
-        assert_eq!(
-            worst, 0,
-            "16x16 ADST RD not bit-exact with dav1d (check txtp idx 2 / iadst16)"
         );
     }
 

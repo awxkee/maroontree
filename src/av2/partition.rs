@@ -158,8 +158,8 @@ fn implied_boundary(
 /// raw partition context (left*2 + above) from the partition-context arrays.
 fn raw_ctx(above_pctx: &[u8], left_pctx: &[u8], mi_row: usize, mi_col: usize, b: usize) -> usize {
     let (bsl_w, bsl_h) = (MI_WL[b], MI_HL[b]);
-    let above = ((above_pctx[mi_col] >> bsl_w.saturating_sub(1).max(0)) & 1) as usize;
-    let left = ((left_pctx[mi_row & 15] >> bsl_h.saturating_sub(1).max(0)) & 1) as usize;
+    let above = ((above_pctx[mi_col] >> bsl_w.saturating_sub(1)) & 1) as usize;
+    let left = ((left_pctx[mi_row & 15] >> bsl_h.saturating_sub(1)) & 1) as usize;
     left * 2 + above
 }
 

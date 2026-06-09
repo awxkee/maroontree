@@ -1,0 +1,16 @@
+[workspace]
+members = ["app"]
+
+[package]
+name = "maroontree"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+default = ["neon"]
+neon = []
+
+[profile.release]
+debug = "full"

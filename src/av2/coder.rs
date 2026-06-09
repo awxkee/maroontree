@@ -448,7 +448,7 @@ fn encode_luma32_token(
         enc.encode_symbol_esc(&LUMA32_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
         encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
     }
-    if (level as i32) <= limit - 1 {
+    if (level as i32) < limit {
         level as i32
     } else {
         limit + (level as i32 - limit).min(3)
@@ -660,7 +660,7 @@ fn encode_luma4_token(
         enc.encode_symbol_esc(&BASE_TX4_Q0[base_ctx][0], 3, 3);
         encode_br4(enc, level, hi_ctx, false);
     }
-    if (level as i32) <= limit - 1 {
+    if (level as i32) < limit {
         level as i32
     } else {
         limit + (level as i32 - limit).min(3)

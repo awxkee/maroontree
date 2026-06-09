@@ -42,7 +42,7 @@ mod tables;
 mod tables_tx32;
 mod wht;
 
-use crate::av2::avif::Av2Format;
+use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::CHROMA_SKIP_V_QC;
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::coder::{
@@ -850,9 +850,8 @@ impl Av2Encoder {
                                 &lutus, ly, lx, &mut ua, &mut ul, false, false, lrows, lcols,
                             );
                             // avm's eob_u_flag is the LAST U TU of the block, used by every V TU.
-                            let u_last_nz = lutus
-                                .last()
-                                .map_or(false, |t| t.iter().any(|&(_, l)| l != 0));
+                            let u_last_nz =
+                                lutus.last().is_some_and(|t| t.iter().any(|&(_, l)| l != 0));
                             let vskip = sb_tu4_chroma_skip(
                                 &lvtus, ly, lx, &mut va, &mut vl, true, u_last_nz, lrows, lcols,
                             );
@@ -1018,7 +1017,7 @@ impl Av2Encoder {
         let (w, h) = (img.width, img.height);
         let bd = img.bit_depth.bits();
         let maxv = (1i32 << bd) - 1;
-        let off_q = ((1i32 << (bd - 1)) as i32) << Q;
+        let off_q = (1i32 << (bd - 1)) << Q;
         let mx_i = maxv;
         let cw = w.div_ceil(2);
         let mut y = vec![0i32; w * h];
@@ -1113,7 +1112,7 @@ impl Av2Encoder {
         // Lossless now codes every boundary geometry via the recursive forced-split
         // partition coder, so it always signals the real size (decoder crops to W x H).
         // Lossy doesn't clip its tx blocks at boundaries, so it pads unless SB-aligned.
-        let aligned = mi_cols % MIB == 0 && mi_rows % MIB == 0;
+        let aligned = mi_cols.is_multiple_of(MIB) && mi_rows.is_multiple_of(MIB);
         let exact = if config.lossless { true } else { aligned };
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
@@ -1169,5 +1168,37 @@ impl Av2Encoder {
             return Ok(avif::to_avif_cicp_icc(frame, &format, icc_profile.to_vec()));
         }
         Ok(avif::to_avif(frame, &format))
+    }
+
+    /// Wrap a color frame together with a monochrome alpha auxiliary item into an
+    /// AVIF (alpha = an `encode_yuv400` result, typically of the alpha plane). The
+    /// alpha item is linked via `auxl` and tagged with the standard alpha `auxC` URN.
+    pub fn wrap_avif_alpha(
+        frame: &Av2Frame,
+        alpha: &Av2Frame,
+        icc_profile: Option<Vec<u8>>,
+        exif: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let format = Av2Format {
+            bit_depth: frame.bit_depth,
+            monochrome: frame.chroma_format == ChromaFormat::Monochrome,
+            chroma_sub_x: frame.chroma_format == ChromaFormat::Yuv422
+                || frame.chroma_format == ChromaFormat::Yuv420,
+            chroma_sub_y: frame.chroma_format == ChromaFormat::Yuv420,
+        };
+        let color = match icc_profile {
+            Some(icc) => Av2Color::Both {
+                cicp: frame.color,
+                icc,
+            },
+            None => Av2Color::Cicp(frame.color),
+        };
+        Ok(avif::to_avif_color_alpha(
+            frame,
+            alpha,
+            &format,
+            &color,
+            exif.as_deref(),
+        ))
     }
 }
