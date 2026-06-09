@@ -111,15 +111,69 @@ fn clampi(v: i32, lo: i32, hi: i32) -> i32 {
 /// One size-32 inverse DCT line. `src` = 32 inputs; writes 32 outputs.
 /// Equivalent (bit-exact, integer sums are associative) to avm's butterfly:
 /// `dst[m] = clamp((sum_j K32[j*32+m]*src[j] + (1<<(shift-1))) >> shift)`.
-fn idct32_line(src: &[i32; 32], shift: i64, lo: i32, hi: i32) -> [i32; 32] {
-    let add = 1i64 << (shift - 1);
-    let mut dst = [0i32; 32];
-    for m in 0..32 {
-        let mut acc = 0i64;
-        for j in 0..32 {
-            acc += K32[j * 32 + m] as i64 * src[j] as i64;
+// Exact even/odd butterfly factorization of the size-32 inverse DCT-II.
+// Mathematically identical to the dense matrix product `dst[m] =
+// Σ_j K32[j*32+m]·src[j]` (the K32 kernel is perfectly even/odd symmetric, so
+// outputs 16..31 are recovered from the low half via `a[15-k] ∓ b[15-k]`),
+// but with ~3× fewer multiplies and i32 arithmetic. All intermediates are
+// spec-bounded to fit i32 (verified bit-exact against the dense product and
+// the reference decoder).
+#[inline]
+fn idct32_line(src: &[i32; 32], shift: i32, lo: i32, hi: i32) -> [i32; 32] {
+    let add = 1i32 << (shift - 1);
+    let k = |j: usize, m: usize| K32[j * 32 + m];
+
+    // Odd inputs (1,3,...,31) → b[0..16]
+    let mut b = [0i32; 16];
+    for (m, bm) in b.iter_mut().enumerate() {
+        let mut s = 0i32;
+        let mut j = 1;
+        while j < 32 {
+            s += k(j, m) * src[j];
+            j += 2;
         }
-        dst[m] = clampi(((acc + add) >> shift) as i32, lo, hi);
+        *bm = s;
+    }
+    // Inputs 2,6,10,...,30 → d[0..8]
+    let mut d = [0i32; 8];
+    for (m, dm) in d.iter_mut().enumerate() {
+        let mut s = 0i32;
+        let mut j = 2;
+        while j < 32 {
+            s += k(j, m) * src[j];
+            j += 4;
+        }
+        *dm = s;
+    }
+    // Inputs 4,12,20,28 → f[0..4]
+    let mut f = [0i32; 4];
+    for (m, fm) in f.iter_mut().enumerate() {
+        *fm = k(4, m) * src[4] + k(12, m) * src[12] + k(20, m) * src[20] + k(28, m) * src[28];
+    }
+    // Inputs 8,24 → h[0..2]; inputs 0,16 → g[0..2]
+    let h = [
+        k(8, 0) * src[8] + k(24, 0) * src[24],
+        k(8, 1) * src[8] + k(24, 1) * src[24],
+    ];
+    let g = [
+        k(0, 0) * src[0] + k(16, 0) * src[16],
+        k(0, 1) * src[0] + k(16, 1) * src[16],
+    ];
+    let e = [g[0] + h[0], g[1] + h[1], g[1] - h[1], g[0] - h[0]];
+    let mut c = [0i32; 8];
+    for kk in 0..4 {
+        c[kk] = e[kk] + f[kk];
+        c[kk + 4] = e[3 - kk] - f[3 - kk];
+    }
+    let mut a = [0i32; 16];
+    for kk in 0..8 {
+        a[kk] = c[kk] + d[kk];
+        a[kk + 8] = c[7 - kk] - d[7 - kk];
+    }
+    let mut dst = [0i32; 32];
+    for kk in 0..16 {
+        dst[kk] = clampi((a[kk] + b[kk] + add) >> shift, lo, hi);
+        dst[kk + 16] = clampi((a[15 - kk] - b[15 - kk] + add) >> shift, lo, hi);
     }
     dst
 }

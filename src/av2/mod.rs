@@ -112,13 +112,33 @@ fn predict_luma(
     }
 }
 
-/// Encode one 64x64 luma superblock as a single PARTITION_NONE block with a
-/// per-SB intra mode chosen from {DC, SMOOTH, PAETH}. Each candidate is fully
-/// trialled (4x TX_32X32 with intra-SB reconstruction feedback); the mode with
-/// the smallest total coefficient magnitude (rate proxy) wins. Mutates `recy`
-/// (leaving the winner's reconstruction) and returns the four TX coefficient
-/// lists plus the chosen `mode_idx` (0=DC, 1=SMOOTH, 4=PAETH).
 #[allow(clippy::too_many_arguments)]
+fn coeff_cost_bits(lev: &[f32]) -> f64 {
+    const N: usize = 4096;
+    static TABLE: std::sync::OnceLock<[f64; N]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0f64; N];
+        for (i, e) in t.iter_mut().enumerate() {
+            *e = 2.0 + 2.0 * ((i as f64) + 1.0).log2();
+        }
+        t
+    });
+    let mut cost = 0f64;
+    for &v in lev {
+        if v != 0.0 {
+            let a = v.abs() as usize;
+            // |a| stays small for realistic q; the rare large level falls back
+            // to the exact expression so results never diverge from the table.
+            cost += if a < N {
+                table[a]
+            } else {
+                2.0 + 2.0 * ((a as f64) + 1.0).log2()
+            };
+        }
+    }
+    cost
+}
+
 fn encode_luma_sb(
     recy: &mut [f32],
     yp: &[f32],
@@ -154,13 +174,11 @@ fn encode_luma_sb(
             let lev = luma.project(&resid, 0.0);
             // Bit-cost estimate: each nonzero coefficient costs roughly a
             // significance+sign pair plus a magnitude term ~ log2(|lev|).
-            // This tracks coded size far better than Sum|lev|, which
-            // over-rewards numerous tiny-magnitude coefficients.
-            cost += lev
-                .iter()
-                .filter(|&&v| v != 0.0)
-                .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                .sum::<f64>();
+            // Tracks coded size far better than Sum|lev|. The per-coefficient
+            // term is read from an exact lookup table (same f64 value as
+            // `2 + 2·log2(|v|+1)`) to keep a transcendental call out of this
+            // hot path while leaving mode decisions bit-identical.
+            cost += coeff_cost_bits(&lev);
             let rb = itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[i] = levels_to_coeffs(&lev);
