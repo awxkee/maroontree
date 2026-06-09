@@ -166,11 +166,65 @@ pub(crate) fn inv_tx_32x64_8bit(dqcoeff: &[i32; 1024]) -> Vec<i32> {
     res
 }
 
+/// Exact avm inverse of a TX_32X32 block (8-bit). `dqcoeff` = 32x32 grid
+/// `dq[vfreq*32 + hfreq]`. Returns a 32x32 residual `res[y*32 + x]`. No Sqrt2
+/// pre-scale (log2(32)+log2(32)=10 is even); `inv_tx_shift[TX_32X32]={6,13}`; both
+/// passes size-32; no upsample.
+pub(crate) fn inv_tx_32x32_8bit(dqcoeff: &[i32; 1024]) -> [i32; 1024] {
+    // Pass 1: row (horizontal) transform, shift 6, clamp +/-2^15. 32 rows.
+    let mut tmp = [0i32; 1024];
+    let mut line = [0i32; 32];
+    for y in 0..32 {
+        line.copy_from_slice(&dqcoeff[y * 32..y * 32 + 32]);
+        let o = idct32_line(&line, 6, -(1 << 15), (1 << 15) - 1);
+        for x in 0..32 {
+            tmp[x * 32 + y] = o[x];
+        }
+    }
+    // Pass 2: column (vertical) transform, shift 13, clamp +/-256. 32 columns.
+    let mut block = [0i32; 1024];
+    for x in 0..32 {
+        line.copy_from_slice(&tmp[x * 32..x * 32 + 32]);
+        let o = idct32_line(&line, 13, -(1 << 8), (1 << 8) - 1);
+        for y in 0..32 {
+            block[y * 32 + x] = o[y];
+        }
+    }
+    block
+}
+
+/// Reconstruct a 32x32 luma block bit-exactly: `clip(pred[i] + inv_tx(dequant(lev)))`.
+/// `pred` = per-pixel prediction (1024 samples, row-major); `lev` = scan-ordered
+/// levels; `qstep` = ac/dc dqv; `scan` = the TX_32X32 scan. avm dequant:
+/// `ROUND_POWER_OF_TWO(|lev|*dqv,3) >> tx_scale`, tx_scale=av2_get_tx_scale(TX_32X32)=1,
+/// sign applied last.
+pub(crate) fn reconstruct_luma(pred: &[f32], lev: &[f32], qstep: i32, scan: &[u16]) -> [f32; 1024] {
+    let mut dq = [0i32; 1024];
+    for k in 0..1024 {
+        let l = lev[k];
+        if l != 0.0 {
+            let rc = scan[k] as usize;
+            let (c, a) = (rc & 31, rc >> 5);
+            let li = l as i64;
+            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
+            let dqmag = (rounded >> 1) as i32; // >> tx_scale (TX_32X32 => 1)
+            dq[c * 32 + a] = if li < 0 { -dqmag } else { dqmag };
+        }
+    }
+    let res = inv_tx_32x32_8bit(&dq);
+    let mut out = [0f32; 1024];
+    for i in 0..1024 {
+        out[i] = clampi((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
+    }
+    out
+}
+
 /// Bit-exact 4:2:2 chroma reconstruction for one 32x64 block: dequantize the
 /// scan-ordered levels (`dq[vfreq*32+hfreq] = level * qstep`), run avm's exact
 /// inverse TX_32X64, add the (DC) prediction and clip. Layout matches
 /// `put_block_rect` (`out[y*32 + x]`, 32 wide x 64 tall).
-pub(crate) fn reconstruct_422(pred: f32, lev: &[f32], qstep: i32, scan: &[u16]) -> Vec<f32> {
+pub(crate) fn reconstruct_422(pred: f32, lev: &[f32], qstep: i32, scan: &[u16]) -> [f32; 2048] {
     let mut dq = [0i32; 1024];
     for k in 0..1024 {
         let l = lev[k];
@@ -190,8 +244,8 @@ pub(crate) fn reconstruct_422(pred: f32, lev: &[f32], qstep: i32, scan: &[u16]) 
     }
     let res = inv_tx_32x64_8bit(&dq);
     let p = pred.round() as i32;
-    let mut out = vec![0f32; 32 * 64];
-    for i in 0..32 * 64 {
+    let mut out = [0f32; 2048];
+    for i in 0..2048 {
         out[i] = clampi(p + res[i], 0, 255) as f32;
     }
     out

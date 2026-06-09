@@ -33,6 +33,7 @@ mod coder;
 mod entropy;
 mod headers;
 mod helpers;
+mod intrapred;
 mod itx422;
 mod layout;
 mod lossless;
@@ -57,8 +58,137 @@ use crate::av2::helpers::{
     sb_tu4_contexts,
 };
 use crate::av2::layout::Layout;
+use crate::av2::proj::Basis;
 use crate::err::EncodeError;
 use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
+
+/// Build the prediction block for luma candidate `m` (0=DC, 1=SMOOTH, 4=PAETH)
+/// at TX index `i` (raster within the 64x64 SB) and pixel origin `(y0,x0)`.
+#[allow(clippy::too_many_arguments)]
+fn predict_luma(
+    recy: &[f32],
+    pw: usize,
+    width: usize,
+    height: usize,
+    i: usize,
+    y0: usize,
+    x0: usize,
+    m: usize,
+    neutral: f32,
+) -> Vec<f32> {
+    if m == 0 {
+        return vec![dc_pred(recy, pw, y0, x0, 32, neutral); 1024];
+    }
+    let have_above = y0 > 0;
+    let have_left = x0 > 0;
+    let mi_col_end = (((width + 63) & !63) >> 2) as i64;
+    let mi_row_end = (((height + 63) & !63) >> 2) as i64;
+    let sb_y0 = (y0 / 64) * 64;
+    let sb_x0 = (x0 / 64) * 64;
+    let mi_row = (sb_y0 >> 2) as i64;
+    let mi_col = (sb_x0 >> 2) as i64;
+    let (row_off, col_off) = ((y0 - sb_y0) as i64 / 4, (x0 - sb_x0) as i64 / 4);
+    let (lx, ly) = ((x0 - sb_x0) as i64, (y0 - sb_y0) as i64); // TX offset px within SB
+    let xr = ((mi_col_end - mi_col - 16) << 2) + 32 - lx;
+    let yd = ((mi_row_end - mi_row - 16) << 2) + 32 - ly;
+    let right_available = (mi_col + col_off + 8) < mi_col_end;
+    let bottom_available = (yd > 0) && ((mi_row + row_off + 8) < mi_row_end);
+    // top-right: needed by TX 0/1/2 (TX 3 has col_off+txw==block width -> none)
+    let tr_ok = matches!(i, 0 | 1 | 2) && have_above && right_available && xr > 0;
+    let tr_px = if tr_ok {
+        (xr.min(32)).max(0) as usize
+    } else {
+        0
+    };
+    // bottom-left: only TX 0 (others sit at/under the block's bottom-left edge)
+    let bl_ok = i == 0 && have_left && bottom_available && yd > 0;
+    let bl_px = if bl_ok { yd.min(32).max(0) as usize } else { 0 };
+    let (ab, lf, corner) =
+        intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
+    if m == 1 {
+        intrapred::smooth(32, &ab, &lf)
+    } else {
+        intrapred::paeth(32, &ab, &lf, corner)
+    }
+}
+
+/// Encode one 64x64 luma superblock as a single PARTITION_NONE block with a
+/// per-SB intra mode chosen from {DC, SMOOTH, PAETH}. Each candidate is fully
+/// trialled (4x TX_32X32 with intra-SB reconstruction feedback); the mode with
+/// the smallest total coefficient magnitude (rate proxy) wins. Mutates `recy`
+/// (leaving the winner's reconstruction) and returns the four TX coefficient
+/// lists plus the chosen `mode_idx` (0=DC, 1=SMOOTH, 4=PAETH).
+#[allow(clippy::too_many_arguments)]
+fn encode_luma_sb(
+    recy: &mut [f32],
+    yp: &[f32],
+    pw: usize,
+    width: usize,
+    height: usize,
+    sb_y: usize,
+    sb_x: usize,
+    luma: &Basis,
+    qstep: i32,
+    scan: &[u16],
+    neutral: f32,
+) -> ([Vec<Coeff>; 4], usize) {
+    const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
+    let mut best_cost = f64::INFINITY;
+    let mut best_mode = 0usize;
+    let mut best_tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut best_region = vec![0f32; 64 * 64];
+    let cands: &[usize] = &[0usize, 1, 4];
+    let mut resid = [0f32; 1024];
+    for &m in cands {
+        let mut cost = 0f64;
+        let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (i, &(ty, tx)) in POS.iter().enumerate() {
+            let (y0, x0) = (sb_y + ty, sb_x + tx);
+            let pblk = predict_luma(recy, pw, width, height, i, y0, x0, m, neutral);
+            for r in 0..32 {
+                let base = (y0 + r) * pw + x0;
+                for c in 0..32 {
+                    resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                }
+            }
+            let lev = luma.project(&resid, 0.0);
+            // Bit-cost estimate: each nonzero coefficient costs roughly a
+            // significance+sign pair plus a magnitude term ~ log2(|lev|).
+            // This tracks coded size far better than Sum|lev|, which
+            // over-rewards numerous tiny-magnitude coefficients.
+            cost += lev
+                .iter()
+                .filter(|&&v| v != 0.0)
+                .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                .sum::<f64>();
+            let rb = itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
+            put_block(recy, pw, y0, x0, 32, &rb);
+            tus[i] = levels_to_coeffs(&lev);
+        }
+        // Mode-signaling cost (once per 64x64 block). DC is the cheapest to
+        // signal; SMOOTH/PAETH cost a few extra bits, so only pick them when
+        // they save more than they cost.
+        if m != 0 {
+            cost += 6.0;
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best_mode = m;
+            best_tus = tus;
+            for ry in 0..64 {
+                let dst = ry * 64;
+                let src = (sb_y + ry) * pw + sb_x;
+                best_region[dst..dst + 64].copy_from_slice(&recy[src..src + 64]);
+            }
+        }
+    }
+    for ry in 0..64 {
+        let src = ry * 64;
+        let dst = (sb_y + ry) * pw + sb_x;
+        recy[dst..dst + 64].copy_from_slice(&best_region[src..src + 64]);
+    }
+    (best_tus, best_mode)
+}
 
 // Q0.13 coefficients  (value = round(f * 8192))
 const Q: i32 = 13;
@@ -241,26 +371,22 @@ impl Av2Encoder {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                for (i, &(ty, tx)) in [(0, 0), (0, 32), (32, 0), (32, 32)].iter().enumerate() {
-                    let (y0, x0) = (sb_y + ty, sb_x + tx);
-                    let pred = dc_pred(&recy, pw, y0, x0, 32, neutral);
-                    let lev = bases
-                        .luma
-                        .project(&get_residual(&yp, pw, y0, x0, 32, pred), 0.0);
-                    put_block(
-                        &mut recy,
-                        pw,
-                        y0,
-                        x0,
-                        32,
-                        &bases.luma.reconstruct(pred, &lev),
-                    );
-                    tus[i] = levels_to_coeffs(&lev);
-                }
+                let (tus, mode_idx) = encode_luma_sb(
+                    &mut recy,
+                    &yp,
+                    pw,
+                    width,
+                    height,
+                    sb_y,
+                    sb_x,
+                    &bases.luma,
+                    quant::qstep(self.base_q_idx as u32) as i32,
+                    &tables::SCAN,
+                    neutral,
+                );
                 let (skip_cdfs, dc_sign_ctxs) =
                     sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc);
-                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, true);
+                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, mode_idx, true);
 
                 let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
                 let levu = bases
@@ -354,26 +480,22 @@ impl Av2Encoder {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                for (i, &(ty, tx)) in [(0, 0), (0, 32), (32, 0), (32, 32)].iter().enumerate() {
-                    let (y0, x0) = (sb_y + ty, sb_x + tx);
-                    let pred = dc_pred(&recy, pw, y0, x0, 32, neutral);
-                    let lev = bases
-                        .luma
-                        .project(&get_residual(&yp, pw, y0, x0, 32, pred), 0.0);
-                    put_block(
-                        &mut recy,
-                        pw,
-                        y0,
-                        x0,
-                        32,
-                        &bases.luma.reconstruct(pred, &lev),
-                    );
-                    tus[i] = levels_to_coeffs(&lev);
-                }
+                let (tus, mode_idx) = encode_luma_sb(
+                    &mut recy,
+                    &yp,
+                    pw,
+                    width,
+                    height,
+                    sb_y,
+                    sb_x,
+                    &bases.luma,
+                    crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
+                    &crate::av2::tables::SCAN,
+                    neutral,
+                );
                 let (skip_cdfs, dc_sign_ctxs) =
                     sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc);
-                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, true);
+                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, mode_idx, true);
 
                 let (cy, cx) = (sb_y / 2, sb_x / 2);
                 let predu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
@@ -470,26 +592,22 @@ impl Av2Encoder {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                for (i, &(ty, tx)) in [(0, 0), (0, 32), (32, 0), (32, 32)].iter().enumerate() {
-                    let (y0, x0) = (sb_y + ty, sb_x + tx);
-                    let pred = dc_pred(&recy, pw, y0, x0, 32, neutral);
-                    let lev = bases
-                        .luma
-                        .project(&get_residual(&yp, pw, y0, x0, 32, pred), 0.0);
-                    put_block(
-                        &mut recy,
-                        pw,
-                        y0,
-                        x0,
-                        32,
-                        &bases.luma.reconstruct(pred, &lev),
-                    );
-                    tus[i] = levels_to_coeffs(&lev);
-                }
+                let (tus, mode_idx) = encode_luma_sb(
+                    &mut recy,
+                    &yp,
+                    pw,
+                    width,
+                    height,
+                    sb_y,
+                    sb_x,
+                    &bases.luma,
+                    crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
+                    &crate::av2::tables::SCAN,
+                    neutral,
+                );
                 let (skip_cdfs, dc_sign_ctxs) =
                     sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc);
-                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, true);
+                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, mode_idx, true);
 
                 // Chroma block: 32 wide (sb_x/2) × 64 tall (sb_y), one TX_32X64 per plane.
                 let (cy, cx) = (sb_y, sb_x / 2);
@@ -504,11 +622,11 @@ impl Av2Encoder {
                     cx,
                     32,
                     64,
-                    &crate::av2::itx422::reconstruct_422(
+                    &itx422::reconstruct_422(
                         predu,
                         &levu,
-                        crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
-                        &crate::av2::tables::SCAN,
+                        quant::qstep(self.base_q_idx as u32) as i32,
+                        &tables::SCAN,
                     ),
                 );
                 let predv = dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral);
@@ -592,26 +710,22 @@ impl Av2Encoder {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                for (i, &(ty, tx)) in [(0, 0), (0, 32), (32, 0), (32, 32)].iter().enumerate() {
-                    let (y0, x0) = (sb_y + ty, sb_x + tx);
-                    let pred = dc_pred(&recy, pw, y0, x0, 32, neutral);
-                    let lev = bases
-                        .luma
-                        .project(&get_residual(&yp, pw, y0, x0, 32, pred), 0.0);
-                    put_block(
-                        &mut recy,
-                        pw,
-                        y0,
-                        x0,
-                        32,
-                        &bases.luma.reconstruct(pred, &lev),
-                    );
-                    tus[i] = levels_to_coeffs(&lev);
-                }
+                let (tus, mode_idx) = encode_luma_sb(
+                    &mut recy,
+                    &yp,
+                    pw,
+                    width,
+                    height,
+                    sb_y,
+                    sb_x,
+                    &bases.luma,
+                    crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
+                    &crate::av2::tables::SCAN,
+                    neutral,
+                );
                 let (skip_cdfs, dc_sign_ctxs) =
                     sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc);
-                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, 0, false);
+                encode_luma_block_split(&mut enc, &tus, &skip_cdfs, &dc_sign_ctxs, mode_idx, false);
             }
         }
         Ok(self.finish(enc, &config, pw, ph, width, height, color))
@@ -1137,7 +1251,7 @@ impl Av2Encoder {
         // Lossless now codes every boundary geometry via the recursive forced-split
         // partition coder, so it always signals the real size (decoder crops to W x H).
         // Lossy doesn't clip its tx blocks at boundaries, so it pads unless SB-aligned.
-        let aligned = mi_cols.is_multiple_of(MIB) && mi_rows.is_multiple_of(MIB);
+        let aligned = mi_cols % MIB == 0 && mi_rows % MIB == 0;
         let exact = if config.lossless { true } else { aligned };
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
