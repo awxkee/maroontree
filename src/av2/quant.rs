@@ -27,50 +27,30 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Real AV1 entropy / tile modules
-pub mod av1_coefs;
-pub mod av1_tables;
-pub mod av1_tile;
-pub mod av1_wht;
-pub mod av1real;
-mod av2;
-mod avif;
-pub mod bitwriter;
-pub mod cdf_tables;
-mod coef_q;
-pub mod coeff;
-mod color;
-mod dct;
-pub mod decoder;
-pub mod encoder;
-mod err;
-mod idct;
-mod isobmff;
-mod loopfilter;
-mod metadata;
-mod msac_enc;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod obu;
-mod odec;
-mod pixel;
-mod predict;
-mod rangecoder;
-mod transform;
-mod trellis;
+//! AV2 (avm) quantizer-step lookup for 8-bit.
+//!
+//! avm replaced AV1's separate dc/ac 256-entry tables with one compact 25-entry
+//! base table that doubles every 24 q-indices (`av2/common/quant_common.c`,
+//! `ac_qlookup_QTX` + `qlookup`). With the frame's dc/ac delta-q at 0, the DC and
+//! AC steps are identical, so a single `qstep` drives the whole frame.
 
-pub use av2::Av2Encoder;
-pub use avif::{
-    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
-    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
-    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
-    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
-};
-pub use color::{
-    ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
-};
-pub use encoder::{
-    Encoded, PlanarImage, encode_still, encode_still_mono, encode_still_with, encode_yuv420,
-    encode_yuv422, encode_yuv444,
-};
-pub use pixel::{BitDepth, Pixel};
+static AC_QLOOKUP_QTX: [u32; 25] = [
+    64, 40, 41, 43, 44, 45, 47, 48, 49, 51, 52, 54, 55, 57, 59, 60, 62, 64, 66, 68, 70, 72, 74, 76,
+    78,
+];
+
+/// Dequant step for an 8-bit base_q_idx (delta_q = 0), matching avm `get_q`.
+pub(crate) fn qstep(qindex: u32) -> u32 {
+    if qindex == 0 {
+        return AC_QLOOKUP_QTX[0];
+    }
+    let q = qindex.clamp(1, 255);
+    if q < 25 {
+        AC_QLOOKUP_QTX[q as usize]
+    } else {
+        AC_QLOOKUP_QTX[(((q - 1) % 24) + 1) as usize] << ((q - 1) / 24)
+    }
+}
+
+/// base_q_idx the bundled bases were measured at, and its step (78 << 4 = 1248).
+pub(crate) const BASE_Q: u32 = 120;

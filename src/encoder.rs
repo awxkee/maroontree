@@ -83,6 +83,19 @@ impl<T: Pixel> PlanarImage<T> {
         }
     }
 
+    /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
+    /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
+    pub fn from_luma(width: usize, height: usize, bit_depth: u8, luma: &[T]) -> Self {
+        assert_eq!(luma.len(), width * height);
+
+        PlanarImage {
+            width,
+            height,
+            bit_depth,
+            planes: [luma.to_vec(), vec![], vec![]],
+        }
+    }
+
     /// Reconstruct interleaved RGB from the GBR planes.
     pub fn to_interleaved_rgb(&self) -> Vec<T> {
         let n = self.width * self.height;
@@ -121,7 +134,7 @@ pub struct Encoded {
 pub fn encode_still_lossy<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Encoded {
     assert!(
@@ -173,7 +186,7 @@ pub fn encode_still_lossy<T: Pixel>(
 pub fn encode_still_lossy_422<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Encoded {
     assert!(
@@ -251,7 +264,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
 pub fn encode_still_lossy_420<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Encoded {
     assert!(

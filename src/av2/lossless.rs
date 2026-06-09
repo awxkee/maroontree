@@ -27,50 +27,17 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Real AV1 entropy / tile modules
-pub mod av1_coefs;
-pub mod av1_tables;
-pub mod av1_tile;
-pub mod av1_wht;
-pub mod av1real;
-mod av2;
-mod avif;
-pub mod bitwriter;
-pub mod cdf_tables;
-mod coef_q;
-pub mod coeff;
-mod color;
-mod dct;
-pub mod decoder;
-pub mod encoder;
-mod err;
-mod idct;
-mod isobmff;
-mod loopfilter;
-mod metadata;
-mod msac_enc;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod obu;
-mod odec;
-mod pixel;
-mod predict;
-mod rangecoder;
-mod transform;
-mod trellis;
+pub static SCAN_4X4: [u8; 16] = [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15];
 
-pub use av2::Av2Encoder;
-pub use avif::{
-    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
-    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
-    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
-    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
-};
-pub use color::{
-    ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
-};
-pub use encoder::{
-    Encoded, PlanarImage, encode_still, encode_still_mono, encode_still_with, encode_yuv420,
-    encode_yuv422, encode_yuv444,
-};
-pub use pixel::{BitDepth, Pixel};
+/// Convert a 4×4 transform unit's 16 raster-order levels into the entropy coder's
+/// `(scan_position, level)` list (nonzero only), walked in `SCAN_4X4` order.
+pub(crate) fn levels_to_coeffs_4x4(levels: &[i32; 16]) -> Vec<(usize, i32)> {
+    let mut out = Vec::new();
+    for (scan_pos, &raster) in SCAN_4X4.iter().enumerate() {
+        let l = levels[raster as usize];
+        if l != 0 {
+            out.push((scan_pos, l));
+        }
+    }
+    out
+}

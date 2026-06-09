@@ -27,50 +27,35 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Real AV1 entropy / tile modules
-pub mod av1_coefs;
-pub mod av1_tables;
-pub mod av1_tile;
-pub mod av1_wht;
-pub mod av1real;
-mod av2;
-mod avif;
-pub mod bitwriter;
-pub mod cdf_tables;
-mod coef_q;
-pub mod coeff;
-mod color;
-mod dct;
-pub mod decoder;
-pub mod encoder;
-mod err;
-mod idct;
-mod isobmff;
-mod loopfilter;
-mod metadata;
-mod msac_enc;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod obu;
-mod odec;
-mod pixel;
-mod predict;
-mod rangecoder;
-mod transform;
-mod trellis;
+/// Inverse of avm's decoder butterfly. Given the four outputs the decoder would produce
+/// `(o0,o1,o2,o3)`, returns the four inputs it consumed `(in0,in1,in2,in3)`.
+#[inline]
+fn inv_bfly(o0: i32, o1: i32, o2: i32, o3: i32) -> (i32, i32, i32, i32) {
+    let e = (o0 + o1 + o2 - o3) >> 1;
+    (o0 + o1 + o2 - e, e - o2, o3 - o2 + e - o1, e - o1)
+}
 
-pub use av2::Av2Encoder;
-pub use avif::{
-    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
-    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
-    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
-    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
-};
-pub use color::{
-    ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
-};
-pub use encoder::{
-    Encoded, PlanarImage, encode_still, encode_still_mono, encode_still_with, encode_yuv420,
-    encode_yuv422, encode_yuv444,
-};
-pub use pixel::{BitDepth, Pixel};
+/// Forward 4×4 WHT: residual (row-major, 16 samples) → coded coefficient levels
+/// (row-major). The result is `butterfly²(resid)`; the decoder reconstructs the exact
+/// residual via `iwht4x4(level * WHT_DEQUANT)`.
+pub fn fwht4x4(resid: &[i32; 16]) -> [i32; 16] {
+    // inverse of the decoder's column pass
+    let mut tmp = [0i32; 16];
+    for i in 0..4 {
+        let (a, b, c, d) = inv_bfly(resid[i], resid[4 + i], resid[8 + i], resid[12 + i]);
+        tmp[i] = a;
+        tmp[4 + i] = b;
+        tmp[8 + i] = c;
+        tmp[12 + i] = d;
+    }
+    // inverse of the decoder's row pass
+    let mut out = [0i32; 16];
+    for i in 0..4 {
+        let (a, b, c, d) = inv_bfly(tmp[i * 4], tmp[i * 4 + 1], tmp[i * 4 + 2], tmp[i * 4 + 3]);
+        out[i * 4] = a;
+        out[i * 4 + 1] = b;
+        out[i * 4 + 2] = c;
+        out[i * 4 + 3] = d;
+    }
+    out
+}
