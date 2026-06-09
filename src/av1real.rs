@@ -3543,7 +3543,7 @@ impl<'a> LossyTile<'a> {
         // Forward-transform/quantize all planes up front to decide block skip.
         // Luma is always 8x8; chroma is 8x8 (4:4:4) or 4x8 (4:2:2).
         // Luma 8x8: search the non-directional intra modes (DC + SMOOTH*/PAETH)
-        // and keep the one minimising pixel SSE + lambda * estimated bits. The
+        // and keep the one minimizing pixel SSE + lambda * estimated bits. The
         // chosen prediction is per-pixel; reconstruction uses the same array so
         // the decoder (which re-derives the identical prediction) stays bit-exact.
         let (dcq, acq, lam) = (
@@ -3972,8 +3972,10 @@ impl<'a> LossyTile<'a> {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                     if chosen_uv_block == SMOOTH_V_PRED {
                         let prow = &sv_preds_420[ci][ry * 4..];
-                        for (j, (dv, &rv)) in drow[..4].iter_mut().zip(rrow.iter()).enumerate() {
-                            *dv = (prow[j] + rv).clamp(0, (1 << self.bd) - 1);
+                        for ((dv, &rv), &prow) in
+                            drow[..4].iter_mut().zip(rrow.iter()).zip(prow.iter())
+                        {
+                            *dv = (prow + rv).clamp(0, (1 << self.bd) - 1);
                         }
                     } else {
                         for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
@@ -4094,8 +4096,8 @@ impl<'a> LossyTile<'a> {
     fn skip_ctx_16x32_422(&self, plane: usize, bx4c: usize, by4c: usize) -> usize {
         let a = &self.a_coef[plane];
         let l = &self.l_coef[plane];
-        let ca = (0..4).any(|k| a[bx4c + k] != 0x40) as usize;
-        let cl = (0..8).any(|k| l[by4c + k] != 0x40) as usize;
+        let ca = a[bx4c..bx4c + 4].iter().any(|&x| x != 0x40) as usize;
+        let cl = l[by4c..by4c + 8].iter().any(|&x| x != 0x40) as usize;
         7 + ca + cl
     }
 
@@ -4103,8 +4105,8 @@ impl<'a> LossyTile<'a> {
     fn dc_sign_ctx_16x32_422(&self, plane: usize, bx4c: usize, by4c: usize) -> usize {
         let a = &self.a_coef[plane];
         let l = &self.l_coef[plane];
-        let suma: i32 = (0..4).map(|k| (a[bx4c + k] >> 6) as i32).sum();
-        let suml: i32 = (0..8).map(|k| (l[by4c + k] >> 6) as i32).sum();
+        let suma: i32 = a[bx4c..bx4c + 4].iter().map(|x| (x >> 6) as i32).sum();
+        let suml: i32 = l[by4c..by4c + 8].iter().map(|x| (x >> 6) as i32).sum();
         let s = suma + suml - 12;
         (s != 0) as usize + (s > 0) as usize
     }
@@ -4696,10 +4698,14 @@ impl<'a> LossyTile<'a> {
             {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 let prow = &sv_preds[ci][ry * 16..];
-                for j in 0..16 {
-                    let s = srow[j];
-                    let d = s - (dc + rd_row[j]).clamp(0, maxval);
-                    let v = s - (prow[j] + rs_row[j]).clamp(0, maxval);
+                for (((&s, &prow), &rd), &rs) in srow[..16]
+                    .iter()
+                    .zip(prow[..16].iter())
+                    .zip(rd_row[..16].iter())
+                    .zip(rs_row[..16].iter())
+                {
+                    let d = s - (dc + rd).clamp(0, maxval);
+                    let v = s - (prow + rs).clamp(0, maxval);
                     sse_dc += (d * d) as i64;
                     sse_sv += (v * v) as i64;
                 }
