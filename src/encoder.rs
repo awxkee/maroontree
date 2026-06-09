@@ -26,8 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+use crate::BitDepth;
+use crate::avif::{checked_buffer_size, validate_dims};
 use crate::color::ColorEncoding;
+use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
 
@@ -36,8 +38,58 @@ use crate::pixel::Pixel;
 pub struct PlanarImage<T: Pixel> {
     pub width: usize,
     pub height: usize,
-    pub bit_depth: u8,
+    pub bit_depth: BitDepth,
     pub planes: [Vec<T>; 3],
+}
+
+fn validate_buf<T>(buf: &[T], w: usize, h: usize, ch: usize) -> Result<(), EncodeError> {
+    let needed = checked_buffer_size::<T>(w, h, ch)?;
+    if buf.len() != needed {
+        return Err(EncodeError::InvalidInput);
+    }
+    Ok(())
+}
+
+impl<T: Pixel> PlanarImage<T> {
+    pub(crate) fn validate_400(&self) -> Result<(), EncodeError> {
+        validate_dims(self.width as u32, self.height as u32)?;
+        validate_buf(&self.planes[0], self.width, self.height, 1)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_444(&self) -> Result<(), EncodeError> {
+        validate_dims(self.width as u32, self.height as u32)?;
+        validate_buf(&self.planes[0], self.width, self.height, 1)?;
+        validate_buf(&self.planes[1], self.width, self.height, 1)?;
+        validate_buf(&self.planes[2], self.width, self.height, 1)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_422(&self) -> Result<(), EncodeError> {
+        validate_dims(self.width as u32, self.height as u32)?;
+        validate_buf(&self.planes[0], self.width, self.height, 1)?;
+        validate_buf(&self.planes[1], self.width.div_ceil(2), self.height, 1)?;
+        validate_buf(&self.planes[2], self.width.div_ceil(2), self.height, 1)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_420(&self) -> Result<(), EncodeError> {
+        validate_dims(self.width as u32, self.height as u32)?;
+        validate_buf(&self.planes[0], self.width, self.height, 1)?;
+        validate_buf(
+            &self.planes[1],
+            self.width.div_ceil(2),
+            self.height.div_ceil(2),
+            1,
+        )?;
+        validate_buf(
+            &self.planes[2],
+            self.width.div_ceil(2),
+            self.height.div_ceil(2),
+            1,
+        )?;
+        Ok(())
+    }
 }
 
 // Q0.13 coefficients  (value = round(f * 8192))
@@ -59,7 +111,12 @@ const CR_B: i32 = -666; // round(-0.081312 * 8192)
 impl<T: Pixel> PlanarImage<T> {
     /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
     /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
-    pub fn from_interleaved_rgb(width: usize, height: usize, bit_depth: u8, rgb: &[T]) -> Self {
+    pub fn from_interleaved_rgb(
+        width: usize,
+        height: usize,
+        bit_depth: BitDepth,
+        rgb: &[T],
+    ) -> Self {
         assert_eq!(rgb.len(), width * height * 3);
         let n = width * height;
         let mut g = vec![T::default(); n];
@@ -85,7 +142,7 @@ impl<T: Pixel> PlanarImage<T> {
 
     /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
     /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
-    pub fn from_luma(width: usize, height: usize, bit_depth: u8, luma: &[T]) -> Self {
+    pub fn from_luma(width: usize, height: usize, bit_depth: BitDepth, luma: &[T]) -> Self {
         assert_eq!(luma.len(), width * height);
 
         PlanarImage {
@@ -141,14 +198,10 @@ pub fn encode_still_lossy<T: Pixel>(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
     );
-    assert!(
-        matches!(img.bit_depth, 8 | 10 | 12),
-        "only 8/10/12-bit supported"
-    );
     assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
     let bd = img.bit_depth;
-    let maxv = (1i32 << bd) - 1;
-    let off = (1i32 << (bd - 1)) as f32;
+    let maxv = (1i32 << bd.bits()) - 1;
+    let off = (1i32 << (bd.bits() - 1)) as f32;
     let mx = maxv as f32;
     let n = img.planes[0].len();
     let off_q = (off as i32) << Q;
@@ -168,7 +221,15 @@ pub fn encode_still_lossy<T: Pixel>(
         *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
     }
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
-        base_q_idx, bd, img.width, img.height, &y, &cb, &cr, color, threads,
+        base_q_idx,
+        bd.bits(),
+        img.width,
+        img.height,
+        &y,
+        &cb,
+        &cr,
+        color,
+        threads,
     );
     Encoded {
         bytes,
@@ -193,15 +254,11 @@ pub fn encode_still_lossy_422<T: Pixel>(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
     );
-    assert!(
-        matches!(img.bit_depth, 8 | 10 | 12),
-        "only 8/10/12-bit supported"
-    );
     assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
     let (w, h) = (img.width, img.height);
     let bd = img.bit_depth;
-    let maxv = (1i32 << bd) - 1;
-    let off = (1i32 << (bd - 1)) as f32;
+    let maxv = (1i32 << bd.bits()) - 1;
+    let off = (1i32 << (bd.bits() - 1)) as f32;
     let mx = maxv as f32;
     let cw = w.div_ceil(2);
     let mut y = vec![0i32; w * h];
@@ -246,7 +303,15 @@ pub fn encode_still_lossy_422<T: Pixel>(
         }
     }
     let bytes = crate::av1real::encode_av1_lossy_image_422(
-        base_q_idx, bd, w, h, &y, &cb, &cr, color, threads,
+        base_q_idx,
+        bd.bits(),
+        w,
+        h,
+        &y,
+        &cb,
+        &cr,
+        color,
+        threads,
     );
     Encoded {
         bytes,
@@ -271,15 +336,11 @@ pub fn encode_still_lossy_420<T: Pixel>(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
     );
-    assert!(
-        matches!(img.bit_depth, 8 | 10 | 12),
-        "only 8/10/12-bit supported"
-    );
     assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
     let (w, h) = (img.width, img.height);
     let bd = img.bit_depth;
-    let maxv = (1i32 << bd) - 1;
-    let off = (1i32 << (bd - 1)) as f32;
+    let maxv = (1i32 << bd.bits()) - 1;
+    let off = (1i32 << (bd.bits() - 1)) as f32;
     let mx = maxv as f32;
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
 
@@ -322,7 +383,15 @@ pub fn encode_still_lossy_420<T: Pixel>(
         }
     }
     let bytes = crate::av1real::encode_av1_lossy_image_420(
-        base_q_idx, bd, w, h, &y, &cb, &cr, color, threads,
+        base_q_idx,
+        bd.bits(),
+        w,
+        h,
+        &y,
+        &cb,
+        &cr,
+        color,
+        threads,
     );
     Encoded {
         bytes,
@@ -343,22 +412,24 @@ pub fn encode_still_mono<T: Pixel>(
     plane: &[T],
     width: usize,
     height: usize,
-    bit_depth: u8,
+    bit_depth: BitDepth,
     base_q_idx: u8,
     full_range: bool,
     threads: usize,
 ) -> Encoded {
     assert!(width > 0 && height > 0, "width/height must be non-zero");
-    assert!(
-        matches!(bit_depth, 8 | 10 | 12),
-        "only 8/10/12-bit supported"
-    );
     assert!(base_q_idx != 0, "monochrome lossless is not yet supported");
     assert_eq!(plane.len(), width * height, "plane must be width*height");
-    let maxv = (1i32 << bit_depth) - 1;
+    let maxv = (1i32 << bit_depth.bits()) - 1;
     let luma: Vec<i32> = plane.iter().map(|v| v.to_i32().clamp(0, maxv)).collect();
     let bytes = crate::av1real::encode_av1_mono_image(
-        base_q_idx, bit_depth, width, height, &luma, full_range, threads,
+        base_q_idx,
+        bit_depth.bits(),
+        width,
+        height,
+        &luma,
+        full_range,
+        threads,
     );
     Encoded {
         bytes,
@@ -393,11 +464,11 @@ pub fn encode_still_with<T: Pixel>(
         img.width > 0 && img.height > 0,
         "width/height must be non-zero"
     );
-    assert!(
-        matches!(img.bit_depth, 8 | 10 | 12),
-        "only 8/10/12-bit supported"
-    );
-    let profile: u32 = if img.bit_depth == 12 { 2 } else { 1 };
+    let profile: u32 = if img.bit_depth == BitDepth::Twelve {
+        2
+    } else {
+        1
+    };
     let (w, h) = (img.width, img.height);
     let (w8, h8) = (crate::av1real::align8(w), crate::av1real::align8(h));
     let to_i16 = |p: &[T]| p.iter().map(|p| p.to_i32() as i16).collect::<Vec<i16>>();
@@ -412,11 +483,11 @@ pub fn encode_still_with<T: Pixel>(
         w as u32,
         h as u32,
         profile,
-        img.bit_depth,
+        img.bit_depth.bits(),
         color,
     ));
     bytes.extend_from_slice(&crate::av1real::encode_lossless_frame_obus(
-        img.bit_depth,
+        img.bit_depth.bits(),
         w8,
         h8,
         &planes_i16,
@@ -438,7 +509,7 @@ pub fn encode_yuv444<T: Pixel>(
     cr: &[T],
     width: usize,
     height: usize,
-    bit_depth: u8,
+    bit_depth: BitDepth,
     base_q_idx: u8,
     color: &ColorEncoding,
     threads: usize,
@@ -447,7 +518,7 @@ pub fn encode_yuv444<T: Pixel>(
     assert_eq!(y.len(), width * height, "y plane must be width×height");
     assert_eq!(cb.len(), width * height, "cb plane must be width×height");
     assert_eq!(cr.len(), width * height, "cr plane must be width×height");
-    let maxv = (1i32 << bit_depth) - 1;
+    let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
             .map(|v| v.to_i32().clamp(0, maxv))
@@ -455,7 +526,7 @@ pub fn encode_yuv444<T: Pixel>(
     };
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
         base_q_idx,
-        bit_depth,
+        bit_depth.bits(),
         width,
         height,
         &to_i(y),
@@ -480,13 +551,13 @@ pub fn encode_yuv422<T: Pixel>(
     cr: &[T],
     width: usize,
     height: usize,
-    bit_depth: u8,
+    bit_depth: BitDepth,
     base_q_idx: u8,
     color: &crate::color::ColorEncoding,
     threads: usize,
 ) -> Encoded {
     assert!(base_q_idx != 0, "use encode_still for lossless");
-    let maxv = (1i32 << bit_depth) - 1;
+    let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
             .map(|v| v.to_i32().clamp(0, maxv))
@@ -494,7 +565,7 @@ pub fn encode_yuv422<T: Pixel>(
     };
     let bytes = crate::av1real::encode_av1_lossy_image_422(
         base_q_idx,
-        bit_depth,
+        bit_depth.bits(),
         width,
         height,
         &to_i(y),
@@ -519,13 +590,13 @@ pub fn encode_yuv420<T: Pixel>(
     cr: &[T],
     width: usize,
     height: usize,
-    bit_depth: u8,
+    bit_depth: BitDepth,
     base_q_idx: u8,
     color: &ColorEncoding,
     threads: usize,
 ) -> Encoded {
     assert!(base_q_idx != 0, "use encode_still for lossless");
-    let maxv = (1i32 << bit_depth) - 1;
+    let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
             .map(|v| v.to_i32().clamp(0, maxv))
@@ -533,7 +604,7 @@ pub fn encode_yuv420<T: Pixel>(
     };
     let bytes = crate::av1real::encode_av1_lossy_image_420(
         base_q_idx,
-        bit_depth,
+        bit_depth.bits(),
         width,
         height,
         &to_i(y),
@@ -567,7 +638,7 @@ mod tests {
                 rgb[i + 2] = ((x + y) % 64) as u8;
             }
         }
-        let img = PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
+        let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
         let out = encode_still(&img);
         assert!(out.lossless_verified);
         // header signals the exact (unpadded) frame size
@@ -599,7 +670,7 @@ mod tests {
                     rgb[i + 2] = (((x * y + 1) as u32) as u16) % m;
                 }
             }
-            let img = PlanarImage::from_interleaved_rgb(w, h, bd, &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
             let p = encode_still(&img).bytes;
             assert_eq!(p.len(), len, "bd={} length", bd);
             assert_eq!(
@@ -658,7 +729,13 @@ mod tests {
                     rgb[i + 2] = ((x + y * 5) % 256) as u8;
                 }
             }
-            encode_still(&PlanarImage::from_interleaved_rgb(w, h, 8, &rgb)).bytes
+            encode_still(&PlanarImage::from_interleaved_rgb(
+                w,
+                h,
+                BitDepth::Eight,
+                &rgb,
+            ))
+            .bytes
         };
 
         let small = obu_types(&mk(96, 64));
@@ -688,7 +765,7 @@ mod tests {
         for (i, b) in rgb.iter_mut().enumerate() {
             *b = (i * 31 % 256) as u8;
         }
-        let img = PlanarImage::from_interleaved_rgb(4160, 64, 8, &rgb);
+        let img = PlanarImage::from_interleaved_rgb(4160, 64, BitDepth::Eight, &rgb);
         let s1 = encode_still_with(&img, &color, 1).bytes;
         let s2 = encode_still_with(&img, &color, 2).bytes;
         assert_eq!(
@@ -721,7 +798,7 @@ mod tests {
                     rgb[i + 2] = (((x * y + 1) as u32) as u16) % m;
                 }
             }
-            let img = PlanarImage::from_interleaved_rgb(w, h, bd, &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
             let outs = [
                 encode_still_lossy(&img, 80, &crate::color::ColorEncoding::srgb_ycbcr(), 1),
                 encode_still_lossy_422(&img, 80, &crate::color::ColorEncoding::srgb_ycbcr(), 1),
@@ -747,7 +824,7 @@ mod tests {
     fn arbitrary_sizes_do_not_panic() {
         for &(w, h) in &[(1usize, 1usize), (17, 17), (65, 33), (127, 129), (33, 7)] {
             let rgb = vec![100u8; w * h * 3];
-            let img = PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
             assert!(!encode_still(&img).bytes.is_empty());
             assert!(
                 !encode_still_lossy(&img, 16, &crate::color::ColorEncoding::srgb_ycbcr(), 0)

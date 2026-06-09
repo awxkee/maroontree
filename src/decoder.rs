@@ -28,7 +28,6 @@
  */
 
 #![allow(unused)]
-use crate::PlanarImage;
 use crate::bitwriter::read_leb128;
 use crate::coeff::{CoeffCdfs, decode_block};
 use crate::obu::FRAME_HEADER_LEN;
@@ -36,6 +35,7 @@ use crate::pixel::Pixel;
 use crate::predict::left_predictor;
 use crate::rangecoder::RangeDecoder;
 use crate::transform::iwht4x4;
+use crate::{BitDepth, PlanarImage};
 
 const OBU_FRAME: u8 = 6;
 
@@ -63,67 +63,4 @@ fn find_frame_payload(bytes: &[u8]) -> Option<&[u8]> {
         pos += size as usize;
     }
     None
-}
-
-/// Decode a still image previously produced by `encode_still`.
-pub(crate) fn decode_still<T: Pixel>(
-    bytes: &[u8],
-    width: usize,
-    height: usize,
-    bit_depth: u8,
-) -> PlanarImage<T> {
-    let payload = find_frame_payload(bytes).expect("no OBU_FRAME found");
-    // OBU_FRAME payload = frame_header (FRAME_HEADER_LEN bytes) || tile entropy.
-    let entropy = &payload[FRAME_HEADER_LEN..];
-
-    let mut dec = RangeDecoder::new(entropy);
-    let mut cdfs = CoeffCdfs::default();
-
-    let mut planes: [Vec<T>; 3] = [
-        vec![T::default(); width * height],
-        vec![T::default(); width * height],
-        vec![T::default(); width * height],
-    ];
-    for plane in planes.iter_mut() {
-        decode_plane(plane, width, height, bit_depth, &mut dec, &mut cdfs);
-    }
-
-    PlanarImage {
-        width,
-        height,
-        bit_depth,
-        planes,
-    }
-}
-
-fn decode_plane<T: Pixel>(
-    out: &mut [T],
-    width: usize,
-    height: usize,
-    bit_depth: u8,
-    dec: &mut RangeDecoder,
-    cdfs: &mut CoeffCdfs,
-) {
-    let mut recon = vec![0i32; width * height];
-    let bw = width.div_ceil(4);
-    let bh = height.div_ceil(4);
-
-    for by in 0..bh {
-        for bx in 0..bw {
-            let pred = left_predictor(&recon, width, height, bx, by, bit_depth);
-            let coeffs = decode_block(dec, cdfs);
-            let inv = iwht4x4(&coeffs);
-            for yy in 0..4 {
-                for xx in 0..4 {
-                    let gx = bx * 4 + xx;
-                    let gy = by * 4 + yy;
-                    if gx < width && gy < height {
-                        let r = pred[yy * 4 + xx] + inv[yy * 4 + xx];
-                        recon[gy * width + gx] = r;
-                        out[gy * width + gx] = T::from_i32_clamped(r, bit_depth);
-                    }
-                }
-            }
-        }
-    }
 }

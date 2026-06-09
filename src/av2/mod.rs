@@ -45,16 +45,17 @@ use crate::av2::avif::Av2Format;
 use crate::av2::cdfs_qctx::CHROMA_SKIP_V_QC;
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::coder::{
-    encode_chroma_block, encode_chroma_tu4, encode_lossless_luma_sb, encode_luma_block_split, Coeff,
+    Coeff, encode_chroma_block, encode_chroma_tu4, encode_lossless_luma_sb, encode_luma_block_split,
 };
 use crate::av2::entropy::RangeEncoder;
-use crate::av2::headers::{frame_header, obu, sequence_header, Config};
+use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
     dc_pred, dc_pred_rect, get_residual, get_residual_rect, levels_to_coeffs, lossless_sb_tus,
-    pad_plane, put_block, put_block_rect, sb_align, sb_tu4_chroma_skip, sb_tu4_contexts,
-    sb_tu_contexts,
+    pad_plane, put_block, put_block_rect, sb_align, sb_tu_contexts, sb_tu4_chroma_skip,
+    sb_tu4_contexts,
 };
 use crate::av2::layout::Layout;
+use crate::avif::validate_dims;
 use crate::err::EncodeError;
 use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
 
@@ -73,6 +74,10 @@ const CB_B: i32 = 4096; // round( 0.5 * 8192)
 const CR_R: i32 = 4096; // round( 0.5 * 8192)
 const CR_G: i32 = -3430; // round(-0.418688 * 8192)
 const CR_B: i32 = -666; // round(-0.081312 * 8192)
+
+/// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
+/// samples; with both axes capped here the largest possible frame is ~268 MP.
+const MAX_DIM: u32 = 16_383;
 
 pub fn get_q_ctx(q: u8) -> usize {
     if q <= 90 {
@@ -168,7 +173,7 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
-    ) -> AvFrame {
+    ) -> Result<AvFrame, EncodeError> {
         let width = planar_image.width;
         let height = planar_image.height;
         let y = &planar_image.planes[0];
@@ -186,7 +191,7 @@ impl Av2Encoder {
             "Cr plane must be full-resolution (4:4:4)"
         );
         if self.base_q_idx == 0 {
-            return self.encode_yuv444_lossless(y, cb, cr, width, height, color);
+            return Ok(self.encode_yuv444_lossless(y, cb, cr, width, height, color));
         }
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
@@ -278,7 +283,7 @@ impl Av2Encoder {
                 v_has[row * sb_cols + col] = vcoeffs.iter().any(|&(_, l)| l != 0) as i32;
             }
         }
-        self.finish(enc, &config, pw, ph, width, height, color)
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
     /// Encode a 4:2:0 YCbCr still. `y` is `width × height`; `cb`/`cr` are
@@ -738,27 +743,23 @@ impl Av2Encoder {
         self.finish(enc, &config, pw, ph, width, height, color)
     }
 
+    /// Encode an RGB image to 4:4:4 AV2. Converts RGB→YCbCr internally.
+    ///
+    /// Returns `Err` if dimensions are out of range (0 or > 16 383) or if
+    /// `img.bit_depth` is not 8, 10, or 12.
     pub fn encode_image_444<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
         color: &ColorEncoding,
         threads: usize,
-    ) -> AvFrame {
-        assert!(
-            img.width > 0 && img.height > 0,
-            "width/height must be non-zero"
-        );
-        assert!(
-            matches!(img.bit_depth, 8 | 10 | 12),
-            "only 8/10/12-bit supported"
-        );
+    ) -> Result<AvFrame, EncodeError> {
+        img.validate_444()?;
+        validate_dims(img.width as u32, img.height as u32)?;
         let bd = img.bit_depth;
-        let maxv = (1i32 << bd) - 1;
-        let off = (1i32 << (bd - 1)) as f32;
-        let mx = maxv as f32;
+        let maxv = (1i32 << bd.bits()) - 1;
+        let off_q = (1i32 << (bd.bits() - 1)) << Q;
+        let mx_i = maxv;
         let n = img.planes[0].len();
-        let off_q = (off as i32) << Q;
-        let mx_i = mx as i32;
         let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
         for (((((yv, cbv), crv), &rr), &gg), &bb) in y
             .iter_mut()
@@ -784,36 +785,33 @@ impl Av2Encoder {
         )
     }
 
+    /// Encode an RGB image to 4:2:0 AV2. Converts RGB→YCbCr and downsamples
+    /// chroma with a 2×2 box filter internally.
+    ///
+    /// Returns `Err` if dimensions are out of range (0 or > 16 383), if
+    /// `img.bit_depth` is not 8, 10, or 12, or if `base_q_idx` is 0 (use the
+    /// lossless path for that).
     pub fn encode_image_420<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
         base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
-    ) -> AvFrame {
-        assert!(
-            img.width > 0 && img.height > 0,
-            "width/height must be non-zero"
-        );
-        assert!(
-            matches!(img.bit_depth, 8 | 10 | 12),
-            "only 8/10/12-bit supported"
-        );
-        assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
+    ) -> Result<AvFrame, EncodeError> {
+        img.validate_444()?;
+        validate_dims(img.width as u32, img.height as u32)?;
+        if base_q_idx == 0 {
+            return Err(EncodeError::InvalidQuality);
+        }
         let (w, h) = (img.width, img.height);
-        let bd = img.bit_depth;
+        let bd = img.bit_depth.bits();
         let maxv = (1i32 << bd) - 1;
-        let off = (1i32 << (bd - 1)) as f32;
-        let mx = maxv as f32;
+        let off_q = (1i32 << (bd - 1)) << Q;
+        let mx_i = maxv;
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-
-        let off_q = (off as i32) << Q;
-        let mx_i = mx as i32;
-
         let mut y = vec![0i32; w * h];
         let mut fcb_q = vec![0i32; w * h];
         let mut fcr_q = vec![0i32; w * h];
-
         for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
             .iter_mut()
             .zip(fcb_q.iter_mut())
@@ -823,29 +821,23 @@ impl Av2Encoder {
             .zip(img.planes[1].iter())
         {
             let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-
             *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
             *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
             *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
         }
-
         const HALF_AVG: i32 = 1 << (Q + 1); // rounding bias for >> (Q+2)
-
         let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
-
         for row in 0..ch {
             for c in 0..cw {
                 let (x0, x1) = (2 * c, (2 * c + 1).min(w - 1));
                 let (y0, y1) = (2 * row, (2 * row + 1).min(h - 1));
-
                 let avg_q =
                     |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
-
                 cb[row * cw + c] = ((avg_q(&fcb_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
                 cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
             }
         }
-        self.encode_yuv420(
+        Ok(self.encode_yuv420(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -853,39 +845,36 @@ impl Av2Encoder {
                 planes: [y, cb, cr],
             },
             color,
-        )
+        ))
     }
 
+    /// Encode an RGB image to 4:2:2 AV2. Converts RGB→YCbCr and downsamples
+    /// chroma horizontally with a 2-tap box filter internally.
+    ///
+    /// Returns `Err` if dimensions are out of range (0 or > 16 383), if
+    /// `img.bit_depth` is not 8, 10, or 12, or if `base_q_idx` is 0 (use the
+    /// lossless path for that).
     pub fn encode_image_422<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
         base_q_idx: u8,
         color: &ColorEncoding,
         threads: usize,
-    ) -> AvFrame {
-        assert!(
-            img.width > 0 && img.height > 0,
-            "width/height must be non-zero"
-        );
-        assert!(
-            matches!(img.bit_depth, 8 | 10 | 12),
-            "only 8/10/12-bit supported"
-        );
-        assert!(base_q_idx != 0, "use encode_still for lossless (q=0)");
+    ) -> Result<AvFrame, EncodeError> {
+        img.validate_444()?;
+        validate_dims(img.width as u32, img.height as u32)?;
+        if base_q_idx == 0 {
+            return Err(EncodeError::InvalidQuality);
+        }
         let (w, h) = (img.width, img.height);
-        let bd = img.bit_depth;
+        let bd = img.bit_depth.bits();
         let maxv = (1i32 << bd) - 1;
-        let off = (1i32 << (bd - 1)) as f32;
-        let mx = maxv as f32;
+        let off_q = ((1i32 << (bd - 1)) as i32) << Q;
+        let mx_i = maxv;
         let cw = w.div_ceil(2);
         let mut y = vec![0i32; w * h];
-
-        let off_q = (off as i32) << Q;
-        let mx_i = mx as i32;
-
         let mut fcb_q = vec![0i32; w * h];
         let mut fcr_q = vec![0i32; w * h];
-
         for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
             .iter_mut()
             .zip(fcb_q.iter_mut())
@@ -895,31 +884,25 @@ impl Av2Encoder {
             .zip(img.planes[1].iter())
         {
             let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-
             *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
-
             *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
             *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
         }
         const HALF_AVG: i32 = 1 << Q;
-
         let (mut cb, mut cr) = (vec![0i32; cw * h], vec![0i32; cw * h]);
-
         for row in 0..h {
             for c in 0..cw {
                 let x0 = 2 * c;
                 let x1 = (2 * c + 1).min(w - 1);
-
                 let cb0 = fcb_q[row * w + x0];
                 let cb1 = fcb_q[row * w + x1];
                 let cr0 = fcr_q[row * w + x0];
                 let cr1 = fcr_q[row * w + x1];
-
                 cb[row * cw + c] = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
                 cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
             }
         }
-        self.encode_yuv422(
+        Ok(self.encode_yuv422(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -927,27 +910,23 @@ impl Av2Encoder {
                 planes: [y, cb, cr],
             },
             color,
-        )
+        ))
     }
 
+    /// Encode a luma-only (4:0:0 / monochrome) image to AV2.
+    ///
+    /// Returns `Err` if dimensions are out of range (0 or > 16 383) or if
+    /// `img.bit_depth` is not 8, 10, or 12.
     pub fn encode_image_400<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
         color: &ColorEncoding,
         threads: usize,
-    ) -> AvFrame {
-        assert!(
-            img.width > 0 && img.height > 0,
-            "width/height must be non-zero"
-        );
-        assert!(
-            matches!(img.bit_depth, 8 | 10 | 12),
-            "only 8/10/12-bit supported"
-        );
-
+    ) -> Result<AvFrame, EncodeError> {
+        img.validate_400()?;
+        validate_dims(img.width as u32, img.height as u32)?;
         let plane = img.planes[0].to_vec();
-
-        self.encode_yuv400(
+        Ok(self.encode_yuv400(
             &PlanarImage {
                 width: img.width,
                 height: img.height,
@@ -955,7 +934,7 @@ impl Av2Encoder {
                 planes: [plane, vec![], vec![]],
             },
             color,
-        )
+        ))
     }
 
     fn finish(
@@ -984,7 +963,7 @@ impl Av2Encoder {
         let safe_w = (sb_cols - 1) * MIB + 8 < mi_cols;
         let safe_h = (sb_rows - 1) * MIB + 8 < mi_rows;
         let exact = safe_w && safe_h && !config.lossless; // lossless can't code boundary SBs -> pad
-        // Signalled dimensions: real size when boundary-safe, else the padded size.
+        // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
         if !exact {
             eprintln!(

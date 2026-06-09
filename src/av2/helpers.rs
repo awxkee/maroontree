@@ -154,9 +154,8 @@ pub(crate) fn get_residual(
 }
 pub(crate) fn put_block(plane: &mut [f32], w: usize, y0: usize, x0: usize, bs: usize, rec: &[f32]) {
     for yy in 0..bs {
-        for xx in 0..bs {
-            plane[(y0 + yy) * w + x0 + xx] = rec[yy * bs + xx];
-        }
+        plane[(y0 + yy) * w + x0..(y0 + yy) * w + x0 + bs]
+            .copy_from_slice(&rec[yy * bs..yy * bs + bs]);
     }
 }
 /// DC prediction for a `bw`-wide × `bh`-tall block (4:2:2 chroma is 32×64).
