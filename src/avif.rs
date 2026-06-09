@@ -60,7 +60,6 @@ use crate::encoder::{encode_still_lossy, encode_still_lossy_420, encode_still_lo
 use crate::err::EncodeError;
 use crate::isobmff;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
-// ─── Constants ───────────────────────────────────────────────────────────────
 
 const MIN_DIM: u32 = 1;
 /// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
@@ -190,8 +189,6 @@ impl EncodeConfig {
         validate_quality(self.quality)
     }
 }
-
-// ─── Validation helpers ───────────────────────────────────────────────────────
 
 pub(crate) fn validate_dims(width: u32, height: u32) -> Result<(), EncodeError> {
     if width < MIN_DIM || height < MIN_DIM || width > MAX_DIM || height > MAX_DIM {
@@ -353,7 +350,7 @@ fn dispatch_lossy<T: crate::Pixel>(
     img: &crate::PlanarImage<T>,
     q: u8,
     chroma: ChromaFormat,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     match chroma {
@@ -378,7 +375,6 @@ pub fn encode_rgb8(
     cfg.validate()?;
     validate_buf_u8(rgb, width, height, 3)?;
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, rgb);
-    println!("working q {}", quality_to_q(cfg.quality));
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -402,7 +398,7 @@ pub fn encode_rgba8(
     cfg.validate()?;
     validate_buf_u8(rgba, width, height, 4)?;
     let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 8, &rgb);
@@ -432,13 +428,19 @@ pub fn encode_rgba8_with_alpha(
     validate_buf_u8(rgba, width, height, 4)?;
     let (w, h) = (width as usize, height as usize);
     let q = quality_to_q(cfg.quality);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    let mut alpha = Vec::with_capacity(w * h);
-    for px in rgba.chunks_exact(4) {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-        alpha.push(px[3]);
+    let mut rgb = vec![0u8; w * h * 3];
+    let mut alpha = vec![0u8; w * h];
+    for ((px, dst_rgb), alpha) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+        .zip(alpha.iter_mut())
+    {
+        dst_rgb[0] = px[0];
+        dst_rgb[1] = px[1];
+        dst_rgb[2] = px[2];
+        *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 8, &rgb);
     let color_obu = dispatch_lossy(
@@ -488,7 +490,7 @@ pub fn encode_rgba10(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 10, &rgb);
@@ -514,13 +516,19 @@ pub fn encode_rgba10_with_alpha(
     validate_buf_u16(rgba, width, height, 4)?;
     let (w, h) = (width as usize, height as usize);
     let q = quality_to_q(cfg.quality);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    let mut alpha = Vec::with_capacity(w * h);
-    for px in rgba.chunks_exact(4) {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-        alpha.push(px[3]);
+    let mut rgb = vec![0u16; w * h * 3];
+    let mut alpha = vec![0u16; w * h];
+    for ((px, dst_rgb), alpha) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+        .zip(alpha.iter_mut())
+    {
+        dst_rgb[0] = px[0];
+        dst_rgb[1] = px[1];
+        dst_rgb[2] = px[2];
+        *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 10, &rgb);
     let color_obu = dispatch_lossy(
@@ -533,8 +541,6 @@ pub fn encode_rgba10_with_alpha(
     let alpha_obu = crate::encode_still_mono(&alpha, w, h, 10, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
 }
-
-// ─── 12-bit RGB entry points (u16, values 0..=4095) ──────────────────────────
 
 /// Encode a 12-bit RGB image to AVIF.
 ///
@@ -574,7 +580,7 @@ pub fn encode_rgba12(
     cfg.validate()?;
     validate_buf_u16(rgba, width, height, 4)?;
     let rgb: Vec<u16> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
     let img = crate::PlanarImage::from_interleaved_rgb(width as usize, height as usize, 12, &rgb);
@@ -603,13 +609,19 @@ pub fn encode_rgba12_with_alpha(
     validate_buf_u16(rgba, width, height, 4)?;
     let (w, h) = (width as usize, height as usize);
     let q = quality_to_q(cfg.quality);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    let mut alpha = Vec::with_capacity(w * h);
-    for px in rgba.chunks_exact(4) {
-        rgb.push(px[0]);
-        rgb.push(px[1]);
-        rgb.push(px[2]);
-        alpha.push(px[3]);
+    let mut rgb = vec![0u16; w * h * 3];
+    let mut alpha = vec![0u16; w * h];
+    for ((px, dst_rgb), alpha) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+        .zip(alpha.iter_mut())
+    {
+        dst_rgb[0] = px[0];
+        dst_rgb[1] = px[1];
+        dst_rgb[2] = px[2];
+        *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, 12, &rgb);
     let color_obu = dispatch_lossy(
@@ -622,8 +634,6 @@ pub fn encode_rgba12_with_alpha(
     let alpha_obu = crate::encode_still_mono(&alpha, w, h, 12, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
 }
-
-// ─── Grayscale entry points ───────────────────────────────────────────────────
 
 /// Encode an 8-bit grayscale image to AVIF using AV1 monochrome coding.
 ///
@@ -704,7 +714,6 @@ pub fn encode_gray12(
     finalize_color(obu, width, height, 12, ChromaFormat::Monochrome, cfg)
 }
 
-// ─── YUV direct entry points ──────────────────────────────────────────────────
 //
 // The `encode_yuv*` functions accept pre-converted, pre-subsampled planar YCbCr
 // data.  They bypass the internal RGB→YCbCr step entirely, calling crate's
@@ -916,7 +925,7 @@ fn dispatch_yuv_u8(
     bd: u8,
     q: u8,
     chroma: ChromaFormat,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
@@ -939,7 +948,7 @@ fn dispatch_yuv_u16(
     bd: u8,
     q: u8,
     chroma: ChromaFormat,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
 ) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);

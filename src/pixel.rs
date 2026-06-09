@@ -9,6 +9,7 @@
 pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug {
     /// Promote a stored sample to the signed working type used by the transform.
     fn to_i32(self) -> i32;
+    fn to_f32(self) -> f32;
     /// Clip a reconstructed signed value back into `[0, (1<<bit_depth)-1]`.
     fn from_i32_clamped(v: i32, bit_depth: u8) -> Self;
 }
@@ -17,6 +18,10 @@ impl Pixel for u8 {
     #[inline]
     fn to_i32(self) -> i32 {
         self as i32
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
     }
     #[inline]
     fn from_i32_clamped(v: i32, _bit_depth: u8) -> Self {
@@ -30,9 +35,29 @@ impl Pixel for u16 {
         self as i32
     }
     #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
     fn from_i32_clamped(v: i32, bit_depth: u8) -> Self {
         let max = (1i32 << bit_depth) - 1;
         v.clamp(0, max) as u16
+    }
+}
+
+impl Pixel for i32 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn from_i32_clamped(v: i32, bit_depth: u8) -> Self {
+        let max = (1i32 << bit_depth) - 1;
+        v.clamp(0, max)
     }
 }
 

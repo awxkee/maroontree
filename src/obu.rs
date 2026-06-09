@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::bitwriter::{leb128, BitWriter};
+use crate::bitwriter::{BitWriter, leb128};
 use crate::color::MasteringDisplay;
 use crate::metadata::ContentLightLevel;
 

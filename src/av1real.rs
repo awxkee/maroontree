@@ -40,6 +40,7 @@ use crate::obu::{
     wrap_obu_frame, wrap_obu_frame_split,
 };
 use crate::odec::OdEcEncoder;
+use crate::trellis::{trellis_optimize, trellis_optimize_ctx};
 
 fn icdf(args: &[u16]) -> Vec<u16> {
     let mut v: Vec<u16> = args.iter().map(|&a| 32768 - a).collect();
@@ -56,33 +57,33 @@ static SKIP_CDF: [u16; 3] = [31671, 16515, 4576];
 /// `OdEcEncoder::encode_symbol`. Coef class index: 0 = `TX_4X4` (4:2:0 chroma),
 /// 1 = `TX_8X8`/`RTX_4X8` (luma, 4:4:4 and 4:2:2 chroma). Plane index: 0 = luma,
 /// 1 = chroma.
-struct Cdfs {
-    skip: Vec<Vec<u16>>,               // block skip [3 ctx]
-    part_bl8: Vec<Vec<u16>>,           // PARTITION_NONE @ 8x8 [4 ctx]
-    part_split: Vec<Vec<Vec<u16>>>,    // SPLIT [bl-1=0..3][4 ctx]
-    kf_y: Vec<Vec<u16>>,               // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
-    uv_mode: Vec<Vec<u16>>,            // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
-    angle_delta: Vec<Vec<u16>>,        // angle_delta[8 directional modes]
-    cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
-    cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
-    txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
-    txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
-    txb_skip: [Vec<Vec<u16>>; 4],      // [class][13 ctx] (class 3 = TX_32X32)
-    base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
-    br_tok: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][21 ctx]
-    eob_base: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][4 ctx]
-    eob_hi: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][11 bins], each a 2-sym CDF
-    dc_sign: [Vec<Vec<u16>>; 2],       // [plane][3 ctx]
-    eob_bin_16_c: Vec<u16>,            // chroma, 4x4
-    eob_bin_32_c: Vec<u16>,            // chroma, 4x8
-    eob_bin_64_l: Vec<u16>,            // luma, 8x8
-    eob_bin_64_c: Vec<u16>,            // chroma, 8x8
-    eob_bin_256_l: Vec<u16>,           // luma, 16x16 (class 2)
-    eob_bin_256_c: Vec<u16>,           // chroma, 16x16 (class 2)
-    eob_bin_128_c: Vec<u16>,           // chroma, RTX_8X16 (class 2, 128 coeffs)
-    eob_bin_1024_l: Vec<u16>,          // luma, 32x32 (class 3, 1024 coeffs)
-    eob_bin_1024_c: Vec<u16>,          // chroma, 32x32 (class 3, 1024 coeffs)
-    eob_bin_512_c: Vec<u16>,           // chroma, RTX_16X32 (class 3, 512 coeffs)
+pub(crate) struct Cdfs {
+    pub(crate) skip: Vec<Vec<u16>>,               // block skip [3 ctx]
+    pub(crate) part_bl8: Vec<Vec<u16>>,           // PARTITION_NONE @ 8x8 [4 ctx]
+    pub(crate) part_split: Vec<Vec<Vec<u16>>>,    // SPLIT [bl-1=0..3][4 ctx]
+    pub(crate) kf_y: Vec<Vec<u16>>,               // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
+    pub(crate) uv_mode: Vec<Vec<u16>>,            // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
+    pub(crate) angle_delta: Vec<Vec<u16>>,        // angle_delta[8 directional modes]
+    pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
+    pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
+    pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
+    pub(crate) txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
+    pub(crate) txb_skip: [Vec<Vec<u16>>; 4],      // [class][13 ctx] (class 3 = TX_32X32)
+    pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
+    pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][21 ctx]
+    pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][4 ctx]
+    pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][11 bins], each a 2-sym CDF
+    pub(crate) dc_sign: [Vec<Vec<u16>>; 2],       // [plane][3 ctx]
+    pub(crate) eob_bin_16_c: Vec<u16>,            // chroma, 4x4
+    pub(crate) eob_bin_32_c: Vec<u16>,            // chroma, 4x8
+    pub(crate) eob_bin_64_l: Vec<u16>,            // luma, 8x8
+    pub(crate) eob_bin_64_c: Vec<u16>,            // chroma, 8x8
+    pub(crate) eob_bin_256_l: Vec<u16>,           // luma, 16x16 (class 2)
+    pub(crate) eob_bin_256_c: Vec<u16>,           // chroma, 16x16 (class 2)
+    pub(crate) eob_bin_128_c: Vec<u16>,           // chroma, RTX_8X16 (class 2, 128 coeffs)
+    pub(crate) eob_bin_1024_l: Vec<u16>,          // luma, 32x32 (class 3, 1024 coeffs)
+    pub(crate) eob_bin_1024_c: Vec<u16>,          // chroma, 32x32 (class 3, 1024 coeffs)
+    pub(crate) eob_bin_512_c: Vec<u16>,           // chroma, RTX_16X32 (class 3, 512 coeffs)
 }
 
 impl Cdfs {
@@ -475,8 +476,8 @@ pub(crate) static ANGLE_DELTA_CDF: [[u16; 6]; 8] = [
 
 const DC_PRED: usize = 0;
 
-const NUM_BASE_LEVELS: i32 = 2;
-const COEFF_BASE_RANGE: i32 = 12;
+pub(crate) const NUM_BASE_LEVELS: i32 = 2;
+pub(crate) const COEFF_BASE_RANGE: i32 = 12;
 
 /// Encode `read_golomb` value `v` (>=0) as unary-prefixed binary via bypass bits.
 fn encode_golomb(enc: &mut OdEcEncoder, v: u32) {
@@ -634,7 +635,7 @@ static SCAN_8X8: [usize; 64] = [
     38, 45, 52, 59, 60, 53, 46, 39, 47, 54, 61, 62, 55, 63,
 ];
 /// `dav1d_lo_ctx_offsets[0]` (square, w==h) — position offset for coeff_base ctx.
-static LO_CTX_OFF: [[u32; 5]; 5] = [
+pub(crate) static LO_CTX_OFF: [[u32; 5]; 5] = [
     [0, 1, 6, 6, 21],
     [1, 6, 6, 21, 21],
     [6, 6, 21, 21, 21],
@@ -644,7 +645,8 @@ static LO_CTX_OFF: [[u32; 5]; 5] = [
 
 /// The byte dav1d stores in its `levels` map for a coefficient of magnitude `m`,
 /// used by the neighbour-context model: `m*0x41` for m<=2, else `min(m,15)+0xC0`.
-fn level_byte(m: u32) -> u8 {
+#[inline]
+pub(crate) fn level_byte(m: u32) -> u8 {
     if m == 0 {
         0
     } else if m <= 2 {
@@ -721,120 +723,6 @@ fn trellis_lambda() -> f64 {
     TRELLIS_LAMBDA0
 }
 
-/// Rate-distortion optimized quantization (trellis / RDOQ). Given baseline
-/// rounded levels `cf` and the matching pre-round real targets `tf` (the value
-/// `cf` was rounded from, = forward coefficient * SCALE / quant-step), this
-/// lowers coefficient magnitudes and trims the end-of-block wherever doing so
-/// reduces `D + lambda*R`, where `D` is the dequantized-domain squared error
-/// (orthonormal transform, so proportional to pixel SSE) and `R` the estimated
-/// coded bits. Only the written levels change, so the decoder — which simply
-/// inverse-transforms whatever levels are coded — stays bit-exact; the caller
-/// reconstructs from this same `cf`.
-fn trellis_optimize(
-    cf: &mut [i32],
-    tf: &[f64],
-    dc_q: f64,
-    ac_q: f64,
-    scan: &[usize],
-    lambda0: f64,
-) {
-    if lambda0 <= 0.0 {
-        return; // trellis disabled
-    }
-    let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q;
-    let dqf = |rc: usize| if rc == 0 { dc_q } else { ac_q };
-    let d = |rc: usize, lev: i32| {
-        let dq = dqf(rc);
-        let t = tf[rc].abs();
-        dq * dq * (t - lev.unsigned_abs() as f64).powi(2)
-    };
-
-    let mut eob_idx: i32 = -1;
-    for i in 0..n {
-        if cf[scan[i]] != 0 {
-            eob_idx = i as i32;
-        }
-    }
-    if eob_idx < 0 {
-        return; // already all-zero
-    }
-
-    // Step A: per-coefficient round-down (toward zero) by local R-D.
-    for &rc in scan[..=eob_idx as usize].iter() {
-        let l = cf[rc].unsigned_abs();
-        if l == 0 {
-            continue;
-        }
-        let cost_l = d(rc, l as i32) + lambda * coef_rate_bits(l);
-        let cost_dn = d(rc, (l - 1) as i32) + lambda * coef_rate_bits(l - 1);
-        if cost_dn < cost_l {
-            let s = if cf[rc] < 0 { -1 } else { 1 };
-            cf[rc] = s * (l as i32 - 1);
-        }
-    }
-
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<f64>, Vec<f64>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
-    }
-    let (mut suf0, mut pre) = SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        (std::mem::take(&mut b.0), std::mem::take(&mut b.1))
-    });
-
-    suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
-    suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
-    for i in (0..n).rev() {
-        suf0[i] = suf0[i + 1] + d(scan[i], 0);
-    }
-    pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
-    pre[0] = 0.0; // empty-prefix seed
-    for i in 0..n {
-        let rc = scan[i];
-        pre[i + 1] = pre[i] + d(rc, cf[rc]) + lambda * coef_rate_bits(cf[rc].unsigned_abs());
-    }
-    let eob_sig = |e: usize| -> f64 {
-        let bin = if e < 2 {
-            e
-        } else {
-            (32 - (e as u32).leading_zeros()) as usize
-        };
-        let extra = if bin > 1 { bin - 2 } else { 0 };
-        (bin as f64) * 0.9 + extra as f64 + 2.0 // eob_pt + extra bits + eob_base token
-    };
-
-    let mut best_e: i32 = -1;
-    let mut best_cost = f64::INFINITY;
-    for e in 0..n {
-        let rc = scan[e];
-        if cf[rc] == 0 {
-            continue; // the EOB must land on a nonzero
-        }
-        let c = pre[e] + d(rc, cf[rc]) + lambda * eob_sig(e) + suf0[e + 1];
-        if c < best_cost {
-            best_cost = c;
-            best_e = e as i32;
-        }
-    }
-    let skip_cost = suf0[0] + lambda * 1.0; // zero everything + the txb_skip flag
-    if best_e < 0 || skip_cost < best_cost {
-        for &rc in scan.iter() {
-            cf[rc] = 0;
-        }
-    } else {
-        for i in (best_e as usize + 1)..n {
-            cf[scan[i]] = 0;
-        }
-    }
-
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        b.0 = std::mem::take(&mut suf0);
-        b.1 = std::mem::take(&mut pre);
-    });
-}
-
 /// Probability -> bit-cost table. `COST_Q[p]` holds `-log2(p / 32768)` in
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in
 /// `[1, 32768]`. Built once; replaces a per-call `log2()` (a libm transcendental
@@ -862,7 +750,7 @@ fn cost_q_table() -> &'static [u32; 32769] {
 /// term), so it is the same rate libaom's cost tables approximate. The `-log2`
 /// is a precomputed fixed-point table lookup (see [`cost_q_table`]).
 #[inline]
-fn cdf_cost(cdf: &[u16], s: usize) -> f64 {
+pub(crate) fn cdf_cost(cdf: &[u16], s: usize) -> f64 {
     let fl = if s > 0 { cdf[s - 1] as i32 } else { 32768 };
     let fh = cdf[s] as i32;
     let p = (fl - fh).max(1) as usize;
@@ -871,14 +759,14 @@ fn cdf_cost(cdf: &[u16], s: usize) -> f64 {
 
 /// Bypass bits for the Exp-Golomb tail coding `v` (level ≥ 15 carries `v=L-15`).
 #[inline]
-fn golomb_cost(v: u32) -> f64 {
+pub(crate) fn golomb_cost(v: u32) -> f64 {
     let len = 32 - (v + 1).leading_zeros();
     (2 * len - 1) as f64
 }
 
 /// Accurate bit cost of the base-range (hi_tok) ladder for magnitude `m` (≥ 3)
 /// against `br_cdf`, plus the Exp-Golomb tail when `m ≥ 15`.
-fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f64 {
+pub(crate) fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f64 {
     let total_br = (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE);
     let mut coded = 0i32;
     let mut bits = 0.0;
@@ -896,387 +784,6 @@ fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f64 {
     bits
 }
 
-/// Context-accurate RDOQ for the 2D square luma transforms (TX_8X8/16X16/32X32,
-/// `cls` 1/2/3). Unlike [`trellis_optimize`], the per-coefficient rate is the
-/// *real* coding cost: the base token cost depends on the neighbour-magnitude
-/// context (so coefficients in sparse regions are correctly cheap), the
-/// base-range/Golomb tail and the EOB signalling are priced from the live CDFs.
-/// Level reduction runs in reverse scan order so forward-neighbour contexts are
-/// stable; a final pass re-selects the EOB with accurate `eob_pt`/`eob_base`
-/// costs. Only the chosen levels change, so the result still decodes exactly.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn trellis_optimize_ctx(
-    cf: &mut [i32],
-    tf: &[f64],
-    dc_q: f64,
-    ac_q: f64,
-    scan: &[usize],
-    lambda0: f64,
-    w: usize,
-    cdfs: &Cdfs,
-    cls: usize,
-    plane: usize,
-    eob_bin_cdf: &[u16],
-    dcs_ctx: usize,
-) {
-    if lambda0 <= 0.0 {
-        return;
-    }
-    let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q;
-    let log2w = w.trailing_zeros() as usize;
-    let stride = w;
-    // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
-    // re-walking the nested arrays on every coefficient).
-    let base_tok = &cdfs.base_tok[cls][plane];
-    let br_tok = &cdfs.br_tok[cls][plane];
-    let eob_hi = &cdfs.eob_hi[cls][plane];
-    let eob_base = &cdfs.eob_base[cls][plane];
-    let dc_sign = &cdfs.dc_sign[plane];
-    let dq2_dc = dc_q * dc_q;
-    let dq2_ac = ac_q * ac_q;
-    let dist = |rc: usize, lev: i32| {
-        let dq2 = if rc == 0 { dq2_dc } else { dq2_ac };
-        let e = tf[rc].abs() - (lev.abs() as f64);
-        dq2 * (e * e)
-    };
-
-    // Precompute the base-range (hi_tok) ladder cost for every br context and
-    // every total_br in 0..=12, once per call. `hi_tok_cost` otherwise reruns a
-    // 4-step `cdf_cost` ladder for every level-3+ coefficient (hot at high
-    // quality). Only worth the ~0.5us setup for the larger transforms (n >= 256),
-    // where it is called hundreds of times; small blocks use the direct path.
-    // Accumulation order matches `hi_tok_cost` exactly, so the chosen levels are
-    // identical either way.
-    let use_br_table = n >= 256;
-    let mut br_cum = [[0f64; 13]; 21];
-    if use_br_table {
-        for (bc, row) in br_cum.iter_mut().enumerate() {
-            let br = &br_tok[bc];
-            let c = [
-                cdf_cost(br, 0),
-                cdf_cost(br, 1),
-                cdf_cost(br, 2),
-                cdf_cost(br, 3),
-            ];
-            for (j, slot) in row.iter_mut().enumerate() {
-                let mut coded = 0i32;
-                let mut bits = 0.0;
-                for _ in 0..(COEFF_BASE_RANGE / 3) {
-                    let s = (j as i32 - coded).min(3);
-                    bits += c[s as usize];
-                    coded += s;
-                    if s < 3 {
-                        break;
-                    }
-                }
-                *slot = bits;
-            }
-        }
-    }
-    // Base-range tail cost for magnitude `m` (>= 3) in br context `bc`.
-    let hi_cost = |m: u32, bc: usize| -> f64 {
-        if use_br_table {
-            let total_br = (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE);
-            let mut bits = br_cum[bc][total_br as usize];
-            if m >= 15 {
-                bits += golomb_cost(m - 15);
-            }
-            bits
-        } else {
-            hi_tok_cost(m, &br_tok[bc])
-        }
-    };
-
-    // Last nonzero in scan order. `rposition` scans from the end and stops at the
-    // first hit, and iterating `scan` drops its bounds check (only `cf[rc]` is a
-    // random access). Same value as the forward max-index scan.
-    let eob: i32 = scan
-        .iter()
-        .rposition(|&rc| cf[rc] != 0)
-        .map_or(-1, |i| i as i32);
-    if eob < 0 {
-        return;
-    }
-    let eu = eob as usize;
-
-    // Reuse scratch allocations across calls (this runs once per coded transform
-    // block, so per-call alloc+zero+free of `levels`/`pre`/`suf0`/`irate` shows
-    // up in profiles). Buffers are taken from a thread-local pool and returned at
-    // the single exit below. Entries are fully overwritten before use except the
-    // cumulative seed (`suf0[n]`) and `levels` (a sparse magnitude map
-    // that must start zeroed), which are reset explicitly.
-
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<f64>, Vec<f64>, Vec<f64>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
-    }
-    let (mut levels, mut pre, mut suf0, mut irate) = SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        (
-            std::mem::take(&mut b.0),
-            std::mem::take(&mut b.1),
-            std::mem::take(&mut b.2),
-            std::mem::take(&mut b.3),
-        )
-    });
-    levels.clear();
-    levels.resize(w * (w + 4), 0);
-    let set_level = |levels: &mut [u8], rc: usize, m: u32| {
-        levels[(rc >> log2w) * stride + (rc & (w - 1))] = level_byte(m);
-    };
-    for &rc in &scan[..eu + 1] {
-        set_level(&mut levels, rc, cf[rc].unsigned_abs());
-    }
-
-    // Interior base-token context + br context for a position, from `levels`.
-    let interior_ctx = |levels: &[u8], rc: usize| -> (usize, usize) {
-        let (x, y) = (rc >> log2w, rc & (w - 1));
-        let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, &LO_CTX_OFF, stride);
-        let mag = hi_mag & 63;
-        let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
-        (ctx, bc as usize)
-    };
-    let dc_brc = |levels: &[u8]| -> usize {
-        let mag = (levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32) & 63;
-        if mag > 12 {
-            6
-        } else {
-            ((mag + 1) >> 1) as usize
-        }
-    };
-    // Rate of an interior coefficient at level k (base_tok + br + AC sign).
-    let interior_rate = |ctx: usize, bc: usize, k: u32| -> f64 {
-        if k == 0 {
-            return cdf_cost(&base_tok[ctx], 0);
-        }
-        let tok = k.min(3);
-        let mut b = cdf_cost(&base_tok[ctx], tok as usize);
-        if tok == 3 {
-            b += hi_cost(k, bc);
-        }
-        b + 1.0 // AC sign (bypass)
-    };
-
-    // Step A: reverse-scan per-coefficient RD-best level (interior), then DC.
-    for i in (1..(eob as usize)).rev() {
-        let rc = scan[i];
-        let l = cf[rc].unsigned_abs();
-        if l == 0 {
-            continue;
-        }
-        let (ctx, bc) = interior_ctx(&levels, rc);
-        // Hoist the four base-token costs (tok 0..=3) out of the k-loop; only the
-        // br/Golomb tail (k >= 3) and distortion vary per candidate. Float-op
-        // order matches `interior_rate` exactly so the choice is unchanged.
-        let bt = &base_tok[ctx];
-        let bt0 = cdf_cost(bt, 0);
-        let bt1 = cdf_cost(bt, 1);
-        let bt2 = cdf_cost(bt, 2);
-        let bt3 = cdf_cost(bt, 3);
-        let rate_k = |k: u32| -> f64 {
-            match k {
-                0 => bt0,
-                1 => bt1 + 1.0,
-                2 => bt2 + 1.0,
-                _ => (bt3 + hi_cost(k, bc)) + 1.0,
-            }
-        };
-        let mut best_k = l;
-        let mut best_c = dist(rc, l as i32) + lambda * rate_k(l);
-        for k in (0..l).rev() {
-            let dk = dist(rc, k as i32);
-            // dist grows monotonically as k falls below l (l <= |tf|), and the
-            // rate is non-negative, so once dist alone reaches best_c no smaller
-            // level can win. Exact, just stops the scan early.
-            if dk >= best_c {
-                break;
-            }
-            let c = dk + lambda * rate_k(k);
-            if c < best_c {
-                best_c = c;
-                best_k = k;
-            }
-        }
-        if best_k != l {
-            cf[rc] = if cf[rc] < 0 {
-                -(best_k as i32)
-            } else {
-                best_k as i32
-            };
-            set_level(&mut levels, rc, best_k);
-        }
-    }
-    {
-        let rc = scan[0];
-        let l = cf[rc].unsigned_abs();
-        if l != 0 {
-            let bc = dc_brc(&levels);
-            let sgn = (cf[rc] < 0) as usize;
-            let dc_rate = |k: u32| -> f64 {
-                if k == 0 {
-                    return cdf_cost(&base_tok[0], 0);
-                }
-                let tok = k.min(3);
-                let mut b = cdf_cost(&base_tok[0], tok as usize);
-                if tok == 3 {
-                    b += hi_cost(k, bc);
-                }
-                b + cdf_cost(&dc_sign[dcs_ctx], sgn)
-            };
-            let mut best_k = l;
-            let mut best_c = dist(rc, l as i32) + lambda * dc_rate(l);
-            for k in (0..l).rev() {
-                let dk = dist(rc, k as i32);
-                if dk >= best_c {
-                    break;
-                }
-                let c = dk + lambda * dc_rate(k);
-                if c < best_c {
-                    best_c = c;
-                    best_k = k;
-                }
-            }
-            if best_k != l {
-                cf[rc] = if cf[rc] < 0 {
-                    -(best_k as i32)
-                } else {
-                    best_k as i32
-                };
-                set_level(&mut levels, rc, best_k);
-            }
-        }
-    }
-
-    // Step B: EOB-position selection with accurate eob_pt / eob_base costs.
-    let eob_pt_cost = |e: usize| -> f64 {
-        let bin = if e < 2 {
-            e
-        } else {
-            32 - (e as u32).leading_zeros() as usize
-        };
-        let mut c = cdf_cost(eob_bin_cdf, bin);
-        if bin > 1 {
-            let nbits = bin - 2;
-            c += cdf_cost(&eob_hi[bin], (e >> nbits) & 1);
-            c += nbits as f64; // remaining eob offset bits (bypass)
-        }
-        c
-    };
-    let eob_coeff_cost = |e: usize, m: u32| -> f64 {
-        let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
-        let tok = m.min(3);
-        let mut c = cdf_cost(&eob_base[ctx_e], tok as usize - 1);
-        if tok == 3 {
-            let rc = scan[e];
-            let (ex, ey) = (rc >> log2w, rc & (w - 1));
-            let bc = if (ex | ey) > 1 { 14 } else { 7 };
-            c += hi_cost(m, bc);
-        }
-        c + 1.0 // sign
-    };
-
-    // Interior (base_tok) rate of each position at its current level, for the
-    // running prefix; positions are priced as interior even if they will end up
-    // being the EOB (corrected by swapping in eob_coeff_cost at the candidate).
-    // Driven by zipped slice iterators so the sequential index checks drop out;
-    // accumulation order (`acc + lambda*r + d`) matches the indexed form exactly.
-    pre.resize(n + 1, 0.0);
-    irate.resize(n, 0.0);
-    let mut acc = 0.0f64; // pre[1]: empty prefix
-    // Interior positions [1, eob]: priced with neighbour context.
-    for ((&rc, ir), p) in scan[1..eu + 1]
-        .iter()
-        .zip(irate[1..eu + 1].iter_mut())
-        .zip(pre[2..eu + 2].iter_mut())
-    {
-        let (ctx, bc) = interior_ctx(&levels, rc);
-        let r = interior_rate(ctx, bc, cf[rc].unsigned_abs());
-        *ir = r;
-        acc = (acc + lambda * r) + dist(rc, cf[rc]);
-        *p = acc;
-    }
-    // Trailing positions (eob, n): coded as zeros, distortion only.
-    for (&rc, p) in scan[eu + 1..n].iter().zip(pre[eu + 2..n + 1].iter_mut()) {
-        acc += dist(rc, 0);
-        *p = acc;
-    }
-    suf0.resize(n + 1, 0.0);
-    suf0[n] = 0.0; // suffix seed (read as suf0[n]; not written by the loop below)
-    let mut sacc = 0.0f64;
-    for (&rc, s) in scan[1..n].iter().rev().zip(suf0[1..n].iter_mut().rev()) {
-        sacc += dist(rc, 0);
-        *s = sacc;
-    }
-    // DC contribution (rate + distortion), constant across EOB choices ≥ 1.
-    let dc_rc = scan[0];
-    let dc_m = cf[dc_rc].unsigned_abs();
-    let dc_cost = if dc_m == 0 {
-        lambda * cdf_cost(&base_tok[0], 0)
-    } else {
-        let bc = dc_brc(&levels);
-        let tok = dc_m.min(3);
-        let mut b = cdf_cost(&base_tok[0], tok as usize);
-        if tok == 3 {
-            b += hi_cost(dc_m, bc);
-        }
-        b += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
-        lambda * b
-    } + dist(dc_rc, cf[dc_rc]);
-
-    let mut best_e: i32 = -1;
-    let mut best_cost = f64::INFINITY;
-    for e in 1..n {
-        let rc = scan[e];
-        if cf[rc] == 0 {
-            continue; // EOB must land on a nonzero
-        }
-        // pre[e] prices position e as interior; replace with eob_coeff cost.
-        // A nonzero at `e` implies `e <= eob`, so `irate[e]` was filled above
-        // (identical value to interior_rate here, just cached).
-        let interior_e = lambda * irate[e];
-        let c = dc_cost
-            + (pre[e + 1] - interior_e)
-            + lambda * (eob_pt_cost(e) + eob_coeff_cost(e, cf[rc].unsigned_abs()))
-            + suf0[e + 1];
-        if c < best_cost {
-            best_cost = c;
-            best_e = e as i32;
-        }
-    }
-    // EOB at DC (only DC nonzero) and the all-zero (txb_skip) alternative.
-    if dc_m != 0 {
-        let ctx_e = 1usize; // e == 0
-        let tok = dc_m.min(3);
-        let mut c0 = cdf_cost(eob_bin_cdf, 0) + cdf_cost(&eob_base[ctx_e], tok as usize - 1);
-        if tok == 3 {
-            c0 += hi_cost(dc_m, dc_brc(&levels));
-        }
-        c0 += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
-        let total0 = lambda * c0 + dist(dc_rc, cf[dc_rc]) + suf0[1];
-        if total0 < best_cost {
-            best_cost = total0;
-            best_e = 0;
-        }
-    }
-    let skip_cost = suf0[1] + dist(dc_rc, 0) + lambda * 1.0;
-    if best_e < 0 || skip_cost < best_cost {
-        for &rc in scan.iter() {
-            cf[rc] = 0;
-        }
-    } else {
-        for i in (best_e as usize + 1)..n {
-            cf[scan[i]] = 0;
-        }
-    }
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        b.0 = std::mem::take(&mut levels);
-        b.1 = std::mem::take(&mut pre);
-        b.2 = std::mem::take(&mut suf0);
-        b.3 = std::mem::take(&mut irate);
-    });
-}
 /// directional modes (V/H and the diagonals, 1..=8) are intentionally omitted
 /// from this set: they would also require the `angle_delta` symbol on >= 8x8
 /// blocks. These four need no extra symbols beyond `y_mode` itself.
@@ -1560,9 +1067,8 @@ fn intra_predict_nd(
                         out[y * bw + x] = (v + 32) >> 6;
                     } else {
                         let fill = top[max_base_x as usize];
-                        for xx in x..bw {
-                            out[y * bw + xx] = fill;
-                        }
+                        let row = y * bw;
+                        out[row + x..row + bw].fill(fill);
                         break;
                     }
                     bx += 1;
@@ -1752,7 +1258,7 @@ fn mode_signal_bits(m: usize) -> f64 {
 }
 const MODE_SIGNAL_BITS: f64 = 30.0;
 
-fn get_lo_ctx_2d(
+pub(crate) fn get_lo_ctx_2d(
     levels: &[u8],
     x: usize,
     y: usize,
@@ -1821,12 +1327,15 @@ fn encode_tx8_coeffs_adapt(
 ) -> u8 {
     let pl = chroma as usize;
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_8X8.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
     }
@@ -1834,7 +1343,6 @@ fn encode_tx8_coeffs_adapt(
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]); // luma: 1=DCT_DCT, 4=ADST_ADST
     }
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -1952,12 +1460,15 @@ fn encode_tx16_coeffs_adapt(
 ) -> u8 {
     let pl = chroma as usize;
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_16X16.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
     }
@@ -1965,7 +1476,6 @@ fn encode_tx16_coeffs_adapt(
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp16[y_mode]); // luma TX_16X16: 1=DCT_DCT, 2=ADST_ADST
     }
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2082,18 +1592,20 @@ fn encode_tx32_coeffs_adapt(
 ) -> u8 {
     let pl = chroma as usize;
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_32X32.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 1
         return 0x40;
     }
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 0
     // NO txtp symbol for intra TX_32X32 (DCT_DCT implied).
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2206,19 +1718,21 @@ fn encode_4x8_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_4X8.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
     }
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     // chroma infers txtp (no symbol)
 
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2321,19 +1835,21 @@ fn encode_8x16_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_8X16.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
     }
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
     // chroma infers txtp (no symbol)
 
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2430,18 +1946,20 @@ fn encode_4x4_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_4X4.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
         return 0x40;
     }
     enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
 
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2871,17 +2389,19 @@ fn encode_16x32_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
     for (i, &rc) in SCAN_16X32.iter().enumerate() {
-        if cf[rc] != 0 {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
             eob = i;
         }
     }
-    if cf.iter().all(|&c| c == 0) {
+    if cul == 0 {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
         return 0x40;
     }
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
-    let cul: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -3191,8 +2711,8 @@ impl<'a> LossyTile<'a> {
         } else {
             let a = &self.a_coef[plane];
             let l = &self.l_coef[plane];
-            let ca = (0..4).any(|k| a[bx4 + k] != 0x40) as usize;
-            let cl = (0..4).any(|k| l[by4 + k] != 0x40) as usize;
+            let ca = a[bx4..bx4 + 4].iter().any(|&x| x != 0x40) as usize;
+            let cl = l[by4..by4 + 4].iter().any(|&x| x != 0x40) as usize;
             7 + ca + cl
         }
     }
@@ -3201,8 +2721,8 @@ impl<'a> LossyTile<'a> {
     fn dc_sign_ctx_16(&self, plane: usize, bx4: usize, by4: usize) -> usize {
         let a = &self.a_coef[plane];
         let l = &self.l_coef[plane];
-        let suma: i32 = (0..4).map(|k| (a[bx4 + k] >> 6) as i32).sum();
-        let suml: i32 = (0..4).map(|k| (l[by4 + k] >> 6) as i32).sum();
+        let suma: i32 = a[bx4..bx4 + 4].iter().map(|&x| (x >> 6) as i32).sum();
+        let suml: i32 = l[by4..by4 + 4].iter().map(|&x| (x >> 6) as i32).sum();
         let s = suma + suml - 8;
         (s != 0) as usize + (s > 0) as usize
     }
@@ -3936,8 +3456,10 @@ impl<'a> LossyTile<'a> {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
                     let prow = &sv_preds[ci][ry * 8..];
-                    for (j, (dv, &rv)) in drow[..8].iter_mut().zip(rrow.iter()).enumerate() {
-                        *dv = (prow[j] + rv).clamp(0, maxval);
+                    for ((dv, &rv), &prow) in
+                        drow[..8].iter_mut().zip(rrow.iter()).zip(prow[..8].iter())
+                    {
+                        *dv = (prow + rv).clamp(0, maxval);
                     }
                 } else {
                     let dc = dc_preds[ci];
@@ -5024,8 +4546,8 @@ impl<'a> LossyTile<'a> {
                 for ry in 0..32 {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds32[ci][ry * 32..];
-                    for j in 0..32 {
-                        let d = srow[j] - prow[j];
+                    for (&srow, &prow) in srow[..32].iter().zip(prow[..32].iter()) {
+                        let d = srow - prow;
                         sse_sv += (d * d) as i64;
                     }
                 }
@@ -5233,8 +4755,12 @@ impl<'a> LossyTile<'a> {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
                     let prow = &sv_preds[ci][ry * 16..];
-                    for (j, (dv, &rv)) in drow[..16].iter_mut().zip(rrow.iter()).enumerate() {
-                        *dv = (prow[j] + rv).clamp(0, maxval);
+                    for ((dv, &rv), &prow) in drow[..16]
+                        .iter_mut()
+                        .zip(rrow[..16].iter())
+                        .zip(prow[..16].iter())
+                    {
+                        *dv = (prow + rv).clamp(0, maxval);
                     }
                 } else {
                     let dc = dc_preds[ci];

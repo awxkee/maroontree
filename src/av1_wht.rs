@@ -81,9 +81,8 @@ fn wht_scalar(resid: &mut [i32; 16]) {
     resid.copy_from_slice(&t)
 }
 
-// signed level (raster) such that dav1d inverse WHT reproduces resid exactly
-pub fn levels_from_resid(resid: &mut [i32; 16]) {
-    pub(crate) type Wht = dyn Fn(&mut [i32; 16]) + Send + Sync;
+pub(crate) fn levels_from_resid(resid: &mut [i32; 16]) {
+    type Wht = dyn Fn(&mut [i32; 16]) + Send + Sync;
     static WHT: OnceLock<Arc<Wht>> = OnceLock::new();
     let f = WHT.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
