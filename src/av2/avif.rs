@@ -150,7 +150,8 @@ pub struct AlphaItem<'a> {
 /// Wrap an AV2 OBU stream (`Encoded::data` = TD + sequence + frame OBUs) into an
 /// AVIF-style ISOBMFF file. `width`/`height` are the *display* dimensions
 /// (`ispe`); the bitstream may decode to a padded size and be cropped on output.
-pub fn wrap_av2_image(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_av2_image(
     obu: &[u8],
     width: u32,
     height: u32,

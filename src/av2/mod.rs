@@ -56,7 +56,6 @@ use crate::av2::helpers::{
     sb_tu4_contexts,
 };
 use crate::av2::layout::Layout;
-use crate::avif::validate_dims;
 use crate::err::EncodeError;
 use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
 
@@ -77,6 +76,7 @@ const CR_G: i32 = -3430; // round(-0.418688 * 8192)
 const CR_B: i32 = -666; // round(-0.081312 * 8192)
 
 const MAX_DIM: u32 = 65535;
+const MIN_DIM: u32 = 1;
 
 pub fn get_q_ctx(q: u8) -> usize {
     if q <= 90 {
@@ -88,6 +88,13 @@ pub fn get_q_ctx(q: u8) -> usize {
     } else {
         3
     }
+}
+
+fn validate_dims(width: u32, height: u32) -> Result<(), EncodeError> {
+    if width < MIN_DIM || height < MIN_DIM || width > MAX_DIM || height > MAX_DIM {
+        return Err(EncodeError::InvalidDimensions { width, height });
+    }
+    Ok(())
 }
 
 /// Result of an encode: the AV2 bitstream plus the metadata needed to interpret it.
@@ -199,11 +206,12 @@ impl Av2Encoder {
         planar_image.validate_444()?;
         let width = planar_image.width;
         let height = planar_image.height;
+        validate_dims(width as u32, height as u32)?;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
         if self.base_q_idx == 0 {
-            return Ok(self.encode_yuv444_lossless(y, cb, cr, width, height, color, threads));
+            return self.encode_yuv444_lossless(planar_image, color, threads);
         }
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
@@ -312,6 +320,7 @@ impl Av2Encoder {
         let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
+        validate_dims(width as u32, height as u32)?;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
@@ -428,6 +437,7 @@ impl Av2Encoder {
         let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
+        validate_dims(width as u32, height as u32)?;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
@@ -542,6 +552,7 @@ impl Av2Encoder {
         planar_image.validate_400()?;
         let width = planar_image.width;
         let height = planar_image.height;
+        validate_dims(width as u32, height as u32)?;
         let y = &planar_image.planes[0];
         let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
@@ -600,6 +611,7 @@ impl Av2Encoder {
     /// 4x4 transform units (forced TX_4X4), DC-predicted per TU and carried by the 4x4
     /// WHT. `yp` is the SB-padded source plane. The pixel reconstruction is bit-exact;
     /// the 4x4 coefficient CDFs/contexts are still being validated against the decoder.
+    #[allow(clippy::too_many_arguments)]
     fn encode_yuv400_lossless(
         &self,
         yp: &[f32],
@@ -662,7 +674,7 @@ impl Av2Encoder {
                 let rc = (code_mc - col * 16).min(16);
                 // SB grid of in-frame 4x4 TUs (precomputed in Phase A).
                 let tus = &sbtus[row * sb_cols + col];
-                let ops = crate::av2::partition::sb_partition_ops(
+                let ops = partition::sb_partition_ops(
                     row,
                     col,
                     code_mr,
@@ -672,10 +684,10 @@ impl Av2Encoder {
                 );
                 for op in &ops {
                     match *op {
-                        crate::av2::partition::Op::RectType { cdf, val } => {
+                        partition::Op::RectType { cdf, val } => {
                             enc.encode_bool(cdf, val);
                         }
-                        crate::av2::partition::Op::Leaf {
+                        partition::Op::Leaf {
                             mi_row,
                             mi_col,
                             bw_mi,
@@ -721,14 +733,17 @@ impl Av2Encoder {
     /// luma TUs, 256 U TUs, 256 V TUs — matching avm's shared-tree plane order.
     fn encode_yuv444_lossless<T: Pixel>(
         &self,
-        y: &[T],
-        cb: &[T],
-        cr: &[T],
-        width: usize,
-        height: usize,
+        planar_image: &PlanarImage<T>,
         color: &ColorEncoding,
         threads: usize,
-    ) -> Av2Frame {
+    ) -> Result<Av2Frame, EncodeError> {
+        planar_image.validate_444()?;
+        let width = planar_image.width;
+        let height = planar_image.height;
+        validate_dims(width as u32, height as u32)?;
+        let y = &planar_image.planes[0];
+        let cb = &planar_image.planes[1];
+        let cr = &planar_image.planes[2];
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (pw, ph) = (sb_align(width), sb_align(height));
         let yp = pad_plane(&to_plane(y), width, height, pw, ph);
@@ -756,10 +771,11 @@ impl Av2Encoder {
         let nsb = sb_rows * sb_cols;
         // Phase A: per-SB TU generation (DC-pred + WHT + levels). Independent across SBs
         // (lossless reconstruction == source), so this is data-parallel.
+        #[allow(clippy::type_complexity)]
         let mut sbtus: Vec<(Vec<Vec<Coeff>>, Vec<Vec<Coeff>>, Vec<Vec<Coeff>>)> = (0..nsb)
             .map(|_| (Vec::new(), Vec::new(), Vec::new()))
             .collect();
-        let gen_val =
+        let gen_tile =
             |idx: usize, slot: &mut (Vec<Vec<Coeff>>, Vec<Vec<Coeff>>, Vec<Vec<Coeff>>)| {
                 let (sb_y, sb_x) = ((idx / sb_cols) * 64, (idx % sb_cols) * 64);
                 let (rr, rc) = rem(idx / sb_cols, idx % sb_cols);
@@ -772,7 +788,7 @@ impl Av2Encoder {
         let nthreads = Self::resolve_threads(threads);
         if nthreads <= 1 || nsb < 8 {
             for (idx, slot) in sbtus.iter_mut().enumerate() {
-                gen_val(idx, slot);
+                gen_tile(idx, slot);
             }
         } else {
             let chunk = nsb.div_ceil(nthreads);
@@ -807,7 +823,7 @@ impl Av2Encoder {
                 let (sb_y, sb_x) = (row * 64, col * 64);
                 let (rr, rc) = rem(row, col);
                 let (ytus, utus, vtus) = &sbtus[row * sb_cols + col];
-                let ops = crate::av2::partition::sb_partition_ops(
+                let ops = partition::sb_partition_ops(
                     row,
                     col,
                     code_mr,
@@ -817,10 +833,10 @@ impl Av2Encoder {
                 );
                 for op in &ops {
                     match *op {
-                        crate::av2::partition::Op::RectType { cdf, val } => {
+                        partition::Op::RectType { cdf, val } => {
                             enc.encode_bool(cdf, val);
                         }
-                        crate::av2::partition::Op::Leaf {
+                        partition::Op::Leaf {
                             mi_row,
                             mi_col,
                             bw_mi,
@@ -886,7 +902,7 @@ impl Av2Encoder {
                 }
             }
         }
-        self.finish(enc, &config, pw, ph, width, height, color)
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
     /// Encode an RGB image to 4:4:4 AV2. Converts RGB→YCbCr internally.
@@ -1087,6 +1103,7 @@ impl Av2Encoder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
         enc: RangeEncoder,
