@@ -273,7 +273,7 @@ impl Basis {
 
 /// The 16 KB 1D bases are embedded directly in the binary, so the default encode
 /// path needs no external file and cannot fail to locate it.
-const EMBEDDED_BASES: &[u8] = include_bytes!("tree_av2_bases.bin");
+static EMBEDDED_BASES: &[u8] = include_bytes!("tree_av2_bases.bin");
 
 /// Read one 1D-profile block, returning `(dc, side, profile)`. The dense square basis
 /// is built by the caller via [`Basis::from_1d`]; keeping the raw profile lets us also

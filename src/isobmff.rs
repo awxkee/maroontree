@@ -55,7 +55,7 @@
 //!   mdat  ← iloc extent_offset patched after mdat is laid out
 //! ```
 
-use crate::color::ColorMetadata;
+use crate::ColorEncoding;
 use crate::err::EncodeError;
 use crate::metadata::Metadata;
 
@@ -92,16 +92,10 @@ fn patch(buf: &mut [u8], start: usize) {
 
 /// Write a `colr` box: either an enumerated CICP `nclx` payload or an embedded
 /// ICC profile `prof` payload.
-fn write_colr(f: &mut Vec<u8>, color: &ColorMetadata) {
+fn write_colr(f: &mut Vec<u8>, color: &ColorEncoding) {
     let sh = f.len();
     write_box(f, b"colr");
-    match color {
-        ColorMetadata::Cicp(enc) => f.extend_from_slice(&enc.nclx_payload()),
-        ColorMetadata::Icc(icc) => {
-            f.extend_from_slice(b"prof");
-            f.extend_from_slice(icc);
-        }
-    }
+    f.extend_from_slice(&color.nclx_payload());
     patch(f, sh);
 }
 
@@ -184,7 +178,8 @@ pub(crate) fn wrap_av1_image(
     bit_depth: u8,
     channels: u8,
     av1c: &Av1cParams,
-    color_meta: &ColorMetadata,
+    color_meta: &ColorEncoding,
+    icc_profile: Option<&[u8]>,
     metadata: &Metadata,
 ) -> Result<Vec<u8>, EncodeError> {
     let av1c_data = build_av1c(av1c);
@@ -348,11 +343,27 @@ pub(crate) fn wrap_av1_image(
                 f.extend_from_slice(&av1c_data);
                 patch(&mut f, sh);
             }
-            // prop 4: colr (color metadata)
-            write_colr(&mut f, color_meta);
+            // prop 4 (+5): colr. MIAF allows at most one colr per colour_type,
+            // so a CICP `nclx` and an ICC `prof` may coexist. Keep `nclx` (it
+            // carries matrix_coefficients/range, which an ICC profile cannot),
+            // and append `prof` when an extra ICC profile is supplied. Track each
+            // colr's 1-based ipco index for `ipma`.
+            let mut colr_props: Vec<u8> = Vec::new();
+            let mut next_prop: u8 = 4;
+            write_colr(&mut f, color_meta); // nclx for Cicp, prof for Icc
+            colr_props.push(next_prop);
+            next_prop += 1;
+            if let Some(icc) = icc_profile {
+                let sh = f.len();
+                write_box(&mut f, b"colr");
+                f.extend_from_slice(b"prof");
+                f.extend_from_slice(icc);
+                patch(&mut f, sh);
+                colr_props.push(next_prop);
+                next_prop += 1;
+            }
 
-            // Optional transform + HDR properties (5+)
-            let mut next_prop: u8 = 5;
+            // Optional transform + HDR properties (after the colr boxes)
             let mut irot_idx = 0u8;
             let mut imir_idx = 0u8;
             let mut clli_idx = 0u8;
@@ -382,15 +393,16 @@ pub(crate) fn wrap_av1_image(
                 next_prop += 1;
             }
             let _ = next_prop;
-            extra_props = (irot_idx, imir_idx, clli_idx);
+            extra_props = (colr_props, irot_idx, imir_idx, clli_idx);
             patch(&mut f, si);
         }
 
         // ipma — associations for item 1
         {
-            let (irot_idx, imir_idx, clli_idx) = extra_props;
-            // ispe(1), pixi(2), av1C(3, essential), colr(4)  — libavif order
-            let mut assoc: Vec<u8> = vec![1, 2, 0x80 | 3, 4];
+            let (colr_props, irot_idx, imir_idx, clli_idx) = extra_props;
+            // ispe(1), pixi(2), av1C(3, essential), colr(es), then optionals.
+            let mut assoc: Vec<u8> = vec![1, 2, 0x80 | 3];
+            assoc.extend(colr_props.iter().copied()); // colr boxes (non-essential)
             if irot_idx != 0 {
                 assoc.push(0x80 | irot_idx);
             } // essential
@@ -452,7 +464,8 @@ pub(crate) fn wrap_av1_image_with_alpha(
     bit_depth: u8,
     av1c_color: &Av1cParams,
     av1c_alpha: &Av1cParams,
-    color_meta: &ColorMetadata,
+    color_meta: &ColorEncoding,
+    icc_profile: Option<&[u8]>,
     metadata: &Metadata,
 ) -> Result<Vec<u8>, EncodeError> {
     let color_av1c = build_av1c(av1c_color);
@@ -570,6 +583,11 @@ pub(crate) fn wrap_av1_image_with_alpha(
         let mut irot_idx = 0u8;
         let mut imir_idx = 0u8;
         let mut clli_idx = 0u8;
+        // Dynamic property indices (a second colr shifts the alpha props down by 1).
+        let mut colr_props: Vec<u8> = Vec::new();
+        let alpha_av1c_idx;
+        let alpha_pixi_idx;
+        let auxc_idx;
         {
             let si = f.len();
             write_box(&mut f, b"ipco");
@@ -599,17 +617,33 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 f.extend_from_slice(&color_av1c);
                 patch(&mut f, sh);
             }
-            // 4: colr
+            // 4 (+5): colr for the color item — nclx and/or prof (see single-image
+            // path). The alpha item's properties follow, so their indices depend
+            // on how many colr boxes were written.
+            let mut next_colr: u8 = 4;
             write_colr(&mut f, color_meta);
+            colr_props.push(next_colr);
+            next_colr += 1;
+            if let Some(icc) = icc_profile {
+                let sh = f.len();
+                write_box(&mut f, b"colr");
+                f.extend_from_slice(b"prof");
+                f.extend_from_slice(icc);
+                patch(&mut f, sh);
+                colr_props.push(next_colr);
+                next_colr += 1;
+            }
 
-            // 5: av1C (alpha)
+            // av1C (alpha)
+            alpha_av1c_idx = next_colr;
             {
                 let sh = f.len();
                 write_box(&mut f, b"av1C");
                 f.extend_from_slice(&alpha_av1c);
                 patch(&mut f, sh);
             }
-            // 6: pixi (alpha, 1 channel)
+            // pixi (alpha, 1 channel)
+            alpha_pixi_idx = next_colr + 1;
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"pixi", 0, 0);
@@ -617,7 +651,8 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 f.push(bit_depth);
                 patch(&mut f, sh);
             }
-            // 7: auxC (alpha auxiliary type URN)
+            // auxC (alpha auxiliary type URN)
+            auxc_idx = next_colr + 2;
             {
                 let sh = f.len();
                 write_fullbox(&mut f, b"auxC", 0, 0);
@@ -625,8 +660,8 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 patch(&mut f, sh);
             }
 
-            // Optional transform + HDR properties (8+), color item only.
-            let mut next_prop: u8 = 8;
+            // Optional transform + HDR properties (color item only), after auxC.
+            let mut next_prop: u8 = next_colr + 3;
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
                 write_box(&mut f, b"irot");
@@ -660,8 +695,9 @@ pub(crate) fn wrap_av1_image_with_alpha(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 2); // entry_count
-            // color item 1: ispe(1), pixi(2), av1C(3,essential), colr(4) + optionals
-            let mut c_assoc: Vec<u8> = vec![1, 2, 0x80 | 3, 4];
+            // color item 1: ispe(1), pixi(2), av1C(3,essential), colr(es) + optionals
+            let mut c_assoc: Vec<u8> = vec![1, 2, 0x80 | 3];
+            c_assoc.extend(colr_props.iter().copied());
             if irot_idx != 0 {
                 c_assoc.push(0x80 | irot_idx);
             }
@@ -674,13 +710,14 @@ pub(crate) fn wrap_av1_image_with_alpha(
             w16(&mut f, 1);
             f.push(c_assoc.len() as u8);
             f.extend_from_slice(&c_assoc);
-            // alpha item 2: ispe(1), av1C(5,essential), pixi(6), auxC(7)
+            // alpha item 2: ispe(1), av1C(essential), pixi, auxC (indices shift
+            // when the color item carries two colr boxes).
             w16(&mut f, 2);
             f.push(4);
             f.push(1); // ispe
-            f.push(0x80 | 5); // av1C alpha essential
-            f.push(6); // pixi
-            f.push(7); // auxC
+            f.push(0x80 | alpha_av1c_idx); // av1C alpha essential
+            f.push(alpha_pixi_idx); // pixi
+            f.push(auxc_idx); // auxC
             patch(&mut f, si);
         }
         patch(&mut f, s);
@@ -721,6 +758,109 @@ mod tests {
         }
     }
 
+    // Count colr boxes and return (count, has_nclx, has_prof, ipma_assoc_count).
+    fn colr_summary(b: &[u8]) -> (usize, bool, bool, u8) {
+        let mut count = 0;
+        let mut nclx = false;
+        let mut prof = false;
+        let mut i = 0;
+        while i + 8 <= b.len() {
+            if &b[i + 4..i + 8] == b"colr" {
+                count += 1;
+                match &b[i + 8..i + 12] {
+                    b"nclx" => nclx = true,
+                    b"prof" => prof = true,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let ipma = b.windows(4).position(|w| w == b"ipma").unwrap();
+        // fullbox(12) + entry_count(4) + item_ID(2) => association_count byte
+        let ac = b[ipma + 8 + 4 + 2]; // fullbox(8..12) + entry_count(4) + item_ID(2)
+        (count, nclx, prof, ac)
+    }
+
+    #[test]
+    fn cicp_plus_icc_writes_both_colr() {
+        let icc = vec![0xAAu8; 64];
+        let b = wrap_av1_image(
+            &[0x00],
+            16,
+            16,
+            8,
+            3,
+            &dummy_av1c(),
+            &crate::color::ColorEncoding::srgb(),
+            Some(&icc),
+            &Metadata::default(),
+        )
+        .unwrap();
+        let (count, nclx, prof, ac) = colr_summary(&b);
+        assert_eq!(count, 2, "expect nclx + prof");
+        assert!(nclx && prof, "both colr types present");
+        assert_eq!(ac, 5, "ipma: ispe,pixi,av1C,nclx,prof");
+        // prof payload must contain the ICC bytes verbatim
+        let p = b.windows(4).rposition(|w| w == b"prof").unwrap();
+        assert_eq!(&b[p + 4..p + 4 + icc.len()], &icc[..], "ICC bytes embedded");
+    }
+
+    #[test]
+    fn cicp_only_single_colr() {
+        let b = wrap_av1_image(
+            &[0x00],
+            16,
+            16,
+            8,
+            3,
+            &dummy_av1c(),
+            &ColorEncoding::srgb(),
+            None,
+            &Metadata::default(),
+        )
+        .unwrap();
+        let (count, nclx, prof, ac) = colr_summary(&b);
+        assert_eq!((count, nclx, prof, ac), (1, true, false, 4));
+    }
+
+    #[test]
+    fn alpha_with_cicp_plus_icc_shifts_indices() {
+        let icc = vec![0x5Au8; 40];
+        let b = wrap_av1_image_with_alpha(
+            &[0x10],
+            &[0x20],
+            16,
+            16,
+            8,
+            &dummy_av1c(),
+            &dummy_av1c(),
+            &crate::color::ColorEncoding::srgb(),
+            Some(&icc),
+            &Metadata::default(),
+        )
+        .unwrap();
+        // two colr boxes on the color item
+        let ncolr = (0..b.len().saturating_sub(8))
+            .filter(|&i| &b[i + 4..i + 8] == b"colr")
+            .count();
+        assert_eq!(ncolr, 2, "color item should have nclx + prof");
+        // ipma second entry (alpha) must reference av1C at index 6 (shifted from 5)
+        let ipma = b.windows(4).position(|w| w == b"ipma").unwrap();
+        // entry1: item_ID(2) assoc_count(1) + assoc bytes; color assoc =
+        // [1,2,0x83,4,5] => count 5. Then entry2 item_ID(2)=2, count(1)=4, assoc...
+        let p = ipma + 8 + 4; // -> first entry item_ID
+        let c_count = b[p + 2] as usize; // color assoc_count
+        assert_eq!(c_count, 5, "color: ispe,pixi,av1C,nclx,prof");
+        let a = p + 3 + c_count; // alpha entry item_ID
+        let a_count = b[a + 2] as usize;
+        let a_assoc = &b[a + 3..a + 3 + a_count];
+        assert_eq!(
+            a_assoc,
+            &[1u8, 0x80 | 6, 7, 8],
+            "alpha: ispe, av1C(6,ess), pixi(7), auxC(8)"
+        );
+    }
+
     #[test]
     fn ftyp_brand_avif() {
         let b = wrap_av1_image(
@@ -730,7 +870,8 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            &ColorMetadata::default(),
+            &ColorEncoding::default(),
+            None,
             &Metadata::default(),
         )
         .unwrap();
@@ -754,7 +895,8 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            &ColorMetadata::default(),
+            &ColorEncoding::default(),
+            None,
             &Metadata::default(),
         )
         .unwrap();
@@ -774,7 +916,8 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            &ColorMetadata::default(),
+            &ColorEncoding::default(),
+            None,
             &Metadata::default(),
         )
         .unwrap();
@@ -795,7 +938,8 @@ mod tests {
             8,
             &dummy_av1c(),
             &dummy_av1c(),
-            &ColorMetadata::default(),
+            &ColorEncoding::default(),
+            None,
             &Metadata::default(),
         )
         .unwrap();
@@ -826,7 +970,8 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            &ColorMetadata::default(),
+            &ColorEncoding::default(),
+            None,
             &Metadata::default(),
         )
         .unwrap();

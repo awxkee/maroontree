@@ -69,10 +69,6 @@ fn bits_for(v: u32) -> u8 {
     b
 }
 
-/// Length in bytes of `frame_header_lossless()` output (used by the decoder to
-/// skip past the header inside an OBU_FRAME).
-pub(crate) const FRAME_HEADER_LEN: usize = 3;
-
 #[allow(unused)]
 pub(crate) fn frame_header_lossless() -> Vec<u8> {
     frame_header_lossless_tiled(1, 1)

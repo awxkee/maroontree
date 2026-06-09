@@ -27,22 +27,20 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// Real AV1 entropy / tile modules
-pub mod av1_coefs;
-pub mod av1_tables;
-pub mod av1_tile;
-pub mod av1_wht;
-pub mod av1real;
+mod av1_coefs;
+mod av1_tables;
+mod av1_tile;
+mod av1_wht;
+mod av1real;
 mod av2;
 mod avif;
-pub mod bitwriter;
-pub mod cdf_tables;
+mod bitwriter;
+mod cdf_tables;
 mod coef_q;
 pub mod coeff;
 mod color;
 mod dct;
-pub mod decoder;
-pub mod encoder;
+mod encoder;
 mod err;
 mod idct;
 mod isobmff;
@@ -54,7 +52,6 @@ mod neon;
 mod obu;
 mod odec;
 mod pixel;
-mod predict;
 mod rangecoder;
 mod transform;
 mod trellis;

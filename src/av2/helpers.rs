@@ -146,8 +146,11 @@ pub(crate) fn get_residual(
 ) -> Vec<f32> {
     let mut r = vec![0f32; bs * bs];
     for yy in 0..bs {
-        for xx in 0..bs {
-            r[yy * bs + xx] = plane[(y0 + yy) * w + x0 + xx] - pred;
+        for (dst, &src) in r[yy * bs..yy * bs + bs]
+            .iter_mut()
+            .zip(plane[(y0 + yy) * w + x0..(y0 + yy) * w + x0 + bs].iter())
+        {
+            *dst = src - pred;
         }
     }
     r
