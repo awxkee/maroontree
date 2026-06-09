@@ -790,7 +790,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            &crate::color::ColorEncoding::srgb(),
+            &ColorEncoding::srgb(),
             Some(&icc),
             &Metadata::default(),
         )
