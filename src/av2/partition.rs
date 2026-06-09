@@ -171,13 +171,10 @@ fn update_pctx(
     b: usize,
 ) {
     let (w, h) = (MI_W[b], MI_H[b]);
-    for c in mi_col..(mi_col + w).min(above_pctx.len()) {
-        above_pctx[c] = PCTX_ABOVE[b];
-    }
+    let max_len = above_pctx.len();
+    above_pctx[mi_col..(mi_col + w).min(max_len)].fill(PCTX_ABOVE[b]);
     let base = mi_row & 15;
-    for r in base..(base + h).min(16) {
-        left_pctx[r] = PCTX_LEFT[b];
-    }
+    left_pctx[base..(base + h).min(16)].fill(PCTX_LEFT[b]);
 }
 
 /// A partition op in pre-order. `RectType` is a signalled rect_type bool; `Leaf`
@@ -197,7 +194,7 @@ pub(crate) enum Op {
     },
 }
 
-/// Recursively walk one block, appending ops and updating the partition context.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     mi_row: usize,
     mi_col: usize,
@@ -353,6 +350,7 @@ fn decide_signaled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recurse(
     part: u8,
     mi_row: usize,

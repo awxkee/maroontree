@@ -26,12 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::BitDepth;
 use crate::avif::{checked_buffer_size, validate_dims};
 use crate::color::ColorEncoding;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
+use crate::{BitDepth, ChromaFormat};
 
 /// A planar image. `planes[0..3]` are full-resolution (4:4:4).
 /// For identity RGB we store G, B, R in planes 0, 1, 2 (AV1 GBR ordering).
@@ -88,6 +88,24 @@ impl<T: Pixel> PlanarImage<T> {
             self.height.div_ceil(2),
             1,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_with(&self, chroma_format: ChromaFormat) -> Result<(), EncodeError> {
+        match chroma_format {
+            ChromaFormat::Yuv420 => {
+                self.validate_420()?;
+            }
+            ChromaFormat::Yuv422 => {
+                self.validate_422()?;
+            }
+            ChromaFormat::Yuv444 => {
+                self.validate_444()?;
+            }
+            ChromaFormat::Monochrome => {
+                self.validate_400()?;
+            }
+        }
         Ok(())
     }
 }
@@ -409,32 +427,29 @@ pub fn encode_still_lossy_420<T: Pixel>(
 /// toward the thread count, and large planes tile by size, exactly like the
 /// color encoders). For exact alpha, use a small `base_q_idx`.
 pub fn encode_still_mono<T: Pixel>(
-    plane: &[T],
-    width: usize,
-    height: usize,
+    planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
     full_range: bool,
     threads: usize,
-) -> Encoded {
-    assert!(width > 0 && height > 0, "width/height must be non-zero");
+) -> Result<Vec<u8>, EncodeError> {
+    planar_image.validate_400()?;
     assert!(base_q_idx != 0, "monochrome lossless is not yet supported");
-    assert_eq!(plane.len(), width * height, "plane must be width*height");
     let maxv = (1i32 << bit_depth.bits()) - 1;
-    let luma: Vec<i32> = plane.iter().map(|v| v.to_i32().clamp(0, maxv)).collect();
+    let luma: Vec<i32> = planar_image.planes[0]
+        .iter()
+        .map(|v| v.to_i32().clamp(0, maxv))
+        .collect();
     let bytes = crate::av1real::encode_av1_mono_image(
         base_q_idx,
         bit_depth.bits(),
-        width,
-        height,
+        planar_image.width,
+        planar_image.height,
         &luma,
         full_range,
         threads,
     );
-    Encoded {
-        bytes,
-        lossless_verified: false,
-    }
+    Ok(bytes)
 }
 
 /// Encode a 64×64 8-bit 4:4:4 still image to a conformant AV1 OBU stream.
@@ -504,20 +519,14 @@ pub fn encode_still_with<T: Pixel>(
 /// Y, Cb, Cr are full-resolution (`width × height`) samples. The AV1 bitstream
 /// carries full-range BT.601 YCbCr signaling (profile 1 for ≤10-bit, 2 for 12-bit).
 pub fn encode_yuv444<T: Pixel>(
-    y: &[T],
-    cb: &[T],
-    cr: &[T],
-    width: usize,
-    height: usize,
+    planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
     color: &ColorEncoding,
     threads: usize,
-) -> Encoded {
+) -> Result<Vec<u8>, EncodeError> {
+    planar_image.validate_444()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
-    assert_eq!(y.len(), width * height, "y plane must be width×height");
-    assert_eq!(cb.len(), width * height, "cb plane must be width×height");
-    assert_eq!(cr.len(), width * height, "cr plane must be width×height");
     let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
@@ -527,18 +536,15 @@ pub fn encode_yuv444<T: Pixel>(
     let bytes = crate::av1real::encode_av1_lossy_image_cs(
         base_q_idx,
         bit_depth.bits(),
-        width,
-        height,
-        &to_i(y),
-        &to_i(cb),
-        &to_i(cr),
+        planar_image.width,
+        planar_image.height,
+        &to_i(&planar_image.planes[0]),
+        &to_i(&planar_image.planes[1]),
+        &to_i(&planar_image.planes[2]),
         color,
         threads,
     );
-    Encoded {
-        bytes,
-        lossless_verified: false,
-    }
+    Ok(bytes)
 }
 
 /// Encode a pre-subsampled 4:2:2 YCbCr still.
@@ -546,16 +552,13 @@ pub fn encode_yuv444<T: Pixel>(
 /// `cb` and `cr` must each be `ceil(width/2) × height` samples. The AV1 bitstream
 /// uses AV1 profile 2 (4:2:2 / 12-bit profile).
 pub fn encode_yuv422<T: Pixel>(
-    y: &[T],
-    cb: &[T],
-    cr: &[T],
-    width: usize,
-    height: usize,
+    planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: &crate::color::ColorEncoding,
+    color: &ColorEncoding,
     threads: usize,
-) -> Encoded {
+) -> Result<Vec<u8>, EncodeError> {
+    planar_image.validate_422()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
     let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
@@ -566,18 +569,15 @@ pub fn encode_yuv422<T: Pixel>(
     let bytes = crate::av1real::encode_av1_lossy_image_422(
         base_q_idx,
         bit_depth.bits(),
-        width,
-        height,
-        &to_i(y),
-        &to_i(cb),
-        &to_i(cr),
+        planar_image.width,
+        planar_image.height,
+        &to_i(&planar_image.planes[0]),
+        &to_i(&planar_image.planes[1]),
+        &to_i(&planar_image.planes[2]),
         color,
         threads,
     );
-    Encoded {
-        bytes,
-        lossless_verified: false,
-    }
+    Ok(bytes)
 }
 
 /// Encode a pre-subsampled 4:2:0 YCbCr still.
@@ -585,16 +585,13 @@ pub fn encode_yuv422<T: Pixel>(
 /// `cb` and `cr` must each be `ceil(width/2) × ceil(height/2)` samples. The AV1
 /// bitstream uses AV1 profile 0 (4:2:0 main profile).
 pub fn encode_yuv420<T: Pixel>(
-    y: &[T],
-    cb: &[T],
-    cr: &[T],
-    width: usize,
-    height: usize,
+    planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
     color: &ColorEncoding,
     threads: usize,
-) -> Encoded {
+) -> Result<Vec<u8>, EncodeError> {
+    planar_image.validate_420()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
     let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
@@ -605,18 +602,15 @@ pub fn encode_yuv420<T: Pixel>(
     let bytes = crate::av1real::encode_av1_lossy_image_420(
         base_q_idx,
         bit_depth.bits(),
-        width,
-        height,
-        &to_i(y),
-        &to_i(cb),
-        &to_i(cr),
+        planar_image.width,
+        planar_image.height,
+        &to_i(&planar_image.planes[0]),
+        &to_i(&planar_image.planes[1]),
+        &to_i(&planar_image.planes[2]),
         color,
         threads,
     );
-    Encoded {
-        bytes,
-        lossless_verified: false,
-    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
