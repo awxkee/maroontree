@@ -231,7 +231,7 @@ pub fn encode_still_lossy<T: Pixel>(
         *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
         *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
     }
-    let bytes = crate::av1real::encode_av1_lossy_image_cs(
+    crate::av1real::encode_av1_lossy_image_cs(
         base_q_idx,
         bd.bits(),
         img.width,
@@ -241,8 +241,7 @@ pub fn encode_still_lossy<T: Pixel>(
         &cr,
         color,
         threads,
-    );
-    bytes
+    )
 }
 
 /// Encode a **lossy 4:2:2** still (profile 2). Like [`encode_still_lossy`] but
@@ -310,7 +309,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
             cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
         }
     }
-    let bytes = crate::av1real::encode_av1_lossy_image_422(
+    crate::av1real::encode_av1_lossy_image_422(
         base_q_idx,
         bd.bits(),
         w,
@@ -320,8 +319,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
         &cr,
         color,
         threads,
-    );
-    bytes
+    )
 }
 
 /// Encode a **lossy 4:2:0** still (profile 0). Like [`encode_still_lossy`] but
@@ -387,7 +385,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
             cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
         }
     }
-    let bytes = crate::av1real::encode_av1_lossy_image_420(
+    crate::av1real::encode_av1_lossy_image_420(
         base_q_idx,
         bd.bits(),
         w,
@@ -397,8 +395,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
         &cr,
         color,
         threads,
-    );
-    bytes
+    )
 }
 
 /// Encode a single grayscale plane as a **monochrome** AV1 still

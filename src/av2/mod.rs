@@ -33,6 +33,7 @@ mod coder;
 mod entropy;
 mod headers;
 mod helpers;
+mod itx422;
 mod layout;
 mod lossless;
 mod partition;
@@ -437,7 +438,6 @@ impl Av2Encoder {
         let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
-        validate_dims(width as u32, height as u32)?;
         let y = &planar_image.planes[0];
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
@@ -504,7 +504,12 @@ impl Av2Encoder {
                     cx,
                     32,
                     64,
-                    &bases.chroma422.reconstruct(predu, &levu),
+                    &crate::av2::itx422::reconstruct_422(
+                        predu,
+                        &levu,
+                        crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
+                        &crate::av2::tables::SCAN,
+                    ),
                 );
                 let predv = dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral);
                 let levv = bases
@@ -517,7 +522,12 @@ impl Av2Encoder {
                     cx,
                     32,
                     64,
-                    &bases.chroma422.reconstruct(predv, &levv),
+                    &crate::av2::itx422::reconstruct_422(
+                        predv,
+                        &levv,
+                        crate::av2::quant::qstep(self.base_q_idx as u32) as i32,
+                        &crate::av2::tables::SCAN,
+                    ),
                 );
                 let ucoeffs = levels_to_coeffs(&levu);
                 let vcoeffs = levels_to_coeffs(&levv);
@@ -771,12 +781,12 @@ impl Av2Encoder {
         let nsb = sb_rows * sb_cols;
         // Phase A: per-SB TU generation (DC-pred + WHT + levels). Independent across SBs
         // (lossless reconstruction == source), so this is data-parallel.
-        #[allow(clippy::type_complexity)]
-        let mut sbtus: Vec<(Vec<Vec<Coeff>>, Vec<Vec<Coeff>>, Vec<Vec<Coeff>>)> = (0..nsb)
+        type PackedCoeff = Vec<Coeff>;
+        let mut sbtus: Vec<(Vec<PackedCoeff>, Vec<PackedCoeff>, Vec<PackedCoeff>)> = (0..nsb)
             .map(|_| (Vec::new(), Vec::new(), Vec::new()))
             .collect();
         let gen_tile =
-            |idx: usize, slot: &mut (Vec<Vec<Coeff>>, Vec<Vec<Coeff>>, Vec<Vec<Coeff>>)| {
+            |idx: usize, slot: &mut (Vec<PackedCoeff>, Vec<PackedCoeff>, Vec<PackedCoeff>)| {
                 let (sb_y, sb_x) = ((idx / sb_cols) * 64, (idx % sb_cols) * 64);
                 let (rr, rc) = rem(idx / sb_cols, idx % sb_cols);
                 *slot = (

@@ -183,7 +183,9 @@ pub(crate) fn dc_pred_rect(
         0
     };
     let p = if ha && hl {
-        (sa + sl + ((bw + bh) as i64) / 2) / ((bw + bh) as i64)
+        debug_assert_eq!(bw + bh, 96);
+        let sum = sa + sl;
+        ((sum * 341 + 16384) >> 15).clamp(0, 255)
     } else if ha {
         (sa + bw as i64 / 2) / bw as i64
     } else if hl {
@@ -335,7 +337,6 @@ pub(crate) fn lossless_sb_tus(
 /// U: ctx = (above_nz + left_nz) + 6, indexed into the shared txb_skip table.
 /// V: ctx = (above_nz + left_nz) + 3 + (co-located U non-zero ? 6 : 0), indexed into
 /// the separate v_txb_skip table. Entropy context inits to 0; grids store cul.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu4_chroma_skip(
     tus: &[Vec<Coeff>],
     sb_y: usize,
