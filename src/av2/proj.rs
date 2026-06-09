@@ -89,7 +89,7 @@ impl Basis {
 
 impl Bases {
     /// Rescale bases measured at `quant::BASE_Q` to an arbitrary 8-bit base_q_idx.
-    /// Set the reconstruction clamp ceiling from the signalled bit depth (8/10/12).
+    /// Set the reconstruction clamp ceiling from the signaled bit depth (8/10/12).
     pub(crate) fn set_bit_depth(&mut self, bit_depth: u8) {
         let mv = ((1u32 << bit_depth) - 1) as f32;
         self.luma.max_val = mv;
@@ -137,7 +137,7 @@ impl Basis {
     /// grid is 32×32 (avm zeroes the long axis' high frequencies and reuses the 32×32
     /// scan), so scan position k → horizontal frequency `a = SCAN[k] >> 5`, vertical
     /// frequency `c = SCAN[k] & 31`. Only the per-axis spatial profiles are stored; the
-    /// dense outer product is never materialised. `norm2[k]` is computed separably,
+    /// dense outer product is never materialiszd. `norm2[k]` is computed separably,
     /// `Σ(hv[c,py]·hh[a,px]/dc)² = (Σ hv[c]²)(Σ hh[a]²)/dc²`.
     fn from_1d_rect(
         dc: f32,
@@ -197,17 +197,17 @@ impl Basis {
                 t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
             }
         }
-        // vertical pass + quantise. S[c,a] = Σ_py t[a,py]·hv[c,py]; the dense projection
+        // vertical pass + quantize. S[c,a] = Σ_py t[a,py]·hv[c,py]; the dense projection
         // is S/dc, and pr = S/(dc·scale·norm2).
         let mut lev = vec![0f32; self.n_cf];
         let inv = 1.0 / (self.dc * self.scale);
-        for k in 0..self.n_cf {
+        for (k, (dst, &norm2)) in lev.iter_mut().zip(self.norm2.iter()).enumerate() {
             let rc = SCAN[k] as usize;
             let (a, c) = (rc >> 5, rc & 31);
             let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
-            let pr = s * inv / self.norm2[k];
+            let pr = s * inv / norm2;
             if pr.abs() >= thresh {
-                lev[k] = pr.round();
+                *dst = pr.round();
             }
         }
         lev
