@@ -521,7 +521,7 @@ pub fn encode_yuv422<T: Pixel>(
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
-    assert!(base_q_idx != 0, "use encode_still for lossless");
+    assert!(base_q_idx != 0, "4:2:2 doesn't support lossless encoding");
     let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
@@ -615,12 +615,6 @@ mod tests {
         }
     }
 
-    /// Lossless frames must tile like the lossy path: a small frame stays a
-    /// single combined `OBU_FRAME` (type 6), while a frame wider than 4096px is
-    /// forced to multiple tile columns and emitted as `OBU_FRAME_HEADER` (3) +
-    /// `OBU_TILE_GROUP` (4). (The previous single-tile lossless path mis-signalled
-    /// the wide case, so the decoder, deriving a non-zero minimum tile count,
-    /// could not parse it.)
     #[test]
     fn lossless_wide_frame_is_multitile() {
         fn obu_types(buf: &[u8]) -> Vec<u8> {
