@@ -305,9 +305,6 @@ pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// Forward ADST16 (1-D), Q12 matrix: gain-matched transpose of dav1d's integer
-/// inverse ADST16 (`inv_adst16_1d`), calibrated to the DCT16 pair's round-trip
-/// gain so the 16x16 quant multipliers and inverse shifts apply unchanged.
 static ADST16_FWD_Q12: [[i32; 16]; 16] = [
     [
         284, 850, 1408, 1951, 2477, 2978, 3451, 3891, 4294, 4653, 4969, 5236, 5455, 5619, 5731,

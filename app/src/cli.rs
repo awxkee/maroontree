@@ -209,16 +209,12 @@ fn parse_args() -> Args {
     }
 }
 
-// ── Quality mapping ───────────────────────────────────────────────────────────
-
 /// Maps CLI quality 1–100 to AV2 `base_q_idx` 1–254.
 /// quality 100 → q≈3 (near-lossless), quality 60 → q≈100, quality 1 → q=254.
 fn av2_base_q(quality: u8) -> u8 {
     debug_assert!(quality >= 1 && quality <= 100);
     ((100 - quality as u32) * 254 / 99).clamp(1, 254) as u8
 }
-
-// ── Source type helpers ───────────────────────────────────────────────────────
 
 fn is_16bit(ct: image::ColorType) -> bool {
     use image::ColorType::*;
