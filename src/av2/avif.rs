@@ -29,7 +29,7 @@
 
 //! AV2-in-ISOBMFF still-image container ("AVIF-style").
 //!
-//! AVIF (ISO/IEC 23000-22) standardises AV1 in a MIAF/ISOBMFF file: item type
+//! AVIF (ISO/IEC 23000-22) standardizes AV1 in a MIAF/ISOBMFF file: item type
 //! `av01`, codec-config box `av1C`. AV2 has no ratified ISOBMFF binding yet, so
 //! this module mirrors that layout with AV2-specific four-character codes that
 //! are this project's convention:
@@ -49,6 +49,20 @@
 //! of `wrap_av1_image`.
 use crate::ColorEncoding;
 use crate::av2::AvFrame;
+
+/// Colour information for the `colr` box: either enumerated CICP (`nclx`) or an
+/// embedded ICC profile (`prof`). An ICC profile can only live in the container
+/// — the AV2 bitstream carries CICP indices only, no place for a profile blob.
+pub enum Av2Color {
+    /// Enumerated CICP primaries/transfer/matrix + range → `colr` type `nclx`.
+    Cicp(ColorEncoding),
+    /// Raw ICC profile bytes (no extra header) → `colr` type `prof`.
+    Icc(Vec<u8>),
+    /// Both: an `nclx` box (CICP, carries the matrix/range) and a `prof` box
+    /// (ICC, for display). Allowed by MIAF (one colr per colour_type) and what
+    /// libavif/avifenc emit, since ICC alone cannot signal matrix_coefficients.
+    Both { cicp: ColorEncoding, icc: Vec<u8> },
+}
 
 fn w16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_be_bytes());
@@ -90,38 +104,6 @@ pub struct Av2Format {
 }
 
 impl Av2Format {
-    pub fn yuv444(bit_depth: u8) -> Self {
-        Self {
-            bit_depth,
-            monochrome: false,
-            chroma_sub_x: false,
-            chroma_sub_y: false,
-        }
-    }
-    pub fn yuv422(bit_depth: u8) -> Self {
-        Self {
-            bit_depth,
-            monochrome: false,
-            chroma_sub_x: true,
-            chroma_sub_y: false,
-        }
-    }
-    pub fn yuv420(bit_depth: u8) -> Self {
-        Self {
-            bit_depth,
-            monochrome: false,
-            chroma_sub_x: true,
-            chroma_sub_y: true,
-        }
-    }
-    pub fn mono(bit_depth: u8) -> Self {
-        Self {
-            bit_depth,
-            monochrome: true,
-            chroma_sub_x: true,
-            chroma_sub_y: true,
-        }
-    }
     fn channels(&self) -> u8 {
         if self.monochrome { 1 } else { 3 }
     }
@@ -187,11 +169,23 @@ pub fn wrap_av2_image(
     width: u32,
     height: u32,
     fmt: &Av2Format,
-    color: &ColorEncoding,
+    color: &Av2Color,
+    exif: Option<&[u8]>,
 ) -> Vec<u8> {
     let channels = fmt.channels();
     let av2c = build_av2c(fmt, width, height);
-    let mut f = Vec::with_capacity(obu.len() + 512);
+    // EXIF item data is `ExifDataBlock`: a 4-byte exif_tiff_header_offset (0 when
+    // the payload starts at the TIFF header) followed by the raw TIFF/EXIF bytes.
+    let has_exif = exif.is_some();
+    let exif_block: Vec<u8> = exif
+        .map(|e| {
+            let mut p = Vec::with_capacity(e.len() + 4);
+            p.extend_from_slice(&0u32.to_be_bytes()); // exif_tiff_header_offset = 0
+            p.extend_from_slice(e);
+            p
+        })
+        .unwrap_or_default();
+    let mut f = Vec::with_capacity(obu.len() + exif_block.len() + 512);
 
     // ── ftyp ────────────────────────────────────────────────────────────────
     {
@@ -224,30 +218,62 @@ pub fn wrap_av2_image(
         w16(&mut f, 1);
         patch(&mut f, s);
     }
-    // iloc — one item, one extent; offset patched once mdat position is known.
+    // iloc — image item (1), plus an Exif item (2) when present. Offsets patched
+    // once the mdat position is known.
     let iloc_offset_pos;
+    let mut iloc_exif_pos = 0usize;
     {
         let s = write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
-        w16(&mut f, 1); // item_count
+        w16(&mut f, if has_exif { 2 } else { 1 }); // item_count
+        // item 1: the AV2 image
         w16(&mut f, 1); // item_ID
         w16(&mut f, 0); // data_reference_index (0 = this file)
         w16(&mut f, 1); // extent_count
         iloc_offset_pos = f.len();
         w32(&mut f, 0); // extent_offset — patched after mdat is placed
         w32(&mut f, obu.len() as u32); // extent_length
+        if has_exif {
+            // item 2: the Exif metadata
+            w16(&mut f, 2);
+            w16(&mut f, 0);
+            w16(&mut f, 1);
+            iloc_exif_pos = f.len();
+            w32(&mut f, 0); // extent_offset — patched later
+            w32(&mut f, exif_block.len() as u32);
+        }
         patch(&mut f, s);
     }
-    // iinf → infe ('av02')
+    // iinf → infe ('av02', and 'Exif' when present)
     {
         let s = write_fullbox(&mut f, b"iinf", 0, 0);
-        w16(&mut f, 1); // entry_count
-        let si = write_fullbox(&mut f, b"infe", 2, 0);
-        w16(&mut f, 1); // item_ID
-        w16(&mut f, 0); // item_protection_index
-        f.extend_from_slice(b"av02"); // item_type — AV2 image (this project's 4CC)
-        f.push(0); // item_name (empty)
+        w16(&mut f, if has_exif { 2 } else { 1 }); // entry_count
+        {
+            let si = write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, 1); // item_ID
+            w16(&mut f, 0); // item_protection_index
+            f.extend_from_slice(b"av02"); // item_type — AV2 image (this project's 4CC)
+            f.push(0); // item_name (empty)
+            patch(&mut f, si);
+        }
+        if has_exif {
+            let si = write_fullbox(&mut f, b"infe", 2, 0);
+            w16(&mut f, 2); // item_ID
+            w16(&mut f, 0);
+            f.extend_from_slice(b"Exif"); // item_type — Exif metadata
+            f.push(0);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+    // iref — the Exif item (2) describes the primary image (1) via 'cdsc'.
+    if has_exif {
+        let s = write_fullbox(&mut f, b"iref", 0, 0);
+        let si = write_box(&mut f, b"cdsc");
+        w16(&mut f, 2); // from_item_ID = Exif
+        w16(&mut f, 1); // reference_count
+        w16(&mut f, 1); // to_item_ID = image
         patch(&mut f, si);
         patch(&mut f, s);
     }
@@ -277,27 +303,63 @@ pub fn wrap_av2_image(
             f.extend_from_slice(&av2c);
             patch(&mut f, p);
         }
-        // prop 4: colr (nclx CICP)
-        {
-            let p = write_box(&mut f, b"colr");
+        // colr properties. MIAF allows at most one per color_type, so an `nclx`
+        // (CICP: primaries/transfer/matrix/range) and a `prof` (ICC) may coexist.
+        // Keep `nclx` whenever CICP is known: an ICC profile cannot carry
+        // matrix_coefficients, so the YUV→RGB matrix must live in nclx (or the
+        // bitstream). Track each colr's 1-based property index for `ipma`.
+        let mut colr_props: Vec<u8> = Vec::new();
+        let mut next_prop: u8 = 4; // ispe=1, pixi=2, av2C=3 precede these
+        let write_nclx = |f: &mut Vec<u8>, c: &ColorEncoding| {
+            let p = write_box(f, b"colr");
             f.extend_from_slice(b"nclx");
-            w16(&mut f, color.primaries as u16);
-            w16(&mut f, color.transfer as u16);
-            w16(&mut f, color.matrix as u16);
-            f.push(if color.full_range { 0x80 } else { 0x00 });
-            patch(&mut f, p);
+            w16(f, c.primaries as u16);
+            w16(f, c.transfer as u16);
+            w16(f, c.matrix as u16);
+            f.push(if c.full_range { 0x80 } else { 0x00 });
+            patch(f, p);
+        };
+        let write_prof = |f: &mut Vec<u8>, icc: &[u8]| {
+            let p = write_box(f, b"colr");
+            f.extend_from_slice(b"prof");
+            f.extend_from_slice(icc);
+            patch(f, p);
+        };
+        match color {
+            Av2Color::Cicp(c) => {
+                write_nclx(&mut f, c);
+                colr_props.push(next_prop);
+                next_prop += 1;
+            }
+            Av2Color::Icc(icc) => {
+                write_prof(&mut f, icc);
+                colr_props.push(next_prop);
+                next_prop += 1;
+            }
+            Av2Color::Both { cicp, icc } => {
+                write_nclx(&mut f, cicp);
+                colr_props.push(next_prop);
+                next_prop += 1;
+                write_prof(&mut f, icc);
+                colr_props.push(next_prop);
+                next_prop += 1;
+            }
         }
+        let _ = next_prop;
         patch(&mut f, ipco);
-        // ipma — associate item 1 with the four properties (av2C is essential).
+        // ipma — associate item 1 with ispe(1), pixi(2), av2C(3, essential), and
+        // each colr property. (None of the colr boxes are marked essential.)
         {
             let p = write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 1); // entry_count
             w16(&mut f, 1); // item_ID
-            f.push(4); // association_count
-            f.push(1); // ispe (non-essential)
+            f.push(3 + colr_props.len() as u8); // association_count
+            f.push(1); // ispe
             f.push(2); // pixi
-            f.push(0x80 | 3); // av2C (essential bit set)
-            f.push(4); // colr
+            f.push(0x80 | 3); // av2C (essential)
+            for &idx in &colr_props {
+                f.push(idx); // colr (non-essential)
+            }
             patch(&mut f, p);
         }
         patch(&mut f, s);
@@ -308,21 +370,75 @@ pub fn wrap_av2_image(
     let mdat_start = write_box(&mut f, b"mdat");
     let payload_off = f.len();
     f.extend_from_slice(obu);
+    let exif_off = f.len();
+    if has_exif {
+        f.extend_from_slice(&exif_block);
+    }
     patch(&mut f, mdat_start);
 
-    // Backfill the iloc extent offset (absolute file position of the OBU bytes).
+    // Backfill the iloc extent offsets (absolute file positions in the mdat).
     f[iloc_offset_pos..iloc_offset_pos + 4].copy_from_slice(&(payload_off as u32).to_be_bytes());
+    if has_exif {
+        f[iloc_exif_pos..iloc_exif_pos + 4].copy_from_slice(&(exif_off as u32).to_be_bytes());
+    }
 
     f
 }
 
-/// Convenience: wrap an `Encoded` result straight into an AVIF-style file.
-pub fn to_avif(enc: &AvFrame, fmt: &Av2Format) -> Vec<u8> {
+/// Wrap an `Encoded` result into an AVIF-style file with explicit colour info.
+pub fn to_avif_color(
+    enc: &AvFrame,
+    fmt: &Av2Format,
+    color: &Av2Color,
+    exif: Option<&[u8]>,
+) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
         enc.width as u32,
         enc.height as u32,
         fmt,
-        &enc.color,
+        color,
+        exif,
     )
+}
+
+/// Convenience: wrap an `Encoded` result using its CICP colour metadata (`nclx`).
+pub fn to_avif(enc: &AvFrame, fmt: &Av2Format) -> Vec<u8> {
+    to_avif_color(enc, fmt, &Av2Color::Cicp(enc.color.clone()), None)
+}
+
+/// Convenience: wrap an `Encoded` result embedding an ICC profile (`prof`).
+pub fn to_avif_icc(enc: &AvFrame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
+    to_avif_color(enc, fmt, &Av2Color::Icc(icc), None)
+}
+
+/// Convenience: wrap an `Encoded` result with both CICP (`nclx`) and ICC (`prof`).
+pub fn to_avif_cicp_icc(enc: &AvFrame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
+    to_avif_color(
+        enc,
+        fmt,
+        &Av2Color::Both {
+            cicp: enc.color,
+            icc,
+        },
+        None,
+    )
+}
+
+/// Convenience: wrap an `Encoded` result with CICP plus an optional ICC profile
+/// and/or an EXIF metadata item.
+pub fn to_avif_full(
+    enc: &AvFrame,
+    fmt: &Av2Format,
+    icc: Option<Vec<u8>>,
+    exif: Option<&[u8]>,
+) -> Vec<u8> {
+    let color = match icc {
+        Some(icc) => Av2Color::Both {
+            cicp: enc.color,
+            icc,
+        },
+        None => Av2Color::Cicp(enc.color),
+    };
+    to_avif_color(enc, fmt, &color, exif)
 }

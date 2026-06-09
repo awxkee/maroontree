@@ -98,22 +98,6 @@ pub(crate) fn leb128(mut value: u64) -> Vec<u8> {
     out
 }
 
-/// Decode a LEB128 value from the front of `buf`.
-/// Returns `(value, bytes_consumed)`.
-pub(crate) fn read_leb128(buf: &[u8]) -> (u64, usize) {
-    let mut value = 0u64;
-    let mut i = 0;
-    loop {
-        let byte = buf[i];
-        value |= ((byte & 0x7f) as u64) << (7 * i);
-        i += 1;
-        if byte & 0x80 == 0 {
-            break;
-        }
-    }
-    (value, i)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,15 +125,5 @@ mod tests {
         assert_eq!(leb128(127), vec![0x7f]);
         assert_eq!(leb128(128), vec![0x80, 0x01]);
         assert_eq!(leb128(300), vec![0xac, 0x02]);
-    }
-
-    #[test]
-    fn leb128_read_roundtrip() {
-        for v in [0u64, 1, 127, 128, 300, 16384, 1_000_000, 1 << 40] {
-            let enc = leb128(v);
-            let (got, used) = read_leb128(&enc);
-            assert_eq!(got, v);
-            assert_eq!(used, enc.len());
-        }
     }
 }

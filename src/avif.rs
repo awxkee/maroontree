@@ -55,7 +55,7 @@
 //! // cb/cr must be ceil(w/2)×ceil(h/2) samples when cfg.chroma == Yuv420
 //! ```
 
-use crate::color::{ColorEncoding, ColorMetadata};
+use crate::color::ColorEncoding;
 use crate::encoder::{encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
@@ -65,8 +65,6 @@ const MIN_DIM: u32 = 1;
 /// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
 /// samples; with both axes capped here the largest possible frame is ~268 MP.
 const MAX_DIM: u32 = 16_383;
-
-// ─── ChromaFormat ─────────────────────────────────────────────────────────────
 
 /// Chroma subsampling format for the AV1 encoder.
 ///
@@ -109,7 +107,8 @@ pub struct EncodeConfig {
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
     /// Colour metadata written to the `colr` box in the container.
-    pub color: ColorMetadata,
+    pub color_encoding: ColorEncoding,
+    pub icc: Option<Vec<u8>>,
     /// Optional image metadata (orientation, HDR content light level, EXIF).
     pub metadata: Metadata,
     /// Worker threads for tile-level parallelism.
@@ -122,7 +121,8 @@ impl Default for EncodeConfig {
         EncodeConfig {
             quality: 80,
             chroma: ChromaFormat::Yuv420,
-            color: ColorMetadata::default(),
+            color_encoding: ColorEncoding::srgb_ycbcr(),
+            icc: None,
             metadata: Metadata::default(),
             threads: 1,
         }
@@ -145,18 +145,13 @@ impl EncodeConfig {
         self
     }
 
-    pub fn with_color(mut self, color: ColorMetadata) -> Self {
-        self.color = color;
+    pub fn with_cicp(mut self, color: ColorEncoding) -> Self {
+        self.color_encoding = color;
         self
     }
 
     pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
-        self.color = ColorMetadata::Icc(icc);
-        self
-    }
-
-    pub fn with_cicp(mut self, enc: ColorEncoding) -> Self {
-        self.color = ColorMetadata::Cicp(enc);
+        self.icc = Some(icc);
         self
     }
 
@@ -317,7 +312,8 @@ fn finalize_color(
         bit_depth,
         channels,
         &av1c,
-        &cfg.color,
+        &cfg.color_encoding,
+        cfg.icc.as_deref(),
         &cfg.metadata,
     )
 }
@@ -348,7 +344,8 @@ fn finalize_with_alpha(
         bit_depth,
         &av1c_color,
         &av1c_alpha,
-        &cfg.color,
+        &cfg.color_encoding,
+        cfg.icc.as_deref(),
         &cfg.metadata,
     )
 }
@@ -394,7 +391,7 @@ pub fn encode_rgb8(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
@@ -428,7 +425,7 @@ pub fn encode_rgba8(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
@@ -465,13 +462,7 @@ pub fn encode_rgba8_with_alpha(
         *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
-    let color_obu = dispatch_lossy(
-        &img,
-        q,
-        cfg.chroma,
-        &cfg.color.color_encoding(),
-        cfg.threads,
-    );
+    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
     let alpha_obu =
         crate::encode_still_mono(&alpha, w, h, BitDepth::Eight, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
@@ -499,7 +490,7 @@ pub fn encode_rgb10(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
@@ -533,7 +524,7 @@ pub fn encode_rgba10(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
@@ -566,13 +557,7 @@ pub fn encode_rgba10_with_alpha(
         *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Ten, &rgb);
-    let color_obu = dispatch_lossy(
-        &img,
-        q,
-        cfg.chroma,
-        &cfg.color.color_encoding(),
-        cfg.threads,
-    );
+    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
     let alpha_obu =
         crate::encode_still_mono(&alpha, w, h, BitDepth::Ten, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
@@ -601,7 +586,7 @@ pub fn encode_rgb12(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
@@ -636,7 +621,7 @@ pub fn encode_rgba12(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
@@ -672,13 +657,7 @@ pub fn encode_rgba12_with_alpha(
         *alpha = px[3];
     }
     let img = crate::PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
-    let color_obu = dispatch_lossy(
-        &img,
-        q,
-        cfg.chroma,
-        &cfg.color.color_encoding(),
-        cfg.threads,
-    );
+    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
     let alpha_obu =
         crate::encode_still_mono(&alpha, w, h, BitDepth::Twelve, q, true, cfg.threads).bytes;
     finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
@@ -798,7 +777,7 @@ pub fn encode_yuv8(
         BitDepth::Eight,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
@@ -828,7 +807,7 @@ pub fn encode_yuv10(
         BitDepth::Ten,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
@@ -858,7 +837,7 @@ pub fn encode_yuv12(
         BitDepth::Twelve,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
@@ -890,7 +869,7 @@ pub fn encode_yuva8_with_alpha(
         BitDepth::Eight,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     let alpha_obu = crate::encode_still_mono(
@@ -930,7 +909,7 @@ pub fn encode_yuva10_with_alpha(
         BitDepth::Ten,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     let alpha_obu = crate::encode_still_mono(
@@ -970,7 +949,7 @@ pub fn encode_yuva12_with_alpha(
         BitDepth::Twelve,
         q,
         cfg.chroma,
-        &cfg.color.color_encoding(),
+        &cfg.color_encoding,
         cfg.threads,
     );
     let alpha_obu = crate::encode_still_mono(

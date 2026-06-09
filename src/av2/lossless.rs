@@ -27,7 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub static SCAN_4X4: [u8; 16] = [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15];
+pub(crate) static SCAN_4X4: [u8; 16] = [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15];
 
 /// Convert a 4×4 transform unit's 16 raster-order levels into the entropy coder's
 /// `(scan_position, level)` list (nonzero only), walked in `SCAN_4X4` order.
