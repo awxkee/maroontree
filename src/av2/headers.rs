@@ -152,8 +152,8 @@ pub(crate) fn frame_header(config: &Config, width: u32, height: u32) -> Vec<u8> 
     b.write_bit(0);
     b.write_bit(1);
 
-    let sb_cols = (width + 63) / 64;
-    let sb_rows = (height + 63) / 64;
+    let sb_cols = width.div_ceil(64);
+    let sb_rows = height.div_ceil(64);
     b.write_bit(1);
     if sb_cols > 1 {
         b.write_bit(0);

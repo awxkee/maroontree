@@ -88,10 +88,10 @@ pub(crate) fn trellis_optimize_ctx(
     if use_br_table {
         for (row, br) in br_cum.iter_mut().zip(br_tok.iter()) {
             let c = [
-                cdf_cost(&br, 0),
-                cdf_cost(&br, 1),
-                cdf_cost(&br, 2),
-                cdf_cost(&br, 3),
+                cdf_cost(br, 0),
+                cdf_cost(br, 1),
+                cdf_cost(br, 2),
+                cdf_cost(br, 3),
             ];
             for (j, slot) in row.iter_mut().enumerate() {
                 let mut coded = 0i32;
@@ -364,8 +364,8 @@ pub(crate) fn trellis_optimize_ctx(
 
     assert!(scan.len() >= n, "scan must be indexed up to n-1");
     assert!(irate.len() >= n, "irate must be indexed up to n");
-    assert!(pre.len() >= n + 1, "pre must be indexed up to n+1");
-    assert!(suf0.len() >= n + 1, "suf0 must be indexed up to n+1");
+    assert!(pre.len() > n, "pre must be indexed up to n+1");
+    assert!(suf0.len() > n, "suf0 must be indexed up to n+1");
 
     for e in 1..n {
         let rc = scan[e];
@@ -483,12 +483,12 @@ pub(crate) fn trellis_optimize(
 
     suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
     suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
-    assert!(suf0.len() >= n + 1, "suf0 must be indexed up to n");
+    assert!(suf0.len() > n, "suf0 must be indexed up to n");
     for (i, &s) in (0..n).rev().zip(scan[..n].iter().rev()) {
         suf0[i] = suf0[i + 1] + d(s, 0);
     }
     pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
-    assert!(pre.len() >= n + 1, "pre must be indexed up to n");
+    assert!(pre.len() > n, "pre must be indexed up to n");
 
     pre[0] = 0.0; // empty-prefix seed
     for (i, &rc) in scan[..n].iter().enumerate() {

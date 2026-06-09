@@ -108,7 +108,7 @@ pub(crate) fn pad_plane(src: &[f32], w: usize, h: usize, pw: usize, ph: usize) -
 }
 /// SB-aligned (multiple of 64) size for a given dimension.
 pub(crate) fn sb_align(n: usize) -> usize {
-    (n + 63) / 64 * 64
+    n.div_ceil(64) * 64
 }
 
 /// DC prediction for a `bw`-wide × `bh`-tall block (4:2:2 chroma is 32×64).
