@@ -965,12 +965,6 @@ impl Av2Encoder {
         let exact = safe_w && safe_h && !config.lossless; // lossless can't code boundary SBs -> pad
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
-        if !exact {
-            eprintln!(
-                "note: {width}x{height} has a <=32px edge superblock (mi {mi_cols}x{mi_rows}); \
-                 exact-size signalling needs forced-partition handling, signalling padded {pw}x{ph}"
-            );
-        }
         let mut frame = frame_header(config, sw as u32, sh as u32);
         frame.extend(&tile);
         let mut data = vec![];
