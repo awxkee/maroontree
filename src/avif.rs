@@ -604,7 +604,7 @@ pub fn encode_rgba12(
         .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(
+    let img = PlanarImage::from_interleaved_rgb(
         width as usize,
         height as usize,
         BitDepth::Twelve,
