@@ -26,48 +26,16 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-/*
- * Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without modification,
- * are permitted provided that the following conditions are met:
- *
- * 1.  Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2.  Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3.  Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
 use crate::dct::{
     SQRT2, WC4_0, WC4_1, WC8_0, WC8_1, WC8_2, WC8_3, WC16_0, WC16_1, WC16_2, WC16_3, WC16_4,
     WC16_5, WC16_6, WC16_7, WC32,
 };
 use std::arch::aarch64::*;
 
-// ── Vector type: two int32x4_t lanes = 8 × i32 ───────────────────────────────
-
 #[derive(Clone, Copy)]
 struct I32x8 {
-    lo: int32x4_t, // lanes 0-3
-    hi: int32x4_t, // lanes 4-7
+    lo: int32x4_t,
+    hi: int32x4_t,
 }
 
 impl I32x8 {
@@ -135,8 +103,6 @@ impl I32x8 {
     }
 }
 
-// ── 4×4 and 8×8 transpose (identical structure to f32 version) ───────────────
-
 #[inline]
 #[target_feature(enable = "neon")]
 fn transpose_4x4_i32(
@@ -187,8 +153,6 @@ fn transpose_8x8_i32(c: &mut [I32x8; 8]) {
     c[6] = I32x8 { lo: b2, hi: d2 };
     c[7] = I32x8 { lo: b3, hi: d3 };
 }
-
-// ── 1-D DCT kernels ───────────────────────────────────────────────────────────
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -296,8 +260,6 @@ fn dct1d_16_v_i32(c: &mut [I32x8; 16]) {
     c[14] = evens[7];
     c[15] = odds[7];
 }
-
-// ── Load / store helpers ──────────────────────────────────────────────────────
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -450,10 +412,8 @@ fn dct1d_32_v_i32(c: &mut [I32x8; 32]) {
     let mut evens = std::array::from_fn::<I32x8, 16, _>(|i| c[i].add(c[31 - i]));
     let mut odds = std::array::from_fn::<I32x8, 16, _>(|i| c[i].sub(c[31 - i]));
 
-    // ── Even half: recurse with DCT-16 ───────────────────────────────────────
     dct1d_16_v_i32(&mut evens);
 
-    // ── Odd half: scale by WC32, then DCT-16 ─────────────────────────────────
     // Scale lane-by-lane using the scalar WC32 coefficients.
     // Each I32x8 holds the same logical element across 8 independent columns,
     // so the coefficient is scalar (same for all 8 lanes).
@@ -462,7 +422,6 @@ fn dct1d_32_v_i32(c: &mut [I32x8; 32]) {
     }
     dct1d_16_v_i32(&mut odds);
 
-    // ── Post-butterfly odd-half combine chain ─────────────────────────────────
     odds[0] = odds[0].fma_sqrt2(odds[1]);
     odds[1] = odds[1].add(odds[2]);
     odds[2] = odds[2].add(odds[3]);
@@ -479,14 +438,11 @@ fn dct1d_32_v_i32(c: &mut [I32x8; 32]) {
     odds[13] = odds[13].add(odds[14]);
     odds[14] = odds[14].add(odds[15]);
 
-    // ── Interleave even/odd outputs ───────────────────────────────────────────
     for i in 0..16 {
         c[2 * i] = evens[i];
         c[2 * i + 1] = odds[i];
     }
 }
-
-// ── Load helpers for 32-wide rows/columns ────────────────────────────────────
 
 /// Load 32 rows × 8 cols (left or right half) with given column stride.
 #[inline]
@@ -509,7 +465,6 @@ fn load32_i32(ptr: &[i32], stride: usize) -> [I32x8; 32] {
 pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     let mut tmp = [0i32; 1024];
 
-    // ── Pass 1: column-wise DCT-32 (4 groups of 8 columns) ───────────────────
     for group in 0..4usize {
         let col_start = group * 8;
         let mut cols = load32_i32(&input[col_start..], 32);
@@ -523,7 +478,6 @@ pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
         }
     }
 
-    // ── Pass 2: row-wise DCT-32 (4 groups of 8 rows) + 1/4 normalization ──────
     let mut out = [0i32; 1024];
     for group in 0..4usize {
         let row_start = group * 8;
@@ -618,9 +572,7 @@ mod neon_vs_scalar {
 
     use crate::dct::{dct8x8_scalar, dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
     use crate::neon::{dct8x8_neon_i32, dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
-
-    // ── helpers ───────────────────────────────────────────────────────────
-
+    
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
     /// values is required so these tests actually exercise the transform LAYOUT
