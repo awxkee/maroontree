@@ -572,7 +572,7 @@ mod neon_vs_scalar {
 
     use crate::dct::{dct8x8_scalar, dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
     use crate::neon::{dct8x8_neon_i32, dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
-    
+
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
     /// values is required so these tests actually exercise the transform LAYOUT

@@ -250,12 +250,15 @@ pub(crate) fn sb_tu4_contexts(
     sb_x: usize,
     above: &mut [u8],
     left: &mut [u8],
+    rem_rows: usize,
+    rem_cols: usize,
 ) -> (Vec<usize>, Vec<usize>) {
-    let mut skip_ctx = vec![0usize; 256];
-    let mut dc_sign_ctx = vec![0usize; 256];
-    for by in 0..16 {
-        for bx in 0..16 {
-            let i = by * 16 + bx;
+    let n = rem_rows * rem_cols;
+    let mut skip_ctx = vec![0usize; n];
+    let mut dc_sign_ctx = vec![0usize; n];
+    for by in 0..rem_rows {
+        for bx in 0..rem_cols {
+            let i = by * rem_cols + bx;
             let cx = sb_x / 4 + bx;
             let cy = sb_y / 4 + by;
             let a = above[cx];
@@ -307,10 +310,12 @@ pub(crate) fn lossless_sb_tus(
     sb_y: usize,
     sb_x: usize,
     neutral: f32,
+    rem_rows: usize,
+    rem_cols: usize,
 ) -> Vec<Vec<Coeff>> {
-    let mut tus: Vec<Vec<Coeff>> = Vec::with_capacity(256);
-    for by in 0..16 {
-        for bx in 0..16 {
+    let mut tus: Vec<Vec<Coeff>> = Vec::with_capacity(rem_rows * rem_cols);
+    for by in 0..rem_rows {
+        for bx in 0..rem_cols {
             let (y0, x0) = (sb_y + by * 4, sb_x + bx * 4);
             let pred = dc_pred(src, pw, y0, x0, 4, neutral);
             let mut resid = [0i32; 16];
@@ -338,15 +343,17 @@ pub(crate) fn sb_tu4_chroma_skip(
     left: &mut [u8],
     plane_v: bool,
     eob_u_last: bool,
+    rem_rows: usize,
+    rem_cols: usize,
 ) -> Vec<usize> {
     // avm reads all U txbs then all V txbs; xd->eob_u_flag is a single field left at the
     // LAST U txb's value, so every V TU's skip context uses (last U TU nonzero), not the
     // co-located one.
     let v_off = 3 + if eob_u_last { 6 } else { 0 };
-    let mut skip = vec![0usize; 256];
-    for by in 0..16 {
-        for bx in 0..16 {
-            let i = by * 16 + bx;
+    let mut skip = vec![0usize; rem_rows * rem_cols];
+    for by in 0..rem_rows {
+        for bx in 0..rem_cols {
+            let i = by * rem_cols + bx;
             let cx = sb_x / 4 + bx;
             let cy = sb_y / 4 + by;
             let base = ((above[cx] != 0) as usize) + ((left[cy] != 0) as usize);

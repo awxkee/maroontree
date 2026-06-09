@@ -56,7 +56,7 @@ mod rangecoder;
 mod transform;
 mod trellis;
 
-pub use av2::Av2Encoder;
+pub use av2::{Av2Encoder, Av2Frame};
 pub use avif::{
     ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
     encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,

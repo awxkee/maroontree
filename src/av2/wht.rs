@@ -38,8 +38,7 @@ fn inv_bfly(o0: i32, o1: i32, o2: i32, o3: i32) -> (i32, i32, i32, i32) {
 /// Forward 4×4 WHT: residual (row-major, 16 samples) → coded coefficient levels
 /// (row-major). The result is `butterfly²(resid)`; the decoder reconstructs the exact
 /// residual via `iwht4x4(level * WHT_DEQUANT)`.
-pub fn fwht4x4(resid: &[i32; 16]) -> [i32; 16] {
-    // inverse of the decoder's column pass
+pub(crate) fn fwht4x4(resid: &[i32; 16]) -> [i32; 16] {
     let mut tmp = [0i32; 16];
     for i in 0..4 {
         let (a, b, c, d) = inv_bfly(resid[i], resid[4 + i], resid[8 + i], resid[12 + i]);

@@ -1,31 +1,4 @@
-/*
- * Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without modification,
- * are permitted provided that the following conditions are met:
- *
- * 1.  Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2.  Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3.  Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+//! OBU framing and the uncompressed sequence/frame headers.
 
 use crate::av2::entropy::ByteWriter;
 use crate::av2::layout::Layout;
@@ -96,8 +69,10 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     };
     b.write_uvlc(bitdepth_idx);
 
-    let width_bits = 32 - (width - 1).leading_zeros();
-    let height_bits = 32 - (height - 1).leading_zeros();
+    // frame_width_bits_minus_1 stores (dim-1) in (n+1) bits; dim==1 needs 1 bit
+    // for the value 0, so clamp the bit count to at least 1.
+    let width_bits = (32 - (width - 1).leading_zeros()).max(1);
+    let height_bits = (32 - (height - 1).leading_zeros()).max(1);
     b.write_bits(width_bits - 1, 4);
     b.write_bits(height_bits - 1, 4);
     b.write_bits(width - 1, width_bits);

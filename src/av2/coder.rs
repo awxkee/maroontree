@@ -233,8 +233,19 @@ fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
 // ----- luma block ---------------------------------------------------------------
 
 /// Encode the intra mode information that precedes a luma block's coefficients.
-fn encode_intra_modes(enc: &mut RangeEncoder, mode_idx: usize, has_chroma: bool, lossless: bool) {
-    enc.encode_bool(12276, 0); // partition: no split
+fn encode_intra_modes(
+    enc: &mut RangeEncoder,
+    mode_idx: usize,
+    has_chroma: bool,
+    lossless: bool,
+    partition_cdf: Option<u32>,
+) {
+    // do_split bool (=0, PARTITION_NONE) with the leaf's per-bsize/context cdf.
+    // None for non-partition-point leaves (4x4 / narrow ext blocks), which read
+    // no partition bit at all.
+    if let Some(cdf) = partition_cdf {
+        enc.encode_bool(cdf, 0);
+    }
     if lossless {
         // Lossless intra reads use_dpcm_y (dpcm_cdf, AVM_CDF2(16384)) before the luma
         // mode. 0 = no DPCM, then the normal intra-mode path follows.
@@ -509,7 +520,7 @@ pub(crate) fn encode_luma_block_split(
     mode_idx: usize,
     has_chroma: bool,
 ) -> [u32; 4] {
-    encode_intra_modes(enc, mode_idx, has_chroma, false);
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(12276));
     enc.encode_bool(TX_SPLIT_64 as u32, 1); // tx_split = 1
     enc.encode_symbol(&TX_PART_2D_64, 0, 6); // tx_part symbol 0 = SPLIT
     let mut cul = [0u32; 4];
@@ -920,8 +931,9 @@ pub(crate) fn encode_lossless_luma_sb(
     dc_sign_ctxs: &[usize],
     mode_idx: usize,
     has_chroma: bool,
+    partition_cdf: Option<u32>,
 ) {
-    encode_intra_modes(enc, mode_idx, has_chroma, true);
+    encode_intra_modes(enc, mode_idx, has_chroma, true, partition_cdf);
     for (i, tu) in tus.iter().enumerate() {
         encode_luma_tu4(enc, tu, skip_cdfs[i], dc_sign_ctxs[i]);
     }

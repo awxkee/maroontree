@@ -208,7 +208,7 @@ impl Default for ColorMetadata {
 
 /// CICP-style color encoding: the primaries + transfer + matrix the image is
 /// authored in, plus the sample range. Drives both the HEIF `colr` (nclx) box and
-/// the HEVC VUI signalling.
+/// the HEVC VUI signaling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorEncoding {
     pub primaries: Primaries,
