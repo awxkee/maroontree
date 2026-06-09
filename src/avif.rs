@@ -56,7 +56,10 @@
 //! ```
 
 use crate::color::ColorEncoding;
-use crate::encoder::{encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422};
+use crate::encoder::{
+    encode_lossy_gray_obu, encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422,
+    encode_yuv420_obu, encode_yuv422_obu, encode_yuv444_obu,
+};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
 use crate::{BitDepth, PlanarImage, isobmff};
@@ -401,12 +404,8 @@ pub fn encode_rgba8(
         .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(
-        width as usize,
-        height as usize,
-        BitDepth::Eight,
-        &rgb,
-    );
+    let img =
+        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Eight, &rgb);
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -449,7 +448,7 @@ pub fn encode_rgba8_with_alpha(
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
     let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
             height: img.height,
@@ -476,12 +475,8 @@ pub fn encode_rgb10(
     validate_dims(width, height)?;
     cfg.validate()?;
     validate_buf_u16(rgb, width, height, 3)?;
-    let img = crate::PlanarImage::from_interleaved_rgb(
-        width as usize,
-        height as usize,
-        BitDepth::Ten,
-        rgb,
-    );
+    let img =
+        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Ten, rgb);
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -510,12 +505,8 @@ pub fn encode_rgba10(
         .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = crate::PlanarImage::from_interleaved_rgb(
-        width as usize,
-        height as usize,
-        BitDepth::Ten,
-        &rgb,
-    );
+    let img =
+        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Ten, &rgb);
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
@@ -554,7 +545,7 @@ pub fn encode_rgba10_with_alpha(
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Ten, &rgb);
     let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
             height: img.height,
@@ -660,7 +651,7 @@ pub fn encode_rgba12_with_alpha(
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
     let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
             height: img.height,
@@ -689,7 +680,7 @@ pub fn encode_gray8(
     cfg.validate()?;
     validate_buf_u8(gray, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = crate::encode_lossy_gray(
+    let obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: width as usize,
             height: height as usize,
@@ -717,7 +708,7 @@ pub fn encode_gray10(
     cfg.validate()?;
     validate_buf_u16(gray, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = crate::encode_lossy_gray(
+    let obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: width as usize,
             height: height as usize,
@@ -745,7 +736,7 @@ pub fn encode_gray12(
     cfg.validate()?;
     validate_buf_u16(gray, width, height, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = crate::encode_lossy_gray(
+    let obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: width as usize,
             height: height as usize,
@@ -868,7 +859,7 @@ pub fn encode_yuva8_with_alpha(
         &cfg.color_encoding,
         cfg.threads,
     )?;
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: planar_image.width,
             height: planar_image.height,
@@ -910,7 +901,7 @@ pub fn encode_yuva10_with_alpha(
         &cfg.color_encoding,
         cfg.threads,
     )?;
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: planar_image.width,
             height: planar_image.height,
@@ -957,7 +948,7 @@ pub fn encode_yuva12_with_alpha(
         &cfg.color_encoding,
         cfg.threads,
     )?;
-    let alpha_obu = crate::encode_lossy_gray(
+    let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: planar_image.width,
             height: planar_image.height,
@@ -980,7 +971,6 @@ pub fn encode_yuva12_with_alpha(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dispatch_yuv_u8(
     planar_image: &PlanarImage<u8>,
     bd: BitDepth,
@@ -991,15 +981,14 @@ fn dispatch_yuv_u8(
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
-        ChromaFormat::Yuv420 => crate::encode_yuv420(planar_image, bd, q, color, threads),
-        ChromaFormat::Yuv422 => crate::encode_yuv422(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            crate::encode_yuv444(planar_image, bd, q, color, threads)
+            encode_yuv444_obu(planar_image, bd, q, color, threads)
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dispatch_yuv_u16(
     planar_image: &PlanarImage<u16>,
     bd: BitDepth,
@@ -1010,10 +999,10 @@ fn dispatch_yuv_u16(
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
-        ChromaFormat::Yuv420 => crate::encode_yuv420(planar_image, bd, q, color, threads),
-        ChromaFormat::Yuv422 => crate::encode_yuv422(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            crate::encode_yuv444(planar_image, bd, q, color, threads)
+            encode_yuv444_obu(planar_image, bd, q, color, threads)
         }
     }
 }

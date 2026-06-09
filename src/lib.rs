@@ -66,8 +66,5 @@ pub use avif::{
 pub use color::{
     ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
 };
-pub use encoder::{
-    PlanarImage, encode_lossless, encode_lossless_with, encode_lossy_gray, encode_yuv420,
-    encode_yuv422, encode_yuv444,
-};
+pub use encoder::{PlanarImage, encode_lossless, encode_lossless_with};
 pub use pixel::{BitDepth, Pixel};
