@@ -294,8 +294,6 @@ fn encode_av1(
     })
 }
 
-// ── AV2 encode path ───────────────────────────────────────────────────────────
-
 fn encode_av2(
     img: &image::DynamicImage,
     args: &Args,
