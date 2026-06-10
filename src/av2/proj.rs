@@ -28,7 +28,9 @@
  */
 
 use crate::av2::quant::{BASE_Q, qstep};
-use crate::av2::tables::{SCAN, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
+use crate::av2::tables::{
+    SCAN, SCAN4X32, SCAN8X16, SCAN8X32, SCAN16, SCAN16X8, SCAN16X32, SCAN32X8, SCAN32X16,
+};
 
 pub(crate) struct Basis {
     pub(crate) dc: f32,
@@ -95,6 +97,18 @@ pub(crate) struct Bases {
     /// SCAN32X8). TX_8X32/32X8 are entropy class 2 (reuse the LUMA16 token cdfs).
     pub(crate) luma8x32: Basis,
     pub(crate) luma32x8: Basis,
+    /// 4:2:2 chroma basis for a 32×32 luma leaf: chroma is 16 wide × 32 tall (TX_16X32,
+    /// coeff region 16×32, SCAN16X32).
+    pub(crate) c16x32: Basis,
+    /// 4:2:2 chroma for 32×64 luma → 16×64 already covered by luma16x64. These three
+    /// cover the 4:2:2 16-family: 16×64 luma→8×64 (TX_8X64), 64×16 luma→32×16
+    /// (TX_32X16), 16×16 luma→8×16 (TX_8X16) chroma.
+    pub(crate) c8x64: Basis,
+    pub(crate) c32x16: Basis,
+    pub(crate) c8x16: Basis,
+    /// 4:2:2 8-family chroma: 8×32 luma→4×32 (TX_4X32) and 32×8 luma→16×8 (TX_16X8).
+    pub(crate) c4x32: Basis,
+    pub(crate) c16x8: Basis,
 }
 
 impl Basis {
@@ -122,6 +136,12 @@ impl Bases {
         self.luma16x16.max_val = mv;
         self.luma8x32.max_val = mv;
         self.luma32x8.max_val = mv;
+        self.c16x32.max_val = mv;
+        self.c8x64.max_val = mv;
+        self.c32x16.max_val = mv;
+        self.c8x16.max_val = mv;
+        self.c4x32.max_val = mv;
+        self.c16x8.max_val = mv;
     }
     pub(crate) fn rescaled_to_q(mut self, base_q_idx: u32) -> Bases {
         let f = qstep(base_q_idx) as f32 / qstep(BASE_Q) as f32;
@@ -136,6 +156,12 @@ impl Bases {
             self.luma16x16.scale(f);
             self.luma8x32.scale(f);
             self.luma32x8.scale(f);
+            self.c16x32.scale(f);
+            self.c8x64.scale(f);
+            self.c32x16.scale(f);
+            self.c8x16.scale(f);
+            self.c4x32.scale(f);
+            self.c16x8.scale(f);
         }
         self
     }
@@ -506,10 +532,17 @@ fn parse_bases(b: &[u8]) -> Bases {
     let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh16, 16, &SCAN16X32);
     let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh64, 64, &SCAN32X16);
     let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
+    let lh4 = build_dct_profile(4, lh[0]);
     let lh8 = build_dct_profile(8, lh[0]);
     let lh32 = build_dct_profile(32, lh[0]);
     let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
     let luma32x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh32, 32, &SCAN32X8);
+    let c16x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh16, 16, &SCAN16X32);
+    let c8x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh8, 8, &SCAN8X32);
+    let c32x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32, 32, &SCAN32X16);
+    let c8x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh8, 8, &SCAN8X16);
+    let c4x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh4, 4, &SCAN4X32);
+    let c16x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh16, 16, &SCAN16X8);
     Bases {
         luma,
         chroma420,
@@ -521,6 +554,12 @@ fn parse_bases(b: &[u8]) -> Bases {
         luma16x16,
         luma8x32,
         luma32x8,
+        c16x32,
+        c8x64,
+        c32x16,
+        c8x16,
+        c4x32,
+        c16x8,
     }
 }
 

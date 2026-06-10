@@ -641,6 +641,13 @@ pub(crate) static CHROMA_EOB512_QC: [[u16; 7]; 4] = [
 ];
 
 pub(crate) static EOB_HI_BIT_QC: [u16; 4] = [16377, 14442, 13095, 12404];
+pub(crate) static CHROMA_EOB128_QC: [[u16; 7]; 4] = [
+    [22699, 20105, 14332, 8443, 4317, 2209, 1208],
+    [23055, 20622, 15284, 9950, 5396, 2380, 957],
+    [17727, 14489, 8338, 3833, 1223, 329, 96],
+    [9278, 6907, 2763, 672, 67, 48, 44],
+];
+
 pub(crate) static CHROMA_EOB_HI_BIT_QC: [u16; 4] = [16377, 14442, 13095, 12404];
 
 // === TX_16X16 (entropy class 2) coeff/skip/eob cdfs (16X16 corner leaf) ===
