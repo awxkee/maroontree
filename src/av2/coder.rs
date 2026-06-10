@@ -245,6 +245,186 @@ fn encode_eob(enc: &mut RangeEncoder, eob: usize, eob_bin: &[u16], eob_hi_bit: u
     }
 }
 
+// ----- trellis RDOQ (encoder-only; bit-exact by construction) ------------------
+//
+// The decoder reconstructs from whatever levels we ship, so we're free to pick
+// levels by rate-distortion instead of round-to-nearest. `luma_level_bits`
+// mirrors the real token coder (`encode_luma32_token` + base-range), so the rate
+// term is the actual coded cost, contextualised by `luma_coeff_context`. We then
+// (A) RD-optimise each coefficient's magnitude and (B) RD-trim the EOB.
+
+#[inline]
+fn tok_cost(icdf: &[u16], s: usize) -> f64 {
+    let hi = if s == 0 { 32768i32 } else { icdf[s - 1] as i32 };
+    let lo = if s < icdf.len() { icdf[s] as i32 } else { 0 };
+    (32768.0 / (hi - lo).max(1) as f64).log2()
+}
+
+#[inline]
+fn rice_tail_bits(hr: u32) -> f64 {
+    2.0 * ((hr + 1) as f64).log2() + 2.0
+}
+
+fn base_range_bits(level: u32, hi_range_ctx: usize, high_freq: bool, qc: usize) -> f64 {
+    let limit = if high_freq { 3u32 } else { 5u32 };
+    let over = level - limit;
+    let cdf: &[u16] = if high_freq {
+        &BR_TOK_HF_QC[qc][hi_range_ctx]
+    } else {
+        &BR_TOK_QC[qc][hi_range_ctx]
+    };
+    if over <= 2 {
+        tok_cost(cdf, over as usize)
+    } else {
+        tok_cost(cdf, 3) + rice_tail_bits(level - (limit + 3))
+    }
+}
+
+/// Estimated bits to code a luma coefficient of magnitude `level` at the given
+/// context, matching `encode_luma32_token`. ~1-bit sign for nonzero levels.
+fn luma_level_bits(
+    level: u32,
+    is_eob: bool,
+    base_ctx: usize,
+    hi_range_ctx: usize,
+    high_freq: bool,
+    qc: usize,
+) -> f64 {
+    let mut bits = if !high_freq {
+        if is_eob {
+            if level <= 4 {
+                tok_cost(&LUMA32_EOB_TOK_LF_QC[qc][base_ctx], (level - 1) as usize)
+            } else {
+                tok_cost(&LUMA32_EOB_TOK_LF_QC[qc][base_ctx], 4)
+                    + base_range_bits(level, hi_range_ctx, false, qc)
+            }
+        } else if level <= 4 {
+            tok_cost(&LUMA32_BASE_TOK_LF_QC[qc][base_ctx], level as usize)
+        } else {
+            tok_cost(&LUMA32_BASE_TOK_LF_QC[qc][base_ctx], 5)
+                + base_range_bits(level, hi_range_ctx, false, qc)
+        }
+    } else if is_eob {
+        if level <= 2 {
+            tok_cost(&LUMA32_EOB_TOK_HF_QC[qc][base_ctx], (level - 1) as usize)
+        } else {
+            tok_cost(&LUMA32_EOB_TOK_HF_QC[qc][base_ctx], 2)
+                + base_range_bits(level, hi_range_ctx, true, qc)
+        }
+    } else if level <= 2 {
+        tok_cost(&LUMA32_BASE_TOK_HF_QC[qc][base_ctx], level as usize)
+    } else {
+        tok_cost(&LUMA32_BASE_TOK_HF_QC[qc][base_ctx], 3)
+            + base_range_bits(level, hi_range_ctx, true, qc)
+    };
+    if level > 0 {
+        bits += 1.0;
+    }
+    bits
+}
+
+/// RD-optimise the quantised luma coefficients of one TX_32X32 in place.
+/// `prm[k]`=|unquantised projection| at scan pos k, `lev[k]`=round-to-nearest
+/// level. `lambda` is the RD multiplier (level^2 per bit). Returns estimated coded
+/// bits. `lambda <= 0` => no-op (returns round-to-nearest rate).
+pub(crate) fn rdoq_luma(
+    prm: &[f32],
+    lev: &mut [f32],
+    qc: usize,
+    scan: &[u16],
+    area: usize,
+    lambda: f64,
+) -> f64 {
+    let n = lev.len();
+    let mut eob = 0usize;
+    for k in 0..n {
+        if lev[k] != 0.0 {
+            eob = k;
+        }
+    }
+    if lev[eob] == 0.0 {
+        return 0.0;
+    }
+    let (th1, th2) = (area / 8, area / 4);
+    let mut levels = vec![0i32; PLVL_BUF];
+
+    let ctx_at = |levels: &[i32], k: usize, is_eob: bool| -> (usize, usize) {
+        if is_eob {
+            let high_freq = k >= LUMA_HI_TO_LOW;
+            (
+                1 + (k > th1) as usize + (k > th2) as usize,
+                if high_freq { 0 } else { 7 },
+            )
+        } else {
+            let rc = scan[k] as i32;
+            luma_coeff_context(levels, rc, (rc >> 5) + (rc & 31))
+        }
+    };
+    let store = |levels: &mut [i32], k: usize, mag: i32| {
+        let rc = scan[k] as i32;
+        let high_freq = k >= LUMA_HI_TO_LOW;
+        let limit = if high_freq { 3 } else { 5 };
+        levels[plvl(rc) as usize] = if mag < limit {
+            mag
+        } else {
+            limit + (mag - limit).min(3)
+        };
+    };
+
+    // Phase A: per-coefficient magnitude RD (EOB fixed).
+    let mut total_bits = 0.0f64;
+    for k in (0..=eob).rev() {
+        let is_eob = k == eob;
+        let high_freq = k >= LUMA_HI_TO_LOW;
+        let a = prm[k] as f64;
+        let q = lev[k].abs() as u32;
+        let (bc, hc) = ctx_at(&levels, k, is_eob);
+        let lo = if is_eob { 1u32 } else { 0u32 };
+        let hi = q.max(lo);
+        let mut best_l = hi;
+        let mut best_cost = f64::INFINITY;
+        for l in lo..=hi {
+            let d = (a - l as f64) * (a - l as f64);
+            let r = luma_level_bits(l, is_eob, bc, hc, high_freq, qc);
+            let cost = d + lambda * r;
+            if cost < best_cost {
+                best_cost = cost;
+                best_l = l;
+            }
+        }
+        lev[k] = best_l as f32 * lev[k].signum();
+        store(&mut levels, k, best_l as i32);
+        total_bits += luma_level_bits(best_l, is_eob, bc, hc, high_freq, qc);
+    }
+
+    // Phase B: EOB RD-trim.
+    loop {
+        let mut last = None;
+        for k in 0..=eob {
+            if lev[k] != 0.0 {
+                last = Some(k);
+            }
+        }
+        let Some(p) = last else { break };
+        if p == 0 {
+            break;
+        }
+        let high_freq = p >= LUMA_HI_TO_LOW;
+        let (bc, hc) = ctx_at(&levels, p, true);
+        let a = prm[p] as f64;
+        let drop_bits = luma_level_bits(lev[p].abs() as u32, true, bc, hc, high_freq, qc);
+        if lambda * drop_bits > a * a {
+            lev[p] = 0.0;
+            let rc = scan[p] as i32;
+            levels[plvl(rc) as usize] = 0;
+            total_bits -= drop_bits;
+        } else {
+            break;
+        }
+    }
+    total_bits
+}
+
 fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
     coeffs
         .iter()
