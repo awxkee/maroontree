@@ -1,6 +1,6 @@
-# maroontre
+# maroontree
 
-Still images AV1 and AV2 AVIF encoder in Rust.
+Still images AV1 and AV2 AVIFs encoder in Rust.
 
 ## Example
 

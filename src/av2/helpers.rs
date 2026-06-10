@@ -38,6 +38,8 @@ pub(crate) fn sb_tu_contexts(
     above: &mut [u8],
     left: &mut [u8],
     qc: usize,
+    mc: i64,
+    mr: i64,
 ) -> ([u32; 4], [usize; 4]) {
     let pos = [(0usize, 0usize), (0, 32), (32, 0), (32, 32)];
     let mut skip_cdfs = [0u32; 4];
@@ -80,16 +82,221 @@ pub(crate) fn sb_tu_contexts(
             };
             (cul & 0x3F) | dcbits
         };
+        // avm av2_set_entropy_contexts zeroes entropy context for out-of-frame
+        // columns/rows of a partial-edge TU (in-frame → cul_level, rest → 0).
+        // Replicate that here so DC-sign/skip contexts for the next TU match the
+        // decoder. For SB-aligned/padded encodes mc/mr are multiples of 16 so the
+        // clamp is a no-op and behaviour is unchanged.
+        let in_cols = (mc - cx as i64).clamp(0, 8) as usize;
+        let in_rows = (mr - cy as i64).clamp(0, 8) as usize;
         for k in 0..8 {
-            above[cx + k] = res;
-            left[cy + k] = res;
+            above[cx + k] = if k < in_cols { res } else { 0x40 };
+            left[cy + k] = if k < in_rows { res } else { 0x40 };
         }
     }
     (skip_cdfs, dc_sign_ctxs)
 }
 
-/// Edge-replicate a `w`x`h` plane into a `pw`x`ph` buffer. The encoder tiles the
-/// frame with whole 64x64 superblocks, so dimensions that are not multiples of 64
+/// Per-TU skip / DC-sign contexts for a bottom-edge 64x32 luma leaf, coded as two
+/// side-by-side TX_32X32 (left, right). Mirrors `sb_tu_contexts` but only the top
+/// two TU positions; updates the same `above`/`left` coeff-context arrays in order.
+pub(crate) fn sb_tu_contexts_64x32(
+    tus: &[Vec<Coeff>; 2],
+    sb_y: usize,
+    sb_x: usize,
+    above: &mut [u8],
+    left: &mut [u8],
+    qc: usize,
+    mc: i64,
+    mr: i64,
+) -> ([u32; 2], [usize; 2]) {
+    let pos = [(0usize, 0usize), (0, 32)];
+    let mut skip_cdfs = [0u32; 2];
+    let mut dc_sign_ctxs = [0usize; 2];
+    for i in 0..2 {
+        let (ty, tx) = pos[i];
+        let cy = (sb_y + ty) / 4;
+        let cx = (sb_x + tx) / 4;
+        let a = &above[cx..cx + 8];
+        let l = &left[cy..cy + 8];
+        let merge_a = a.iter().fold(0u8, |acc, &b| acc | b);
+        let merge_l = l.iter().fold(0u8, |acc, &b| acc | b);
+        let sctx = (((merge_a & 0x3F).min(4) + (merge_l & 0x3F).min(4)) as usize + 3) >> 1;
+        let dcs: i32 = a.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>()
+            + l.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>();
+        let sgn = dcs - 8 - 8;
+        skip_cdfs[i] = CHROMA_SKIP_TX32_QC[qc][sctx] as u32;
+        dc_sign_ctxs[i] = ((sgn != 0) as usize) + ((sgn > 0) as usize);
+        let nz: Vec<Coeff> = tus[i].iter().cloned().filter(|&(_, l)| l != 0).collect();
+        let res = if nz.is_empty() {
+            0x40u8
+        } else {
+            let cul = (nz
+                .iter()
+                .map(|&(_, l)| l.unsigned_abs())
+                .sum::<u32>()
+                .min(63)) as u8;
+            let dc = nz
+                .iter()
+                .find(|&&(s, _)| s == 0)
+                .map(|&(_, l)| l)
+                .unwrap_or(0);
+            let dcbits = if dc > 0 {
+                0x80
+            } else if dc < 0 {
+                0x00
+            } else {
+                0x40
+            };
+            (cul & 0x3F) | dcbits
+        };
+        let in_cols = (mc - cx as i64).clamp(0, 8) as usize;
+        let in_rows = (mr - cy as i64).clamp(0, 8) as usize;
+        for k in 0..8 {
+            above[cx + k] = if k < in_cols { res } else { 0x40 };
+            left[cy + k] = if k < in_rows { res } else { 0x40 };
+        }
+    }
+    (skip_cdfs, dc_sign_ctxs)
+}
+
+/// Per-TU skip / DC-sign contexts for an arbitrary list of TX_32X32 sub-TUs within
+/// an SB (used by the 32X64 / 32X32 partition leaves). `pos` holds the SB-relative
+/// pixel offsets in coding order; updates `above`/`left` coeff-context arrays with
+/// the same edge-clamp as `sb_tu_contexts`.
+pub(crate) fn sb_tu_contexts_pos(
+    pos: &[(usize, usize)],
+    tus: &[Vec<Coeff>],
+    sb_y: usize,
+    sb_x: usize,
+    above: &mut [u8],
+    left: &mut [u8],
+    qc: usize,
+    mc: i64,
+    mr: i64,
+    block_eq_tx: bool,
+) -> (Vec<u32>, Vec<usize>) {
+    let mut skip_cdfs = vec![0u32; pos.len()];
+    let mut dc_sign_ctxs = vec![0usize; pos.len()];
+    for (i, &(ty, tx)) in pos.iter().enumerate() {
+        let cy = (sb_y + ty) / 4;
+        let cx = (sb_x + tx) / 4;
+        let a = &above[cx..cx + 8];
+        let l = &left[cy..cy + 8];
+        let merge_a = a.iter().fold(0u8, |acc, &b| acc | b);
+        let merge_l = l.iter().fold(0u8, |acc, &b| acc | b);
+        let sctx = (((merge_a & 0x3F).min(4) + (merge_l & 0x3F).min(4)) as usize + 3) >> 1;
+        // avm get_txb_ctx (plane 0): a single full-block transform (block == tx)
+        // forces txb_skip_ctx = 0; the neighbour skip_contexts[top][left] formula
+        // applies only when block != tx (e.g. the 32X64 stacked TUs).
+        let sctx = if block_eq_tx { 0 } else { sctx };
+        let dcs: i32 = a.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>()
+            + l.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>();
+        let sgn = dcs - 8 - 8;
+        skip_cdfs[i] = CHROMA_SKIP_TX32_QC[qc][sctx] as u32;
+        dc_sign_ctxs[i] = ((sgn != 0) as usize) + ((sgn > 0) as usize);
+        let nz: Vec<Coeff> = tus[i].iter().cloned().filter(|&(_, l)| l != 0).collect();
+        let res = if nz.is_empty() {
+            0x40u8
+        } else {
+            let cul = (nz
+                .iter()
+                .map(|&(_, l)| l.unsigned_abs())
+                .sum::<u32>()
+                .min(63)) as u8;
+            let dc = nz
+                .iter()
+                .find(|&&(s, _)| s == 0)
+                .map(|&(_, l)| l)
+                .unwrap_or(0);
+            let dcbits = if dc > 0 {
+                0x80
+            } else if dc < 0 {
+                0x00
+            } else {
+                0x40
+            };
+            (cul & 0x3F) | dcbits
+        };
+        let in_cols = (mc - cx as i64).clamp(0, 8) as usize;
+        let in_rows = (mr - cy as i64).clamp(0, 8) as usize;
+        for k in 0..8 {
+            above[cx + k] = if k < in_cols { res } else { 0x40 };
+            left[cy + k] = if k < in_rows { res } else { 0x40 };
+        }
+    }
+    (skip_cdfs, dc_sign_ctxs)
+}
+
+/// Context for a single rectangular luma TU (16-tap family: TX_16X64 4×16 mi,
+/// TX_64X16 16×4 mi, TX_16X16 4×4 mi). `wu`/`hu` are the tx width/height in mi units
+/// (tx_size_wide_unit/high_unit). Skip ctx is 0 when `block_eq_tx` (block == tx, which
+/// holds for all single-TX 16-family leaves); dc_sign ctx sums neighbour sign bits over
+/// the tx units. Updates `wu` above + `hu` left entries with this TU's cul/DC byte.
+/// Returns `(skip_cdf, dc_sign_ctx)`.
+pub(crate) fn sb_tu_contexts_rect(
+    tu: &[Coeff],
+    sb_y: usize,
+    sb_x: usize,
+    above: &mut [u8],
+    left: &mut [u8],
+    qc: usize,
+    mc: i64,
+    mr: i64,
+    wu: usize,
+    hu: usize,
+    block_eq_tx: bool,
+) -> (u32, usize) {
+    let cy = sb_y / 4;
+    let cx = sb_x / 4;
+    let a = &above[cx..cx + wu];
+    let l = &left[cy..cy + hu];
+    let sctx = if block_eq_tx {
+        0
+    } else {
+        let merge_a = a.iter().fold(0u8, |acc, &b| acc | b);
+        let merge_l = l.iter().fold(0u8, |acc, &b| acc | b);
+        (((merge_a & 0x3F).min(4) + (merge_l & 0x3F).min(4)) as usize + 3) >> 1
+    };
+    let dcs: i32 = a.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>()
+        + l.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>();
+    // Neutral sign byte (0x40) contributes 1 each; subtract the neutral baseline.
+    let sgn = dcs - (wu as i32) - (hu as i32);
+    let skip_cdf = CHROMA_SKIP_TX32_QC[qc][sctx] as u32;
+    let dc_sign_ctx = ((sgn != 0) as usize) + ((sgn > 0) as usize);
+    let nz: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    let res = if nz.is_empty() {
+        0x40u8
+    } else {
+        let cul = (nz
+            .iter()
+            .map(|&(_, l)| l.unsigned_abs())
+            .sum::<u32>()
+            .min(63)) as u8;
+        let dc = nz
+            .iter()
+            .find(|&&(s, _)| s == 0)
+            .map(|&(_, l)| l)
+            .unwrap_or(0);
+        let dcbits = if dc > 0 {
+            0x80
+        } else if dc < 0 {
+            0x00
+        } else {
+            0x40
+        };
+        (cul & 0x3F) | dcbits
+    };
+    let in_cols = (mc - cx as i64).clamp(0, wu as i64) as usize;
+    let in_rows = (mr - cy as i64).clamp(0, hu as i64) as usize;
+    for k in 0..wu {
+        above[cx + k] = if k < in_cols { res } else { 0x40 };
+    }
+    for k in 0..hu {
+        left[cy + k] = if k < in_rows { res } else { 0x40 };
+    }
+    (skip_cdf, dc_sign_ctx)
+}
 /// must be padded up to the SB grid; replicating the last row/column keeps the
 /// boundary residual small. The decoder is told the padded size and the caller
 /// crops the top-left `w`x`h` region back out.
@@ -108,7 +315,7 @@ pub(crate) fn pad_plane(src: &[f32], w: usize, h: usize, pw: usize, ph: usize) -
 }
 /// SB-aligned (multiple of 64) size for a given dimension.
 pub(crate) fn sb_align(n: usize) -> usize {
-    n.div_ceil(64) * 64
+    (n + 63) / 64 * 64
 }
 
 /// DC prediction for a `bw`-wide × `bh`-tall block (4:2:2 chroma is 32×64).
@@ -183,6 +390,12 @@ pub(crate) fn dc_pred_rect(
         0
     };
     let p = if ha && hl {
+        // avm `highbd_dc_predictor_rect`: for the non-power-of-2 count bw+bh=96
+        // (a 1:2 rect block), avm divides by a reciprocal multiply, not plain
+        // integer division. `resolve_divisor_32(96)` → scale=341, shift=15
+        // (div_lut[64]=341, DIV_LUT_PREC_BITS=9). Plain `(sum+48)/96` rounds
+        // differently on some sums, and that ±1 difference accumulates through
+        // the chroma DC-prediction feedback into a visible drift.
         debug_assert_eq!(bw + bh, 96);
         let sum = sa + sl;
         ((sum * 341 + 16384) >> 15).clamp(0, 255)

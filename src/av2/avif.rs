@@ -133,18 +133,18 @@ fn build_av2c(fmt: &Av2Format, width: u32, height: u32) -> [u8; 4] {
     [b0, b1, b2, 0x00]
 }
 
-/// An alpha auxiliary item to mux alongside the colour image. The alpha is a
-/// monochrome AV2 image (encode_yuv400) linked to the colour item via `auxl` and
+/// An alpha auxiliary item to mux alongside the color image. The alpha is a
+/// monochrome AV2 image (encode_yuv400) linked to the color item via `auxl` and
 /// carrying an `auxC` property declaring the standard alpha aux-type URN.
-pub struct AlphaItem<'a> {
-    pub obu: &'a [u8],
-    /// Coded (decoder-output) size signalled in the alpha OBU.
-    pub coded_width: u32,
-    pub coded_height: u32,
-    /// Display size (== colour display size); a `clap` crops the coded alpha to it.
-    pub disp_width: u32,
-    pub disp_height: u32,
-    pub bit_depth: u8,
+pub(crate) struct AlphaItem<'a> {
+    pub(crate) obu: &'a [u8],
+    /// Coded (decoder-output) size signaled in the alpha OBU.
+    pub(crate) coded_width: u32,
+    pub(crate) coded_height: u32,
+    /// Display size (== colour  isplay size); a `clap` crops the coded alpha to it.
+    pub(crate) disp_width: u32,
+    pub(crate) disp_height: u32,
+    pub(crate) bit_depth: u8,
 }
 
 /// Wrap an AV2 OBU stream (`Encoded::data` = TD + sequence + frame OBUs) into an
@@ -515,7 +515,7 @@ pub(crate) fn wrap_av2_image(
 }
 
 /// Wrap an `Encoded` result into an AVIF-style file with explicit colour info.
-pub fn to_avif_color(
+pub(crate) fn to_avif_color(
     enc: &Av2Frame,
     fmt: &Av2Format,
     color: &Av2Color,
@@ -536,7 +536,7 @@ pub fn to_avif_color(
 
 /// Like `to_avif_color` but muxes a monochrome alpha auxiliary item (`alpha`, an
 /// `encode_yuv400` result) linked to the colour image via `auxl` + `auxC`.
-pub fn to_avif_color_alpha(
+pub(crate) fn to_avif_color_alpha(
     enc: &Av2Frame,
     alpha: &Av2Frame,
     fmt: &Av2Format,

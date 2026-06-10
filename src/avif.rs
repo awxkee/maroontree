@@ -604,12 +604,8 @@ pub fn encode_rgba12(
         .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect();
-    let img = PlanarImage::from_interleaved_rgb(
-        width as usize,
-        height as usize,
-        BitDepth::Twelve,
-        &rgb,
-    );
+    let img =
+        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Twelve, &rgb);
     let obu = dispatch_lossy(
         &img,
         quality_to_q(cfg.quality),
