@@ -28,7 +28,7 @@
  */
 
 use crate::av2::quant::{BASE_Q, qstep};
-use crate::av2::tables::SCAN;
+use crate::av2::tables::{SCAN, SCAN16, SCAN16X32, SCAN32X16};
 
 pub(crate) struct Basis {
     pub(crate) dc: f32,
@@ -75,6 +75,20 @@ pub(crate) struct Bases {
     /// rectangular-transform normalisation and is the one value to confirm on avmdec.
     pub(crate) chroma422: Basis,
     pub(crate) chroma444: Basis,
+    /// 4:4:4 chroma for a bottom-edge 64×32 leaf: a 64-wide × 32-tall (TX_64X32)
+    /// transform = the transpose of `chroma422`. avmdec codes its coefficients
+    /// exactly like the 64×64 chroma (32×32 coeff region, scan default_scan_32x32,
+    /// EOB size class 6, txs entropy context TX_64X64); only the basis differs
+    /// (horizontal axis = 64-tap profile, vertical axis = 32-tap profile).
+    pub(crate) chroma444_64x32: Basis,
+    /// 16-tap-family luma bases (residue-4 leaves). `luma16x64` = 16 wide × 64 tall
+    /// (TX_16X64, SCAN16X32 coeff grid); `luma64x16` = 64 wide × 16 tall (TX_64X16,
+    /// SCAN32X16); `luma16x16` = 16×16 (TX_16X16, SCAN16). The 16-tap 1D profile is
+    /// derived analytically (DCT-II) from the luma 32-tap DC gain — adequate for
+    /// bitstream validity; tune empirically against avmdec to remove drift.
+    pub(crate) luma16x64: Basis,
+    pub(crate) luma64x16: Basis,
+    pub(crate) luma16x16: Basis,
 }
 
 impl Basis {
@@ -96,6 +110,10 @@ impl Bases {
         self.chroma420.max_val = mv;
         self.chroma422.max_val = mv;
         self.chroma444.max_val = mv;
+        self.chroma444_64x32.max_val = mv;
+        self.luma16x64.max_val = mv;
+        self.luma64x16.max_val = mv;
+        self.luma16x16.max_val = mv;
     }
     pub(crate) fn rescaled_to_q(mut self, base_q_idx: u32) -> Bases {
         let f = qstep(base_q_idx) as f32 / qstep(BASE_Q) as f32;
@@ -104,6 +122,10 @@ impl Bases {
             self.chroma420.scale(f);
             self.chroma422.scale(f);
             self.chroma444.scale(f);
+            self.chroma444_64x32.scale(f);
+            self.luma16x64.scale(f);
+            self.luma64x16.scale(f);
+            self.luma16x16.scale(f);
         }
         self
     }
@@ -269,6 +291,131 @@ impl Basis {
         }
         out
     }
+
+    /// Build a rectangular basis whose coefficient grid follows `scan` (length =
+    /// number of coded positions), rather than the global 32×32 SCAN. Used by the
+    /// 16-family transforms (TX_16X64 → SCAN16X32, TX_64X16 → SCAN32X16). `norm2`
+    /// is sized to `scan.len()`; otherwise identical to `from_1d_rect`.
+    fn from_1d_rect_scan(
+        dc: f32,
+        h_vert: &[f32],
+        side_v: usize,
+        h_horiz: &[f32],
+        side_h: usize,
+        scan: &[u16],
+    ) -> Basis {
+        let n_pix = side_v * side_h;
+        let nv: Vec<f32> = (0..NF)
+            .map(|c| {
+                h_vert[c * side_v..c * side_v + side_v]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum()
+            })
+            .collect();
+        let nh: Vec<f32> = (0..NF)
+            .map(|a| {
+                h_horiz[a * side_h..a * side_h + side_h]
+                    .iter()
+                    .map(|&x| x * x)
+                    .sum()
+            })
+            .collect();
+        let dc2 = dc * dc;
+        let norm2: Vec<f32> = scan
+            .iter()
+            .map(|&rc| nv[(rc as usize) & 31] * nh[(rc as usize) >> 5] / dc2)
+            .collect();
+        Basis {
+            dc,
+            _n_pix: n_pix,
+            n_cf: scan.len(),
+            norm2,
+            hv: h_vert.to_vec(),
+            side_v,
+            hh: h_horiz.to_vec(),
+            side_h,
+            scale: 1.0,
+            max_val: 255.0,
+        }
+    }
+
+    /// Scan-parameterised projection (see `project`). Iterates `scan` positions
+    /// instead of the global SCAN; `self.norm2` must have been built for the same scan.
+    pub(crate) fn project_scan(&self, resid: &[f32], thresh: f32, scan: &[u16]) -> Vec<f32> {
+        let (sv, sh) = (self.side_v, self.side_h);
+        let mut t = [0f32; NF * 64];
+        for py in 0..sv {
+            let row = &resid[py * sh..py * sh + sh];
+            for a in 0..NF {
+                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
+            }
+        }
+        let mut lev = vec![0f32; scan.len()];
+        let inv = 1.0 / (self.dc * self.scale);
+        for (k, (dst, &norm2)) in lev.iter_mut().zip(self.norm2.iter()).enumerate() {
+            let rc = scan[k] as usize;
+            let (a, c) = (rc >> 5, rc & 31);
+            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
+            let pr = s * inv / norm2;
+            if pr.abs() >= thresh {
+                *dst = pr.round();
+            }
+        }
+        lev
+    }
+
+    /// Scan-parameterised reconstruction (see `reconstruct`).
+    pub(crate) fn reconstruct_scan(&self, pred: f32, lev: &[f32], scan: &[u16]) -> Vec<f32> {
+        let (sv, sh) = (self.side_v, self.side_h);
+        let mut s_grid = [0f32; NF * NF];
+        let mut row_nz = [false; NF];
+        for (k, &l) in lev.iter().enumerate() {
+            if l == 0.0 {
+                continue;
+            }
+            let rc = scan[k] as usize;
+            s_grid[(rc & 31) * NF + (rc >> 5)] = l;
+            row_nz[rc & 31] = true;
+        }
+        let mut w = [0f32; NF * 64];
+        for c in 0..NF {
+            if !row_nz[c] {
+                continue;
+            }
+            let wc = &mut w[c * sh..c * sh + sh];
+            for a in 0..NF {
+                let sca = s_grid[c * NF + a];
+                if sca == 0.0 {
+                    continue;
+                }
+                for (o, &b) in wc.iter_mut().zip(&self.hh[a * sh..a * sh + sh]) {
+                    *o += sca * b;
+                }
+            }
+        }
+        let mut out = vec![pred; sv * sh];
+        let g = self.scale / self.dc;
+        for c in 0..NF {
+            if !row_nz[c] {
+                continue;
+            }
+            let wc = &w[c * sh..c * sh + sh];
+            let hvc = &self.hv[c * sv..c * sv + sv];
+            for py in 0..sv {
+                let coef = hvc[py] * g;
+                let orow = &mut out[py * sh..py * sh + sh];
+                for (o, &b) in orow.iter_mut().zip(wc) {
+                    *o += coef * b;
+                }
+            }
+        }
+        let mv = self.max_val;
+        for v in out.iter_mut() {
+            *v = v.round().clamp(0.0, mv);
+        }
+        out
+    }
 }
 
 /// The 16 KB 1D bases are embedded directly in the binary, so the default encode
@@ -335,12 +482,54 @@ fn parse_bases(b: &[u8]) -> Bases {
     );
     let dc_mix = (c420dc * c444dc).sqrt();
     let chroma422 = Basis::from_1d_rect(dc_mix, &c444h, 64, &c420h, 32);
+    // TX_64X32 (bottom-edge 64×32 leaf) = transpose of 4:2:2: vertical 32-tap,
+    // horizontal 64-tap, same rectangular dc_mix normalisation.
+    let chroma444_64x32 = Basis::from_1d_rect(dc_mix, &c420h, 32, &c444h, 64);
+
+    // --- 16-tap family (residue-4 leaves) ---
+    // Analytical inverse DCT-II profiles scaled to the luma DC sample (lh[0] = ldc),
+    // for BOTH axes, so the rectangular norm2 matches the square luma basis exactly
+    // (norm2 = 1024·ldc² regardless of the axis split). Using the chroma 64-tap here
+    // would inject the chroma quant scale and produce a pathologically dense block.
+    let lh16 = build_dct_profile(16, lh[0]);
+    let lh64 = build_dct_profile(64, lh[0]);
+    let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh16, 16, &SCAN16X32);
+    let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh64, 64, &SCAN32X16);
+    let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
     Bases {
         luma,
         chroma420,
         chroma422,
         chroma444,
+        chroma444_64x32,
+        luma16x64,
+        luma64x16,
+        luma16x16,
     }
+}
+
+/// Analytical N-point inverse DCT-II basis profile laid out `[freq*N + spatial]`
+/// for NF frequency slots (only the first N are non-zero). `dc_sample` sets the
+/// DC-row (freq 0) per-sample amplitude so the profile is scaled consistently with
+/// an existing square basis. Used to bootstrap the 16-tap family for bitstream
+/// validity; the exact avm transform can be substituted later for bit-exactness.
+fn build_dct_profile(n: usize, dc_sample: f32) -> Vec<f32> {
+    use core::f32::consts::PI;
+    // Orthonormal DCT-II: e_a[x] = sqrt(2/n)*w(a)*cos(pi*(2x+1)*a/(2n)), w(0)=1/sqrt2.
+    // DC row value = sqrt(2/n)*(1/sqrt2) = sqrt(1/n); scale so it equals dc_sample.
+    let amp = dc_sample / (1.0 / (n as f32)).sqrt();
+    let mut h = vec![0f32; NF * n];
+    // Only the first NF (=32) frequencies are ever coded (the coeff region caps the
+    // long axis at 32), so build at most NF rows; for n=64 the upper 32 freqs are zero.
+    let nf = n.min(NF);
+    for a in 0..nf {
+        let wa = if a == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
+        let k = amp * (2.0 / n as f32).sqrt() * wa;
+        for x in 0..n {
+            h[a * n + x] = k * (PI * (2 * x + 1) as f32 * a as f32 / (2.0 * n as f32)).cos();
+        }
+    }
+    h
 }
 
 /// Bases compiled into the binary (default).
@@ -348,7 +537,7 @@ pub(crate) fn default_bases() -> Bases {
     parse_bases(EMBEDDED_BASES)
 }
 
-/// Override: load bases from an external `SL1D` file (e.g. a different quantiser).
+/// Override: load bases from an external `SL1D` file (e.g. a different quantizer).
 pub(crate) fn load_bases(path: &str) -> Bases {
     let b = std::fs::read(path).unwrap_or_else(|_| panic!("cannot read bases file {path}"));
     parse_bases(&b)
