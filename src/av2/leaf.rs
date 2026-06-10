@@ -101,6 +101,42 @@ pub(super) fn predict_luma(
 /// the smallest total coefficient magnitude (rate proxy) wins. Mutates `recy`
 /// (leaving the winner's reconstruction) and returns the four TX coefficient
 /// lists plus the chosen `mode_idx` (0=DC, 1=SMOOTH, 4=PAETH).
+/// Trellis-RDOQ strength (level^2 per bit). 0 disables RDOQ and reproduces the
+/// round-to-nearest + EOB-truncation baseline exactly. Overridable via AV2_RDOQ_LAMBDA.
+fn rdoq_lambda() -> f64 {
+    use std::sync::OnceLock;
+    static L: OnceLock<f64> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("AV2_RDOQ_LAMBDA")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.09)
+    })
+}
+
+fn project_luma_rdoq(
+    luma: &Basis,
+    resid: &[f32],
+    scan: &[u16],
+    qc: usize,
+    cost: &mut f64,
+) -> Vec<f32> {
+    let lambda = rdoq_lambda();
+    if lambda > 0.0 {
+        let (mut l, prm) = luma.project_scan_with_prm(resid, scan);
+        *cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+        l
+    } else {
+        let l = luma.project(resid, 0.0);
+        *cost += l
+            .iter()
+            .filter(|&&v| v != 0.0)
+            .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+            .sum::<f64>();
+        l
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_luma_sb(
     recy: &mut [f32],
@@ -114,6 +150,7 @@ pub(super) fn encode_luma_sb(
     qstep: i32,
     scan: &[u16],
     neutral: f32,
+    qc: usize,
 ) -> ([Vec<Coeff>; 4], usize) {
     const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
     let mut best_cost = f64::INFINITY;
@@ -135,16 +172,23 @@ pub(super) fn encode_luma_sb(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = luma.project(&resid, 0.0);
-            // Bit-cost estimate: each nonzero coefficient costs roughly a
-            // significance+sign pair plus a magnitude term ~ log2(|lev|).
-            // This tracks coded size far better than Sum|lev|, which
-            // over-rewards numerous tiny-magnitude coefficients.
-            cost += lev
-                .iter()
-                .filter(|&&v| v != 0.0)
-                .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                .sum::<f64>();
+            let lambda = rdoq_lambda();
+            let lev = if lambda > 0.0 {
+                // Trellis RDOQ: pick coefficient levels by real rate-distortion
+                // (rate = true coded bits), then RD-trim the EOB. The mode cost
+                // becomes the actual estimated bits.
+                let (mut l, prm) = luma.project_with_prm(&resid);
+                cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+                l
+            } else {
+                let l = luma.project(&resid, 0.0);
+                cost += l
+                    .iter()
+                    .filter(|&&v| v != 0.0)
+                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                    .sum::<f64>();
+                l
+            };
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[i] = levels_to_coeffs(&lev);
@@ -241,6 +285,7 @@ pub(super) fn encode_luma_leaf32(
     qstep: i32,
     scan: &[u16],
     neutral: f32,
+    qc: usize,
 ) -> ([Vec<Coeff>; 2], usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
@@ -259,12 +304,7 @@ pub(super) fn encode_luma_leaf32(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = luma.project(&resid, 0.0);
-            cost += lev
-                .iter()
-                .filter(|&&v| v != 0.0)
-                .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                .sum::<f64>();
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[ti] = levels_to_coeffs(&lev);
@@ -361,6 +401,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     qstep: i32,
     scan: &[u16],
     neutral: f32,
+    qc: usize,
 ) -> ([Vec<Coeff>; 2], usize) {
     let tu_i = [(0usize, 0usize), (32usize, 2usize)]; // (ty, raster-i)
     let mut best_cost = f64::INFINITY;
@@ -380,12 +421,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = luma.project(&resid, 0.0);
-            cost += lev
-                .iter()
-                .filter(|&&v| v != 0.0)
-                .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                .sum::<f64>();
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[k] = levels_to_coeffs(&lev);
@@ -424,6 +460,7 @@ pub(super) fn encode_luma_leaf_s32x32(
     qstep: i32,
     scan: &[u16],
     neutral: f32,
+    qc: usize,
 ) -> (Vec<Coeff>, usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
@@ -438,12 +475,8 @@ pub(super) fn encode_luma_leaf_s32x32(
                 resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
             }
         }
-        let lev = luma.project(&resid, 0.0);
-        let mut cost: f64 = lev
-            .iter()
-            .filter(|&&v| v != 0.0)
-            .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-            .sum();
+        let mut cost = 0f64;
+        let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
         if m != 0 {
             cost += 6.0;
         }

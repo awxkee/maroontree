@@ -113,6 +113,7 @@ impl Av2Encoder {
                         qstep_i,
                         &crate::av2::tables::SCAN,
                         neutral,
+                        qc,
                     );
                     let (skip_cdfs, dc_sign_ctxs) =
                         sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
@@ -251,6 +252,7 @@ impl Av2Encoder {
                                 qstep_i,
                                 &crate::av2::tables::SCAN,
                                 neutral,
+                                qc,
                             );
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -306,6 +308,7 @@ impl Av2Encoder {
                                 qstep_i,
                                 &crate::av2::tables::SCAN,
                                 neutral,
+                                qc,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_64x32(
                                 &tus2, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -355,6 +358,7 @@ impl Av2Encoder {
                                 qstep_i,
                                 &crate::av2::tables::SCAN,
                                 neutral,
+                                qc,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -413,6 +417,7 @@ impl Av2Encoder {
                                 qstep_i,
                                 &crate::av2::tables::SCAN,
                                 neutral,
+                                qc,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],

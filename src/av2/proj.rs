@@ -332,6 +332,38 @@ impl Basis {
         lev
     }
 
+    /// Like [`project`] but returns the round-to-nearest levels together with the
+    /// per-coefficient unquantised magnitudes `|pr|` (scan order), and applies no
+    /// EOB truncation — trellis RDOQ ([`crate::av2::coder::rdoq_luma`]) consumes
+    /// these and does its own level + EOB optimisation.
+    pub(crate) fn project_with_prm(&self, resid: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let (sv, sh) = (self.side_v, self.side_h);
+        let mut t = [0f32; NF * 64];
+        for py in 0..sv {
+            let row = &resid[py * sh..py * sh + sh];
+            for a in 0..NF {
+                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
+            }
+        }
+        let mut lev = vec![0f32; self.n_cf];
+        let mut prm = vec![0f32; self.n_cf];
+        let inv = 1.0 / (self.dc * self.scale);
+        for (k, ((dst, pm), &norm2)) in lev
+            .iter_mut()
+            .zip(prm.iter_mut())
+            .zip(self.norm2.iter())
+            .enumerate()
+        {
+            let rc = SCAN[k] as usize;
+            let (a, c) = (rc >> 5, rc & 31);
+            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
+            let pr = s * inv / norm2;
+            *pm = pr.abs();
+            *dst = pr.round();
+        }
+        (lev, prm)
+    }
+
     /// Reconstruct: clip(round(pred + scale·inverse_transform(lev))), `n_pix` samples.
     /// Separable inverse: scatter levels into the 32×32 frequency grid, synthesise
     /// horizontally per frequency row, then vertically into pixels. Empty rows skip.
@@ -468,6 +500,40 @@ impl Basis {
         }
         rdoq_truncate_eob(&mut lev, &prm);
         lev
+    }
+
+    /// Scan-parameterised [`project_with_prm`]: round levels + `|pr|`, no EOB
+    /// truncation, for the partition leaf paths (all TX_32X32-class).
+    pub(crate) fn project_scan_with_prm(
+        &self,
+        resid: &[f32],
+        scan: &[u16],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (sv, sh) = (self.side_v, self.side_h);
+        let mut t = [0f32; NF * 64];
+        for py in 0..sv {
+            let row = &resid[py * sh..py * sh + sh];
+            for a in 0..NF {
+                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
+            }
+        }
+        let mut lev = vec![0f32; scan.len()];
+        let mut prm = vec![0f32; scan.len()];
+        let inv = 1.0 / (self.dc * self.scale);
+        for (k, ((dst, pm), &norm2)) in lev
+            .iter_mut()
+            .zip(prm.iter_mut())
+            .zip(self.norm2.iter())
+            .enumerate()
+        {
+            let rc = scan[k] as usize;
+            let (a, c) = (rc >> 5, rc & 31);
+            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
+            let pr = s * inv / norm2;
+            *pm = pr.abs();
+            *dst = pr.round();
+        }
+        (lev, prm)
     }
 
     /// Scan-parameterised reconstruction (see `reconstruct`).
