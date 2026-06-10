@@ -225,6 +225,11 @@ fn encode_eob(enc: &mut RangeEncoder, eob: usize, eob_bin: &[u16], eob_hi_bit: u
     }
     if bin <= 6 {
         enc.encode_symbol(eob_bin, bin, 7);
+    } else if esc_bits == 0 {
+        // No-escape eob classes (eob_multi64 / eob_multi128): the top eob_pt symbol is
+        // coded directly (decode_eob cases 2/3) with no escape literal. Use the esc
+        // helper purely to extend the stored cdf so symbol 7 has a valid upper boundary.
+        enc.encode_symbol_esc(eob_bin, bin, 7);
     } else {
         enc.encode_symbol_esc(eob_bin, 7, 7);
         enc.encode_bypass((bin - 7) as u32, esc_bits);
@@ -415,7 +420,19 @@ pub(crate) fn encode_chroma_block_rect(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, eob_bin, eob_hi, if area == 256 { 1 } else { 2 });
+    encode_eob(
+        enc,
+        eob,
+        eob_bin,
+        eob_hi,
+        if area <= 128 {
+            0
+        } else if area == 256 {
+            1
+        } else {
+            2
+        },
+    );
     let plane_offset = if is_u_plane { 0 } else { 4 };
     let stored = encode_chroma_tokens_scan(enc, &nonzero, eob, plane_offset, scan, area);
     encode_chroma_signs(enc, &nonzero, &stored);
@@ -615,7 +632,19 @@ pub(crate) fn encode_luma_tu_rect(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, eob_bin, eob_hi, if area == 256 { 1 } else { 2 });
+    encode_eob(
+        enc,
+        eob,
+        eob_bin,
+        eob_hi,
+        if area <= 128 {
+            0
+        } else if area == 256 {
+            1
+        } else {
+            2
+        },
+    );
     // TX_16X64/TX_64X16 are intra EXT_TX_SET_LONG_SIDE_64 (7 types), so the decoder
     // reads a 4-symbol short_side tx_type when eob count > 1 (i.e. not DC-only). The
     // long side is implicitly DCT (tx_size_sqr_up = TX_64X64 ≠ TX_32X32, no flag), and

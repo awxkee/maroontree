@@ -389,24 +389,50 @@ pub(crate) fn dc_pred_rect(
     } else {
         0
     };
-    let p = if ha && hl {
-        // avm `highbd_dc_predictor_rect`: for the non-power-of-2 count bw+bh=96
-        // (a 1:2 rect block), avm divides by a reciprocal multiply, not plain
-        // integer division. `resolve_divisor_32(96)` → scale=341, shift=15
-        // (div_lut[64]=341, DIV_LUT_PREC_BITS=9). Plain `(sum+48)/96` rounds
-        // differently on some sums, and that ±1 difference accumulates through
-        // the chroma DC-prediction feedback into a visible drift.
-        debug_assert_eq!(bw + bh, 96);
-        let sum = sa + sl;
-        ((sum * 341 + 16384) >> 15).clamp(0, 255)
-    } else if ha {
-        (sa + bw as i64 / 2) / bw as i64
-    } else if hl {
-        (sl + bh as i64 / 2) / bh as i64
-    } else {
-        return neutral;
+    // avm `highbd_dc_predictor` (reconintra.h) averages the `count` reference
+    // samples with a reciprocal-multiply, NOT plain integer division: it computes
+    // `(sum * scale + (1<<shift>>1)) >> shift` where `(scale, shift)` come from
+    // `resolve_divisor_32(count)`. For non-power-of-2 counts (96, 80, 72, 48, 36,
+    // 24 — every 1:2 / mixed rect chroma TX) plain `sum/count` rounds differently
+    // on many sums, and that ±1 difference accumulates through the chroma
+    // DC-prediction feedback loop into a top→bottom drift (the green cast). Using
+    // the exact reciprocal for ALL counts keeps every chroma TX bit-exact.
+    let (count, sum) = match (ha, hl) {
+        (true, true) => (bw + bh, sa + sl),
+        (true, false) => (bw, sa),
+        (false, true) => (bh, sl),
+        (false, false) => return neutral,
     };
+    let (scale, shift) = resolve_divisor_32(count as u32);
+    let rounding: i64 = (1i64 << shift) >> 1;
+    let p = ((sum * scale + rounding) >> shift).clamp(0, 255);
     p as f32
+}
+
+/// avm `div_lut` (warped_motion.h): reciprocals at `DIV_LUT_PREC_BITS`=9 precision.
+static DIV_LUT: [u16; 129] = [
+    512, 508, 504, 500, 496, 493, 489, 485, 482, 478, 475, 471, 468, 465, 462, 458, 455, 452, 449,
+    446, 443, 440, 437, 434, 431, 428, 426, 423, 420, 417, 415, 412, 410, 407, 405, 402, 400, 397,
+    395, 392, 390, 388, 386, 383, 381, 379, 377, 374, 372, 370, 368, 366, 364, 362, 360, 358, 356,
+    354, 352, 350, 349, 347, 345, 343, 341, 340, 338, 336, 334, 333, 331, 329, 328, 326, 324, 323,
+    321, 320, 318, 317, 315, 314, 312, 311, 309, 308, 306, 305, 303, 302, 301, 299, 298, 297, 295,
+    294, 293, 291, 290, 289, 287, 286, 285, 284, 282, 281, 280, 279, 278, 277, 275, 274, 273, 272,
+    271, 270, 269, 267, 266, 265, 264, 263, 262, 261, 260, 259, 258, 257, 256,
+];
+
+/// avm `resolve_divisor_32` (warped_motion.h): decomposes D so 1/D ≈ scale/2^shift.
+pub(crate) fn resolve_divisor_32(d: u32) -> (i64, u32) {
+    let mut shift = 31 - d.leading_zeros(); // get_msb(D) = floor(log2 D)
+    let e = d - (1u32 << shift); // D with the MSB cleared
+    let f = if shift > 7 {
+        // ROUND_POWER_OF_TWO(e, shift - 7)
+        let s = shift - 7;
+        ((e + (1u32 << (s - 1))) >> s) as usize
+    } else {
+        (e << (7 - shift)) as usize
+    };
+    shift += 9; // DIV_LUT_PREC_BITS
+    (DIV_LUT[f] as i64, shift)
 }
 /// Residual of a `bw`-wide × `bh`-tall block, row-major (`r[yy*bw + xx]`).
 pub(crate) fn get_residual_rect(
@@ -481,7 +507,7 @@ pub(crate) fn sb_tu4_contexts(
             let top = (a & 0x3F).min(4) as usize;
             let lft = (l & 0x3F).min(4) as usize;
             skip_ctx[i] = (top + lft + 3) >> 1;
-            // each neighbour unit contributes its packed sign (0x40 -> 1 baseline)
+            // each neighbor unit contributes its packed sign (0x40 -> 1 baseline)
             let dcs = ((a & 0xC0) >> 6) as i32 + ((l & 0xC0) >> 6) as i32;
             let sgn = dcs - 2; // two neutral units sum to 2
             dc_sign_ctx[i] = ((sgn != 0) as usize) + ((sgn > 0) as usize);
