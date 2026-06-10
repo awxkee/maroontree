@@ -51,10 +51,7 @@
 //!   -h, --help                  Print this help
 //! ```
 
-use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, encode_gray8,
-    encode_gray10, encode_rgb8, encode_rgb10, encode_rgba8_with_alpha, encode_rgba10_with_alpha,
-};
+use maroontree::{Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10, encode_rgba8_with_alpha, encode_rgba10_with_alpha, av2_map_quality};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -209,13 +206,6 @@ fn parse_args() -> Args {
     }
 }
 
-/// Maps CLI quality 1–100 to AV2 `base_q_idx` 1–254.
-/// quality 100 → q≈3 (near-lossless), quality 60 → q≈100, quality 1 → q=254.
-fn av2_base_q(quality: u8) -> u8 {
-    debug_assert!(quality >= 1 && quality <= 100);
-    ((100 - quality as u32) * 254 / 99).clamp(1, 254) as u8
-}
-
 fn is_16bit(ct: image::ColorType) -> bool {
     use image::ColorType::*;
     matches!(ct, L16 | La16 | Rgb16 | Rgba16)
@@ -306,7 +296,7 @@ fn encode_av2(
     let base_q: u8 = if args.lossless {
         0
     } else {
-        av2_base_q(args.quality)
+        av2_map_quality(args.quality)
     };
     let chroma_choice = args
         .chroma
