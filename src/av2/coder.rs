@@ -723,7 +723,14 @@ pub(crate) fn encode_luma_leaf_32x64(
 /// `dc_level` of 0 emits a skip. `tx_type` is luma-only, so chroma 16×16 still codes
 /// full AC separately. The DC is the LF eob coeff at raster pos 0, so its base-range
 /// context is 0 (get_br_ctx_lf_eob).
-pub(crate) fn encode_luma_leaf_16x16(
+/// Encode a DC-only intra luma leaf in entropy class 2: the 16×16 corner (TX_16X16,
+/// do_part group 3 → cdf 11074) and the residue-2 edges 8×32 / 32×8 (TX_8X32 / TX_32X8,
+/// do_part group 7 → cdf 18032). Keeping eob count == 1 makes the decoder skip the
+/// tx_type read (dc_skip), avoiding the EXT_NEW_TX_SET / LONG_SIDE_32 sets these sizes
+/// would otherwise use. All three are entropy class 2 (LUMA16 LF eob cdf) with eob
+/// class 256. `dc_level` 0 → skip. `tx_type` is luma-only so chroma still codes full
+/// AC. The DC is the LF eob coeff at raster pos 0, base-range context 0.
+pub(crate) fn encode_luma_leaf_dc_class2(
     enc: &mut RangeEncoder,
     dc_level: i32,
     skip_cdf: u32,
@@ -731,9 +738,10 @@ pub(crate) fn encode_luma_leaf_16x16(
     mode_idx: usize,
     has_chroma: bool,
     part_cdf: u32,
+    do_part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(11074, 0); // tx do_partition = NONE → single TX_16X16 (group 3)
+    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE → single transform
     if dc_level == 0 {
         enc.encode_bool(skip_cdf, 1);
         return 0;
