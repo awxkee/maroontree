@@ -28,7 +28,7 @@
  */
 
 use crate::av2::quant::{BASE_Q, qstep};
-use crate::av2::tables::{SCAN, SCAN16, SCAN16X32, SCAN32X16};
+use crate::av2::tables::{SCAN, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 
 pub(crate) struct Basis {
     pub(crate) dc: f32,
@@ -89,6 +89,12 @@ pub(crate) struct Bases {
     pub(crate) luma16x64: Basis,
     pub(crate) luma64x16: Basis,
     pub(crate) luma16x16: Basis,
+    /// 8-tap-family luma bases (residue-2 leaves). The right/bottom edges partition to
+    /// 8×32 / 32×8 (BLOCK_8X64 would be 1:8 aspect, which is disallowed). `luma8x32` =
+    /// 8 wide × 32 tall (TX_8X32, SCAN8X32); `luma32x8` = 32 wide × 8 tall (TX_32X8,
+    /// SCAN32X8). TX_8X32/32X8 are entropy class 2 (reuse the LUMA16 token cdfs).
+    pub(crate) luma8x32: Basis,
+    pub(crate) luma32x8: Basis,
 }
 
 impl Basis {
@@ -114,6 +120,8 @@ impl Bases {
         self.luma16x64.max_val = mv;
         self.luma64x16.max_val = mv;
         self.luma16x16.max_val = mv;
+        self.luma8x32.max_val = mv;
+        self.luma32x8.max_val = mv;
     }
     pub(crate) fn rescaled_to_q(mut self, base_q_idx: u32) -> Bases {
         let f = qstep(base_q_idx) as f32 / qstep(BASE_Q) as f32;
@@ -126,6 +134,8 @@ impl Bases {
             self.luma16x64.scale(f);
             self.luma64x16.scale(f);
             self.luma16x16.scale(f);
+            self.luma8x32.scale(f);
+            self.luma32x8.scale(f);
         }
         self
     }
@@ -496,6 +506,10 @@ fn parse_bases(b: &[u8]) -> Bases {
     let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh16, 16, &SCAN16X32);
     let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh64, 64, &SCAN32X16);
     let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
+    let lh8 = build_dct_profile(8, lh[0]);
+    let lh32 = build_dct_profile(32, lh[0]);
+    let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
+    let luma32x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh32, 32, &SCAN32X8);
     Bases {
         luma,
         chroma420,
@@ -505,6 +519,8 @@ fn parse_bases(b: &[u8]) -> Bases {
         luma16x64,
         luma64x16,
         luma16x16,
+        luma8x32,
+        luma32x8,
     }
 }
 
