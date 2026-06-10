@@ -51,7 +51,11 @@
 //!   -h, --help                  Print this help
 //! ```
 
-use maroontree::{Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10, encode_rgba8_with_alpha, encode_rgba10_with_alpha, av2_map_quality};
+use maroontree::{
+    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, av2_map_quality,
+    encode_gray8, encode_gray10, encode_rgb8, encode_rgb10, encode_rgba8_with_alpha,
+    encode_rgba10_with_alpha,
+};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

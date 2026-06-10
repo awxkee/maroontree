@@ -86,6 +86,10 @@ pub(super) fn predict_luma(
         intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
+    } else if m == 2 {
+        intrapred::smooth_v(32, &ab, &lf)
+    } else if m == 3 {
+        intrapred::smooth_h(32, &ab, &lf)
     } else {
         intrapred::paeth(32, &ab, &lf, corner)
     }
@@ -116,7 +120,7 @@ pub(super) fn encode_luma_sb(
     let mut best_mode = 0usize;
     let mut best_tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 64 * 64];
-    let cands: &[usize] = &[0usize, 1, 4];
+    let cands: &[usize] = &[0usize, 1, 2, 3, 4];
     // Reused per-TU residual scratch (fully overwritten each pass).
     let mut resid = vec![0f32; 1024];
     for &m in cands {
@@ -210,6 +214,10 @@ pub(super) fn predict_luma_leaf32(
         intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, 0);
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
+    } else if m == 2 {
+        intrapred::smooth_v(32, &ab, &lf)
+    } else if m == 3 {
+        intrapred::smooth_h(32, &ab, &lf)
     } else {
         intrapred::paeth(32, &ab, &lf, corner)
     }
@@ -239,7 +247,7 @@ pub(super) fn encode_luma_leaf32(
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 64 * 32];
     let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 4] {
+    for &m in &[0usize, 1, 2, 3, 4] {
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
         for ti in 0..2 {
@@ -329,6 +337,10 @@ pub(super) fn predict_luma_leaf_tu(
         intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
+    } else if m == 2 {
+        intrapred::smooth_v(32, &ab, &lf)
+    } else if m == 3 {
+        intrapred::smooth_h(32, &ab, &lf)
     } else {
         intrapred::paeth(32, &ab, &lf, corner)
     }
@@ -356,7 +368,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 32 * 64];
     let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 4] {
+    for &m in &[0usize, 1, 2, 3, 4] {
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
         for (k, &(ty, i)) in tu_i.iter().enumerate() {
@@ -418,7 +430,7 @@ pub(super) fn encode_luma_leaf_s32x32(
     let mut best_tu: Vec<Coeff> = Vec::new();
     let mut best_region = vec![0f32; 32 * 32];
     let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 4] {
+    for &m in &[0usize, 1, 2, 3, 4] {
         let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, 0, 0, 0, m, neutral);
         for r in 0..32 {
             let base = (sb_y + r) * pw + sb_x;
