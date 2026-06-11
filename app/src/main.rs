@@ -53,9 +53,13 @@ fn main() {
     let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
     let instant = Instant::now();
     let out = encode_rgb8(
-        &img.to_vec(),
-        img.width(),
-        img.height(),
+        &PlanarImage::from_interleaved_rgb(
+            img.width() as usize,
+            img.height() as usize,
+            BitDepth::Eight,
+            &img,
+        )
+        .unwrap(),
         &EncodeConfig::new()
             .with_quality(60)
             .with_cicp(ColorEncoding::srgb_ycbcr())
@@ -69,7 +73,8 @@ fn main() {
         img.height() as usize,
         BitDepth::Eight,
         &img.to_vec(),
-    );
+    )
+    .unwrap();
     let instant = Instant::now();
     let av2_encoder = Av2Encoder::new(av2_map_quality(53))
         .with_tiles(512, 512)

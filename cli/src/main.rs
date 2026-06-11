@@ -57,9 +57,9 @@ use crate::av1_lossless::encode_av1_lossless;
 use crate::av2_lossless::encode_av2_lossless_image;
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, av2_map_quality,
-    encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10, encode_rgb12,
-    encode_rgba8_with_alpha, encode_rgba10_with_alpha, encode_rgba12_with_alpha,
+    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, TxPart,
+    av2_map_quality, encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10,
+    encode_rgb12, encode_rgba8_with_alpha, encode_rgba10_with_alpha, encode_rgba12_with_alpha,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -470,8 +470,12 @@ fn encode_av2(
         .unwrap_or(if gray { Chroma::C444 } else { Chroma::C420 });
     let color = ColorEncoding::srgb_ycbcr();
 
-    let enc = Av2Encoder::new(base_q);
-    let alpha_enc = Av2Encoder::new(0);
+    let enc = Av2Encoder::new(base_q)
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay);
+    let alpha_enc = Av2Encoder::new(0)
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay);
 
     if gray {
         let frame = match effective_depth {

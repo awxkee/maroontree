@@ -29,7 +29,7 @@
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
     Av2Encoder, BitDepth, ChromaSamplePosition, ColorEncoding, MatrixCoefficients, PlanarImage,
-    Primaries, TransferFunction,
+    Primaries, TransferFunction, TxPart,
 };
 use yuv::{
     YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444, rgb10_to_icgc410,
@@ -70,8 +70,12 @@ pub(crate) fn encode_av2_lossless_image(
         return Err("Chroma mode is not supported for lossless".into());
     }
 
-    let enc = Av2Encoder::new(0);
-    let alpha_enc = Av2Encoder::new(0);
+    let enc = Av2Encoder::new(0)
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay);
+    let alpha_enc = Av2Encoder::new(0)
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay);
 
     if gray {
         let frame = match effective_depth {
