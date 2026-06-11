@@ -31,6 +31,7 @@ use crate::av2::coder::Coeff;
 use crate::av2::lossless::levels_to_coeffs_4x4;
 use crate::av2::wht::fwht4x4;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu_contexts(
     tus: &[Vec<Coeff>; 4],
     sb_y: usize,
@@ -97,9 +98,7 @@ pub(crate) fn sb_tu_contexts(
     (skip_cdfs, dc_sign_ctxs)
 }
 
-/// Per-TU skip / DC-sign contexts for a bottom-edge 64x32 luma leaf, coded as two
-/// side-by-side TX_32X32 (left, right). Mirrors `sb_tu_contexts` but only the top
-/// two TU positions; updates the same `above`/`left` coeff-context arrays in order.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu_contexts_64x32(
     tus: &[Vec<Coeff>; 2],
     sb_y: usize,
@@ -164,6 +163,7 @@ pub(crate) fn sb_tu_contexts_64x32(
 /// an SB (used by the 32X64 / 32X32 partition leaves). `pos` holds the SB-relative
 /// pixel offsets in coding order; updates `above`/`left` coeff-context arrays with
 /// the same edge-clamp as `sb_tu_contexts`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu_contexts_pos(
     pos: &[(usize, usize)],
     tus: &[Vec<Coeff>],
@@ -234,6 +234,7 @@ pub(crate) fn sb_tu_contexts_pos(
 /// holds for all single-TX 16-family leaves); dc_sign ctx sums neighbour sign bits over
 /// the tx units. Updates `wu` above + `hu` left entries with this TU's cul/DC byte.
 /// Returns `(skip_cdf, dc_sign_ctx)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu_contexts_rect(
     tu: &[Coeff],
     sb_y: usize,
@@ -576,6 +577,7 @@ pub(crate) fn lossless_sb_tus(
 /// U: ctx = (above_nz + left_nz) + 6, indexed into the shared txb_skip table.
 /// V: ctx = (above_nz + left_nz) + 3 + (co-located U non-zero ? 6 : 0), indexed into
 /// the separate v_txb_skip table. Entropy context inits to 0; grids store cul.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu4_chroma_skip(
     tus: &[Vec<Coeff>],
     sb_y: usize,

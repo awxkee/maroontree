@@ -447,6 +447,115 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                             )
                         }
+                        (4, 4) => {
+                            // Bottom-right 16×16 corner leaf (residue 4 in both dims):
+                            // full-AC TX_16X16 luma with 4-way ADST RD (DCT_DCT /
+                            // ADST_ADST / ADST_DCT / DCT_ADST, DC mode) → 4:2:0 chroma
+                            // 8×8 (TX_8X8, SCAN8X8, eob class 64, skip txs_ctx 1).
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 16, neutral);
+                            let resid = get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred);
+                            let pred_flat = [pred; 256];
+                            let mut src16 = [0f32; 256];
+                            for r in 0..16 {
+                                for c in 0..16 {
+                                    src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
+                                }
+                            }
+                            let rate = |lev: &[f32]| -> f64 {
+                                lev.iter()
+                                    .filter(|&&v| v != 0.0)
+                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                                    .sum::<f64>()
+                            };
+                            let sse = |rec: &[f32]| -> f64 {
+                                (0..256)
+                                    .map(|i| {
+                                        let d = src16[i] as f64 - rec[i] as f64;
+                                        d * d
+                                    })
+                                    .sum()
+                            };
+                            let lambda =
+                                crate::av2::leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                            let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_dct = crate::av2::itx422::reconstruct_luma16(
+                                &pred_flat, &lev_dct, qstep_i, &SCAN16,
+                            );
+                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_adst = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_adst, qstep_i, &SCAN16, true, true,
+                            );
+                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let lev_ad =
+                                bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_ad = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_ad, qstep_i, &SCAN16, false, true,
+                            );
+                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let lev_da =
+                                bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_da = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_da, qstep_i, &SCAN16, true, false,
+                            );
+                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let mut best = cost_dct;
+                            let mut choice = 0usize;
+                            if cost_adst < best {
+                                best = cost_adst;
+                                choice = 1;
+                            }
+                            if cost_ad < best {
+                                best = cost_ad;
+                                choice = 2;
+                            }
+                            if cost_da < best {
+                                choice = 3;
+                            }
+                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice {
+                                1 => (&lev_adst, &rec_adst, 1),
+                                2 => (&lev_ad, &rec_ad, 2),
+                                3 => (&lev_da, &rec_da, 3),
+                                _ => (&lev_dct, &rec_dct, 0),
+                            };
+                            put_block_rect(recy, pw, sb_y, sb_x, 16, 16, rec);
+                            let tu: Vec<Coeff> = levels_to_coeffs(lev);
+                            let (_s, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 4, true,
+                            );
+                            let skip = SKIP_TX16_QC[qc][0] as u32;
+                            encode_luma_leaf_16x16_full(
+                                enc, &tu, skip, dcs, 0, true, pc, 11074, tx_idx,
+                            );
+                            code_422_chroma_tu(
+                                enc,
+                                ChromaPlanes {
+                                    rec_u: &mut *recu,
+                                    rec_v: &mut *recv,
+                                    src_u: up,
+                                    src_v: vp,
+                                    stride: pcw,
+                                },
+                                cy,
+                                cx,
+                                &ChromaTxSpec {
+                                    cw: 8,
+                                    ch: 8,
+                                    basis: &bases.c8x8,
+                                    scan: &SCAN8X8,
+                                    eob_bin: &CHROMA_EOB64_QC[qc],
+                                    eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                    area: 64,
+                                    u_skip_row: &SKIP_TX8_QC[qc],
+                                },
+                                QuantCtx {
+                                    qc,
+                                    neutral,
+                                    qstep: qstep_i,
+                                },
+                                ChromaNeighbors { ua, ul, va, vl },
+                            )
+                        }
                         other => unreachable!("unsupported native 4:2:0 leaf {:?}", other),
                     };
                     for c in lmc..lmc + bw_mi {
@@ -740,7 +849,7 @@ impl Av2Encoder {
             }
         } else {
             let chunk = n.div_ceil(nthreads);
-            let me = &*self;
+            let me = self;
             let (yf, cbf, crf) = (&yf, &cbf, &crf);
             std::thread::scope(|sc| {
                 for (out_chunk, spec_chunk) in

@@ -321,22 +321,32 @@ impl Av2Encoder {
                     let lambda = crate::av2::leaf::part_lambda(qstep_i, part_lambda_c);
                     // ---- SPLIT candidate (existing mode search) ----
                     let (tus_s, mode_idx) = encode_luma_sb(
-                        &mut recy, &yp, pw, width, height, sb_y, sb_x,
-                        &bases.luma, qstep_i, &crate::av2::tables::SCAN, neutral, qc,
+                        &mut recy,
+                        &yp,
+                        pw,
+                        width,
+                        height,
+                        sb_y,
+                        sb_x,
+                        &bases.luma,
+                        qstep_i,
+                        &crate::av2::tables::SCAN,
+                        neutral,
+                        qc,
                         rdoq_lambda,
                     );
                     let j_s = sse_region(&recy)
-                        + lambda * (rate_proxy(&tus_s, 3.0) + if mode_idx != 0 { 6.0 } else { 0.0 });
+                        + lambda
+                            * (rate_proxy(&tus_s, 3.0) + if mode_idx != 0 { 6.0 } else { 0.0 });
                     // partition strategy from tuning (was AV2_TXPART env)
                     // Rect tx-partition (VERT4/HORZ4) is only safe on FULL interior 64x64
                     // SBs: on a partial edge SB the rect strips cross the frame boundary
                     // and the edge-clamped coding desyncs the decoder. Restrict rect
                     // candidates to whole SBs; partial edge SBs fall back to SPLIT.
                     let whole_sb = sb_x + 64 <= width && sb_y + 64 <= height;
-                    let want_vert4 =
-                        whole_sb && matches!(txpart, TxPart::ThreeWay | TxPart::Rd2 | TxPart::Vert4);
-                    let want_horz4 =
-                        whole_sb && matches!(txpart, TxPart::ThreeWay | TxPart::Horz4);
+                    let want_vert4 = whole_sb
+                        && matches!(txpart, TxPart::ThreeWay | TxPart::Rd2 | TxPart::Vert4);
+                    let want_horz4 = whole_sb && matches!(txpart, TxPart::ThreeWay | TxPart::Horz4);
                     let force_vert4 = txpart == TxPart::Vert4;
                     let force_horz4 = txpart == TxPart::Horz4;
                     let mut snap_split = [0f32; 64 * 64];
@@ -366,7 +376,7 @@ impl Av2Encoder {
                         [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
                     // ---- VERT4 candidate (4× TX_16X64, strips L→R) ----
                     if want_vert4 {
-                        for i in 0..4 {
+                        for (i, tus_v) in tus_v[..4].iter_mut().enumerate() {
                             let x0 = sb_x + i * 16;
                             let predv = dc_pred_rect(&recy, pw, sb_y, x0, 16, 64, neutral);
                             let lev = bases.luma16x64.project_scan(
@@ -376,12 +386,17 @@ impl Av2Encoder {
                             );
                             let pred_flat = [predv; 1024];
                             put_block_rect(
-                                &mut recy, pw, sb_y, x0, 16, 64,
-                                &crate::av2::itx422::reconstruct_luma_16x64(
+                                &mut recy,
+                                pw,
+                                sb_y,
+                                x0,
+                                16,
+                                64,
+                                &itx422::reconstruct_luma_16x64(
                                     &pred_flat, &lev, qstep_i, &SCAN16X32,
                                 ),
                             );
-                            tus_v[i] = levels_to_coeffs(&lev);
+                            *tus_v = levels_to_coeffs(&lev);
                         }
                         let j_v = sse_region(&recy) + lambda * rate_proxy(&tus_v, 4.0);
                         let take = force_vert4 || j_v < best_j;
@@ -401,7 +416,7 @@ impl Av2Encoder {
                     }
                     // ---- HORZ4 candidate (4× TX_64X16, strips T→B) ----
                     if want_horz4 {
-                        for i in 0..4 {
+                        for (i, tus_h) in tus_h[..4].iter_mut().enumerate() {
                             let y0 = sb_y + i * 16;
                             let predh = dc_pred_rect(&recy, pw, y0, sb_x, 64, 16, neutral);
                             let lev = bases.luma64x16.project_scan(
@@ -411,12 +426,17 @@ impl Av2Encoder {
                             );
                             let pred_flat = [predh; 1024];
                             put_block_rect(
-                                &mut recy, pw, y0, sb_x, 64, 16,
-                                &crate::av2::itx422::reconstruct_luma_64x16(
+                                &mut recy,
+                                pw,
+                                y0,
+                                sb_x,
+                                64,
+                                16,
+                                &itx422::reconstruct_luma_64x16(
                                     &pred_flat, &lev, qstep_i, &SCAN32X16,
                                 ),
                             );
-                            tus_h[i] = levels_to_coeffs(&lev);
+                            *tus_h = levels_to_coeffs(&lev);
                         }
                         let j_h = sse_region(&recy) + lambda * rate_proxy(&tus_h, 4.0);
                         let take = force_horz4 || j_h < best_j;
@@ -438,14 +458,29 @@ impl Av2Encoder {
                             let mut dc_sign_ctxs = [0usize; 4];
                             for i in 0..4 {
                                 let (s, d) = sb_tu_contexts_rect(
-                                    &tus_v[i], sb_y, sb_x + i * 16, &mut above, &mut left, qc,
-                                    tmc, tmr, 4, 16, false,
+                                    &tus_v[i],
+                                    sb_y,
+                                    sb_x + i * 16,
+                                    &mut above,
+                                    &mut left,
+                                    qc,
+                                    tmc,
+                                    tmr,
+                                    4,
+                                    16,
+                                    false,
                                 );
                                 skip_cdfs[i] = s;
                                 dc_sign_ctxs[i] = d;
                             }
                             encode_luma_block_vert4(
-                                &mut enc, &tus_v, &skip_cdfs, &dc_sign_ctxs, 0, true, 12276,
+                                &mut enc,
+                                &tus_v,
+                                &skip_cdfs,
+                                &dc_sign_ctxs,
+                                0,
+                                true,
+                                12276,
                             );
                         }
                         Part::Horz4 => {
@@ -453,21 +488,43 @@ impl Av2Encoder {
                             let mut dc_sign_ctxs = [0usize; 4];
                             for i in 0..4 {
                                 let (s, d) = sb_tu_contexts_rect(
-                                    &tus_h[i], sb_y + i * 16, sb_x, &mut above, &mut left, qc,
-                                    tmc, tmr, 16, 4, false,
+                                    &tus_h[i],
+                                    sb_y + i * 16,
+                                    sb_x,
+                                    &mut above,
+                                    &mut left,
+                                    qc,
+                                    tmc,
+                                    tmr,
+                                    16,
+                                    4,
+                                    false,
                                 );
                                 skip_cdfs[i] = s;
                                 dc_sign_ctxs[i] = d;
                             }
                             encode_luma_block_horz4(
-                                &mut enc, &tus_h, &skip_cdfs, &dc_sign_ctxs, 0, true, 12276,
+                                &mut enc,
+                                &tus_h,
+                                &skip_cdfs,
+                                &dc_sign_ctxs,
+                                0,
+                                true,
+                                12276,
                             );
                         }
                         Part::Split => {
-                            let (skip_cdfs, dc_sign_ctxs) =
-                                sb_tu_contexts(&tus_s, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
+                            let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
+                                &tus_s, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
+                            );
                             encode_luma_block_split(
-                                &mut enc, &tus_s, &skip_cdfs, &dc_sign_ctxs, mode_idx, true, 12276,
+                                &mut enc,
+                                &tus_s,
+                                &skip_cdfs,
+                                &dc_sign_ctxs,
+                                mode_idx,
+                                true,
+                                12276,
                             );
                         }
                     }
@@ -1192,13 +1249,11 @@ impl Av2Encoder {
                             );
                             let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
                             // ADST_ADST candidate (idx 1, DST-VII both axes).
-                            let lev_adst =
-                                bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = crate::av2::itx422::reconstruct_luma16_adst(
                                 &pred_flat, &lev_adst, qstep_i, &SCAN16, true, true,
                             );
-                            let cost_adst =
-                                sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
                             // ADST_DCT candidate (idx 2: ADST vertical, DCT horizontal →
                             // inverse row_adst=false, col_adst=true). The tx_type symbol
                             // costs ~3.1 bits more than DCT (idx 2 in the EXT_NEW_TX_SET
@@ -1234,8 +1289,7 @@ impl Av2Encoder {
                             if cost_da < best {
                                 choice = 3;
                             }
-                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice
-                            {
+                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice {
                                 1 => (&lev_adst, &rec_adst, 1),
                                 2 => (&lev_ad, &rec_ad, 2),
                                 3 => (&lev_da, &rec_da, 3),
@@ -1396,7 +1450,7 @@ impl Av2Encoder {
             }
         } else {
             let chunk = n.div_ceil(nthreads);
-            let me = &*self;
+            let me = self;
             let (yf, cbf, crf) = (&yf, &cbf, &crf);
             std::thread::scope(|sc| {
                 for (out_chunk, spec_chunk) in

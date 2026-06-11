@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::ChromaFormat;
 use std::fmt;
 
 #[derive(Debug)]
@@ -39,28 +40,32 @@ pub enum EncodeError {
     Io(std::io::Error),
     DimensionTooLarge { width: usize, height: usize },
     InvalidQuality,
+    UnsupportedChromaFormat(ChromaFormat),
 }
 
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EncodeError::InvalidDimensions { width, height } => {
+            Self::InvalidDimensions { width, height } => {
                 write!(f, "Invalid image dimensions: {width}x{height}")
             }
-            EncodeError::InvalidInput => write!(
+            Self::InvalidInput => write!(
                 f,
                 "Invalid input: plane sizes or parameters are inconsistent"
             ),
-            EncodeError::DctError(msg) => write!(f, "DCT block error: {msg}"),
-            EncodeError::BitstreamError(msg) => write!(f, "Bitstream write error: {msg}"),
-            EncodeError::IsobmffError(msg) => write!(f, "ISOBMFF error: {msg}"),
-            EncodeError::Io(e) => write!(f, "IO error: {e}"),
+            Self::DctError(msg) => write!(f, "DCT block error: {msg}"),
+            Self::BitstreamError(msg) => write!(f, "Bitstream write error: {msg}"),
+            Self::IsobmffError(msg) => write!(f, "ISOBMFF error: {msg}"),
+            Self::Io(e) => write!(f, "IO error: {e}"),
             Self::DimensionTooLarge { width, height } => write!(
                 f,
                 "image dimensions {width}×{height} exceed the maximum ({})",
                 16534
             ),
             Self::InvalidQuality => write!(f, "Invalid quality"),
+            Self::UnsupportedChromaFormat(chroma) => {
+                write!(f, "Chroma {:?} in current path is not supported", chroma)
+            }
         }
     }
 }

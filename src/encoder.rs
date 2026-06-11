@@ -26,12 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::avif::{checked_buffer_size, validate_dims};
+use crate::avif::{checked_buffer_size, make_av1c, validate_dims};
 use crate::color::ColorEncoding;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
-use crate::{BitDepth, ChromaFormat};
+use crate::{BitDepth, ChromaFormat, EncodeConfig, isobmff};
 
 /// A planar image. `planes[0..3]` are full-resolution (4:4:4).
 /// For identity RGB we store G, B, R in planes 0, 1, 2 (AV1 GBR ordering).
@@ -202,7 +202,7 @@ impl<T: Pixel> PlanarImage<T> {
 pub fn encode_still_lossy<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -254,7 +254,7 @@ pub fn encode_still_lossy<T: Pixel>(
 pub fn encode_still_lossy_422<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -332,7 +332,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
 pub fn encode_still_lossy_420<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -424,14 +424,10 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     Ok(bytes)
 }
 
-pub fn encode_lossless<T: Pixel>(img: &PlanarImage<T>) -> Result<Vec<u8>, EncodeError> {
-    encode_lossless_with(img, &ColorEncoding::identity_rgb(), 1)
-}
-
 /// Encode a lossless 4:4:4 still with color signaling.
-pub fn encode_lossless_with<T: Pixel>(
+pub fn encode_lossless_obu<T: Pixel>(
     img: &PlanarImage<T>,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
@@ -467,6 +463,37 @@ pub fn encode_lossless_with<T: Pixel>(
     Ok(bytes)
 }
 
+/// Encode a lossless 4:4:4 AVIF still with color signaling.
+pub fn encode_lossless<T: Pixel>(
+    img: &PlanarImage<T>,
+    cfg: &EncodeConfig,
+    threads: usize,
+) -> Result<Vec<u8>, EncodeError> {
+    img.validate_444()?;
+    if cfg.chroma != ChromaFormat::Yuv444 {
+        return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
+    }
+    let obu = encode_lossless_obu(img, cfg.color_encoding.as_ref(), threads)?;
+    let av1c = make_av1c(
+        &obu,
+        img.bit_depth as u8,
+        img.width as u32,
+        img.height as u32,
+        ChromaFormat::Yuv444,
+    );
+    isobmff::wrap_av1_image(
+        &obu,
+        img.width as u32,
+        img.height as u32,
+        img.bit_depth as u8,
+        3,
+        &av1c,
+        cfg.color_encoding.as_ref(),
+        cfg.icc.as_deref(),
+        &cfg.metadata,
+    )
+}
+
 /// Encode a pre-converted 4:4:4 YCbCr still.
 ///
 /// Y, Cb, Cr are full-resolution (`width × height`) samples. The AV1 bitstream
@@ -475,7 +502,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
@@ -508,7 +535,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
@@ -541,7 +568,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
@@ -594,7 +621,7 @@ mod tests {
                 }
             }
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
-            let p = encode_lossless(&img).unwrap();
+            let p = encode_lossless_obu(&img, None, 9).unwrap();
             assert_eq!(p.len(), len, "bd={} length", bd);
             assert_eq!(
                 p.iter().map(|&x| x as u64).sum::<u64>(),
@@ -646,12 +673,11 @@ mod tests {
                     rgb[i + 2] = ((x + y * 5) % 256) as u8;
                 }
             }
-            encode_lossless(&PlanarImage::from_interleaved_rgb(
-                w,
-                h,
-                BitDepth::Eight,
-                &rgb,
-            ))
+            encode_lossless_obu(
+                &PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb),
+                None,
+                9,
+            )
             .unwrap()
         };
 
@@ -683,8 +709,8 @@ mod tests {
             *b = (i * 31 % 256) as u8;
         }
         let img = PlanarImage::from_interleaved_rgb(4160, 64, BitDepth::Eight, &rgb);
-        let s1 = encode_lossless_with(&img, &color, 1).unwrap();
-        let s2 = encode_lossless_with(&img, &color, 2).unwrap();
+        let s1 = encode_lossless_obu(&img, Some(&color), 1).unwrap();
+        let s2 = encode_lossless_obu(&img, Some(&color), 2).unwrap();
         assert_eq!(
             s1, s2,
             "lossless threaded bytes must match serial (same tiling)"
@@ -696,8 +722,6 @@ mod tests {
     /// bit-exact against dav1d 1.4.1 (`recon == decode`, maxdiff 0) at both
     /// depths and all three chroma formats, and that dav1d reports the correct
     /// `C444p10/C422p10/C420p10` (and `p12`) format.
-    #[test]
-    #[test]
     #[test]
     fn lossy_high_bitdepth_stable() {
         let (w, h) = (40usize, 24usize);
@@ -717,9 +741,9 @@ mod tests {
             }
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
             let outs = [
-                encode_still_lossy(&img, 80, &ColorEncoding::srgb_ycbcr(), 1),
-                encode_still_lossy_422(&img, 80, &ColorEncoding::srgb_ycbcr(), 1),
-                encode_still_lossy_420(&img, 80, &ColorEncoding::srgb_ycbcr(), 1),
+                encode_still_lossy(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
+                encode_still_lossy_422(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
+                encode_still_lossy_420(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
             ];
             for (k, o) in outs.iter().enumerate() {
                 assert_eq!(o.len(), exp[k].0, "bd={} fmt={} len", bd, k);
@@ -741,8 +765,10 @@ mod tests {
         for &(w, h) in &[(1usize, 1usize), (17, 17), (65, 33), (127, 129), (33, 7)] {
             let rgb = vec![100u8; w * h * 3];
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
-            assert!(!encode_lossless(&img).unwrap().is_empty());
-            assert!(!encode_still_lossy(&img, 16, &ColorEncoding::srgb_ycbcr(), 0).is_empty());
+            assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
+            assert!(
+                !encode_still_lossy(&img, 16, Some(&ColorEncoding::srgb_ycbcr()), 0).is_empty()
+            );
         }
     }
 }

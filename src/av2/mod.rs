@@ -53,8 +53,9 @@ mod wht;
 
 use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::{
-    CHROMA_EOB_BIN_QC, CHROMA_EOB_HI_BIT_QC, CHROMA_EOB128_QC, CHROMA_EOB256_QC, CHROMA_EOB512_QC,
-    CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC, SKIP_TX16_QC,
+    CHROMA_EOB_BIN_QC, CHROMA_EOB_HI_BIT_QC, CHROMA_EOB64_QC, CHROMA_EOB128_QC, CHROMA_EOB256_QC,
+    CHROMA_EOB512_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC, SKIP_TX8_QC,
+    SKIP_TX16_QC,
 };
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::chroma422::{
@@ -62,14 +63,15 @@ use crate::av2::chroma422::{
 };
 use crate::av2::coder::{
     Coeff, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
-    encode_lossless_luma_sb, encode_luma_block_split, encode_luma_block_vert4, encode_luma_block_horz4, encode_luma_leaf_16x64,
+    encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
+    encode_luma_block_vert4, encode_luma_leaf_16x16_full, encode_luma_leaf_16x64,
     encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
     encode_luma_leaf_dc_class2,
-    encode_luma_leaf_16x16_full,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,
 };
+use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for, tile_specs};
 use crate::av2::entropy::RangeEncoder;
 use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
@@ -79,12 +81,11 @@ use crate::av2::helpers::{
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;
-use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for, tile_specs};
 use crate::av2::leaf::{
     encode_luma_leaf_s32x32, encode_luma_leaf_v32x64, encode_luma_leaf32, encode_luma_sb,
 };
 use crate::av2::proj::Basis;
-use crate::av2::tables::{SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
+use crate::av2::tables::{SCAN8X8, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 use crate::err::EncodeError;
 use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
 
@@ -226,8 +227,10 @@ fn native_420_mi(width: usize, height: usize) -> Option<(i64, i64)> {
     if !(ok(mc) && ok(mr)) {
         return None;
     }
-    // residue-4 is only supported as a single edge against a whole-SB perpendicular.
-    let perp_ok4 = |a: i64, b: i64| a % 16 != 4 || b % 16 == 0;
+    // residue-4 is supported either as a single edge against a whole-SB perpendicular
+    // (16×64 / 64×16 edge leaves) or as a residue-4-both-dims corner (the 16×16 luma
+    // + 8×8 chroma `(4,4)` leaf). residue-4 against residue-6+ is still unsupported.
+    let perp_ok4 = |a: i64, b: i64| a % 16 != 4 || b % 16 == 0 || b % 16 == 4;
     if !(perp_ok4(mc, mr) && perp_ok4(mr, mc)) {
         return None;
     }
@@ -458,8 +461,8 @@ impl Av2Encoder {
     /// Finish wrapping a color AV1 OBU stream in an AVIF container.
     pub fn wrap_avif(
         frame: &Av2Frame,
-        icc_profile: Option<Vec<u8>>,
-        exif: Option<Vec<u8>>,
+        icc_profile: Option<&[u8]>,
+        exif: Option<&[u8]>,
     ) -> Result<Vec<u8>, EncodeError> {
         let format = Av2Format {
             bit_depth: frame.bit_depth,
@@ -473,7 +476,7 @@ impl Av2Encoder {
                 frame,
                 &format,
                 Some(icc_profile),
-                Some(&exif),
+                Some(exif),
             ));
         }
         if let Some(icc_profile) = icc_profile.as_ref() {
@@ -488,8 +491,8 @@ impl Av2Encoder {
     pub fn wrap_avif_alpha(
         frame: &Av2Frame,
         alpha: &Av2Frame,
-        icc_profile: Option<Vec<u8>>,
-        exif: Option<Vec<u8>>,
+        icc_profile: Option<&[u8]>,
+        exif: Option<&[u8]>,
     ) -> Result<Vec<u8>, EncodeError> {
         let format = Av2Format {
             bit_depth: frame.bit_depth,
@@ -501,16 +504,12 @@ impl Av2Encoder {
         let color = match icc_profile {
             Some(icc) => Av2Color::Both {
                 cicp: frame.color,
-                icc,
+                icc: icc.to_vec(),
             },
             None => Av2Color::Cicp(frame.color),
         };
         Ok(avif::to_avif_color_alpha(
-            frame,
-            alpha,
-            &format,
-            &color,
-            exif.as_deref(),
+            frame, alpha, &format, &color, exif,
         ))
     }
 }
@@ -518,6 +517,6 @@ impl Av2Encoder {
 /// Maps CLI quality 1–100 to AV2 `base_q_idx` 1–254.
 /// quality 100 → q≈3 (near-lossless), quality 60 → q≈100, quality 1 → q=254.
 pub fn av2_map_quality(quality: u8) -> u8 {
-    debug_assert!(quality >= 1 && quality <= 100);
+    debug_assert!((1..=100).contains(&quality));
     ((100 - quality as u32) * 254 / 99).clamp(1, 254) as u8
 }

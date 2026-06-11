@@ -142,7 +142,12 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
 }
 
 /// Build the key-frame header OBU payload (the tile data is appended by the caller).
-pub(crate) fn frame_header(config: &Config, width: u32, height: u32, tiles: (usize, usize, usize)) -> Vec<u8> {
+pub(crate) fn frame_header(
+    config: &Config,
+    width: u32,
+    height: u32,
+    tiles: (usize, usize, usize),
+) -> Vec<u8> {
     let has_chroma = config.layout.has_chroma();
     let mut b = ByteWriter::new();
     b.write_bit(1);
@@ -237,7 +242,7 @@ pub(crate) fn frame_header(config: &Config, width: u32, height: u32, tiles: (usi
     b.write_bits(0, 2); // reduced_txtp_set
     if log2c > 0 || log2r > 0 {
         b.write_bit(0); // tile_start_and_end_present_flag = 0 (decoder reads it here,
-                        // folded into the frame header's own byte alignment)
+        // folded into the frame header's own byte alignment)
     }
     b.align_with_zero();
     b.into_bytes()

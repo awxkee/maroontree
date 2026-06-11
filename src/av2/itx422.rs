@@ -499,7 +499,12 @@ pub(crate) fn inv_tx_16x16_8bit(dqcoeff: &[i32; 256]) -> [i32; 256] {
 /// TX_16X16 luma reconstruction with per-pixel prediction. Dequant mirrors
 /// `reconstruct_luma` but `tx_scale = av2_get_tx_scale(TX_16X16) = 0` (256 pels),
 /// then the bit-exact 16×16 DCT_DCT inverse. `scan` is SCAN16 (rc = a*32 + c).
-pub(crate) fn reconstruct_luma16(pred: &[f32], lev: &[f32], qstep: i32, scan: &[u16]) -> [f32; 256] {
+pub(crate) fn reconstruct_luma16(
+    pred: &[f32],
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+) -> [f32; 256] {
     let mut dq = [0i32; 256];
     for k in 0..256 {
         let l = lev[k];
@@ -550,7 +555,13 @@ pub(crate) fn reconstruct_luma_64x16(
     }
     let mut tmp = vec![0i32; h * cw];
     for row in 0..h {
-        let o = idct_line_n(&block[row * cw..row * cw + cw], cw, 6, -(1 << 15), (1 << 15) - 1);
+        let o = idct_line_n(
+            &block[row * cw..row * cw + cw],
+            cw,
+            6,
+            -(1 << 15),
+            (1 << 15) - 1,
+        );
         for col in 0..cw {
             tmp[col * h + row] = o[col];
         }
@@ -595,13 +606,25 @@ pub(crate) fn reconstruct_luma_16x64(
     }
     let mut tmp = vec![0i32; ch * w];
     for row in 0..ch {
-        let o = idct_line_n(&block[row * w..row * w + w], w, 6, -(1 << 15), (1 << 15) - 1);
+        let o = idct_line_n(
+            &block[row * w..row * w + w],
+            w,
+            6,
+            -(1 << 15),
+            (1 << 15) - 1,
+        );
         for col in 0..w {
             tmp[col * ch + row] = o[col];
         }
     }
     for col in 0..w {
-        let o = idct_line_n(&tmp[col * ch..col * ch + ch], ch, 13, -(1 << 8), (1 << 8) - 1);
+        let o = idct_line_n(
+            &tmp[col * ch..col * ch + ch],
+            ch,
+            13,
+            -(1 << 8),
+            (1 << 8) - 1,
+        );
         for row in 0..ch {
             block[row * w + col] = o[row];
         }

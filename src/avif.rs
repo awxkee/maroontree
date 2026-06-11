@@ -110,7 +110,7 @@ pub struct EncodeConfig {
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
     /// Color metadata written to the `colr` box in the container.
-    pub color_encoding: ColorEncoding,
+    pub color_encoding: Option<ColorEncoding>,
     pub icc: Option<Vec<u8>>,
     /// Optional image metadata (orientation, HDR content light level, EXIF).
     pub metadata: Metadata,
@@ -124,7 +124,7 @@ impl Default for EncodeConfig {
         EncodeConfig {
             quality: 80,
             chroma: ChromaFormat::Yuv420,
-            color_encoding: ColorEncoding::srgb_ycbcr(),
+            color_encoding: Some(ColorEncoding::srgb_ycbcr()),
             icc: None,
             metadata: Metadata::default(),
             threads: 1,
@@ -149,7 +149,7 @@ impl EncodeConfig {
     }
 
     pub fn with_cicp(mut self, color: ColorEncoding) -> Self {
-        self.color_encoding = color;
+        self.color_encoding = Some(color);
         self
     }
 
@@ -255,7 +255,7 @@ fn av1_profile(bit_depth: u8, chroma: ChromaFormat) -> u8 {
 
 /// Build the [`isobmff::Av1cParams`] for a given encode. Extracts the sequence
 /// header OBU from the encoder output and embeds it as `configOBUs`.
-fn make_av1c(
+pub(crate) fn make_av1c(
     _obu: &[u8],
     bit_depth: u8,
     width: u32,
@@ -305,7 +305,7 @@ fn finalize_color(
         bit_depth,
         channels,
         &av1c,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.icc.as_deref(),
         &cfg.metadata,
     )
@@ -337,7 +337,7 @@ fn finalize_with_alpha(
         bit_depth,
         &av1c_color,
         &av1c_alpha,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.icc.as_deref(),
         &cfg.metadata,
     )
@@ -347,10 +347,10 @@ fn finalize_with_alpha(
 /// The `img` planes must already be in crate's expected GBR order
 /// (set by `PlanarImage::from_interleaved_rgb`).
 fn dispatch_lossy<T: crate::Pixel>(
-    img: &crate::PlanarImage<T>,
+    img: &PlanarImage<T>,
     q: u8,
     chroma: ChromaFormat,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Vec<u8> {
     match chroma {
@@ -380,7 +380,7 @@ pub fn encode_rgb8(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
@@ -410,7 +410,7 @@ pub fn encode_rgba8(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 8, cfg.chroma, cfg)
@@ -447,7 +447,13 @@ pub fn encode_rgba8_with_alpha(
         *alpha = px[3];
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        cfg.color_encoding.as_ref(),
+        cfg.threads,
+    );
     let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
@@ -481,7 +487,7 @@ pub fn encode_rgb10(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
@@ -511,7 +517,7 @@ pub fn encode_rgba10(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 10, cfg.chroma, cfg)
@@ -544,7 +550,13 @@ pub fn encode_rgba10_with_alpha(
         *alpha = px[3];
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Ten, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        cfg.color_encoding.as_ref(),
+        cfg.threads,
+    );
     let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
@@ -579,7 +591,7 @@ pub fn encode_rgb12(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
@@ -610,7 +622,7 @@ pub fn encode_rgba12(
         &img,
         quality_to_q(cfg.quality),
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     );
     finalize_color(obu, width, height, 12, cfg.chroma, cfg)
@@ -646,7 +658,13 @@ pub fn encode_rgba12_with_alpha(
         *alpha = px[3];
     }
     let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
-    let color_obu = dispatch_lossy(&img, q, cfg.chroma, &cfg.color_encoding, cfg.threads);
+    let color_obu = dispatch_lossy(
+        &img,
+        q,
+        cfg.chroma,
+        cfg.color_encoding.as_ref(),
+        cfg.threads,
+    );
     let alpha_obu = encode_lossy_gray_obu(
         &PlanarImage {
             width: img.width,
@@ -763,7 +781,7 @@ pub fn encode_yuv8(
         BitDepth::Eight,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     finalize_color(
@@ -792,7 +810,7 @@ pub fn encode_yuv10(
         BitDepth::Ten,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     finalize_color(
@@ -821,7 +839,7 @@ pub fn encode_yuv12(
         BitDepth::Twelve,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     finalize_color(
@@ -852,7 +870,7 @@ pub fn encode_yuva8_with_alpha(
         BitDepth::Eight,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     let alpha_obu = encode_lossy_gray_obu(
@@ -894,7 +912,7 @@ pub fn encode_yuva10_with_alpha(
         BitDepth::Ten,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     let alpha_obu = encode_lossy_gray_obu(
@@ -941,7 +959,7 @@ pub fn encode_yuva12_with_alpha(
         BitDepth::Twelve,
         q,
         cfg.chroma,
-        &cfg.color_encoding,
+        cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
     let alpha_obu = encode_lossy_gray_obu(
@@ -972,7 +990,7 @@ fn dispatch_yuv_u8(
     bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
@@ -990,7 +1008,7 @@ fn dispatch_yuv_u16(
     bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
-    color: &ColorEncoding,
+    color: Option<&ColorEncoding>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
