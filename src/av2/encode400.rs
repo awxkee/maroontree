@@ -622,7 +622,7 @@ impl Av2Encoder {
                 width: img.width,
                 height: img.height,
                 bit_depth: img.bit_depth,
-                planes: [plane, vec![], vec![]],
+                planes: [plane, Vec::new(), Vec::new(), Vec::new()],
             },
             color,
             threads,

@@ -35,13 +35,26 @@ use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
 use crate::{BitDepth, ChromaFormat, EncodeConfig, isobmff};
 
-/// A planar image. `planes[0..3]` are full-resolution (4:4:4).
-/// For identity RGB we store G, B, R in planes 0, 1, 2 (AV1 GBR ordering).
+/// A planar image with a fixed four-plane layout.
+///
+/// `planes[0..3]` are the full-resolution colour planes; for identity RGB they
+/// hold G, B, R (AV1 GBR ordering), and for pre-converted YCbCr they hold
+/// Y, Cb, Cr. `planes[3]` is the optional alpha plane.
+///
+/// A plane that is not present is stored as an empty `Vec`:
+/// * monochrome (4:0:0) uses only `planes[0]`;
+/// * subsampled chroma sizes are validated by the `validate_*` methods;
+/// * an image without alpha has an empty `planes[3]` (see [`Self::has_alpha`]).
+///
+/// Carrying alpha as the fourth plane lets a single deinterleave
+/// ([`Self::from_interleaved_rgba`] / [`Self::from_interleaved_gray_alpha`])
+/// populate the whole image, instead of splitting interleaved input into a
+/// colour buffer plus a side alpha buffer at every call site.
 pub struct PlanarImage<T: Pixel> {
     pub width: usize,
     pub height: usize,
     pub bit_depth: BitDepth,
-    pub planes: [Vec<T>; 3],
+    pub planes: [Vec<T>; 4],
 }
 
 fn validate_buf<T>(buf: &[T], w: usize, h: usize, ch: usize) -> Result<(), EncodeError> {
@@ -130,14 +143,19 @@ const CR_B: i32 = -666; // round(-0.081312 * 8192)
 
 impl<T: Pixel> PlanarImage<T> {
     /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
-    /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
+    /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R. No alpha.
     pub fn from_interleaved_rgb(
         width: usize,
         height: usize,
         bit_depth: BitDepth,
         rgb: &[T],
-    ) -> Self {
-        assert_eq!(rgb.len(), width * height * 3);
+    ) -> Result<Self, EncodeError> {
+        if rgb.len() != width * height * 3 {
+            return Err(EncodeError::InvalidDimensions {
+                width: width as u32,
+                height: height as u32,
+            });
+        }
         let n = width * height;
         let mut g = vec![T::default(); n];
         let mut b = vec![T::default(); n];
@@ -152,28 +170,155 @@ impl<T: Pixel> PlanarImage<T> {
             *g = px[1];
             *b = px[2];
         }
-        PlanarImage {
+        Ok(PlanarImage {
             width,
             height,
             bit_depth,
-            planes: [g, b, r],
-        }
+            planes: [g, b, r, Vec::new()],
+        })
     }
 
-    /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
-    /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R.
-    pub fn from_luma(width: usize, height: usize, bit_depth: BitDepth, luma: &[T]) -> Self {
-        assert_eq!(luma.len(), width * height);
-
-        PlanarImage {
+    /// Build from interleaved RGBA samples (`r,g,b,a,r,g,b,a,...`) in a single
+    /// pass: plane0=G, plane1=B, plane2=R, plane3=A. This is the deinterleave
+    /// the `*_with_alpha` paths use — the colour planes and the alpha plane are
+    /// split once, with no intermediate RGB buffer.
+    pub fn from_interleaved_rgba(
+        width: usize,
+        height: usize,
+        bit_depth: BitDepth,
+        rgba: &[T],
+    ) -> Result<Self, EncodeError> {
+        if rgba.len() != width * height * 4 {
+            return Err(EncodeError::InvalidDimensions {
+                width: width as u32,
+                height: height as u32,
+            });
+        }
+        let n = width * height;
+        let mut g = vec![T::default(); n];
+        let mut b = vec![T::default(); n];
+        let mut r = vec![T::default(); n];
+        let mut a = vec![T::default(); n];
+        for ((((px, g), b), r), a) in rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(g.iter_mut())
+            .zip(b.iter_mut())
+            .zip(r.iter_mut())
+            .zip(a.iter_mut())
+        {
+            *r = px[0];
+            *g = px[1];
+            *b = px[2];
+            *a = px[3];
+        }
+        Ok(PlanarImage {
             width,
             height,
             bit_depth,
-            planes: [luma.to_vec(), vec![], vec![]],
+            planes: [g, b, r, a],
+        })
+    }
+
+    /// Build a monochrome image from a single luma plane. No alpha.
+    pub fn from_luma(
+        width: usize,
+        height: usize,
+        bit_depth: BitDepth,
+        luma: &[T],
+    ) -> Result<Self, EncodeError> {
+        if luma.len() != width * height {
+            return Err(EncodeError::InvalidDimensions {
+                width: width as u32,
+                height: height as u32,
+            });
+        }
+        Ok(PlanarImage {
+            width,
+            height,
+            bit_depth,
+            planes: [luma.to_vec(), Vec::new(), Vec::new(), Vec::new()],
+        })
+    }
+
+    /// Build a monochrome-plus-alpha image from interleaved gray/alpha samples
+    /// (`l,a,l,a,...`) in a single pass: plane0=luma, plane3=alpha (planes 1/2
+    /// stay empty). Mirrors [`Self::from_interleaved_rgba`] for the 2-channel
+    /// gray+alpha case.
+    pub fn from_interleaved_gray_alpha(
+        width: usize,
+        height: usize,
+        bit_depth: BitDepth,
+        gray_alpha: &[T],
+    ) -> Result<Self, EncodeError> {
+        if gray_alpha.len() != width * height * 2 {
+            return Err(EncodeError::InvalidDimensions {
+                width: width as u32,
+                height: height as u32,
+            });
+        }
+        let n = width * height;
+        let mut luma = vec![T::default(); n];
+        let mut a = vec![T::default(); n];
+        for ((px, luma), a) in gray_alpha
+            .chunks_exact(2)
+            .zip(luma.iter_mut())
+            .zip(a.iter_mut())
+        {
+            *luma = px[0];
+            *a = px[1];
+        }
+        Ok(PlanarImage {
+            width,
+            height,
+            bit_depth,
+            planes: [luma, a, Vec::new(), Vec::new()],
+        })
+    }
+
+    pub(crate) fn packed_3(&self) -> PlanarImage<T> {
+        PlanarImage {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            planes: [
+                self.planes[0].to_vec(),
+                self.planes[1].to_vec(),
+                self.planes[2].to_vec(),
+                vec![],
+            ],
         }
     }
 
-    /// Reconstruct interleaved RGB from the GBR planes.
+    pub(crate) fn packed_alpha_4(&self) -> PlanarImage<T> {
+        PlanarImage {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            planes: [self.planes[3].to_vec(), vec![], vec![], vec![]],
+        }
+    }
+
+    pub(crate) fn packed_alpha_2(&self) -> PlanarImage<T> {
+        PlanarImage {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            planes: [self.planes[3].to_vec(), vec![], vec![], vec![]],
+        }
+    }
+
+    pub(crate) fn packed_1(&self) -> PlanarImage<T> {
+        PlanarImage {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            planes: [self.planes[0].to_vec(), vec![], vec![], vec![]],
+        }
+    }
+
+    /// Reconstruct interleaved RGB from the GBR planes (alpha is dropped).
     pub fn to_interleaved_rgb(&self) -> Vec<T> {
         let n = self.width * self.height;
         let mut out = vec![T::default(); n * 3];
@@ -469,54 +614,24 @@ pub fn encode_lossless_gray<T: Pixel>(
 }
 
 pub fn encode_lossless_gray_alpha<T: Pixel>(
-    rgba: &[T],
-    width: u32,
-    height: u32,
-    bit_depth: BitDepth,
+    img: &PlanarImage<T>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    crate::avif::validate_buf_u8(rgba, width, height, 2)?;
+    crate::avif::validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    crate::avif::validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
     if cfg.chroma != ChromaFormat::Monochrome {
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
-    let mut gray = vec![T::default(); width as usize * height as usize];
-    let mut alpha = vec![T::default(); width as usize * height as usize];
-    for ((px, dst_gray), alpha) in rgba
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(gray.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        *dst_gray = px[0];
-        *alpha = px[1];
-    }
-    let luma_obu = encode_lossless_gray(
-        &PlanarImage {
-            width: width as usize,
-            height: height as usize,
-            bit_depth,
-            planes: [gray, vec![], vec![]],
-        },
-        cfg,
-    )?;
-    let alpha_obu = encode_lossless_gray(
-        &PlanarImage {
-            width: width as usize,
-            height: height as usize,
-            bit_depth,
-            planes: [alpha, vec![], vec![]],
-        },
-        cfg,
-    )?;
+    let luma_obu = encode_lossless_gray(&img.packed_1(), cfg)?;
+    let alpha_obu = encode_lossless_gray(&img.packed_alpha_2(), cfg)?;
     finalize_with_alpha(
         luma_obu,
         alpha_obu,
-        width,
-        height,
-        bit_depth.bits(),
+        img.width as u32,
+        img.height as u32,
+        img.bit_depth.bits(),
         ChromaFormat::Monochrome,
         cfg,
     )
@@ -593,54 +708,29 @@ pub fn encode_lossless<T: Pixel>(
 
 /// Encode a lossless 4:4:4 AVIF still with color signaling.
 pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
-    rgba: &[T],
-    width: u32,
-    height: u32,
-    bit_depth: BitDepth,
+    img: &PlanarImage<T>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    crate::avif::validate_buf_u8(rgba, width, height, 4)?;
+    crate::avif::validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    crate::avif::validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    crate::avif::validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    crate::avif::validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     if cfg.chroma != ChromaFormat::Yuv444 {
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
-    let mut rgb = vec![T::default(); width as usize * height as usize * 3];
-    let mut alpha = vec![T::default(); width as usize * height as usize];
-    for ((px, dst_rgb), alpha) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        dst_rgb[0] = px[0];
-        dst_rgb[1] = px[1];
-        dst_rgb[2] = px[2];
-        *alpha = px[3];
-    }
-    let img = PlanarImage::from_interleaved_rgb(width as usize, height as usize, bit_depth, &rgb);
 
-    let obu = encode_lossless_obu(&img, cfg.color_encoding.as_ref(), cfg.threads)?;
+    let obu = encode_lossless_obu(&img.packed_3(), cfg.color_encoding.as_ref(), cfg.threads)?;
 
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: img.width,
-            height: img.height,
-            bit_depth,
-            planes: [alpha, vec![], vec![]],
-        },
-        bit_depth,
-        0,
-        true,
-        cfg.threads,
-    )?;
+    let alpha_obu =
+        encode_lossy_gray_obu(&img.packed_alpha_4(), img.bit_depth, 0, true, cfg.threads)?;
     finalize_with_alpha(
         obu,
         alpha_obu,
-        width,
-        height,
-        bit_depth.bits(),
+        img.width as u32,
+        img.height as u32,
+        img.bit_depth.bits(),
         cfg.chroma,
         cfg,
     )
@@ -772,7 +862,8 @@ mod tests {
                     rgb[i + 2] = (((x * y + 1) as u32) as u16) % m;
                 }
             }
-            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb)
+                .unwrap();
             let p = encode_lossless_obu(&img, None, 9).unwrap();
             assert_eq!(p.len(), len, "bd={} length", bd);
             assert_eq!(
@@ -826,7 +917,7 @@ mod tests {
                 }
             }
             encode_lossless_obu(
-                &PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb),
+                &PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb).unwrap(),
                 None,
                 9,
             )
@@ -860,7 +951,7 @@ mod tests {
         for (i, b) in rgb.iter_mut().enumerate() {
             *b = (i * 31 % 256) as u8;
         }
-        let img = PlanarImage::from_interleaved_rgb(4160, 64, BitDepth::Eight, &rgb);
+        let img = PlanarImage::from_interleaved_rgb(4160, 64, BitDepth::Eight, &rgb).unwrap();
         let s1 = encode_lossless_obu(&img, Some(&color), 1).unwrap();
         let s2 = encode_lossless_obu(&img, Some(&color), 2).unwrap();
         assert_eq!(
@@ -891,7 +982,8 @@ mod tests {
                     rgb[i + 2] = (((x * y + 1) as u32) as u16) % m;
                 }
             }
-            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb)
+                .unwrap();
             let outs = [
                 encode_still_lossy(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
                 encode_still_lossy_422(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
@@ -916,7 +1008,7 @@ mod tests {
     fn arbitrary_sizes_do_not_panic() {
         for &(w, h) in &[(1usize, 1usize), (17, 17), (65, 33), (127, 129), (33, 7)] {
             let rgb = vec![100u8; w * h * 3];
-            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
+            let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb).unwrap();
             assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
             assert!(
                 !encode_still_lossy(&img, 16, Some(&ColorEncoding::srgb_ycbcr()), 0).is_empty()

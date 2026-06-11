@@ -30,9 +30,12 @@ use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scal
 use maroontree::{
     BitDepth, ChromaFormat, ChromaSamplePosition, ColorEncoding, EncodeConfig, MatrixCoefficients,
     PlanarImage, Primaries, TransferFunction, encode_lossless, encode_lossless_gray,
-    encode_lossless_with_alpha,
+    encode_lossless_gray_alpha, encode_lossless_with_alpha,
 };
-use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444};
+use yuv::{
+    YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444, rgb10_to_icgc410,
+    rgba_to_ycgco444, rgba12_to_icgc412,
+};
 
 pub(crate) fn encode_av1_lossless(
     img: &image::DynamicImage,
@@ -52,7 +55,6 @@ pub(crate) fn encode_av1_lossless(
             "Chroma format doesn't match yuv444 for lossless"
         ));
     }
-    let (w, h) = (img.width(), img.height());
 
     let color = ColorEncoding {
         primaries: Primaries::Bt709,
@@ -81,21 +83,23 @@ pub(crate) fn encode_av1_lossless(
     Ok(match (effective_depth, gray, alpha) {
         (Depth::D8, true, alpha) => {
             if alpha {
-                encode_lossless_with_alpha(
-                    &img.to_luma_alpha8(),
-                    img.width(),
-                    img.height(),
-                    BitDepth::Eight,
+                encode_lossless_gray_alpha(
+                    &PlanarImage::from_interleaved_gray_alpha(
+                        img.width() as usize,
+                        img.height() as usize,
+                        BitDepth::Eight,
+                        &&img.to_luma8(),
+                    )?,
                     &cfg,
                 )?
             } else {
                 encode_lossless_gray(
-                    &PlanarImage {
-                        width: img.width() as usize,
-                        height: img.height() as usize,
-                        bit_depth: BitDepth::Eight,
-                        planes: [img.to_luma8().to_vec(), vec![], vec![]],
-                    },
+                    &PlanarImage::from_interleaved_gray_alpha(
+                        img.width() as usize,
+                        img.height() as usize,
+                        BitDepth::Eight,
+                        &img.to_luma_alpha8(),
+                    )?,
                     &cfg,
                 )?
             }
@@ -114,62 +118,199 @@ pub(crate) fn encode_av1_lossless(
                     planar_image.y_plane.borrow().to_vec(),
                     planar_image.u_plane.borrow().to_vec(),
                     planar_image.v_plane.borrow().to_vec(),
+                    vec![],
                 ],
             };
             encode_lossless(&planar_image, &cfg)?
         }
         (Depth::D8, false, true) => {
-            encode_lossless_with_alpha(img.to_rgba8().as_raw(), w, h, BitDepth::Eight, &cfg)?
+            let rgba8 = img.to_rgba8();
+            let mut planar_image = YuvPlanarImageMut::alloc(
+                rgba8.width(),
+                rgba8.height(),
+                YuvChromaSubsampling::Yuv444,
+            );
+            rgba_to_ycgco444(&mut planar_image, &rgba8, rgba8.width() * 4, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+
+            let alpha_chan = rgba8
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| x[3])
+                .collect::<Vec<_>>();
+
+            let planar_image = PlanarImage {
+                width: rgba8.width() as usize,
+                height: rgba8.height() as usize,
+                bit_depth: BitDepth::Eight,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                    alpha_chan,
+                ],
+            };
+            encode_lossless_with_alpha(&planar_image, &cfg)?
         }
-        (Depth::D10, true, _) => encode_lossless_gray(
-            &PlanarImage {
-                width: img.width() as usize,
-                height: img.height() as usize,
+        (Depth::D10, true, alpha) => {
+            if alpha {
+                encode_lossless_gray_alpha(
+                    &PlanarImage::from_interleaved_gray_alpha(
+                        img.width() as usize,
+                        img.height() as usize,
+                        BitDepth::Ten,
+                        &scale16_to_10(&img.to_luma_alpha16()),
+                    )?,
+                    &cfg,
+                )?
+            } else {
+                encode_lossless_gray(
+                    &PlanarImage {
+                        width: img.width() as usize,
+                        height: img.height() as usize,
+                        bit_depth: BitDepth::Ten,
+                        planes: [
+                            scale16_to_10(&img.to_luma16()).to_vec(),
+                            vec![],
+                            vec![],
+                            vec![],
+                        ],
+                    },
+                    &cfg,
+                )?
+            }
+        }
+        (Depth::D10, false, false) => {
+            let rgb10 = img.to_rgb16();
+            let src10 = scale16_to_10(&rgb10);
+            let mut planar_image = YuvPlanarImageMut::alloc(
+                rgb10.width(),
+                rgb10.height(),
+                YuvChromaSubsampling::Yuv444,
+            );
+            rgb10_to_icgc410(&mut planar_image, &src10, rgb10.width() * 3, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+            let planar_image = PlanarImage {
+                width: rgb10.width() as usize,
+                height: rgb10.height() as usize,
                 bit_depth: BitDepth::Ten,
-                planes: [scale16_to_10(&img.to_luma16()).to_vec(), vec![], vec![]],
-            },
-            &cfg,
-        )?,
-        (Depth::D10, false, false) => encode_lossless(
-            &PlanarImage::from_interleaved_rgb(
-                img.width() as usize,
-                img.height() as usize,
-                BitDepth::Ten,
-                &scale16_to_10(&img.to_rgb16()),
-            ),
-            &cfg,
-        )?,
-        (Depth::D10, false, true) => encode_lossless_with_alpha(
-            &scale16_to_10(img.to_rgba16().as_raw()),
-            w,
-            h,
-            BitDepth::Ten,
-            &cfg,
-        )?,
-        (Depth::D12, true, _) => encode_lossless_gray(
-            &PlanarImage {
-                width: img.width() as usize,
-                height: img.height() as usize,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                    vec![],
+                ],
+            };
+            encode_lossless(&planar_image, &cfg)?
+        }
+        (Depth::D10, false, true) => {
+            let rgb10 = img.to_rgba16();
+            let src10 = scale16_to_10(&rgb10);
+            let mut planar_image = YuvPlanarImageMut::alloc(
+                rgb10.width(),
+                rgb10.height(),
+                YuvChromaSubsampling::Yuv444,
+            );
+            rgb10_to_icgc410(&mut planar_image, &src10, rgb10.width() * 4, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+
+            let alpha_chan = src10
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| x[3])
+                .collect::<Vec<_>>();
+
+            let planar_image = PlanarImage {
+                width: rgb10.width() as usize,
+                height: rgb10.height() as usize,
+                bit_depth: BitDepth::Ten,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                    alpha_chan,
+                ],
+            };
+            encode_lossless_with_alpha(&planar_image, &cfg)?
+        }
+        (Depth::D12, true, alpha) => {
+            if alpha {
+                encode_lossless_gray_alpha(
+                    &PlanarImage::from_interleaved_gray_alpha(
+                        img.width() as usize,
+                        img.height() as usize,
+                        BitDepth::Twelve,
+                        &scale16_to_12(img.to_luma_alpha16().as_raw()),
+                    )?,
+                    &cfg,
+                )?
+            } else {
+                encode_lossless_gray(
+                    &PlanarImage::from_luma(
+                        img.width() as usize,
+                        img.height() as usize,
+                        BitDepth::Twelve,
+                        &scale16_to_12(img.to_luma16().as_raw()),
+                    )?,
+                    &cfg,
+                )?
+            }
+        }
+        (Depth::D12, false, false) => {
+            let rgb12 = img.to_rgb16();
+            let src12 = scale16_to_12(&rgb12);
+            let mut planar_image = YuvPlanarImageMut::alloc(
+                rgb12.width(),
+                rgb12.height(),
+                YuvChromaSubsampling::Yuv444,
+            );
+            rgba12_to_icgc412(&mut planar_image, &src12, rgb12.width() * 4, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+            let planar_image = PlanarImage {
+                width: rgb12.width() as usize,
+                height: rgb12.height() as usize,
                 bit_depth: BitDepth::Twelve,
-                planes: [scale16_to_10(&img.to_luma16()).to_vec(), vec![], vec![]],
-            },
-            &cfg,
-        )?,
-        (Depth::D12, false, false) => encode_lossless(
-            &PlanarImage::from_interleaved_rgb(
-                img.width() as usize,
-                img.height() as usize,
-                BitDepth::Twelve,
-                &scale16_to_12(&img.to_rgb16()),
-            ),
-            &cfg,
-        )?,
-        (Depth::D12, false, true) => encode_lossless_with_alpha(
-            &scale16_to_10(img.to_rgba16().as_raw()),
-            w,
-            h,
-            BitDepth::Twelve,
-            &cfg,
-        )?,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                    vec![],
+                ],
+            };
+            encode_lossless(&planar_image, &cfg)?
+        }
+        (Depth::D12, false, true) => {
+            let rgb12 = img.to_rgba16();
+            let src12 = scale16_to_12(&rgb12);
+            let mut planar_image = YuvPlanarImageMut::alloc(
+                rgb12.width(),
+                rgb12.height(),
+                YuvChromaSubsampling::Yuv444,
+            );
+            rgba12_to_icgc412(&mut planar_image, &src12, rgb12.width() * 4, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+
+            let alpha_chan = src12
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| x[3])
+                .collect::<Vec<_>>();
+
+            let planar_image = PlanarImage {
+                width: rgb12.width() as usize,
+                height: rgb12.height() as usize,
+                bit_depth: BitDepth::Twelve,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                    alpha_chan,
+                ],
+            };
+            encode_lossless_with_alpha(&planar_image, &cfg)?
+        }
     })
 }
