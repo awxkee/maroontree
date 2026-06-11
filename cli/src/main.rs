@@ -57,9 +57,9 @@ use crate::av1_lossless::encode_av1_lossless;
 use crate::av2_lossless::encode_av2_lossless_image;
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, TxPart,
-    av2_map_quality, encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10,
-    encode_rgb12, encode_rgba8_with_alpha, encode_rgba10_with_alpha, encode_rgba12_with_alpha,
+    BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, encode_gray8, encode_gray10,
+    encode_gray12, encode_rgb8, encode_rgb10, encode_rgb12, encode_rgba8_with_alpha,
+    encode_rgba10_with_alpha, encode_rgba12_with_alpha,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -429,25 +429,6 @@ fn encode_av1(
     })
 }
 
-fn deinterleave_rgba<T: Copy + Default>(rgba: &[T], w: usize, h: usize) -> (Vec<T>, Vec<T>) {
-    let npx = w * h;
-    let mut rgb = vec![T::default(); npx * 3];
-    let mut alpha = vec![T::default(); npx];
-    for ((px, rgb), alpha) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        rgb[0] = px[0];
-        rgb[1] = px[1];
-        rgb[2] = px[2];
-        *alpha = px[3];
-    }
-    (rgb, alpha)
-}
-
 fn encode_av2(
     img: &image::DynamicImage,
     args: &Args,
@@ -456,167 +437,115 @@ fn encode_av2(
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (w, h) = (img.width() as usize, img.height() as usize);
+    if args.lossless {
+        return encode_av2_lossless_image(img, args, color_type, effective_depth, icc, exif);
+    };
+
+    let chroma_fmt = match args.chroma.unwrap_or(Chroma::C422) {
+        Chroma::C444 => ChromaFormat::Yuv444,
+        Chroma::C422 => ChromaFormat::Yuv422,
+        Chroma::C420 => ChromaFormat::Yuv420,
+    };
+
+    let mut cfg = EncodeConfig::new()
+        .with_quality(args.quality)
+        .with_chroma(chroma_fmt)
+        .with_cicp(ColorEncoding::srgb_ycbcr())
+        .with_threads(args.threads);
+
+    if let Some(icc) = icc {
+        cfg = cfg.with_icc_profile(icc.to_vec());
+    }
+    if let Some(exif) = exif {
+        cfg = cfg.with_exif(exif.to_vec());
+    }
+
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
-    let base_q = if args.lossless {
-        return encode_av2_lossless_image(img, args, color_type, effective_depth, icc, exif);
-    } else {
-        av2_map_quality(args.quality)
-    };
-    let chroma_choice = args
-        .chroma
-        .unwrap_or(if gray { Chroma::C444 } else { Chroma::C420 });
-    let color = ColorEncoding::srgb_ycbcr();
-
-    let enc = Av2Encoder::new(base_q)
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay);
-    let alpha_enc = Av2Encoder::new(0)
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay);
-
-    if gray {
-        let frame = match effective_depth {
-            Depth::D8 => {
-                let l = img.to_luma8().into_raw();
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Eight, &l)?,
-                    &color,
-                    args.threads,
-                )?
-            }
-            Depth::D10 => {
-                let l = scale16_to_10(img.to_luma16().as_raw());
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Ten, &l)?,
-                    &color,
-                    args.threads,
-                )?
-            }
-            Depth::D12 => {
-                let l = scale16_to_12(img.to_luma16().as_raw());
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Twelve, &l)?,
-                    &color,
-                    args.threads,
-                )?
-            }
-        };
-        return Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?);
-    }
-
-    let encode_color_8 = |pimg: &PlanarImage<u8>| -> Result<_, Box<dyn std::error::Error>> {
-        Ok(match (chroma_choice, args.lossless) {
-            (_, true) | (Chroma::C444, _) => enc.encode_image_444(pimg, &color, args.threads)?,
-            (Chroma::C420, false) => enc.encode_image_420(pimg, &color, args.threads)?,
-            (Chroma::C422, false) => enc.encode_image_422(pimg, &color, args.threads)?,
-        })
-    };
-
-    let encode_color_16 = |pimg: &PlanarImage<u16>| -> Result<_, Box<dyn std::error::Error>> {
-        Ok(match (chroma_choice, args.lossless) {
-            (_, true) | (Chroma::C444, _) => enc.encode_image_444(pimg, &color, args.threads)?,
-            (Chroma::C420, false) => enc.encode_image_420(pimg, &color, args.threads)?,
-            (Chroma::C422, false) => enc.encode_image_422(pimg, &color, args.threads)?,
-        })
-    };
-
-    if effective_depth == Depth::D8 {
-        return if !alpha {
-            let rgb = img.to_rgb8().into_raw();
-            let frame = encode_color_8(&PlanarImage::from_interleaved_rgb(
-                w,
-                h,
+    Ok(match (effective_depth, gray, alpha) {
+        (Depth::D8, true, _) => maroontree::av2_image::encode_gray8(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
                 BitDepth::Eight,
-                &rgb,
-            )?)?;
-            Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
-        } else {
-            let (rgb, a) = deinterleave_rgba(&img.to_rgba8().into_raw(), w, h);
-            let frame = encode_color_8(&PlanarImage::from_interleaved_rgb(
-                w,
-                h,
+                img.to_luma8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D8, false, false) => maroontree::av2_image::encode_rgb8(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
                 BitDepth::Eight,
-                &rgb,
-            )?)?;
-            let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Eight, &a)?,
-                &color,
-                args.threads,
-            )?;
-            Ok(Av2Encoder::wrap_avif_alpha(
-                &frame,
-                &alpha_frame,
-                icc,
-                exif,
-            )?)
-        };
-    }
-
-    if effective_depth == Depth::D10 {
-        return if !alpha {
-            let raw16 = scale16_to_10(img.to_rgb16().as_raw());
-            let frame = encode_color_16(&PlanarImage::from_interleaved_rgb(
-                w,
-                h,
+                img.to_rgb8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D8, false, true) => maroontree::av2_image::encode_rgba8_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Eight,
+                img.to_rgba8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, true, _) => maroontree::av2_image::encode_gray10(
+            &PlanarImage::from_luma(
+                img.width() as usize,
+                img.height() as usize,
                 BitDepth::Ten,
-                &raw16,
-            )?)?;
-            Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
-        } else {
-            let (rgb, a) = deinterleave_rgba(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
-            let frame = encode_color_16(&PlanarImage::from_interleaved_rgb(
-                w,
-                h,
+                &scale16_to_10(img.to_luma16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, false, false) => maroontree::av2_image::encode_rgb10(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
                 BitDepth::Ten,
-                &rgb,
-            )?)?;
-            let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Ten, &a)?,
-                &color,
-                args.threads,
-            )?;
-            Ok(Av2Encoder::wrap_avif_alpha(
-                &frame,
-                &alpha_frame,
-                icc,
-                exif,
-            )?)
-        };
-    }
-
-    // Depth::D12
-    if !alpha {
-        let raw16 = scale16_to_12(img.to_rgb16().as_raw());
-        let frame = encode_color_16(&PlanarImage::from_interleaved_rgb(
-            w,
-            h,
-            BitDepth::Twelve,
-            &raw16,
-        )?)?;
-        Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
-    } else {
-        let (rgb, a) = deinterleave_rgba(&scale16_to_12(img.to_rgba16().as_raw()), w, h);
-        let frame = encode_color_16(&PlanarImage::from_interleaved_rgb(
-            w,
-            h,
-            BitDepth::Twelve,
-            &rgb,
-        )?)?;
-        let alpha_frame = alpha_enc.encode_yuv400(
-            &PlanarImage::from_luma(w, h, BitDepth::Twelve, &a)?,
-            &color,
-            args.threads,
-        )?;
-        Ok(Av2Encoder::wrap_avif_alpha(
-            &frame,
-            &alpha_frame,
-            icc,
-            exif,
-        )?)
-    }
+                &scale16_to_10(img.to_rgb16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, false, true) => maroontree::av2_image::encode_rgba10_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Ten,
+                &scale16_to_10(img.to_rgba16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, true, _) => maroontree::av2_image::encode_gray12(
+            &PlanarImage::from_luma(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_luma16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, false, false) => maroontree::av2_image::encode_rgb12(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_rgb16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, false, true) => maroontree::av2_image::encode_rgba12_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_rgba16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+    })
 }
 
 fn main() {

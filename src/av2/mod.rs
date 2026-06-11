@@ -47,6 +47,7 @@ mod lossless;
 mod partition;
 mod proj;
 mod quant;
+pub mod simple;
 mod tables;
 mod tables_tx32;
 mod wht;
