@@ -1185,28 +1185,61 @@ impl Av2Encoder {
                             };
                             let lambda =
                                 crate::av2::leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
-                            // DCT_DCT candidate.
+                            // DCT_DCT candidate (idx 0).
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                             let rec_dct = crate::av2::itx422::reconstruct_luma16(
                                 &pred_flat, &lev_dct, qstep_i, &SCAN16,
                             );
                             let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
-                            // ADST_ADST candidate (DST-VII both axes).
+                            // ADST_ADST candidate (idx 1, DST-VII both axes).
                             let lev_adst =
                                 bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = crate::av2::itx422::reconstruct_luma16_adst(
                                 &pred_flat, &lev_adst, qstep_i, &SCAN16, true, true,
                             );
-                            // ADST pays a slightly higher tx_type symbol (idx 1 > idx 0).
                             let cost_adst =
                                 sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
-                            // Ties → DCT (keeps byte output where ADST doesn't help).
-                            let use_adst = cost_adst < cost_dct;
-                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = if use_adst
+                            // ADST_DCT candidate (idx 2: ADST vertical, DCT horizontal →
+                            // inverse row_adst=false, col_adst=true). The tx_type symbol
+                            // costs ~3.1 bits more than DCT (idx 2 in the EXT_NEW_TX_SET
+                            // cdf), so it only wins on a clear distortion gain.
+                            let lev_ad =
+                                bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_ad = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_ad, qstep_i, &SCAN16, false, true,
+                            );
+                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            // DCT_ADST candidate (idx 3: DCT vertical, ADST horizontal →
+                            // inverse row_adst=true, col_adst=false; ~2.7 extra bits).
+                            let lev_da =
+                                bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_da = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_da, qstep_i, &SCAN16, true, false,
+                            );
+                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            // Pick the best tx_type. Tie-break preserves the original
+                            // DCT_DCT-over-ADST_ADST behaviour (each alternative must be
+                            // STRICTLY better), so byte output is unchanged wherever the
+                            // mixed transforms don't help.
+                            let mut best = cost_dct;
+                            let mut choice = 0usize;
+                            if cost_adst < best {
+                                best = cost_adst;
+                                choice = 1;
+                            }
+                            if cost_ad < best {
+                                best = cost_ad;
+                                choice = 2;
+                            }
+                            if cost_da < best {
+                                choice = 3;
+                            }
+                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice
                             {
-                                (&lev_adst, &rec_adst, 1)
-                            } else {
-                                (&lev_dct, &rec_dct, 0)
+                                1 => (&lev_adst, &rec_adst, 1),
+                                2 => (&lev_ad, &rec_ad, 2),
+                                3 => (&lev_da, &rec_da, 3),
+                                _ => (&lev_dct, &rec_dct, 0),
                             };
                             put_block_rect(&mut recy, pw, sb_y, sb_x, 16, 16, rec);
                             let tu: Vec<Coeff> = levels_to_coeffs(lev);
