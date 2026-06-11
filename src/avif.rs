@@ -183,7 +183,7 @@ impl EncodeConfig {
         self
     }
 
-    fn validate(&self) -> Result<(), EncodeError> {
+    pub(crate) fn validate(&self) -> Result<(), EncodeError> {
         validate_quality(self.quality)
     }
 }
@@ -202,8 +202,8 @@ fn validate_quality(quality: u8) -> Result<(), EncodeError> {
     Ok(())
 }
 
-fn validate_buf_u8(buf: &[u8], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
-    let needed = checked_buffer_size::<u8>(w as usize, h as usize, ch)?;
+pub(crate) fn validate_buf_u8<T>(buf: &[T], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
+    let needed = checked_buffer_size::<T>(w as usize, h as usize, ch)?;
     if buf.len() != needed {
         return Err(EncodeError::InvalidInput);
     }
@@ -312,7 +312,7 @@ fn finalize_color(
 }
 
 /// Finish wrapping a color + alpha OBU pair in an AVIF container.
-fn finalize_with_alpha(
+pub(crate) fn finalize_with_alpha(
     color_obu: Vec<u8>,
     alpha_obu: Vec<u8>,
     width: u32,

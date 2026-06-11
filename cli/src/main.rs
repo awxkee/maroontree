@@ -50,6 +50,11 @@
 //!   -h, --help                  Print this help
 //! ```
 
+mod av1_lossless;
+mod av2_lossless;
+
+use crate::av1_lossless::encode_av1_lossless;
+use crate::av2_lossless::encode_av2_lossless_image;
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, av2_map_quality,
@@ -227,7 +232,10 @@ fn parse_args() -> Args {
             Some(v) => v,
         },
         lossless,
-        chroma,
+        chroma: match chroma {
+            None => Some(if lossless { Chroma::C444 } else { Chroma::C422 }),
+            Some(v) => Some(v),
+        },
         depth,
         threads,
         no_alpha,
@@ -309,13 +317,18 @@ fn encode_av1(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
         Chroma::C422 => ChromaFormat::Yuv422,
         Chroma::C420 => ChromaFormat::Yuv420,
     };
     let (w, h) = (img.width(), img.height());
+
+    if args.lossless {
+        return encode_av1_lossless(img, args, color_type, effective_depth, icc, exif);
+    }
+
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
@@ -389,7 +402,7 @@ fn encode_av2(
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     let base_q = if args.lossless {
-        0
+        return encode_av2_lossless_image(img, args, color_type, effective_depth, icc, exif);
     } else {
         av2_map_quality(args.quality)
     };
@@ -550,9 +563,6 @@ fn encode_av2(
 fn main() {
     let args = parse_args();
 
-    if args.lossless && args.encoder == Encoder::Av1 {
-        die("--lossless requires --encoder av2");
-    }
     if args.lossless {
         if let Some(c) = args.chroma {
             if c != Chroma::C444 {

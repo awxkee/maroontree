@@ -6014,12 +6014,14 @@ mod tests {
             h: usize,
         ) -> (f64, f64) {
             let mut prof = vec![0.0f64; h];
-            for j in 0..h {
+            for (j, prof) in prof[..h].iter_mut().enumerate() {
                 let mut e = 0.0;
-                for i in 0..w {
-                    e += (recon[j * rw + i] - src[j * sw + i]) as f64;
+                let recon = &recon[j * rw..j * rw + w];
+                let src = &src[j * rw..j * rw + w];
+                for (&recon, &src) in recon.iter().zip(src.iter()) {
+                    e += (recon - src) as f64;
                 }
-                prof[j] = e / w as f64;
+                *prof = e / w as f64;
             }
             let lo = prof.iter().cloned().fold(f64::INFINITY, f64::min);
             let hi = prof.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -6033,17 +6035,8 @@ mod tests {
         }
         let p444;
         {
-            let (_b, r, (w8, _)) = encode_av1_lossy_image_cs_recon_dbg(
-                q,
-                8,
-                w,
-                h,
-                &fy,
-                &fu,
-                &fv,
-                Some(&color),
-                1,
-            );
+            let (_b, r, (w8, _)) =
+                encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &fy, &fu, &fv, Some(&color), 1);
             let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
             let (up, us) = analyze(&r[1], w8, &fu, w, w, h);
             eprintln!("FMT 444: luma p2p={yp:.2} step={ys:.2} | U p2p={up:.2} step={us:.2}");

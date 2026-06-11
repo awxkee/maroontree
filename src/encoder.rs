@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::avif::{checked_buffer_size, make_av1c, validate_dims};
+use crate::avif::{checked_buffer_size, finalize_with_alpha, make_av1c, validate_dims};
 use crate::color::ColorEncoding;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
@@ -467,13 +467,12 @@ pub fn encode_lossless_obu<T: Pixel>(
 pub fn encode_lossless<T: Pixel>(
     img: &PlanarImage<T>,
     cfg: &EncodeConfig,
-    threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
     if cfg.chroma != ChromaFormat::Yuv444 {
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
-    let obu = encode_lossless_obu(img, cfg.color_encoding.as_ref(), threads)?;
+    let obu = encode_lossless_obu(img, cfg.color_encoding.as_ref(), cfg.threads)?;
     let av1c = make_av1c(
         &obu,
         img.bit_depth as u8,
@@ -491,6 +490,61 @@ pub fn encode_lossless<T: Pixel>(
         cfg.color_encoding.as_ref(),
         cfg.icc.as_deref(),
         &cfg.metadata,
+    )
+}
+
+/// Encode a lossless 4:4:4 AVIF still with color signaling.
+pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
+    rgba: &[T],
+    width: u32,
+    height: u32,
+    bit_depth: BitDepth,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    cfg.validate()?;
+    crate::avif::validate_buf_u8(rgba, width, height, 4)?;
+    if cfg.chroma != ChromaFormat::Yuv444 {
+        return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
+    }
+    let mut rgb = vec![T::default(); width as usize * height as usize * 3];
+    let mut alpha = vec![T::default(); width as usize * height as usize];
+    for ((px, dst_rgb), alpha) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+        .zip(alpha.iter_mut())
+    {
+        dst_rgb[0] = px[0];
+        dst_rgb[1] = px[1];
+        dst_rgb[2] = px[2];
+        *alpha = px[3];
+    }
+    let img = PlanarImage::from_interleaved_rgb(width as usize, height as usize, bit_depth, &rgb);
+
+    let obu = encode_lossless_obu(&img, cfg.color_encoding.as_ref(), cfg.threads)?;
+
+    let alpha_obu = encode_lossy_gray_obu(
+        &PlanarImage {
+            width: img.width,
+            height: img.height,
+            bit_depth,
+            planes: [alpha, vec![], vec![]],
+        },
+        bit_depth,
+        0,
+        true,
+        cfg.threads,
+    )?;
+    finalize_with_alpha(
+        obu,
+        alpha_obu,
+        width,
+        height,
+        bit_depth.bits(),
+        cfg.chroma,
+        cfg,
     )
 }
 
