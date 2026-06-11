@@ -284,7 +284,7 @@ pub(crate) fn make_av1c(
 }
 
 /// Finish wrapping a color AV1 OBU stream in an AVIF container.
-fn finalize_color(
+pub(crate) fn finalize_color(
     av1_obu: Vec<u8>,
     width: u32,
     height: u32,
@@ -754,7 +754,7 @@ pub fn encode_gray12(
         &PlanarImage {
             width: width as usize,
             height: height as usize,
-            bit_depth: BitDepth::Eight,
+            bit_depth: BitDepth::Twelve,
             planes: [gray.to_vec(), vec![], vec![]],
         },
         BitDepth::Twelve,

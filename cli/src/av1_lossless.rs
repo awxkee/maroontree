@@ -29,8 +29,10 @@
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
     BitDepth, ChromaFormat, ChromaSamplePosition, ColorEncoding, EncodeConfig, MatrixCoefficients,
-    PlanarImage, Primaries, TransferFunction, encode_lossless, encode_lossless_with_alpha,
+    PlanarImage, Primaries, TransferFunction, encode_lossless, encode_lossless_gray,
+    encode_lossless_with_alpha,
 };
+use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444};
 
 pub(crate) fn encode_av1_lossless(
     img: &image::DynamicImage,
@@ -77,22 +79,57 @@ pub(crate) fn encode_av1_lossless(
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     Ok(match (effective_depth, gray, alpha) {
-        (Depth::D8, true, _) => return Err(anyhow::anyhow!("Lossless gray is not supported")),
-        (Depth::D8, false, false) => encode_lossless(
-            &PlanarImage::from_interleaved_rgb(
-                img.width() as usize,
-                img.height() as usize,
-                BitDepth::Eight,
-                &img.to_rgb8(),
-            ),
-            &cfg,
-        )?,
+        (Depth::D8, true, alpha) => {
+            if alpha {
+                encode_lossless_with_alpha(
+                    &img.to_luma_alpha8(),
+                    img.width(),
+                    img.height(),
+                    BitDepth::Eight,
+                    &cfg,
+                )?
+            } else {
+                encode_lossless_gray(
+                    &PlanarImage {
+                        width: img.width() as usize,
+                        height: img.height() as usize,
+                        bit_depth: BitDepth::Eight,
+                        planes: [img.to_luma8().to_vec(), vec![], vec![]],
+                    },
+                    &cfg,
+                )?
+            }
+        }
+        (Depth::D8, false, false) => {
+            let rgb8 = img.to_rgb8();
+            let mut planar_image =
+                YuvPlanarImageMut::alloc(rgb8.width(), rgb8.height(), YuvChromaSubsampling::Yuv444);
+            rgb_to_ycgco444(&mut planar_image, &rgb8, rgb8.width() * 3, YuvRange::Full)
+                .map_err(|x| anyhow::anyhow!(x))?;
+            let planar_image = PlanarImage {
+                width: rgb8.width() as usize,
+                height: rgb8.height() as usize,
+                bit_depth: BitDepth::Eight,
+                planes: [
+                    planar_image.y_plane.borrow().to_vec(),
+                    planar_image.u_plane.borrow().to_vec(),
+                    planar_image.v_plane.borrow().to_vec(),
+                ],
+            };
+            encode_lossless(&planar_image, &cfg)?
+        }
         (Depth::D8, false, true) => {
             encode_lossless_with_alpha(img.to_rgba8().as_raw(), w, h, BitDepth::Eight, &cfg)?
         }
-        (Depth::D10, true, _) => {
-            return Err(anyhow::anyhow!("Lossless gray is not supported"));
-        }
+        (Depth::D10, true, _) => encode_lossless_gray(
+            &PlanarImage {
+                width: img.width() as usize,
+                height: img.height() as usize,
+                bit_depth: BitDepth::Ten,
+                planes: [scale16_to_10(&img.to_luma16()).to_vec(), vec![], vec![]],
+            },
+            &cfg,
+        )?,
         (Depth::D10, false, false) => encode_lossless(
             &PlanarImage::from_interleaved_rgb(
                 img.width() as usize,
@@ -109,9 +146,15 @@ pub(crate) fn encode_av1_lossless(
             BitDepth::Ten,
             &cfg,
         )?,
-        (Depth::D12, true, _) => {
-            return Err(anyhow::anyhow!("Lossless gray is not supported"));
-        }
+        (Depth::D12, true, _) => encode_lossless_gray(
+            &PlanarImage {
+                width: img.width() as usize,
+                height: img.height() as usize,
+                bit_depth: BitDepth::Twelve,
+                planes: [scale16_to_10(&img.to_luma16()).to_vec(), vec![], vec![]],
+            },
+            &cfg,
+        )?,
         (Depth::D12, false, false) => encode_lossless(
             &PlanarImage::from_interleaved_rgb(
                 img.width() as usize,

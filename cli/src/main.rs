@@ -409,11 +409,7 @@ fn encode_av2(
     let chroma_choice = args
         .chroma
         .unwrap_or(if gray { Chroma::C444 } else { Chroma::C420 });
-    let color = if args.lossless {
-        ColorEncoding::identity_rgb()
-    } else {
-        ColorEncoding::srgb_ycbcr()
-    };
+    let color = ColorEncoding::srgb_ycbcr();
 
     let enc = Av2Encoder::new(base_q);
     let alpha_enc = Av2Encoder::new(0);

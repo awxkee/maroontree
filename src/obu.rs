@@ -81,7 +81,7 @@ pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8>
     // Single tile: one `0` stop-bit per dimension that spans >1 superblock.
     let cols = if sb_cols > 1 { vec![false] } else { vec![] };
     let rows = if sb_rows > 1 { vec![false] } else { vec![] };
-    frame_header_lossless_impl(&cols, &rows, 0, 0, false)
+    frame_header_lossless_impl(&cols, &rows, 0, 0, false, false)
 }
 
 /// Multi-tile lossless frame header. `cols_incr` / `rows_incr` are the
@@ -95,7 +95,14 @@ pub(crate) fn frame_header_lossless_multitile(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
 ) -> Vec<u8> {
-    frame_header_lossless_impl(cols_incr, rows_incr, tile_cols_log2, tile_rows_log2, false)
+    frame_header_lossless_impl(
+        cols_incr,
+        rows_incr,
+        tile_cols_log2,
+        tile_rows_log2,
+        false,
+        false,
+    )
 }
 
 /// Like [`frame_header_lossless_multitile`] but terminated with `trailing_bits()`
@@ -106,7 +113,53 @@ pub(crate) fn frame_header_lossless_multitile_th(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
 ) -> Vec<u8> {
-    frame_header_lossless_impl(cols_incr, rows_incr, tile_cols_log2, tile_rows_log2, true)
+    frame_header_lossless_impl(
+        cols_incr,
+        rows_incr,
+        tile_cols_log2,
+        tile_rows_log2,
+        true,
+        false,
+    )
+}
+
+/// Monochrome (`NumPlanes == 1`) lossless frame header. Identical to
+/// [`frame_header_lossless_multitile`] except the two chroma `DeltaQ` delta-coded
+/// flags are omitted: `quantization_params()` reads them only for
+/// `NumPlanes > 1`, so a monochrome frame must not code them or the decoder
+/// misaligns the bitstream.
+pub(crate) fn frame_header_lossless_mono_multitile(
+    cols_incr: &[bool],
+    rows_incr: &[bool],
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Vec<u8> {
+    frame_header_lossless_impl(
+        cols_incr,
+        rows_incr,
+        tile_cols_log2,
+        tile_rows_log2,
+        false,
+        true,
+    )
+}
+
+/// `trailing_bits()`-terminated monochrome lossless frame header for a
+/// standalone `OBU_FRAME_HEADER` (type 3).
+pub(crate) fn frame_header_lossless_mono_multitile_th(
+    cols_incr: &[bool],
+    rows_incr: &[bool],
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
+) -> Vec<u8> {
+    frame_header_lossless_impl(
+        cols_incr,
+        rows_incr,
+        tile_cols_log2,
+        tile_rows_log2,
+        true,
+        true,
+    )
 }
 
 fn frame_header_lossless_impl(
@@ -115,6 +168,7 @@ fn frame_header_lossless_impl(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     trailing: bool,
+    mono: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     // (reduced_still_picture_header => frame_type=KEY_FRAME, show_frame=1,
@@ -138,8 +192,12 @@ fn frame_header_lossless_impl(
     // quantization_params()
     w.f(0, 8); // base_q_idx = 0  -> lossless -> CodedLossless = 1
     w.flag(false); // DeltaQYDc delta_coded
-    w.flag(false); // DeltaQUDc delta_coded
-    w.flag(false); // DeltaQUAc delta_coded
+    if !mono {
+        // chroma delta-Q reads are coded only for NumPlanes > 1; monochrome
+        // (NumPlanes == 1) omits both, or the decoder misaligns the bitstream.
+        w.flag(false); // DeltaQUDc delta_coded
+        w.flag(false); // DeltaQUAc delta_coded
+    }
     w.flag(false); // using_qmatrix
     // segmentation_params()
     w.flag(false); // segmentation_enabled

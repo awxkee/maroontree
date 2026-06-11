@@ -185,7 +185,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
-                                &crate::av2::tables::SCAN,
+                                &tables::SCAN,
                                 neutral,
                                 qc,
                                 self.tune.rdoq_lambda,
@@ -389,7 +389,7 @@ impl Av2Encoder {
         enc.qc = get_q_ctx(self.base_q_idx);
         let qc = enc.qc;
         let neutral = self.dc_neutral();
-        let qstep_i = crate::av2::quant::qstep(self.base_q_idx as u32) as i32;
+        let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
         let mut above = vec![0x40u8; pw / 4 + 16];
         let mut left = vec![0x40u8; ph / 4 + 16];
         let sb_cols = pw / 64;

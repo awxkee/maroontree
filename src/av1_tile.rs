@@ -651,6 +651,232 @@ pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 
     wr.finish()
 }
 
+// ─── Monochrome (1-plane) lossless ───────────────────────────────────────────
+//
+// A monochrome AV1 frame has `mono_chrome = 1`, so `NumPlanes == 1` and
+// `HasChroma` is false. Relative to the 4:4:4 leaf, the decoder codes **no**
+// `uv_mode` symbol and **no** chroma transform blocks. These mono functions are
+// exact subsets of their 4:4:4 counterparts above — identical skip / kf_y mode /
+// angle_delta / luma-coefficient coding (so the verified luma bitstream is
+// reused byte-for-byte), with only the chroma elements removed. The `Plan`,
+// `LlState`, partition-context and coefficient helpers are shared unchanged; the
+// `uv_mode` slot in `Plan::Leaf` is carried as a `0` placeholder and ignored.
+
+/// Best luma mode for a mono leaf, with total residual+overhead bits (no uv).
+fn best_leaf_mono(
+    luma: &[i16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    n_tx: usize,
+    base: i32,
+) -> (f64, usize) {
+    let mut y_mode = 0usize;
+    let mut yb = f64::INFINITY;
+    for &m in LL_MODES.iter() {
+        let b = plane_leaf_bits(m, luma, stride, px, py, n_tx, base);
+        if b < yb {
+            yb = b;
+            y_mode = m;
+        }
+    }
+    let ang = |m: usize| if (1..=8).contains(&m) { 1.5 } else { 0.0 };
+    // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
+    let ovh = 4.0 + ang(y_mode);
+    (yb + ovh, y_mode)
+}
+
+/// Mono partition plan for a fully-in-frame square block (luma only).
+fn plan_full_mono(
+    luma: &[i16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    sz8: usize,
+    base: i32,
+) -> (f64, Plan) {
+    let (bits_leaf, ym) = best_leaf_mono(luma, stride, px, py, sz8 * 2, base);
+    let none = PART_NONE_BITS + bits_leaf;
+    if sz8 == 1 {
+        return (none, Plan::Leaf(ym, 0));
+    }
+    let hh = sz8 / 2;
+    let mut split = PART_SPLIT_BITS;
+    let mut kids: [Option<Plan>; 4] = [None, None, None, None];
+    for (i, (cx, cy)) in [
+        (px, py),
+        (px + hh * 8, py),
+        (px, py + hh * 8),
+        (px + hh * 8, py + hh * 8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (b, p) = plan_full_mono(luma, stride, cx, cy, hh, base);
+        split += b;
+        kids[i] = Some(p);
+    }
+    if none <= split {
+        (none, Plan::Leaf(ym, 0))
+    } else {
+        (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
+    }
+}
+
+/// Code a mono lossless leaf: block skip + kf_y mode (+ angle_delta) then the
+/// luma `(size/4)²` `TX_4X4` WHT. No uv_mode symbol, no chroma blocks.
+fn code_leaf_mono(
+    wr: &mut Writer,
+    luma: &[i16],
+    st: &mut LlState,
+    px: usize,
+    py: usize,
+    size: usize,
+    y_mode: usize,
+) {
+    let n_tx = size / 4;
+    wr.symbol(0, &C::BLK_SKIP); // skip = 0
+    let (x8, y8) = (px / 8, py / 8);
+    let kfy = icdf13(
+        &crate::av1real::KF_Y_MODE_CDF[crate::av1real::INTRA_MODE_CTX[st.a_mode[x8] as usize]]
+            [crate::av1real::INTRA_MODE_CTX[st.l_mode[y8] as usize]],
+    );
+    wr.symbol(y_mode as u32, &kfy);
+    if (1..=8).contains(&y_mode) {
+        wr.symbol(3, &icdf7(&crate::av1real::ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
+    }
+    // (mono: HasChroma == false ⇒ no uv_mode symbol, no chroma residual)
+    let u8sz = size / 8;
+    for u in x8..x8 + u8sz {
+        st.a_mode[u] = y_mode as u8;
+    }
+    for u in y8..y8 + u8sz {
+        st.l_mode[u] = y_mode as u8;
+    }
+    encode_plane_block(
+        wr,
+        luma,
+        st.w,
+        px,
+        py,
+        n_tx,
+        false, // luma
+        y_mode,
+        st.base,
+        &mut st.a_coef[0],
+        &mut st.l_coef[0],
+    );
+}
+
+/// Mono counterpart of [`encode_plan`].
+fn encode_plan_mono(
+    wr: &mut Writer,
+    luma: &[i16],
+    st: &mut LlState,
+    bl: usize,
+    x8: usize,
+    y8: usize,
+    sz8: usize,
+    plan: &Plan,
+) {
+    let (px, py) = (x8 * 8, y8 * 8);
+    match plan {
+        Plan::Leaf(ym, _uv) => {
+            wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
+            code_leaf_mono(wr, luma, st, px, py, sz8 * 8, *ym);
+            let pb = part_byte(sz8);
+            for u in x8..x8 + sz8 {
+                st.a_part[u] = pb;
+            }
+            for u in y8..y8 + sz8 {
+                st.l_part[u] = pb;
+            }
+        }
+        Plan::Split(kids) => {
+            wr.symbol(3, part_cdf(st, bl, x8, y8)); // PARTITION_SPLIT
+            let hh = sz8 / 2;
+            let corners = [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)];
+            for (i, (cx, cy)) in corners.into_iter().enumerate() {
+                encode_plan_mono(wr, luma, st, bl + 1, cx, cy, hh, &kids[i]);
+            }
+        }
+    }
+}
+
+/// Mono counterpart of [`decode_sb_ll`] (frame-edge force-split, luma only).
+fn decode_sb_ll_mono(
+    wr: &mut Writer,
+    luma: &[i16],
+    st: &mut LlState,
+    bl: usize,
+    x8: usize,
+    y8: usize,
+    sz8: usize,
+) {
+    let (px, py, size) = (x8 * 8, y8 * 8, sz8 * 8);
+    let full = px + size <= st.w && py + size <= st.h;
+
+    if full {
+        let (_bits, plan) = plan_full_mono(luma, st.w, px, py, sz8, st.base);
+        encode_plan_mono(wr, luma, st, bl, x8, y8, sz8, &plan);
+        return;
+    }
+    if sz8 == 1 {
+        let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
+        wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
+        let (_b, ym) = best_leaf_mono(luma, st.w, px, py, 2, st.base);
+        code_leaf_mono(wr, luma, st, px, py, 8, ym);
+        st.a_part[x8] = 0x1e;
+        st.l_part[y8] = 0x1e;
+        return;
+    }
+
+    let hh = sz8 / 2;
+    let have_h = (x8 + hh) * 8 < st.w;
+    let have_v = (y8 + hh) * 8 < st.h;
+    let cdf = part_cdf(st, bl, x8, y8);
+    if have_h && have_v {
+        wr.symbol(3, cdf); // PARTITION_SPLIT
+    } else if have_h {
+        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), true));
+    } else if have_v {
+        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), false));
+    }
+    for (cx, cy) in [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)] {
+        if cx * 8 < st.w && cy * 8 < st.h {
+            decode_sb_ll_mono(wr, luma, st, bl + 1, cx, cy, hh);
+        }
+    }
+}
+
+/// Encode a **monochrome** lossless AV1 tile (single luma plane), width/height
+/// multiples of 8. Structure mirrors [`encode_tile_lossless`] but for a 1-plane
+/// (`mono_chrome = 1`) frame: only the luma plane is coded.
+pub fn encode_tile_lossless_mono(w: usize, h: usize, bit_depth: u8, luma: &[i16]) -> Vec<u8> {
+    assert!(
+        w.is_multiple_of(8) && h.is_multiple_of(8),
+        "width/height must be multiples of 8"
+    );
+    let mut wr = Writer::new();
+    let mut st = LlState {
+        w,
+        h,
+        base: 1i32 << (bit_depth - 1),
+        a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
+        l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
+        a_part: vec![0; w / 8],
+        l_part: vec![0; h / 8],
+        a_mode: vec![0; w / 8],
+        l_mode: vec![0; h / 8],
+    };
+    for sb_y in (0..h).step_by(64) {
+        for sb_x in (0..w).step_by(64) {
+            decode_sb_ll_mono(&mut wr, luma, &mut st, 1, sb_x / 8, sb_y / 8, 8);
+        }
+    }
+    wr.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +921,54 @@ mod tests {
         assert_eq!(p.len(), 2904);
         assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 384244);
         assert_eq!(&p[..6], &[0xdd, 0x6b, 0x5a, 0xd7, 0x5b, 0x18]);
+    }
+
+    /// Mono lossless determinism + non-emptiness. The mono leaf is an exact
+    /// subset of the verified 4:4:4 leaf (no uv_mode symbol, no chroma blocks),
+    /// so its luma coding is byte-for-byte the 4:4:4 luma coding. Golden bytes
+    /// for these assertions should be captured once the stream is confirmed to
+    /// round-trip in dav1d/avifdec (a mono AVIF wrapper with `mono_chrome = 1`).
+    #[test]
+    fn mono_lossless_deterministic_nonempty() {
+        let (w, h) = (72usize, 64usize); // includes a frame-edge split column
+        let mut y = vec![0i16; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = (((i * 5 + j * 3) % 47) as i16) - 8;
+            }
+        }
+        let a = encode_tile_lossless_mono(w, h, 8, &y);
+        let b = encode_tile_lossless_mono(w, h, 8, &y);
+        assert!(!a.is_empty(), "mono lossless output must be non-empty");
+        assert_eq!(a, b, "mono lossless must be deterministic");
+        // A mono leaf omits the uv_mode symbol + 2 chroma planes, so for the same
+        // luma it must be strictly smaller than the 4:4:4 tile carrying that luma
+        // in all three planes.
+        let c444 = encode_tile_lossless(w, h, 8, [&y, &y, &y]);
+        assert!(
+            a.len() < c444.len(),
+            "mono ({}) must be smaller than 4:4:4 ({})",
+            a.len(),
+            c444.len()
+        );
+    }
+
+    /// 10- and 12-bit mono lossless must encode without panicking and stay
+    /// deterministic (the `base` pivot is `1<<(bd-1)`).
+    #[test]
+    fn mono_lossless_highbd_runs() {
+        let (w, h) = (64usize, 64usize);
+        for &bd in &[10u8, 12u8] {
+            let maxv = (1i32 << bd) - 1;
+            let mut y = vec![0i16; w * h];
+            for j in 0..h {
+                for i in 0..w {
+                    y[j * w + i] = (((i * 17 + j * 11) as i32) % (maxv + 1)) as i16;
+                }
+            }
+            let p = encode_tile_lossless_mono(w, h, bd, &y);
+            assert!(!p.is_empty());
+            assert_eq!(p, encode_tile_lossless_mono(w, h, bd, &y));
+        }
     }
 }
