@@ -109,11 +109,10 @@ pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     for r in 0..bs {
         let s_top = BLEND_WEIGHT_MAX >> clamp_log2.min(((r as i32) << 1) >> scale);
         let row = &mut out[r * bs..r * bs + bs];
-        for c in 0..bs {
-            let top = above[c];
+        for (&top, out) in above[..bs].iter().zip(row[..bs].iter_mut()) {
             let mut predv = bl + divide_round((top - bl) * (bs as i32 - 1 - r as i32), log2_h);
             predv += divide_round((top - predv) * s_top, blend_max_log2 + 1);
-            row[c] = predv as f32;
+            *out = predv as f32;
         }
     }
     out
@@ -133,11 +132,11 @@ pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     for r in 0..bs {
         let l = left[r];
         let row = &mut out[r * bs..r * bs + bs];
-        for c in 0..bs {
+        for (c, out) in row[..bs].iter_mut().enumerate() {
             let s_left = BLEND_WEIGHT_MAX >> clamp_log2.min(((c as i32) << 1) >> scale);
             let mut predh = tr + divide_round((l - tr) * (bs as i32 - 1 - c as i32), log2_w);
             predh += divide_round((l - predh) * s_left, blend_max_log2 + 1);
-            row[c] = predh as f32;
+            *out = predh as f32;
         }
     }
     out

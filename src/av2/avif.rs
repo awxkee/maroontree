@@ -30,10 +30,14 @@
 use crate::ColorEncoding;
 use crate::av2::Av2Frame;
 
-pub enum Av2Color {
+pub(crate) enum Av2Color {
     Cicp(ColorEncoding),
+    #[allow(unused)]
     Icc(Vec<u8>),
-    Both { cicp: ColorEncoding, icc: Vec<u8> },
+    Both {
+        cicp: ColorEncoding,
+        icc: Vec<u8>,
+    },
 }
 
 fn w16(buf: &mut Vec<u8>, v: u16) {

@@ -70,11 +70,7 @@ pub(super) fn predict_luma(
     let bottom_available = (yd > 0) && ((mi_row + row_off + 8) < mi_row_end);
     // top-right: needed by TX 0/1/2 (TX 3 has col_off+txw==block width -> none)
     let tr_ok = matches!(i, 0..=2) && have_above && right_available && xr > 0;
-    let tr_px = if tr_ok {
-        (xr.min(32)).max(0) as usize
-    } else {
-        0
-    };
+    let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
     // bottom-left: only TX 0 (others sit at/under the block's bottom-left edge)
     let bl_ok = i == 0 && have_left && bottom_available && yd > 0;
     let bl_px = if bl_ok {
@@ -118,7 +114,7 @@ fn project_luma_rdoq(
 ) -> Vec<f32> {
     if lambda > 0.0 {
         let (mut l, prm) = luma.project_scan_with_prm(resid, scan);
-        *cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+        *cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
         l
     } else {
         let l = luma.project(resid, 0.0);
@@ -130,7 +126,6 @@ fn project_luma_rdoq(
         l
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_luma_sb(
@@ -292,7 +287,7 @@ pub(super) fn encode_luma_leaf32(
     for &m in &[0usize, 1, 2, 3, 4] {
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
-        for ti in 0..2 {
+        for (ti, tus) in tus[..2].iter_mut().enumerate() {
             let (y0, x0) = (sb_y, sb_x + ti * 32);
             let pblk = predict_luma_leaf32(recy, pw, mi_cols, mi_rows, sb_y, sb_x, ti, m, neutral);
             for r in 0..32 {
@@ -302,9 +297,9 @@ pub(super) fn encode_luma_leaf32(
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
-            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
+            let rb = reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
-            tus[ti] = levels_to_coeffs(&lev);
+            *tus = levels_to_coeffs(&lev);
         }
         if m != 0 {
             cost += 6.0;
@@ -359,17 +354,9 @@ pub(super) fn predict_luma_leaf_tu(
     let right_available = (mi_col + col_off + 8) < mc;
     let bottom_available = (yd > 0) && ((mi_row + row_off + 8) < mr);
     let tr_ok = matches!(i, 0..=2) && have_above && right_available && xr > 0;
-    let tr_px = if tr_ok {
-        (xr.min(32)).max(0) as usize
-    } else {
-        0
-    };
+    let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
     let bl_ok = i == 0 && have_left && bottom_available && yd > 0;
-    let bl_px = if bl_ok {
-        (yd.min(32)).max(0) as usize
-    } else {
-        0
-    };
+    let bl_px = if bl_ok { yd.min(32).max(0) as usize } else { 0 };
     let (ab, lf, corner) =
         intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
     if m == 1 {

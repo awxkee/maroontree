@@ -29,7 +29,7 @@
 
 use crate::av2::quant::{BASE_Q, qstep};
 use crate::av2::tables::{
-    SCAN, SCAN4X32, SCAN8X16, SCAN8X32, SCAN16, SCAN16X8, SCAN16X32, SCAN32X8, SCAN32X16,
+    SCAN, SCAN4X32, SCAN8X8, SCAN8X16, SCAN8X32, SCAN16, SCAN16X8, SCAN16X32, SCAN32X8, SCAN32X16,
 };
 
 pub(crate) struct Basis {
@@ -157,6 +157,8 @@ pub(crate) struct Bases {
     pub(crate) c8x64: Basis,
     pub(crate) c32x16: Basis,
     pub(crate) c8x16: Basis,
+    /// 8×8 chroma basis (TX_8X8) for the 4:2:0 16×16 luma corner leaf.
+    pub(crate) c8x8: Basis,
     /// 4:2:2 8-family chroma: 8×32 luma→4×32 (TX_4X32) and 32×8 luma→16×8 (TX_16X8).
     pub(crate) c4x32: Basis,
     pub(crate) c16x8: Basis,
@@ -194,6 +196,7 @@ impl Bases {
         self.c8x64.max_val = mv;
         self.c32x16.max_val = mv;
         self.c8x16.max_val = mv;
+        self.c8x8.max_val = mv;
         self.c4x32.max_val = mv;
         self.c16x8.max_val = mv;
     }
@@ -217,6 +220,7 @@ impl Bases {
             self.c8x64.scale(f);
             self.c32x16.scale(f);
             self.c8x16.scale(f);
+            self.c8x8.scale(f);
             self.c4x32.scale(f);
             self.c16x8.scale(f);
         }
@@ -509,7 +513,7 @@ impl Basis {
         lev
     }
 
-    /// Scan-parameterised [`project_with_prm`]: round levels + `|pr|`, no EOB
+    /// Scan-parameterized [`project_with_prm`]: round levels + `|pr|`, no EOB
     /// truncation, for the partition leaf paths (all TX_32X32-class).
     pub(crate) fn project_scan_with_prm(
         &self,
@@ -687,14 +691,11 @@ fn parse_bases(b: &[u8]) -> Bases {
     let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32dup64, 64, &SCAN32X16);
     let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
     let lh16_adst = build_adst16_profile(ldc);
-    let luma16x16_adst =
-        Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16_adst, 16, &SCAN16);
+    let luma16x16_adst = Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16_adst, 16, &SCAN16);
     // ADST_DCT: ADST vertical (h_vert), DCT horizontal (h_horiz).
-    let luma16x16_adst_dct =
-        Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16, 16, &SCAN16);
+    let luma16x16_adst_dct = Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16, 16, &SCAN16);
     // DCT_ADST: DCT vertical (h_vert), ADST horizontal (h_horiz).
-    let luma16x16_dct_adst =
-        Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16_adst, 16, &SCAN16);
+    let luma16x16_dct_adst = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16_adst, 16, &SCAN16);
     let lh4 = build_dct_profile(4, lh[0]);
     let lh8 = build_dct_profile(8, lh[0]);
     let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
@@ -703,6 +704,7 @@ fn parse_bases(b: &[u8]) -> Bases {
     let c8x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh8, 8, &SCAN8X32);
     let c32x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32, 32, &SCAN32X16);
     let c8x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh8, 8, &SCAN8X16);
+    let c8x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh8, 8, &SCAN8X8);
     let c4x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh4, 4, &SCAN4X32);
     let c16x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh16, 16, &SCAN16X8);
     Bases {
@@ -723,6 +725,7 @@ fn parse_bases(b: &[u8]) -> Bases {
         c8x64,
         c32x16,
         c8x16,
+        c8x8,
         c4x32,
         c16x8,
     }
@@ -763,7 +766,11 @@ fn build_adst16_profile(dc_sample: f32) -> Vec<f32> {
     let mut h = vec![0f32; NF * n];
     for k in 0..n {
         let row = &crate::av2::itx422::ADST16[k * 16..k * 16 + 16];
-        let norm = row.iter().map(|&v| (v as f32) * (v as f32)).sum::<f32>().sqrt();
+        let norm = row
+            .iter()
+            .map(|&v| (v as f32) * (v as f32))
+            .sum::<f32>()
+            .sqrt();
         for x in 0..n {
             h[k * n + x] = amp * (row[x] as f32) / norm;
         }

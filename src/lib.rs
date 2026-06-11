@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(clippy::manual_clamp)]
 
 mod av1_coefs;
 mod av1_tables;
@@ -66,5 +67,5 @@ pub use avif::{
 pub use color::{
     ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
 };
-pub use encoder::{PlanarImage, encode_lossless, encode_lossless_with};
+pub use encoder::{PlanarImage, encode_lossless, encode_lossless_obu};
 pub use pixel::{BitDepth, Pixel};

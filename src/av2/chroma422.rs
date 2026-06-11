@@ -38,14 +38,9 @@ pub(super) fn recon_422_chroma(
     ch: usize,
     basis: &Basis,
 ) -> Vec<f32> {
-    // Bit-exact real-inverse reconstruction for the chroma TXs whose entropy/recon
-    // round-trips bit-exactly against avmdec (coeff areas 128/256/1024). The three
-    // coeff-area-512 rect TXs (16x64, 16x32, 32x16) fall back to the analytical basis
-    // — exactly as the luma rect edge leaves do — since they sit only in thin residue
-    // edge strips where the analytical recon is the established, decode-clean path.
     match (cw, ch) {
         (32, 64) | (32, 32) | (8, 64) | (8, 16) | (4, 32) | (16, 8) => {
-            crate::av2::itx422::reconstruct_chroma_rect(pred, lev, qstep, scan, cw, ch)
+            itx422::reconstruct_chroma_rect(pred, lev, qstep, scan, cw, ch)
         }
         _ => basis.reconstruct_scan(pred, lev, scan),
     }

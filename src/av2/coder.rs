@@ -253,11 +253,27 @@ fn encode_eob(enc: &mut RangeEncoder, eob: usize, eob_bin: &[u16], eob_hi_bit: u
 // term is the actual coded cost, contextualised by `luma_coeff_context`. We then
 // (A) RD-optimise each coefficient's magnitude and (B) RD-trim the EOB.
 
+/// Precomputed `log2(32768/d)` for d in 1..=32768. The coefficient-cost CDFs are fixed
+/// (allow_update=0), so every `tok_cost` is a constant of the interval width `d = hi-lo`;
+/// caching `log2` turns the innermost RDOQ rate term from a transcendental into a lookup
+/// (values are bit-identical to the direct computation, so encoder output is unchanged).
+static TOK_LOG2_LUT: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
 #[inline]
+fn tok_log2_lut() -> &'static [f64] {
+    TOK_LOG2_LUT.get_or_init(|| {
+        let mut v = vec![0.0f64; 32769];
+        for (d, slot) in v.iter_mut().enumerate().skip(1) {
+            *slot = (32768.0 / d as f64).log2();
+        }
+        v[0] = v[1];
+        v
+    })
+}
+
 fn tok_cost(icdf: &[u16], s: usize) -> f64 {
     let hi = if s == 0 { 32768i32 } else { icdf[s - 1] as i32 };
     let lo = if s < icdf.len() { icdf[s] as i32 } else { 0 };
-    (32768.0 / (hi - lo).max(1) as f64).log2()
+    tok_log2_lut()[(hi - lo).max(1) as usize]
 }
 
 #[inline]
@@ -337,8 +353,8 @@ pub(crate) fn rdoq_luma(
 ) -> f64 {
     let n = lev.len();
     let mut eob = 0usize;
-    for k in 0..n {
-        if lev[k] != 0.0 {
+    for (k, &lev) in lev[..n].iter().enumerate() {
+        if lev != 0.0 {
             eob = k;
         }
     }
@@ -364,7 +380,11 @@ pub(crate) fn rdoq_luma(
         let rc = scan[k] as i32;
         let high_freq = k >= LUMA_HI_TO_LOW;
         let limit = if high_freq { 3 } else { 5 };
-        levels[plvl(rc) as usize] = if mag < limit { mag } else { limit + (mag - limit).min(3) };
+        levels[plvl(rc) as usize] = if mag < limit {
+            mag
+        } else {
+            limit + (mag - limit).min(3)
+        };
     };
 
     // Phase A: per-coefficient magnitude RD (EOB fixed).
@@ -396,8 +416,8 @@ pub(crate) fn rdoq_luma(
     // Phase B: EOB RD-trim.
     loop {
         let mut last = None;
-        for k in 0..=eob {
-            if lev[k] != 0.0 {
+        for (k, &lev) in lev[..=eob].iter().enumerate() {
+            if lev != 0.0 {
                 last = Some(k);
             }
         }
@@ -579,6 +599,7 @@ fn encode_chroma_tokens_scan(
 /// Rectangular chroma block coder for the 16-tap family (TX_16X64/TX_64X16 chroma,
 /// 16×32 / 32×16 coeff region). `scan` + `area` parameterise the region; `eob_bin`
 /// selects the 512-region chroma EOB cdf (CHROMA_EOB512_QC).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_chroma_block_rect(
     enc: &mut RangeEncoder,
     coeffs: &[Coeff],
@@ -814,6 +835,7 @@ fn encode_luma16_tokens_scan(
 /// skip, EOB (class 256), then — when eob>0 — the EXT_NEW_TX_SET tx_type symbol
 /// (DCT_DCT = index 0, mode-independent since bit 0 is always the lowest set bit
 /// of av2_md_trfm_used_flag), then the class-2 tokens and signs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_leaf_16x16_full(
     enc: &mut RangeEncoder,
     tu: &[Coeff],
@@ -831,7 +853,7 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     // 0 = DCT_DCT, 1 = ADST_ADST (mode-independent for the DC/SMOOTH/PAETH classes
     // this encoder emits). CDFs are non-adaptive (frame disable_cdf_update), so the
     // fixed icdf stays in sync regardless of which index is coded.
-    const INTRA_EXT_TX16: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
+    static INTRA_EXT_TX16: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE -> single TX_16X16
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
@@ -847,9 +869,12 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, &SCAN16, 256);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    nonzero.iter().map(|&(_, l)| l.unsigned_abs()).sum::<u32>().min(63)
+    nonzero
+        .iter()
+        .map(|&(_, l)| l.unsigned_abs())
+        .sum::<u32>()
+        .min(63)
 }
-
 
 /// Generalised luma coeff-token coder. `scan` is the coefficient scan in slimav
 /// column-major convention (rc = a*32 + c); `area` = coeff-region width*height,
@@ -926,6 +951,7 @@ pub(crate) fn encode_luma_tu32(
 /// (SCAN16, area 256). Coeff base/br cdfs are the shared TX_32X32 class; only the
 /// scan, eob cdf, and EOB-token thresholds (area) differ. `eob_bin`/`eob_hi` select
 /// the EOB position-token cdf (EOB512_QC for 16X64/64X16).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_tu_rect(
     enc: &mut RangeEncoder,
     coeffs: &[Coeff],
@@ -1135,6 +1161,7 @@ pub(crate) fn encode_luma_leaf_32x64(
 /// would otherwise use. All three are entropy class 2 (LUMA16 LF eob cdf) with eob
 /// class 256. `dc_level` 0 → skip. `tx_type` is luma-only so chroma still codes full
 /// AC. The DC is the LF eob coeff at raster pos 0, base-range context 0.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_leaf_dc_class2(
     enc: &mut RangeEncoder,
     dc_level: i32,

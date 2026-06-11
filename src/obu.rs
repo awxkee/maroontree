@@ -318,7 +318,7 @@ pub(crate) fn sequence_header_cicp(
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: &crate::color::ColorEncoding,
+    color: Option<&crate::color::ColorEncoding>,
 ) -> Vec<u8> {
     seq_header_ss(width, height, profile, bit_depth, color, 0, 0)
 }
@@ -330,7 +330,7 @@ pub(crate) fn sequence_header_cicp_ss(
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: &crate::color::ColorEncoding,
+    color: Option<&crate::color::ColorEncoding>,
     ss_x: u32,
     ss_y: u32,
 ) -> Vec<u8> {
@@ -392,12 +392,18 @@ pub(crate) fn sequence_header_mono(
 /// (0/1 each): (0,0) = 4:4:4, (1,0) = 4:2:2, (1,1) = 4:2:0. Subsampling is coded
 /// in `color_config` only for profile 2 at 12-bit (otherwise it is implied by
 /// the profile); `chroma_sample_position` is coded whenever the format is 4:2:0.
+///
+/// `color` is optional: when `None`, `color_description_present_flag` is 0 and
+/// primaries/transfer/matrix default to *_UNSPECIFIED. With no description the
+/// MC_IDENTITY path is unreachable, so `color_range` and the subsampling/CSP
+/// bits are always coded; `color_range` defaults to limited (0) and
+/// `chroma_sample_position` to CSP_UNKNOWN (0).
 fn seq_header_ss(
     width: u32,
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: &crate::color::ColorEncoding,
+    color: Option<&crate::color::ColorEncoding>,
     ss_x: u32,
     ss_y: u32,
 ) -> Vec<u8> {
@@ -432,15 +438,30 @@ fn seq_header_ss(
     if profile != 1 {
         w.flag(false); // mono_chrome = 0
     }
-    w.flag(true); // color_description_present_flag = 1
-    w.f(color.primaries as u32, 8);
-    w.f(color.transfer as u32, 8);
-    w.f(color.matrix as u32, 8);
-    if color.matrix == MatrixCoefficients::Identity {
+
+    // The MC_IDENTITY (RGB) path forces range=1 and 4:4:4 without coding them,
+    // but it requires an explicit color description — so it can never apply when
+    // color info is absent.
+    let is_identity = matches!(color, Some(c) if c.matrix == MatrixCoefficients::Identity);
+
+    if let Some(c) = color {
+        w.flag(true); // color_description_present_flag = 1
+        w.f(c.primaries as u32, 8);
+        w.f(c.transfer as u32, 8);
+        w.f(c.matrix as u32, 8);
+    } else {
+        w.flag(false); // color_description_present_flag = 0
+        // primaries/transfer/matrix implicitly *_UNSPECIFIED (not coded)
+    }
+
+    if is_identity {
         // MC_IDENTITY ⇒ AV1 forces color_range = 1 and subsampling 0,0 (4:4:4);
         // neither is coded here.
     } else {
-        w.flag(color.full_range); // color_range
+        // color_range from the description when present, else limited (0).
+        let full_range = color.map(|c| c.full_range).unwrap_or(false);
+        w.flag(full_range); // color_range
+
         // AV1 §5.5.2: subsampling is coded explicitly only for profile 2 at
         // 12-bit; for all other profiles it is implied (0 ⇒ 4:2:0, 1 ⇒ 4:4:4,
         // 2/8-10bit ⇒ 4:2:2). chroma_sample_position is coded for 4:2:0.
@@ -451,7 +472,8 @@ fn seq_header_ss(
             }
         }
         if ss_x == 1 && ss_y == 1 {
-            w.f(color.chroma_sample_position as u32, 2);
+            let csp = color.map(|c| c.chroma_sample_position as u32).unwrap_or(0);
+            w.f(csp, 2); // chroma_sample_position (CSP_UNKNOWN=0 when absent)
         }
     }
     w.flag(false); // separate_uv_delta_q
