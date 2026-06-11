@@ -134,6 +134,14 @@ pub(crate) struct Bases {
     /// ADST_ADST (DST-VII both axes) 16×16 luma basis — the mode-dependent transform
     /// alternative to `luma16x16` (DCT_DCT) for native TX_16X16 intra leaves.
     pub(crate) luma16x16_adst: Basis,
+    /// Mixed 1D transforms for native TX_16X16 intra leaves (DC mode, EXT_NEW_TX_SET):
+    /// `luma16x16_adst_dct` = ADST_DCT (idx 2: ADST vertical / DST-VII column, DCT
+    /// horizontal); `luma16x16_dct_adst` = DCT_ADST (idx 3: DCT vertical, ADST
+    /// horizontal). Per avm, the row (horizontal) transform is g_hor_tx_type and the
+    /// column (vertical) is g_ver_tx_type; from_1d_rect_scan's `h_vert` is the vertical
+    /// (column-index) profile and `h_horiz` the horizontal (row-index) profile.
+    pub(crate) luma16x16_adst_dct: Basis,
+    pub(crate) luma16x16_dct_adst: Basis,
     /// 8-tap-family luma bases (residue-2 leaves). The right/bottom edges partition to
     /// 8×32 / 32×8 (BLOCK_8X64 would be 1:8 aspect, which is disallowed). `luma8x32` =
     /// 8 wide × 32 tall (TX_8X32, SCAN8X32); `luma32x8` = 32 wide × 8 tall (TX_32X8,
@@ -178,6 +186,8 @@ impl Bases {
         self.luma64x16.max_val = mv;
         self.luma16x16.max_val = mv;
         self.luma16x16_adst.max_val = mv;
+        self.luma16x16_adst_dct.max_val = mv;
+        self.luma16x16_dct_adst.max_val = mv;
         self.luma8x32.max_val = mv;
         self.luma32x8.max_val = mv;
         self.c16x32.max_val = mv;
@@ -199,6 +209,8 @@ impl Bases {
             self.luma64x16.scale(f);
             self.luma16x16.scale(f);
             self.luma16x16_adst.scale(f);
+            self.luma16x16_adst_dct.scale(f);
+            self.luma16x16_dct_adst.scale(f);
             self.luma8x32.scale(f);
             self.luma32x8.scale(f);
             self.c16x32.scale(f);
@@ -677,6 +689,12 @@ fn parse_bases(b: &[u8]) -> Bases {
     let lh16_adst = build_adst16_profile(ldc);
     let luma16x16_adst =
         Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16_adst, 16, &SCAN16);
+    // ADST_DCT: ADST vertical (h_vert), DCT horizontal (h_horiz).
+    let luma16x16_adst_dct =
+        Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16, 16, &SCAN16);
+    // DCT_ADST: DCT vertical (h_vert), ADST horizontal (h_horiz).
+    let luma16x16_dct_adst =
+        Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16_adst, 16, &SCAN16);
     let lh4 = build_dct_profile(4, lh[0]);
     let lh8 = build_dct_profile(8, lh[0]);
     let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
@@ -697,6 +715,8 @@ fn parse_bases(b: &[u8]) -> Bases {
         luma64x16,
         luma16x16,
         luma16x16_adst,
+        luma16x16_adst_dct,
+        luma16x16_dct_adst,
         luma8x32,
         luma32x8,
         c16x32,
