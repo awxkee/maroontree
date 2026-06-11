@@ -70,23 +70,13 @@ const NF: usize = 32; // coded frequencies per axis
 /// flat/detailed/directional content). Crucially this only touches the *trailing* tail;
 /// thresholding interior coefficients the same way regresses badly. Overridable via
 /// `AV2_EOB_T` for retuning on other material.
-const RDOQ_EOB_T: f32 = 0.9;
-
-fn rdoq_eob_t() -> f32 {
-    use std::sync::OnceLock;
-    static T: OnceLock<f32> = OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("AV2_EOB_T")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(RDOQ_EOB_T)
-    })
-}
+pub(crate) const RDOQ_EOB_T: f32 = 0.9;
+/// Default trellis-RDOQ strength (see [`crate::av2::Tuning::rdoq_lambda`]).
+pub(crate) const DEFAULT_RDOQ_LAMBDA: f64 = 0.09;
 
 /// Zero trailing coefficients (scan order) whose unrounded magnitude `prm[k]` is below the
-/// EOB threshold, stopping at the first kept coefficient. `lev`/`prm` are in scan order.
-fn rdoq_truncate_eob(lev: &mut [f32], prm: &[f32]) {
-    let t = rdoq_eob_t();
+/// EOB threshold `t`, stopping at the first kept coefficient. `lev`/`prm` are in scan order.
+fn rdoq_truncate_eob(lev: &mut [f32], prm: &[f32], t: f32) {
     if t <= 0.0 {
         return;
     }
@@ -141,6 +131,9 @@ pub(crate) struct Bases {
     pub(crate) luma16x64: Basis,
     pub(crate) luma64x16: Basis,
     pub(crate) luma16x16: Basis,
+    /// ADST_ADST (DST-VII both axes) 16×16 luma basis — the mode-dependent transform
+    /// alternative to `luma16x16` (DCT_DCT) for native TX_16X16 intra leaves.
+    pub(crate) luma16x16_adst: Basis,
     /// 8-tap-family luma bases (residue-2 leaves). The right/bottom edges partition to
     /// 8×32 / 32×8 (BLOCK_8X64 would be 1:8 aspect, which is disallowed). `luma8x32` =
     /// 8 wide × 32 tall (TX_8X32, SCAN8X32); `luma32x8` = 32 wide × 8 tall (TX_32X8,
@@ -184,6 +177,7 @@ impl Bases {
         self.luma16x64.max_val = mv;
         self.luma64x16.max_val = mv;
         self.luma16x16.max_val = mv;
+        self.luma16x16_adst.max_val = mv;
         self.luma8x32.max_val = mv;
         self.luma32x8.max_val = mv;
         self.c16x32.max_val = mv;
@@ -204,6 +198,7 @@ impl Bases {
             self.luma16x64.scale(f);
             self.luma64x16.scale(f);
             self.luma16x16.scale(f);
+            self.luma16x16_adst.scale(f);
             self.luma8x32.scale(f);
             self.luma32x8.scale(f);
             self.c16x32.scale(f);
@@ -328,7 +323,7 @@ impl Basis {
                 *dst = pr.round();
             }
         }
-        rdoq_truncate_eob(&mut lev, &prm);
+        rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
         lev
     }
 
@@ -498,7 +493,7 @@ impl Basis {
                 *dst = pr.round();
             }
         }
-        rdoq_truncate_eob(&mut lev, &prm);
+        rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
         lev
     }
 
@@ -664,12 +659,26 @@ fn parse_bases(b: &[u8]) -> Bases {
     // would inject the chroma quant scale and produce a pathologically dense block.
     let lh16 = build_dct_profile(16, lh[0]);
     let lh64 = build_dct_profile(64, lh[0]);
-    let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh16, 16, &SCAN16X32);
-    let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh64, 64, &SCAN32X16);
+    let lh32 = build_dct_profile(32, lh[0]);
+    // avm's TX_16X64 inverse is a 32-pt IDCT followed by nearest row-duplication
+    // (32→64), NOT a 64-pt IDCT. The forward basis profile must equal that spatial
+    // response, so the 64-tall vertical profile is the 32-pt profile with each row
+    // duplicated. (Using lh64 here projects onto 64-pt DCT modes the decoder never
+    // inverts → garbage AC; DC happens to agree, which is why DC-only worked.)
+    let mut lh32dup64 = vec![0f32; NF * 64];
+    for c in 0..NF {
+        for py in 0..64 {
+            lh32dup64[c * 64 + py] = lh32[c * 32 + py / 2];
+        }
+    }
+    let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh32dup64, 64, &lh16, 16, &SCAN16X32);
+    let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32dup64, 64, &SCAN32X16);
     let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
+    let lh16_adst = build_adst16_profile(ldc);
+    let luma16x16_adst =
+        Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16_adst, 16, &SCAN16);
     let lh4 = build_dct_profile(4, lh[0]);
     let lh8 = build_dct_profile(8, lh[0]);
-    let lh32 = build_dct_profile(32, lh[0]);
     let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
     let luma32x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh32, 32, &SCAN32X8);
     let c16x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh16, 16, &SCAN16X32);
@@ -687,6 +696,7 @@ fn parse_bases(b: &[u8]) -> Bases {
         luma16x64,
         luma64x16,
         luma16x16,
+        luma16x16_adst,
         luma8x32,
         luma32x8,
         c16x32,
@@ -722,12 +732,32 @@ fn build_dct_profile(n: usize, dc_sample: f32) -> Vec<f32> {
     h
 }
 
+/// Forward 16-pt ADST (DST-VII) 1D profile, calibrated to the same gain as
+/// [`build_dct_profile`] so the existing TX_16X16 quant step applies unchanged: each
+/// frequency row is the avm inverse-ADST kernel row (`itx422::ADST16`, the synthesis
+/// basis) renormalised to unit energy and scaled by `amp = dc_sample·sqrt(16)`. Only
+/// the 16 real frequencies are populated; rows 16..NF stay zero.
+fn build_adst16_profile(dc_sample: f32) -> Vec<f32> {
+    let n = 16usize;
+    let amp = dc_sample / (1.0 / (n as f32)).sqrt();
+    let mut h = vec![0f32; NF * n];
+    for k in 0..n {
+        let row = &crate::av2::itx422::ADST16[k * 16..k * 16 + 16];
+        let norm = row.iter().map(|&v| (v as f32) * (v as f32)).sum::<f32>().sqrt();
+        for x in 0..n {
+            h[k * n + x] = amp * (row[x] as f32) / norm;
+        }
+    }
+    h
+}
+
 /// Bases compiled into the binary (default).
 pub(crate) fn default_bases() -> Bases {
     parse_bases(EMBEDDED_BASES)
 }
 
 /// Override: load bases from an external `SL1D` file (e.g. a different quantizer).
+#[allow(dead_code)]
 pub(crate) fn load_bases(path: &str) -> Bases {
     let b = std::fs::read(path).unwrap_or_else(|_| panic!("cannot read bases file {path}"));
     parse_bases(&b)

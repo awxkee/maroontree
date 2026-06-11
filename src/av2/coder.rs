@@ -364,11 +364,7 @@ pub(crate) fn rdoq_luma(
         let rc = scan[k] as i32;
         let high_freq = k >= LUMA_HI_TO_LOW;
         let limit = if high_freq { 3 } else { 5 };
-        levels[plvl(rc) as usize] = if mag < limit {
-            mag
-        } else {
-            limit + (mag - limit).min(3)
-        };
+        levels[plvl(rc) as usize] = if mag < limit { mag } else { limit + (mag - limit).min(3) };
     };
 
     // Phase A: per-coefficient magnitude RD (EOB fixed).
@@ -720,6 +716,141 @@ fn encode_luma32_tokens(enc: &mut RangeEncoder, coeffs: &[Coeff], eob: usize) ->
     encode_luma_tokens_scan(enc, coeffs, eob, &SCAN, 1024)
 }
 
+// ---- TX_16X16 (entropy class 2) full-AC luma token coding (clones of the 32x32
+// versions using the LUMA16 base/eob token cdfs; base-range cdf is shared). ----
+fn encode_luma16_token(
+    enc: &mut RangeEncoder,
+    level: u32,
+    is_eob: bool,
+    base_ctx: usize,
+    hi_range_ctx: usize,
+    high_freq: bool,
+) -> i32 {
+    let limit = if high_freq { 3 } else { 5 };
+    if !high_freq {
+        if is_eob {
+            if level <= 4 {
+                enc.encode_symbol(
+                    &LUMA16_EOB_TOK_LF_QC[enc.qc][base_ctx],
+                    (level - 1) as usize,
+                    4,
+                );
+            } else {
+                enc.encode_symbol_esc(&LUMA16_EOB_TOK_LF_QC[enc.qc][base_ctx], 4, 4);
+                encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
+            }
+        } else if level <= 4 {
+            enc.encode_symbol(&LUMA16_BASE_TOK_LF_QC[enc.qc][base_ctx], level as usize, 5);
+        } else {
+            enc.encode_symbol_esc(&LUMA16_BASE_TOK_LF_QC[enc.qc][base_ctx], 5, 5);
+            encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
+        }
+    } else if is_eob {
+        if level <= 2 {
+            enc.encode_symbol(
+                &LUMA16_EOB_TOK_HF_QC[enc.qc][base_ctx],
+                (level - 1) as usize,
+                2,
+            );
+        } else {
+            enc.encode_symbol_esc(&LUMA16_EOB_TOK_HF_QC[enc.qc][base_ctx], 2, 2);
+            encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
+        }
+    } else if level <= 2 {
+        enc.encode_symbol(&LUMA16_BASE_TOK_HF_QC[enc.qc][base_ctx], level as usize, 3);
+    } else {
+        enc.encode_symbol_esc(&LUMA16_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
+        encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
+    }
+    if (level as i32) < limit {
+        level as i32
+    } else {
+        limit + (level as i32 - limit).min(3)
+    }
+}
+
+fn encode_luma16_tokens_scan(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    eob: usize,
+    scan: &[u16],
+    area: usize,
+) -> Vec<LumaStored> {
+    let (th1, th2) = (area / 8, area / 4);
+    let mut levels = vec![0i32; PLVL_BUF];
+    let mut stored: Vec<LumaStored> = vec![];
+    for scan_pos in (0..=eob).rev() {
+        let level = level_at(coeffs, scan_pos);
+        let rc = scan[scan_pos] as i32;
+        let x = rc >> 5;
+        let y = rc & 31;
+        let mag = level.unsigned_abs();
+        let is_eob = scan_pos == eob;
+        let high_freq = scan_pos >= LUMA_HI_TO_LOW;
+        let (base_ctx, hi_range_ctx) = if is_eob {
+            if eob == 0 {
+                (0usize, 0usize)
+            } else {
+                (
+                    1 + (eob > th1) as usize + (eob > th2) as usize,
+                    // get_br_ctx_lf_eob: the eob coeff's br ctx is 0 at the DC (raster
+                    // pos 0, i.e. eob position 0) and 7 elsewhere in the LF region; HF
+                    // eob uses 0.
+                    if high_freq || eob == 0 { 0 } else { 7 },
+                )
+            }
+        } else {
+            luma_coeff_context(&levels, rc, x + y)
+        };
+        let stored_level = encode_luma16_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
+        levels[plvl(rc) as usize] = stored_level;
+        stored.push((rc, x, y, level, high_freq));
+    }
+    stored
+}
+
+/// Full-AC intra luma leaf for a native TX_16X16 block (EXT_NEW_TX_SET).
+/// Bit order mirrors the validated rect path: intra modes, tx do_partition=NONE,
+/// skip, EOB (class 256), then — when eob>0 — the EXT_NEW_TX_SET tx_type symbol
+/// (DCT_DCT = index 0, mode-independent since bit 0 is always the lowest set bit
+/// of av2_md_trfm_used_flag), then the class-2 tokens and signs.
+pub(crate) fn encode_luma_leaf_16x16_full(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    mode_idx: usize,
+    has_chroma: bool,
+    part_cdf: u32,
+    do_part_cdf: u32,
+    tx_type_idx: usize,
+) -> u32 {
+    // intra_ext_tx_cdf[eset=1][TX_16X16] = AVM_CDF7(13759,26108,27688,29793,30265,
+    // 31576); icdf = 32768 - cumulative. reduced_tx_set=0, FSC/IST off (headers).
+    // `tx_type_idx` indexes the EXT_NEW_TX_SET (av2_md_idx2type[size_class=2][mode]):
+    // 0 = DCT_DCT, 1 = ADST_ADST (mode-independent for the DC/SMOOTH/PAETH classes
+    // this encoder emits). CDFs are non-adaptive (frame disable_cdf_update), so the
+    // fixed icdf stays in sync regardless of which index is coded.
+    const INTRA_EXT_TX16: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
+    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE -> single TX_16X16
+    let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    if nonzero.is_empty() {
+        enc.encode_bool(skip_cdf, 1);
+        return 0;
+    }
+    enc.encode_bool(skip_cdf, 0);
+    let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
+    encode_eob(enc, eob, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1);
+    if eob >= 1 {
+        enc.encode_symbol(&INTRA_EXT_TX16, tx_type_idx, 6); // tx_type index
+    }
+    let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, &SCAN16, 256);
+    encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    nonzero.iter().map(|&(_, l)| l.unsigned_abs()).sum::<u32>().min(63)
+}
+
+
 /// Generalised luma coeff-token coder. `scan` is the coefficient scan in slimav
 /// column-major convention (rc = a*32 + c); `area` = coeff-region width*height,
 /// which sets the EOB-token base-context thresholds (avm get_lower_levels_ctx_eob:
@@ -860,6 +991,71 @@ pub(crate) fn encode_luma_block_split(
     let mut cul = [0u32; 4];
     for i in 0..4 {
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
+    }
+    cul
+}
+
+/// Encode a 64x64 intra luma block as tx-partition VERT4 → four side-by-side
+/// TX_16X64 strips (left→right). The block stays PARTITION_NONE (one prediction);
+/// only the luma transform is partitioned. do_partition=1 then 4-way type symbol 4
+/// (TX_PARTITION_VERT4 = partition value 5). Each strip is a TX_16X64 (scan
+/// SCAN16X32, eob class 512) with its own short-side tx_type (DCT) — same coding as
+/// the validated right-edge 16×64 leaf.
+pub(crate) fn encode_luma_block_vert4(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 4],
+    skip_cdfs: &[u32; 4],
+    dc_sign_ctxs: &[usize; 4],
+    mode_idx: usize,
+    has_chroma: bool,
+    part_cdf: u32,
+) -> [u32; 4] {
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
+    enc.encode_bool(TX_SPLIT_64 as u32, 1); // do_partition = 1
+    enc.encode_symbol(&TX_PART_2D_64, 4, 6); // type symbol 4 = VERT4
+    let mut cul = [0u32; 4];
+    for i in 0..4 {
+        cul[i] = encode_luma_tu_rect(
+            enc,
+            &tus[i],
+            skip_cdfs[i],
+            dc_sign_ctxs[i],
+            &SCAN16X32,
+            &EOB512_QC[enc.qc],
+            EOB_HI_BIT_QC[enc.qc],
+            512,
+        );
+    }
+    cul
+}
+
+/// HORZ4 tx-partition: four stacked TX_64X16 strips (top->bottom). Type symbol 3
+/// (TX_PARTITION_HORZ4 = partition value 4). Mirror of VERT4 with the wide TU
+/// (scan SCAN32X16, eob class 512, short-side tx_type DCT).
+pub(crate) fn encode_luma_block_horz4(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 4],
+    skip_cdfs: &[u32; 4],
+    dc_sign_ctxs: &[usize; 4],
+    mode_idx: usize,
+    has_chroma: bool,
+    part_cdf: u32,
+) -> [u32; 4] {
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
+    enc.encode_bool(TX_SPLIT_64 as u32, 1); // do_partition = 1
+    enc.encode_symbol(&TX_PART_2D_64, 3, 6); // type symbol 3 = HORZ4
+    let mut cul = [0u32; 4];
+    for i in 0..4 {
+        cul[i] = encode_luma_tu_rect(
+            enc,
+            &tus[i],
+            skip_cdfs[i],
+            dc_sign_ctxs[i],
+            &SCAN32X16,
+            &EOB512_QC[enc.qc],
+            EOB_HI_BIT_QC[enc.qc],
+            512,
+        );
     }
     cul
 }

@@ -108,6 +108,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip_cdfs, dc_sign_ctxs) =
                                 sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -135,6 +136,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) =
                                 sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -154,6 +156,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -185,6 +188,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],
@@ -393,7 +397,15 @@ impl Av2Encoder {
 
         let native_mi = lossy_native_mi(width, height);
         let (tmc, tmr) = native_mi.unwrap_or(((pw / 4) as i64, (ph / 4) as i64));
-        let needs_partition = native_mi.is_some() && lossy_needs_partition(width, height);
+        // Same edge fix as 4:2:0: residues {10,12,14} return native (un-padded) mi
+        // extents from `lossy_native_mi` but `lossy_needs_partition` is false, so the old
+        // code took the fast whole-SB path with a native/padded extent mismatch and
+        // desynced the decoder on the partial edge SB (any side ≡ 40/48/56 mod 64). Route
+        // every non-64-aligned dimension through the edge-aware partition walk instead.
+        let mc_edge = (((width + 7) & !7) / 4) as i64 % 16;
+        let mr_edge = (((height + 7) & !7) / 4) as i64 % 16;
+        let needs_partition = native_mi.is_some()
+            && (lossy_needs_partition(width, height) || mc_edge != 0 || mr_edge != 0);
         if needs_partition {
             let mut above_pctx = vec![0u8; tmc as usize + 16];
             let mut left_pctx = vec![0u8; 16];
@@ -445,6 +457,7 @@ impl Av2Encoder {
                     &crate::av2::tables::SCAN,
                     neutral,
                     qc,
+                    self.tune.rdoq_lambda,
                 );
                 let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                     &tus,

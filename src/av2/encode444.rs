@@ -29,6 +29,161 @@
 
 use super::*;
 
+/// Resolve the requested tile grid (`Tuning::tile_cols/rows`) into (log2_cols,
+/// log2_rows). Rounds each request up to a power of two and clamps to the available
+/// superblock count. Returns `None` for a single tile (1x1, or fewer SBs than tiles).
+pub(super) fn tile_grid_for(
+    tile_cols: usize,
+    tile_rows: usize,
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize)> {
+    let log2 = |n: usize| {
+        let mut k = 0;
+        while (1usize << k) < n {
+            k += 1;
+        }
+        k
+    };
+    let (mut lc, mut lr) = (log2(tile_cols.max(1)), log2(tile_rows.max(1)));
+    // Clamp to the available superblock count on each axis.
+    let (sbc, sbr) = (width.div_ceil(64), height.div_ceil(64));
+    while (1usize << lc) > sbc && lc > 0 {
+        lc -= 1;
+    }
+    while (1usize << lr) > sbr && lr > 0 {
+        lr -= 1;
+    }
+    if lc == 0 && lr == 0 {
+        return None;
+    }
+    Some((lc, lr))
+}
+
+/// Copy the `tw x th` sub-plane at `(x0, y0)` out of a `width`-stride plane.
+pub(super) fn extract_subplane(
+    p: &[f32],
+    width: usize,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+) -> Vec<f32> {
+    let mut o = vec![0f32; tw * th];
+    for r in 0..th {
+        o[r * tw..r * tw + tw]
+            .copy_from_slice(&p[(y0 + r) * width + x0..(y0 + r) * width + x0 + tw]);
+    }
+    o
+}
+
+/// Tile SB-start boundaries EXACTLY as the decoder computes them
+/// (av2_calculate_tile_cols/rows, uniform spacing, seq SB == coding SB so scale_sb=0):
+/// base = sb_count >> log2, the first `extra` tiles get one extra SB. Yields widths like
+/// 3,3,2,2 for 10 cols / 4 tiles — NOT a uniform ceil, which would desync the decode.
+/// Tile start SBs for one axis, matching the decoder's `av2_calculate_tile_cols/rows`
+/// (av2/common/tile_common.c) EXACTLY. The base tile size and remainder come from
+/// `full_sb = mi_count >> mib_size_log2` — the FLOOR of the SB count derived from the
+/// (8-px-aligned) MI count — while the last tile extends to the ceil SB count. Using
+/// the ceil count for base/extra mis-distributes the remainder SB whenever a frame has
+/// a partial right/bottom SB (e.g. 4000px → floor 62 vs ceil 63), desyncing the tile
+/// grid for non-64-aligned frames larger than one SB per tile.
+fn tile_starts(dim_px: usize, log2: usize) -> Vec<usize> {
+    let n = 1usize << log2;
+    let mi = ((dim_px + 7) & !7) / 4; // 8-px-aligned MI count
+    let full_sb = mi >> 4; // floor(mi / 16) — decoder's full_sb_cols/rows
+    let ceil_sb = dim_px.div_ceil(64); // sentinel / loop bound (seq_sb)
+    let base = full_sb >> log2;
+    let mut extra = full_sb as isize - ((base << log2) as isize);
+    let mut starts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while start < ceil_sb && i < n {
+        starts.push(start);
+        start += base + if extra > 0 { 1 } else { 0 };
+        if extra > 0 {
+            extra -= 1;
+        }
+        i += 1;
+    }
+    starts.push(ceil_sb); // sentinel: tile k spans [starts[k], starts[k+1])
+    starts
+}
+
+/// Luma tile regions in raster order: `(x0, y0, tw, th)` (all luma-pixel units, x0/y0 on
+/// 64-px SB boundaries). Tile column/row boundaries are in superblock units and so are
+/// identical across chroma formats.
+pub(super) fn tile_specs(
+    width: usize,
+    height: usize,
+    log2c: usize,
+    log2r: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let col_starts = tile_starts(width, log2c);
+    let row_starts = tile_starts(height, log2r);
+    let mut specs = Vec::new();
+    for tr in 0..row_starts.len() - 1 {
+        let (r0, r1) = (row_starts[tr], row_starts[tr + 1]);
+        let (y0, th) = (r0 * 64, (r1 * 64).min(height) - r0 * 64);
+        for tc in 0..col_starts.len() - 1 {
+            let (c0, c1) = (col_starts[tc], col_starts[tc + 1]);
+            let (x0, tw) = (c0 * 64, (c1 * 64).min(width) - c0 * 64);
+            specs.push((x0, y0, tw, th));
+        }
+    }
+    specs
+}
+
+/// Wrap already-encoded per-tile byte streams (raster order) into a single multi-tile
+/// frame: frame header with the tile grid, `tsb`-byte size prefixes before every tile
+/// but the last, then the TD/SEQ/FRAME OBUs. Format-agnostic — chroma signalling lives
+/// in `config`/`chroma_format`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn assemble_multitile(
+    config: &Config,
+    sig_w: usize,
+    sig_h: usize,
+    disp_w: usize,
+    disp_h: usize,
+    color: &ColorEncoding,
+    log2c: usize,
+    log2r: usize,
+    bit_depth: u8,
+    chroma_format: ChromaFormat,
+    tiles_bytes: &[Vec<u8>],
+) -> Av2Frame {
+    let n = tiles_bytes.len();
+    // Fixed TileSizeBytes = 4 (matches the reference encoders; always sufficient).
+    let tsb = 4usize;
+    let mut frame = frame_header(config, sig_w as u32, sig_h as u32, (log2c, log2r, tsb));
+    for (i, t) in tiles_bytes.iter().enumerate() {
+        if i + 1 < n {
+            let v = t.len() - 1; // - AV2_MIN_TILE_SIZE_BYTES (=1)
+            for b in 0..tsb {
+                frame.push(((v >> (8 * b)) & 0xff) as u8);
+            }
+        }
+        frame.extend(t);
+    }
+    let mut data = vec![];
+    data.extend(obu(2, &[]));
+    data.extend(obu(1, &sequence_header(config, sig_w as u32, sig_h as u32)));
+    data.extend(obu(4, &frame));
+    Av2Frame {
+        data,
+        width: disp_w,
+        height: disp_h,
+        // Coded size = the OBU-signaled size. When it exceeds the display size (the
+        // padded-tiling fallback for non-boundary-exact frames) the AVIF muxer crops
+        // via a `clap` box.
+        coded_width: sig_w,
+        coded_height: sig_h,
+        bit_depth,
+        color: *color,
+        chroma_format,
+    }
+}
+
 impl Av2Encoder {
     /// Encode a 4:4:4 YCbCr still. `y`, `cb`, `cr` are full-resolution
     /// (`width × height`). Luma is four 32x32 transform units per 64x64 superblock;
@@ -49,19 +204,47 @@ impl Av2Encoder {
         if self.base_q_idx == 0 {
             return self.encode_yuv444_lossless(planar_image, color, threads);
         }
-        let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
+        let (yf, cbf, crf) = (to_plane(y), to_plane(cb), to_plane(cr));
+        let (pw, ph) = (sb_align(width), sb_align(height));
+        let config = self.config(Layout::I444);
+        if let Some((log2c, log2r)) =
+            tile_grid_for(self.tune.tile_cols, self.tune.tile_rows, width, height)
+        {
+            return Ok(self.encode_444_tiled(
+                &yf, &cbf, &crf, width, height, &config, color, log2c, log2r, threads,
+            ));
+        }
+        let enc = self.encode_444_core(&yf, &cbf, &crf, width, height);
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
+    }
+
+    /// SB-loop core for one 4:4:4 region (a whole frame, or one tile treated as a
+    /// sub-frame). Returns the finished entropy coder; assembly (frame header/OBU,
+    /// or multi-tile concatenation) happens in the caller.
+    fn encode_444_core(
+        &self,
+        y: &[f32],
+        cb: &[f32],
+        cr: &[f32],
+        width: usize,
+        height: usize,
+    ) -> RangeEncoder {
+        let bases = &self.bases;
+        // Encode-time tuning (was AV2_* env). Captured once per region.
+        let rdoq_lambda = self.tune.rdoq_lambda;
+        let part_lambda_c = self.tune.part_lambda_c;
+        let txpart = self.tune.txpart;
         let (pw, ph) = (sb_align(width), sb_align(height));
         // Native-size 444: boundary-safe non-aligned sizes can signal real W×H so the
         // decoder reconstructs the full padded SB and crops — no AVIF clap box needed.
         let native_mi = lossy_native_mi(width, height);
         let (tmc, tmr) = native_mi.unwrap_or(((pw / 4) as i64, (ph / 4) as i64));
-        let yp = pad_plane(&to_plane(y), width, height, pw, ph);
-        let up = pad_plane(&to_plane(cb), width, height, pw, ph);
-        let vp = pad_plane(&to_plane(cr), width, height, pw, ph);
+        let yp = pad_plane(y, width, height, pw, ph);
+        let up = pad_plane(cb, width, height, pw, ph);
+        let vp = pad_plane(cr, width, height, pw, ph);
 
         let layout = Layout::I444;
-        let config = self.config(layout);
         let mut recy = vec![0f32; pw * ph];
         let mut recu = vec![0f32; pw * ph];
         let mut recv = vec![0f32; pw * ph];
@@ -110,32 +293,184 @@ impl Av2Encoder {
                 // Helper closures capture nothing mutable; chroma coeff encode is inlined
                 // per leaf because basis/size/skip-table differ.
                 if !needs_partition {
-                    // Fast path: whole 64X64 SB.
-                    let (tus, mode_idx) = encode_luma_sb(
-                        &mut recy,
-                        &yp,
-                        pw,
-                        width,
-                        height,
-                        sb_y,
-                        sb_x,
-                        &bases.luma,
-                        qstep_i,
-                        &crate::av2::tables::SCAN,
-                        neutral,
-                        qc,
+                    // Fast path: whole 64X64 SB. RD-choose luma tx-partition between
+                    // SPLIT (4×TX_32X32) and VERT4 (4×TX_16X64), cheap SSE + rate proxy.
+                    let sse_region = |rec: &[f32]| -> f64 {
+                        let mut s = 0f64;
+                        for r in 0..64 {
+                            let b = (sb_y + r) * pw + sb_x;
+                            for c in 0..64 {
+                                let d = (rec[b + c] - yp[b + c]) as f64;
+                                s += d * d;
+                            }
+                        }
+                        s
+                    };
+                    let rate_proxy = |tus: &[Vec<Coeff>], ovh: f64| -> f64 {
+                        let mut bits = 0f64;
+                        for tu in tus {
+                            bits += ovh;
+                            for &(_, l) in tu {
+                                if l != 0 {
+                                    bits += 2.0 + 2.0 * ((l.unsigned_abs() as f64) + 1.0).log2();
+                                }
+                            }
+                        }
+                        bits
+                    };
+                    let lambda = crate::av2::leaf::part_lambda(qstep_i, part_lambda_c);
+                    // ---- SPLIT candidate (existing mode search) ----
+                    let (tus_s, mode_idx) = encode_luma_sb(
+                        &mut recy, &yp, pw, width, height, sb_y, sb_x,
+                        &bases.luma, qstep_i, &crate::av2::tables::SCAN, neutral, qc,
+                        rdoq_lambda,
                     );
-                    let (skip_cdfs, dc_sign_ctxs) =
-                        sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
-                    encode_luma_block_split(
-                        &mut enc,
-                        &tus,
-                        &skip_cdfs,
-                        &dc_sign_ctxs,
-                        mode_idx,
-                        true,
-                        12276,
-                    );
+                    let j_s = sse_region(&recy)
+                        + lambda * (rate_proxy(&tus_s, 3.0) + if mode_idx != 0 { 6.0 } else { 0.0 });
+                    // partition strategy from tuning (was AV2_TXPART env)
+                    // Rect tx-partition (VERT4/HORZ4) is only safe on FULL interior 64x64
+                    // SBs: on a partial edge SB the rect strips cross the frame boundary
+                    // and the edge-clamped coding desyncs the decoder. Restrict rect
+                    // candidates to whole SBs; partial edge SBs fall back to SPLIT.
+                    let whole_sb = sb_x + 64 <= width && sb_y + 64 <= height;
+                    let want_vert4 =
+                        whole_sb && matches!(txpart, TxPart::ThreeWay | TxPart::Rd2 | TxPart::Vert4);
+                    let want_horz4 =
+                        whole_sb && matches!(txpart, TxPart::ThreeWay | TxPart::Horz4);
+                    let force_vert4 = txpart == TxPart::Vert4;
+                    let force_horz4 = txpart == TxPart::Horz4;
+                    let mut snap_split = [0f32; 64 * 64];
+                    let mut snap_best = [0f32; 64 * 64];
+                    for r in 0..64 {
+                        let b = (sb_y + r) * pw + sb_x;
+                        snap_split[r * 64..r * 64 + 64].copy_from_slice(&recy[b..b + 64]);
+                    }
+                    snap_best.copy_from_slice(&snap_split);
+                    let restore = |recy: &mut [f32], snap: &[f32]| {
+                        for r in 0..64 {
+                            let b = (sb_y + r) * pw + sb_x;
+                            recy[b..b + 64].copy_from_slice(&snap[r * 64..r * 64 + 64]);
+                        }
+                    };
+                    #[derive(PartialEq)]
+                    enum Part {
+                        Split,
+                        Vert4,
+                        Horz4,
+                    }
+                    let mut best = Part::Split;
+                    let mut best_j = j_s;
+                    let mut tus_v: [Vec<Coeff>; 4] =
+                        [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                    let mut tus_h: [Vec<Coeff>; 4] =
+                        [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                    // ---- VERT4 candidate (4× TX_16X64, strips L→R) ----
+                    if want_vert4 {
+                        for i in 0..4 {
+                            let x0 = sb_x + i * 16;
+                            let predv = dc_pred_rect(&recy, pw, sb_y, x0, 16, 64, neutral);
+                            let lev = bases.luma16x64.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, x0, 16, 64, predv),
+                                0.0,
+                                &SCAN16X32,
+                            );
+                            let pred_flat = [predv; 1024];
+                            put_block_rect(
+                                &mut recy, pw, sb_y, x0, 16, 64,
+                                &crate::av2::itx422::reconstruct_luma_16x64(
+                                    &pred_flat, &lev, qstep_i, &SCAN16X32,
+                                ),
+                            );
+                            tus_v[i] = levels_to_coeffs(&lev);
+                        }
+                        let j_v = sse_region(&recy) + lambda * rate_proxy(&tus_v, 4.0);
+                        let take = force_vert4 || j_v < best_j;
+                        if take {
+                            best = Part::Vert4;
+                            best_j = j_v;
+                            snap_best.copy_from_slice(&{
+                                let mut s = [0f32; 64 * 64];
+                                for r in 0..64 {
+                                    let b = (sb_y + r) * pw + sb_x;
+                                    s[r * 64..r * 64 + 64].copy_from_slice(&recy[b..b + 64]);
+                                }
+                                s
+                            });
+                        }
+                        restore(&mut recy, &snap_split);
+                    }
+                    // ---- HORZ4 candidate (4× TX_64X16, strips T→B) ----
+                    if want_horz4 {
+                        for i in 0..4 {
+                            let y0 = sb_y + i * 16;
+                            let predh = dc_pred_rect(&recy, pw, y0, sb_x, 64, 16, neutral);
+                            let lev = bases.luma64x16.project_scan(
+                                &get_residual_rect(&yp, pw, y0, sb_x, 64, 16, predh),
+                                0.0,
+                                &SCAN32X16,
+                            );
+                            let pred_flat = [predh; 1024];
+                            put_block_rect(
+                                &mut recy, pw, y0, sb_x, 64, 16,
+                                &crate::av2::itx422::reconstruct_luma_64x16(
+                                    &pred_flat, &lev, qstep_i, &SCAN32X16,
+                                ),
+                            );
+                            tus_h[i] = levels_to_coeffs(&lev);
+                        }
+                        let j_h = sse_region(&recy) + lambda * rate_proxy(&tus_h, 4.0);
+                        let take = force_horz4 || j_h < best_j;
+                        if take {
+                            best = Part::Horz4;
+                            // best_j no longer read past the last candidate.
+                            for r in 0..64 {
+                                let b = (sb_y + r) * pw + sb_x;
+                                snap_best[r * 64..r * 64 + 64].copy_from_slice(&recy[b..b + 64]);
+                            }
+                        }
+                        restore(&mut recy, &snap_split);
+                    }
+                    // ---- commit winner ----
+                    restore(&mut recy, &snap_best);
+                    match best {
+                        Part::Vert4 => {
+                            let mut skip_cdfs = [0u32; 4];
+                            let mut dc_sign_ctxs = [0usize; 4];
+                            for i in 0..4 {
+                                let (s, d) = sb_tu_contexts_rect(
+                                    &tus_v[i], sb_y, sb_x + i * 16, &mut above, &mut left, qc,
+                                    tmc, tmr, 4, 16, false,
+                                );
+                                skip_cdfs[i] = s;
+                                dc_sign_ctxs[i] = d;
+                            }
+                            encode_luma_block_vert4(
+                                &mut enc, &tus_v, &skip_cdfs, &dc_sign_ctxs, 0, true, 12276,
+                            );
+                        }
+                        Part::Horz4 => {
+                            let mut skip_cdfs = [0u32; 4];
+                            let mut dc_sign_ctxs = [0usize; 4];
+                            for i in 0..4 {
+                                let (s, d) = sb_tu_contexts_rect(
+                                    &tus_h[i], sb_y + i * 16, sb_x, &mut above, &mut left, qc,
+                                    tmc, tmr, 16, 4, false,
+                                );
+                                skip_cdfs[i] = s;
+                                dc_sign_ctxs[i] = d;
+                            }
+                            encode_luma_block_horz4(
+                                &mut enc, &tus_h, &skip_cdfs, &dc_sign_ctxs, 0, true, 12276,
+                            );
+                        }
+                        Part::Split => {
+                            let (skip_cdfs, dc_sign_ctxs) =
+                                sb_tu_contexts(&tus_s, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
+                            encode_luma_block_split(
+                                &mut enc, &tus_s, &skip_cdfs, &dc_sign_ctxs, mode_idx, true, 12276,
+                            );
+                        }
+                    }
                     let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
                     let levu = bases
                         .chroma444
@@ -228,6 +563,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                rdoq_lambda,
                             );
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -288,6 +624,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_64x32(
                                 &tus2, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -346,6 +683,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -414,6 +752,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],
@@ -816,40 +1155,68 @@ impl Av2Encoder {
                         }
                         (4, 4) => {
                             // Bottom-right 16×16 corner leaf (residue 4 in both dims).
-                            // Luma is DC-only (eob count 1) so the decoder skips the
-                            // EXT_NEW_TX_SET tx_type; chroma codes full AC (tx_type is
-                            // luma-only). TX_16X16 = entropy class 2, eob class 256.
+                            // Native TX_16X16 (entropy class 2, eob class 256). The luma
+                            // tx_type is RD-chosen between DCT_DCT (idx 0) and ADST_ADST
+                            // (idx 1, the mode-dependent EXT_NEW_TX_SET alternative);
+                            // chroma stays DCT (tx_type is luma-only).
                             let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 16, neutral);
-                            let mut lev = bases.luma16x16.project_scan(
-                                &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 16, pred),
-                                0.0,
-                                &SCAN16,
-                            );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0; // keep DC only → eob count 1
+                            let resid = get_residual_rect(&yp, pw, sb_y, sb_x, 16, 16, pred);
+                            let pred_flat = [pred; 256];
+                            // Source pixels for the distortion term.
+                            let mut src16 = [0f32; 256];
+                            for r in 0..16 {
+                                for c in 0..16 {
+                                    src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
+                                }
                             }
-                            put_block_rect(
-                                &mut recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                16,
-                                16,
-                                &bases.luma16x16.reconstruct_scan(pred, &lev, &SCAN16),
-                            );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
+                            let rate = |lev: &[f32]| -> f64 {
+                                lev.iter()
+                                    .filter(|&&v| v != 0.0)
+                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                                    .sum::<f64>()
                             };
+                            let sse = |rec: &[f32]| -> f64 {
+                                (0..256)
+                                    .map(|i| {
+                                        let d = src16[i] as f64 - rec[i] as f64;
+                                        d * d
+                                    })
+                                    .sum()
+                            };
+                            let lambda =
+                                crate::av2::leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                            // DCT_DCT candidate.
+                            let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_dct = crate::av2::itx422::reconstruct_luma16(
+                                &pred_flat, &lev_dct, qstep_i, &SCAN16,
+                            );
+                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            // ADST_ADST candidate (DST-VII both axes).
+                            let lev_adst =
+                                bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_adst = crate::av2::itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_adst, qstep_i, &SCAN16, true, true,
+                            );
+                            // ADST pays a slightly higher tx_type symbol (idx 1 > idx 0).
+                            let cost_adst =
+                                sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            // Ties → DCT (keeps byte output where ADST doesn't help).
+                            let use_adst = cost_adst < cost_dct;
+                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = if use_adst
+                            {
+                                (&lev_adst, &rec_adst, 1)
+                            } else {
+                                (&lev_dct, &rec_dct, 0)
+                            };
+                            put_block_rect(&mut recy, pw, sb_y, sb_x, 16, 16, rec);
+                            let tu: Vec<Coeff> = levels_to_coeffs(lev);
                             let (_s, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 4, true,
                             );
                             // TX_16X16 luma skip = class-2 cdf, block_eq_tx → ctx 0.
                             let skip = SKIP_TX16_QC[qc][0] as u32;
-                            encode_luma_leaf_dc_class2(
-                                &mut enc, dc_level, skip, dcs, 0, true, pc, 11074,
+                            encode_luma_leaf_16x16_full(
+                                &mut enc, &tu, skip, dcs, 0, true, pc, 11074, tx_idx,
                             );
                             // chroma 16×16 (TX_16X16): full AC, reuse luma16x16 basis,
                             // chroma eob class 256, class-2 U skip / shared V skip.
@@ -923,17 +1290,109 @@ impl Av2Encoder {
                 }
             }
         }
-        if std::env::var("AV2_DUMP_SSE").is_ok() {
-            let mut sse = 0f64;
-            for r in 0..height {
-                for c in 0..width {
-                    let d = (recy[r * pw + c] - yp[r * pw + c]) as f64;
-                    sse += d * d;
-                }
+        enc
+    }
+
+    /// Multi-tile 4:4:4 assembly. Each tile is encoded as an independent sub-frame
+    /// (CDFs/contexts reset, tile boundary == frame boundary for prediction), then
+    /// concatenated under one multi-tile frame header with size prefixes. Tiles are
+    /// independent, so the per-tile encodes run in parallel across `threads` workers.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_444_tiled(
+        &self,
+        yf: &[f32],
+        cbf: &[f32],
+        crf: &[f32],
+        width: usize,
+        height: usize,
+        config: &Config,
+        color: &ColorEncoding,
+        log2c: usize,
+        log2r: usize,
+        threads: usize,
+    ) -> Av2Frame {
+        // Tile column/row boundaries fall on 64-px superblock edges, so every interior
+        // tile is SB-aligned; only the right-column / bottom-row tiles inherit the
+        // frame's partial edge. A tile decodes correctly in-frame when its dimensions
+        // are boundary-exact (lossy_native_mi is Some — SB-aligned or a supported
+        // residue edge). When *every* tile is exact we signal the real frame size and
+        // each tile carries its own native partial-edge entropy (byte-identical to a
+        // standalone encode of that region). When some edge tile is NOT exact (e.g. a
+        // residue-2 corner that would otherwise pad+clap per tile — which is invalid in
+        // a shared multi-tile frame), we instead pad the WHOLE frame to SB-aligned, carve
+        // tiles on the padded grid so all of them are SB-aligned, signal the padded size,
+        // and let the AVIF muxer crop back to width×height with one frame-level clap.
+        let native_specs = tile_specs(width, height, log2c, log2r);
+        let exact = native_specs
+            .iter()
+            .all(|&(_, _, tw, th)| lossy_native_mi(tw, th).is_some());
+        let (pw, ph) = (sb_align(width), sb_align(height));
+        let (sig_w, sig_h, stride, planes, specs) = if exact {
+            (
+                width,
+                height,
+                width,
+                (yf.to_vec(), cbf.to_vec(), crf.to_vec()),
+                native_specs,
+            )
+        } else {
+            (
+                pw,
+                ph,
+                pw,
+                (
+                    pad_plane(yf, width, height, pw, ph),
+                    pad_plane(cbf, width, height, pw, ph),
+                    pad_plane(crf, width, height, pw, ph),
+                ),
+                tile_specs(pw, ph, log2c, log2r),
+            )
+        };
+        let (yf, cbf, crf) = (&planes.0, &planes.1, &planes.2);
+        let n = specs.len();
+        let mut tiles_bytes: Vec<Vec<u8>> = vec![Vec::new(); n];
+        // Each tile is a fully independent sub-frame encode, so they run concurrently.
+        // Output order (raster) is preserved because each worker writes its own slot.
+        let nthreads = Self::resolve_threads(threads).min(n.max(1));
+        if nthreads <= 1 || n <= 1 {
+            for (slot, &(x0, y0, tw, th)) in tiles_bytes.iter_mut().zip(&specs) {
+                let ty = extract_subplane(yf, stride, x0, y0, tw, th);
+                let tu = extract_subplane(cbf, stride, x0, y0, tw, th);
+                let tv = extract_subplane(crf, stride, x0, y0, tw, th);
+                *slot = self.encode_444_core(&ty, &tu, &tv, tw, th).finish();
             }
-            eprintln!("SSE {}", sse);
+        } else {
+            let chunk = n.div_ceil(nthreads);
+            let me = &*self;
+            let (yf, cbf, crf) = (&yf, &cbf, &crf);
+            std::thread::scope(|sc| {
+                for (out_chunk, spec_chunk) in
+                    tiles_bytes.chunks_mut(chunk).zip(specs.chunks(chunk))
+                {
+                    sc.spawn(move || {
+                        for (slot, &(x0, y0, tw, th)) in out_chunk.iter_mut().zip(spec_chunk) {
+                            let ty = extract_subplane(yf, stride, x0, y0, tw, th);
+                            let tu = extract_subplane(cbf, stride, x0, y0, tw, th);
+                            let tv = extract_subplane(crf, stride, x0, y0, tw, th);
+                            *slot = me.encode_444_core(&ty, &tu, &tv, tw, th).finish();
+                        }
+                    });
+                }
+            });
         }
-        Ok(self.finish(enc, &config, pw, ph, width, height, color))
+        assemble_multitile(
+            config,
+            sig_w,
+            sig_h,
+            width,
+            height,
+            color,
+            log2c,
+            log2r,
+            self.bit_depth,
+            ChromaFormat::Yuv444,
+            &tiles_bytes,
+        )
     }
 
     /// 4:4:4 lossless (q=0): luma + full-resolution U/V, all TX_4X4 WHT. Per superblock
