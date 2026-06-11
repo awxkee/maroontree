@@ -68,5 +68,8 @@ pub use color::{
     ChromaSamplePosition, ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay,
     MatrixCoefficients, Primaries, TransferFunction,
 };
-pub use encoder::{PlanarImage, encode_lossless, encode_lossless_obu, encode_lossless_with_alpha};
+pub use encoder::{
+    PlanarImage, encode_lossless, encode_lossless_gray, encode_lossless_gray_alpha,
+    encode_lossless_gray_obu, encode_lossless_obu, encode_lossless_with_alpha,
+};
 pub use pixel::{BitDepth, Pixel};

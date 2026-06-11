@@ -26,7 +26,9 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::avif::{checked_buffer_size, finalize_with_alpha, make_av1c, validate_dims};
+use crate::avif::{
+    checked_buffer_size, finalize_color, finalize_with_alpha, make_av1c, validate_dims,
+};
 use crate::color::ColorEncoding;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
@@ -399,29 +401,125 @@ pub fn encode_still_lossy_420<T: Pixel>(
 }
 
 pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
-    planar_image: &PlanarImage<T>,
+    img: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
     full_range: bool,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
-    planar_image.validate_400()?;
-    assert!(base_q_idx != 0, "monochrome lossless is not yet supported");
+    validate_dims(img.width as u32, img.height as u32)?;
+    img.validate_400()?;
     let maxv = (1i32 << bit_depth.bits()) - 1;
-    let luma: Vec<i32> = planar_image.planes[0]
+    if base_q_idx == 0 {
+        let luma: Vec<i16> = img.planes[0]
+            .iter()
+            .map(|v| v.to_i32().clamp(0, maxv) as i16)
+            .collect();
+        return Ok(crate::av1real::encode_av1_mono_lossless_image(
+            bit_depth.bits(),
+            img.width,
+            img.height,
+            &luma,
+            full_range,
+            threads,
+        ));
+    }
+    let luma: Vec<i32> = img.planes[0]
         .iter()
         .map(|v| v.to_i32().clamp(0, maxv))
         .collect();
     let bytes = crate::av1real::encode_av1_mono_image(
         base_q_idx,
         bit_depth.bits(),
-        planar_image.width,
-        planar_image.height,
+        img.width,
+        img.height,
         &luma,
         full_range,
         threads,
     );
     Ok(bytes)
+}
+
+pub fn encode_lossless_gray_obu<T: Pixel>(
+    img: &PlanarImage<T>,
+    full_range: bool,
+    threads: usize,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(img.width as u32, img.height as u32)?;
+    img.validate_400()?;
+    encode_lossy_gray_obu(img, img.bit_depth, 0, full_range, threads)
+}
+
+/// Encode a lossless grayscale (monochrome) AVIF still.
+pub fn encode_lossless_gray<T: Pixel>(
+    img: &PlanarImage<T>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(img.width as u32, img.height as u32)?;
+    img.validate_400()?;
+    let obu = encode_lossy_gray_obu(img, img.bit_depth, 0, true, cfg.threads)?;
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        img.bit_depth.bits(),
+        ChromaFormat::Monochrome,
+        cfg,
+    )
+}
+
+pub fn encode_lossless_gray_alpha<T: Pixel>(
+    rgba: &[T],
+    width: u32,
+    height: u32,
+    bit_depth: BitDepth,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(width, height)?;
+    cfg.validate()?;
+    crate::avif::validate_buf_u8(rgba, width, height, 2)?;
+    if cfg.chroma != ChromaFormat::Monochrome {
+        return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
+    }
+    let mut gray = vec![T::default(); width as usize * height as usize];
+    let mut alpha = vec![T::default(); width as usize * height as usize];
+    for ((px, dst_gray), alpha) in rgba
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(gray.iter_mut())
+        .zip(alpha.iter_mut())
+    {
+        *dst_gray = px[0];
+        *alpha = px[1];
+    }
+    let luma_obu = encode_lossless_gray(
+        &PlanarImage {
+            width: width as usize,
+            height: height as usize,
+            bit_depth,
+            planes: [gray, vec![], vec![]],
+        },
+        cfg,
+    )?;
+    let alpha_obu = encode_lossless_gray(
+        &PlanarImage {
+            width: width as usize,
+            height: height as usize,
+            bit_depth,
+            planes: [alpha, vec![], vec![]],
+        },
+        cfg,
+    )?;
+    finalize_with_alpha(
+        luma_obu,
+        alpha_obu,
+        width,
+        height,
+        bit_depth.bits(),
+        ChromaFormat::Monochrome,
+        cfg,
+    )
 }
 
 /// Encode a lossless 4:4:4 still with color signaling.
@@ -475,7 +573,7 @@ pub fn encode_lossless<T: Pixel>(
     let obu = encode_lossless_obu(img, cfg.color_encoding.as_ref(), cfg.threads)?;
     let av1c = make_av1c(
         &obu,
-        img.bit_depth as u8,
+        img.bit_depth.bits(),
         img.width as u32,
         img.height as u32,
         ChromaFormat::Yuv444,
@@ -484,7 +582,7 @@ pub fn encode_lossless<T: Pixel>(
         &obu,
         img.width as u32,
         img.height as u32,
-        img.bit_depth as u8,
+        img.bit_depth.bits(),
         3,
         &av1c,
         cfg.color_encoding.as_ref(),

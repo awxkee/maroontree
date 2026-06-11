@@ -5592,6 +5592,137 @@ fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Crop the single luma plane to a tile rect and encode it as a mono lossless
+/// tile. Pure function of its inputs (safe on any thread).
+fn encode_one_lossless_tile_mono(
+    bd: u8,
+    full_w: usize,
+    luma: &[i16],
+    r: &(usize, usize, usize, usize),
+) -> Vec<u8> {
+    let (x0, y0, tw, th) = *r;
+    let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
+    crate::av1_tile::encode_tile_lossless_mono(tw, th, bd, &p0)
+}
+
+/// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res
+/// luma plane (`w8*h8`, padded to a multiple of 8) tiled identically to the
+/// 4:4:4 path. Byte-identical output for a fixed tiling regardless of thread
+/// count.
+fn encode_lossless_mono_tilegroup(
+    bd: u8,
+    w8: usize,
+    h8: usize,
+    luma: &[i16],
+    threads: usize,
+) -> (Vec<u8>, Tiling) {
+    let sb_cols = w8.div_ceil(64) as u32;
+    let sb_rows = h8.div_ceil(64) as u32;
+    let want = resolve_threads(threads);
+    let plan = plan_tiling(sb_cols, sb_rows, want);
+    let col_starts = tile_starts_sb(sb_cols, plan.tcl);
+    let row_starts = tile_starts_sb(sb_rows, plan.trl);
+
+    let mut rects: Vec<(usize, usize, usize, usize)> =
+        Vec::with_capacity(col_starts.len() * row_starts.len());
+    for (ti, &rsb) in row_starts.iter().enumerate() {
+        let y0 = rsb as usize * 64;
+        let y1 = (row_starts.get(ti + 1).map_or(sb_rows, |&n| n) as usize * 64).min(h8);
+        for (tj, &csb) in col_starts.iter().enumerate() {
+            let x0 = csb as usize * 64;
+            let x1 = (col_starts.get(tj + 1).map_or(sb_cols, |&n| n) as usize * 64).min(w8);
+            rects.push((x0, y0, x1 - x0, y1 - y0));
+        }
+    }
+
+    let n = rects.len();
+    let nthreads = want.clamp(1, n.max(1));
+    let payloads: Vec<Vec<u8>> = if nthreads <= 1 || n <= 1 {
+        rects
+            .iter()
+            .map(|r| encode_one_lossless_tile_mono(bd, w8, luma, r))
+            .collect()
+    } else {
+        let mut slots: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
+        let chunk = n.div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            for (rs, os) in rects.chunks(chunk).zip(slots.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (r, o) in rs.iter().zip(os.iter_mut()) {
+                        *o = Some(encode_one_lossless_tile_mono(bd, w8, luma, r));
+                    }
+                });
+            }
+        });
+        slots.into_iter().map(|o| o.unwrap()).collect()
+    };
+
+    (assemble_tilegroup(payloads), plan)
+}
+
+/// Wrap a mono lossless tile group with a `mono_chrome = 1` lossless frame
+/// header (single tile ⇒ combined `OBU_FRAME`; multi-tile ⇒ `OBU_FRAME_HEADER` +
+/// `OBU_TILE_GROUP`).
+fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
+    if plan.tcl + plan.trl > 0 {
+        let fh = crate::obu::frame_header_lossless_mono_multitile_th(
+            &plan.cols_incr,
+            &plan.rows_incr,
+            plan.tcl,
+            plan.trl,
+        );
+        wrap_obu_frame_split(&fh, tilegroup)
+    } else {
+        let fh = crate::obu::frame_header_lossless_mono_multitile(
+            &plan.cols_incr,
+            &plan.rows_incr,
+            0,
+            0,
+        );
+        wrap_obu_frame(&fh, tilegroup)
+    }
+}
+
+/// Encode a monochrome lossless frame's OBU portion from a padded `w8*h8` luma
+/// plane. Caller prepends temporal delimiter, sequence header, metadata.
+pub(crate) fn encode_lossless_mono_frame_obus(
+    bd: u8,
+    w8: usize,
+    h8: usize,
+    luma: &[i16],
+    threads: usize,
+) -> Vec<u8> {
+    let (tilegroup, plan) = encode_lossless_mono_tilegroup(bd, w8, h8, luma, threads);
+    assemble_lossless_mono_frame_obus(&plan, &tilegroup)
+}
+
+/// Encode a full monochrome **lossless** AV1 still image: temporal delimiter +
+/// monochrome sequence header (`mono_chrome = 1`) + lossless frame. `luma` is
+/// `w*h` samples; it is padded to a multiple of 8 internally. Profile 0 for
+/// 8/10-bit, profile 2 for 12-bit.
+pub(crate) fn encode_av1_mono_lossless_image(
+    bd: u8,
+    w: usize,
+    h: usize,
+    luma: &[i16],
+    full_range: bool,
+    threads: usize,
+) -> Vec<u8> {
+    assert_eq!(luma.len(), w * h, "luma plane must be w*h");
+    assert!(w > 0 && h > 0, "width/height must be non-zero");
+    let (w8, h8) = (align8(w), align8(h));
+    let padded = pad_to_mult8(luma, w, h, w8, h8);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&temporal_delimiter());
+    bytes.extend_from_slice(&crate::obu::sequence_header_mono(
+        w as u32, h as u32, bd, full_range,
+    ));
+    bytes.extend_from_slice(&encode_lossless_mono_frame_obus(
+        bd, w8, h8, &padded, threads,
+    ));
+    bytes
+}
+
 /// Lossy encoder with explicit color mode: `ycbcr=false` signals MC_IDENTITY
 /// (planes coded as GBR); `ycbcr=true` signals full-range BT.601 so the decoder
 /// converts the coded Y/Cb/Cr planes back to RGB (decorrelated -> smaller).
