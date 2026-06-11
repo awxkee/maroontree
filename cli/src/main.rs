@@ -323,7 +323,6 @@ fn encode_av1(
         Chroma::C422 => ChromaFormat::Yuv422,
         Chroma::C420 => ChromaFormat::Yuv420,
     };
-    let (w, h) = (img.width(), img.height());
 
     if args.lossless {
         return encode_av1_lossless(img, args, color_type, effective_depth, icc, exif);
@@ -346,27 +345,87 @@ fn encode_av1(
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     Ok(match (effective_depth, gray, alpha) {
-        (Depth::D8, true, _) => encode_gray8(img.to_luma8().as_raw(), w, h, &cfg)?,
-        (Depth::D8, false, false) => encode_rgb8(img.to_rgb8().as_raw(), w, h, &cfg)?,
-        (Depth::D8, false, true) => encode_rgba8_with_alpha(img.to_rgba8().as_raw(), w, h, &cfg)?,
-        (Depth::D10, true, _) => {
-            encode_gray10(&scale16_to_10(img.to_luma16().as_raw()), w, h, &cfg)?
-        }
-        (Depth::D10, false, false) => {
-            encode_rgb10(&scale16_to_10(img.to_rgb16().as_raw()), w, h, &cfg)?
-        }
-        (Depth::D10, false, true) => {
-            encode_rgba10_with_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h, &cfg)?
-        }
-        (Depth::D12, true, _) => {
-            encode_gray12(&scale16_to_12(img.to_luma16().as_raw()), w, h, &cfg)?
-        }
-        (Depth::D12, false, false) => {
-            encode_rgb12(&scale16_to_12(img.to_rgb16().as_raw()), w, h, &cfg)?
-        }
-        (Depth::D12, false, true) => {
-            encode_rgba12_with_alpha(&scale16_to_12(img.to_rgba16().as_raw()), w, h, &cfg)?
-        }
+        (Depth::D8, true, _) => encode_gray8(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Eight,
+                img.to_luma8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D8, false, false) => encode_rgb8(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Eight,
+                img.to_rgb8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D8, false, true) => encode_rgba8_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Eight,
+                img.to_rgba8().as_raw(),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, true, _) => encode_gray10(
+            &PlanarImage::from_luma(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Ten,
+                &scale16_to_10(img.to_luma16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, false, false) => encode_rgb10(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Ten,
+                &scale16_to_10(img.to_rgb16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D10, false, true) => encode_rgba10_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Ten,
+                &scale16_to_10(img.to_rgba16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, true, _) => encode_gray12(
+            &PlanarImage::from_luma(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_luma16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, false, false) => encode_rgb12(
+            &PlanarImage::from_interleaved_rgb(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_rgb16().as_raw()),
+            )?,
+            &cfg,
+        )?,
+        (Depth::D12, false, true) => encode_rgba12_with_alpha(
+            &PlanarImage::from_interleaved_rgba(
+                img.width() as usize,
+                img.height() as usize,
+                BitDepth::Twelve,
+                &scale16_to_12(img.to_rgba16().as_raw()),
+            )?,
+            &cfg,
+        )?,
     })
 }
 
@@ -419,7 +478,7 @@ fn encode_av2(
             Depth::D8 => {
                 let l = img.to_luma8().into_raw();
                 enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Eight, &l),
+                    &PlanarImage::from_luma(w, h, BitDepth::Eight, &l)?,
                     &color,
                     args.threads,
                 )?
@@ -427,7 +486,7 @@ fn encode_av2(
             Depth::D10 => {
                 let l = scale16_to_10(img.to_luma16().as_raw());
                 enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Ten, &l),
+                    &PlanarImage::from_luma(w, h, BitDepth::Ten, &l)?,
                     &color,
                     args.threads,
                 )?
@@ -435,7 +494,7 @@ fn encode_av2(
             Depth::D12 => {
                 let l = scale16_to_12(img.to_luma16().as_raw());
                 enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Twelve, &l),
+                    &PlanarImage::from_luma(w, h, BitDepth::Twelve, &l)?,
                     &color,
                     args.threads,
                 )?
@@ -468,7 +527,7 @@ fn encode_av2(
                 h,
                 BitDepth::Eight,
                 &rgb,
-            ))?;
+            )?)?;
             Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
         } else {
             let (rgb, a) = deinterleave_rgba(&img.to_rgba8().into_raw(), w, h);
@@ -477,9 +536,9 @@ fn encode_av2(
                 h,
                 BitDepth::Eight,
                 &rgb,
-            ))?;
+            )?)?;
             let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Eight, &a),
+                &PlanarImage::from_luma(w, h, BitDepth::Eight, &a)?,
                 &color,
                 args.threads,
             )?;
@@ -500,7 +559,7 @@ fn encode_av2(
                 h,
                 BitDepth::Ten,
                 &raw16,
-            ))?;
+            )?)?;
             Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
         } else {
             let (rgb, a) = deinterleave_rgba(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
@@ -509,9 +568,9 @@ fn encode_av2(
                 h,
                 BitDepth::Ten,
                 &rgb,
-            ))?;
+            )?)?;
             let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Ten, &a),
+                &PlanarImage::from_luma(w, h, BitDepth::Ten, &a)?,
                 &color,
                 args.threads,
             )?;
@@ -532,7 +591,7 @@ fn encode_av2(
             h,
             BitDepth::Twelve,
             &raw16,
-        ))?;
+        )?)?;
         Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
     } else {
         let (rgb, a) = deinterleave_rgba(&scale16_to_12(img.to_rgba16().as_raw()), w, h);
@@ -541,9 +600,9 @@ fn encode_av2(
             h,
             BitDepth::Twelve,
             &rgb,
-        ))?;
+        )?)?;
         let alpha_frame = alpha_enc.encode_yuv400(
-            &PlanarImage::from_luma(w, h, BitDepth::Twelve, &a),
+            &PlanarImage::from_luma(w, h, BitDepth::Twelve, &a)?,
             &color,
             args.threads,
         )?;

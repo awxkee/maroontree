@@ -27,7 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ChromaFormat;
+use crate::{BitDepth, ChromaFormat};
 use std::fmt;
 
 #[derive(Debug)]
@@ -41,6 +41,7 @@ pub enum EncodeError {
     DimensionTooLarge { width: usize, height: usize },
     InvalidQuality,
     UnsupportedChromaFormat(ChromaFormat),
+    UnsupportedChromaBitDepth(BitDepth),
 }
 
 impl fmt::Display for EncodeError {
@@ -65,6 +66,9 @@ impl fmt::Display for EncodeError {
             Self::InvalidQuality => write!(f, "Invalid quality"),
             Self::UnsupportedChromaFormat(chroma) => {
                 write!(f, "Chroma {:?} in current path is not supported", chroma)
+            }
+            EncodeError::UnsupportedChromaBitDepth(bp) => {
+                write!(f, "Bit-depth {:?} is not supported", bp)
             }
         }
     }

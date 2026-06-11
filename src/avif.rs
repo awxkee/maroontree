@@ -62,7 +62,7 @@ use crate::encoder::{
 };
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
-use crate::{BitDepth, PlanarImage, isobmff};
+use crate::{BitDepth, PlanarImage, encode_lossless_gray_obu, isobmff};
 
 const MIN_DIM: u32 = 1;
 /// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
@@ -202,16 +202,8 @@ fn validate_quality(quality: u8) -> Result<(), EncodeError> {
     Ok(())
 }
 
-pub(crate) fn validate_buf_u8<T>(buf: &[T], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
+pub(crate) fn validate_buf<T>(buf: &[T], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
     let needed = checked_buffer_size::<T>(w as usize, h as usize, ch)?;
-    if buf.len() != needed {
-        return Err(EncodeError::InvalidInput);
-    }
-    Ok(())
-}
-
-fn validate_buf_u16(buf: &[u16], w: u32, h: u32, ch: usize) -> Result<(), EncodeError> {
-    let needed = checked_buffer_size::<u16>(w as usize, h as usize, ch)?;
     if buf.len() != needed {
         return Err(EncodeError::InvalidInput);
     }
@@ -365,55 +357,46 @@ fn dispatch_lossy<T: crate::Pixel>(
 /// Encode an 8-bit RGB image to AVIF.
 ///
 /// `rgb` must hold exactly `width * height * 3` bytes in R, G, B order.
-pub fn encode_rgb8(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u8(rgb, width, height, 3)?;
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Eight, rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 8, cfg.chroma, cfg)
+    finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
 
 /// Encode an 8-bit RGBA image to AVIF. The alpha channel is **discarded**.
 ///
 /// `rgba` must hold exactly `width * height * 4` bytes in R, G, B, A order.
-pub fn encode_rgba8(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgba8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u8(rgba, width, height, 4)?;
-    let rgb: Vec<u8> = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Eight, &rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 8, cfg.chroma, cfg)
+    finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
 
 /// Encode an 8-bit RGBA image to AVIF with a separate alpha auxiliary image.
@@ -422,210 +405,189 @@ pub fn encode_rgba8(
 /// alpha image linked by an `auxl` reference. `rgba` must hold exactly
 /// `width * height * 4` bytes in R, G, B, A order.
 pub fn encode_rgba8_with_alpha(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
+    img: &PlanarImage<u8>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
-    cfg.validate()?;
-    validate_buf_u8(rgba, width, height, 4)?;
-    let (w, h) = (width as usize, height as usize);
-    let q = quality_to_q(cfg.quality);
-    let mut rgb = vec![0u8; w * h * 3];
-    let mut alpha = vec![0u8; w * h];
-    for ((px, dst_rgb), alpha) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        dst_rgb[0] = px[0];
-        dst_rgb[1] = px[1];
-        dst_rgb[2] = px[2];
-        *alpha = px[3];
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
     }
-    let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb);
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: img.width,
-            height: img.height,
-            bit_depth: BitDepth::Eight,
-            planes: [alpha, vec![], vec![]],
-        },
-        BitDepth::Eight,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_with_alpha(color_obu, alpha_obu, width, height, 8, cfg.chroma, cfg)
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        8,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 10-bit RGB image to AVIF.
 ///
 /// `rgb` must hold exactly `width * height * 3` `u16` samples, each in `0..=1023`.
-pub fn encode_rgb10(
-    rgb: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgb10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(rgb, width, height, 3)?;
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Ten, rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 10, cfg.chroma, cfg)
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        10,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 10-bit RGBA image to AVIF. Alpha is discarded.
 ///
 /// `rgba` must hold exactly `width * height * 4` `u16` samples in `0..=1023`.
-pub fn encode_rgba10(
-    rgba: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgba10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(rgba, width, height, 4)?;
-    let rgb: Vec<u16> = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Ten, &rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 10, cfg.chroma, cfg)
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        10,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 10-bit RGBA image to AVIF with a separate alpha auxiliary image.
 pub fn encode_rgba10_with_alpha(
-    rgba: &[u16],
-    width: u32,
-    height: u32,
+    img: &PlanarImage<u16>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
-    cfg.validate()?;
-    validate_buf_u16(rgba, width, height, 4)?;
-    let (w, h) = (width as usize, height as usize);
-    let q = quality_to_q(cfg.quality);
-    let mut rgb = vec![0u16; w * h * 3];
-    let mut alpha = vec![0u16; w * h];
-    for ((px, dst_rgb), alpha) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        dst_rgb[0] = px[0];
-        dst_rgb[1] = px[1];
-        dst_rgb[2] = px[2];
-        *alpha = px[3];
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
     }
-    let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Ten, &rgb);
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: img.width,
-            height: img.height,
-            bit_depth: BitDepth::Ten,
-            planes: [alpha, vec![], vec![]],
-        },
-        BitDepth::Ten,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_with_alpha(color_obu, alpha_obu, width, height, 10, cfg.chroma, cfg)
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        10,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 12-bit RGB image to AVIF.
 ///
 /// `rgb` must hold exactly `width * height * 3` samples, each in `0..=4095`,
 /// packed as `u16`.
-pub fn encode_rgb12(
-    rgb: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgb12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(rgb, width, height, 3)?;
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Twelve, rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 12, cfg.chroma, cfg)
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        12,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 12-bit RGBA image to AVIF. Alpha is **discarded**.
 ///
 /// `rgba` must hold exactly `width * height * 4` samples in R, G, B, A order,
 /// each in `0..=4095`, packed as `u16`.
-pub fn encode_rgba12(
-    rgba: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_rgba12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(rgba, width, height, 4)?;
-    let rgb: Vec<u16> = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
-    let img =
-        PlanarImage::from_interleaved_rgb(width as usize, height as usize, BitDepth::Twelve, &rgb);
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     let obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         quality_to_q(cfg.quality),
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    finalize_color(obu, width, height, 12, cfg.chroma, cfg)
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        12,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode a 12-bit RGBA image to AVIF with a separate alpha auxiliary image.
@@ -633,180 +595,140 @@ pub fn encode_rgba12(
 /// `rgba` must hold exactly `width * height * 4` samples in R, G, B, A order,
 /// each in `0..=4095`, packed as `u16`.
 pub fn encode_rgba12_with_alpha(
-    rgba: &[u16],
-    width: u32,
-    height: u32,
+    img: &PlanarImage<u16>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
-    cfg.validate()?;
-    validate_buf_u16(rgba, width, height, 4)?;
-    let (w, h) = (width as usize, height as usize);
-    let q = quality_to_q(cfg.quality);
-    let mut rgb = vec![0u16; w * h * 3];
-    let mut alpha = vec![0u16; w * h];
-    for ((px, dst_rgb), alpha) in rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
-        .zip(alpha.iter_mut())
-    {
-        dst_rgb[0] = px[0];
-        dst_rgb[1] = px[1];
-        dst_rgb[2] = px[2];
-        *alpha = px[3];
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
     }
-    let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb);
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_lossy(
-        &img,
+        &img.packed_3(),
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     );
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: img.width,
-            height: img.height,
-            bit_depth: BitDepth::Twelve,
-            planes: [alpha, vec![], vec![]],
-        },
-        BitDepth::Twelve,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_with_alpha(color_obu, alpha_obu, width, height, 12, cfg.chroma, cfg)
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        12,
+        cfg.chroma,
+        cfg,
+    )
 }
 
 /// Encode an 8-bit grayscale image to AVIF using AV1 monochrome coding.
 ///
 /// `gray` must hold exactly `width * height` bytes. The output uses
 /// `mono_chrome = 1` (NumPlanes = 1) and AV1 profile 0.
-pub fn encode_gray8(
-    gray: &[u8],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_gray8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u8(gray, width, height, 1)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: width as usize,
-            height: height as usize,
-            bit_depth: BitDepth::Eight,
-            planes: [gray.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Eight,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_color(obu, width, height, 8, ChromaFormat::Monochrome, cfg)
+    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Eight, q, true, cfg.threads)?;
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        8,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
 }
 
 /// Encode a 10-bit grayscale image to AVIF.
 ///
 /// `gray` must hold exactly `width * height` `u16` samples in `0..=1023`.
-pub fn encode_gray10(
-    gray: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_gray10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(gray, width, height, 1)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: width as usize,
-            height: height as usize,
-            bit_depth: BitDepth::Ten,
-            planes: [gray.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Ten,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_color(obu, width, height, 10, ChromaFormat::Monochrome, cfg)
+    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Ten, q, true, cfg.threads)?;
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        10,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
 }
 
 /// Encode a 12-bit grayscale image to AVIF.
 ///
 /// `gray` must hold exactly `width * height` `u16` samples in `0..=4095`.
-pub fn encode_gray12(
-    gray: &[u16],
-    width: u32,
-    height: u32,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(width, height)?;
+pub fn encode_gray12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    validate_buf_u16(gray, width, height, 1)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: width as usize,
-            height: height as usize,
-            bit_depth: BitDepth::Twelve,
-            planes: [gray.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Twelve,
-        q,
-        true,
-        cfg.threads,
-    )?;
-    finalize_color(obu, width, height, 12, ChromaFormat::Monochrome, cfg)
+    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Twelve, q, true, cfg.threads)?;
+    finalize_color(
+        obu,
+        img.width as u32,
+        img.height as u32,
+        12,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
 }
 
 /// Encode a pre-converted 8-bit planar YCbCr image to AVIF.
 ///
 /// `y` must be `width × height` bytes; `cb`/`cr` must match `cfg.chroma`.
-pub fn encode_yuv8(
-    planar_image: &PlanarImage<u8>,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+pub fn encode_yuv8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
+    img.validate_with(cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
     let obu = dispatch_yuv_u8(
-        planar_image,
+        img,
         BitDepth::Eight,
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
-    finalize_color(
-        obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
-        8,
-        cfg.chroma,
-        cfg,
-    )
+    finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
 
 /// Encode a pre-converted 10-bit planar YCbCr image to AVIF.
 ///
 /// Each sample is a `u16` in `0..=1023`; `cb`/`cr` must match `cfg.chroma`.
-pub fn encode_yuv10(
-    planar_image: &PlanarImage<u16>,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+pub fn encode_yuv10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
+    img.validate_with(cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
     let obu = dispatch_yuv_u16(
-        planar_image,
+        img,
         BitDepth::Ten,
         q,
         cfg.chroma,
@@ -815,8 +737,8 @@ pub fn encode_yuv10(
     )?;
     finalize_color(
         obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
+        img.width as u32,
+        img.height as u32,
         10,
         cfg.chroma,
         cfg,
@@ -826,16 +748,16 @@ pub fn encode_yuv10(
 /// Encode a pre-converted 12-bit planar YCbCr image to AVIF.
 ///
 /// Each sample is a `u16` in `0..=4095`; `cb`/`cr` must match `cfg.chroma`.
-pub fn encode_yuv12(
-    planar_image: &PlanarImage<u16>,
-    cfg: &EncodeConfig,
-) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+pub fn encode_yuv12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
+    img.validate_with(cfg.chroma)?;
     let q = quality_to_q(cfg.quality);
     let obu = dispatch_yuv_u16(
-        planar_image,
+        img,
         BitDepth::Twelve,
         q,
         cfg.chroma,
@@ -844,8 +766,8 @@ pub fn encode_yuv12(
     )?;
     finalize_color(
         obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
+        img.width as u32,
+        img.height as u32,
         12,
         cfg.chroma,
         cfg,
@@ -856,40 +778,34 @@ pub fn encode_yuv12(
 ///
 /// `a` must be `width * height` bytes; YCbCr subsampling must match `cfg.chroma`.
 pub fn encode_yuva8_with_alpha(
-    planar_image: &PlanarImage<u8>,
-    a: &[u8],
+    img: &PlanarImage<u8>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
-    validate_buf_u8(a, planar_image.width as u32, planar_image.height as u32, 1)?;
+    img.validate_with(cfg.chroma)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_yuv_u8(
-        planar_image,
+        &img.packed_3(),
         BitDepth::Eight,
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: planar_image.width,
-            height: planar_image.height,
-            bit_depth: BitDepth::Eight,
-            planes: [a.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Eight,
-        q,
-        true,
-        cfg.threads,
-    )?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
+        img.width as u32,
+        img.height as u32,
         8,
         cfg.chroma,
         cfg,
@@ -898,40 +814,34 @@ pub fn encode_yuva8_with_alpha(
 
 /// Encode pre-converted 10-bit YCbCr + a separate 10-bit alpha plane to AVIF.
 pub fn encode_yuva10_with_alpha(
-    planar_image: &PlanarImage<u16>,
-    a: &[u16],
+    img: &PlanarImage<u16>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
-    validate_buf_u16(a, planar_image.width as u32, planar_image.height as u32, 1)?;
+    img.validate_with(cfg.chroma)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_yuv_u16(
-        planar_image,
+        &img.packed_3(),
         BitDepth::Ten,
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: planar_image.width,
-            height: planar_image.height,
-            bit_depth: BitDepth::Ten,
-            planes: [a.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Ten,
-        q,
-        true,
-        cfg.threads,
-    )?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
+        img.width as u32,
+        img.height as u32,
         10,
         cfg.chroma,
         cfg,
@@ -940,45 +850,35 @@ pub fn encode_yuva10_with_alpha(
 
 /// Encode pre-converted 12-bit YCbCr + a separate 12-bit alpha plane to AVIF.
 pub fn encode_yuva12_with_alpha(
-    planar_image: &PlanarImage<u16>,
-    a: &[u16],
+    img: &PlanarImage<u16>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(planar_image.width as u32, planar_image.height as u32)?;
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
-    planar_image.validate_with(cfg.chroma)?;
-    validate_buf_u16(a, planar_image.width as u32, planar_image.height as u32, 1)?;
+    img.validate_with(cfg.chroma)?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
+
     let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_yuv_u16(
-        &PlanarImage {
-            width: planar_image.width,
-            height: planar_image.height,
-            bit_depth: BitDepth::Twelve,
-            planes: [a.to_vec(), vec![], vec![]],
-        },
+        &img.packed_3(),
         BitDepth::Twelve,
         q,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
     )?;
-    let alpha_obu = encode_lossy_gray_obu(
-        &PlanarImage {
-            width: planar_image.width,
-            height: planar_image.height,
-            bit_depth: BitDepth::Twelve,
-            planes: [a.to_vec(), vec![], vec![]],
-        },
-        BitDepth::Twelve,
-        q,
-        true,
-        cfg.threads,
-    )?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
-        planar_image.width as u32,
-        planar_image.height as u32,
+        img.width as u32,
+        img.height as u32,
         12,
         cfg.chroma,
         cfg,
