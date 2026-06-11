@@ -57,6 +57,9 @@ mod rangecoder;
 mod transform;
 mod trellis;
 
+pub mod av2_image {
+    pub use crate::av2::simple::*;
+}
 pub use av2::{Av2Encoder, Av2Frame, Tuning, TxPart, av2_map_quality};
 pub use avif::{
     ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
