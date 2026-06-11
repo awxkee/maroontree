@@ -101,17 +101,11 @@ pub(super) fn predict_luma(
 /// the smallest total coefficient magnitude (rate proxy) wins. Mutates `recy`
 /// (leaving the winner's reconstruction) and returns the four TX coefficient
 /// lists plus the chosen `mode_idx` (0=DC, 1=SMOOTH, 4=PAETH).
-/// Trellis-RDOQ strength (level^2 per bit). 0 disables RDOQ and reproduces the
-/// round-to-nearest + EOB-truncation baseline exactly. Overridable via AV2_RDOQ_LAMBDA.
-fn rdoq_lambda() -> f64 {
-    use std::sync::OnceLock;
-    static L: OnceLock<f64> = OnceLock::new();
-    *L.get_or_init(|| {
-        std::env::var("AV2_RDOQ_LAMBDA")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0.09)
-    })
+/// RD lambda for the per-SB luma tx-partition choice (pixel-SSE vs coded bits).
+/// Scales ~qstep^2 like a standard mode-decision lambda; `c` is the multiplier in
+/// lambda = c*qstep^2 (see [`crate::av2::Tuning::part_lambda_c`]).
+pub(crate) fn part_lambda(qstep: i32, c: f64) -> f64 {
+    c * (qstep as f64) * (qstep as f64)
 }
 
 fn project_luma_rdoq(
@@ -120,8 +114,8 @@ fn project_luma_rdoq(
     scan: &[u16],
     qc: usize,
     cost: &mut f64,
+    lambda: f64,
 ) -> Vec<f32> {
-    let lambda = rdoq_lambda();
     if lambda > 0.0 {
         let (mut l, prm) = luma.project_scan_with_prm(resid, scan);
         *cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
@@ -137,6 +131,7 @@ fn project_luma_rdoq(
     }
 }
 
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_luma_sb(
     recy: &mut [f32],
@@ -151,6 +146,7 @@ pub(super) fn encode_luma_sb(
     scan: &[u16],
     neutral: f32,
     qc: usize,
+    rdoq_lambda: f64,
 ) -> ([Vec<Coeff>; 4], usize) {
     const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
     let mut best_cost = f64::INFINITY;
@@ -172,7 +168,7 @@ pub(super) fn encode_luma_sb(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lambda = rdoq_lambda();
+            let lambda = rdoq_lambda;
             let lev = if lambda > 0.0 {
                 // Trellis RDOQ: pick coefficient levels by real rate-distortion
                 // (rate = true coded bits), then RD-trim the EOB. The mode cost
@@ -286,6 +282,7 @@ pub(super) fn encode_luma_leaf32(
     scan: &[u16],
     neutral: f32,
     qc: usize,
+    rdoq_lambda: f64,
 ) -> ([Vec<Coeff>; 2], usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
@@ -304,7 +301,7 @@ pub(super) fn encode_luma_leaf32(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[ti] = levels_to_coeffs(&lev);
@@ -402,6 +399,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     scan: &[u16],
     neutral: f32,
     qc: usize,
+    rdoq_lambda: f64,
 ) -> ([Vec<Coeff>; 2], usize) {
     let tu_i = [(0usize, 0usize), (32usize, 2usize)]; // (ty, raster-i)
     let mut best_cost = f64::INFINITY;
@@ -421,7 +419,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[k] = levels_to_coeffs(&lev);
@@ -461,6 +459,7 @@ pub(super) fn encode_luma_leaf_s32x32(
     scan: &[u16],
     neutral: f32,
     qc: usize,
+    rdoq_lambda: f64,
 ) -> (Vec<Coeff>, usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
@@ -476,7 +475,7 @@ pub(super) fn encode_luma_leaf_s32x32(
             }
         }
         let mut cost = 0f64;
-        let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost);
+        let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
         if m != 0 {
             cost += 6.0;
         }

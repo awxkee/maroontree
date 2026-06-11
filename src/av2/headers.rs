@@ -142,7 +142,7 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
 }
 
 /// Build the key-frame header OBU payload (the tile data is appended by the caller).
-pub(crate) fn frame_header(config: &Config, width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn frame_header(config: &Config, width: u32, height: u32, tiles: (usize, usize, usize)) -> Vec<u8> {
     let has_chroma = config.layout.has_chroma();
     let mut b = ByteWriter::new();
     b.write_bit(1);
@@ -152,14 +152,44 @@ pub(crate) fn frame_header(config: &Config, width: u32, height: u32) -> Vec<u8> 
     b.write_bit(0);
     b.write_bit(1);
 
-    let sb_cols = width.div_ceil(64);
-    let sb_rows = height.div_ceil(64);
-    b.write_bit(1);
-    if sb_cols > 1 {
+    let sb_cols = (width as usize).div_ceil(64);
+    let sb_rows = (height as usize).div_ceil(64);
+    let (log2c, log2r, tsb) = tiles;
+    let tlog2 = |blk: usize, tgt: usize| {
+        let mut k = 0;
+        while (blk << k) < tgt {
+            k += 1;
+        }
+        k
+    };
+    // seq_max_level_idx = SEQ_LEVEL_MAX makes the decoder's max tile width and max
+    // tile area unconstrained (get_max_tile_width/area return sb_cols / sb_cols*sb_rows),
+    // so it computes min_log2_cols = 0 and min_log2_tiles = 0 — NOT tile_log2(64, sb).
+    // The tile_info increment loops must start from these same minima or the decoder
+    // reads the wrong TileColsLog2/TileRowsLog2. Using tile_log2(64, sb) desynced every
+    // tiled frame with a side > 4096px (sb_cols/sb_rows > 64); small frames matched only
+    // because tile_log2(64, sb)=0 there. min_log2_tile_rows = max(min_log2_tiles-log2c,0)=0.
+    let (min_lc, max_lc) = (0usize, tlog2(1, sb_cols.min(64)));
+    let (min_lr, max_lr) = (0usize, tlog2(1, sb_rows.min(64)));
+    b.write_bit(1); // uniform_tile_spacing_flag
+    for _ in min_lc..log2c {
+        b.write_bit(1);
+    }
+    if log2c < max_lc {
         b.write_bit(0);
     }
-    if sb_rows > 1 {
+    for _ in min_lr..log2r {
+        b.write_bit(1);
+    }
+    if log2r < max_lr {
         b.write_bit(0);
+    }
+    if log2c > 0 || log2r > 0 {
+        // NB: single_picture_header_flag=1 forces enable_avg_cdf=avg_cdf_type=1 in the
+        // sequence header, which makes the decoder OMIT context_update_tile_id in
+        // tile_info(). Emitting it here would shift tile_size_bytes and misalign the
+        // tile data. So we write only tile_size_bytes_minus_1.
+        b.write_bits((tsb - 1) as u32, 2); // tile_size_bytes_minus_1
     }
     b.write_bits(if config.lossless { 0 } else { config.base_q }, 8);
     b.write_bit(0);
@@ -171,6 +201,9 @@ pub(crate) fn frame_header(config: &Config, width: u32, height: u32) -> Vec<u8> 
         // skipped, and read_tx_mode is forced to ONLY_4X4 with no bit. Only the
         // 2-bit reduced_tx_set remains before byte alignment.
         b.write_bits(0, 2); // reduced_tx_set
+        if log2c > 0 || log2r > 0 {
+            b.write_bit(0); // tile_start_and_end_present_flag = 0
+        }
         b.align_with_zero();
         return b.into_bytes();
     }
@@ -202,6 +235,10 @@ pub(crate) fn frame_header(config: &Config, width: u32, height: u32) -> Vec<u8> 
     }
     b.write_bit(if config.tx_switchable { 1 } else { 0 }); // txfm_mode: 1=SWITCHABLE
     b.write_bits(0, 2); // reduced_txtp_set
+    if log2c > 0 || log2r > 0 {
+        b.write_bit(0); // tile_start_and_end_present_flag = 0 (decoder reads it here,
+                        // folded into the frame header's own byte alignment)
+    }
     b.align_with_zero();
     b.into_bytes()
 }

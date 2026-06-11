@@ -26,45 +26,11 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-mod av1_coefs;
-mod av1_tables;
-mod av1_tile;
-mod av1_wht;
-mod av1real;
-mod av2;
-mod avif;
-mod bitwriter;
-mod cdf_tables;
-mod coef_q;
-pub mod coeff;
-mod color;
 mod dct;
-mod encoder;
-mod err;
-mod idct;
-mod isobmff;
-mod loopfilter;
-mod metadata;
-mod msac_enc;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod obu;
-mod odec;
-mod pixel;
-mod rangecoder;
-mod transform;
-mod trellis;
+mod wht;
 
-pub use av2::{Av2Encoder, Av2Frame, Tuning, TxPart, av2_map_quality};
-pub use avif::{
-    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
-    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
-    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
-    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
+pub(crate) use dct::{
+    dct8x8_neon_coeffs, dct8x8_neon_i32, dct8x16_neon_coeffs, dct8x16_neon_i32,
+    dct16x16_neon_coeffs, dct16x16_neon_i32, dct32x32_neon_coeffs, dct32x32_neon_i32,
 };
-pub use color::{
-    ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay, Primaries, TransferFunction,
-};
-pub use encoder::{PlanarImage, encode_lossless, encode_lossless_with};
-pub use pixel::{BitDepth, Pixel};
+pub(crate) use wht::fwht_raw_neon;

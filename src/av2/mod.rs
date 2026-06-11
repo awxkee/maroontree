@@ -62,9 +62,10 @@ use crate::av2::chroma422::{
 };
 use crate::av2::coder::{
     Coeff, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
-    encode_lossless_luma_sb, encode_luma_block_split, encode_luma_leaf_16x64,
+    encode_lossless_luma_sb, encode_luma_block_split, encode_luma_block_vert4, encode_luma_block_horz4, encode_luma_leaf_16x64,
     encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
     encode_luma_leaf_dc_class2,
+    encode_luma_leaf_16x16_full,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,
@@ -78,6 +79,7 @@ use crate::av2::helpers::{
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;
+use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for, tile_specs};
 use crate::av2::leaf::{
     encode_luma_leaf_s32x32, encode_luma_leaf_v32x64, encode_luma_leaf32, encode_luma_sb,
 };
@@ -111,6 +113,55 @@ impl Av2Frame {
     }
 }
 
+/// Luma transform-partition strategy for a 64x64 superblock (replaces the old
+/// `AV2_TXPART` env). `ThreeWay` RD-chooses among SPLIT/VERT4/HORZ4; `Rd2` restricts
+/// to {SPLIT,VERT4}; the rest force a single partition (mainly for testing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TxPart {
+    /// RD between SPLIT (4xTX_32X32), VERT4 (4xTX_16X64) and HORZ4 (4xTX_64X16).
+    #[default]
+    ThreeWay,
+    /// RD between SPLIT and VERT4 only.
+    Rd2,
+    /// Force SPLIT (4xTX_32X32).
+    Split,
+    /// Force VERT4 (4xTX_16X64).
+    Vert4,
+    /// Force HORZ4 (4xTX_64X16).
+    Horz4,
+}
+
+/// Encoder tuning knobs. Previously set through `AV2_*` environment variables; now
+/// a plain config value carried by [`Av2Encoder`]. [`Tuning::default`] reproduces the
+/// shipping defaults exactly.
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    /// Requested tile-grid columns (>=1). The encoder rounds up to a power of two and
+    /// clamps to the available superblock count; 1 means a single column of tiles.
+    pub tile_cols: usize,
+    /// Requested tile-grid rows (>=1).
+    pub tile_rows: usize,
+    /// Luma transform-partition strategy.
+    pub txpart: TxPart,
+    /// Trellis-RDOQ strength (level^2 per bit). `0.0` disables RDOQ (round-to-nearest
+    /// + EOB truncation baseline).
+    pub rdoq_lambda: f64,
+    /// Multiplier `c` in the tx-partition RD lambda `lambda = c * qstep^2`.
+    pub part_lambda_c: f64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            tile_cols: 1,
+            tile_rows: 1,
+            txpart: TxPart::ThreeWay,
+            rdoq_lambda: proj::DEFAULT_RDOQ_LAMBDA,
+            part_lambda_c: 0.0001,
+        }
+    }
+}
+
 /// A reusable still-image encoder configured for one quality.
 ///
 /// `Av2Encoder::new(q)` loads the bundled q120 bases and rescales them to the target
@@ -121,6 +172,7 @@ pub struct Av2Encoder {
     bases: proj::Bases,
     base_q_idx: u8,
     bit_depth: u8,
+    tune: Tuning,
 }
 
 /// Returns the AV2 mi-unit frame extents `(mc, mr)` for a native (no-pad) lossy 4:4:4
@@ -243,8 +295,7 @@ struct ChromaNeighborBufs<'a> {
 }
 
 impl Av2Encoder {
-    /// Build an 8-bit encoder for `base_q_idx`. Honors the `BASES` env override for
-    /// the source basis file, otherwise uses the embedded q120 set, then rescales.
+    /// Build an 8-bit encoder for `base_q_idx` with default [`Tuning`].
     pub fn new(base_q_idx: u8) -> Self {
         Self::with_bit_depth(base_q_idx, 8)
     }
@@ -258,17 +309,47 @@ impl Av2Encoder {
             matches!(bit_depth, 8 | 10 | 12),
             "bit_depth must be 8, 10 or 12, got {bit_depth}"
         );
-        let mut bases = match std::env::var("BASES") {
-            Ok(p) => proj::load_bases(&p),
-            Err(_) => proj::default_bases(),
-        }
-        .rescaled_to_q(base_q_idx as u32);
+        let mut bases = proj::default_bases().rescaled_to_q(base_q_idx as u32);
         bases.set_bit_depth(bit_depth);
         Av2Encoder {
             bases,
             base_q_idx,
             bit_depth,
+            tune: Tuning::default(),
         }
+    }
+
+    /// Replace the full [`Tuning`] (builder style).
+    pub fn with_tuning(mut self, tune: Tuning) -> Self {
+        self.tune = tune;
+        self
+    }
+
+    /// Request a tile grid for parallel encoding. `cols`/`rows` are rounded up to a
+    /// power of two and clamped to the available superblock count; `(1, 1)` (the
+    /// default) encodes a single tile. Tiles are encoded in parallel when the encode
+    /// call is given more than one thread.
+    pub fn with_tiles(mut self, cols: usize, rows: usize) -> Self {
+        self.tune.tile_cols = cols.max(1);
+        self.tune.tile_rows = rows.max(1);
+        self
+    }
+
+    /// Select the luma transform-partition strategy.
+    pub fn with_txpart(mut self, txpart: TxPart) -> Self {
+        self.tune.txpart = txpart;
+        self
+    }
+
+    /// Set the trellis-RDOQ strength (`0.0` disables RDOQ).
+    pub fn with_rdoq_lambda(mut self, lambda: f64) -> Self {
+        self.tune.rdoq_lambda = lambda;
+        self
+    }
+
+    /// Current tuning.
+    pub fn tuning(&self) -> Tuning {
+        self.tune
     }
 
     /// The quality this encoder is configured for.
@@ -347,7 +428,7 @@ impl Av2Encoder {
         let exact = config.lossless || aligned || lossy_native;
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
-        let mut frame = frame_header(config, sw as u32, sh as u32);
+        let mut frame = frame_header(config, sw as u32, sh as u32, (0, 0, 1));
         frame.extend(&tile);
         let mut data = vec![];
         data.extend(obu(2, &[]));

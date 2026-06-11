@@ -42,28 +42,46 @@ impl Av2Encoder {
         color: &ColorEncoding,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
-        // Lossy 4:2:x is reconstruction-sequential (intra prediction reads the
-        // running reconstruction), so it codes serially regardless of `threads`.
-        let _ = threads;
         let width = planar_image.width;
         let height = planar_image.height;
-        let y = &planar_image.planes[0];
-        let cb = &planar_image.planes[1];
-        let cr = &planar_image.planes[2];
         planar_image.validate_422()?;
         if self.base_q_idx == 0 {
             return self.encode_yuv422_lossless(planar_image, color, threads);
         }
-        let bases = &self.bases;
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
+        let yf = to_plane(&planar_image.planes[0]);
+        let cbf = to_plane(&planar_image.planes[1]);
+        let crf = to_plane(&planar_image.planes[2]);
+        let (pw, ph) = (sb_align(width), sb_align(height));
+        let config = self.config(Layout::I422);
+        if let Some((log2c, log2r)) =
+            tile_grid_for(self.tune.tile_cols, self.tune.tile_rows, width, height)
+        {
+            return Ok(self.encode_422_tiled(
+                &yf, &cbf, &crf, width, height, &config, color, log2c, log2r, threads,
+            ));
+        }
+        let enc = self.encode_422_core(&yf, &cbf, &crf, width, height);
+        Ok(self.finish(enc, &config, pw, ph, width, height, color))
+    }
+
+    /// SB-loop core for one 4:2:2 region (whole frame or one tile). Pads the region
+    /// planes, runs the per-SB encode, and returns the entropy coder; header/finish
+    /// (or multi-tile assembly) happens in the caller.
+    fn encode_422_core(
+        &self,
+        yf: &[f32],
+        cbf: &[f32],
+        crf: &[f32],
+        width: usize,
+        height: usize,
+    ) -> RangeEncoder {
+        let bases = &self.bases;
         let (pw, ph) = (sb_align(width), sb_align(height));
         let (pcw, pch) = (pw / 2, ph); // chroma: half width, full height
-        let yp = pad_plane(&to_plane(y), width, height, pw, ph);
-        let up = pad_plane(&to_plane(cb), width / 2, height, pcw, pch);
-        let vp = pad_plane(&to_plane(cr), width / 2, height, pcw, pch);
-
-        let layout = Layout::I422;
-        let config = self.config(layout);
+        let yp = pad_plane(yf, width, height, pw, ph);
+        let up = pad_plane(cbf, width / 2, height, pcw, pch);
+        let vp = pad_plane(crf, width / 2, height, pcw, pch);
         let mut recy = vec![0f32; pw * ph];
         let mut recu = vec![0f32; pcw * pch + 1];
         let mut recv = vec![0f32; pcw * pch + 1];
@@ -114,6 +132,7 @@ impl Av2Encoder {
                         &crate::av2::tables::SCAN,
                         neutral,
                         qc,
+                        self.tune.rdoq_lambda,
                     );
                     let (skip_cdfs, dc_sign_ctxs) =
                         sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
@@ -253,6 +272,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -309,6 +329,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_64x32(
                                 &tus2, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -359,6 +380,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -418,6 +440,7 @@ impl Av2Encoder {
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
+                                self.tune.rdoq_lambda,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],
@@ -769,7 +792,101 @@ impl Av2Encoder {
                 }
             }
         }
-        Ok(self.finish(enc, &config, pw, ph, width, height, color))
+        enc
+    }
+
+    /// Multi-tile 4:2:2 assembly. Each tile is an independent sub-frame encode; tiles
+    /// run in parallel across `threads` workers (raster order preserved). 4:2:2 chroma
+    /// is half-width/full-height, so a luma tile at `(x0, tw)` maps to chroma
+    /// `(x0/2, tw/2)` — both even because SB boundaries and 4:2:2 width are even.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_422_tiled(
+        &self,
+        yf: &[f32],
+        cbf: &[f32],
+        crf: &[f32],
+        width: usize,
+        height: usize,
+        config: &Config,
+        color: &ColorEncoding,
+        log2c: usize,
+        log2r: usize,
+        threads: usize,
+    ) -> Av2Frame {
+        // See encode_444_tiled: pad the whole frame SB-aligned (one frame-level clap)
+        // when any edge tile isn't boundary-exact; otherwise signal the real size.
+        let native_specs = tile_specs(width, height, log2c, log2r);
+        let exact = native_specs
+            .iter()
+            .all(|&(_, _, tw, th)| native_422_mi(tw, th).is_some());
+        let (pw, ph) = (sb_align(width), sb_align(height));
+        let (sig_w, sig_h, lstride, cstride, planes, specs) = if exact {
+            (
+                width,
+                height,
+                width,
+                width / 2,
+                (yf.to_vec(), cbf.to_vec(), crf.to_vec()),
+                native_specs,
+            )
+        } else {
+            (
+                pw,
+                ph,
+                pw,
+                pw / 2,
+                (
+                    pad_plane(yf, width, height, pw, ph),
+                    pad_plane(cbf, width / 2, height, pw / 2, ph),
+                    pad_plane(crf, width / 2, height, pw / 2, ph),
+                ),
+                tile_specs(pw, ph, log2c, log2r),
+            )
+        };
+        let (yf, cbf, crf) = (&planes.0, &planes.1, &planes.2);
+        let cw = cstride; // chroma plane stride (4:2:2)
+        let n = specs.len();
+        let mut tiles_bytes: Vec<Vec<u8>> = vec![Vec::new(); n];
+        let nthreads = Self::resolve_threads(threads).min(n.max(1));
+        if nthreads <= 1 || n <= 1 {
+            for (slot, &(x0, y0, tw, th)) in tiles_bytes.iter_mut().zip(&specs) {
+                let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
+                let tu = extract_subplane(cbf, cw, x0 / 2, y0, tw / 2, th);
+                let tv = extract_subplane(crf, cw, x0 / 2, y0, tw / 2, th);
+                *slot = self.encode_422_core(&ty, &tu, &tv, tw, th).finish();
+            }
+        } else {
+            let chunk = n.div_ceil(nthreads);
+            let me = &*self;
+            let (yf, cbf, crf) = (&yf, &cbf, &crf);
+            std::thread::scope(|sc| {
+                for (out_chunk, spec_chunk) in
+                    tiles_bytes.chunks_mut(chunk).zip(specs.chunks(chunk))
+                {
+                    sc.spawn(move || {
+                        for (slot, &(x0, y0, tw, th)) in out_chunk.iter_mut().zip(spec_chunk) {
+                            let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
+                            let tu = extract_subplane(cbf, cw, x0 / 2, y0, tw / 2, th);
+                            let tv = extract_subplane(crf, cw, x0 / 2, y0, tw / 2, th);
+                            *slot = me.encode_422_core(&ty, &tu, &tv, tw, th).finish();
+                        }
+                    });
+                }
+            });
+        }
+        assemble_multitile(
+            config,
+            sig_w,
+            sig_h,
+            width,
+            height,
+            color,
+            log2c,
+            log2r,
+            self.bit_depth,
+            ChromaFormat::Yuv422,
+            &tiles_bytes,
+        )
     }
 
     /// Lossless 4:2:2: identical recursion to the 4:4:4 lossless path, but the chroma
