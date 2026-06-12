@@ -5,6 +5,17 @@ members = ["app", "cli"]
 name = "maroontree"
 version = "0.1.0"
 edition = "2024"
+description = "AV1 & AV2 tiny still-image (AVIF) encoder"
+readme = "README.md"
+keywords = ["avif", "av1", "av2", "encoder", "image"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/maroontree"
+categories = ["multimedia::images", "compression", "encoding"]
+homepage = "https://github.com/awxkee/maroontree"
+repository = "https://github.com/awxkee/maroontree"
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
+rust-version = "1.93.0"
 
 [dependencies]
 
