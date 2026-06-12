@@ -54,9 +54,14 @@ mod av1_lossless;
 mod av1_lossy;
 mod av2_lossless;
 mod av2_lossy;
+#[cfg(feature = "heic")]
+mod heic;
+#[cfg(feature = "heic")]
+mod orientation;
 
 use crate::av1_lossy::encode_av1;
 use crate::av2_lossy::encode_av2;
+use image::{DynamicImage, Luma, Rgb, Rgba};
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -94,6 +99,7 @@ struct Args {
     no_alpha: bool,
     no_exif: bool,
     no_icc: bool,
+    apply_icc: bool,
     verbose: bool,
 }
 
@@ -116,6 +122,7 @@ Options:
       --no-alpha              Discard alpha channel
       --no-exif               Strip EXIF metadata from output
       --no-icc                Strip ICC colour profile from output
+      --apply-icc             Apply ICC profile to pixels (convert to sRGB), then strip it
   -v, --verbose               Print timing and file stats
   -h, --help                  Print this help"
     );
@@ -146,6 +153,7 @@ fn parse_args() -> Args {
     let mut no_alpha = false;
     let mut no_exif = false;
     let mut no_icc = false;
+    let mut apply_icc = false;
     let mut verbose = false;
 
     while let Some(arg) = args.next() {
@@ -156,6 +164,7 @@ fn parse_args() -> Args {
             "--no-alpha" => no_alpha = true,
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
+            "--apply-icc" => apply_icc = true,
             "-e" | "--encoder" => match args.next().unwrap_or_default().as_str() {
                 "av1" => encoder = Encoder::Av1,
                 "av2" => encoder = Encoder::Av2,
@@ -238,6 +247,7 @@ fn parse_args() -> Args {
         no_alpha,
         no_exif,
         no_icc,
+        apply_icc,
         verbose,
     }
 }
@@ -307,6 +317,127 @@ fn read_icc(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+fn apply_icc_to_image(
+    img: &DynamicImage,
+    effective_depth: Depth,
+    icc: &[u8],
+) -> Result<DynamicImage, anyhow::Error> {
+    use moxcms::{ColorProfile, Layout, TransformOptions};
+
+    let src = ColorProfile::new_from_slice(icc)
+        .map_err(|e| anyhow::anyhow!("invalid ICC profile: {e:?}"))?;
+    let dst = ColorProfile::new_srgb();
+    let opts = TransformOptions::default();
+
+    if has_alpha_channel(img.color()) {
+        if effective_depth == Depth::D8 {
+            if matches!(img, DynamicImage::ImageLumaA8(_)) {
+                // gray image
+                let rgba = img.to_luma_alpha8();
+                let (w, h) = rgba.dimensions();
+                let buf = rgba.into_raw();
+                let mut dst_data = vec![0u8; buf.len()];
+                src.create_transform_8bit(Layout::GrayAlpha, &dst, Layout::GrayAlpha, opts)
+                    .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                    .transform(&buf, &mut dst_data)
+                    .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+                return Ok(DynamicImage::ImageLumaA8(
+                    image::GrayAlphaImage::from_raw(w, h, dst_data)
+                        .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+                ));
+            }
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let buf = rgba.into_raw();
+            let mut dst_data = vec![0u8; buf.len()];
+            src.create_transform_8bit(Layout::Rgba, &dst, Layout::Rgba, opts)
+                .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                .transform(&buf, &mut dst_data)
+                .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+            Ok(DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(w, h, dst_data)
+                    .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+            ))
+        } else {
+            let rgba = img.to_rgba16();
+            let (w, h) = rgba.dimensions();
+            let buf = rgba.into_raw();
+            let mut dst_data = vec![0u16; buf.len()];
+            src.create_transform_16bit(Layout::Rgba, &dst, Layout::Rgba, opts)
+                .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                .transform(&buf, &mut dst_data)
+                .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+            Ok(image::DynamicImage::ImageRgba16(
+                image::ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(w, h, dst_data)
+                    .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+            ))
+        }
+    } else {
+        if effective_depth == Depth::D8 {
+            if matches!(img, DynamicImage::ImageLuma8(_)) {
+                // gray image
+                let rgba = img.to_luma8();
+                let (w, h) = rgba.dimensions();
+                let buf = rgba.into_raw();
+                let mut dst_data = vec![0u8; buf.len()];
+                src.create_transform_8bit(Layout::Gray, &dst, Layout::Gray, opts)
+                    .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                    .transform(&buf, &mut dst_data)
+                    .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+                return Ok(DynamicImage::ImageLuma8(
+                    image::GrayImage::from_raw(w, h, dst_data)
+                        .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+                ));
+            }
+            let rgba = img.to_rgb8();
+            let (w, h) = rgba.dimensions();
+            let buf = rgba.into_raw();
+            let mut dst_data = vec![0u8; buf.len()];
+            src.create_transform_8bit(Layout::Rgb, &dst, Layout::Rgb, opts)
+                .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                .transform(&buf, &mut dst_data)
+                .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+            Ok(DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(w, h, dst_data)
+                    .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+            ))
+        } else {
+            if matches!(img, DynamicImage::ImageLuma16(_)) {
+                // gray image
+                let rgba = img.to_luma16();
+                let (w, h) = rgba.dimensions();
+                let buf = rgba.into_raw();
+                let mut dst_data = vec![0u16; buf.len()];
+                src.create_transform_16bit(Layout::Gray, &dst, Layout::Gray, opts)
+                    .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                    .transform(&buf, &mut dst_data)
+                    .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+                return Ok(DynamicImage::ImageLuma16(
+                    image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, dst_data)
+                        .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+                ));
+            }
+            let rgba = img.to_rgb16();
+            let (w, h) = rgba.dimensions();
+            let buf = rgba.into_raw();
+            let mut dst_data = vec![0u16; buf.len()];
+            src.create_transform_16bit(Layout::Rgb, &dst, Layout::Rgb, opts)
+                .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
+                .transform(&buf, &mut dst_data)
+                .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
+            Ok(DynamicImage::ImageRgb16(
+                image::ImageBuffer::<Rgb<u16>, Vec<u16>>::from_raw(w, h, dst_data)
+                    .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "heic")]
+fn is_heif_format(fmt: &str) -> bool {
+    matches!(fmt.to_lowercase().as_str(), "heic" | "heif")
+}
+
 fn main() {
     let args = parse_args();
 
@@ -318,8 +449,31 @@ fn main() {
         }
     }
 
-    let img = image::open(&args.input)
-        .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())));
+    #[cfg(feature = "heic")]
+    let format = args
+        .input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
+    let img: DynamicImage;
+    #[cfg(feature = "heic")]
+    if let Some(format) = format
+        && is_heif_format(&format)
+    {
+        use crate::heic::decode_heic_file_url;
+        img = decode_heic_file_url(&args.input)
+            .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
+    } else {
+        img = image::open(&args.input)
+            .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
+    }
+    #[cfg(not(feature = "heic"))]
+    {
+        img = image::open(&args.input)
+            .unwrap_or_else(|e| crate::die(format!("cannot open '{}': {e}", args.input.display())));
+    }
+
     let color_type = img.color();
     let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
         Depth::D10
@@ -328,7 +482,33 @@ fn main() {
     });
 
     let exif_bytes = (!args.no_exif).then(|| read_exif(&args.input)).flatten();
-    let icc_bytes = (!args.no_icc).then(|| read_icc(&args.input)).flatten();
+
+    let raw_icc = if args.apply_icc || !args.no_icc {
+        read_icc(&args.input)
+    } else {
+        None
+    };
+
+    // Apply ICC profile to pixel data via moxcms, then discard the profile so
+    // it is not embedded in the output.  The encoded image will be plain sRGB.
+    let (img, icc_bytes) = if args.apply_icc {
+        match raw_icc {
+            Some(ref icc) => {
+                let converted = apply_icc_to_image(&img, effective_depth, icc)
+                    .unwrap_or_else(|e| die(format!("ICC apply failed: {e}")));
+                (converted, None)
+            }
+            None => {
+                if args.verbose {
+                    eprintln!("apply-icc: no ICC profile found in source, skipping");
+                }
+                (img, None)
+            }
+        }
+    } else {
+        // --no-icc just strips without converting
+        (img, if args.no_icc { None } else { raw_icc })
+    };
 
     if args.verbose {
         match &exif_bytes {
@@ -336,7 +516,8 @@ fn main() {
             None => eprintln!("exif   : none"),
         }
         match &icc_bytes {
-            Some(b) => eprintln!("icc    : {} bytes", b.len()),
+            Some(b) => eprintln!("icc    : {} bytes (embedded)", b.len()),
+            None if args.apply_icc => eprintln!("icc    : applied, not embedded"),
             None => eprintln!("icc    : none"),
         }
         eprintln!(
