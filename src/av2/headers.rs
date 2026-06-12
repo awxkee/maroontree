@@ -18,6 +18,8 @@ pub(crate) struct Config {
     pub(crate) delta_q: i32,
     pub(crate) tx_switchable: bool,
     pub(crate) guided_deblock: Option<GuidedDeblock>,
+    /// In-loop CDEF.
+    pub(crate) cdef: Option<(u8, u8, u8)>,
     /// Coded bit depth: 8, 10 or 12.
     pub(crate) bit_depth: u8,
     /// When set, emit a `coded_lossless` frame: base_q forced to 0, in-loop filters and
@@ -123,8 +125,8 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
         b.write_bits(23, 5); // base uv-ac delta-q (raw 23 => delta 0)
         b.write_bit(0); // uv-ac delta-q enabled
     }
-    b.write_bit(0);
-    b.write_bit(0); // disable lf across tiles, cdef
+    b.write_bit(0); // disable_loopfilters_across_tiles
+    b.write_bit(config.cdef.is_some() as u32); // enable_cdef
     if config.guided_deblock.is_some() {
         b.write_bit(1);
         b.write_bit(0);
@@ -237,6 +239,26 @@ pub(crate) fn frame_header(
         b.write_bit(0);
         b.write_bits(gdf.qp_offset, 2);
         b.write_bits(gdf.scale_minus_one, 2);
+    }
+    if let Some((y_str, uv_str, damping)) = config.cdef {
+        // setup_cdef: single_picture_header forces cdef_frame_enable=1 (no bit) and
+        // enable_cdef_on_skip_txfm=ADAPTIVE (one frame bit). nb_cdef_strengths=1.
+        b.write_bits((damping as u32).saturating_sub(3) & 3, 2); // cdef_damping-3
+        b.write_bits(0, 3); // nb_cdef_strengths - 1 (== 0)
+        b.write_bit(0); // cdef_on_skip_txfm_frame_enable
+        let mut wstr = |s: u8| {
+            if s < 4 {
+                b.write_bit(1);
+                b.write_bits(s as u32, 2);
+            } else {
+                b.write_bit(0);
+                b.write_bits(s as u32, 6); // CDEF_STRENGTH_BITS
+            }
+        };
+        wstr(y_str);
+        if has_chroma {
+            wstr(uv_str);
+        }
     }
     b.write_bit(if config.tx_switchable { 1 } else { 0 }); // txfm_mode: 1=SWITCHABLE
     b.write_bits(0, 2); // reduced_txtp_set

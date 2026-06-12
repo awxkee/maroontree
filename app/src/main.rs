@@ -77,11 +77,12 @@ fn main() {
     .unwrap();
     let instant = Instant::now();
     let av2_encoder = Av2Encoder::new(av2_map_quality(53))
-        .with_tiles(512, 512)
+        .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
-        .with_rdoq_lambda(0.09);
+        .with_rdoq_lambda(0.09)
+        .with_cdef(false);
     let encoded = av2_encoder
-        .encode_image_422(&pimg, &ColorEncoding::srgb_ycbcr(), 9)
+        .encode_image_422(&pimg, &ColorEncoding::srgb_ycbcr(), 1)
         .unwrap();
     let out_obu = encoded.view();
     println!("encoding time {:?}", instant.elapsed());
