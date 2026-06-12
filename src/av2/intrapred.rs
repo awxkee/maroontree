@@ -56,11 +56,10 @@ const BLEND_WEIGHT_MAX: i32 = 32;
 /// PAETH predictor for a `bs`x`bs` block → row-major `bs*bs` f32 samples.
 pub(crate) fn paeth(bs: usize, above: &[i32], left: &[i32], corner: i32) -> Vec<f32> {
     let mut out = vec![0f32; bs * bs];
-    for r in 0..bs {
-        let l = left[r];
+    for (r, &l) in left[..bs].iter().enumerate() {
         let row = &mut out[r * bs..r * bs + bs];
-        for c in 0..bs {
-            row[c] = paeth_single(l, above[c], corner) as f32;
+        for (dst, &top) in row[..bs].iter_mut().zip(above[..bs].iter()) {
+            *dst = paeth_single(l, top, corner) as f32;
         }
     }
     out
@@ -78,18 +77,16 @@ pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     let blend_max_log2 = blk_size_log2(BLEND_WEIGHT_MAX as usize); // 5
     let clamp_log2 = blk_size_log2((BLEND_WEIGHT_MAX << 1) as usize); // log2(64)=6
     let mut out = vec![0f32; bs * bs];
-    for r in 0..bs {
+    for (r, &l) in left[..bs].iter().enumerate() {
         let s_top = BLEND_WEIGHT_MAX >> clamp_log2.min(((r as i32) << 1) >> scale);
-        let l = left[r];
         let row = &mut out[r * bs..r * bs + bs];
-        for c in 0..bs {
+        for (c, (dst, &top)) in row[..bs].iter_mut().zip(above[..bs].iter()).enumerate() {
             let s_left = BLEND_WEIGHT_MAX >> clamp_log2.min(((c as i32) << 1) >> scale);
-            let top = above[c];
             let mut predv = bl + divide_round((top - bl) * (bs as i32 - 1 - r as i32), log2_h);
             let mut predh = tr + divide_round((l - tr) * (bs as i32 - 1 - c as i32), log2_w);
             predv += divide_round((top - predv) * s_top, blend_max_log2 + 1);
             predh += divide_round((l - predh) * s_left, blend_max_log2 + 1);
-            row[c] = divide_round(predv + predh, 1) as f32;
+            *dst = divide_round(predv + predh, 1) as f32;
         }
     }
     out

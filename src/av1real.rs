@@ -6013,17 +6013,8 @@ mod tests {
         }
         let color = ColorEncoding::srgb_ycbcr();
         for &q in &[52u8, 129] {
-            let (bytes, recon, (w8, _h8, cw8)) = super::encode_av1_lossy_image_422_recon_dbg(
-                q,
-                8,
-                w,
-                h,
-                &y,
-                &u,
-                &v,
-                Some(&color),
-                1,
-            );
+            let (bytes, recon, (w8, _h8, cw8)) =
+                encode_av1_lossy_image_422_recon_dbg(q, 8, w, h, &y, &u, &v, Some(&color), 1);
             std::fs::write("/tmp/lf422.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
                 .args(["-i", "/tmp/lf422.obu", "-o", "/tmp/lf422.y4m", "--quiet"])
