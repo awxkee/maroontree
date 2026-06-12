@@ -37,17 +37,17 @@
 //!   [OUTPUT]  Destination .avif  [default: INPUT stem + ".avif"]
 //!
 //! Options:
-//!   -e, --encoder <av1|av2>     Encoder backend                 [default: av1]
-//!   -q, --quality <1-100>       Encode quality (higher = better) [default: 80(AV1)/60(AV2)]
-//!       --lossless              Pixel-perfect lossless (AV2 only)
-//!   -c, --chroma <444|422|420>  Chroma subsampling              [default: 420]
-//!   -d, --depth <8|10|12>       Output bit depth (auto-detect from source)
-//!   -t, --threads <N>           Worker threads; 0 = all cores   [default: all]
-//!       --no-alpha              Discard alpha channel
-//!       --no-exif               Strip EXIF from output
-//!       --no-icc                Strip ICC profile from output
-//!   -v, --verbose               Print dimensions, timing, file size
-//!   -h, --help                  Print this help
+//!   -e, --encoder <av1|av2|hevc|jxl>     Encoder backend                 [default: av1]
+//!   -q, --quality <1-100>                Encode quality (higher = better) [default: 80(AV1)/60(AV2)]
+//!       --lossless                       Pixel-perfect lossless
+//!   -c, --chroma <444|422|420>           Chroma subsampling              [default: 420]
+//!   -d, --depth <8|10|12>                Output bit depth (auto-detect from source)
+//!   -t, --threads <N>                    Worker threads; 0 = all cores   [default: all]
+//!       --no-alpha                       Discard alpha channel
+//!       --no-exif                        Strip EXIF from output
+//!       --no-icc                         Strip ICC profile from output
+//!   -v, --verbose                        Print dimensions, timing, file size
+//!   -h, --help                           Print this help
 //! ```
 
 mod av1_lossless;
@@ -56,11 +56,14 @@ mod av2_lossless;
 mod av2_lossy;
 #[cfg(feature = "heic")]
 mod heic;
+mod jxl;
 #[cfg(feature = "heic")]
 mod orientation;
 
 use crate::av1_lossy::encode_av1;
 use crate::av2_lossy::encode_av2;
+use crate::heic::encode_hevc;
+use crate::jxl::{decode_jxl, encode_jxl};
 use image::{DynamicImage, Luma, Rgb, Rgba};
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use std::path::{Path, PathBuf};
@@ -70,6 +73,8 @@ use std::time::Instant;
 enum Encoder {
     Av1,
     Av2,
+    Hevc,
+    JpegXl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,18 +118,18 @@ Arguments:
   [OUTPUT]  Output .avif  [default: input stem + \".avif\"]
 
 Options:
-  -e, --encoder <av1|av2>     Encoder backend                 [default: av1]
-  -q, --quality <1-100>       Quality (higher = better)       [default: 80(AV1)/60(AV2)]
-      --lossless              Pixel-perfect lossless (AV2 only)
-  -c, --chroma <444|422|420>  Chroma subsampling              [default: 420]
-  -d, --depth <8|10|12>       Output bit depth (auto from source)
-  -t, --threads <N>           Worker threads; 0 = all cores   [default: all]
-      --no-alpha              Discard alpha channel
-      --no-exif               Strip EXIF metadata from output
-      --no-icc                Strip ICC colour profile from output
-      --apply-icc             Apply ICC profile to pixels (convert to sRGB), then strip it
-  -v, --verbose               Print timing and file stats
-  -h, --help                  Print this help"
+  -e, --encoder <av1|av2|hevc|jxl>  Encoder backend                 [default: av1]
+  -q, --quality <1-100>             Quality (higher = better)       [default: 80(AV1)/60(AV2)]
+      --lossless                    Pixel-perfect lossless (AV2 only)
+  -c, --chroma <444|422|420>        Chroma subsampling              [default: 420]
+  -d, --depth <8|10|12>             Output bit depth (auto from source)
+  -t, --threads <N>                 Worker threads; 0 = all cores   [default: all]
+      --no-alpha                    Discard alpha channel
+      --no-exif                     Strip EXIF metadata from output
+      --no-icc                      Strip ICC colour profile from output
+      --apply-icc                   Apply ICC profile to pixels (convert to sRGB), then strip it
+  -v, --verbose                     Print timing and file stats
+  -h, --help                        Print this help"
     );
     std::process::exit(0);
 }
@@ -168,6 +173,8 @@ fn parse_args() -> Args {
             "-e" | "--encoder" => match args.next().unwrap_or_default().as_str() {
                 "av1" => encoder = Encoder::Av1,
                 "av2" => encoder = Encoder::Av2,
+                "hevc" | "heic" | "heif" => encoder = Encoder::Hevc,
+                "jxl" | "jpegxl" | "jpeg-xl" => encoder = Encoder::JpegXl,
                 other => die(format!("unknown encoder '{other}'; use av1 or av2")),
             },
             "-q" | "--quality" => {
@@ -234,6 +241,8 @@ fn parse_args() -> Args {
             None => match encoder {
                 Encoder::Av1 => 80,
                 Encoder::Av2 => 60,
+                Encoder::Hevc => 80,
+                Encoder::JpegXl => 70,
             },
             Some(v) => v,
         },
@@ -367,7 +376,7 @@ fn apply_icc_to_image(
                 .map_err(|e| anyhow::anyhow!("ICC transform create: {e:?}"))?
                 .transform(&buf, &mut dst_data)
                 .map_err(|e| anyhow::anyhow!("ICC transform apply: {e:?}"))?;
-            Ok(image::DynamicImage::ImageRgba16(
+            Ok(DynamicImage::ImageRgba16(
                 image::ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(w, h, dst_data)
                     .ok_or_else(|| anyhow::anyhow!("buffer size mismatch after ICC apply"))?,
             ))
@@ -438,6 +447,10 @@ fn is_heif_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "heic" | "heif")
 }
 
+fn is_jxl_format(fmt: &str) -> bool {
+    matches!(fmt.to_lowercase().as_str(), "jxl" | "jpegxl")
+}
+
 fn main() {
     let args = parse_args();
 
@@ -456,17 +469,28 @@ fn main() {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
 
+    let mut have_icc: Option<Vec<u8>> = None;
+
     let img: DynamicImage;
     #[cfg(feature = "heic")]
-    if let Some(format) = format
+    if let Some(format) = format.as_ref()
         && is_heif_format(&format)
     {
         use crate::heic::decode_heic_file_url;
         img = decode_heic_file_url(&args.input)
             .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
     } else {
-        img = image::open(&args.input)
-            .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
+        if let Some(format) = format.as_ref()
+            && is_jxl_format(&format)
+        {
+            let (img1, prof) = decode_jxl(&args.input)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())));
+            img = img1;
+            have_icc = prof;
+        } else {
+            img = image::open(&args.input)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
+        }
     }
     #[cfg(not(feature = "heic"))]
     {
@@ -483,11 +507,14 @@ fn main() {
 
     let exif_bytes = (!args.no_exif).then(|| read_exif(&args.input)).flatten();
 
-    let raw_icc = if args.apply_icc || !args.no_icc {
+    let mut raw_icc = if args.apply_icc || !args.no_icc {
         read_icc(&args.input)
     } else {
         None
     };
+    if let Some(have_icc) = have_icc {
+        raw_icc = Some(have_icc.to_vec());
+    }
 
     // Apply ICC profile to pixel data via moxcms, then discard the profile so
     // it is not embedded in the output.  The encoded image will be plain sRGB.
@@ -552,6 +579,24 @@ fn main() {
         )
         .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
         Encoder::Av2 => encode_av2(
+            &img,
+            &args,
+            color_type,
+            effective_depth,
+            icc_bytes.as_deref(),
+            exif_bytes.as_deref(),
+        )
+        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+        Encoder::Hevc => encode_hevc(
+            &img,
+            &args,
+            color_type,
+            effective_depth,
+            icc_bytes.as_deref(),
+            exif_bytes.as_deref(),
+        )
+        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+        Encoder::JpegXl => encode_jxl(
             &img,
             &args,
             color_type,

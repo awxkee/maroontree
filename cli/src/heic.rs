@@ -27,6 +27,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::orientation::apply_orientation;
+use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use hpvca::ChromaFormat;
 use image::{DynamicImage, Luma};
 use std::fs;
 use std::path::PathBuf;
@@ -50,6 +52,8 @@ pub enum HeicError {
     Format(String),
     #[error("Cannot read file due to an error:`{0}`")]
     Io(String),
+    #[error("Lossless allowed only on 4:4:4 chroma but it was: `{0:?}`")]
+    Lossless444(ChromaFormat),
 }
 
 pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicError> {
@@ -91,6 +95,7 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
     let mut is_ycgco = false;
     if let Some(enc) = &dec.color.cicp {
         matrix = match enc.matrix {
+            MatrixCoefficients::Smpte170m => YuvStandardMatrix::Bt601,
             MatrixCoefficients::Bt709 => YuvStandardMatrix::Bt709,
             MatrixCoefficients::Bt2020Ncl | MatrixCoefficients::Bt2020Cl => {
                 YuvStandardMatrix::Bt2020
@@ -440,4 +445,89 @@ fn finish_monochrome(
         }
     };
     Ok(apply_orientation(img, dec.orientation))
+}
+
+pub(crate) fn encode_hevc(
+    img: &DynamicImage,
+    args: &Args,
+    color_type: image::ColorType,
+    effective_depth: Depth,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
+        Chroma::C444 => ChromaFormat::Yuv444,
+        Chroma::C422 => ChromaFormat::Yuv422,
+        Chroma::C420 => ChromaFormat::Yuv420,
+    };
+
+    if args.lossless && chroma_fmt != ChromaFormat::Yuv444 {
+        return Err(anyhow::anyhow!(HeicError::Lossless444(chroma_fmt)));
+    }
+
+    let mut cfg = hpvca::EncodeConfig::new()
+        .with_quality(args.quality)
+        .with_chroma(chroma_fmt)
+        .with_threads(args.threads);
+
+    if let Some(icc) = icc {
+        cfg = cfg.with_icc_profile(icc.to_vec());
+    }
+    if let Some(exif) = exif {
+        cfg = cfg.with_exif(exif.to_vec());
+    }
+
+    if args.lossless {
+        cfg = cfg.with_lossless(true);
+    }
+
+    let gray = is_gray(color_type);
+    let alpha = has_alpha_channel(color_type) && !args.no_alpha;
+    Ok(match (effective_depth, gray, alpha) {
+        (Depth::D8, true, _) => {
+            hpvca::encode_gray(img.to_luma8().as_raw(), img.width(), img.height(), &cfg)?
+        }
+        (Depth::D8, false, false) => {
+            hpvca::encode_rgb(img.to_rgb8().as_raw(), img.width(), img.height(), &cfg)?
+        }
+        (Depth::D8, false, true) => {
+            hpvca::encode_rgba_with_alpha(img.to_rgba8().as_raw(), img.width(), img.height(), &cfg)?
+        }
+        (Depth::D10, true, _) => hpvca::encode_gray10(
+            &scale16_to_10(img.to_luma16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+        (Depth::D10, false, false) => hpvca::encode_rgb10(
+            &scale16_to_10(img.to_rgb16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+        (Depth::D10, false, true) => hpvca::encode_rgba10_with_alpha(
+            &scale16_to_10(img.to_rgba16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+        (Depth::D12, true, _) => hpvca::encode_gray12(
+            &scale16_to_12(img.to_luma16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+        (Depth::D12, false, false) => hpvca::encode_rgb12(
+            &scale16_to_12(img.to_rgb16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+        (Depth::D12, false, true) => hpvca::encode_rgba12_with_alpha(
+            &scale16_to_12(img.to_rgba16().as_raw()),
+            img.width(),
+            img.height(),
+            &cfg,
+        )?,
+    })
 }
