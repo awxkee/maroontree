@@ -29,6 +29,7 @@
 
 use crate::ColorEncoding;
 use crate::av2::Av2Frame;
+use crate::metadata::{ContentLightLevel, Orientation};
 
 pub(crate) enum Av2Color {
     Cicp(ColorEncoding),
@@ -164,6 +165,8 @@ pub(crate) fn wrap_av2_image(
     fmt: &Av2Format,
     color: &Av2Color,
     exif: Option<&[u8]>,
+    orientation: Orientation,
+    clli: Option<ContentLightLevel>,
     alpha: Option<AlphaItem>,
 ) -> Vec<u8> {
     let channels = fmt.channels();
@@ -400,6 +403,34 @@ pub(crate) fn wrap_av2_image(
             clap_prop = Some(next_prop);
             next_prop += 1;
         }
+        // Optional orientation (`irot` / `imir`) and HDR content light level
+        // (`clli`) for the color item, matching the AV1 path in `isobmff.rs`.
+        // `irot`/`imir` are transformative (essential); `clli` is descriptive.
+        // Written after `clap` so the transform order is clap → irot → imir.
+        let mut irot_prop: Option<u8> = None;
+        let mut imir_prop: Option<u8> = None;
+        let mut clli_prop: Option<u8> = None;
+        if orientation.irot_steps() != 0 {
+            let p = write_box(&mut f, b"irot");
+            f.push(orientation.irot_steps() & 0x03);
+            patch(&mut f, p);
+            irot_prop = Some(next_prop);
+            next_prop += 1;
+        }
+        if let Some(horizontal_axis) = orientation.imir_axis() {
+            let p = write_box(&mut f, b"imir");
+            f.push(if horizontal_axis { 1 } else { 0 });
+            patch(&mut f, p);
+            imir_prop = Some(next_prop);
+            next_prop += 1;
+        }
+        if let Some(cll) = clli {
+            let p = write_box(&mut f, b"clli");
+            f.extend_from_slice(&cll.clli_payload());
+            patch(&mut f, p);
+            clli_prop = Some(next_prop);
+            next_prop += 1;
+        }
         // Alpha auxiliary item properties: ispe, pixi(1ch), av2C(mono), auxC, clap?.
         // (No colr — alpha is auxiliary and carries no colour information.)
         let mut alpha_props: Option<(u8, u8, u8, u8, Option<u8>)> = None;
@@ -461,9 +492,14 @@ pub(crate) fn wrap_av2_image(
         {
             let p = write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 1 + has_alpha as u32); // entry_count
-            // colour item (1): ispe, pixi, av2C(ess), colr(s), clap?(ess)
+            // colour item (1): ispe, pixi, av2C(ess), colr(s), clap?(ess), irot?/imir?(ess), clli?
             w16(&mut f, 1);
-            let assoc = 3 + colr_props.len() as u8 + clap_prop.is_some() as u8;
+            let assoc = 3
+                + colr_props.len() as u8
+                + clap_prop.is_some() as u8
+                + irot_prop.is_some() as u8
+                + imir_prop.is_some() as u8
+                + clli_prop.is_some() as u8;
             f.push(assoc);
             f.push(1); // ispe
             f.push(2); // pixi
@@ -473,6 +509,15 @@ pub(crate) fn wrap_av2_image(
             }
             if let Some(idx) = clap_prop {
                 f.push(0x80 | idx); // clap (essential, transformative)
+            }
+            if let Some(idx) = irot_prop {
+                f.push(0x80 | idx); // irot (essential, transformative)
+            }
+            if let Some(idx) = imir_prop {
+                f.push(0x80 | idx); // imir (essential, transformative)
+            }
+            if let Some(idx) = clli_prop {
+                f.push(idx); // clli (descriptive only)
             }
             // alpha item (2): ispe, pixi, av2C(ess), auxC(ess), clap?(ess)
             if let Some((ispe_a, pixi_a, av2c_a, auxc_a, clap_a)) = alpha_props {
@@ -524,6 +569,8 @@ pub(crate) fn to_avif_color(
     fmt: &Av2Format,
     color: &Av2Color,
     exif: Option<&[u8]>,
+    orientation: Orientation,
+    clli: Option<ContentLightLevel>,
 ) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
@@ -534,6 +581,8 @@ pub(crate) fn to_avif_color(
         fmt,
         color,
         exif,
+        orientation,
+        clli,
         None,
     )
 }
@@ -546,6 +595,8 @@ pub(crate) fn to_avif_color_alpha(
     fmt: &Av2Format,
     color: &Av2Color,
     exif: Option<&[u8]>,
+    orientation: Orientation,
+    clli: Option<ContentLightLevel>,
 ) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
@@ -556,6 +607,8 @@ pub(crate) fn to_avif_color_alpha(
         fmt,
         color,
         exif,
+        orientation,
+        clli,
         Some(AlphaItem {
             obu: &alpha.data,
             coded_width: alpha.coded_width as u32,
@@ -567,11 +620,6 @@ pub(crate) fn to_avif_color_alpha(
     )
 }
 
-/// Convenience: wrap an `Encoded` result using its CICP colour metadata (`nclx`).
-pub fn to_avif(enc: &Av2Frame, fmt: &Av2Format) -> Vec<u8> {
-    to_avif_color(enc, fmt, &Av2Color::Cicp(enc.color), None)
-}
-
 // pub fn to_avif_alpha(enc: &Av2Frame, alpha: &Av2Frame, fmt: &Av2Format) -> Vec<u8> {
 //     to_avif_color_alpha(enc, alpha, fmt, &Av2Color::Cicp(enc.color), None)
 // }
@@ -579,34 +627,3 @@ pub fn to_avif(enc: &Av2Frame, fmt: &Av2Format) -> Vec<u8> {
 // pub fn to_avif_icc(enc: &Av2Frame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
 //     to_avif_color(enc, fmt, &Av2Color::Icc(icc), None)
 // }
-
-/// Convenience: wrap an `Encoded` result with both CICP (`nclx`) and ICC (`prof`).
-pub fn to_avif_cicp_icc(enc: &Av2Frame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
-    to_avif_color(
-        enc,
-        fmt,
-        &Av2Color::Both {
-            cicp: enc.color,
-            icc,
-        },
-        None,
-    )
-}
-
-/// Convenience: wrap an `Encoded` result with CICP plus an optional ICC profile
-/// and/or an EXIF metadata item.
-pub fn to_avif_full(
-    enc: &Av2Frame,
-    fmt: &Av2Format,
-    icc: Option<&[u8]>,
-    exif: Option<&[u8]>,
-) -> Vec<u8> {
-    let color = match icc {
-        Some(icc) => Av2Color::Both {
-            cicp: enc.color,
-            icc: icc.to_vec(),
-        },
-        None => Av2Color::Cicp(enc.color),
-    };
-    to_avif_color(enc, fmt, &color, exif)
-}
