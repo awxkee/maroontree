@@ -9,3 +9,11 @@ maroontree = { path = "../" }
 img-parts = "0.4.0"
 yuv = "0.8.14"
 anyhow = "1.0.102"
+moxcms = { version = "0.8.1" }
+hpvcd = { version = "0.1.2", optional = true }
+fast_transpose = { version = "0.2.7", optional = true }
+thiserror = "2.0.18"
+
+[features]
+default = ["heic"]
+heic = ["dep:hpvcd", "dep:fast_transpose"]

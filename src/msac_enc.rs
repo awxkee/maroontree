@@ -136,7 +136,7 @@ impl Writer {
         }
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         let l = self.low;
         let mut c = self.cnt;
         let mut s = 10i16;
