@@ -126,8 +126,7 @@ pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     let blend_max_log2 = blk_size_log2(BLEND_WEIGHT_MAX as usize); // 5
     let clamp_log2 = blk_size_log2((BLEND_WEIGHT_MAX << 1) as usize); // 6
     let mut out = vec![0f32; bs * bs];
-    for r in 0..bs {
-        let l = left[r];
+    for (r, &l) in left[..bs].iter().enumerate() {
         let row = &mut out[r * bs..r * bs + bs];
         for (c, out) in row[..bs].iter_mut().enumerate() {
             let s_left = BLEND_WEIGHT_MAX >> clamp_log2.min(((c as i32) << 1) >> scale);
