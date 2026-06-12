@@ -29,8 +29,8 @@
 
 use image::imageops::FilterType;
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, TxPart,
-    av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
+    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, Orientation, PlanarImage,
+    TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
 };
 use std::io::Write;
 use std::time::Instant;
@@ -99,7 +99,8 @@ fn main() {
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(&out_obu).unwrap();
 
-    let encoded_avif_av2 = Av2Encoder::wrap_avif(&encoded, None, None).unwrap();
+    let encoded_avif_av2 =
+        Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "out10_avif.avif".into());

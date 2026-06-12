@@ -88,6 +88,7 @@ use crate::av2::leaf::{
 use crate::av2::proj::Basis;
 use crate::av2::tables::{SCAN8X8, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 use crate::err::EncodeError;
+use crate::metadata::{ContentLightLevel, Orientation};
 use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
 
 // Free luma-leaf prediction/coding helpers live in `leaf`.
@@ -490,6 +491,8 @@ impl Av2Encoder {
         frame: &Av2Frame,
         icc_profile: Option<&[u8]>,
         exif: Option<&[u8]>,
+        orientation: Orientation,
+        clli: Option<ContentLightLevel>,
     ) -> Result<Vec<u8>, EncodeError> {
         let format = Av2Format {
             bit_depth: frame.bit_depth,
@@ -498,18 +501,21 @@ impl Av2Encoder {
                 || frame.chroma_format == ChromaFormat::Yuv420,
             chroma_sub_y: frame.chroma_format == ChromaFormat::Yuv420,
         };
-        if let (Some(exif), Some(icc_profile)) = (exif, icc_profile.as_ref()) {
-            return Ok(avif::to_avif_full(
-                frame,
-                &format,
-                Some(icc_profile),
-                Some(exif),
-            ));
-        }
-        if let Some(icc_profile) = icc_profile.as_ref() {
-            return Ok(avif::to_avif_cicp_icc(frame, &format, icc_profile.to_vec()));
-        }
-        Ok(avif::to_avif(frame, &format))
+        let color = match icc_profile {
+            Some(icc) => Av2Color::Both {
+                cicp: frame.color,
+                icc: icc.to_vec(),
+            },
+            None => Av2Color::Cicp(frame.color),
+        };
+        Ok(avif::to_avif_color(
+            frame,
+            &format,
+            &color,
+            exif,
+            orientation,
+            clli,
+        ))
     }
 
     /// Wrap a color frame together with a monochrome alpha auxiliary item into an
@@ -520,6 +526,8 @@ impl Av2Encoder {
         alpha: &Av2Frame,
         icc_profile: Option<&[u8]>,
         exif: Option<&[u8]>,
+        orientation: Orientation,
+        clli: Option<ContentLightLevel>,
     ) -> Result<Vec<u8>, EncodeError> {
         let format = Av2Format {
             bit_depth: frame.bit_depth,
@@ -536,7 +544,13 @@ impl Av2Encoder {
             None => Av2Color::Cicp(frame.color),
         };
         Ok(avif::to_avif_color_alpha(
-            frame, alpha, &format, &color, exif,
+            frame,
+            alpha,
+            &format,
+            &color,
+            exif,
+            orientation,
+            clli,
         ))
     }
 }

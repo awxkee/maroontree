@@ -30,6 +30,7 @@
 use super::{Av2Encoder, Av2Frame, av2_map_quality};
 use crate::avif::{validate_buf, validate_dims};
 use crate::err::EncodeError;
+use crate::metadata::{ContentLightLevel, Orientation};
 use crate::{BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, Pixel, PlanarImage, TxPart};
 
 /// Resolve the colour signalling for an encode: the configured CICP, or a
@@ -116,6 +117,16 @@ fn exif(cfg: &EncodeConfig) -> Option<&[u8]> {
     cfg.metadata.exif.as_deref()
 }
 
+#[inline]
+fn orientation(cfg: &EncodeConfig) -> Orientation {
+    cfg.metadata.orientation
+}
+
+#[inline]
+fn clli(cfg: &EncodeConfig) -> Option<ContentLightLevel> {
+    cfg.metadata.content_light_level
+}
+
 fn rgb_core<T: Pixel>(
     img: &PlanarImage<T>,
     cfg: &EncodeConfig,
@@ -128,7 +139,7 @@ fn rgb_core<T: Pixel>(
     validate_buf(&img.planes[2], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
     let frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
 /// Same as [`rgb_core`] but the input carries an alpha plane that is **dropped**.
@@ -145,7 +156,7 @@ fn rgba_drop_core<T: Pixel>(
     validate_buf(&img.planes[3], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
     let frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
 fn rgba_alpha_core<T: Pixel>(
@@ -162,7 +173,14 @@ fn rgba_alpha_core<T: Pixel>(
     let color = resolve_color(cfg);
     let color_frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
     let alpha_frame = encode_alpha(&img.packed_alpha_4(), img.bit_depth, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif_alpha(&color_frame, &alpha_frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif_alpha(
+        &color_frame,
+        &alpha_frame,
+        icc(cfg),
+        exif(cfg),
+        orientation(cfg),
+        clli(cfg),
+    )
 }
 
 fn gray_core<T: Pixel>(
@@ -175,7 +193,7 @@ fn gray_core<T: Pixel>(
     validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
     let frame = enc.encode_image_400(img, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
 fn yuv_core<T: Pixel>(
@@ -188,7 +206,7 @@ fn yuv_core<T: Pixel>(
     img.validate_with(cfg.chroma)?;
     let color = resolve_color(cfg);
     let frame = encode_yuv_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
 fn yuva_alpha_core<T: Pixel>(
@@ -203,7 +221,14 @@ fn yuva_alpha_core<T: Pixel>(
     let color = resolve_color(cfg);
     let color_frame = encode_yuv_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
     let alpha_frame = encode_alpha(&img.packed_alpha_4(), img.bit_depth, &color, cfg.threads)?;
-    Av2Encoder::wrap_avif_alpha(&color_frame, &alpha_frame, icc(cfg), exif(cfg))
+    Av2Encoder::wrap_avif_alpha(
+        &color_frame,
+        &alpha_frame,
+        icc(cfg),
+        exif(cfg),
+        orientation(cfg),
+        clli(cfg),
+    )
 }
 
 // ─── public API (mirrors crate::avif) ────────────────────────────────────────

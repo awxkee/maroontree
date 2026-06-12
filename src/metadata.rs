@@ -98,9 +98,7 @@ impl Orientation {
     }
 }
 
-/// HDR content light level (CTA-861.3 / ISOBMFF `clli`): the maximum content light
-/// level (MaxCLL) and maximum frame-average light level (MaxFALL), both in cd/m²
-/// (nits). Written as the `ContentLightLevelBox`.
+/// HDR content light level (CTA-861.3 / ISOBMFF `clli`)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentLightLevel {
     /// MaxCLL — maximum content light level, nits.

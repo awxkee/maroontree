@@ -307,7 +307,7 @@ impl Basis {
     /// levels (`n_cf`); |projection| < thresh is dropped. Separable: a horizontal 1D
     /// transform of each row, then a vertical 1D transform per coefficient.
     ///
-    /// After quantisation an RD end-of-block (EOB) truncation is applied: see
+    /// After quantization an RD end-of-block (EOB) truncation is applied: see
     /// [`rdoq_truncate_eob`].
     pub(crate) fn project(&self, resid: &[f32], thresh: f32) -> Vec<f32> {
         let (sv, sh) = (self.side_v, self.side_h);

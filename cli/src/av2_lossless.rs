@@ -28,8 +28,8 @@
  */
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaSamplePosition, ColorEncoding, MatrixCoefficients, PlanarImage,
-    Primaries, TransferFunction, TxPart,
+    Av2Encoder, BitDepth, ChromaSamplePosition, ColorEncoding, MatrixCoefficients, Orientation,
+    PlanarImage, Primaries, TransferFunction, TxPart,
 };
 use yuv::{
     YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444, rgb10_to_icgc410,
@@ -104,7 +104,13 @@ pub(crate) fn encode_av2_lossless_image(
                 )?
             }
         };
-        return Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?);
+        return Ok(Av2Encoder::wrap_avif(
+            &frame,
+            icc,
+            exif,
+            Orientation::Normal,
+            None,
+        )?);
     }
 
     let encode_color_8 = || -> Result<_, anyhow::Error> {
@@ -174,7 +180,13 @@ pub(crate) fn encode_av2_lossless_image(
     if effective_depth == Depth::D8 {
         return if !alpha {
             let frame = encode_color_8()?;
-            Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
+            Ok(Av2Encoder::wrap_avif(
+                &frame,
+                icc,
+                exif,
+                Orientation::Normal,
+                None,
+            )?)
         } else {
             let a = extract_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
             let frame = encode_color_8()?;
@@ -188,6 +200,8 @@ pub(crate) fn encode_av2_lossless_image(
                 &alpha_frame,
                 icc,
                 exif,
+                Orientation::Normal,
+                None,
             )?)
         };
     }
@@ -195,7 +209,13 @@ pub(crate) fn encode_av2_lossless_image(
     if effective_depth == Depth::D10 {
         return if !alpha {
             let frame = encode_color_16(10)?;
-            Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
+            Ok(Av2Encoder::wrap_avif(
+                &frame,
+                icc,
+                exif,
+                Orientation::Normal,
+                None,
+            )?)
         } else {
             let a = extract_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
             let frame = encode_color_16(10)?;
@@ -209,6 +229,8 @@ pub(crate) fn encode_av2_lossless_image(
                 &alpha_frame,
                 icc,
                 exif,
+                Orientation::Normal,
+                None,
             )?)
         };
     }
@@ -216,7 +238,13 @@ pub(crate) fn encode_av2_lossless_image(
     // Depth::D12
     if !alpha {
         let frame = encode_color_16(12)?;
-        Ok(Av2Encoder::wrap_avif(&frame, icc, exif)?)
+        Ok(Av2Encoder::wrap_avif(
+            &frame,
+            icc,
+            exif,
+            Orientation::Normal,
+            None,
+        )?)
     } else {
         let a = extract_alpha(&scale16_to_12(img.to_rgba16().as_raw()), w, h);
         let frame = encode_color_16(12)?;
@@ -230,6 +258,8 @@ pub(crate) fn encode_av2_lossless_image(
             &alpha_frame,
             icc,
             exif,
+            Orientation::Normal,
+            None,
         )?)
     }
 }
