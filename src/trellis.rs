@@ -26,10 +26,10 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av1real::{
-    COEFF_BASE_RANGE, Cdfs, LO_CTX_OFF, NUM_BASE_LEVELS, cdf_cost, coef_rate_bits, get_lo_ctx_2d,
-    golomb_cost, hi_tok_cost, level_byte,
-};
+use crate::av1real::*;
+use crate::coeffs::get_lo_ctx_2d;
+use crate::cost::*;
+use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
 
 /// Context-accurate RDOQ for the 2D square luma transforms (TX_8X8/16X16/32X32,
 /// `cls` 1/2/3). Unlike [`trellis_optimize`], the per-coefficient rate is the

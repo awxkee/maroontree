@@ -27,7 +27,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::{Args, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
-use hpvca::ChromaFormat;
 use image::DynamicImage;
 use jxl::api::{JxlColorProfile, JxlColorType, JxlDataFormat};
 use jxl::headers::extra_channels::ExtraChannel;
