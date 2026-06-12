@@ -150,6 +150,10 @@ pub struct Tuning {
     pub rdoq_lambda: f64,
     /// Multiplier `c` in the tx-partition RD lambda `lambda = c * qstep^2`.
     pub part_lambda_c: f64,
+    /// Enable the in-loop deblocking filter
+    pub deblock: bool,
+    /// Enable the in-loop CDEF (directional de-ring).
+    pub cdef: bool,
 }
 
 impl Default for Tuning {
@@ -160,6 +164,8 @@ impl Default for Tuning {
             txpart: TxPart::ThreeWay,
             rdoq_lambda: proj::DEFAULT_RDOQ_LAMBDA,
             part_lambda_c: 0.0001,
+            deblock: true,
+            cdef: false,
         }
     }
 }
@@ -351,6 +357,18 @@ impl Av2Encoder {
         self
     }
 
+    /// Enable the in-loop deblocking filter (q-derived strength)
+    pub fn with_deblock(mut self, on: bool) -> Self {
+        self.tune.deblock = on;
+        self
+    }
+
+    /// Enable the in-loop CDEF filter at a q-derived global strength
+    pub fn with_cdef(mut self, on: bool) -> Self {
+        self.tune.cdef = on;
+        self
+    }
+
     /// Current tuning.
     pub fn tuning(&self) -> Tuning {
         self.tune
@@ -365,10 +383,18 @@ impl Av2Encoder {
         Config {
             layout,
             base_q: self.base_q_idx as u32,
-            deblock: false,
+            deblock: self.tune.deblock,
             delta_q: 0,
             tx_switchable: true,
             guided_deblock: None,
+            cdef: if self.tune.cdef {
+                // q-derived global strength: scales with base_q_idx, off (None) at high
+                // quality. pri = clamp((q-120)/8, 0, 11); strength = pri*4 (sec=0).
+                let pri = ((self.base_q_idx as i32 - 120) / 8).clamp(0, 11) as u8;
+                (pri > 0).then_some((pri * 4, pri * 4, 3))
+            } else {
+                None
+            },
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
         }
