@@ -768,7 +768,7 @@ fn code_leaf_mono(
     );
 }
 
-/// Mono counterpart of [`encode_plan`].
+#[allow(clippy::too_many_arguments)]
 fn encode_plan_mono(
     wr: &mut Writer,
     luma: &[i16],
