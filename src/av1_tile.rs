@@ -31,7 +31,10 @@ use crate::av1_coefs::encode_coefs;
 use crate::av1_tables::SKIP_CTX;
 use crate::av1_wht::levels_from_resid;
 use crate::cdf_tables as C;
+use crate::cost::coef_rate_bits;
+use crate::intrapred::INTRA_MODE_CTX;
 use crate::msac_enc::Writer;
+use crate::tables::*;
 
 /// DC prediction for a 4×4 block at pixel origin (ox, oy).
 /// Reads from the source plane directly (lossless: recon == src).
@@ -331,7 +334,7 @@ fn plane_leaf_bits(
             levels_from_resid(&mut resid);
             bits += 2.0; // eob / skip overhead
             for &lv in resid.iter() {
-                bits += crate::av1real::coef_rate_bits(lv.unsigned_abs());
+                bits += coef_rate_bits(lv.unsigned_abs());
             }
         }
     }
@@ -450,17 +453,17 @@ fn code_leaf(
     wr.symbol(0, &C::BLK_SKIP); // skip = 0
     let (x8, y8) = (px / 8, py / 8);
     let kfy = icdf13(
-        &crate::av1real::KF_Y_MODE_CDF[crate::av1real::INTRA_MODE_CTX[st.a_mode[x8] as usize]]
-            [crate::av1real::INTRA_MODE_CTX[st.l_mode[y8] as usize]],
+        &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
+            [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
     );
     wr.symbol(y_mode as u32, &kfy);
     if (1..=8).contains(&y_mode) {
-        wr.symbol(3, &icdf7(&crate::av1real::ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
+        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
     }
-    let uvc = icdf13(&crate::av1real::UV_MODE_NOCFL_CDF[y_mode]);
+    let uvc = icdf13(&UV_MODE_NOCFL_CDF[y_mode]);
     wr.symbol(uv_mode as u32, &uvc);
     if (1..=8).contains(&uv_mode) {
-        wr.symbol(3, &icdf7(&crate::av1real::ANGLE_DELTA_CDF[uv_mode - 1]));
+        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[uv_mode - 1]));
     }
     let u8sz = size / 8;
     for u in x8..x8 + u8sz {
@@ -738,12 +741,12 @@ fn code_leaf_mono(
     wr.symbol(0, &C::BLK_SKIP); // skip = 0
     let (x8, y8) = (px / 8, py / 8);
     let kfy = icdf13(
-        &crate::av1real::KF_Y_MODE_CDF[crate::av1real::INTRA_MODE_CTX[st.a_mode[x8] as usize]]
-            [crate::av1real::INTRA_MODE_CTX[st.l_mode[y8] as usize]],
+        &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
+            [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
     );
     wr.symbol(y_mode as u32, &kfy);
     if (1..=8).contains(&y_mode) {
-        wr.symbol(3, &icdf7(&crate::av1real::ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
+        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
     }
     // (mono: HasChroma == false ⇒ no uv_mode symbol, no chroma residual)
     let u8sz = size / 8;

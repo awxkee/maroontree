@@ -36,7 +36,7 @@
 // WC8[3] = 2.5629156  -> 167982
 // SQRT_2  = 1.4142136  -> 92682
 
-use crate::av1real::Dct;
+use crate::quant::Dct;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const WC4_0: i32 = 35468; // 0.541196  * 65536
@@ -864,7 +864,7 @@ pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1real::Quant;
+    use crate::quant::Quant;
 
     fn pat(n: usize) -> Vec<i32> {
         (0..n).map(|i| ((i * 41 + 7) % 113) as i32 - 56).collect()

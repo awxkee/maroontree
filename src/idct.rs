@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av1real::Dct;
+use crate::quant::Dct;
 
 pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
