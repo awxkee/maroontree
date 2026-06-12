@@ -35,9 +35,7 @@ use crate::{BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, Pixel, PlanarIm
 /// Resolve the colour signalling for an encode: the configured CICP, or a
 /// sensible sRGB-YCbCr default when the caller left it unset.
 fn resolve_color(cfg: &EncodeConfig) -> ColorEncoding {
-    cfg.color_encoding
-        .clone()
-        .unwrap_or_else(ColorEncoding::srgb_ycbcr)
+    cfg.color_encoding.unwrap_or_else(ColorEncoding::srgb_ycbcr)
 }
 
 /// Encode an interleaved-RGB (GBR-plane) image to a colour [`Av2Frame`],
