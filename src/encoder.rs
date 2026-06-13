@@ -29,7 +29,7 @@
 use crate::avif::{
     checked_buffer_size, finalize_color, finalize_with_alpha, make_av1c, validate_dims,
 };
-use crate::color::ColorEncoding;
+use crate::color::Cicp;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
@@ -349,7 +349,7 @@ impl<T: Pixel> PlanarImage<T> {
 pub fn encode_still_lossy<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -401,7 +401,7 @@ pub fn encode_still_lossy<T: Pixel>(
 pub fn encode_still_lossy_422<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -479,7 +479,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
 pub fn encode_still_lossy_420<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     assert!(
@@ -640,7 +640,7 @@ pub fn encode_lossless_gray_alpha<T: Pixel>(
 /// Encode a lossless 4:4:4 still with color signaling.
 pub fn encode_lossless_obu<T: Pixel>(
     img: &PlanarImage<T>,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
@@ -744,7 +744,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
@@ -777,7 +777,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
@@ -810,7 +810,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
     base_q_idx: u8,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
@@ -946,7 +946,7 @@ mod tests {
 
         // Threading is deterministic for a fixed tiling: a >4096px-wide frame is
         // 2 tile columns at both 1 and 2 threads, so the bytes must be identical.
-        let color = ColorEncoding::identity_rgb();
+        let color = Cicp::identity_rgb();
         let mut rgb = vec![0u8; 4160 * 64 * 3];
         for (i, b) in rgb.iter_mut().enumerate() {
             *b = (i * 31 % 256) as u8;
@@ -985,9 +985,9 @@ mod tests {
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb)
                 .unwrap();
             let outs = [
-                encode_still_lossy(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
-                encode_still_lossy_422(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
-                encode_still_lossy_420(&img, 80, Some(&ColorEncoding::srgb_ycbcr()), 1),
+                encode_still_lossy(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
+                encode_still_lossy_422(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
+                encode_still_lossy_420(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
             ];
             for (k, o) in outs.iter().enumerate() {
                 assert_eq!(o.len(), exp[k].0, "bd={} fmt={} len", bd, k);
@@ -1010,9 +1010,7 @@ mod tests {
             let rgb = vec![100u8; w * h * 3];
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb).unwrap();
             assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
-            assert!(
-                !encode_still_lossy(&img, 16, Some(&ColorEncoding::srgb_ycbcr()), 0).is_empty()
-            );
+            assert!(!encode_still_lossy(&img, 16, Some(&Cicp::srgb_ycbcr()), 0).is_empty());
         }
     }
 }

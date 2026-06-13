@@ -29,7 +29,7 @@
 use crate::av1_lossless::encode_av1_lossless;
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
-    BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage, encode_gray8, encode_gray10,
+    BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, encode_gray8, encode_gray10,
     encode_gray12, encode_rgb8, encode_rgb10, encode_rgb12, encode_rgba8_with_alpha,
     encode_rgba10_with_alpha, encode_rgba12_with_alpha,
 };
@@ -55,7 +55,7 @@ pub(crate) fn encode_av1(
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
-        .with_cicp(ColorEncoding::srgb_ycbcr())
+        .with_cicp(Cicp::srgb_ycbcr())
         .with_threads(args.threads);
 
     if let Some(icc) = icc {

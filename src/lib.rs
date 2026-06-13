@@ -73,8 +73,8 @@ pub use avif::{
     encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
 };
 pub use color::{
-    ChromaSamplePosition, ColorEncoding, ColorMetadata, ItutT35, MasteringDisplay,
-    MatrixCoefficients, Primaries, TransferFunction,
+    ChromaSamplePosition, Cicp, ColorMetadata, ItutT35, MasteringDisplay, MatrixCoefficients,
+    Primaries, TransferFunction,
 };
 pub use encoder::{
     PlanarImage, encode_lossless, encode_lossless_gray, encode_lossless_gray_alpha,

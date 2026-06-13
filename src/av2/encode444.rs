@@ -145,7 +145,7 @@ pub(super) fn assemble_multitile(
     sig_h: usize,
     disp_w: usize,
     disp_h: usize,
-    color: &ColorEncoding,
+    color: &Cicp,
     log2c: usize,
     log2r: usize,
     bit_depth: u8,
@@ -191,7 +191,7 @@ impl Av2Encoder {
     pub fn encode_yuv444<T: Pixel>(
         &self,
         planar_image: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_444()?;
@@ -1393,7 +1393,7 @@ impl Av2Encoder {
         width: usize,
         height: usize,
         config: &Config,
-        color: &ColorEncoding,
+        color: &Cicp,
         log2c: usize,
         log2r: usize,
         threads: usize,
@@ -1488,7 +1488,7 @@ impl Av2Encoder {
     fn encode_yuv444_lossless<T: Pixel>(
         &self,
         planar_image: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_444()?;
@@ -1666,7 +1666,7 @@ impl Av2Encoder {
     pub fn encode_image_444<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;

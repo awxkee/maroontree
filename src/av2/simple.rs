@@ -31,12 +31,12 @@ use super::{Av2Encoder, Av2Frame, av2_map_quality};
 use crate::avif::{validate_buf, validate_dims};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Orientation};
-use crate::{BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, Pixel, PlanarImage, TxPart};
+use crate::{BitDepth, ChromaFormat, Cicp, EncodeConfig, Pixel, PlanarImage, TxPart};
 
 /// Resolve the colour signalling for an encode: the configured CICP, or a
 /// sensible sRGB-YCbCr default when the caller left it unset.
-fn resolve_color(cfg: &EncodeConfig) -> ColorEncoding {
-    cfg.color_encoding.unwrap_or_else(ColorEncoding::srgb_ycbcr)
+fn resolve_color(cfg: &EncodeConfig) -> Cicp {
+    cfg.color_encoding.unwrap_or_else(Cicp::srgb_ycbcr)
 }
 
 /// Encode an interleaved-RGB (GBR-plane) image to a colour [`Av2Frame`],
@@ -45,7 +45,7 @@ fn encode_rgb_color<T: Pixel>(
     enc: &Av2Encoder,
     img: &PlanarImage<T>,
     chroma: ChromaFormat,
-    color: &ColorEncoding,
+    color: &Cicp,
     threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     match chroma {
@@ -62,7 +62,7 @@ fn encode_yuv_color<T: Pixel>(
     enc: &Av2Encoder,
     img: &PlanarImage<T>,
     chroma: ChromaFormat,
-    color: &ColorEncoding,
+    color: &Cicp,
     threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     match chroma {
@@ -79,7 +79,7 @@ fn encode_yuv_color<T: Pixel>(
 fn encode_alpha<T: Pixel>(
     alpha_mono: &PlanarImage<T>,
     bit_depth: BitDepth,
-    color: &ColorEncoding,
+    color: &Cicp,
     threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     // base_q_idx = 0 ⇒ the mono path takes its lossless branch.

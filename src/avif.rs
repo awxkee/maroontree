@@ -55,7 +55,7 @@
 //! // cb/cr must be ceil(w/2)×ceil(h/2) samples when cfg.chroma == Yuv420
 //! ```
 
-use crate::color::ColorEncoding;
+use crate::color::Cicp;
 use crate::encoder::{
     encode_lossy_gray_obu, encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422,
     encode_yuv420_obu, encode_yuv422_obu, encode_yuv444_obu,
@@ -110,7 +110,7 @@ pub struct EncodeConfig {
     /// always use [`ChromaFormat::Monochrome`].
     pub chroma: ChromaFormat,
     /// Color metadata written to the `colr` box in the container.
-    pub color_encoding: Option<ColorEncoding>,
+    pub color_encoding: Option<Cicp>,
     pub icc: Option<Vec<u8>>,
     /// Optional image metadata (orientation, HDR content light level, EXIF).
     pub metadata: Metadata,
@@ -124,7 +124,7 @@ impl Default for EncodeConfig {
         EncodeConfig {
             quality: 80,
             chroma: ChromaFormat::Yuv420,
-            color_encoding: Some(ColorEncoding::srgb_ycbcr()),
+            color_encoding: Some(Cicp::srgb_ycbcr()),
             icc: None,
             metadata: Metadata::default(),
             threads: 1,
@@ -148,7 +148,7 @@ impl EncodeConfig {
         self
     }
 
-    pub fn with_cicp(mut self, color: ColorEncoding) -> Self {
+    pub fn with_cicp(mut self, color: Cicp) -> Self {
         self.color_encoding = Some(color);
         self
     }
@@ -342,7 +342,7 @@ fn dispatch_lossy<T: crate::Pixel>(
     img: &PlanarImage<T>,
     q: u8,
     chroma: ChromaFormat,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     match chroma {
@@ -890,7 +890,7 @@ fn dispatch_yuv_u8(
     bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
@@ -908,7 +908,7 @@ fn dispatch_yuv_u16(
     bd: BitDepth,
     q: u8,
     chroma: ChromaFormat,
-    color: Option<&ColorEncoding>,
+    color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
