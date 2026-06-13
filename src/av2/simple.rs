@@ -107,6 +107,28 @@ fn prepare(
     )
 }
 
+fn prepare_lossless_capable(
+    bit_depth: BitDepth,
+    want: BitDepth,
+    width: usize,
+    height: usize,
+    cfg: &EncodeConfig,
+) -> Result<Av2Encoder, EncodeError> {
+    if bit_depth != want {
+        return Err(EncodeError::UnsupportedChromaBitDepth(bit_depth));
+    }
+    validate_dims(width as u32, height as u32)?;
+    cfg.validate()?;
+    let q = if cfg.quality == 0 {
+        0
+    } else {
+        av2_map_quality(cfg.quality)
+    };
+    Ok(Av2Encoder::with_bit_depth(q, bit_depth.bits())
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay))
+}
+
 #[inline]
 fn icc(cfg: &EncodeConfig) -> Option<&[u8]> {
     cfg.icc.as_deref()
@@ -189,7 +211,7 @@ fn gray_core<T: Pixel>(
     want: BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let (w, h) = (img.width, img.height);
-    let enc = prepare(img.bit_depth, want, w, h, cfg)?;
+    let enc = prepare_lossless_capable(img.bit_depth, want, w, h, cfg)?;
     validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
     let frame = enc.encode_image_400(img, &color, cfg.threads)?;
@@ -202,7 +224,12 @@ fn yuv_core<T: Pixel>(
     want: BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let (w, h) = (img.width, img.height);
-    let enc = prepare(img.bit_depth, want, w, h, cfg)?;
+    let enc = match cfg.chroma {
+        ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
+            prepare_lossless_capable(img.bit_depth, want, w, h, cfg)?
+        }
+        _ => prepare(img.bit_depth, want, w, h, cfg)?,
+    };
     img.validate_with(cfg.chroma)?;
     let color = resolve_color(cfg);
     let frame = encode_yuv_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
@@ -215,7 +242,12 @@ fn yuva_alpha_core<T: Pixel>(
     want: BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let (w, h) = (img.width, img.height);
-    let enc = prepare(img.bit_depth, want, w, h, cfg)?;
+    let enc = match cfg.chroma {
+        ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
+            prepare_lossless_capable(img.bit_depth, want, w, h, cfg)?
+        }
+        _ => prepare(img.bit_depth, want, w, h, cfg)?,
+    };
     img.validate_with(cfg.chroma)?;
     validate_buf(&img.planes[3], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
@@ -237,7 +269,7 @@ fn gray_alpha_core<T: Pixel>(
     want: BitDepth,
 ) -> Result<Vec<u8>, EncodeError> {
     let (w, h) = (img.width, img.height);
-    let enc = prepare(img.bit_depth, want, w, h, cfg)?;
+    let enc = prepare_lossless_capable(img.bit_depth, want, w, h, cfg)?;
     validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
     validate_buf(&img.planes[1], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
