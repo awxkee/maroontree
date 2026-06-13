@@ -787,9 +787,6 @@ pub fn encode_yuva8_with_alpha(
     validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
     img.validate_with(cfg.chroma)?;
-    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_yuv_u8(
@@ -823,9 +820,6 @@ pub fn encode_yuva10_with_alpha(
     validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
     img.validate_with(cfg.chroma)?;
-    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
     let color_obu = dispatch_yuv_u16(
@@ -859,9 +853,6 @@ pub fn encode_yuva12_with_alpha(
     validate_dims(img.width as u32, img.height as u32)?;
     cfg.validate()?;
     img.validate_with(cfg.chroma)?;
-    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
-    validate_buf(&img.planes[2], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[3], img.width as u32, img.height as u32, 1)?;
 
     let q = quality_to_q(cfg.quality);
