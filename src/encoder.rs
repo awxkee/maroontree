@@ -305,7 +305,7 @@ impl<T: Pixel> PlanarImage<T> {
             width: self.width,
             height: self.height,
             bit_depth: self.bit_depth,
-            planes: [self.planes[3].to_vec(), vec![], vec![], vec![]],
+            planes: [self.planes[1].to_vec(), vec![], vec![], vec![]],
         }
     }
 

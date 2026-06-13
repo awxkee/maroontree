@@ -67,10 +67,11 @@ pub mod av2_image {
 }
 pub use av2::{Av2Encoder, Av2Frame, Tuning, TxPart, av2_map_quality};
 pub use avif::{
-    ChromaFormat, EncodeConfig, encode_gray8, encode_gray10, encode_gray12, encode_rgb8,
-    encode_rgb10, encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10,
-    encode_rgba10_with_alpha, encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10,
-    encode_yuv12, encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
+    ChromaFormat, EncodeConfig, encode_gray_alpha8, encode_gray_alpha10, encode_gray_alpha12,
+    encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10, encode_rgb12,
+    encode_rgba8, encode_rgba8_with_alpha, encode_rgba10, encode_rgba10_with_alpha, encode_rgba12,
+    encode_rgba12_with_alpha, encode_yuv8, encode_yuv10, encode_yuv12, encode_yuva8_with_alpha,
+    encode_yuva10_with_alpha, encode_yuva12_with_alpha,
 };
 pub use color::{
     ChromaSamplePosition, Cicp, ColorMetadata, ItutT35, MasteringDisplay, MatrixCoefficients,
