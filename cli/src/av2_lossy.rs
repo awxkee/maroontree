@@ -28,7 +28,7 @@
  */
 use crate::av2_lossless::encode_av2_lossless_image;
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
-use maroontree::{BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, PlanarImage};
+use maroontree::{BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage};
 
 pub(crate) fn encode_av2(
     img: &image::DynamicImage,
@@ -51,7 +51,7 @@ pub(crate) fn encode_av2(
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
-        .with_cicp(ColorEncoding::srgb_ycbcr())
+        .with_cicp(Cicp::srgb_ycbcr())
         .with_threads(args.threads);
 
     if let Some(icc) = icc {

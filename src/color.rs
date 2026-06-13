@@ -182,9 +182,9 @@ impl MatrixCoefficients {
 /// * `Icc`  → `colr` box of type `prof` (embedded ICC profile bytes).
 #[derive(Clone, Debug)]
 pub enum ColorMetadata {
-    /// Enumerated CICP code points. Use one of the [`ColorEncoding`] constructors
+    /// Enumerated CICP code points. Use one of the [`Cicp`] constructors
     /// or build a custom value with the enum fields.
-    Cicp(ColorEncoding),
+    Cicp(Cicp),
     /// Embedded ICC profile bytes (the raw profile, without any container header).
     Icc(Vec<u8>),
 }
@@ -192,17 +192,17 @@ pub enum ColorMetadata {
 impl ColorMetadata {
     /// The color encoding implied by these metadata, used to drive the AV1
     /// sequence-header `color_config()`. An ICC profile is treated as sRGB.
-    pub fn color_encoding(&self) -> ColorEncoding {
+    pub fn color_encoding(&self) -> Cicp {
         match self {
             ColorMetadata::Cicp(c) => *c,
-            ColorMetadata::Icc(_) => ColorEncoding::srgb(),
+            ColorMetadata::Icc(_) => Cicp::srgb(),
         }
     }
 }
 
 impl Default for ColorMetadata {
     fn default() -> Self {
-        ColorMetadata::Cicp(ColorEncoding::srgb())
+        ColorMetadata::Cicp(Cicp::srgb())
     }
 }
 
@@ -210,7 +210,7 @@ impl Default for ColorMetadata {
 /// authored in, plus the sample range. Drives both the HEIF `colr` (nclx) box and
 /// the HEVC VUI signaling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColorEncoding {
+pub struct Cicp {
     pub primaries: Primaries,
     pub transfer: TransferFunction,
     pub matrix: MatrixCoefficients,
@@ -218,9 +218,9 @@ pub struct ColorEncoding {
     pub chroma_sample_position: ChromaSamplePosition,
 }
 
-impl ColorEncoding {
-    pub fn identity_rgb() -> ColorEncoding {
-        ColorEncoding {
+impl Cicp {
+    pub fn identity_rgb() -> Cicp {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             matrix: MatrixCoefficients::Identity,
@@ -230,11 +230,11 @@ impl ColorEncoding {
     }
 }
 
-impl ColorEncoding {
+impl Cicp {
     /// sRGB: BT.709 primaries, sRGB transfer, BT.709 matrix, full range. This is the
     /// encoder's working color space (full-range BT.709 RGB→YCbCr).
     pub const fn srgb() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             matrix: MatrixCoefficients::Bt709,
@@ -249,7 +249,7 @@ impl ColorEncoding {
     /// Use this when you want the container `colr` and OBU `color_config` to both
     /// agree with the encoder's actual YCbCr coefficients.
     pub const fn srgb_ycbcr() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             matrix: MatrixCoefficients::Smpte170m,
@@ -260,7 +260,7 @@ impl ColorEncoding {
 
     /// BT.709 video: BT.709 primaries/transfer/matrix, full range.
     pub const fn bt709() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Bt709,
             matrix: MatrixCoefficients::Bt709,
@@ -271,7 +271,7 @@ impl ColorEncoding {
 
     /// BT.2020 PQ (HDR10): BT.2020 primaries, PQ transfer, BT.2020 NCL matrix.
     pub const fn bt2020_pq() -> Self {
-        ColorEncoding {
+        Cicp {
             primaries: Primaries::Bt2020,
             transfer: TransferFunction::Smpte2084,
             matrix: MatrixCoefficients::Bt2020Ncl,
@@ -294,9 +294,9 @@ impl ColorEncoding {
     }
 }
 
-impl Default for ColorEncoding {
+impl Default for Cicp {
     fn default() -> Self {
-        ColorEncoding::srgb()
+        Cicp::srgb()
     }
 }
 

@@ -89,7 +89,7 @@ use crate::av2::proj::Basis;
 use crate::av2::tables::{SCAN8X8, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Orientation};
-use crate::{ChromaFormat, ColorEncoding, Pixel, PlanarImage};
+use crate::{ChromaFormat, Cicp, Pixel, PlanarImage};
 
 // Free luma-leaf prediction/coding helpers live in `leaf`.
 
@@ -106,7 +106,7 @@ pub struct Av2Frame {
     coded_width: usize,
     coded_height: usize,
     bit_depth: u8,
-    color: ColorEncoding,
+    color: Cicp,
     chroma_format: ChromaFormat,
 }
 
@@ -430,7 +430,7 @@ impl Av2Encoder {
         ph: usize,
         width: usize,
         height: usize,
-        color: &ColorEncoding,
+        color: &Cicp,
     ) -> Av2Frame {
         let tile = enc.finish();
         // AV2 derives its mode-info grid by rounding the frame to 4px

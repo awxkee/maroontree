@@ -60,7 +60,7 @@
 //! both are absent the image carries no `colr` property at all (decoders fall
 //! back to the CICP values carried in the AV1 sequence header).
 
-use crate::ColorEncoding;
+use crate::Cicp;
 use crate::err::EncodeError;
 use crate::metadata::Metadata;
 
@@ -96,7 +96,7 @@ fn patch(buf: &mut [u8], start: usize) {
 }
 
 /// Write an enumerated-CICP `nclx` `colr` box from a `ColorEncoding`.
-fn write_colr(f: &mut Vec<u8>, color: &ColorEncoding) {
+fn write_colr(f: &mut Vec<u8>, color: &Cicp) {
     let sh = f.len();
     write_box(f, b"colr");
     f.extend_from_slice(&color.nclx_payload());
@@ -117,7 +117,7 @@ fn write_colr_icc(f: &mut Vec<u8>, icc: &[u8]) {
 /// `next_idx`. Either, both, or neither may be written.
 fn write_colr_boxes(
     f: &mut Vec<u8>,
-    color_meta: Option<&ColorEncoding>,
+    color_meta: Option<&Cicp>,
     icc_profile: Option<&[u8]>,
     next_idx: &mut u8,
     colr_props: &mut Vec<u8>,
@@ -214,7 +214,7 @@ pub(crate) fn wrap_av1_image(
     bit_depth: u8,
     channels: u8,
     av1c: &Av1cParams,
-    color_meta: Option<&ColorEncoding>,
+    color_meta: Option<&Cicp>,
     icc_profile: Option<&[u8]>,
     metadata: &Metadata,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -498,7 +498,7 @@ pub(crate) fn wrap_av1_image_with_alpha(
     bit_depth: u8,
     av1c_color: &Av1cParams,
     av1c_alpha: &Av1cParams,
-    color_meta: Option<&ColorEncoding>,
+    color_meta: Option<&Cicp>,
     icc_profile: Option<&[u8]>,
     metadata: &Metadata,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -820,7 +820,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::srgb()),
+            Some(&Cicp::srgb()),
             Some(&icc),
             &Metadata::default(),
         )
@@ -843,7 +843,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::srgb()),
+            Some(&Cicp::srgb()),
             None,
             &Metadata::default(),
         )
@@ -904,7 +904,7 @@ mod tests {
             8,
             &dummy_av1c(),
             &dummy_av1c(),
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             Some(&icc),
             &Metadata::default(),
         )
@@ -977,7 +977,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::default()),
+            Some(&Cicp::default()),
             None,
             &Metadata::default(),
         )
@@ -1002,7 +1002,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::default()),
+            Some(&Cicp::default()),
             None,
             &Metadata::default(),
         )
@@ -1023,7 +1023,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::default()),
+            Some(&Cicp::default()),
             None,
             &Metadata::default(),
         )
@@ -1045,7 +1045,7 @@ mod tests {
             8,
             &dummy_av1c(),
             &dummy_av1c(),
-            Some(&ColorEncoding::default()),
+            Some(&Cicp::default()),
             None,
             &Metadata::default(),
         )
@@ -1077,7 +1077,7 @@ mod tests {
             8,
             3,
             &dummy_av1c(),
-            Some(&ColorEncoding::default()),
+            Some(&Cicp::default()),
             None,
             &Metadata::default(),
         )

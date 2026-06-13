@@ -3451,7 +3451,7 @@ pub(crate) fn encode_av1_lossy_image_cs(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     encode_av1_lossy_image_cs_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads).0
@@ -3468,7 +3468,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize)) {
     assert_eq!(luma.len(), w * h);
@@ -3504,7 +3504,7 @@ pub(crate) fn encode_av1_lossy_image_422(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     encode_av1_lossy_image_422_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads).0
@@ -3519,7 +3519,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
@@ -3556,7 +3556,7 @@ pub(crate) fn encode_av1_lossy_image_420(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> Vec<u8> {
     encode_av1_lossy_image_420_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads).0
@@ -3574,7 +3574,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     luma: &[i32],
     u: &[i32],
     v: &[i32],
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     threads: usize,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
@@ -3653,7 +3653,7 @@ pub(crate) fn encode_av1_mono_image_recon_dbg(
 mod tests {
     #[test]
     fn loop_filter_reduces_banding() {
-        use crate::color::ColorEncoding;
+        use crate::color::Cicp;
         // Textured sky gradient that previously showed 4:4:4 boundary banding.
         let (w, h) = (256usize, 256usize);
         let mut y = vec![0i32; w * h];
@@ -3668,7 +3668,7 @@ mod tests {
                 v[j * w + i] = ((140.0 - 20.0 * t) as i32).clamp(0, 255);
             }
         }
-        let color = ColorEncoding::srgb_ycbcr();
+        let color = Cicp::srgb_ycbcr();
         let q = 65u8; // quality ~75
         let (_b, recon, (w8, _h8)) =
             super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, Some(&color), 1);
@@ -3707,7 +3707,7 @@ mod tests {
             eprintln!("skip 422: no dav1d");
             return;
         }
-        use crate::color::ColorEncoding;
+        use crate::color::Cicp;
         let (w, h) = (128usize, 96usize);
         let cw = w / 2;
         let mut y = vec![0i32; w * h];
@@ -3727,7 +3727,7 @@ mod tests {
                 v[j * cw + i] = (140.0 - 12.0 * t) as i32;
             }
         }
-        let color = ColorEncoding::srgb_ycbcr();
+        let color = Cicp::srgb_ycbcr();
         for &q in &[52u8, 129] {
             let (bytes, recon, (w8, _h8, cw8)) =
                 encode_av1_lossy_image_422_recon_dbg(q, 8, w, h, &y, &u, &v, Some(&color), 1);
@@ -3771,7 +3771,7 @@ mod tests {
             eprintln!("skip loop_filter_bit_exact_444: no dav1d");
             return;
         }
-        use crate::color::ColorEncoding;
+        use crate::color::Cicp;
         let (w, h) = (128usize, 96usize);
         let mut y = vec![0i32; w * h];
         let mut u = vec![0i32; w * h];
@@ -3785,7 +3785,7 @@ mod tests {
                 v[j * w + i] = ((140.0 - 12.0 * t) as i32).clamp(0, 255);
             }
         }
-        let color = ColorEncoding::srgb_ycbcr();
+        let color = Cicp::srgb_ycbcr();
         for &q in &[52u8, 129] {
             let (bytes, recon, (w8, _h8)) =
                 super::encode_av1_lossy_image_cs_recon_dbg(q, 8, w, h, &y, &u, &v, Some(&color), 1);
@@ -3825,7 +3825,7 @@ mod tests {
             eprintln!("skip: no dav1d");
             return;
         }
-        use crate::color::ColorEncoding;
+        use crate::color::Cicp;
         let (w, h) = (256usize, 256usize);
         // Gentle sky: small gradient + faint texture (closer to a real photo).
         let mut fy = vec![0i32; w * h];
@@ -3840,7 +3840,7 @@ mod tests {
                 fv[j * w + i] = ((134.0 - 9.0 * t) as i32).clamp(0, 255);
             }
         }
-        let color = ColorEncoding::srgb_ycbcr();
+        let color = Cicp::srgb_ycbcr();
         let q = 65u8;
         // helper: low-freq profile p2p + max block step of (recon-src) for a plane
         fn analyze(
@@ -3956,7 +3956,7 @@ mod tests {
             eprintln!("skip loop_filter_bit_exact_420: no dav1d");
             return;
         }
-        use crate::color::ColorEncoding;
+        use crate::color::Cicp;
         let (w, h) = (128usize, 96usize);
         let (cw, ch) = (w / 2, h / 2);
         let mut y = vec![0i32; w * h];
@@ -3976,7 +3976,7 @@ mod tests {
                 v[j * cw + i] = (140.0 - 12.0 * t) as i32;
             }
         }
-        let color = ColorEncoding::srgb_ycbcr();
+        let color = Cicp::srgb_ycbcr();
         for &q in &[52u8, 129, 167] {
             let (bytes, recon, (w8, _h8, cw8, _ch8)) = super::encode_av1_lossy_image_420_recon_dbg(
                 q,
@@ -4184,7 +4184,7 @@ mod tests {
             &luma,
             &u,
             &v,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             1,
         );
         let par2a = encode_av1_lossy_image_420(
@@ -4195,7 +4195,7 @@ mod tests {
             &luma,
             &u,
             &v,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             2,
         );
         let par2b = encode_av1_lossy_image_420(
@@ -4206,7 +4206,7 @@ mod tests {
             &luma,
             &u,
             &v,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             2,
         );
         assert_eq!(
@@ -4260,7 +4260,7 @@ mod tests {
             &luma,
             &u,
             &v,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             1,
         );
         assert!(
@@ -4277,7 +4277,7 @@ mod tests {
             &luma,
             &u,
             &v,
-            Some(&crate::color::ColorEncoding::srgb()),
+            Some(&crate::color::Cicp::srgb()),
             4,
         );
         let tt = obu_types(&threaded);
@@ -4316,7 +4316,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(bytes.len(), 50, "4:2:0 stream length drifted");
@@ -4354,7 +4354,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(bytes.len(), 265, "4:2:0 8x8-leaves stream length drifted");
@@ -4393,7 +4393,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(bytes.len(), 74, "4:2:2 stream length drifted");
@@ -4431,7 +4431,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(bytes.len(), 338, "4:2:2 8x8-leaves stream length drifted");
@@ -4467,7 +4467,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(p.len(), 139, "32x32 4:2:0 stream length drifted");
@@ -4507,7 +4507,7 @@ mod tests {
             &y.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &u.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
             &v.iter().map(|&x| x as i32).collect::<Vec<i32>>(),
-            Some(&crate::color::ColorEncoding::srgb_ycbcr()),
+            Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
         );
         assert_eq!(p.len(), 376, "64x64 4:2:2 stream length drifted");

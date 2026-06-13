@@ -28,8 +28,8 @@
  */
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaSamplePosition, ColorEncoding, MatrixCoefficients, Orientation,
-    PlanarImage, Primaries, TransferFunction, TxPart,
+    Av2Encoder, BitDepth, ChromaSamplePosition, Cicp, MatrixCoefficients, Orientation, PlanarImage,
+    Primaries, TransferFunction, TxPart,
 };
 use yuv::{
     YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444, rgb10_to_icgc410,
@@ -58,7 +58,7 @@ pub(crate) fn encode_av2_lossless_image(
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     let chroma_choice = args.chroma.unwrap_or(Chroma::C444);
-    let color = ColorEncoding {
+    let color = Cicp {
         primaries: Primaries::Bt709,
         transfer: TransferFunction::Srgb,
         matrix: MatrixCoefficients::YCgCo,

@@ -376,7 +376,7 @@ pub(crate) fn sequence_header_cicp(
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
 ) -> Vec<u8> {
     seq_header_ss(width, height, profile, bit_depth, color, 0, 0)
 }
@@ -388,7 +388,7 @@ pub(crate) fn sequence_header_cicp_ss(
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
 ) -> Vec<u8> {
@@ -461,7 +461,7 @@ fn seq_header_ss(
     height: u32,
     profile: u32,
     bit_depth: u8,
-    color: Option<&crate::color::ColorEncoding>,
+    color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
 ) -> Vec<u8> {

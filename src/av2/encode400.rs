@@ -362,7 +362,7 @@ impl Av2Encoder {
     pub fn encode_yuv400<T: Pixel>(
         &self,
         planar_image: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_400()?;
@@ -496,7 +496,7 @@ impl Av2Encoder {
         width: usize,
         height: usize,
         config: &Config,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Av2Frame {
         let mut enc = RangeEncoder::new();
@@ -611,7 +611,7 @@ impl Av2Encoder {
     pub fn encode_image_400<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_400()?;

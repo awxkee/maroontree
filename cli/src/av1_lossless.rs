@@ -28,7 +28,7 @@
  */
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use maroontree::{
-    BitDepth, ChromaFormat, ChromaSamplePosition, ColorEncoding, EncodeConfig, MatrixCoefficients,
+    BitDepth, ChromaFormat, ChromaSamplePosition, Cicp, EncodeConfig, MatrixCoefficients,
     PlanarImage, Primaries, TransferFunction, encode_lossless, encode_lossless_gray,
     encode_lossless_gray_alpha, encode_lossless_with_alpha,
 };
@@ -56,7 +56,7 @@ pub(crate) fn encode_av1_lossless(
         ));
     }
 
-    let color = ColorEncoding {
+    let color = Cicp {
         primaries: Primaries::Bt709,
         transfer: TransferFunction::Srgb,
         matrix: MatrixCoefficients::YCgCo,

@@ -29,8 +29,8 @@
 
 use image::imageops::FilterType;
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, ColorEncoding, EncodeConfig, Orientation, PlanarImage,
-    TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
+    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, TxPart,
+    av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
 };
 use std::io::Write;
 use std::time::Instant;
@@ -62,7 +62,7 @@ fn main() {
         .unwrap(),
         &EncodeConfig::new()
             .with_quality(60)
-            .with_cicp(ColorEncoding::srgb_ycbcr())
+            .with_cicp(Cicp::srgb_ycbcr())
             .with_chroma(ChromaFormat::Yuv444),
     )
     .unwrap();
@@ -82,7 +82,7 @@ fn main() {
         .with_rdoq_lambda(0.09)
         .with_cdef(false);
     let encoded = av2_encoder
-        .encode_image_422(&pimg, &ColorEncoding::srgb_ycbcr(), 1)
+        .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
         .unwrap();
     let out_obu = encoded.view();
     println!("encoding time {:?}", instant.elapsed());

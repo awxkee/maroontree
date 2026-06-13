@@ -39,7 +39,7 @@ impl Av2Encoder {
     pub fn encode_yuv422<T: Pixel>(
         &self,
         planar_image: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         let width = planar_image.width;
@@ -862,7 +862,7 @@ impl Av2Encoder {
         width: usize,
         height: usize,
         config: &Config,
-        color: &ColorEncoding,
+        color: &Cicp,
         log2c: usize,
         log2r: usize,
         threads: usize,
@@ -950,7 +950,7 @@ impl Av2Encoder {
     fn encode_yuv422_lossless<T: Pixel>(
         &self,
         planar_image: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_422()?;
@@ -1142,7 +1142,7 @@ impl Av2Encoder {
     pub fn encode_image_422<T: Pixel>(
         &self,
         img: &PlanarImage<T>,
-        color: &ColorEncoding,
+        color: &Cicp,
         threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;

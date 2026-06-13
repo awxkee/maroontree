@@ -27,16 +27,16 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ColorEncoding;
+use crate::Cicp;
 use crate::av2::Av2Frame;
 use crate::metadata::{ContentLightLevel, Orientation};
 
 pub(crate) enum Av2Color {
-    Cicp(ColorEncoding),
+    Cicp(Cicp),
     #[allow(unused)]
     Icc(Vec<u8>),
     Both {
-        cicp: ColorEncoding,
+        cicp: Cicp,
         icc: Vec<u8>,
     },
 }
@@ -348,7 +348,7 @@ pub(crate) fn wrap_av2_image(
         // bitstream). Track each colr's 1-based property index for `ipma`.
         let mut colr_props: Vec<u8> = Vec::new();
         let mut next_prop: u8 = 4; // ispe=1, pixi=2, av2C=3 precede these
-        let write_nclx = |f: &mut Vec<u8>, c: &ColorEncoding| {
+        let write_nclx = |f: &mut Vec<u8>, c: &Cicp| {
             let p = write_box(f, b"colr");
             f.extend_from_slice(b"nclx");
             w16(f, c.primaries as u16);
