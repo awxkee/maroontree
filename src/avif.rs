@@ -885,6 +885,84 @@ pub fn encode_yuva12_with_alpha(
     )
 }
 
+/// Encode an 8-bit grayscale image plus a separate 8-bit alpha plane to AVIF.
+pub fn encode_gray_alpha8(
+    img: &PlanarImage<u8>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Eight {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
+    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Eight, q, true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        8,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
+}
+
+/// Encode a 10-bit grayscale image plus a separate 10-bit alpha plane to AVIF.
+pub fn encode_gray_alpha10(
+    img: &PlanarImage<u16>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Ten {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
+    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Ten, q, true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        10,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
+}
+
+/// Encode a 12-bit grayscale image plus a separate 12-bit alpha plane to AVIF.
+pub fn encode_gray_alpha12(
+    img: &PlanarImage<u16>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if img.bit_depth != BitDepth::Twelve {
+        return Err(EncodeError::UnsupportedChromaBitDepth(img.bit_depth));
+    }
+    validate_dims(img.width as u32, img.height as u32)?;
+    cfg.validate()?;
+    validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
+    validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
+    let q = quality_to_q(cfg.quality);
+    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Twelve, q, true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    finalize_with_alpha(
+        color_obu,
+        alpha_obu,
+        img.width as u32,
+        img.height as u32,
+        12,
+        ChromaFormat::Monochrome,
+        cfg,
+    )
+}
+
 fn dispatch_yuv_u8(
     planar_image: &PlanarImage<u8>,
     bd: BitDepth,

@@ -231,7 +231,27 @@ fn yuva_alpha_core<T: Pixel>(
     )
 }
 
-// ─── public API (mirrors crate::avif) ────────────────────────────────────────
+fn gray_alpha_core<T: Pixel>(
+    img: &PlanarImage<T>,
+    cfg: &EncodeConfig,
+    want: BitDepth,
+) -> Result<Vec<u8>, EncodeError> {
+    let (w, h) = (img.width, img.height);
+    let enc = prepare(img.bit_depth, want, w, h, cfg)?;
+    validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
+    validate_buf(&img.planes[1], w as u32, h as u32, 1)?;
+    let color = resolve_color(cfg);
+    let color_frame = enc.encode_image_400(img, &color, cfg.threads)?;
+    let alpha_frame = encode_alpha(&img.packed_alpha_2(), img.bit_depth, &color, cfg.threads)?;
+    Av2Encoder::wrap_avif_alpha(
+        &color_frame,
+        &alpha_frame,
+        icc(cfg),
+        exif(cfg),
+        orientation(cfg),
+        clli(cfg),
+    )
+}
 
 /// Encode an 8-bit RGB image (identity-RGB GBR planes) to AV2 AVIF.
 pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>, EncodeError> {
@@ -327,4 +347,25 @@ pub fn encode_yuva12_with_alpha(
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     yuva_alpha_core(img, cfg, BitDepth::Twelve)
+}
+
+pub fn encode_gray_alpha8(
+    img: &PlanarImage<u8>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    gray_alpha_core(img, cfg, BitDepth::Eight)
+}
+/// Encode a 10-bit grayscale image + alpha to AV2 AVIF (lossless alpha item).
+pub fn encode_gray_alpha10(
+    img: &PlanarImage<u16>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    gray_alpha_core(img, cfg, BitDepth::Ten)
+}
+/// Encode a 12-bit grayscale image + alpha to AV2 AVIF (lossless alpha item).
+pub fn encode_gray_alpha12(
+    img: &PlanarImage<u16>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    gray_alpha_core(img, cfg, BitDepth::Twelve)
 }
