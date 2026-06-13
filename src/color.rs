@@ -258,6 +258,22 @@ impl Cicp {
         }
     }
 
+    /// Unspecified colorimetry (CICP value 2 for primaries/transfer/matrix),
+    /// full range. Use this — or simply leave the CICP unset — when the color
+    /// space should not be asserted in the file. Note the encoder always
+    /// performs the RGB→YCbCr conversion with full-range BT.709 math regardless,
+    /// so "unspecified" signals only the *display* interpretation; a decoder may
+    /// fall back to its own default matrix.
+    pub const fn unspecified() -> Self {
+        Cicp {
+            primaries: Primaries::Unspecified,
+            transfer: TransferFunction::Unspecified,
+            matrix: MatrixCoefficients::Unspecified,
+            full_range: true,
+            chroma_sample_position: ChromaSamplePosition::Unknown,
+        }
+    }
+
     /// BT.709 video: BT.709 primaries/transfer/matrix, full range.
     pub const fn bt709() -> Self {
         Cicp {
