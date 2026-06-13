@@ -147,6 +147,53 @@ pub(crate) fn cfl_ac_444(luma_rec: &[i32], w: usize, h: usize, ac: &mut [i32]) {
     }
 }
 
+/// CfL luma-AC for subsampled chroma (dav1d `cfl_ac` with `ss_hor`/`ss_ver`).
+/// `luma_rec` is the reconstructed luma block, stride `lstride`, covering the
+/// chroma block of `(cw, ch)` samples. Each chroma position sums the covered
+/// luma samples and is scaled by `1 << (1 + !ss_ver + !ss_hor)` (so 4:4:4 ->
+/// `<< 3`, matching `cfl_ac_444`), then the block mean is removed.
+pub(crate) fn cfl_ac_sub(
+    luma_rec: &[i32],
+    lstride: usize,
+    cw: usize,
+    ch: usize,
+    ss_hor: bool,
+    ss_ver: bool,
+    ac: &mut [i32],
+) {
+    let shift = 1 + (!ss_ver as u32) + (!ss_hor as u32);
+    let sx = ss_hor as usize;
+    let sy = ss_ver as usize;
+    for y in 0..ch {
+        let ac = &mut ac[y * cw..y * cw + cw];
+        for (x, dst) in ac[..cw].iter_mut().enumerate() {
+            let ly = y << sy;
+            let lx = x << sx;
+            let mut s = luma_rec[ly * lstride + lx];
+            if ss_hor {
+                s += luma_rec[ly * lstride + lx + 1];
+            }
+            if ss_ver {
+                s += luma_rec[(ly + 1) * lstride + lx];
+                if ss_hor {
+                    s += luma_rec[(ly + 1) * lstride + lx + 1];
+                }
+            }
+            *dst = s << shift;
+        }
+    }
+    let n = cw * ch;
+    let log2sz = cw.trailing_zeros() + ch.trailing_zeros();
+    let mut sum: i64 = (1i64 << log2sz) >> 1;
+    for v in ac[..n].iter() {
+        sum += *v as i64;
+    }
+    let mean = (sum >> log2sz) as i32;
+    for v in ac[..n].iter_mut() {
+        *v -= mean;
+    }
+}
+
 /// CfL prediction combine (dav1d `cfl_pred`): `dc + sign(diff)*((|diff|+32)>>6)`.
 #[inline]
 pub(crate) fn cfl_pred_pixel(dc: i32, ac: i32, alpha: i32, bd: u8) -> i32 {

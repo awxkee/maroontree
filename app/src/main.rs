@@ -63,7 +63,8 @@ fn main() {
         &EncodeConfig::new()
             .with_quality(60)
             .with_cicp(Cicp::srgb_ycbcr())
-            .with_chroma(ChromaFormat::Yuv444),
+            .with_chroma(ChromaFormat::Yuv420)
+            .with_threads(12),
     )
     .unwrap();
     println!("encoding time {:?}", instant.elapsed());

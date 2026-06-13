@@ -324,10 +324,14 @@ fn frame_header_lossy_impl(
     w.f(base_q_idx as u32, 8); // base_q_idx (non-zero -> lossy)
     w.flag(false); // DeltaQYDc delta_coded
     if !mono {
-        // chroma delta-Q reads are coded only for NumPlanes > 1; monochrome
-        // (NumPlanes == 1) omits both, or the decoder misaligns the bitstream.
-        w.flag(false); // DeltaQUDc delta_coded
-        w.flag(false); // DeltaQUAc delta_coded
+        let uv_dc = crate::quant::chroma_dc_delta(base_q_idx);
+        if uv_dc != 0 {
+            w.flag(true); // DeltaQUDc delta_coded
+            w.f((uv_dc & 0x7f) as u32, 7); // su(1+6): 7-bit two's complement
+        } else {
+            w.flag(false); // DeltaQUDc delta_coded
+        }
+        w.flag(false); // DeltaQUAc delta_coded (== 0)
     }
     w.flag(false); // using_qmatrix
     // segmentation_params()
