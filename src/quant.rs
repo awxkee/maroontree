@@ -51,6 +51,15 @@ pub(crate) fn ac_q(base_q_idx: u8, bd: u8) -> u16 {
     t[base_q_idx as usize]
 }
 
+pub(crate) fn chroma_dc_delta(base_q_idx: u8) -> i32 {
+    let q = base_q_idx as i32;
+    if q <= 160 {
+        0
+    } else {
+        -((q - 160) / 3).min(32)
+    }
+}
+
 /// Inverse-transform clip bounds for `bit_depth`, matching dav1d's `itx_tmpl.c`:
 /// returns `(row_min, row_max, col_min, col_max, cf_max)`. 8-bit uses `INT16`
 /// for both row and col; for higher depth the row clip is `±2^(bd+7)`, the
@@ -105,6 +114,24 @@ impl Quant {
     pub(crate) fn new(base_q_idx: u8, bd: u8) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
         let dc = dc_q(base_q_idx, bd) as i32;
+        let ac = ac_q(base_q_idx, bd) as i32;
+        Quant {
+            dc,
+            ac,
+            q_mult_dc: (65536.0_f64 / dc as f64).round() as i32,
+            q_mult_ac: (65536.0_f64 / ac as f64).round() as i32,
+            rmin,
+            rmax,
+            cmin,
+            cmax,
+            cf_max,
+        }
+    }
+
+    pub(crate) fn new_chroma(base_q_idx: u8, bd: u8) -> Self {
+        let dc_idx = (base_q_idx as i32 + chroma_dc_delta(base_q_idx)).clamp(0, 255) as u8;
+        let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
+        let dc = dc_q(dc_idx, bd) as i32;
         let ac = ac_q(base_q_idx, bd) as i32;
         Quant {
             dc,
