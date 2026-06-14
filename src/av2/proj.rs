@@ -375,63 +375,6 @@ impl Basis {
         (lev, prm)
     }
 
-    /// Reconstruct: clip(round(pred + scale·inverse_transform(lev))), `n_pix` samples.
-    /// Separable inverse: scatter levels into the 32×32 frequency grid, synthesise
-    /// horizontally per frequency row, then vertically into pixels. Empty rows skip.
-    pub(crate) fn reconstruct(&self, pred: f32, lev: &[f32]) -> Vec<f32> {
-        let (sv, sh) = (self.side_v, self.side_h);
-        let mut s_grid = [0f32; NF * NF];
-        let mut row_nz = [false; NF];
-        for k in 0..self.n_cf {
-            let l = lev[k];
-            if l == 0.0 {
-                continue;
-            }
-            let rc = SCAN[k] as usize;
-            s_grid[(rc & 31) * NF + (rc >> 5)] = l;
-            row_nz[rc & 31] = true;
-        }
-        // horizontal synthesis → w[c, px] = Σ_a S[c,a]·hh[a,px]
-        let mut w = [0f32; NF * 64];
-        for c in 0..NF {
-            if !row_nz[c] {
-                continue;
-            }
-            let wc = &mut w[c * sh..c * sh + sh];
-            for a in 0..NF {
-                let sca = s_grid[c * NF + a];
-                if sca == 0.0 {
-                    continue;
-                }
-                for (o, &b) in wc.iter_mut().zip(&self.hh[a * sh..a * sh + sh]) {
-                    *o += sca * b;
-                }
-            }
-        }
-        // vertical synthesis → out[py,px] = pred + (scale/dc)·Σ_c w[c,px]·hv[c,py]
-        let mut out = vec![pred; sv * sh];
-        let g = self.scale / self.dc;
-        for c in 0..NF {
-            if !row_nz[c] {
-                continue;
-            }
-            let wc = &w[c * sh..c * sh + sh];
-            let hvc = &self.hv[c * sv..c * sv + sv];
-            for py in 0..sv {
-                let coef = hvc[py] * g;
-                let orow = &mut out[py * sh..py * sh + sh];
-                for (o, &b) in orow.iter_mut().zip(wc) {
-                    *o += coef * b;
-                }
-            }
-        }
-        let mv = self.max_val;
-        for v in out.iter_mut() {
-            *v = v.round().clamp(0.0, mv);
-        }
-        out
-    }
-
     /// Build a rectangular basis whose coefficient grid follows `scan` (length =
     /// number of coded positions), rather than the global 32×32 SCAN. Used by the
     /// 16-family transforms (TX_16X64 → SCAN16X32, TX_64X16 → SCAN32X16). `norm2`

@@ -8,6 +8,12 @@
 //! `corner` (= avm `above_row[-1]`). PAETH reads `above[0..bs)`, `left[0..bs)`,
 //! `corner`; SMOOTH additionally reads `above[bs]` (top-right "tr") and
 //! `left[bs]` (bottom-left "bl").
+//!
+//! SMOOTH/SMOOTH_V/SMOOTH_H are expressed in dav2d's `ipred_smooth*` table-MAC
+//! form (`SM_WEIGHTS` lookup + `pred += ((s - pred) * w + 32) >> 6`), which is
+//! bit-identical to the previous computed-weight formulation for every square
+//! size, and carries an aarch64 NEON path (4 columns/iteration, `vmlaq_s32`
+//! fused multiply-accumulate) that is bit-exact to the scalar core.
 
 /// `blk_size_log2[n]` = log2(n) for the power-of-two block dimensions avm uses.
 #[inline]
@@ -20,13 +26,6 @@ fn blk_size_log2(n: usize) -> i32 {
         64 => 6,
         _ => (usize::BITS - 1 - n.leading_zeros()) as i32,
     }
-}
-
-/// avm `divide_round(value, bits) = (value + (1<<(bits-1))) >> bits` with the
-/// arithmetic right shift C uses for signed values.
-#[inline]
-fn divide_round(value: i32, bits: i32) -> i32 {
-    (value + (1 << (bits - 1))) >> bits
 }
 
 #[inline]
@@ -51,8 +50,6 @@ fn paeth_single(left: i32, top: i32, top_left: i32) -> i32 {
     }
 }
 
-const BLEND_WEIGHT_MAX: i32 = 32;
-
 /// PAETH predictor for a `bs`x`bs` block → row-major `bs*bs` f32 samples.
 pub(crate) fn paeth(bs: usize, above: &[i32], left: &[i32], corner: i32) -> Vec<f32> {
     let mut out = vec![0f32; bs * bs];
@@ -65,85 +62,254 @@ pub(crate) fn paeth(bs: usize, above: &[i32], left: &[i32], corner: i32) -> Vec<
     out
 }
 
-/// AV2 SMOOTH predictor (the two-axis blend, not the simple AV1 version) for a
-/// `bs`x`bs` block. `above[bs]` = top-right, `left[bs]` = bottom-left.
+/// dav2d `sm_weights[scale][i] = 32 >> min(6, (i<<2) >> scale)` (AV2/AVM SMOOTH
+/// blend weights). For the square luma blocks used here `scale = (n_pel>=64) +
+/// (n_pel>512)`. Equivalent to the previous `32 >> min(6, (i<<1) >> scale')`
+/// formula for every square size, just expressed as dav2d's lookup table.
+#[rustfmt::skip]
+static SM_WEIGHTS: [[i32; 64]; 3] = [
+    [32, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [32, 32, 16, 16, 8, 8, 4, 4, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+];
+
+#[inline]
+fn smooth_scale(bs: usize) -> usize {
+    let n_pel = bs * bs;
+    (n_pel >= 64) as usize + (n_pel > 512) as usize
+}
+
+/// AV2/AVM SMOOTH: two-axis blend of a vertical gradient (toward bottom-left)
+/// and a horizontal gradient (toward top-right), each refined by the
+/// boundary-weighted MAC `pred += ((sample - pred) * w + 32) >> 6`. Bit-exact to
+/// dav2d `ipred_smooth_c`. `above[bs]` = top-right, `left[bs]` = bottom-left.
+fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    let log2 = blk_size_log2(bs);
+    let rnd = (bs as i32) >> 1;
+    let w = &SM_WEIGHTS[smooth_scale(bs)];
+    let (right, bottom) = (above[bs], left[bs]);
+    let mut out = vec![0f32; bs * bs];
+    for (y, &l) in left[..bs].iter().enumerate() {
+        let (diff_hor, off_ver, w_ver) = (l - right, bs as i32 - 1 - y as i32, w[y]);
+        let row = &mut out[y * bs..y * bs + bs];
+        for (x, (dst, &above_x)) in row.iter_mut().zip(&above[..bs]).enumerate() {
+            let mut pred_ver = bottom + (((above_x - bottom) * off_ver + rnd) >> log2);
+            let mut pred_hor = right + ((diff_hor * (bs as i32 - 1 - x as i32) + rnd) >> log2);
+            pred_ver += ((above_x - pred_ver) * w_ver + 32) >> 6;
+            pred_hor += ((l - pred_hor) * w[x] + 32) >> 6;
+            *dst = ((pred_ver + pred_hor + 1) >> 1) as f32;
+        }
+    }
+    out
+}
+
+/// AV2/AVM SMOOTH_V: vertical half of [`smooth`]. Bit-exact to dav2d
+/// `ipred_smooth_v_c`. `left[bs]` = bottom-left.
+fn smooth_v_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    let log2 = blk_size_log2(bs);
+    let rnd = (bs as i32) >> 1;
+    let w = &SM_WEIGHTS[smooth_scale(bs)];
+    let bottom = left[bs];
+    let mut out = vec![0f32; bs * bs];
+    for y in 0..bs {
+        let (off, w_ver) = (bs as i32 - 1 - y as i32, w[y]);
+        let row = &mut out[y * bs..y * bs + bs];
+        for (dst, &above_x) in row.iter_mut().zip(&above[..bs]) {
+            let pred = bottom + (((above_x - bottom) * off + rnd) >> log2);
+            *dst = (pred + (((above_x - pred) * w_ver + 32) >> 6)) as f32;
+        }
+    }
+    out
+}
+
+/// AV2/AVM SMOOTH_H: horizontal half of [`smooth`]. Bit-exact to dav2d
+/// `ipred_smooth_h_c`. `above[bs]` = top-right.
+fn smooth_h_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    let log2 = blk_size_log2(bs);
+    let rnd = (bs as i32) >> 1;
+    let w = &SM_WEIGHTS[smooth_scale(bs)];
+    let right = above[bs];
+    let mut out = vec![0f32; bs * bs];
+    for (y, &l) in left[..bs].iter().enumerate() {
+        let diff = l - right;
+        let row = &mut out[y * bs..y * bs + bs];
+        for (x, dst) in row.iter_mut().enumerate() {
+            let pred = right + ((diff * (bs as i32 - 1 - x as i32) + rnd) >> log2);
+            *dst = (pred + (((l - pred) * w[x] + 32) >> 6)) as f32;
+        }
+    }
+    out
+}
+
+/// Public SMOOTH dispatch: NEON (4-lane, MAC) on aarch64, scalar elsewhere. The
+/// NEON kernel is bit-exact to [`smooth_scalar`] (validated lane-for-lane).
 pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    let bl = left[bs];
-    let tr = above[bs];
-    let log2_h = blk_size_log2(bs);
-    let log2_w = blk_size_log2(bs);
-    // scale = ROUND_POWER_OF_TWO((log2(bh)-2 + log2(bw)-2), 2)
-    let scale = ((log2_h - 2 + log2_w - 2) + 2) >> 2;
-    let blend_max_log2 = blk_size_log2(BLEND_WEIGHT_MAX as usize); // 5
-    let clamp_log2 = blk_size_log2((BLEND_WEIGHT_MAX << 1) as usize); // log2(64)=6
-    let mut out = vec![0f32; bs * bs];
-    for (r, &l) in left[..bs].iter().enumerate() {
-        let s_top = BLEND_WEIGHT_MAX >> clamp_log2.min(((r as i32) << 1) >> scale);
-        let row = &mut out[r * bs..r * bs + bs];
-        for (c, (dst, &top)) in row[..bs].iter_mut().zip(above[..bs].iter()).enumerate() {
-            let s_left = BLEND_WEIGHT_MAX >> clamp_log2.min(((c as i32) << 1) >> scale);
-            let mut predv = bl + divide_round((top - bl) * (bs as i32 - 1 - r as i32), log2_h);
-            let mut predh = tr + divide_round((l - tr) * (bs as i32 - 1 - c as i32), log2_w);
-            predv += divide_round((top - predv) * s_top, blend_max_log2 + 1);
-            predh += divide_round((l - predh) * s_left, blend_max_log2 + 1);
-            *dst = divide_round(predv + predh, 1) as f32;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bs.is_multiple_of(4) {
+            return unsafe { neon::smooth(bs, above, left) };
         }
     }
-    out
+    smooth_scalar(bs, above, left)
 }
 
-/// AVM SMOOTH_V predictor: the vertical half of [`smooth`]. Each sample interpolates
-/// from the top row (r=0) toward the bottom-left sample (r=bs-1), with the same
-/// secondary top-blend as SMOOTH. `above[bs..]`/`left[bs]` carry top-right/bottom-left.
+/// Public SMOOTH_V dispatch (see [`smooth`]).
 pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    let bl = left[bs];
-    let log2_h = blk_size_log2(bs);
-    let log2_w = blk_size_log2(bs);
-    let scale = ((log2_h - 2 + log2_w - 2) + 2) >> 2;
-    let blend_max_log2 = blk_size_log2(BLEND_WEIGHT_MAX as usize); // 5
-    let clamp_log2 = blk_size_log2((BLEND_WEIGHT_MAX << 1) as usize); // 6
-    let mut out = vec![0f32; bs * bs];
-    for r in 0..bs {
-        let s_top = BLEND_WEIGHT_MAX >> clamp_log2.min(((r as i32) << 1) >> scale);
-        let row = &mut out[r * bs..r * bs + bs];
-        for (&top, out) in above[..bs].iter().zip(row[..bs].iter_mut()) {
-            let mut predv = bl + divide_round((top - bl) * (bs as i32 - 1 - r as i32), log2_h);
-            predv += divide_round((top - predv) * s_top, blend_max_log2 + 1);
-            *out = predv as f32;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bs.is_multiple_of(4) {
+            return unsafe { neon::smooth_v(bs, above, left) };
         }
     }
-    out
+    smooth_v_scalar(bs, above, left)
 }
 
-/// AVM SMOOTH_H predictor: the horizontal half of [`smooth`]. Each sample interpolates
-/// from the left column (c=0) toward the top-right sample (c=bs-1), with the same
-/// secondary left-blend as SMOOTH.
+/// Public SMOOTH_H dispatch (see [`smooth`]).
 pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    let tr = above[bs];
-    let log2_h = blk_size_log2(bs);
-    let log2_w = blk_size_log2(bs);
-    let scale = ((log2_h - 2 + log2_w - 2) + 2) >> 2;
-    let blend_max_log2 = blk_size_log2(BLEND_WEIGHT_MAX as usize); // 5
-    let clamp_log2 = blk_size_log2((BLEND_WEIGHT_MAX << 1) as usize); // 6
-    let mut out = vec![0f32; bs * bs];
-    for (r, &l) in left[..bs].iter().enumerate() {
-        let row = &mut out[r * bs..r * bs + bs];
-        for (c, out) in row[..bs].iter_mut().enumerate() {
-            let s_left = BLEND_WEIGHT_MAX >> clamp_log2.min(((c as i32) << 1) >> scale);
-            let mut predh = tr + divide_round((l - tr) * (bs as i32 - 1 - c as i32), log2_w);
-            predh += divide_round((l - predh) * s_left, blend_max_log2 + 1);
-            *out = predh as f32;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bs.is_multiple_of(4) {
+            return unsafe { neon::smooth_h(bs, above, left) };
         }
     }
-    out
+    smooth_h_scalar(bs, above, left)
 }
 
-/// Build avm reference samples for a square `bs` luma block at `(y0,x0)` in the
-/// reconstructed plane `rec` (stride `pw`). Returns `(above, left, corner)` with
-/// `above`/`left` of length `2*bs`. Availability flags and pixel counts come
-/// from the caller (frame/SB geometry). Mirrors
-/// `av2_build_intra_predictors_high_default` for NEED_ABOVE|NEED_LEFT|
-/// NEED_ABOVELEFT (+ optional top-right / bottom-left for SMOOTH).
+/// NEON+MAC SMOOTH kernels. Each iteration predicts 4 columns with two fused
+/// multiply-accumulates per axis: `vmlaq_s32(acc, v, vdupq_n_s32(k))` for the
+/// scalar-weighted vertical gradient and top-blend, and `vmlaq_s32(acc, v, w)`
+/// for the per-column left-weight blend, mirroring dav2d's `ipred_smooth*`
+/// arithmetic exactly. Right-shifts use `vshlq_s32` by a negative count (signed
+/// arithmetic shift, matching `>>` on `i32`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon {
+    use super::{SM_WEIGHTS, smooth_scale};
+    use core::arch::aarch64::*;
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn mla_n(acc: int32x4_t, v: int32x4_t, k: i32) -> int32x4_t {
+        vmlaq_s32(acc, v, vdupq_n_s32(k))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shr(v: int32x4_t, n: i32) -> int32x4_t {
+        vshlq_s32(v, vdupq_n_s32(-n))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn store(v: int32x4_t, dst: &mut [f32]) {
+        unsafe {
+            vst1q_f32(dst.as_mut_ptr(), vcvtq_f32_s32(v));
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn xcoef(base: i32) -> int32x4_t {
+        static IDX: [i32; 4] = [0, 1, 2, 3];
+        unsafe { vsubq_s32(vdupq_n_s32(base), vld1q_s32(IDX.as_ptr())) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+        let log2 = 31 - (bs as u32).leading_zeros() as i32;
+        let rnd = bs as i32 >> 1;
+        let w = &SM_WEIGHTS[smooth_scale(bs)];
+        let (right, bottom) = (above[bs], left[bs]);
+        let mut out = vec![0f32; bs * bs];
+        let (rb, bb, r32, rndb) = (
+            vdupq_n_s32(right),
+            vdupq_n_s32(bottom),
+            vdupq_n_s32(32),
+            vdupq_n_s32(rnd),
+        );
+        for (y, &l) in left[..bs].iter().enumerate() {
+            let (diff_hor, off_ver, w_ver) = (l - right, bs as i32 - 1 - y as i32, w[y]);
+            let lb = vdupq_n_s32(l);
+            let row = &mut out[y * bs..y * bs + bs];
+            let mut x = 0;
+            while x < bs {
+                unsafe {
+                    let av = vld1q_s32(above[x..].as_ptr());
+                    let wx = vld1q_s32(w[x..].as_ptr());
+                    let xc = xcoef(bs as i32 - 1 - x as i32);
+                    // pred_ver = bottom + ((av - bottom) * off_ver + rnd) >> log2
+                    let mut pv = vaddq_s32(bb, shr(mla_n(rndb, vsubq_s32(av, bb), off_ver), log2));
+                    // pred_ver += ((av - pred_ver) * w_ver + 32) >> 6
+                    pv = vaddq_s32(pv, shr(mla_n(r32, vsubq_s32(av, pv), w_ver), 6));
+                    // pred_hor = right + (diff_hor * xc + rnd) >> log2
+                    let mut ph = vaddq_s32(rb, shr(mla_n(rndb, xc, diff_hor), log2));
+                    // pred_hor += ((l - pred_hor) * w[x] + 32) >> 6   (per-column weights)
+                    ph = vaddq_s32(ph, shr(vmlaq_s32(r32, vsubq_s32(lb, ph), wx), 6));
+                    // out = (pred_ver + pred_hor + 1) >> 1
+                    store(
+                        shr(vaddq_s32(vaddq_s32(pv, ph), vdupq_n_s32(1)), 1),
+                        &mut row[x..],
+                    );
+                }
+                x += 4;
+            }
+        }
+        out
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+        let log2 = 31 - (bs as u32).leading_zeros() as i32;
+        let rnd = bs as i32 >> 1;
+        let w = &SM_WEIGHTS[smooth_scale(bs)];
+        let bottom = left[bs];
+        let mut out = vec![0f32; bs * bs];
+        let (bb, r32, rndb) = (vdupq_n_s32(bottom), vdupq_n_s32(32), vdupq_n_s32(rnd));
+        for y in 0..bs {
+            let (off, w_ver) = (bs as i32 - 1 - y as i32, w[y]);
+            let row = &mut out[y * bs..y * bs + bs];
+            let mut x = 0;
+            while x < bs {
+                unsafe {
+                    let av = vld1q_s32(above[x..].as_ptr());
+                    let mut pred = vaddq_s32(bb, shr(mla_n(rndb, vsubq_s32(av, bb), off), log2));
+                    pred = vaddq_s32(pred, shr(mla_n(r32, vsubq_s32(av, pred), w_ver), 6));
+                    store(pred, &mut row[x..]);
+                    x += 4;
+                }
+            }
+        }
+        out
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+        let log2 = 31 - (bs as u32).leading_zeros() as i32;
+        let rnd = bs as i32 >> 1;
+        let w = &SM_WEIGHTS[smooth_scale(bs)];
+        let right = above[bs];
+        let mut out = vec![0f32; bs * bs];
+        let (rb, r32, rndb) = (vdupq_n_s32(right), vdupq_n_s32(32), vdupq_n_s32(rnd));
+        for (y, &l) in left[..bs].iter().enumerate() {
+            let diff = l - right;
+            let lb = vdupq_n_s32(l);
+            let row = &mut out[y * bs..y * bs + bs];
+            let mut x = 0;
+            while x < bs {
+                unsafe {
+                    let wx = vld1q_s32(w[x..].as_ptr());
+                    let xc = xcoef(bs as i32 - 1 - x as i32);
+                    let mut pred = vaddq_s32(rb, shr(mla_n(rndb, xc, diff), log2));
+                    pred = vaddq_s32(pred, shr(vmlaq_s32(r32, vsubq_s32(lb, pred), wx), 6));
+                    store(pred, &mut row[x..]);
+                }
+                x += 4;
+            }
+        }
+        out
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_refs(
     rec: &[f32],
