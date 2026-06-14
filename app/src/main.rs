@@ -29,8 +29,8 @@
 
 use image::imageops::FilterType;
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, TxPart,
-    av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
+    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
+    TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
 };
 use std::io::Write;
 use std::time::Instant;
@@ -64,47 +64,48 @@ fn main() {
             .with_quality(60)
             .with_cicp(Cicp::srgb_ycbcr())
             .with_chroma(ChromaFormat::Yuv420)
-            .with_threads(12),
+            .with_speed(Speed::Fast)
+            .with_threads(1),
     )
     .unwrap();
     println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
-    let pimg = PlanarImage::from_interleaved_rgb(
-        img.width() as usize,
-        img.height() as usize,
-        BitDepth::Eight,
-        &img.to_vec(),
-    )
-    .unwrap();
-    let instant = Instant::now();
-    let av2_encoder = Av2Encoder::new(av2_map_quality(53))
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay)
-        .with_rdoq_lambda(0.09)
-        .with_cdef(false);
-    let encoded = av2_encoder
-        .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
-        .unwrap();
-    let out_obu = encoded.view();
-    println!("encoding time {:?}", instant.elapsed());
+    // let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
+    // let pimg = PlanarImage::from_interleaved_rgb(
+    //     img.width() as usize,
+    //     img.height() as usize,
+    //     BitDepth::Eight,
+    //     &img.to_vec(),
+    // )
+    // .unwrap();
+    // let instant = Instant::now();
+    // let av2_encoder = Av2Encoder::new(av2_map_quality(53))
+    //     .with_tiles(8, 8)
+    //     .with_txpart(TxPart::ThreeWay)
+    //     .with_rdoq_lambda(0.09)
+    //     .with_cdef(false);
+    // let encoded = av2_encoder
+    //     .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
+    //     .unwrap();
+    // let out_obu = encoded.view();
+    // println!("encoding time {:?}", instant.elapsed());
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "out10.avif".into());
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(&out).unwrap();
     eprintln!("wrote {} bytes to {}", out.len(), path);
-
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "out10_av2.obu".into());
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&out_obu).unwrap();
-
-    let encoded_avif_av2 =
-        Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "out10_avif.avif".into());
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&encoded_avif_av2).unwrap();
+    //
+    // let path = std::env::args()
+    //     .nth(1)
+    //     .unwrap_or_else(|| "out10_av2.obu".into());
+    // let mut f = std::fs::File::create(&path).unwrap();
+    // f.write_all(&out_obu).unwrap();
+    //
+    // let encoded_avif_av2 =
+    //     Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
+    // let path = std::env::args()
+    //     .nth(1)
+    //     .unwrap_or_else(|| "out10_avif.avif".into());
+    // let mut f = std::fs::File::create(&path).unwrap();
+    // f.write_all(&encoded_avif_av2).unwrap();
 }

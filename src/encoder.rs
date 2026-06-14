@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::Speed;
 use crate::avif::{
     checked_buffer_size, finalize_color, finalize_with_alpha, make_av1c, validate_dims,
 };
@@ -351,6 +352,7 @@ pub fn encode_still_lossy<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -388,6 +390,7 @@ pub fn encode_still_lossy<T: Pixel>(
         &cr,
         color,
         threads,
+        speed,
     )
 }
 
@@ -403,6 +406,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -466,6 +470,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
         &cr,
         color,
         threads,
+        speed,
     )
 }
 
@@ -481,6 +486,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -542,6 +548,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
         &cr,
         color,
         threads,
+        speed,
     )
 }
 
@@ -551,6 +558,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     base_q_idx: u8,
     full_range: bool,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
@@ -581,6 +589,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
         &luma,
         full_range,
         threads,
+        speed,
     );
     Ok(bytes)
 }
@@ -592,7 +601,7 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
-    encode_lossy_gray_obu(img, img.bit_depth, 0, full_range, threads)
+    encode_lossy_gray_obu(img, img.bit_depth, 0, full_range, threads, Speed::Slow)
 }
 
 /// Encode a lossless grayscale (monochrome) AVIF still.
@@ -602,7 +611,7 @@ pub fn encode_lossless_gray<T: Pixel>(
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
-    let obu = encode_lossy_gray_obu(img, img.bit_depth, 0, true, cfg.threads)?;
+    let obu = encode_lossy_gray_obu(img, img.bit_depth, 0, true, cfg.threads, Speed::Slow)?;
     finalize_color(
         obu,
         img.width as u32,
@@ -723,8 +732,14 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
 
     let obu = encode_lossless_obu(&img.packed_3(), cfg.color_encoding.as_ref(), cfg.threads)?;
 
-    let alpha_obu =
-        encode_lossy_gray_obu(&img.packed_alpha_4(), img.bit_depth, 0, true, cfg.threads)?;
+    let alpha_obu = encode_lossy_gray_obu(
+        &img.packed_alpha_4(),
+        img.bit_depth,
+        0,
+        true,
+        cfg.threads,
+        Speed::Slow,
+    )?;
     finalize_with_alpha(
         obu,
         alpha_obu,
@@ -746,6 +761,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
@@ -765,6 +781,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
         &to_i(&planar_image.planes[2]),
         color,
         threads,
+        speed,
     );
     Ok(bytes)
 }
@@ -779,6 +796,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
     assert!(base_q_idx != 0, "4:2:2 doesn't support lossless encoding");
@@ -798,6 +816,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
         &to_i(&planar_image.planes[2]),
         color,
         threads,
+        speed,
     );
     Ok(bytes)
 }
@@ -812,6 +831,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     base_q_idx: u8,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
@@ -831,6 +851,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
         &to_i(&planar_image.planes[2]),
         color,
         threads,
+        speed,
     );
     Ok(bytes)
 }
@@ -985,9 +1006,9 @@ mod tests {
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::from_u8(bd).unwrap(), &rgb)
                 .unwrap();
             let outs = [
-                encode_still_lossy(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
-                encode_still_lossy_422(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
-                encode_still_lossy_420(&img, 80, Some(&Cicp::srgb_ycbcr()), 1),
+                encode_still_lossy(&img, 80, Some(&Cicp::srgb_ycbcr()), 1, Speed::Slow),
+                encode_still_lossy_422(&img, 80, Some(&Cicp::srgb_ycbcr()), 1, Speed::Slow),
+                encode_still_lossy_420(&img, 80, Some(&Cicp::srgb_ycbcr()), 1, Speed::Slow),
             ];
             for (k, o) in outs.iter().enumerate() {
                 assert_eq!(o.len(), exp[k].0, "bd={} fmt={} len", bd, k);
@@ -1010,7 +1031,10 @@ mod tests {
             let rgb = vec![100u8; w * h * 3];
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb).unwrap();
             assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
-            assert!(!encode_still_lossy(&img, 16, Some(&Cicp::srgb_ycbcr()), 0).is_empty());
+            assert!(
+                !encode_still_lossy(&img, 16, Some(&Cicp::srgb_ycbcr()), 0, Speed::Slow,)
+                    .is_empty()
+            );
         }
     }
 }
