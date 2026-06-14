@@ -31,6 +31,7 @@ use crate::dct::{
     WC16_5, WC16_6, WC16_7, WC32,
 };
 use std::arch::aarch64::*;
+use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy)]
 struct I32x8 {
@@ -350,12 +351,10 @@ pub(crate) fn dct8x8_neon_i32(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x8_neon_coeffs(input);
     quant_flat(&coeffs, dc_q, ac_q, input);
 }
-/// Forward 2-D integer DCT-16 (NEON) -> normalized coefficients `out[u*16+v]`
-/// (DC at index 0), pre-quantization. Mirrors scalar `dct16x16_coeffs`.
+
 #[target_feature(enable = "neon")]
 pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
     unsafe {
-        // Column-wise DCT-16 on left half (cols 0-7) and right half (cols 8-15)
         let mut c_l = load16_i32(input, 16);
         let mut c_r = load16_i32(&input[8..], 16);
 
@@ -386,7 +385,7 @@ pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
 
         let mut out = [0i32; 256];
         for u in 0..16usize {
-            // Normalise the integer DCT-16 gain (sqrt(16) per pass -> 16x) to the
+            // Normalize the integer DCT-16 gain (sqrt(16) per pass -> 16x) to the
             // orthonormal*8 scale by 1/2; matches scalar `mul_q16(_, 32768)`.
             let na = d_a[u].shr::<1>();
             let nb = d_b[u].shr::<1>();
@@ -463,22 +462,25 @@ fn load32_i32(ptr: &[i32], stride: usize) -> [I32x8; 32] {
 /// (DC at index 0), pre-quantization. Mirrors scalar `dct32x32_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
-    let mut tmp = [0i32; 1024];
+    let mut tmp_u = MaybeUninit::<[i32; 1024]>::uninit();
 
     for group in 0..4usize {
         let col_start = group * 8;
         let mut cols = load32_i32(&input[col_start..], 32);
         dct1d_32_v_i32(&mut cols);
         for v in 0..32usize {
-            let base = &mut tmp[v * 32 + col_start..];
+            let dst_ptr = tmp_u.as_mut_ptr() as *mut i32;
+            let base = unsafe { dst_ptr.add(v * 32 + col_start) };
             unsafe {
-                vst1q_s32(base.as_mut_ptr(), cols[v].lo);
-                vst1q_s32(base[4..].as_mut_ptr(), cols[v].hi);
+                vst1q_s32(base, cols[v].lo);
+                vst1q_s32(base.add(4), cols[v].hi);
             }
         }
     }
 
-    let mut out = [0i32; 1024];
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut out = MaybeUninit::<[i32; 1024]>::uninit();
     for group in 0..4usize {
         let row_start = group * 8;
         let base_off = row_start * 32;
@@ -494,7 +496,7 @@ pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
         transpose_8x8_i32(&mut seg_d);
 
         let mut rows = [I32x8::zero(); 32];
-        rows[0..8].copy_from_slice(&seg_a);
+        rows[..8].copy_from_slice(&seg_a);
         rows[8..16].copy_from_slice(&seg_b);
         rows[16..24].copy_from_slice(&seg_c);
         rows[24..32].copy_from_slice(&seg_d);
@@ -502,17 +504,18 @@ pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
         dct1d_32_v_i32(&mut rows);
 
         // rows[u].lane[y] = coeff(horiz=u, vert=row_start+y) -> out[u*32 + row].
-        // Normalise the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
+        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
         for u in 0..32usize {
             let n = rows[u].shr::<2>();
             unsafe {
-                let base = &mut out[u * 32 + row_start..];
-                vst1q_s32(base.as_mut_ptr(), n.lo);
-                vst1q_s32(base[4..].as_mut_ptr(), n.hi);
+                let dst_ptr = out.as_mut_ptr() as *mut i32;
+                let base = dst_ptr.add(u * 32 + row_start);
+                vst1q_s32(base, n.lo);
+                vst1q_s32(base.add(4), n.hi);
             }
         }
     }
-    out
+    unsafe { out.assume_init() }
 }
 
 #[target_feature(enable = "neon")]
@@ -526,8 +529,6 @@ pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
 /// pre-quantization. Mirrors scalar `dct8x16_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
-    // 8 wide x 16 tall: residual read as input[row*8 + col], row 0..16, col 0..8.
-    // Pass 1: DCT-16 down each of the 8 columns (vertical).
     let mut rows = load16_i32(input, 8); // rows[r].lane[c] = input[r*8 + c]
     dct1d_16_v_i32(&mut rows); // rows[fy].lane[c] = vertical DCT-16 freq fy, col c
 
@@ -540,24 +541,25 @@ pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
     dct1d_8_v_i32(&mut a); // a[fx].lane[fy]  = coeff(horiz fx, vert fy   0..8)
     dct1d_8_v_i32(&mut b); // b[fx].lane[fy'] = coeff(horiz fx, vert fy'+8 8..16)
 
-    // Normalise the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8 by
+    // Normalize the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8 by
     // 1/sqrt(2) (round(65536/sqrt2) = 46341), matching scalar.
     let nrm = vdupq_n_s32(46341);
-    let mut out = [0i32; 128];
+    let mut out = MaybeUninit::<[i32; 128]>::uninit();
     for fx in 0..8usize {
         let a_lo = mul_q16_vec(a[fx].lo, nrm);
         let a_hi = mul_q16_vec(a[fx].hi, nrm);
         let b_lo = mul_q16_vec(b[fx].lo, nrm);
         let b_hi = mul_q16_vec(b[fx].hi, nrm);
         unsafe {
-            let base = &mut out[fx * 16..];
-            vst1q_s32(base.as_mut_ptr(), a_lo);
-            vst1q_s32(base[4..].as_mut_ptr(), a_hi);
-            vst1q_s32(base[8..].as_mut_ptr(), b_lo);
-            vst1q_s32(base[12..].as_mut_ptr(), b_hi);
+            let dst_ptr = out.as_mut_ptr() as *mut i32;
+            let base = dst_ptr.add(fx * 16);
+            vst1q_s32(base, a_lo);
+            vst1q_s32(base.add(4), a_hi);
+            vst1q_s32(base.add(8), b_lo);
+            vst1q_s32(base.add(12), b_hi);
         }
     }
-    out
+    unsafe { out.assume_init() }
 }
 
 #[allow(unused)]

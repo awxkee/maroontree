@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::quant::Dct;
+use std::sync::OnceLock;
 
 pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
@@ -224,6 +225,9 @@ pub(crate) fn inv_adst8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[5 * s] = -(((t6 - t7) * 181 + 128) >> 8);
 }
 
+pub(crate) type IdctDequantFn<const N: usize> =
+    unsafe fn(&[i32; N], dequant: &IdctDequant) -> [i32; N];
+
 /// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
 /// inverse transform (TX_8X8 DCT_DCT, 8-bit, shift=1), so the encoder's
 /// reconstruction is bit-identical to the decoder's. This eliminates DC-pred
@@ -231,7 +235,49 @@ pub(crate) fn inv_adst8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
 pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
-    // dequant: coeff[rc] = clamp(|level|*q, cf_max) with sign (dq_shift=0 for TX_8X8)
+    static DEQUANT_8X8: OnceLock<IdctDequantFn<64>> = OnceLock::new();
+    let f = DEQUANT_8X8.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                use crate::neon::idct_dequant_8x8_neon;
+                return idct_dequant_8x8_neon;
+            }
+        }
+        idct_dequant_8x8_scalar
+    });
+    let dequant = IdctDequant {
+        dc_q,
+        ac_q,
+        rmax,
+        rmin,
+        cmin,
+        cmax,
+        cf_max,
+    };
+    unsafe { f(levels, &dequant) }
+}
+
+pub(crate) struct IdctDequant {
+    pub(crate) dc_q: i32,
+    pub(crate) ac_q: i32,
+    pub(crate) rmin: i32,
+    pub(crate) rmax: i32,
+    pub(crate) cmin: i32,
+    pub(crate) cmax: i32,
+    pub(crate) cf_max: i32,
+}
+
+#[allow(unused)]
+pub(crate) fn idct_dequant_8x8_scalar(levels: &[i32; 64], dequant: &IdctDequant) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
         let lvl = levels[rc];
