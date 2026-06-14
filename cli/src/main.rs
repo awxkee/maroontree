@@ -46,6 +46,7 @@
 //!       --no-alpha                       Discard alpha channel
 //!       --no-exif                        Strip EXIF from output
 //!       --no-icc                         Strip ICC profile from output
+//!   -s, --speed                          Encoding effort (default = slow)
 //!   -v, --verbose                        Print dimensions, timing, file size
 //!   -h, --help                           Print this help
 //! ```
@@ -106,6 +107,7 @@ struct Args {
     no_icc: bool,
     apply_icc: bool,
     verbose: bool,
+    speed: EncodingEffort,
 }
 
 fn usage() -> ! {
@@ -128,6 +130,7 @@ Options:
       --no-exif                     Strip EXIF metadata from output
       --no-icc                      Strip ICC colour profile from output
       --apply-icc                   Apply ICC profile to pixels (convert to sRGB), then strip it
+  -s, --speed                       Encoding effort (default = slow)
   -v, --verbose                     Print timing and file stats
   -h, --help                        Print this help"
     );
@@ -145,6 +148,23 @@ fn basic_concurrency() -> usize {
         .unwrap_or(1)
 }
 
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum EncodingEffort {
+    Slow,
+    Medium,
+    Fast,
+}
+
+impl EncodingEffort {
+    pub(crate) fn to_maroontreee(self) -> maroontree::Speed {
+        match self {
+            EncodingEffort::Slow => maroontree::Speed::Slow,
+            EncodingEffort::Medium => maroontree::Speed::Medium,
+            EncodingEffort::Fast => maroontree::Speed::Fast,
+        }
+    }
+}
+
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1).peekable();
     let mut input: Option<PathBuf> = None;
@@ -160,6 +180,7 @@ fn parse_args() -> Args {
     let mut no_icc = false;
     let mut apply_icc = false;
     let mut verbose = false;
+    let mut speed = EncodingEffort::Slow;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -202,6 +223,16 @@ fn parse_args() -> Args {
                     "12" => Depth::D12,
                     other => die(format!("unsupported depth '{other}'; use 8, 10, or 12")),
                 })
+            }
+            "-s" | "--speed" => {
+                speed = match args.next().unwrap_or_default().as_str() {
+                    "slow" => EncodingEffort::Slow,
+                    "medium" => EncodingEffort::Fast,
+                    "fast" => EncodingEffort::Fast,
+                    other => die(format!(
+                        "unsupported speed '{other}'; use slow, medium, or fast"
+                    )),
+                }
             }
             "-t" | "--threads" => {
                 let v = args
@@ -258,6 +289,7 @@ fn parse_args() -> Args {
         no_icc,
         apply_icc,
         verbose,
+        speed,
     }
 }
 

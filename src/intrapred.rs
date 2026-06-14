@@ -506,6 +506,15 @@ pub(crate) fn nd_modes() -> &'static [usize] {
     &ND_LUMA_MODES
 }
 
+/// Reduced candidate set for the fast RDO path (`speed >= 1`): keep DC, the
+/// planar-like SMOOTH, and PAETH, and drop the SMOOTH_V/SMOOTH_H variants
+/// (their wins over SMOOTH are rare and small). Mirrors libaom's intra-mode
+/// pruning at higher `--cpu-used`.
+pub(crate) fn fast_nd_modes() -> &'static [usize] {
+    const FAST: [usize; 3] = [DC_PRED, SMOOTH_PRED, PAETH_PRED];
+    &FAST
+}
+
 /// 8x8 DC_PRED from a reconstructed plane (stride 64). `(ox, oy)` pixel origin.
 pub(crate) fn dc_pred_8x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
     let above = oy > 0;

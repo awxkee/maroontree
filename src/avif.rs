@@ -89,6 +89,42 @@ pub enum ChromaFormat {
     Monochrome,
 }
 
+/// Rate-distortion effort for the encoder's mode search.
+///
+/// Higher effort spends more time per block searching for the smallest stream at
+/// a given quality; faster effort trades a little compression for speed using
+/// libaom-style shortcuts. Currently honoured only by the AV1 lossy path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Speed {
+    /// Exhaustive rate-distortion
+    #[default]
+    Slow,
+    /// Balanced: RDOQ is run once on the chosen mode only
+    Medium,
+    /// Fast path
+    Fast,
+}
+
+impl Speed {
+    /// Whether RDOQ (trellis) is run for *every* candidate during the mode
+    /// search. Only [`Speed::Slow`] does; the faster tiers apply RDOQ once, to
+    /// the winning mode.
+    pub(crate) fn per_candidate_rdoq(self) -> bool {
+        matches!(self, Speed::Slow)
+    }
+
+    /// Whether the winning mode is refined with an ADST_ADST transform-type
+    /// search. Off only for [`Speed::Fast`] (DCT-only).
+    pub(crate) fn try_adst(self) -> bool {
+        !matches!(self, Speed::Fast)
+    }
+
+    /// Whether the intra candidate set is reduced. Only [`Speed::Fast`] does.
+    pub(crate) fn reduced_modes(self) -> bool {
+        matches!(self, Speed::Fast)
+    }
+}
+
 /// Encoder configuration shared by all entry points.
 ///
 /// Build with [`EncodeConfig::new`] and the `with_*` builder methods.
@@ -117,6 +153,8 @@ pub struct EncodeConfig {
     /// Worker threads for tile-level parallelism.
     /// `0` = all available cores; `1` = serial (default); `N` = up to N.
     pub threads: usize,
+    /// RDO effort (AV1 lossy path). See [`Speed`]; defaults to [`Speed::Slow`].
+    pub speed: Speed,
 }
 
 impl Default for EncodeConfig {
@@ -128,6 +166,7 @@ impl Default for EncodeConfig {
             icc: None,
             metadata: Metadata::default(),
             threads: 1,
+            speed: Speed::Slow,
         }
     }
 }
@@ -180,6 +219,12 @@ impl EncodeConfig {
 
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads;
+        self
+    }
+
+    /// Set the RDO effort level (AV1 lossy path). See [`Speed`].
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
         self
     }
 
@@ -344,13 +389,14 @@ fn dispatch_lossy<T: crate::Pixel>(
     chroma: ChromaFormat,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     match chroma {
         ChromaFormat::Yuv420 | ChromaFormat::Monochrome => {
-            encode_still_lossy_420(img, q, color, threads)
+            encode_still_lossy_420(img, q, color, threads, speed)
         }
-        ChromaFormat::Yuv422 => encode_still_lossy_422(img, q, color, threads),
-        ChromaFormat::Yuv444 => encode_still_lossy(img, q, color, threads),
+        ChromaFormat::Yuv422 => encode_still_lossy_422(img, q, color, threads, speed),
+        ChromaFormat::Yuv444 => encode_still_lossy(img, q, color, threads, speed),
     }
 }
 
@@ -372,6 +418,7 @@ pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -395,6 +442,7 @@ pub fn encode_rgba8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -424,6 +472,7 @@ pub fn encode_rgba8_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -455,6 +504,7 @@ pub fn encode_rgb10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(
         obu,
@@ -485,6 +535,7 @@ pub fn encode_rgba10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(
         obu,
@@ -517,6 +568,7 @@ pub fn encode_rgba10_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -549,6 +601,7 @@ pub fn encode_rgb12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(
         obu,
@@ -579,6 +632,7 @@ pub fn encode_rgba12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     finalize_color(
         obu,
@@ -614,6 +668,7 @@ pub fn encode_rgba12_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     );
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -639,7 +694,14 @@ pub fn encode_gray8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
     cfg.validate()?;
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Eight, q, true, cfg.threads)?;
+    let obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Eight,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     finalize_color(
         obu,
         img.width as u32,
@@ -661,7 +723,14 @@ pub fn encode_gray10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
     cfg.validate()?;
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Ten, q, true, cfg.threads)?;
+    let obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Ten,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     finalize_color(
         obu,
         img.width as u32,
@@ -683,7 +752,14 @@ pub fn encode_gray12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
     cfg.validate()?;
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Twelve, q, true, cfg.threads)?;
+    let obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Twelve,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     finalize_color(
         obu,
         img.width as u32,
@@ -712,6 +788,7 @@ pub fn encode_yuv8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -734,6 +811,7 @@ pub fn encode_yuv10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     finalize_color(
         obu,
@@ -763,6 +841,7 @@ pub fn encode_yuv12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     finalize_color(
         obu,
@@ -796,6 +875,7 @@ pub fn encode_yuva8_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -829,6 +909,7 @@ pub fn encode_yuva10_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -863,6 +944,7 @@ pub fn encode_yuva12_with_alpha(
         cfg.chroma,
         cfg.color_encoding.as_ref(),
         cfg.threads,
+        cfg.speed,
     )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
     finalize_with_alpha(
@@ -889,7 +971,14 @@ pub fn encode_gray_alpha8(
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Eight, q, true, cfg.threads)?;
+    let color_obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Eight,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
@@ -915,7 +1004,14 @@ pub fn encode_gray_alpha10(
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Ten, q, true, cfg.threads)?;
+    let color_obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Ten,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
@@ -941,7 +1037,14 @@ pub fn encode_gray_alpha12(
     validate_buf(&img.planes[0], img.width as u32, img.height as u32, 1)?;
     validate_buf(&img.planes[1], img.width as u32, img.height as u32, 1)?;
     let q = quality_to_q(cfg.quality);
-    let color_obu = encode_lossy_gray_obu(&img.packed_1(), BitDepth::Twelve, q, true, cfg.threads)?;
+    let color_obu = encode_lossy_gray_obu(
+        &img.packed_1(),
+        BitDepth::Twelve,
+        q,
+        true,
+        cfg.threads,
+        cfg.speed,
+    )?;
     let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
     finalize_with_alpha(
         color_obu,
@@ -961,13 +1064,14 @@ fn dispatch_yuv_u8(
     chroma: ChromaFormat,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
-        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads),
-        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads, speed),
+        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads, speed),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            encode_yuv444_obu(planar_image, bd, q, color, threads)
+            encode_yuv444_obu(planar_image, bd, q, color, threads, speed)
         }
     }
 }
@@ -979,13 +1083,14 @@ fn dispatch_yuv_u16(
     chroma: ChromaFormat,
     color: Option<&Cicp>,
     threads: usize,
+    speed: Speed,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
-        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads),
-        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads),
+        ChromaFormat::Yuv420 => encode_yuv420_obu(planar_image, bd, q, color, threads, speed),
+        ChromaFormat::Yuv422 => encode_yuv422_obu(planar_image, bd, q, color, threads, speed),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => {
-            encode_yuv444_obu(planar_image, bd, q, color, threads)
+            encode_yuv444_obu(planar_image, bd, q, color, threads, speed)
         }
     }
 }
