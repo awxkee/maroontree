@@ -184,6 +184,9 @@ pub struct Av2Encoder {
     bit_depth: u8,
     tune: Tuning,
     speed: crate::Speed,
+    /// Worker-thread budget for tile/superblock parallelism (`0`/`1` = serial).
+    /// Sourced from `EncodeConfig::threads` via [`Av2Encoder::with_threads`].
+    threads: usize,
 }
 
 /// Returns the AV2 mi-unit frame extents `(mc, mr)` for a native (no-pad) lossy 4:4:4
@@ -330,7 +333,16 @@ impl Av2Encoder {
             bit_depth,
             tune: Tuning::default(),
             speed: crate::Speed::Slow,
+            threads: 1,
         }
+    }
+
+    /// Set the worker-thread budget (builder style). `0` or `1` = serial; `N`
+    /// allows up to `N` threads for tile/superblock parallelism. Typically wired
+    /// from `EncodeConfig::threads`.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
     }
 
     /// Replace the full [`Tuning`] (builder style).

@@ -33,8 +33,6 @@ use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Orientation};
 use crate::{BitDepth, ChromaFormat, Cicp, EncodeConfig, Pixel, PlanarImage, TxPart};
 
-/// Resolve the colour signalling for an encode: the configured CICP, or a
-/// sensible sRGB-YCbCr default when the caller left it unset.
 fn resolve_color(cfg: &EncodeConfig) -> Cicp {
     cfg.color_encoding.unwrap_or_else(Cicp::srgb_ycbcr)
 }
@@ -83,7 +81,9 @@ fn encode_alpha<T: Pixel>(
     threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     // base_q_idx = 0 ⇒ the mono path takes its lossless branch.
-    Av2Encoder::with_bit_depth(0, bit_depth.bits()).encode_image_400(alpha_mono, color, threads)
+    Av2Encoder::with_bit_depth(0, bit_depth.bits())
+        .with_threads(threads)
+        .encode_image_400(alpha_mono, color, threads)
 }
 
 /// Common preamble: enforce the expected bit depth, validate dims + config, and
@@ -104,7 +104,8 @@ fn prepare(
         Av2Encoder::with_bit_depth(av2_map_quality(cfg.quality), bit_depth.bits())
             .with_tiles(8, 8)
             .with_txpart(TxPart::ThreeWay)
-            .with_speed(cfg.speed),
+            .with_speed(cfg.speed)
+            .with_threads(cfg.threads),
     )
 }
 
@@ -128,7 +129,8 @@ fn prepare_lossless_capable(
     Ok(Av2Encoder::with_bit_depth(q, bit_depth.bits())
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
-        .with_speed(cfg.speed))
+        .with_speed(cfg.speed)
+        .with_threads(cfg.threads))
 }
 
 #[inline]
