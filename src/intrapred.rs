@@ -435,53 +435,216 @@ pub(crate) fn intra_predict_nd(
                 }
             }
         }
-        PAETH_PRED => {
-            for (y, orow) in out.chunks_exact_mut(bw).enumerate() {
-                let lv = left[y];
-                for (o, &tv) in orow.iter_mut().zip(top.iter()) {
-                    let b = lv + tv - corner;
-                    let (ld, td, cd) = ((lv - b).abs(), (tv - b).abs(), (corner - b).abs());
-                    *o = if ld <= td && ld <= cd {
-                        lv
-                    } else if td <= cd {
-                        tv
-                    } else {
-                        corner
-                    };
-                }
-            }
-        }
-        SMOOTH_PRED => {
-            let (wv, wh) = (sm_weights(bh), sm_weights(bw));
-            let (right, bottom) = (top[bw - 1], left[bh - 1]);
-            for ((orow, &wvy), &lv) in out.chunks_exact_mut(bw).zip(wv.iter()).zip(left.iter()) {
-                for (o, (&tv, &whx)) in orow.iter_mut().zip(top.iter().zip(wh.iter())) {
-                    let pred = wvy * tv + (256 - wvy) * bottom + whx * lv + (256 - whx) * right;
-                    *o = (pred + 256) >> 9;
-                }
-            }
-        }
-        SMOOTH_V_PRED => {
-            let wv = sm_weights(bh);
-            let bottom = left[bh - 1];
-            for (orow, &wvy) in out.chunks_exact_mut(bw).zip(wv.iter()) {
-                for (o, &tv) in orow.iter_mut().zip(top.iter()) {
-                    let pred = wvy * tv + (256 - wvy) * bottom;
-                    *o = (pred + 128) >> 8;
-                }
-            }
-        }
-        SMOOTH_H_PRED => {
-            let wh = sm_weights(bw);
-            let right = top[bw - 1];
-            for (orow, &lv) in out.chunks_exact_mut(bw).zip(left.iter()) {
-                for (o, &whx) in orow.iter_mut().zip(wh.iter()) {
-                    let pred = whx * lv + (256 - whx) * right;
-                    *o = (pred + 128) >> 8;
-                }
-            }
-        }
+        PAETH_PRED => paeth_pred(bw, bh, &top, &left, corner, out),
+        SMOOTH_PRED => smooth_pred(bw, bh, &top, &left, out),
+        SMOOTH_V_PRED => smooth_v_pred(bw, bh, &top, &left, out),
+        SMOOTH_H_PRED => smooth_h_pred(bw, bh, &top, &left, out),
         _ => unreachable!("intra_predict_nd called with mode {}", mode),
+    }
+}
+
+/// AV1 PAETH predictor, bit-exact to dav1d `ipred_paeth_c`. NEON path uses
+/// `vabdq_s32` + `vcleq_s32` masks + `vbslq_s32` selects (no MAC — PAETH is a
+/// nearest-of-three select), scalar elsewhere.
+pub(crate) fn paeth_pred(
+    bw: usize,
+    bh: usize,
+    top: &[i32],
+    left: &[i32],
+    corner: i32,
+    out: &mut [i32],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bw.is_multiple_of(4) {
+            unsafe { neon::paeth(bw, bh, top, left, corner, out) };
+            return;
+        }
+    }
+    for (y, orow) in out.chunks_exact_mut(bw).enumerate() {
+        let lv = left[y];
+        for (o, &tv) in orow.iter_mut().zip(top.iter()) {
+            let b = lv + tv - corner;
+            let (ld, td, cd) = ((lv - b).abs(), (tv - b).abs(), (corner - b).abs());
+            *o = if ld <= td && ld <= cd {
+                lv
+            } else if td <= cd {
+                tv
+            } else {
+                corner
+            };
+        }
+    }
+}
+
+/// AV1 SMOOTH predictor (4-tap vertical+horizontal weighted blend), bit-exact to
+/// dav1d `ipred_smooth_c`. Dispatches to a NEON+MAC kernel on aarch64, scalar
+/// elsewhere. `top`/`left` hold the prepared edges; output is row-major `bw*bh`.
+pub(crate) fn smooth_pred(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bw.is_multiple_of(4) {
+            unsafe { neon::smooth(bw, bh, top, left, out) };
+            return;
+        }
+    }
+    let (wv, wh) = (sm_weights(bh), sm_weights(bw));
+    let (right, bottom) = (top[bw - 1], left[bh - 1]);
+    for ((orow, &wvy), &lv) in out.chunks_exact_mut(bw).zip(wv.iter()).zip(left.iter()) {
+        for (o, (&tv, &whx)) in orow.iter_mut().zip(top.iter().zip(wh.iter())) {
+            let pred = wvy * tv + (256 - wvy) * bottom + whx * lv + (256 - whx) * right;
+            *o = (pred + 256) >> 9;
+        }
+    }
+}
+
+/// AV1 SMOOTH_V predictor (vertical half), bit-exact to dav1d `ipred_smooth_v_c`.
+pub(crate) fn smooth_v_pred(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bw.is_multiple_of(4) {
+            unsafe { neon::smooth_v(bw, bh, top, left, out) };
+            return;
+        }
+    }
+    let wv = sm_weights(bh);
+    let bottom = left[bh - 1];
+    for (orow, &wvy) in out.chunks_exact_mut(bw).zip(wv.iter()) {
+        for (o, &tv) in orow.iter_mut().zip(top.iter()) {
+            *o = (wvy * tv + (256 - wvy) * bottom + 128) >> 8;
+        }
+    }
+}
+
+/// AV1 SMOOTH_H predictor (horizontal half), bit-exact to dav1d `ipred_smooth_h_c`.
+pub(crate) fn smooth_h_pred(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if bw.is_multiple_of(4) {
+            unsafe { neon::smooth_h(bw, bh, top, left, out) };
+            return;
+        }
+    }
+    let wh = sm_weights(bw);
+    let right = top[bw - 1];
+    for (orow, &lv) in out.chunks_exact_mut(bw).zip(left.iter()) {
+        for (o, &whx) in orow.iter_mut().zip(wh.iter()) {
+            *o = (whx * lv + (256 - whx) * right + 128) >> 8;
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon {
+    use super::sm_weights;
+    use core::arch::aarch64::*;
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn mla_n(acc: int32x4_t, v: int32x4_t, k: i32) -> int32x4_t {
+        vmlaq_s32(acc, v, vdupq_n_s32(k))
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn smooth(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+        let (wv, wh) = (sm_weights(bh), sm_weights(bw));
+        let (right, bottom) = (top[bw - 1], left[bh - 1]);
+        let c256 = vdupq_n_s32(256);
+        let rnd = vdupq_n_s32(256);
+        for y in 0..bh {
+            let (wvy, lv) = (wv[y], left[y]);
+            let base = vdupq_n_s32((256 - wvy) * bottom);
+            let row = &mut out[y * bw..y * bw + bw];
+            let mut x = 0;
+            while x < bw {
+                unsafe {
+                    let tv = vld1q_s32(top[x..].as_ptr());
+                    let whx = vld1q_s32(wh[x..].as_ptr());
+                    let w2 = vsubq_s32(c256, whx);
+                    let mut acc = mla_n(base, tv, wvy); // base + top*wvy
+                    acc = mla_n(acc, whx, lv); // + wh*left[y]
+                    acc = mla_n(acc, w2, right); // + (256-wh)*right
+                    vst1q_s32(row[x..].as_mut_ptr(), vshrq_n_s32::<9>(vaddq_s32(acc, rnd)));
+                }
+                x += 4;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) fn smooth_v(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+        let wv = sm_weights(bh);
+        let bottom = left[bh - 1];
+        let rnd = vdupq_n_s32(128);
+        for y in 0..bh {
+            let wvy = wv[y];
+            let base = vdupq_n_s32((256 - wvy) * bottom);
+            let row = &mut out[y * bw..y * bw + bw];
+            let mut x = 0;
+            while x < bw {
+                unsafe {
+                    let tv = vld1q_s32(top[x..].as_ptr());
+                    let acc = mla_n(base, tv, wvy);
+                    vst1q_s32(row[x..].as_mut_ptr(), vshrq_n_s32(vaddq_s32(acc, rnd), 8));
+                }
+                x += 4;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) fn smooth_h(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+        let wh = sm_weights(bw);
+        let right = top[bw - 1];
+        let c256 = vdupq_n_s32(256);
+        let rnd = vdupq_n_s32(128);
+        for (y, &lv) in left[..bh].iter().enumerate() {
+            let row = &mut out[y * bw..y * bw + bw];
+            let mut x = 0;
+            while x < bw {
+                let whx = unsafe { vld1q_s32(wh[x..].as_ptr()) };
+                let w2 = vsubq_s32(c256, whx);
+                let mut acc = mla_n(vdupq_n_s32(0), w2, right); // (256-wh)*right
+                acc = mla_n(acc, whx, lv); // + wh*left[y]
+                unsafe {
+                    vst1q_s32(row[x..].as_mut_ptr(), vshrq_n_s32(vaddq_s32(acc, rnd), 8));
+                }
+                x += 4;
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) fn paeth(
+        bw: usize,
+        bh: usize,
+        top: &[i32],
+        left: &[i32],
+        corner: i32,
+        out: &mut [i32],
+    ) {
+        let cn = vdupq_n_s32(corner);
+        for (y, &lv) in left[..bh].iter().enumerate() {
+            let lvv = vdupq_n_s32(lv);
+            let lmc = vdupq_n_s32(lv - corner);
+            let row = &mut out[y * bw..y * bw + bw];
+            let mut x = 0;
+            while x < bw {
+                let tv = unsafe { vld1q_s32(top[x..].as_ptr()) };
+                let b = vaddq_s32(tv, lmc); // lv + tv - corner
+                let ld = vabdq_s32(lvv, b);
+                let td = vabdq_s32(tv, b);
+                let cd = vabdq_s32(cn, b);
+                let m_tv = vcleq_s32(td, cd); // td <= cd
+                let m_lv = vandq_u32(vcleq_s32(ld, td), vcleq_s32(ld, cd)); // ld<=td && ld<=cd
+                let mut res = vbslq_s32(m_tv, tv, cn); // td<=cd ? tv : corner
+                res = vbslq_s32(m_lv, lvv, res); // ld<=...? lv : res
+                unsafe {
+                    vst1q_s32(row[x..].as_mut_ptr(), res);
+                }
+                x += 4;
+            }
+        }
     }
 }
 
