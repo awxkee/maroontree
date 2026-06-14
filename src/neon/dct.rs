@@ -325,10 +325,6 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     }
 }
 
-/// Forward 2-D integer DCT-8 (NEON), returning the normalized coefficients in
-/// the canonical `out[horiz*8 + vert]` layout (DC at index 0), pre-quantization.
-/// Shared by the in-place quantizer and the trellis (RDOQ), mirroring the scalar
-/// `dct8x8_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x8_neon_coeffs(input: &[i32; 64]) -> [i32; 64] {
     let mut cols = load8_i32(input, 8);
@@ -336,14 +332,15 @@ pub(crate) fn dct8x8_neon_coeffs(input: &[i32; 64]) -> [i32; 64] {
     transpose_8x8_i32(&mut cols);
     dct1d_8_v_i32(&mut cols);
     // cols[u].lane[j] = coeff(horiz=u, vert=j) -> out[horiz*8 + vert].
-    let mut out = [0i32; 64];
+    let mut out = MaybeUninit::<[i32; 64]>::uninit();
     for (k, col) in cols.iter().enumerate() {
         unsafe {
-            vst1q_s32(out[k * 8..].as_mut_ptr(), col.lo);
-            vst1q_s32(out[k * 8 + 4..].as_mut_ptr(), col.hi);
+            let dst_ptr = out.as_mut_ptr() as *mut i32;
+            vst1q_s32(dst_ptr.add(k * 8), col.lo);
+            vst1q_s32(dst_ptr.add(k * 8 + 4), col.hi);
         }
     }
-    out
+    unsafe { out.assume_init() }
 }
 
 #[target_feature(enable = "neon")]
@@ -383,19 +380,20 @@ pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
         dct1d_16_v_i32(&mut d_a);
         dct1d_16_v_i32(&mut d_b);
 
-        let mut out = [0i32; 256];
+        let mut out = MaybeUninit::<[i32; 256]>::uninit();
         for u in 0..16usize {
             // Normalize the integer DCT-16 gain (sqrt(16) per pass -> 16x) to the
             // orthonormal*8 scale by 1/2; matches scalar `mul_q16(_, 32768)`.
             let na = d_a[u].shr::<1>();
             let nb = d_b[u].shr::<1>();
-            let base = &mut out[u * 16..];
-            vst1q_s32(base.as_mut_ptr(), na.lo);
-            vst1q_s32(base[4..].as_mut_ptr(), na.hi);
-            vst1q_s32(base[8..].as_mut_ptr(), nb.lo);
-            vst1q_s32(base[12..].as_mut_ptr(), nb.hi);
+            let mut dst_ptr = out.as_mut_ptr() as *mut i32;
+            let base = dst_ptr.add(u * 16);
+            vst1q_s32(base, na.lo);
+            vst1q_s32(base.add(4), na.hi);
+            vst1q_s32(base.add(8), nb.lo);
+            vst1q_s32(base.add(12), nb.hi);
         }
-        out
+        out.assume_init()
     }
 }
 

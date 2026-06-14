@@ -92,7 +92,6 @@ impl I32x8 {
     }
 }
 
-/// Transpose a 4x4 i32 tile (verbatim port of the forward DCT helper).
 #[inline]
 #[target_feature(enable = "neon")]
 fn transpose_4x4(
@@ -265,6 +264,177 @@ pub(crate) fn idct_dequant_8x8_neon(levels: &[i32; 64], dequant: &IdctDequant) -
         unsafe {
             vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8), r.lo);
             vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8 + 4), r.hi);
+        }
+    }
+    unsafe { out.assume_init() }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct16_v(c: &mut [I32x8; 16], min: i32, max: i32) {
+    let mn = vdupq_n_s32(min);
+    let mx = vdupq_n_s32(max);
+    let clip = |v: I32x8| v.clip(mn, mx);
+
+    let mut e: [I32x8; 8] = std::array::from_fn(|i| c[2 * i]);
+    inv_dct8_v(&mut e, min, max);
+
+    // odd inputs (read before any write-back to c)
+    let (in1, in3, in5, in7) = (c[1], c[3], c[5], c[7]);
+    let (in9, in11, in13, in15) = (c[9], c[11], c[13], c[15]);
+
+    // stage 1 ; (4076-4096)=-20, (3612-4096)=-484, (3920-4096)=-176
+    let t8a = in1.muli(401).sub(in15.muli(-20)).rsh::<12>(2048).sub(in15);
+    let t9a = in9.muli(1583).sub(in7.muli(1299)).rsh::<11>(1024);
+    let t10a = in5
+        .muli(1931)
+        .sub(in11.muli(-484))
+        .rsh::<12>(2048)
+        .sub(in11);
+    let t11a = in13
+        .muli(-176)
+        .sub(in3.muli(1189))
+        .rsh::<12>(2048)
+        .add(in13);
+    let t12a = in13.muli(1189).add(in3.muli(-176)).rsh::<12>(2048).add(in3);
+    let t13a = in5.muli(-484).add(in11.muli(1931)).rsh::<12>(2048).add(in5);
+    let t14a = in9.muli(1299).add(in7.muli(1583)).rsh::<11>(1024);
+    let t15a = in1.muli(-20).add(in15.muli(401)).rsh::<12>(2048).add(in1);
+
+    // stage 2 (butterflies)
+    let t8 = clip(t8a.add(t9a));
+    let t9 = clip(t8a.sub(t9a));
+    let t10 = clip(t11a.sub(t10a));
+    let t11 = clip(t11a.add(t10a));
+    let t12 = clip(t12a.add(t13a));
+    let t13 = clip(t12a.sub(t13a));
+    let t14 = clip(t15a.sub(t14a));
+    let t15 = clip(t15a.add(t14a));
+
+    // stage 3 (rotations) ; (3784-4096)=-312
+    // t10a' = ((-(t13*(-312) + t10*1567) + 2048)>>12) - t13 = ((t13*312 - t10*1567 + 2048)>>12) - t13
+    let u9a = t14.muli(1567).sub(t9.muli(-312)).rsh::<12>(2048).sub(t9);
+    let u14a = t14.muli(-312).add(t9.muli(1567)).rsh::<12>(2048).add(t14);
+    let u10a = t13.muli(312).sub(t10.muli(1567)).rsh::<12>(2048).sub(t13);
+    let u13a = t13.muli(1567).sub(t10.muli(-312)).rsh::<12>(2048).sub(t10);
+
+    // stage 4 (butterflies)
+    let v8a = clip(t8.add(t11));
+    let v9 = clip(u9a.add(u10a));
+    let v10 = clip(u9a.sub(u10a));
+    let v11a = clip(t8.sub(t11));
+    let v12a = clip(t15.sub(t12));
+    let v13 = clip(u14a.sub(u13a));
+    let v14 = clip(u14a.add(u13a));
+    let v15a = clip(t15.add(t12));
+
+    // stage 5 (181/256 rotations)
+    let w10a = v13.sub(v10).muli(181).rsh::<8>(128);
+    let w13a = v13.add(v10).muli(181).rsh::<8>(128);
+    let w11 = v12a.sub(v11a).muli(181).rsh::<8>(128);
+    let w12 = v12a.add(v11a).muli(181).rsh::<8>(128);
+
+    // combine with even outputs e[0..8] (= scalar t0..t7)
+    c[0] = clip(e[0].add(v15a));
+    c[1] = clip(e[1].add(v14));
+    c[2] = clip(e[2].add(w13a));
+    c[3] = clip(e[3].add(w12));
+    c[4] = clip(e[4].add(w11));
+    c[5] = clip(e[5].add(w10a));
+    c[6] = clip(e[6].add(v9));
+    c[7] = clip(e[7].add(v8a));
+    c[8] = clip(e[7].sub(v8a));
+    c[9] = clip(e[6].sub(v9));
+    c[10] = clip(e[5].sub(w10a));
+    c[11] = clip(e[4].sub(w11));
+    c[12] = clip(e[3].sub(w12));
+    c[13] = clip(e[2].sub(w13a));
+    c[14] = clip(e[1].sub(v14));
+    c[15] = clip(e[0].sub(v15a));
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn idct_dequant_16x16_neon(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
+
+    let cfm = vdupq_n_s32(cf_max);
+    let q_dc = vsetq_lane_s32(dc_q, vdupq_n_s32(ac_q), 0);
+    let q_ac = vdupq_n_s32(ac_q);
+    let mut coeff_u = MaybeUninit::<[i32; 256]>::uninit();
+    unsafe {
+        vst1q_s32(
+            coeff_u.as_mut_ptr().cast(),
+            dequant4(vld1q_s32(levels.as_ptr()), q_dc, cfm),
+        );
+        let mut i = 4;
+        while i < 256 {
+            let l = vld1q_s32(levels.as_ptr().add(i));
+            let coeff_ptr = coeff_u.as_mut_ptr() as *mut i32;
+            vst1q_s32(coeff_ptr.add(i), dequant4(l, q_ac, cfm));
+            i += 4;
+        }
+    }
+
+    let coeff = unsafe { coeff_u.assume_init() };
+
+    let load_l = |x: usize| unsafe {
+        I32x8 {
+            lo: vld1q_s32(coeff.as_ptr().add(x * 16)),
+            hi: vld1q_s32(coeff.as_ptr().add(x * 16 + 4)),
+        }
+    };
+    let load_r = |x: usize| unsafe {
+        I32x8 {
+            lo: vld1q_s32(coeff.as_ptr().add(x * 16 + 8)),
+            hi: vld1q_s32(coeff.as_ptr().add(x * 16 + 12)),
+        }
+    };
+    let mut c_l: [I32x8; 16] = std::array::from_fn(load_l);
+    let mut c_r: [I32x8; 16] = std::array::from_fn(load_r);
+
+    inv_dct16_v(&mut c_l, rmin, rmax);
+    inv_dct16_v(&mut c_r, rmin, rmax);
+
+    let cmn = vdupq_n_s32(cmin);
+    let cmx = vdupq_n_s32(cmax);
+    for vv in c_l.iter_mut().chain(c_r.iter_mut()) {
+        *vv = vv.rsh::<2>(2).clip(cmn, cmx);
+    }
+
+    let mut ll: [I32x8; 8] = c_l[0..8].try_into().unwrap();
+    let mut lr: [I32x8; 8] = c_l[8..16].try_into().unwrap();
+    let mut rl: [I32x8; 8] = c_r[0..8].try_into().unwrap();
+    let mut rr: [I32x8; 8] = c_r[8..16].try_into().unwrap();
+    transpose_8x8(&mut ll);
+    transpose_8x8(&mut lr);
+    transpose_8x8(&mut rl);
+    transpose_8x8(&mut rr);
+    // w_l: cols 0..8, rows 0..8 = ll, rows 8..16 = rl ; w_r: cols 8..16, lr / rr
+    let mut w_l: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { ll[i] } else { rl[i - 8] });
+    let mut w_r: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { lr[i] } else { rr[i - 8] });
+
+    // --- col pass: inv_dct16 across y (vector index) per lane x; clip [cmin,cmax] ---
+    inv_dct16_v(&mut w_l, cmin, cmax);
+    inv_dct16_v(&mut w_r, cmin, cmax);
+
+    // final: (t + 8) >> 4 (no clamp), store row-major out[y*16 + x]
+    let mut out = MaybeUninit::<[i32; 256]>::uninit();
+    for r in 0..16 {
+        let lo = w_l[r].rsh::<4>(8); // cols 0..8
+        let hi = w_r[r].rsh::<4>(8); // cols 8..16
+        unsafe {
+            let dst_ptr = out.as_mut_ptr() as *mut i32;
+            vst1q_s32(dst_ptr.add(r * 16), lo.lo);
+            vst1q_s32(dst_ptr.add(r * 16 + 4), lo.hi);
+            vst1q_s32(dst_ptr.add(r * 16 + 8), hi.lo);
+            vst1q_s32(dst_ptr.add(r * 16 + 12), hi.hi);
         }
     }
     unsafe { out.assume_init() }
