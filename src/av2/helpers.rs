@@ -378,6 +378,7 @@ pub(crate) fn dc_pred_rect(
     bw: usize,
     bh: usize,
     neutral: f32,
+    bd: i32,
 ) -> f32 {
     let (ha, hl) = (y0 > 0, x0 > 0);
     let sa: i64 = if ha {
@@ -406,7 +407,7 @@ pub(crate) fn dc_pred_rect(
     };
     let (scale, shift) = resolve_divisor_32(count as u32);
     let rounding: i64 = (1i64 << shift) >> 1;
-    let p = ((sum * scale + rounding) >> shift).clamp(0, 255);
+    let p = ((sum * scale + rounding) >> shift).clamp(0, (1 << bd) - 1);
     p as f32
 }
 

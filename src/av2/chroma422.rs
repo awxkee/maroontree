@@ -36,14 +36,10 @@ pub(super) fn recon_422_chroma(
     scan: &[u16],
     cw: usize,
     ch: usize,
-    basis: &Basis,
+    _basis: &Basis,
+    bd: i32,
 ) -> Vec<f32> {
-    match (cw, ch) {
-        (32, 64) | (32, 32) | (8, 64) | (8, 16) | (4, 32) | (16, 8) => {
-            itx422::reconstruct_chroma_rect(pred, lev, qstep, scan, cw, ch)
-        }
-        _ => basis.reconstruct_scan(pred, lev, scan),
-    }
+    itx422::reconstruct_chroma(pred, lev, qstep, scan, cw, ch, bd)
 }
 
 /// Reconstruction (`rec_*`, written) and source (`src_*`, read) chroma plane refs plus
@@ -92,6 +88,7 @@ pub(super) fn code_422_chroma_tu(
     spec: &ChromaTxSpec,
     quant: QuantCtx,
     nb: ChromaNeighbors,
+    bd: i32,
 ) -> (bool, bool) {
     let ChromaPlanes {
         rec_u: recu,
@@ -112,7 +109,7 @@ pub(super) fn code_422_chroma_tu(
     } = spec;
     let QuantCtx { qc, neutral, qstep } = quant;
     let ChromaNeighbors { ua, ul, va, vl } = nb;
-    let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral);
+    let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
     let levu = basis.project_scan(
         &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
         0.0,
@@ -125,9 +122,9 @@ pub(super) fn code_422_chroma_tu(
         cx,
         cw,
         ch,
-        &recon_422_chroma(predu, &levu, qstep, scan, cw, ch, basis),
+        &recon_422_chroma(predu, &levu, qstep, scan, cw, ch, basis, bd),
     );
-    let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral);
+    let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
     let levv = basis.project_scan(
         &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
         0.0,
@@ -140,7 +137,7 @@ pub(super) fn code_422_chroma_tu(
         cx,
         cw,
         ch,
-        &recon_422_chroma(predv, &levv, qstep, scan, cw, ch, basis),
+        &recon_422_chroma(predv, &levv, qstep, scan, cw, ch, basis, bd),
     );
     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;

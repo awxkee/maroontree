@@ -110,6 +110,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip_cdfs, dc_sign_ctxs) =
                                 sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -139,6 +140,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) =
                                 sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -160,6 +162,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -193,6 +196,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],
@@ -211,7 +215,16 @@ impl Av2Encoder {
                             );
                         }
                         (4, 16) => {
-                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 64, neutral);
+                            let pred = dc_pred_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                64,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let lev = bases.luma16x64.project_scan(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
                                 0.0,
@@ -233,7 +246,16 @@ impl Av2Encoder {
                             encode_luma_leaf_16x64(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (16, 4) => {
-                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 64, 16, neutral);
+                            let pred = dc_pred_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                64,
+                                16,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let lev = bases.luma64x16.project_scan(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
                                 0.0,
@@ -255,7 +277,16 @@ impl Av2Encoder {
                             encode_luma_leaf_64x16(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (2, 8) => {
-                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 32, neutral);
+                            let pred = dc_pred_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                8,
+                                32,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let mut lev = bases.luma8x32.project_scan(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
                                 0.0,
@@ -288,7 +319,16 @@ impl Av2Encoder {
                             );
                         }
                         (8, 2) => {
-                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 32, 8, neutral);
+                            let pred = dc_pred_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                32,
+                                8,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let mut lev = bases.luma32x8.project_scan(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
                                 0.0,
@@ -321,7 +361,16 @@ impl Av2Encoder {
                             );
                         }
                         (4, 4) => {
-                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 16, neutral);
+                            let pred = dc_pred_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                16,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let mut lev = bases.luma16x16.project_scan(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
                                 0.0,
@@ -463,6 +512,7 @@ impl Av2Encoder {
                     qc,
                     self.tune.rdoq_lambda,
                     self.speed,
+                    self.bit_depth as i32,
                 );
                 let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                     &tus,

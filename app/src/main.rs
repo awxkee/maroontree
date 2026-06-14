@@ -88,7 +88,7 @@ fn main() {
         .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
         .unwrap();
     // let out_obu = encoded.view();
-    // println!("encoding time {:?}", instant.elapsed());
+    println!("encoding time {:?}", instant.elapsed());
     // let path = std::env::args()
     //     .nth(1)
     //     .unwrap_or_else(|| "out10.avif".into());

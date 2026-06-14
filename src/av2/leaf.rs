@@ -144,6 +144,7 @@ pub(super) fn encode_luma_sb(
     qc: usize,
     rdoq_lambda: f64,
     speed: Speed,
+    bd: i32,
 ) -> ([Vec<Coeff>; 4], usize) {
     const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
     let mut best_cost = f64::INFINITY;
@@ -191,7 +192,7 @@ pub(super) fn encode_luma_sb(
                     .sum::<f64>();
                 l
             };
-            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
+            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[i] = levels_to_coeffs(&lev);
         }
@@ -303,6 +304,7 @@ pub(super) fn encode_luma_leaf32(
     qc: usize,
     rdoq_lambda: f64,
     speed: Speed,
+    bd: i32,
 ) -> ([Vec<Coeff>; 2], usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
@@ -332,7 +334,7 @@ pub(super) fn encode_luma_leaf32(
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
-            let rb = reconstruct_luma(&pblk, &lev, qstep, scan);
+            let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
             put_block(recy, pw, y0, x0, 32, &rb);
             *tu = levels_to_coeffs(&lev);
         }
@@ -432,6 +434,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     qc: usize,
     rdoq_lambda: f64,
     speed: Speed,
+    bd: i32,
 ) -> ([Vec<Coeff>; 2], usize) {
     let tu_i = [(0usize, 0usize), (32usize, 2usize)]; // (ty, raster-i)
     let mut best_cost = f64::INFINITY;
@@ -462,7 +465,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
-            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
+            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[k] = levels_to_coeffs(&lev);
         }
@@ -512,6 +515,7 @@ pub(super) fn encode_luma_leaf_s32x32(
     qc: usize,
     rdoq_lambda: f64,
     speed: Speed,
+    bd: i32,
 ) -> (Vec<Coeff>, usize) {
     let cands: &[usize] = if speed.reduced_modes() {
         &[0usize, 1, 2]
@@ -539,7 +543,7 @@ pub(super) fn encode_luma_leaf_s32x32(
         if m != 0 {
             cost += 6.0;
         }
-        let rb = reconstruct_luma(&pblk, &lev, qstep, scan);
+        let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
         (rb, levels_to_coeffs(&lev), cost)
     };
     let mut best_cost = f64::INFINITY;
