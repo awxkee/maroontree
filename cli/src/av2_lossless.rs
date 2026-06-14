@@ -72,10 +72,12 @@ pub(crate) fn encode_av2_lossless_image(
 
     let enc = Av2Encoder::new(0)
         .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay);
+        .with_txpart(TxPart::ThreeWay)
+        .with_speed(args.speed.to_maroontreee());
     let alpha_enc = Av2Encoder::new(0)
         .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay);
+        .with_txpart(TxPart::ThreeWay)
+        .with_speed(args.speed.to_maroontreee());
 
     if gray {
         let frame = match effective_depth {

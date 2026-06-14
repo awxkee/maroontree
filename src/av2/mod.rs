@@ -89,7 +89,7 @@ use crate::av2::proj::Basis;
 use crate::av2::tables::{SCAN8X8, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Orientation};
-use crate::{ChromaFormat, Cicp, Pixel, PlanarImage};
+use crate::{ChromaFormat, Cicp, Pixel, PlanarImage, Speed};
 
 // Free luma-leaf prediction/coding helpers live in `leaf`.
 
@@ -182,6 +182,7 @@ pub struct Av2Encoder {
     base_q_idx: u8,
     bit_depth: u8,
     tune: Tuning,
+    speed: crate::Speed,
 }
 
 /// Returns the AV2 mi-unit frame extents `(mc, mr)` for a native (no-pad) lossy 4:4:4
@@ -327,6 +328,7 @@ impl Av2Encoder {
             base_q_idx,
             bit_depth,
             tune: Tuning::default(),
+            speed: crate::Speed::Slow,
         }
     }
 
@@ -355,6 +357,14 @@ impl Av2Encoder {
     /// Set the trellis-RDOQ strength (`0.0` disables RDOQ).
     pub fn with_rdoq_lambda(mut self, lambda: f64) -> Self {
         self.tune.rdoq_lambda = lambda;
+        self
+    }
+
+    /// Set the RDO effort level (see [`Speed`]). [`Speed::Slow`]
+    /// (the default) does per-candidate RDOQ; faster tiers run RDOQ once on the
+    /// winning luma mode, and [`Speed::Fast`] also reduces the intra set.
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
         self
     }
 

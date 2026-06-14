@@ -28,6 +28,7 @@
  */
 
 use super::*;
+use crate::Speed;
 
 /// Build the prediction block for luma candidate `m` (0=DC, 1=SMOOTH, 4=PAETH)
 /// at TX index `i` (raster within the 64x64 SB) and pixel origin `(y0,x0)`.
@@ -142,16 +143,28 @@ pub(super) fn encode_luma_sb(
     neutral: f32,
     qc: usize,
     rdoq_lambda: f64,
+    speed: Speed,
 ) -> ([Vec<Coeff>; 4], usize) {
     const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
     let mut best_tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 64 * 64];
-    let cands: &[usize] = &[0usize, 1, 2, 3, 4];
-    // Reused per-TU residual scratch (fully overwritten each pass).
-    let mut resid = vec![0f32; 1024];
-    for &m in cands {
+    // Fast reduces the intra candidate set; non-Full tiers rank candidates with a
+    // cheap coeff cost (RDOQ disabled) and re-RDOQ the winner only.
+    let cands: &[usize] = if speed.reduced_modes() {
+        &[0usize, 1, 2]
+    } else {
+        &[0usize, 1, 2, 3, 4]
+    };
+    let search_lambda = if speed.per_candidate_rdoq() {
+        rdoq_lambda
+    } else {
+        0.0
+    };
+    // Encode one mode into `recy`, returning its TU coeffs and RD cost.
+    let encode_mode = |recy: &mut [f32], m: usize, lambda: f64| -> ([Vec<Coeff>; 4], f64) {
+        let mut resid = vec![0f32; 1024];
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for (i, &(ty, tx)) in POS.iter().enumerate() {
@@ -163,11 +176,9 @@ pub(super) fn encode_luma_sb(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lambda = rdoq_lambda;
             let lev = if lambda > 0.0 {
                 // Trellis RDOQ: pick coefficient levels by real rate-distortion
-                // (rate = true coded bits), then RD-trim the EOB. The mode cost
-                // becomes the actual estimated bits.
+                // (rate = true coded bits), then RD-trim the EOB.
                 let (mut l, prm) = luma.project_with_prm(&resid);
                 cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
                 l
@@ -184,12 +195,15 @@ pub(super) fn encode_luma_sb(
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[i] = levels_to_coeffs(&lev);
         }
-        // Mode-signaling cost (once per 64x64 block). DC is the cheapest to
-        // signal; SMOOTH/PAETH cost a few extra bits, so only pick them when
-        // they save more than they cost.
+        // Mode-signaling cost (once per 64x64 block). DC is cheapest to signal;
+        // SMOOTH/PAETH cost a few extra bits, so only win when they earn them.
         if m != 0 {
             cost += 6.0;
         }
+        (tus, cost)
+    };
+    for &m in cands {
+        let (tus, cost) = encode_mode(recy, m, search_lambda);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;
@@ -201,10 +215,20 @@ pub(super) fn encode_luma_sb(
             }
         }
     }
-    for ry in 0..64 {
-        let src = ry * 64;
-        let dst = (sb_y + ry) * pw + sb_x;
-        recy[dst..dst + 64].copy_from_slice(&best_region[src..src + 64]);
+    if speed.per_candidate_rdoq() || rdoq_lambda <= 0.0 {
+        // Winner already coded at the final RDOQ setting (or RDOQ is off):
+        // restore the saved winning reconstruction.
+        for ry in 0..64 {
+            let src = ry * 64;
+            let dst = (sb_y + ry) * pw + sb_x;
+            recy[dst..dst + 64].copy_from_slice(&best_region[src..src + 64]);
+        }
+    } else {
+        // Winner-only RDOQ: re-encode the chosen mode with real RDOQ. `recy` ends
+        // holding this reconstruction and the coeffs come from the same levels, so
+        // bitstream and recon stay consistent by construction.
+        let (tus, _) = encode_mode(recy, best_mode, rdoq_lambda);
+        best_tus = tus;
     }
     (best_tus, best_mode)
 }
@@ -278,16 +302,27 @@ pub(super) fn encode_luma_leaf32(
     neutral: f32,
     qc: usize,
     rdoq_lambda: f64,
+    speed: Speed,
 ) -> ([Vec<Coeff>; 2], usize) {
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 64 * 32];
-    let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 2, 3, 4] {
+    let cands: &[usize] = if speed.reduced_modes() {
+        &[0usize, 1, 2]
+    } else {
+        &[0usize, 1, 2, 3, 4]
+    };
+    let search_lambda = if speed.per_candidate_rdoq() {
+        rdoq_lambda
+    } else {
+        0.0
+    };
+    let encode_mode = |recy: &mut [f32], m: usize, lambda: f64| -> ([Vec<Coeff>; 2], f64) {
+        let mut resid = vec![0f32; 1024];
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
-        for (ti, tus) in tus[..2].iter_mut().enumerate() {
+        for (ti, tu) in tus.iter_mut().enumerate() {
             let (y0, x0) = (sb_y, sb_x + ti * 32);
             let pblk = predict_luma_leaf32(recy, pw, mi_cols, mi_rows, sb_y, sb_x, ti, m, neutral);
             for r in 0..32 {
@@ -296,14 +331,18 @@ pub(super) fn encode_luma_leaf32(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
             let rb = reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
-            *tus = levels_to_coeffs(&lev);
+            *tu = levels_to_coeffs(&lev);
         }
         if m != 0 {
             cost += 6.0;
         }
+        (tus, cost)
+    };
+    for &m in cands {
+        let (tus, cost) = encode_mode(recy, m, search_lambda);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;
@@ -314,9 +353,14 @@ pub(super) fn encode_luma_leaf32(
             }
         }
     }
-    for ry in 0..32 {
-        let dst = (sb_y + ry) * pw + sb_x;
-        recy[dst..dst + 64].copy_from_slice(&best_region[ry * 64..ry * 64 + 64]);
+    if speed.per_candidate_rdoq() || rdoq_lambda <= 0.0 {
+        for ry in 0..32 {
+            let dst = (sb_y + ry) * pw + sb_x;
+            recy[dst..dst + 64].copy_from_slice(&best_region[ry * 64..ry * 64 + 64]);
+        }
+    } else {
+        let (tus, _) = encode_mode(recy, best_mode, rdoq_lambda);
+        best_tus = tus;
     }
     (best_tus, best_mode)
 }
@@ -387,14 +431,25 @@ pub(super) fn encode_luma_leaf_v32x64(
     neutral: f32,
     qc: usize,
     rdoq_lambda: f64,
+    speed: Speed,
 ) -> ([Vec<Coeff>; 2], usize) {
     let tu_i = [(0usize, 0usize), (32usize, 2usize)]; // (ty, raster-i)
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 32 * 64];
-    let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 2, 3, 4] {
+    let cands: &[usize] = if speed.reduced_modes() {
+        &[0usize, 1, 2]
+    } else {
+        &[0usize, 1, 2, 3, 4]
+    };
+    let search_lambda = if speed.per_candidate_rdoq() {
+        rdoq_lambda
+    } else {
+        0.0
+    };
+    let encode_mode = |recy: &mut [f32], m: usize, lambda: f64| -> ([Vec<Coeff>; 2], f64) {
+        let mut resid = vec![0f32; 1024];
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
         for (k, &(ty, i)) in tu_i.iter().enumerate() {
@@ -406,7 +461,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                     resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
                 }
             }
-            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
+            let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
             let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[k] = levels_to_coeffs(&lev);
@@ -414,6 +469,10 @@ pub(super) fn encode_luma_leaf_v32x64(
         if m != 0 {
             cost += 6.0;
         }
+        (tus, cost)
+    };
+    for &m in cands {
+        let (tus, cost) = encode_mode(recy, m, search_lambda);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;
@@ -424,9 +483,14 @@ pub(super) fn encode_luma_leaf_v32x64(
             }
         }
     }
-    for ry in 0..64 {
-        let dst = (sb_y + ry) * pw + sb_x;
-        recy[dst..dst + 32].copy_from_slice(&best_region[ry * 32..ry * 32 + 32]);
+    if speed.per_candidate_rdoq() || rdoq_lambda <= 0.0 {
+        for ry in 0..64 {
+            let dst = (sb_y + ry) * pw + sb_x;
+            recy[dst..dst + 32].copy_from_slice(&best_region[ry * 32..ry * 32 + 32]);
+        }
+    } else {
+        let (tus, _) = encode_mode(recy, best_mode, rdoq_lambda);
+        best_tus = tus;
     }
     (best_tus, best_mode)
 }
@@ -447,14 +511,23 @@ pub(super) fn encode_luma_leaf_s32x32(
     neutral: f32,
     qc: usize,
     rdoq_lambda: f64,
+    speed: Speed,
 ) -> (Vec<Coeff>, usize) {
-    let mut best_cost = f64::INFINITY;
-    let mut best_mode = 0usize;
-    let mut best_tu: Vec<Coeff> = Vec::new();
-    let mut best_region = vec![0f32; 32 * 32];
-    let mut resid = vec![0f32; 1024];
-    for &m in &[0usize, 1, 2, 3, 4] {
+    let cands: &[usize] = if speed.reduced_modes() {
+        &[0usize, 1, 2]
+    } else {
+        &[0usize, 1, 2, 3, 4]
+    };
+    let search_lambda = if speed.per_candidate_rdoq() {
+        rdoq_lambda
+    } else {
+        0.0
+    };
+    // Single TU: no intra-leaf feedback, so a mode is fully described by its
+    // (recon, coeffs, cost) and the winner can simply be re-projected with RDOQ.
+    let encode_mode = |recy: &[f32], m: usize, lambda: f64| -> ([f32; 1024], Vec<Coeff>, f64) {
         let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, 0, 0, 0, m, neutral);
+        let mut resid = vec![0f32; 1024];
         for r in 0..32 {
             let base = (sb_y + r) * pw + sb_x;
             for c in 0..32 {
@@ -462,17 +535,31 @@ pub(super) fn encode_luma_leaf_s32x32(
             }
         }
         let mut cost = 0f64;
-        let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, rdoq_lambda);
+        let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
         if m != 0 {
             cost += 6.0;
         }
         let rb = reconstruct_luma(&pblk, &lev, qstep, scan);
+        (rb, levels_to_coeffs(&lev), cost)
+    };
+    let mut best_cost = f64::INFINITY;
+    let mut best_mode = 0usize;
+    let mut best_tu: Vec<Coeff> = Vec::new();
+    let mut best_region = vec![0f32; 32 * 32];
+    for &m in cands {
+        let (rb, tu, cost) = encode_mode(recy, m, search_lambda);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;
-            best_tu = levels_to_coeffs(&lev);
+            best_tu = tu;
             best_region.copy_from_slice(&rb);
         }
+    }
+    if !speed.per_candidate_rdoq() && rdoq_lambda > 0.0 {
+        // Winner-only RDOQ: re-project the chosen mode with real RDOQ.
+        let (rb, tu, _) = encode_mode(recy, best_mode, rdoq_lambda);
+        best_tu = tu;
+        best_region.copy_from_slice(&rb);
     }
     put_block(recy, pw, sb_y, sb_x, 32, &best_region);
     (best_tu, best_mode)
