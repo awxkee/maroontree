@@ -134,6 +134,7 @@ impl Av2Encoder {
                         qc,
                         self.tune.rdoq_lambda,
                         self.speed,
+                        self.bit_depth as i32,
                     );
                     let (skip_cdfs, dc_sign_ctxs) =
                         sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
@@ -147,7 +148,8 @@ impl Av2Encoder {
                         12276,
                     );
                     let (cy, cx) = (sb_y, sb_x / 2);
-                    let predu = dc_pred_rect(&recu, pcw, cy, cx, 32, 64, neutral);
+                    let predu =
+                        dc_pred_rect(&recu, pcw, cy, cx, 32, 64, neutral, self.bit_depth as i32);
                     let levu = bases.chroma422.project_scan(
                         &get_residual_rect(&up, pcw, cy, cx, 32, 64, predu),
                         0.0,
@@ -168,9 +170,11 @@ impl Av2Encoder {
                             32,
                             64,
                             &bases.chroma422,
+                            self.bit_depth as i32,
                         ),
                     );
-                    let predv = dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral);
+                    let predv =
+                        dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral, self.bit_depth as i32);
                     let levv = bases.chroma422.project_scan(
                         &get_residual_rect(&vp, pcw, cy, cx, 32, 64, predv),
                         0.0,
@@ -191,6 +195,7 @@ impl Av2Encoder {
                             32,
                             64,
                             &bases.chroma422,
+                            self.bit_depth as i32,
                         ),
                     );
                     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
@@ -275,6 +280,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -315,6 +321,7 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (16, 8) => {
@@ -333,6 +340,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_64x32(
                                 &tus2, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
@@ -367,6 +375,7 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (8, 16) => {
@@ -385,6 +394,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0), (32, 0)],
@@ -428,6 +438,7 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (8, 8) => {
@@ -446,6 +457,7 @@ impl Av2Encoder {
                                 qc,
                                 self.tune.rdoq_lambda,
                                 self.speed,
+                                self.bit_depth as i32,
                             );
                             let (skip2, dcs2) = sb_tu_contexts_pos(
                                 &[(0, 0)],
@@ -489,12 +501,22 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (4, 16) => {
                             // Right-edge 16×64 luma leaf → 4:2:2 chroma 8×64 (TX_8X64,
                             // coeff 8×32, SCAN8X32, eob 256, skip class 3).
-                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 64, neutral);
+                            let pred = dc_pred_rect(
+                                &recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                64,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let lev = bases.luma16x64.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 64, pred),
                                 0.0,
@@ -507,7 +529,15 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &bases.luma16x64.reconstruct_scan(pred, &lev, &SCAN16X32),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN16X32,
+                                    16,
+                                    64,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
@@ -541,12 +571,22 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (16, 4) => {
                             // Bottom-edge 64×16 luma leaf → 4:2:2 chroma 32×16 (TX_32X16,
                             // coeff 32×16, SCAN32X16, eob 512, skip class 3).
-                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 64, 16, neutral);
+                            let pred = dc_pred_rect(
+                                &recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                64,
+                                16,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let lev = bases.luma64x16.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 64, 16, pred),
                                 0.0,
@@ -559,7 +599,15 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &bases.luma64x16.reconstruct_scan(pred, &lev, &SCAN32X16),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN32X16,
+                                    64,
+                                    16,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
@@ -593,6 +641,7 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (4, 4) => {
@@ -601,7 +650,16 @@ impl Av2Encoder {
                             // tx_type RD-chosen among DCT_DCT / ADST_ADST / ADST_DCT /
                             // DCT_ADST (EXT_NEW_TX_SET, DC mode); 4:2:2 chroma 8×16 stays
                             // DCT (tx_type is luma-only).
-                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 16, neutral);
+                            let pred = dc_pred_rect(
+                                &recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                16,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let resid = get_residual_rect(&yp, pw, sb_y, sb_x, 16, 16, pred);
                             let pred_flat = [pred; 256];
                             let mut src16 = [0f32; 256];
@@ -629,13 +687,23 @@ impl Av2Encoder {
                             // DCT_DCT candidate (idx 0).
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                             let rec_dct = crate::av2::itx422::reconstruct_luma16(
-                                &pred_flat, &lev_dct, qstep_i, &SCAN16,
+                                &pred_flat,
+                                &lev_dct,
+                                qstep_i,
+                                &SCAN16,
+                                self.bit_depth as i32,
                             );
                             let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
                             // ADST_ADST candidate (idx 1, DST-VII both axes).
                             let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = crate::av2::itx422::reconstruct_luma16_adst(
-                                &pred_flat, &lev_adst, qstep_i, &SCAN16, true, true,
+                                &pred_flat,
+                                &lev_adst,
+                                qstep_i,
+                                &SCAN16,
+                                true,
+                                true,
+                                self.bit_depth as i32,
                             );
                             let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
                             // ADST_DCT candidate (idx 2: ADST vertical, DCT horizontal →
@@ -643,7 +711,13 @@ impl Av2Encoder {
                             let lev_ad =
                                 bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
                             let rec_ad = crate::av2::itx422::reconstruct_luma16_adst(
-                                &pred_flat, &lev_ad, qstep_i, &SCAN16, false, true,
+                                &pred_flat,
+                                &lev_ad,
+                                qstep_i,
+                                &SCAN16,
+                                false,
+                                true,
+                                self.bit_depth as i32,
                             );
                             let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
                             // DCT_ADST candidate (idx 3: DCT vertical, ADST horizontal →
@@ -651,7 +725,13 @@ impl Av2Encoder {
                             let lev_da =
                                 bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_da = crate::av2::itx422::reconstruct_luma16_adst(
-                                &pred_flat, &lev_da, qstep_i, &SCAN16, true, false,
+                                &pred_flat,
+                                &lev_da,
+                                qstep_i,
+                                &SCAN16,
+                                true,
+                                false,
+                                self.bit_depth as i32,
                             );
                             let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
                             // Strict-improvement tie-break (DCT_DCT default).
@@ -710,12 +790,22 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (2, 8) => {
                             // Right-edge 8×32 DC-only luma leaf → 4:2:2 chroma 4×32
                             // (TX_4X32, coeff 4×32, SCAN4X32, eob 128 NO-ESCAPE, class 2).
-                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 8, 32, neutral);
+                            let pred = dc_pred_rect(
+                                &recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                8,
+                                32,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let mut lev = bases.luma8x32.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 8, 32, pred),
                                 0.0,
@@ -731,7 +821,15 @@ impl Av2Encoder {
                                 sb_x,
                                 8,
                                 32,
-                                &bases.luma8x32.reconstruct_scan(pred, &lev, &SCAN8X32),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN8X32,
+                                    8,
+                                    32,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let dc_level = lev[0] as i32;
                             let tu: Vec<Coeff> = if dc_level != 0 {
@@ -773,12 +871,22 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         (8, 2) => {
                             // Bottom-edge 32×8 DC-only luma leaf → 4:2:2 chroma 16×8
                             // (TX_16X8, coeff 16×8, SCAN16X8, eob 128 NO-ESCAPE, class 2).
-                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 32, 8, neutral);
+                            let pred = dc_pred_rect(
+                                &recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                32,
+                                8,
+                                neutral,
+                                self.bit_depth as i32,
+                            );
                             let mut lev = bases.luma32x8.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 32, 8, pred),
                                 0.0,
@@ -794,7 +902,15 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &bases.luma32x8.reconstruct_scan(pred, &lev, &SCAN32X8),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN32X8,
+                                    32,
+                                    8,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let dc_level = lev[0] as i32;
                             let tu: Vec<Coeff> = if dc_level != 0 {
@@ -836,6 +952,7 @@ impl Av2Encoder {
                                     qstep: qstep_i,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
+                                self.bit_depth as i32,
                             )
                         }
                         other => unreachable!("unsupported native 4:2:2 leaf {:?}", other),

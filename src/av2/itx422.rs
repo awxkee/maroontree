@@ -82,6 +82,83 @@ fn idct_line_n(src: &[i32], n: usize, shift: i32, lo: i32, hi: i32) -> [i32; 32]
     dst
 }
 
+/// avm chroma/DC-leaf tx_scale: `0` when `log2(w)+log2(h) <= 8`, else `(sum-7)/2`.
+/// Validated against every `reconstruct_chroma_rect` size and the luma tx_scales.
+fn dc_tx_scale(w: usize, h: usize) -> i32 {
+    let s = (w.trailing_zeros() + h.trailing_zeros()) as i32;
+    if s <= 8 { 0 } else { (s - 7) / 2 }
+}
+
+fn dc_tx_index(w: usize, h: usize) -> usize {
+    use crate::av2::av2_itx::tx_size::*;
+    match (w, h) {
+        (4, 4) => TX_4X4,
+        (8, 8) => TX_8X8,
+        (16, 16) => TX_16X16,
+        (32, 32) => TX_32X32,
+        (64, 64) => TX_64X64,
+        (4, 8) => RTX_4X8,
+        (8, 4) => RTX_8X4,
+        (8, 16) => RTX_8X16,
+        (16, 8) => RTX_16X8,
+        (16, 32) => RTX_16X32,
+        (32, 16) => RTX_32X16,
+        (32, 64) => RTX_32X64,
+        (64, 32) => RTX_64X32,
+        (4, 16) => RTX_4X16,
+        (16, 4) => RTX_16X4,
+        (8, 32) => RTX_8X32,
+        (32, 8) => RTX_32X8,
+        (16, 64) => RTX_16X64,
+        (64, 16) => RTX_64X16,
+        (4, 32) => RTX_4X32,
+        (32, 4) => RTX_32X4,
+        (8, 64) => RTX_8X64,
+        (64, 8) => RTX_64X8,
+        (4, 64) => RTX_4X64,
+        (64, 4) => RTX_64X4,
+        _ => unreachable!("unsupported chroma/DC tx {w}x{h}"),
+    }
+}
+
+/// Integer DC-prediction inverse transform shared by chroma (all subsampling formats)
+/// and the scalar-DC-pred luma rect/16 leaves. Routes through the ported dav2d driver
+/// (`inv_txfm_add`), so it is bit-exact with avmdec and bit-depth correct (`bd`),
+/// replacing the float `Basis::reconstruct[_scan]` path whose synthesis drifts. `pred`
+/// is the scalar DC prediction; `lev` the scan-ordered quantised levels; `(w,h)` the
+/// transform geometry (coefficient region capped at 32; the driver handles 64-upsample).
+pub(crate) fn reconstruct_chroma(
+    pred: f32,
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    bd: i32,
+) -> Vec<f32> {
+    let (cw, ch) = (w.min(32), h.min(32));
+    let txs = dc_tx_scale(w, h);
+    let tx = dc_tx_index(w, h);
+    // Dequantize scan-ordered levels directly into dav2d's transposed coeff
+    // layout (`coeff[col*ch + row]`), skipping the intermediate grid + transpose.
+    let mut coeff = vec![0i32; cw * ch];
+    for (k, &l) in lev.iter().enumerate() {
+        if l != 0.0 {
+            let rc = scan[k] as usize;
+            let (col, row) = (rc >> 5, rc & 31);
+            let li = l as i64;
+            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
+            let dqmag = (rounded >> txs) as i32;
+            coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
+        }
+    }
+    let p = pred.round() as i32;
+    let mut out = vec![0f32; w * h];
+    crate::av2::av2_itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| p);
+    out
+}
+
 /// Bit-exact 4:2:2 chroma reconstruction for ANY rectangular chroma TX, matching
 /// avm's `inv_txfm_c` exactly (`av2/common/idct.c`): optional NewSqrt2 pre-scale when
 /// log2(w)+log2(h) is odd, horizontal pass (shift `inv_tx_shift[tx][0]`), vertical pass
@@ -437,25 +514,32 @@ pub(crate) fn reconstruct_luma16_adst(
     scan: &[u16],
     row_adst: bool,
     col_adst: bool,
+    bd: i32,
 ) -> [f32; 256] {
-    let mut dq = [0i32; 256];
+    let mut coeff = [0i32; 256];
     for k in 0..256 {
         let l = lev[k];
         if l != 0.0 {
             let rc = scan[k] as usize;
-            let (c, a) = (rc & 31, rc >> 5);
+            let (col, row) = (rc >> 5, rc & 31);
             let li = l as i64;
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = rounded as i32;
-            dq[c * 16 + a] = if li < 0 { -dqmag } else { dqmag };
+            coeff[col * 16 + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let res = inv_tx_16x16_adst(&dq, row_adst, col_adst);
+    // txtp = hor | (ver << 5); hor = row transform, ver = col transform. ADST=2, DCT=0.
+    let txtp = (if row_adst { 2 } else { 0 }) | ((if col_adst { 2 } else { 0 }) << 5);
     let mut out = [0f32; 256];
-    for i in 0..256 {
-        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
-    }
+    crate::av2::av2_itx::inv_txfm_recon_f32(
+        &mut out,
+        &coeff,
+        txtp,
+        crate::av2::av2_itx::tx_size::TX_16X16,
+        bd,
+        |i| (pred[i] + 0.5) as i32,
+    );
     out
 }
 
@@ -493,25 +577,32 @@ pub(crate) fn reconstruct_luma16(
     lev: &[f32],
     qstep: i32,
     scan: &[u16],
+    bd: i32,
 ) -> [f32; 256] {
-    let mut dq = [0i32; 256];
+    // Dequantize directly into the transposed coeff layout (`coeff[col*sh + row]`).
+    let mut coeff = [0i32; 256];
     for k in 0..256 {
         let l = lev[k];
         if l != 0.0 {
             let rc = scan[k] as usize;
-            let (c, a) = (rc & 31, rc >> 5);
+            let (col, row) = (rc >> 5, rc & 31);
             let li = l as i64;
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
-            let dqmag = rounded as i32; // >> tx_scale (TX_16X16 => 0)
-            dq[c * 16 + a] = if li < 0 { -dqmag } else { dqmag };
+            let dqmag = rounded as i32; // tx_scale(TX_16X16)=0
+            coeff[col * 16 + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let res = inv_tx_16x16_8bit(&dq);
+    // DCT_DCT (txtp 0), TX_16X16 — fused reconstruct (add pred + clip + cast in one pass).
     let mut out = [0f32; 256];
-    for i in 0..256 {
-        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
-    }
+    crate::av2::av2_itx::inv_txfm_recon_f32(
+        &mut out,
+        &coeff,
+        0,
+        crate::av2::av2_itx::tx_size::TX_16X16,
+        bd,
+        |i| (pred[i] + 0.5) as i32,
+    );
     out
 }
 
@@ -528,9 +619,10 @@ pub(crate) fn reconstruct_luma_64x16(
     lev: &[f32],
     qstep: i32,
     scan: &[u16],
+    bd: i32,
 ) -> [f32; 1024] {
     let (cw, h) = (32usize, 16usize); // clamped transform width, height
-    let mut block = vec![0i32; h * cw];
+    let mut coeff = vec![0i32; cw * h];
     for (k, &l) in lev.iter().enumerate() {
         if l != 0.0 {
             let rc = scan[k] as usize;
@@ -539,38 +631,18 @@ pub(crate) fn reconstruct_luma_64x16(
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> 1) as i32; // tx_scale(TX_64X16)=1
-            block[row * cw + col] = if li < 0 { -dqmag } else { dqmag };
-        }
-    }
-    let mut tmp = vec![0i32; h * cw];
-    for row in 0..h {
-        let o = idct_line_n(
-            &block[row * cw..row * cw + cw],
-            cw,
-            6,
-            -(1 << 15),
-            (1 << 15) - 1,
-        );
-        for col in 0..cw {
-            tmp[col * h + row] = o[col];
-        }
-    }
-    for col in 0..cw {
-        let o = idct_line_n(&tmp[col * h..col * h + h], h, 13, -(1 << 8), (1 << 8) - 1);
-        for row in 0..h {
-            block[row * cw + col] = o[row];
+            coeff[col * h + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
     let mut out = [0f32; 1024];
-    for row in 0..h {
-        for col in 0..cw {
-            let i0 = row * 64 + 2 * col;
-            let i1 = row * 64 + 2 * col + 1;
-            let r = block[row * cw + col];
-            out[i0] = i32::clamp((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
-            out[i1] = i32::clamp((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
-        }
-    }
+    crate::av2::av2_itx::inv_txfm_recon_f32(
+        &mut out,
+        &coeff,
+        0,
+        crate::av2::av2_itx::tx_size::RTX_64X16,
+        bd,
+        |i| (pred[i] + 0.5) as i32,
+    );
     out
 }
 
@@ -579,9 +651,10 @@ pub(crate) fn reconstruct_luma_16x64(
     lev: &[f32],
     qstep: i32,
     scan: &[u16],
+    bd: i32,
 ) -> [f32; 1024] {
     let (w, ch) = (16usize, 32usize);
-    let mut block = vec![0i32; ch * w];
+    let mut coeff = vec![0i32; w * ch];
     for (k, &l) in lev.iter().enumerate() {
         if l != 0.0 {
             let rc = scan[k] as usize;
@@ -590,65 +663,49 @@ pub(crate) fn reconstruct_luma_16x64(
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> 1) as i32; // tx_scale(TX_16X64)=1
-            block[row * w + col] = if li < 0 { -dqmag } else { dqmag };
-        }
-    }
-    let mut tmp = vec![0i32; ch * w];
-    for row in 0..ch {
-        let o = idct_line_n(
-            &block[row * w..row * w + w],
-            w,
-            6,
-            -(1 << 15),
-            (1 << 15) - 1,
-        );
-        for col in 0..w {
-            tmp[col * ch + row] = o[col];
-        }
-    }
-    for col in 0..w {
-        let o = idct_line_n(
-            &tmp[col * ch..col * ch + ch],
-            ch,
-            13,
-            -(1 << 8),
-            (1 << 8) - 1,
-        );
-        for row in 0..ch {
-            block[row * w + col] = o[row];
+            coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
     let mut out = [0f32; 1024];
-    for row in 0..ch {
-        for col in 0..w {
-            let i0 = (2 * row) * w + col;
-            let i1 = (2 * row + 1) * w + col;
-            let r = block[row * w + col];
-            out[i0] = i32::clamp((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
-            out[i1] = i32::clamp((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
-        }
-    }
+    crate::av2::av2_itx::inv_txfm_recon_f32(
+        &mut out,
+        &coeff,
+        0,
+        crate::av2::av2_itx::tx_size::RTX_16X64,
+        bd,
+        |i| (pred[i] + 0.5) as i32,
+    );
     out
 }
 
-pub(crate) fn reconstruct_luma(pred: &[f32], lev: &[f32], qstep: i32, scan: &[u16]) -> [f32; 1024] {
-    let mut dq = [0i32; 1024];
+pub(crate) fn reconstruct_luma(
+    pred: &[f32],
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+    bd: i32,
+) -> [f32; 1024] {
+    let mut coeff = [0i32; 1024];
     for k in 0..1024 {
         let l = lev[k];
         if l != 0.0 {
             let rc = scan[k] as usize;
-            let (c, a) = (rc & 31, rc >> 5);
+            let (col, row) = (rc >> 5, rc & 31);
             let li = l as i64;
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
             let dqmag = (rounded >> 1) as i32; // >> tx_scale (TX_32X32 => 1)
-            dq[c * 32 + a] = if li < 0 { -dqmag } else { dqmag };
+            coeff[col * 32 + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let res = inv_tx_32x32_8bit(&dq);
     let mut out = [0f32; 1024];
-    for i in 0..1024 {
-        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
-    }
+    crate::av2::av2_itx::inv_txfm_recon_f32(
+        &mut out,
+        &coeff,
+        0,
+        crate::av2::av2_itx::tx_size::TX_32X32,
+        bd,
+        |i| (pred[i] + 0.5) as i32,
+    );
     out
 }
