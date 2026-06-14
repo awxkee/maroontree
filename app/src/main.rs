@@ -26,12 +26,12 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 use image::imageops::FilterType;
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
     TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
 };
+use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
 
@@ -50,7 +50,7 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
     let instant = Instant::now();
     // let out = encode_rgb8(
     //     &PlanarImage::from_interleaved_rgb(
@@ -77,18 +77,22 @@ fn main() {
         &img.to_vec(),
     )
     .unwrap();
-    let instant = Instant::now();
     let av2_encoder = Av2Encoder::new(av2_map_quality(53))
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
         .with_cdef(false);
-    let encoded = av2_encoder
-        .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
-        .unwrap();
+    for i in 0..10 {
+        let instant = Instant::now();
+        let encoded = black_box(
+            av2_encoder
+                .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
+                .unwrap(),
+        );
+        println!("encoding time {:?}", instant.elapsed());
+    }
     // let out_obu = encoded.view();
-    println!("encoding time {:?}", instant.elapsed());
     // let path = std::env::args()
     //     .nth(1)
     //     .unwrap_or_else(|| "out10.avif".into());
