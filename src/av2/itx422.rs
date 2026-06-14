@@ -77,7 +77,7 @@ fn idct_line_n(src: &[i32], n: usize, shift: i32, lo: i32, hi: i32) -> [i32; 32]
         for (j, &sv) in src.iter().take(n).enumerate() {
             s += kern(j, m) * sv;
         }
-        *d = clampi((s + add) >> shift, lo, hi);
+        *d = i32::clamp((s + add) >> shift, lo, hi);
     }
     dst
 }
@@ -126,7 +126,7 @@ pub(crate) fn reconstruct_chroma_rect(
     }
     if sqrt2 {
         for v in block.iter_mut() {
-            *v = clampi(
+            *v = i32::clamp(
                 round_shift(*v as i64 * NEW_INV_SQRT2, NEW_SQRT2_BITS),
                 -(1 << 15),
                 (1 << 15) - 1,
@@ -166,7 +166,7 @@ pub(crate) fn reconstruct_chroma_rect(
         let mut out = vec![0f32; w * h];
         for row in 0..ch {
             for col in 0..w {
-                let v = clampi(p + block[row * w + col], 0, 255) as f32;
+                let v = i32::clamp(p + block[row * w + col], 0, 255) as f32;
                 out[(2 * row) * w + col] = v;
                 out[(2 * row + 1) * w + col] = v;
             }
@@ -175,7 +175,7 @@ pub(crate) fn reconstruct_chroma_rect(
     } else {
         let mut out = vec![0f32; w * h];
         for i in 0..w * h {
-            out[i] = clampi(p + block[i], 0, 255) as f32;
+            out[i] = i32::clamp(p + block[i], 0, 255) as f32;
         }
         out
     }
@@ -242,17 +242,6 @@ fn round_shift(v: i64, bit: i64) -> i32 {
     ((v + (1i64 << (bit - 1))) >> bit) as i32
 }
 
-#[inline]
-fn clampi(v: i32, lo: i32, hi: i32) -> i32 {
-    if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
-    }
-}
-
 /// One size-32 inverse DCT line. `src` = 32 inputs; writes 32 outputs.
 /// Equivalent (bit-exact, integer sums are associative) to avm's butterfly:
 /// `dst[m] = clamp((sum_j K32[j*32+m]*src[j] + (1<<(shift-1))) >> shift)`.
@@ -317,8 +306,8 @@ fn idct32_line(src: &[i32; 32], shift: i32, lo: i32, hi: i32) -> [i32; 32] {
     }
     let mut dst = [0i32; 32];
     for kk in 0..16 {
-        dst[kk] = clampi((a[kk] + b[kk] + add) >> shift, lo, hi);
-        dst[kk + 16] = clampi((a[15 - kk] - b[15 - kk] + add) >> shift, lo, hi);
+        dst[kk] = i32::clamp((a[kk] + b[kk] + add) >> shift, lo, hi);
+        dst[kk + 16] = i32::clamp((a[15 - kk] - b[15 - kk] + add) >> shift, lo, hi);
     }
     dst
 }
@@ -391,7 +380,7 @@ fn iadst_line_16(src: &[i32], shift: i32, lo: i32, hi: i32) -> [i32; 16] {
         for (j, &sv) in src.iter().take(16).enumerate() {
             s += ADST16[j * 16 + m] * sv;
         }
-        *d = clampi((s + add) >> shift, lo, hi);
+        *d = i32::clamp((s + add) >> shift, lo, hi);
     }
     dst
 }
@@ -465,7 +454,7 @@ pub(crate) fn reconstruct_luma16_adst(
     let res = inv_tx_16x16_adst(&dq, row_adst, col_adst);
     let mut out = [0f32; 256];
     for i in 0..256 {
-        out[i] = clampi((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
+        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
     }
     out
 }
@@ -521,7 +510,7 @@ pub(crate) fn reconstruct_luma16(
     let res = inv_tx_16x16_8bit(&dq);
     let mut out = [0f32; 256];
     for i in 0..256 {
-        out[i] = clampi((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
+        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
     }
     out
 }
@@ -578,8 +567,8 @@ pub(crate) fn reconstruct_luma_64x16(
             let i0 = row * 64 + 2 * col;
             let i1 = row * 64 + 2 * col + 1;
             let r = block[row * cw + col];
-            out[i0] = clampi((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
-            out[i1] = clampi((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
+            out[i0] = i32::clamp((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
+            out[i1] = i32::clamp((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
         }
     }
     out
@@ -635,8 +624,8 @@ pub(crate) fn reconstruct_luma_16x64(
             let i0 = (2 * row) * w + col;
             let i1 = (2 * row + 1) * w + col;
             let r = block[row * w + col];
-            out[i0] = clampi((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
-            out[i1] = clampi((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
+            out[i0] = i32::clamp((pred[i0] + 0.5) as i32 + r, 0, 255) as f32;
+            out[i1] = i32::clamp((pred[i1] + 0.5) as i32 + r, 0, 255) as f32;
         }
     }
     out
@@ -659,7 +648,7 @@ pub(crate) fn reconstruct_luma(pred: &[f32], lev: &[f32], qstep: i32, scan: &[u1
     let res = inv_tx_32x32_8bit(&dq);
     let mut out = [0f32; 1024];
     for i in 0..1024 {
-        out[i] = clampi((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
+        out[i] = i32::clamp((pred[i] + 0.5) as i32 + res[i], 0, 255) as f32;
     }
     out
 }
