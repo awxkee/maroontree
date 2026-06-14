@@ -29,6 +29,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recon_422_chroma(
     pred: f32,
     lev: &[f32],
@@ -76,10 +77,7 @@ pub(super) struct ChromaNeighbors {
     pub(super) vl: i32,
 }
 
-/// Codes the half-width 4:2:2 chroma TU (U then V) co-located with one luma leaf,
-/// returning `(u_present, v_present)`. `cw`/`ch` are chroma pixel dims; `cx = luma_x/2`,
-/// `cy = luma_y`. Projection/reconstruction are analytical (validity-only). The U skip
-/// uses the leaf's class-indexed txb-skip row; V uses the shared cross-component row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn code_422_chroma_tu(
     enc: &mut RangeEncoder,
     planes: ChromaPlanes,

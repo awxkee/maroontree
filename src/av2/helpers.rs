@@ -370,6 +370,7 @@ pub(crate) fn put_block(plane: &mut [f32], w: usize, y0: usize, x0: usize, bs: u
     }
 }
 /// DC prediction for a `bw`-wide × `bh`-tall block (4:2:2 chroma is 32×64).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dc_pred_rect(
     rec: &[f32],
     w: usize,
