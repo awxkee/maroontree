@@ -90,6 +90,16 @@ impl I32x8 {
             hi: vminq_s32(vmaxq_s32(self.hi, min), max),
         }
     }
+
+    /// Lane-wise negate (for the `-(...)` rotation terms in inv_dct32).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn neg(self) -> I32x8 {
+        I32x8 {
+            lo: vnegq_s32(self.lo),
+            hi: vnegq_s32(self.hi),
+        }
+    }
 }
 
 #[inline]
@@ -438,4 +448,368 @@ pub(crate) fn idct_dequant_16x16_neon(levels: &[i32; 256], dequant: &IdctDequant
         }
     }
     unsafe { out.assume_init() }
+}
+
+/// Dequant 4 levels with `dq_shift = 1` (TX_32X32):
+/// `coeff = sign(lvl) * min(((|lvl|*q) & 0xff_ffff) >> 1, cf_max + (lvl<0))`.
+#[inline]
+#[target_feature(enable = "neon")]
+fn dequant4_dq1(lvl: int32x4_t, q: int32x4_t, cf_max: int32x4_t) -> int32x4_t {
+    let absl = vabsq_s32(lvl);
+    let mask = vdupq_n_s64(0xff_ffff);
+    let plo = vandq_s64(vmull_s32(vget_low_s32(absl), vget_low_s32(q)), mask);
+    let phi = vandq_s64(vmull_s32(vget_high_s32(absl), vget_high_s32(q)), mask);
+    // masked <= 0xff_ffff (non-negative) so >>1 and the narrow are exact.
+    let masked = vshrq_n_s32(vcombine_s32(vmovn_s64(plo), vmovn_s64(phi)), 1);
+    let neg1 = vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(lvl), 31));
+    let cap = vaddq_s32(cf_max, neg1);
+    let mag = vminq_s32(masked, cap);
+    let neg = vnegq_s32(mag);
+    let signmask = vcltq_s32(lvl, vdupq_n_s32(0));
+    vbslq_s32(signmask, neg, mag)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct32_v(c: &mut [I32x8; 32], min: i32, max: i32) {
+    let mn = vdupq_n_s32(min);
+    let mx = vdupq_n_s32(max);
+    let clip = |v: I32x8| v.clip(mn, mx);
+
+    // even half: inv_dct16 on the 16 even-indexed vectors -> e[0..16] = t0..t15
+    let mut e: [I32x8; 16] = std::array::from_fn(|i| c[2 * i]);
+    inv_dct16_v(&mut e, min, max);
+
+    // odd inputs (read before any write-back)
+    let (in1, in3, in5, in7) = (c[1], c[3], c[5], c[7]);
+    let (in9, in11, in13, in15) = (c[9], c[11], c[13], c[15]);
+    let (in17, in19, in21, in23) = (c[17], c[19], c[21], c[23]);
+    let (in25, in27, in29, in31) = (c[25], c[27], c[29], c[31]);
+
+    // stage 1
+    let mut t16a = in1
+        .muli(201)
+        .sub(in31.muli(4091 - 4096))
+        .rsh::<12>(2048)
+        .sub(in31);
+    let mut t17a = in17
+        .muli(3035 - 4096)
+        .sub(in15.muli(2751))
+        .rsh::<12>(2048)
+        .add(in17);
+    let mut t18a = in9
+        .muli(1751)
+        .sub(in23.muli(3703 - 4096))
+        .rsh::<12>(2048)
+        .sub(in23);
+    let mut t19a = in25
+        .muli(3857 - 4096)
+        .sub(in7.muli(1380))
+        .rsh::<12>(2048)
+        .add(in25);
+    let mut t20a = in5
+        .muli(995)
+        .sub(in27.muli(3973 - 4096))
+        .rsh::<12>(2048)
+        .sub(in27);
+    let mut t21a = in21
+        .muli(3513 - 4096)
+        .sub(in11.muli(2106))
+        .rsh::<12>(2048)
+        .add(in21);
+    let mut t22a = in13.muli(1220).sub(in19.muli(1645)).rsh::<11>(1024);
+    let mut t23a = in29
+        .muli(4052 - 4096)
+        .sub(in3.muli(601))
+        .rsh::<12>(2048)
+        .add(in29);
+    let mut t24a = in29
+        .muli(601)
+        .add(in3.muli(4052 - 4096))
+        .rsh::<12>(2048)
+        .add(in3);
+    let mut t25a = in13.muli(1645).add(in19.muli(1220)).rsh::<11>(1024);
+    let mut t26a = in21
+        .muli(2106)
+        .add(in11.muli(3513 - 4096))
+        .rsh::<12>(2048)
+        .add(in11);
+    let mut t27a = in5
+        .muli(3973 - 4096)
+        .add(in27.muli(995))
+        .rsh::<12>(2048)
+        .add(in5);
+    let mut t28a = in25
+        .muli(1380)
+        .add(in7.muli(3857 - 4096))
+        .rsh::<12>(2048)
+        .add(in7);
+    let mut t29a = in9
+        .muli(3703 - 4096)
+        .add(in23.muli(1751))
+        .rsh::<12>(2048)
+        .add(in9);
+    let mut t30a = in17
+        .muli(2751)
+        .add(in15.muli(3035 - 4096))
+        .rsh::<12>(2048)
+        .add(in15);
+    let mut t31a = in1
+        .muli(4091 - 4096)
+        .add(in31.muli(201))
+        .rsh::<12>(2048)
+        .add(in1);
+
+    // stage 2
+    let mut t16 = clip(t16a.add(t17a));
+    let mut t17 = clip(t16a.sub(t17a));
+    let mut t18 = clip(t19a.sub(t18a));
+    let mut t19 = clip(t19a.add(t18a));
+    let mut t20 = clip(t20a.add(t21a));
+    let mut t21 = clip(t20a.sub(t21a));
+    let mut t22 = clip(t23a.sub(t22a));
+    let mut t23 = clip(t23a.add(t22a));
+    let mut t24 = clip(t24a.add(t25a));
+    let mut t25 = clip(t24a.sub(t25a));
+    let mut t26 = clip(t27a.sub(t26a));
+    let mut t27 = clip(t27a.add(t26a));
+    let mut t28 = clip(t28a.add(t29a));
+    let mut t29 = clip(t28a.sub(t29a));
+    let mut t30 = clip(t31a.sub(t30a));
+    let mut t31 = clip(t31a.add(t30a));
+
+    // stage 3
+    t17a = t30
+        .muli(799)
+        .sub(t17.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .sub(t17);
+    t30a = t30
+        .muli(4017 - 4096)
+        .add(t17.muli(799))
+        .rsh::<12>(2048)
+        .add(t30);
+    t18a = t29
+        .muli(4017 - 4096)
+        .add(t18.muli(799))
+        .neg()
+        .rsh::<12>(2048)
+        .sub(t29);
+    t29a = t29
+        .muli(799)
+        .sub(t18.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .sub(t18);
+    t21a = t26.muli(1703).sub(t21.muli(1138)).rsh::<11>(1024);
+    t26a = t26.muli(1138).add(t21.muli(1703)).rsh::<11>(1024);
+    t22a = t25.muli(1138).add(t22.muli(1703)).neg().rsh::<11>(1024);
+    t25a = t25.muli(1703).sub(t22.muli(1138)).rsh::<11>(1024);
+
+    // stage 4
+    t16a = clip(t16.add(t19));
+    t17 = clip(t17a.add(t18a));
+    t18 = clip(t17a.sub(t18a));
+    t19a = clip(t16.sub(t19));
+    t20a = clip(t23.sub(t20));
+    t21 = clip(t22a.sub(t21a));
+    t22 = clip(t22a.add(t21a));
+    t23a = clip(t23.add(t20));
+    t24a = clip(t24.add(t27));
+    t25 = clip(t25a.add(t26a));
+    t26 = clip(t25a.sub(t26a));
+    t27a = clip(t24.sub(t27));
+    t28a = clip(t31.sub(t28));
+    t29 = clip(t30a.sub(t29a));
+    t30 = clip(t30a.add(t29a));
+    t31a = clip(t31.add(t28));
+
+    // stage 5
+    t18a = t29
+        .muli(1567)
+        .sub(t18.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t18);
+    t29a = t29
+        .muli(3784 - 4096)
+        .add(t18.muli(1567))
+        .rsh::<12>(2048)
+        .add(t29);
+    t19 = t28a
+        .muli(1567)
+        .sub(t19a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t19a);
+    t28 = t28a
+        .muli(3784 - 4096)
+        .add(t19a.muli(1567))
+        .rsh::<12>(2048)
+        .add(t28a);
+    t20 = t27a
+        .muli(3784 - 4096)
+        .add(t20a.muli(1567))
+        .neg()
+        .rsh::<12>(2048)
+        .sub(t27a);
+    t27 = t27a
+        .muli(1567)
+        .sub(t20a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t20a);
+    t21a = t26
+        .muli(3784 - 4096)
+        .add(t21.muli(1567))
+        .neg()
+        .rsh::<12>(2048)
+        .sub(t26);
+    t26a = t26
+        .muli(1567)
+        .sub(t21.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t21);
+
+    // stage 6
+    t16 = clip(t16a.add(t23a));
+    t17a = clip(t17.add(t22));
+    t18 = clip(t18a.add(t21a));
+    t19a = clip(t19.add(t20));
+    t20a = clip(t19.sub(t20));
+    t21 = clip(t18a.sub(t21a));
+    t22a = clip(t17.sub(t22));
+    t23 = clip(t16a.sub(t23a));
+    t24 = clip(t31a.sub(t24a));
+    t25a = clip(t30.sub(t25));
+    t26 = clip(t29a.sub(t26a));
+    t27a = clip(t28.sub(t27));
+    t28a = clip(t28.add(t27));
+    t29 = clip(t29a.add(t26a));
+    t30a = clip(t30.add(t25));
+    t31 = clip(t31a.add(t24a));
+
+    // stage 7 (181/256 rotations)
+    t20 = t27a.sub(t20a).muli(181).rsh::<8>(128);
+    t27 = t27a.add(t20a).muli(181).rsh::<8>(128);
+    t21a = t26.sub(t21).muli(181).rsh::<8>(128);
+    t26a = t26.add(t21).muli(181).rsh::<8>(128);
+    t22 = t25a.sub(t22a).muli(181).rsh::<8>(128);
+    t25 = t25a.add(t22a).muli(181).rsh::<8>(128);
+    t23a = t24.sub(t23).muli(181).rsh::<8>(128);
+    t24a = t24.add(t23).muli(181).rsh::<8>(128);
+
+    // combine with even outputs e[0..16] (= scalar t0..t15)
+    c[0] = clip(e[0].add(t31));
+    c[1] = clip(e[1].add(t30a));
+    c[2] = clip(e[2].add(t29));
+    c[3] = clip(e[3].add(t28a));
+    c[4] = clip(e[4].add(t27));
+    c[5] = clip(e[5].add(t26a));
+    c[6] = clip(e[6].add(t25));
+    c[7] = clip(e[7].add(t24a));
+    c[8] = clip(e[8].add(t23a));
+    c[9] = clip(e[9].add(t22));
+    c[10] = clip(e[10].add(t21a));
+    c[11] = clip(e[11].add(t20));
+    c[12] = clip(e[12].add(t19a));
+    c[13] = clip(e[13].add(t18));
+    c[14] = clip(e[14].add(t17a));
+    c[15] = clip(e[15].add(t16));
+    c[16] = clip(e[15].sub(t16));
+    c[17] = clip(e[14].sub(t17a));
+    c[18] = clip(e[13].sub(t18));
+    c[19] = clip(e[12].sub(t19a));
+    c[20] = clip(e[11].sub(t20));
+    c[21] = clip(e[10].sub(t21a));
+    c[22] = clip(e[9].sub(t22));
+    c[23] = clip(e[8].sub(t23a));
+    c[24] = clip(e[7].sub(t24a));
+    c[25] = clip(e[6].sub(t25));
+    c[26] = clip(e[5].sub(t26a));
+    c[27] = clip(e[4].sub(t27));
+    c[28] = clip(e[3].sub(t28a));
+    c[29] = clip(e[2].sub(t29));
+    c[30] = clip(e[1].sub(t30a));
+    c[31] = clip(e[0].sub(t31));
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn idct_dequant_32x32_neon(levels: &[i32; 1024], dequant: &IdctDequant) -> [i32; 1024] {
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
+
+    let cfm = vdupq_n_s32(cf_max);
+    let q_dc = vsetq_lane_s32(dc_q, vdupq_n_s32(ac_q), 0);
+    let q_ac = vdupq_n_s32(ac_q);
+    let mut coeff = [0i32; 1024];
+    unsafe {
+        vst1q_s32(
+            coeff.as_mut_ptr(),
+            dequant4_dq1(vld1q_s32(levels.as_ptr()), q_dc, cfm),
+        );
+        let mut i = 4;
+        while i < 1024 {
+            let l = vld1q_s32(levels.as_ptr().add(i));
+            vst1q_s32(coeff.as_mut_ptr().add(i), dequant4_dq1(l, q_ac, cfm));
+            i += 4;
+        }
+    }
+
+    let cmn = vdupq_n_s32(cmin);
+    let cmx = vdupq_n_s32(cmax);
+
+    let mut scratch_u = MaybeUninit::<[i32; 1024]>::uninit();
+    for yg in (0..32).step_by(8) {
+        // cols[x].lane[yl] = coeff[x*32 + yg + yl]  (== tmp[(yg+yl)*32 + x] = coeff[(yg+yl)+x*32])
+        let mut cols: [I32x8; 32] = std::array::from_fn(|x| unsafe {
+            I32x8 {
+                lo: vld1q_s32(coeff.as_ptr().add(x * 32 + yg)),
+                hi: vld1q_s32(coeff.as_ptr().add(x * 32 + yg + 4)),
+            }
+        });
+        inv_dct32_v(&mut cols, rmin, rmax);
+        for (x, cv) in cols.iter().enumerate() {
+            let r = cv.rsh::<2>(2).clip(cmn, cmx);
+            unsafe {
+                let scratch_ptr = scratch_u.as_mut_ptr() as *mut i32;
+                vst1q_s32(scratch_ptr.add(x * 32 + yg), r.lo);
+                vst1q_s32(scratch_ptr.add(x * 32 + yg + 4), r.hi);
+            }
+        }
+    }
+
+    let scratch = unsafe { scratch_u.assume_init() };
+
+    let mut out_u = MaybeUninit::<[i32; 1024]>::uninit();
+    for xg in (0..32).step_by(8) {
+        // Build rows2[y].lane[xl] = clipped[y][xg+xl] via four load8 + transpose blocks.
+        let mut rows2 = [I32x8 {
+            lo: vdupq_n_s32(0),
+            hi: vdupq_n_s32(0),
+        }; 32];
+        for yg2 in (0..32).step_by(8) {
+            // seg[v].lane[j] = scratch[(xg+v)*32 + yg2 + j] = clipped[yg2+j][xg+v]
+            let mut seg: [I32x8; 8] = std::array::from_fn(|v| unsafe {
+                I32x8 {
+                    lo: vld1q_s32(scratch.as_ptr().add((xg + v) * 32 + yg2)),
+                    hi: vld1q_s32(scratch.as_ptr().add((xg + v) * 32 + yg2 + 4)),
+                }
+            });
+            transpose_8x8(&mut seg); // seg[j].lane[v] = clipped[yg2+j][xg+v]
+            rows2[yg2..yg2 + 8].copy_from_slice(&seg);
+        }
+        inv_dct32_v(&mut rows2, cmin, cmax);
+        for (y, rv) in rows2.iter().enumerate() {
+            let r = rv.rsh::<4>(8);
+            unsafe {
+                let out_ptr = out_u.as_mut_ptr() as *mut i32;
+                vst1q_s32(out_ptr.add(y * 32 + xg), r.lo);
+                vst1q_s32(out_ptr.add(y * 32 + xg + 4), r.hi);
+            }
+        }
+    }
+    unsafe { out_u.assume_init() }
 }
