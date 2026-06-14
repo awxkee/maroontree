@@ -50,48 +50,49 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
-    let instant = Instant::now();
-    // let out = encode_rgb8(
-    //     &PlanarImage::from_interleaved_rgb(
-    //         img.width() as usize,
-    //         img.height() as usize,
-    //         BitDepth::Eight,
-    //         &img,
-    //     )
-    //     .unwrap(),
-    //     &EncodeConfig::new()
-    //         .with_quality(60)
-    //         .with_cicp(Cicp::srgb_ycbcr())
-    //         .with_chroma(ChromaFormat::Yuv420)
-    //         .with_speed(Speed::Fast)
-    //         .with_threads(1),
+    // let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    // let planar_rgb = PlanarImage::from_interleaved_rgb(
+    //     img.width() as usize,
+    //     img.height() as usize,
+    //     BitDepth::Eight,
+    //     &img,
     // )
     // .unwrap();
-    // println!("encoding time {:?}", instant.elapsed());
+    // for i in 0..10 {
+    //     let instant = Instant::now();
+    //     let out = encode_rgb8(
+    //         &planar_rgb,
+    //         &EncodeConfig::new()
+    //             .with_quality(60)
+    //             .with_cicp(Cicp::srgb_ycbcr())
+    //             .with_chroma(ChromaFormat::Yuv420)
+    //             .with_speed(Speed::Slow)
+    //             .with_threads(1),
+    //     )
+    //     .unwrap();
+    //     println!("encoding time {:?}", instant.elapsed());
+    // }
     // let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
-    let pimg = PlanarImage::from_interleaved_rgb(
-        img.width() as usize,
-        img.height() as usize,
-        BitDepth::Eight,
-        &img.to_vec(),
-    )
-    .unwrap();
-    let av2_encoder = Av2Encoder::new(av2_map_quality(53))
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay)
-        .with_rdoq_lambda(0.09)
-        .with_speed(Speed::Fast)
-        .with_cdef(false);
-    for i in 0..10 {
-        let instant = Instant::now();
-        let encoded = black_box(
-            av2_encoder
-                .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
-                .unwrap(),
-        );
-        println!("encoding time {:?}", instant.elapsed());
-    }
+    // let pimg = PlanarImage::from_interleaved_rgb(
+    //     img.width() as usize,
+    //     img.height() as usize,
+    //     BitDepth::Eight,
+    //     &img.to_vec(),
+    // )
+    // .unwrap();
+    // let av2_encoder = Av2Encoder::new(av2_map_quality(53))
+    //     .with_tiles(8, 8)
+    //     .with_txpart(TxPart::ThreeWay)
+    //     .with_rdoq_lambda(0.09)
+    //     .with_speed(Speed::Fast)
+    //     .with_cdef(false);
+    // let instant = Instant::now();
+    // let encoded = black_box(
+    //     av2_encoder
+    //         .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
+    //         .unwrap(),
+    // );
+    // println!("encoding time {:?}", instant.elapsed());
     // let out_obu = encoded.view();
     // let path = std::env::args()
     //     .nth(1)
