@@ -834,6 +834,12 @@ pub(crate) trait Lane: Copy {
     fn add(self, o: Self) -> Self;
     fn sub(self, o: Self) -> Self;
     fn mul_n(self, k: i32) -> Self;
+    /// Fused multiply-accumulate: `self + x * k`. Default routes through
+    /// `mul_n`/`add`; the NEON lane overrides it with a single MLA instruction.
+    #[inline]
+    fn mul_add_n(self, x: Self, k: i32) -> Self {
+        self.add(x.mul_n(k))
+    }
     fn from4(a: [i32; 4]) -> Self;
     fn to4(self) -> [i32; 4];
     fn zero() -> Self;
@@ -847,7 +853,7 @@ fn g_dot<V: Lane>(mat: &[i8], v: &[V]) -> V {
     let (&m0, &x0) = it.next().expect("dot: empty row");
     let mut acc = x0.mul_n(m0 as i32);
     for (&m, &x) in it {
-        acc = acc.add(x.mul_n(m as i32));
+        acc = acc.mul_add_n(x, m as i32);
     }
     acc
 }
@@ -908,7 +914,7 @@ fn g_dct16<V: Lane>(c: &mut [V]) {
         let mut acc = V::zero();
         let mut j = 1;
         while j < 16 {
-            acc = acc.add(s[j].mul_n(k(j, m)));
+            acc = acc.mul_add_n(s[j], k(j, m));
             j += 2;
         }
         *bm = acc;
@@ -918,18 +924,18 @@ fn g_dct16<V: Lane>(c: &mut [V]) {
         let mut acc = V::zero();
         let mut j = 2;
         while j < 16 {
-            acc = acc.add(s[j].mul_n(k(j, m)));
+            acc = acc.mul_add_n(s[j], k(j, m));
             j += 4;
         }
         *dm = acc;
     }
     let f = [
-        s[4].mul_n(k(4, 0)).add(s[12].mul_n(k(12, 0))),
-        s[4].mul_n(k(4, 1)).add(s[12].mul_n(k(12, 1))),
+        s[4].mul_n(k(4, 0)).mul_add_n(s[12], k(12, 0)),
+        s[4].mul_n(k(4, 1)).mul_add_n(s[12], k(12, 1)),
     ];
     let g = [
-        s[0].mul_n(k(0, 0)).add(s[8].mul_n(k(8, 0))),
-        s[0].mul_n(k(0, 1)).add(s[8].mul_n(k(8, 1))),
+        s[0].mul_n(k(0, 0)).mul_add_n(s[8], k(8, 0)),
+        s[0].mul_n(k(0, 1)).mul_add_n(s[8], k(8, 1)),
     ];
     let mut cc = [V::zero(); 4];
     for kk in 0..2 {
@@ -958,7 +964,7 @@ fn g_dct32<V: Lane>(c: &mut [V]) {
         let mut acc = V::zero();
         let mut j = 1;
         while j < 32 {
-            acc = acc.add(s[j].mul_n(k(j, m)));
+            acc = acc.mul_add_n(s[j], k(j, m));
             j += 2;
         }
         *bm = acc;
@@ -968,7 +974,7 @@ fn g_dct32<V: Lane>(c: &mut [V]) {
         let mut acc = V::zero();
         let mut j = 2;
         while j < 32 {
-            acc = acc.add(s[j].mul_n(k(j, m)));
+            acc = acc.mul_add_n(s[j], k(j, m));
             j += 4;
         }
         *dm = acc;
@@ -977,17 +983,17 @@ fn g_dct32<V: Lane>(c: &mut [V]) {
     for (m, fm) in f.iter_mut().enumerate() {
         *fm = s[4]
             .mul_n(k(4, m))
-            .add(s[12].mul_n(k(12, m)))
-            .add(s[20].mul_n(k(20, m)))
-            .add(s[28].mul_n(k(28, m)));
+            .mul_add_n(s[12], k(12, m))
+            .mul_add_n(s[20], k(20, m))
+            .mul_add_n(s[28], k(28, m));
     }
     let h = [
-        s[8].mul_n(k(8, 0)).add(s[24].mul_n(k(24, 0))),
-        s[8].mul_n(k(8, 1)).add(s[24].mul_n(k(24, 1))),
+        s[8].mul_n(k(8, 0)).mul_add_n(s[24], k(24, 0)),
+        s[8].mul_n(k(8, 1)).mul_add_n(s[24], k(24, 1)),
     ];
     let g = [
-        s[0].mul_n(k(0, 0)).add(s[16].mul_n(k(16, 0))),
-        s[0].mul_n(k(0, 1)).add(s[16].mul_n(k(16, 1))),
+        s[0].mul_n(k(0, 0)).mul_add_n(s[16], k(16, 0)),
+        s[0].mul_n(k(0, 1)).mul_add_n(s[16], k(16, 1)),
     ];
     let e = [
         g[0].add(h[0]),
@@ -1171,6 +1177,11 @@ mod neon_lane {
         #[inline]
         fn mul_n(self, k: i32) -> N4 {
             unsafe { N4(vmulq_s32(self.0, vdupq_n_s32(k))) }
+        }
+        #[inline]
+        fn mul_add_n(self, x: N4, k: i32) -> N4 {
+            // Fused multiply-accumulate: self + x*k in a single MLA.
+            unsafe { N4(vmlaq_s32(self.0, x.0, vdupq_n_s32(k))) }
         }
         #[inline]
         fn from4(a: [i32; 4]) -> N4 {
