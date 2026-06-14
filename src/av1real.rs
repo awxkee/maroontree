@@ -3896,13 +3896,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     (bytes, recon, (w8, h8, cw8, ch8))
 }
 
-/// Encode a **monochrome** (single luma plane) AV1 still — the form AVIF uses
-/// for an alpha auxiliary image. `luma` is the `w*h` grayscale plane (e.g. the
-/// alpha channel). `full_range` sets `color_range` (alpha is normally full
-/// range). `base_q_idx` controls quality (use a small value, or the lossless
-/// path, for exact alpha). `threads`: `0` = all cores, `1` = serial, `N` = up to
-/// N (tiles are subdivided toward the thread count, exactly like the color
-/// encoders, so large alpha planes tile and parallelise too).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_av1_mono_image(
     base_q_idx: u8,
     bd: u8,
@@ -3918,10 +3912,8 @@ pub(crate) fn encode_av1_mono_image(
     bytes
 }
 
-/// Debug variant of [`encode_av1_mono_image`] also returning the encoder's
-/// reconstruction (luma, `w8*h8`) and the padded dimensions, for bit-exactness
-/// checks against a decoder.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_av1_mono_image_recon_dbg(
     base_q_idx: u8,
     bd: u8,

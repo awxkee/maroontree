@@ -52,7 +52,8 @@ pub(crate) fn encode_av2(
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
         .with_cicp(Cicp::srgb_ycbcr())
-        .with_threads(args.threads);
+        .with_threads(args.threads)
+        .with_speed(args.speed.to_maroontreee());
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());

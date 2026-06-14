@@ -103,7 +103,8 @@ fn prepare(
     Ok(
         Av2Encoder::with_bit_depth(av2_map_quality(cfg.quality), bit_depth.bits())
             .with_tiles(8, 8)
-            .with_txpart(TxPart::ThreeWay),
+            .with_txpart(TxPart::ThreeWay)
+            .with_speed(cfg.speed),
     )
 }
 
@@ -126,7 +127,8 @@ fn prepare_lossless_capable(
     };
     Ok(Av2Encoder::with_bit_depth(q, bit_depth.bits())
         .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay))
+        .with_txpart(TxPart::ThreeWay)
+        .with_speed(cfg.speed))
 }
 
 #[inline]

@@ -69,37 +69,38 @@ fn main() {
     )
     .unwrap();
     println!("encoding time {:?}", instant.elapsed());
-    // let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
-    // let pimg = PlanarImage::from_interleaved_rgb(
-    //     img.width() as usize,
-    //     img.height() as usize,
-    //     BitDepth::Eight,
-    //     &img.to_vec(),
-    // )
-    // .unwrap();
-    // let instant = Instant::now();
-    // let av2_encoder = Av2Encoder::new(av2_map_quality(53))
-    //     .with_tiles(8, 8)
-    //     .with_txpart(TxPart::ThreeWay)
-    //     .with_rdoq_lambda(0.09)
-    //     .with_cdef(false);
-    // let encoded = av2_encoder
-    //     .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
-    //     .unwrap();
-    // let out_obu = encoded.view();
-    // println!("encoding time {:?}", instant.elapsed());
+    let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
+    let pimg = PlanarImage::from_interleaved_rgb(
+        img.width() as usize,
+        img.height() as usize,
+        BitDepth::Eight,
+        &img.to_vec(),
+    )
+    .unwrap();
+    let instant = Instant::now();
+    let av2_encoder = Av2Encoder::new(av2_map_quality(53))
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay)
+        .with_rdoq_lambda(0.09)
+        .with_speed(Speed::Fast)
+        .with_cdef(false);
+    let encoded = av2_encoder
+        .encode_image_444(&pimg, &Cicp::srgb_ycbcr(), 1)
+        .unwrap();
+    let out_obu = encoded.view();
+    println!("encoding time {:?}", instant.elapsed());
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "out10.avif".into());
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(&out).unwrap();
     eprintln!("wrote {} bytes to {}", out.len(), path);
-    //
-    // let path = std::env::args()
-    //     .nth(1)
-    //     .unwrap_or_else(|| "out10_av2.obu".into());
-    // let mut f = std::fs::File::create(&path).unwrap();
-    // f.write_all(&out_obu).unwrap();
+
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "out10_av2.obu".into());
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&out_obu).unwrap();
     //
     // let encoded_avif_av2 =
     //     Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
