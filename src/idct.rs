@@ -420,13 +420,41 @@ pub(crate) fn inv_dct16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[15 * s] = clip(t0 - t15a);
 }
 
-/// Reconstruct a 16x16 residual from quantized levels via dav1d's EXACT integer
-/// inverse (TX_16X16 DCT_DCT, 8-bit). dq_shift = max(0, ctx-2) = 0 for TX_16X16
-/// (same as TX_8X8); 2D shift = 2 (`inv_txfm_pub(crate) fn16(16,16,2)`): row inv_dct16,
-/// (t+2)>>2 clip int16, col inv_dct16, (t+8)>>4.
 pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    static DEQUANT_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
+    let f = DEQUANT_16X16.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                use crate::neon::idct_dequant_16x16_neon;
+                return idct_dequant_16x16_neon;
+            }
+        }
+        idct_dequant_16x16_scalar
+    });
+    let dequant = IdctDequant {
+        dc_q,
+        ac_q,
+        rmax,
+        rmin,
+        cmin,
+        cmax,
+        cf_max,
+    };
+    unsafe { f(levels, &dequant) }
+}
+
+pub(crate) fn idct_dequant_16x16_scalar(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 256];
     for rc in 0..256 {
         let lvl = levels[rc];
