@@ -98,9 +98,9 @@ fn rdoq_truncate_eob(lev: &mut [f32], prm: &[f32], t: f32) {
 #[inline]
 fn dot8(x: &[f32], y: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
-    for (a, b) in x.chunks_exact(8).zip(y.chunks_exact(8)) {
+    for (a, b) in x.as_chunks::<8>().0.iter().zip(y.as_chunks::<8>().0.iter()) {
         for j in 0..8 {
-            acc[j] += a[j] * b[j];
+            acc[j] = fmla(a[j], b[j], acc[j]);
         }
     }
     ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
@@ -788,4 +788,28 @@ pub(crate) fn default_bases() -> Bases {
 pub(crate) fn load_bases(path: &str) -> Bases {
     let b = std::fs::read(path).unwrap_or_else(|_| panic!("cannot read bases file {path}"));
     parse_bases(&b)
+}
+
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "fma"
+    ),
+    target_arch = "aarch64"
+))]
+#[inline(always)]
+pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
+    f32::mul_add(a, b, c)
+}
+
+#[cfg(not(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "fma"
+    ),
+    target_arch = "aarch64"
+)))]
+#[inline(always)]
+pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
+    a * b + c
 }
