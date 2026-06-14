@@ -386,7 +386,7 @@ pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
             // orthonormal*8 scale by 1/2; matches scalar `mul_q16(_, 32768)`.
             let na = d_a[u].shr::<1>();
             let nb = d_b[u].shr::<1>();
-            let mut dst_ptr = out.as_mut_ptr() as *mut i32;
+            let dst_ptr = out.as_mut_ptr() as *mut i32;
             let base = dst_ptr.add(u * 16);
             vst1q_s32(base, na.lo);
             vst1q_s32(base.add(4), na.hi);
