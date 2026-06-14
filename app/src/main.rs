@@ -86,15 +86,15 @@ fn main() {
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
         .with_cdef(false);
-    for i in 0..10 {
+    // for i in 0..10 {
         let instant = Instant::now();
         let encoded = black_box(
             av2_encoder
                 .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
                 .unwrap(),
         );
-        println!("encoding time {:?}", instant.elapsed());
-    }
+    //     println!("encoding time {:?}", instant.elapsed());
+    // }
     // let out_obu = encoded.view();
     // let path = std::env::args()
     //     .nth(1)
@@ -109,11 +109,11 @@ fn main() {
     // let mut f = std::fs::File::create(&path).unwrap();
     // f.write_all(&out_obu).unwrap();
     //
-    // let encoded_avif_av2 =
-    //     Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
-    // let path = std::env::args()
-    //     .nth(1)
-    //     .unwrap_or_else(|| "out10_avif.avif".into());
-    // let mut f = std::fs::File::create(&path).unwrap();
-    // f.write_all(&encoded_avif_av2).unwrap();
+    let encoded_avif_av2 =
+        Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "out10_avif.avif".into());
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&encoded_avif_av2).unwrap();
 }

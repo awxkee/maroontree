@@ -26,7 +26,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use std::mem::MaybeUninit;
 
 /// avm chroma/DC-leaf tx_scale: `0` when `log2(w)+log2(h) <= 8`, else `(sum-7)/2`.
 /// Validated against every `reconstruct_chroma_rect` size and the luma tx_scales.
@@ -253,7 +252,9 @@ pub(crate) fn reconstruct_luma_16x64(
     bd: i32,
 ) -> [f32; 1024] {
     let ch = 32usize;
-    let mut coeff_u = MaybeUninit::<[i32; 512]>::uninit();
+    // Zero-initialize: the inverse transform reads the full coefficient block,
+    // so every uncoded (zero) coefficient position must be 0, not stack garbage.
+    let mut coeff = [0i32; 512];
     for (&l, &rc) in lev[..512].iter().zip(scan[..512].iter()) {
         if l != 0.0 {
             let (col, row) = (rc as usize >> 5, rc as usize & 31);
@@ -261,15 +262,9 @@ pub(crate) fn reconstruct_luma_16x64(
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> 1) as i32; // tx_scale(TX_16X64)=1
-            let dst_ptr = coeff_u.as_mut_ptr() as *mut i32;
-            unsafe {
-                dst_ptr
-                    .add(col * ch + row)
-                    .write(if li < 0 { -dqmag } else { dqmag });
-            }
+            coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let coeff = unsafe { coeff_u.assume_init() };
     let mut out = [0f32; 1024];
     crate::av2::av2_itx::inv_txfm_recon_f32(
         &mut out,
@@ -289,7 +284,9 @@ pub(crate) fn reconstruct_luma(
     scan: &[u16],
     bd: i32,
 ) -> [f32; 1024] {
-    let mut coeff_u = MaybeUninit::<[i32; 1024]>::uninit();
+    // Zero-initialize: the inverse transform reads the full coefficient block,
+    // so every uncoded (zero) coefficient position must be 0, not stack garbage.
+    let mut coeff = [0i32; 1024];
     for (&l, &rc) in lev[..1024].iter().zip(scan[..1024].iter()) {
         if l != 0.0 {
             let (col, row) = (rc as usize >> 5, rc as usize & 31);
@@ -297,14 +294,9 @@ pub(crate) fn reconstruct_luma(
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
             let dqmag = (rounded >> 1) as i32; // >> tx_scale (TX_32X32 => 1)
-            let ptr = coeff_u.as_mut_ptr() as *mut i32;
-            unsafe {
-                ptr.add(col * 32 + row)
-                    .write(if li < 0 { -dqmag } else { dqmag });
-            }
+            coeff[col * 32 + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let coeff = unsafe { coeff_u.assume_init() };
     let mut out = [0f32; 1024];
     crate::av2::av2_itx::inv_txfm_recon_f32(
         &mut out,
