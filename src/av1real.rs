@@ -3036,16 +3036,17 @@ pub(crate) fn align8(n: usize) -> usize {
 /// Pad a `w`×`h` plane to `w8`×`h8` (≥ originals) by replicating the last
 /// in-frame row/column. AV1's coded block grid is always 8-pixel aligned
 /// (`MiCols = ((w+7)>>3)<<1`), so frames whose dimensions are not multiples of 8
-/// are coded on the padded grid and the decoder crops back to the signalled
+/// are coded on the padded grid and the decoder crops back to the signaled
 /// frame size. Edge replication keeps the (cropped-away) padding cheap to code.
 pub(crate) fn pad_to_mult8<T: Copy>(src: &[T], w: usize, h: usize, w8: usize, h8: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(w8 * h8);
-    for y in 0..h8 {
-        let sy = y.min(h - 1);
-        let row = &src[sy * w..sy * w + w];
-        for x in 0..w8 {
-            out.push(row[x.min(w - 1)]);
-        }
+    for y in 0..h {
+        let row = &src[y * w..y * w + w];
+        out.extend_from_slice(row);
+        out.resize(out.len() + (w8 - w), row[w - 1]);
+    }
+    for _ in h..h8 {
+        out.extend_from_within((h - 1) * w8..h * w8);
     }
     out
 }
