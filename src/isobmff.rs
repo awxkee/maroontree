@@ -804,7 +804,7 @@ mod tests {
             }
             i += 1;
         }
-        let ipma = b.windows(4).position(|w| w == b"ipma").unwrap();
+        let ipma = b.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         // fullbox(12) + entry_count(4) + item_ID(2) => association_count byte
         let ac = b[ipma + 8 + 4 + 2]; // fullbox(8..12) + entry_count(4) + item_ID(2)
         (count, nclx, prof, ac)
@@ -830,7 +830,7 @@ mod tests {
         assert!(nclx && prof, "both colr types present");
         assert_eq!(ac, 5, "ipma: ispe,pixi,av1C,nclx,prof");
         // prof payload must contain the ICC bytes verbatim
-        let p = b.windows(4).rposition(|w| w == b"prof").unwrap();
+        let p = b.array_windows::<4>().rposition(|w| w == b"prof").unwrap();
         assert_eq!(&b[p + 4..p + 4 + icc.len()], &icc[..], "ICC bytes embedded");
     }
 
@@ -870,7 +870,7 @@ mod tests {
         let (count, nclx, prof, ac) = colr_summary(&b);
         // Only the prof colr is written; ipma assoc = ispe,pixi,av1C,prof = 4.
         assert_eq!((count, nclx, prof, ac), (1, false, true, 4));
-        let p = b.windows(4).rposition(|w| w == b"prof").unwrap();
+        let p = b.array_windows::<4>().rposition(|w| w == b"prof").unwrap();
         assert_eq!(&b[p + 4..p + 4 + icc.len()], &icc[..], "ICC bytes embedded");
     }
 
@@ -915,7 +915,7 @@ mod tests {
             .count();
         assert_eq!(ncolr, 2, "color item should have nclx + prof");
         // ipma second entry (alpha) must reference av1C at index 6 (shifted from 5)
-        let ipma = b.windows(4).position(|w| w == b"ipma").unwrap();
+        let ipma = b.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         // entry1: item_ID(2) assoc_count(1) + assoc bytes; color assoc =
         // [1,2,0x83,4,5] => count 5. Then entry2 item_ID(2)=2, count(1)=4, assoc...
         let p = ipma + 8 + 4; // -> first entry item_ID
@@ -954,7 +954,7 @@ mod tests {
             ncolr, 0,
             "no colr box when color_meta and icc are both None"
         );
-        let ipma = b.windows(4).position(|w| w == b"ipma").unwrap();
+        let ipma = b.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         let p = ipma + 8 + 4;
         let c_count = b[p + 2] as usize; // color assoc_count = ispe,pixi,av1C = 3
         assert_eq!(c_count, 3, "color: ispe,pixi,av1C (no colr)");
@@ -1008,10 +1008,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            b.windows(4).any(|w| w == b"av01"),
+            b.array_windows::<4>().any(|w| w == b"av01"),
             "av01 item type must be present"
         );
-        assert!(!b.windows(4).any(|w| w == b"hvc1"), "hvc1 must not appear");
+        assert!(
+            !b.array_windows::<4>().any(|w| w == b"hvc1"),
+            "hvc1 must not appear"
+        );
     }
 
     #[test]
@@ -1029,10 +1032,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            b.windows(4).any(|w| w == b"av1C"),
+            b.array_windows::<4>().any(|w| w == b"av1C"),
             "av1C box must be present"
         );
-        assert!(!b.windows(4).any(|w| w == b"hvcC"), "hvcC must not appear");
+        assert!(
+            !b.array_windows::<4>().any(|w| w == b"hvcC"),
+            "hvcC must not appear"
+        );
     }
 
     #[test]
@@ -1051,18 +1057,24 @@ mod tests {
         )
         .unwrap();
         let s = b.as_slice();
-        assert!(s.windows(4).any(|w| w == b"iref"), "iref box required");
         assert!(
-            s.windows(4).any(|w| w == b"auxl"),
+            s.array_windows::<4>().any(|w| w == b"iref"),
+            "iref box required"
+        );
+        assert!(
+            s.array_windows::<4>().any(|w| w == b"auxl"),
             "auxl reference required"
         );
-        assert!(s.windows(4).any(|w| w == b"auxC"), "auxC property required");
+        assert!(
+            s.array_windows::<4>().any(|w| w == b"auxC"),
+            "auxC property required"
+        );
         assert!(
             s.windows(ALPHA_URN.len() - 1)
                 .any(|w| w == &ALPHA_URN[..ALPHA_URN.len() - 1]),
             "AVIF alpha URN must be present"
         );
-        let ipma_pos = s.windows(4).position(|w| w == b"ipma").unwrap();
+        let ipma_pos = s.array_windows::<4>().position(|w| w == b"ipma").unwrap();
         let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
         assert_eq!(entry_count, 2, "ipma must have 2 entries (color + alpha)");
     }
@@ -1095,7 +1107,7 @@ mod tests {
         }
         assert!(mdat_payload_start > 0);
         // Locate the av1 extent_offset in iloc
-        let iloc_pos = b.windows(4).position(|w| w == b"iloc").unwrap() - 4;
+        let iloc_pos = b.array_windows::<4>().position(|w| w == b"iloc").unwrap() - 4;
         // iloc: 8(box) + 4(fullbox) + 2(fields) + 2(item_count) = 16 bytes before first item
         // first item v0: 2(id)+2(ref)+2(cnt) = 6, then extent_offset (4)
         let off_pos = iloc_pos + 16 + 6;

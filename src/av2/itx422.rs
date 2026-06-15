@@ -66,12 +66,6 @@ fn dc_tx_index(w: usize, h: usize) -> usize {
     }
 }
 
-/// Integer DC-prediction inverse transform shared by chroma (all subsampling formats)
-/// and the scalar-DC-pred luma rect/16 leaves. Routes through the ported dav2d driver
-/// (`inv_txfm_add`), so it is bit-exact with avmdec and bit-depth correct (`bd`),
-/// replacing the float `Basis::reconstruct[_scan]` path whose synthesis drifts. `pred`
-/// is the scalar DC prediction; `lev` the scan-ordered quantised levels; `(w,h)` the
-/// transform geometry (coefficient region capped at 32; the driver handles 64-upsample).
 pub(crate) fn reconstruct_chroma(
     pred: f32,
     lev: &[f32],
@@ -103,39 +97,7 @@ pub(crate) fn reconstruct_chroma(
     out
 }
 
-/// Reconstruct a 32x32 luma block bit-exactly: `clip(pred[i] + inv_tx(dequant(lev)))`.
-/// `pred` = per-pixel prediction (1024 samples, row-major); `lev` = scan-ordered
-/// levels; `qstep` = ac/dc dqv; `scan` = the TX_32X32 scan. avm dequant:
-/// `ROUND_POWER_OF_TWO(|lev|*dqv,3) >> tx_scale`, tx_scale=av2_get_tx_scale(TX_32X32)=1,
-/// sign applied last.
-/// avm's inverse 16-pt ADST (DST-VII) kernel `tx_kernel_adst_size16[INV_TXFM]`
-/// (`av2/common/txb_common.c`), row-major `[k][j]`: pixel `j` accumulates
-/// `coeff[k] * ADST16[k*16+j]`. Used for intra TX_16X16 tx_types ADST_ADST /
-/// ADST_DCT / DCT_ADST (DST7 1D); `replace_adst_by_ddt` is false for intra so the
-/// matrix path (not DDTX) applies.
 #[rustfmt::skip]
-pub(crate) static ADST16: [i32; 256] = [
-     8, 17, 25, 33, 41, 48, 55, 62, 67, 73, 77, 81, 84, 87, 88, 89,
-    25, 48, 67, 81, 88, 88, 81, 67, 48, 25,  0,-25,-48,-67,-81,-88,
-    41, 73, 88, 84, 62, 25,-17,-55,-81,-89,-77,-48, -8, 33, 67, 87,
-    55, 87, 81, 41,-17,-67,-89,-73,-25, 33, 77, 88, 62,  8,-48,-84,
-    67, 88, 48,-25,-81,-81,-25, 48, 88, 67,  0,-67,-88,-48, 25, 81,
-    77, 77,  0,-77,-77,  0, 77, 77,  0,-77,-77,  0, 77, 77,  0,-77,
-    84, 55,-48,-87, -8, 81, 62,-41,-88,-17, 77, 67,-33,-89,-25, 73,
-    88, 25,-81,-48, 67, 67,-48,-81, 25, 88,  0,-88,-25, 81, 48,-67,
-    89, -8,-88, 17, 87,-25,-84, 33, 81,-41,-77, 48, 73,-55,-67, 62,
-    87,-41,-67, 73, 33,-88,  8, 84,-48,-62, 77, 25,-89, 17, 81,-55,
-    81,-67,-25, 88,-48,-48, 88,-25,-67, 81,  0,-81, 67, 25,-88, 48,
-    73,-84, 25, 55,-89, 48, 33,-87, 67,  8,-77, 81,-17,-62, 88,-41,
-    62,-89, 67, -8,-55, 88,-73, 17, 48,-87, 77,-25,-41, 84,-81, 33,
-    48,-81, 88,-67, 25, 25,-67, 88,-81, 48,  0,-48, 81,-88, 67,-25,
-    33,-62, 81,-89, 84,-67, 41, -8,-25, 55,-77, 88,-87, 73,-48, 17,
-    17,-33, 48,-62, 73,-81, 87,-89, 88,-84, 77,-67, 55,-41, 25, -8,
-];
-
-/// TX_16X16 luma reconstruction for the ADST family, identical dequant to
-/// [`reconstruct_luma16`] (tx_scale 0) but using the ADST inverse. `row_adst`/
-/// `col_adst` select the per-axis 1D transform (see [`inv_tx_16x16_adst`]).
 pub(crate) fn reconstruct_luma16_adst(
     pred: &[f32],
     lev: &[f32],
@@ -170,9 +132,6 @@ pub(crate) fn reconstruct_luma16_adst(
     out
 }
 
-/// TX_16X16 luma reconstruction with per-pixel prediction. Dequant mirrors
-/// `reconstruct_luma` but `tx_scale = av2_get_tx_scale(TX_16X16) = 0` (256 pels),
-/// then the bit-exact 16×16 DCT_DCT inverse. `scan` is SCAN16 (rc = a*32 + c).
 pub(crate) fn reconstruct_luma16(
     pred: &[f32],
     lev: &[f32],

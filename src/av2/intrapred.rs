@@ -62,10 +62,6 @@ pub(crate) fn paeth(bs: usize, above: &[i32], left: &[i32], corner: i32) -> Vec<
     out
 }
 
-/// dav2d `sm_weights[scale][i] = 32 >> min(6, (i<<2) >> scale)` (AV2/AVM SMOOTH
-/// blend weights). For the square luma blocks used here `scale = (n_pel>=64) +
-/// (n_pel>512)`. Equivalent to the previous `32 >> min(6, (i<<1) >> scale')`
-/// formula for every square size, just expressed as dav2d's lookup table.
 #[rustfmt::skip]
 static SM_WEIGHTS: [[i32; 64]; 3] = [
     [32, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -79,10 +75,6 @@ fn smooth_scale(bs: usize) -> usize {
     (n_pel >= 64) as usize + (n_pel > 512) as usize
 }
 
-/// AV2/AVM SMOOTH: two-axis blend of a vertical gradient (toward bottom-left)
-/// and a horizontal gradient (toward top-right), each refined by the
-/// boundary-weighted MAC `pred += ((sample - pred) * w + 32) >> 6`. Bit-exact to
-/// dav2d `ipred_smooth_c`. `above[bs]` = top-right, `left[bs]` = bottom-left.
 fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     let log2 = blk_size_log2(bs);
     let rnd = (bs as i32) >> 1;
@@ -175,12 +167,6 @@ pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     smooth_h_scalar(bs, above, left)
 }
 
-/// NEON+MAC SMOOTH kernels. Each iteration predicts 4 columns with two fused
-/// multiply-accumulates per axis: `vmlaq_s32(acc, v, vdupq_n_s32(k))` for the
-/// scalar-weighted vertical gradient and top-blend, and `vmlaq_s32(acc, v, w)`
-/// for the per-column left-weight blend, mirroring dav2d's `ipred_smooth*`
-/// arithmetic exactly. Right-shifts use `vshlq_s32` by a negative count (signed
-/// arithmetic shift, matching `>>` on `i32`).
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod neon {
     use super::{SM_WEIGHTS, smooth_scale};

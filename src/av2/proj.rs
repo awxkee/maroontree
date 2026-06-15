@@ -28,31 +28,18 @@
  */
 
 use crate::av2::quant::{BASE_Q, qstep};
-use crate::av2::tables::{
-    SCAN, SCAN4X32, SCAN8X8, SCAN8X16, SCAN8X32, SCAN16, SCAN16X8, SCAN16X32, SCAN32X8, SCAN32X16,
-};
+use std::cell::RefCell;
 
 pub(crate) struct Basis {
-    pub(crate) dc: f32,
-    pub(crate) _n_pix: usize,
-    pub(crate) n_cf: usize,
-    pub(crate) norm2: Vec<f32>,
-    /// Separable 1D profiles, laid out `[freq*side + spatial]` with 32 frequencies.
-    /// The dense 2D basis is `outer(hv[c], hh[a]) / dc`; storing only the 1D axes lets
-    /// project/reconstruct run as two 1D passes (≈10× fewer mults, 4MB matrix → ~8KB).
-    pub(crate) hv: Vec<f32>,
-    pub(crate) side_v: usize,
-    pub(crate) hh: Vec<f32>,
-    pub(crate) side_h: usize,
-    /// Quantiser rescale factor (qstep_target / qstep_measured), applied at run time
-    /// instead of mutating the profiles.
+    /// Quantiser rescale factor (qstep_target / qstep_measured), applied at run time.
     pub(crate) scale: f32,
-    /// Max reconstructed sample value = (1 << bit_depth) - 1. Defaults to 8-bit (255);
-    /// set per-encode from the signalled bit depth.
+    /// Max reconstructed sample value = (1 << bit_depth) - 1. Defaults to 8-bit (255).
     pub(crate) max_val: f32,
+    /// Dequantiser step for the forward-DCT path (set in [`Bases::rescaled_to_q`]).
+    pub(crate) qstep: i32,
+    /// Which avm forward transform this basis uses (DCT size, or 16×16 ADST mix).
+    pub(crate) fwd: crate::av2::fdct::FwdKind,
 }
-
-const NF: usize = 32; // coded frequencies per axis
 
 /// RD end-of-block (EOB) truncation threshold, in unrounded-coefficient-magnitude units.
 ///
@@ -92,18 +79,6 @@ fn rdoq_truncate_eob(lev: &mut [f32], prm: &[f32], t: f32) {
             break; // first coefficient worth keeping: stop
         }
     }
-}
-
-/// 8-lane dot product; autovectorises (slices are always a multiple of 8 long).
-#[inline]
-fn dot8(x: &[f32], y: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    for (a, b) in x.as_chunks::<8>().0.iter().zip(y.as_chunks::<8>().0.iter()) {
-        for j in 0..8 {
-            acc[j] = fmla(a[j], b[j], acc[j]);
-        }
-    }
-    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
 }
 
 pub(crate) struct Bases {
@@ -162,6 +137,17 @@ pub(crate) struct Bases {
     /// 4:2:2 8-family chroma: 8×32 luma→4×32 (TX_4X32) and 32×8 luma→16×8 (TX_16X8).
     pub(crate) c4x32: Basis,
     pub(crate) c16x8: Basis,
+}
+
+/// Thread-local forward-DCT input/output scratch: the i32 residual fed to the
+/// transform and the coded coefficients fed to the quantiser. Reused across blocks.
+struct FwdScratch {
+    resid: Box<[i32; 4096]>,
+    out: Box<[i32; 1024]>,
+}
+thread_local! {
+    static FWD_SCRATCH: RefCell<FwdScratch> =
+        RefCell::new(FwdScratch { resid: Box::new([0; 4096]), out: Box::new([0; 1024])});
 }
 
 impl Basis {
@@ -224,121 +210,93 @@ impl Bases {
             self.c4x32.scale(f);
             self.c16x8.scale(f);
         }
+        let qs = qstep(base_q_idx) as i32;
+        self.luma.qstep = qs;
+        self.chroma420.qstep = qs;
+        self.chroma444.qstep = qs;
+        self.luma16x16.qstep = qs;
+        self.chroma422.qstep = qs;
+        self.chroma444_64x32.qstep = qs;
+        self.luma16x16_adst.qstep = qs;
+        self.luma16x16_adst_dct.qstep = qs;
+        self.luma16x16_dct_adst.qstep = qs;
+        self.luma8x32.qstep = qs;
+        self.luma32x8.qstep = qs;
+        self.luma16x64.qstep = qs;
+        self.luma64x16.qstep = qs;
+        self.c16x32.qstep = qs;
+        self.c8x64.qstep = qs;
+        self.c32x16.qstep = qs;
+        self.c8x16.qstep = qs;
+        self.c8x8.qstep = qs;
+        self.c4x32.qstep = qs;
+        self.c16x8.qstep = qs;
         self
     }
-}
-
-fn need(b: &[u8], o: usize, n: usize, what: &str) {
-    assert!(
-        o.checked_add(n).is_some_and(|e| e <= b.len()),
-        "bases file truncated/mismatched while reading {what}: need {n} bytes at offset {o}, file is {} bytes (is proj.rs in sync with the .bin?)",
-        b.len()
-    );
-}
-fn rd_f32(b: &[u8], o: usize) -> f32 {
-    need(b, o, 4, "f32");
-    f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
-fn rd_u32(b: &[u8], o: usize) -> u32 {
-    need(b, o, 4, "u32");
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
 impl Basis {
     /// Square separable basis. Equivalent to the rectangular builder with the same
     /// profile on both axes (`m[k][py,px] = h[c,py]·h[a,px]/dc`, c=SCAN[k]&31,
     /// a=SCAN[k]>>5).
-    fn from_1d(dc: f32, side: usize, h: &[f32]) -> Basis {
-        Self::from_1d_rect(dc, h, side, h, side)
-    }
-
-    /// Non-square (`side_h` wide × `side_v` tall) separable basis. The coded coefficient
-    /// grid is 32×32 (avm zeroes the long axis' high frequencies and reuses the 32×32
-    /// scan), so scan position k → horizontal frequency `a = SCAN[k] >> 5`, vertical
-    /// frequency `c = SCAN[k] & 31`. Only the per-axis spatial profiles are stored; the
-    /// dense outer product is never materialiszd. `norm2[k]` is computed separably,
-    /// `Σ(hv[c,py]·hh[a,px]/dc)² = (Σ hv[c]²)(Σ hh[a]²)/dc²`.
-    fn from_1d_rect(
-        dc: f32,
-        h_vert: &[f32],
-        side_v: usize,
-        h_horiz: &[f32],
-        side_h: usize,
-    ) -> Basis {
-        let n_pix = side_v * side_h;
-        let n_cf = 1024;
-        let nv: Vec<f32> = (0..NF)
-            .map(|c| {
-                h_vert[c * side_v..c * side_v + side_v]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum()
-            })
-            .collect();
-        let nh: Vec<f32> = (0..NF)
-            .map(|a| {
-                h_horiz[a * side_h..a * side_h + side_h]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum()
-            })
-            .collect();
-        let dc2 = dc * dc;
-        let mut norm2 = vec![0f32; n_cf];
-        for k in 0..n_cf {
-            let rc = SCAN[k] as usize;
-            norm2[k] = nv[rc & 31] * nh[rc >> 5] / dc2;
-        }
+    /// Minimal basis: only the fields the avm forward path needs. `.fwd` is set by
+    /// the caller; `qstep` is overwritten by [`Bases::rescaled_to_q`].
+    fn new() -> Basis {
         Basis {
-            dc,
-            _n_pix: n_pix,
-            n_cf,
-            norm2,
-            hv: h_vert.to_vec(),
-            side_v,
-            hh: h_horiz.to_vec(),
-            side_h,
             scale: 1.0,
             max_val: 255.0,
+            qstep: qstep(BASE_Q) as i32,
+            fwd: crate::av2::fdct::FwdKind::Proj,
         }
     }
 
-    /// Project a residual block (`n_pix` samples, row-major) → integer coefficient
-    /// levels (`n_cf`); |projection| < thresh is dropped. Separable: a horizontal 1D
-    /// transform of each row, then a vertical 1D transform per coefficient.
+    /// avm forward transform for this basis; returns scan-order `(levels, |unquantised|)`.
+    /// Only the unset `Proj` sentinel returns `None` (no basis is left in that state).
+    fn fwd_fast(&self, resid: &[f32], scan: &[u16], thresh: f32) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::av2::fdct::{FwdKind, dc_tx_scale, fdct_rect, fwd16x16, quantize_to_levels};
+        let q = self.qstep;
+        Some(match self.fwd {
+            FwdKind::Proj => return None,
+            // Every DCT_DCT size routes through the one general avm butterfly driver.
+            FwdKind::Dct(w, h) => {
+                let n = w * h;
+                let cw = w.min(32);
+                let factor = (1u32 << (3 + dc_tx_scale(w, h))) as f64;
+                // Thread-local residual + coded-coeff scratch (reused, never re-zeroed).
+                FWD_SCRATCH.with(|cell| {
+                    let s = &mut *cell.borrow_mut();
+                    for (d, &v) in s.resid[..n].iter_mut().zip(resid) {
+                        *d = v.round() as i32;
+                    }
+                    let nc = fdct_rect(&s.resid[..n], w, h, s.out.as_mut_slice());
+                    quantize_to_levels(&s.out[..nc], cw, q, factor, thresh, scan)
+                })
+            }
+            // 16×16 ADST/DCT mixes: fwd16x16(col_adst, row_adst), factor 8.
+            FwdKind::AdstAdst16 | FwdKind::AdstDct16 | FwdKind::DctAdst16 => {
+                let (col_adst, row_adst) = match self.fwd {
+                    FwdKind::AdstAdst16 => (true, true),
+                    FwdKind::AdstDct16 => (true, false), // ADST_DCT: col ADST, row DCT
+                    _ => (false, true),                  // DCT_ADST: col DCT, row ADST
+                };
+                let mut r = [0i32; 256];
+                for (d, &s) in r.iter_mut().zip(resid) {
+                    *d = s.round() as i32;
+                }
+                quantize_to_levels(&fwd16x16(&r, col_adst, row_adst), 16, q, 8.0, thresh, scan)
+            }
+        })
+    }
+
+    /// Forward-transform a residual block (row-major) → integer coefficient levels;
+    /// |coef| < thresh is dropped.
     ///
     /// After quantization an RD end-of-block (EOB) truncation is applied: see
     /// [`rdoq_truncate_eob`].
     pub(crate) fn project(&self, resid: &[f32], thresh: f32) -> Vec<f32> {
-        let (sv, sh) = (self.side_v, self.side_h);
-        // horizontal pass → t[a*sv + py] = Σ_px resid[py,px]·hh[a,px]
-        let mut t = [0f32; NF * 64];
-        for py in 0..sv {
-            let row = &resid[py * sh..py * sh + sh];
-            for a in 0..NF {
-                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
-            }
-        }
-        // vertical pass + quantize. S[c,a] = Σ_py t[a,py]·hv[c,py]; the dense projection
-        // is S/dc, and pr = S/(dc·scale·norm2).
-        let mut lev = vec![0f32; self.n_cf];
-        let mut prm = vec![0f32; self.n_cf];
-        let inv = 1.0 / (self.dc * self.scale);
-        for (k, ((dst, pm), &norm2)) in lev
-            .iter_mut()
-            .zip(prm.iter_mut())
-            .zip(self.norm2.iter())
-            .enumerate()
-        {
-            let rc = SCAN[k] as usize;
-            let (a, c) = (rc >> 5, rc & 31);
-            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
-            let pr = s * inv / norm2;
-            *pm = pr.abs();
-            if pr.abs() >= thresh {
-                *dst = pr.round();
-            }
-        }
+        let (mut lev, prm) = self
+            .fwd_fast(resid, &crate::av2::tables::SCAN, thresh)
+            .expect("every basis carries a forward DCT");
         rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
         lev
     }
@@ -348,110 +306,15 @@ impl Basis {
     /// EOB truncation — trellis RDOQ ([`crate::av2::coder::rdoq_luma`]) consumes
     /// these and does its own level + EOB optimisation.
     pub(crate) fn project_with_prm(&self, resid: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        let (sv, sh) = (self.side_v, self.side_h);
-        let mut t = [0f32; NF * 64];
-        for py in 0..sv {
-            let row = &resid[py * sh..py * sh + sh];
-            for a in 0..NF {
-                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
-            }
-        }
-        let mut lev = vec![0f32; self.n_cf];
-        let mut prm = vec![0f32; self.n_cf];
-        let inv = 1.0 / (self.dc * self.scale);
-        for (k, ((dst, pm), &norm2)) in lev
-            .iter_mut()
-            .zip(prm.iter_mut())
-            .zip(self.norm2.iter())
-            .enumerate()
-        {
-            let rc = SCAN[k] as usize;
-            let (a, c) = (rc >> 5, rc & 31);
-            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
-            let pr = s * inv / norm2;
-            *pm = pr.abs();
-            *dst = pr.round();
-        }
-        (lev, prm)
+        self.fwd_fast(resid, &crate::av2::tables::SCAN, 0.0)
+            .expect("every basis carries a forward DCT")
     }
 
-    /// Build a rectangular basis whose coefficient grid follows `scan` (length =
-    /// number of coded positions), rather than the global 32×32 SCAN. Used by the
-    /// 16-family transforms (TX_16X64 → SCAN16X32, TX_64X16 → SCAN32X16). `norm2`
-    /// is sized to `scan.len()`; otherwise identical to `from_1d_rect`.
-    fn from_1d_rect_scan(
-        dc: f32,
-        h_vert: &[f32],
-        side_v: usize,
-        h_horiz: &[f32],
-        side_h: usize,
-        scan: &[u16],
-    ) -> Basis {
-        let n_pix = side_v * side_h;
-        let nv: Vec<f32> = (0..NF)
-            .map(|c| {
-                h_vert[c * side_v..c * side_v + side_v]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum()
-            })
-            .collect();
-        let nh: Vec<f32> = (0..NF)
-            .map(|a| {
-                h_horiz[a * side_h..a * side_h + side_h]
-                    .iter()
-                    .map(|&x| x * x)
-                    .sum()
-            })
-            .collect();
-        let dc2 = dc * dc;
-        let norm2: Vec<f32> = scan
-            .iter()
-            .map(|&rc| nv[(rc as usize) & 31] * nh[(rc as usize) >> 5] / dc2)
-            .collect();
-        Basis {
-            dc,
-            _n_pix: n_pix,
-            n_cf: scan.len(),
-            norm2,
-            hv: h_vert.to_vec(),
-            side_v,
-            hh: h_horiz.to_vec(),
-            side_h,
-            scale: 1.0,
-            max_val: 255.0,
-        }
-    }
-
-    /// Scan-parameterised projection (see `project`). Iterates `scan` positions
-    /// instead of the global SCAN; `self.norm2` must have been built for the same scan.
+    /// Scan-parameterised forward transform (see `project`).
     pub(crate) fn project_scan(&self, resid: &[f32], thresh: f32, scan: &[u16]) -> Vec<f32> {
-        let (sv, sh) = (self.side_v, self.side_h);
-        let mut t = [0f32; NF * 64];
-        for py in 0..sv {
-            let row = &resid[py * sh..py * sh + sh];
-            for a in 0..NF {
-                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
-            }
-        }
-        let mut lev = vec![0f32; scan.len()];
-        let mut prm = vec![0f32; scan.len()];
-        let inv = 1.0 / (self.dc * self.scale);
-        for (k, ((dst, pm), &norm2)) in lev
-            .iter_mut()
-            .zip(prm.iter_mut())
-            .zip(self.norm2.iter())
-            .enumerate()
-        {
-            let rc = scan[k] as usize;
-            let (a, c) = (rc >> 5, rc & 31);
-            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
-            let pr = s * inv / norm2;
-            *pm = pr.abs();
-            if pr.abs() >= thresh {
-                *dst = pr.round();
-            }
-        }
+        let (mut lev, prm) = self
+            .fwd_fast(resid, scan, thresh)
+            .expect("every basis carries a forward DCT");
         rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
         lev
     }
@@ -463,296 +326,42 @@ impl Basis {
         resid: &[f32],
         scan: &[u16],
     ) -> (Vec<f32>, Vec<f32>) {
-        let (sv, sh) = (self.side_v, self.side_h);
-        let mut t = [0f32; NF * 64];
-        for py in 0..sv {
-            let row = &resid[py * sh..py * sh + sh];
-            for a in 0..NF {
-                t[a * sv + py] = dot8(row, &self.hh[a * sh..a * sh + sh]);
-            }
-        }
-        let mut lev = vec![0f32; scan.len()];
-        let mut prm = vec![0f32; scan.len()];
-        let inv = 1.0 / (self.dc * self.scale);
-        for (k, ((dst, pm), &norm2)) in lev
-            .iter_mut()
-            .zip(prm.iter_mut())
-            .zip(self.norm2.iter())
-            .enumerate()
-        {
-            let rc = scan[k] as usize;
-            let (a, c) = (rc >> 5, rc & 31);
-            let s = dot8(&t[a * sv..a * sv + sv], &self.hv[c * sv..c * sv + sv]);
-            let pr = s * inv / norm2;
-            *pm = pr.abs();
-            *dst = pr.round();
-        }
-        (lev, prm)
-    }
-
-    /// Scan-parameterised reconstruction (see `reconstruct`).
-    pub(crate) fn reconstruct_scan(&self, pred: f32, lev: &[f32], scan: &[u16]) -> Vec<f32> {
-        let (sv, sh) = (self.side_v, self.side_h);
-        let mut s_grid = [0f32; NF * NF];
-        let mut row_nz = [false; NF];
-        for (k, &l) in lev.iter().enumerate() {
-            if l == 0.0 {
-                continue;
-            }
-            let rc = scan[k] as usize;
-            s_grid[(rc & 31) * NF + (rc >> 5)] = l;
-            row_nz[rc & 31] = true;
-        }
-        let mut w = [0f32; NF * 64];
-        for c in 0..NF {
-            if !row_nz[c] {
-                continue;
-            }
-            let wc = &mut w[c * sh..c * sh + sh];
-            for a in 0..NF {
-                let sca = s_grid[c * NF + a];
-                if sca == 0.0 {
-                    continue;
-                }
-                for (o, &b) in wc.iter_mut().zip(&self.hh[a * sh..a * sh + sh]) {
-                    *o += sca * b;
-                }
-            }
-        }
-        let mut out = vec![pred; sv * sh];
-        let g = self.scale / self.dc;
-        for c in 0..NF {
-            if !row_nz[c] {
-                continue;
-            }
-            let wc = &w[c * sh..c * sh + sh];
-            let hvc = &self.hv[c * sv..c * sv + sv];
-            for py in 0..sv {
-                let coef = hvc[py] * g;
-                let orow = &mut out[py * sh..py * sh + sh];
-                for (o, &b) in orow.iter_mut().zip(wc) {
-                    *o += coef * b;
-                }
-            }
-        }
-        let mv = self.max_val;
-        for v in out.iter_mut() {
-            *v = v.round().clamp(0.0, mv);
-        }
-        out
+        self.fwd_fast(resid, scan, 0.0)
+            .expect("every basis carries a forward DCT")
     }
 }
 
 /// The 16 KB 1D bases are embedded directly in the binary, so the default encode
-/// path needs no external file and cannot fail to locate it.
-static EMBEDDED_BASES: &[u8] = include_bytes!("tree_av2_bases.bin");
 
-/// Read one 1D-profile block, returning `(dc, side, profile)`. The dense square basis
-/// is built by the caller via [`Basis::from_1d`]; keeping the raw profile lets us also
-/// assemble the rectangular 4:2:2 basis from the 64- and 32-tap profiles already present.
-fn read_raw(b: &[u8], o: &mut usize) -> (f32, usize, Vec<f32>) {
-    let dc = rd_f32(b, *o);
-    let side = rd_u32(b, *o + 4) as usize;
-    let nfreq = rd_u32(b, *o + 8) as usize;
-    *o += 12;
-    assert_eq!(
-        nfreq, 32,
-        "expected 32 retained frequencies per dimension, got {nfreq} (proj.rs/.bin mismatch?)"
-    );
-    assert!(
-        side == 32 || side == 64,
-        "unexpected transform side {side} (proj.rs/.bin mismatch?)"
-    );
-    let count = nfreq * side;
-    need(b, *o, count * 4, "1D basis profile");
-    let mut h = vec![0f32; count];
-    for v in h.iter_mut() {
-        *v = rd_f32(b, *o);
-        *o += 4;
-    }
-    (dc, side, h)
-}
-
-fn parse_bases(b: &[u8]) -> Bases {
-    assert!(
-        b.len() >= 8 && &b[0..4] == b"SL1D",
-        "bad bases magic (expected SL1D); proj.rs and slimav_bases1d_q120.bin are out of sync"
-    );
-    let nblocks = rd_u32(b, 4);
-    assert!(
-        nblocks >= 3,
-        "bases file needs luma + chroma420 + chroma444 (nblocks={nblocks})"
-    );
-    let mut o = 8usize;
-    let (ldc, lside, lh) = read_raw(b, &mut o);
-    let (c420dc, c420side, c420h) = read_raw(b, &mut o);
-    let (c444dc, c444side, c444h) = read_raw(b, &mut o);
-    debug_assert_eq!(
-        o,
-        b.len(),
-        "bases file not fully consumed: {o} of {}",
-        b.len()
-    );
-    let luma = Basis::from_1d(ldc, lside, &lh);
-    let chroma420 = Basis::from_1d(c420dc, c420side, &c420h);
-    let chroma444 = Basis::from_1d(c444dc, c444side, &c444h);
-    // 4:2:2 = vertical 64-tap profile (from the 64×64 block) × horizontal 32-tap profile
-    // (from the 32×32 block). The amplitude `dc_mix` is the geometric mean of the two
-    // square DC gains, which reproduces avm's rectangular (1/√2-class) normalisation to
-    // first order; verify/tune it against avmdec.
-    assert_eq!(
-        (c444side, c420side),
-        (64, 32),
-        "expected chroma444 side 64 and chroma420 side 32"
-    );
-    let dc_mix = (c420dc * c444dc).sqrt();
-    let chroma422 = Basis::from_1d_rect(dc_mix, &c444h, 64, &c420h, 32);
-    // TX_64X32 (bottom-edge 64×32 leaf) = transpose of 4:2:2: vertical 32-tap,
-    // horizontal 64-tap, same rectangular dc_mix normalisation.
-    let chroma444_64x32 = Basis::from_1d_rect(dc_mix, &c420h, 32, &c444h, 64);
-
-    // --- 16-tap family (residue-4 leaves) ---
-    // Analytical inverse DCT-II profiles scaled to the luma DC sample (lh[0] = ldc),
-    // for BOTH axes, so the rectangular norm2 matches the square luma basis exactly
-    // (norm2 = 1024·ldc² regardless of the axis split). Using the chroma 64-tap here
-    // would inject the chroma quant scale and produce a pathologically dense block.
-    let lh16 = build_dct_profile(16, lh[0]);
-    let lh64 = build_dct_profile(64, lh[0]);
-    let lh32 = build_dct_profile(32, lh[0]);
-    // avm's TX_16X64 inverse is a 32-pt IDCT followed by nearest row-duplication
-    // (32→64), NOT a 64-pt IDCT. The forward basis profile must equal that spatial
-    // response, so the 64-tall vertical profile is the 32-pt profile with each row
-    // duplicated. (Using lh64 here projects onto 64-pt DCT modes the decoder never
-    // inverts → garbage AC; DC happens to agree, which is why DC-only worked.)
-    let mut lh32dup64 = vec![0f32; NF * 64];
-    for c in 0..NF {
-        for py in 0..64 {
-            lh32dup64[c * 64 + py] = lh32[c * 32 + py / 2];
-        }
-    }
-    let luma16x64 = Basis::from_1d_rect_scan(ldc, &lh32dup64, 64, &lh16, 16, &SCAN16X32);
-    let luma64x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32dup64, 64, &SCAN32X16);
-    let luma16x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16, 16, &SCAN16);
-    let lh16_adst = build_adst16_profile(ldc);
-    let luma16x16_adst = Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16_adst, 16, &SCAN16);
-    // ADST_DCT: ADST vertical (h_vert), DCT horizontal (h_horiz).
-    let luma16x16_adst_dct = Basis::from_1d_rect_scan(ldc, &lh16_adst, 16, &lh16, 16, &SCAN16);
-    // DCT_ADST: DCT vertical (h_vert), ADST horizontal (h_horiz).
-    let luma16x16_dct_adst = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh16_adst, 16, &SCAN16);
-    let lh4 = build_dct_profile(4, lh[0]);
-    let lh8 = build_dct_profile(8, lh[0]);
-    let luma8x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh8, 8, &SCAN8X32);
-    let luma32x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh32, 32, &SCAN32X8);
-    let c16x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh16, 16, &SCAN16X32);
-    let c8x64 = Basis::from_1d_rect_scan(ldc, &lh64, 64, &lh8, 8, &SCAN8X32);
-    let c32x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh32, 32, &SCAN32X16);
-    let c8x16 = Basis::from_1d_rect_scan(ldc, &lh16, 16, &lh8, 8, &SCAN8X16);
-    let c8x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh8, 8, &SCAN8X8);
-    let c4x32 = Basis::from_1d_rect_scan(ldc, &lh32, 32, &lh4, 4, &SCAN4X32);
-    let c16x8 = Basis::from_1d_rect_scan(ldc, &lh8, 8, &lh16, 16, &SCAN16X8);
-    Bases {
-        luma,
-        chroma420,
-        chroma422,
-        chroma444,
-        chroma444_64x32,
-        luma16x64,
-        luma64x16,
-        luma16x16,
-        luma16x16_adst,
-        luma16x16_adst_dct,
-        luma16x16_dct_adst,
-        luma8x32,
-        luma32x8,
-        c16x32,
-        c8x64,
-        c32x16,
-        c8x16,
-        c8x8,
-        c4x32,
-        c16x8,
-    }
-}
-
-/// Analytical N-point inverse DCT-II basis profile laid out `[freq*N + spatial]`
-/// for NF frequency slots (only the first N are non-zero). `dc_sample` sets the
-/// DC-row (freq 0) per-sample amplitude so the profile is scaled consistently with
-/// an existing square basis. Used to bootstrap the 16-tap family for bitstream
-/// validity; the exact avm transform can be substituted later for bit-exactness.
-fn build_dct_profile(n: usize, dc_sample: f32) -> Vec<f32> {
-    use core::f32::consts::PI;
-    // Orthonormal DCT-II: e_a[x] = sqrt(2/n)*w(a)*cos(pi*(2x+1)*a/(2n)), w(0)=1/sqrt2.
-    // DC row value = sqrt(2/n)*(1/sqrt2) = sqrt(1/n); scale so it equals dc_sample.
-    let amp = dc_sample / (1.0 / (n as f32)).sqrt();
-    let mut h = vec![0f32; NF * n];
-    // Only the first NF (=32) frequencies are ever coded (the coeff region caps the
-    // long axis at 32), so build at most NF rows; for n=64 the upper 32 freqs are zero.
-    let nf = n.min(NF);
-    for a in 0..nf {
-        let wa = if a == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
-        let k = amp * (2.0 / n as f32).sqrt() * wa;
-        for x in 0..n {
-            h[a * n + x] = k * (PI * (2 * x + 1) as f32 * a as f32 / (2.0 * n as f32)).cos();
-        }
-    }
-    h
-}
-
-/// Forward 16-pt ADST (DST-VII) 1D profile, calibrated to the same gain as
-/// [`build_dct_profile`] so the existing TX_16X16 quant step applies unchanged: each
-/// frequency row is the avm inverse-ADST kernel row (`itx422::ADST16`, the synthesis
-/// basis) renormalised to unit energy and scaled by `amp = dc_sample·sqrt(16)`. Only
-/// the 16 real frequencies are populated; rows 16..NF stay zero.
-fn build_adst16_profile(dc_sample: f32) -> Vec<f32> {
-    let n = 16usize;
-    let amp = dc_sample / (1.0 / (n as f32)).sqrt();
-    let mut h = vec![0f32; NF * n];
-    for k in 0..n {
-        let row = &crate::av2::itx422::ADST16[k * 16..k * 16 + 16];
-        let norm = row
-            .iter()
-            .map(|&v| (v as f32) * (v as f32))
-            .sum::<f32>()
-            .sqrt();
-        for x in 0..n {
-            h[k * n + x] = amp * (row[x] as f32) / norm;
-        }
-    }
-    h
-}
-
-/// Bases compiled into the binary (default).
+/// Build the full transform-basis table. Every basis runs the avm forward DCT/ADST;
+/// `.fwd` selects which, `qstep` is set later by [`Bases::rescaled_to_q`].
 pub(crate) fn default_bases() -> Bases {
-    parse_bases(EMBEDDED_BASES)
-}
-
-/// Override: load bases from an external `SL1D` file (e.g. a different quantizer).
-#[allow(dead_code)]
-pub(crate) fn load_bases(path: &str) -> Bases {
-    let b = std::fs::read(path).unwrap_or_else(|_| panic!("cannot read bases file {path}"));
-    parse_bases(&b)
-}
-
-#[cfg(any(
-    all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "fma"
-    ),
-    target_arch = "aarch64"
-))]
-#[inline(always)]
-pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
-    f32::mul_add(a, b, c)
-}
-
-#[cfg(not(any(
-    all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "fma"
-    ),
-    target_arch = "aarch64"
-)))]
-#[inline(always)]
-pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
-    a * b + c
+    use crate::av2::fdct::FwdKind::*;
+    let mk = |fwd| {
+        let mut b = Basis::new();
+        b.fwd = fwd;
+        b
+    };
+    Bases {
+        luma: mk(Dct(32, 32)),
+        chroma420: mk(Dct(32, 32)),
+        chroma422: mk(Dct(32, 64)),
+        chroma444: mk(Dct(64, 64)),
+        chroma444_64x32: mk(Dct(64, 32)),
+        luma16x64: mk(Dct(16, 64)),
+        luma64x16: mk(Dct(64, 16)),
+        luma16x16: mk(Dct(16, 16)),
+        luma16x16_adst: mk(AdstAdst16),
+        luma16x16_adst_dct: mk(AdstDct16),
+        luma16x16_dct_adst: mk(DctAdst16),
+        luma8x32: mk(Dct(8, 32)),
+        luma32x8: mk(Dct(32, 8)),
+        c16x32: mk(Dct(16, 32)),
+        c8x64: mk(Dct(8, 64)),
+        c32x16: mk(Dct(32, 16)),
+        c8x16: mk(Dct(8, 16)),
+        c8x8: mk(Dct(8, 8)),
+        c4x32: mk(Dct(4, 32)),
+        c16x8: mk(Dct(16, 8)),
+    }
 }

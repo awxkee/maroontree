@@ -171,7 +171,7 @@ pub(crate) fn wrap_av2_image(
 ) -> Vec<u8> {
     let channels = fmt.channels();
     let av2c = build_av2c(fmt, width, height);
-    // Item IDs: colour = 1, alpha = 2 (if present), Exif = next free.
+    // Item IDs: color = 1, alpha = 2 (if present), Exif = next free.
     let has_alpha = alpha.is_some();
     let alpha_id: u16 = 2;
     let exif_id: u16 = if has_alpha { 3 } else { 2 };
@@ -619,11 +619,3 @@ pub(crate) fn to_avif_color_alpha(
         }),
     )
 }
-
-// pub fn to_avif_alpha(enc: &Av2Frame, alpha: &Av2Frame, fmt: &Av2Format) -> Vec<u8> {
-//     to_avif_color_alpha(enc, alpha, fmt, &Av2Color::Cicp(enc.color), None)
-// }
-
-// pub fn to_avif_icc(enc: &Av2Frame, fmt: &Av2Format, icc: Vec<u8>) -> Vec<u8> {
-//     to_avif_color(enc, fmt, &Av2Color::Icc(icc), None)
-// }
