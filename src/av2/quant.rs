@@ -27,13 +27,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! AV2 (avm) quantizer-step lookup for 8-bit.
-//!
-//! avm replaced AV1's separate dc/ac 256-entry tables with one compact 25-entry
-//! base table that doubles every 24 q-indices (`av2/common/quant_common.c`,
-//! `ac_qlookup_QTX` + `qlookup`). With the frame's dc/ac delta-q at 0, the DC and
-//! AC steps are identical, so a single `qstep` drives the whole frame.
-
 static AC_QLOOKUP_QTX: [u32; 25] = [
     64, 40, 41, 43, 44, 45, 47, 48, 49, 51, 52, 54, 55, 57, 59, 60, 62, 64, 66, 68, 70, 72, 74, 76,
     78,

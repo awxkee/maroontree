@@ -546,7 +546,7 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn smooth(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+    pub(super) fn smooth(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
         let (wv, wh) = (sm_weights(bh), sm_weights(bw));
         let (right, bottom) = (top[bw - 1], left[bh - 1]);
         let c256 = vdupq_n_s32(256);

@@ -38,6 +38,7 @@ mod encode420;
 mod encode422;
 mod encode444;
 mod entropy;
+mod fdct;
 mod headers;
 mod helpers;
 mod intrapred;

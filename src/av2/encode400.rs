@@ -237,7 +237,15 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &bases.luma16x64.reconstruct_scan(pred, &lev, &SCAN16X32),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN16X32,
+                                    16,
+                                    64,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
@@ -268,7 +276,15 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &bases.luma64x16.reconstruct_scan(pred, &lev, &SCAN32X16),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN32X16,
+                                    64,
+                                    16,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
@@ -302,7 +318,15 @@ impl Av2Encoder {
                                 sb_x,
                                 8,
                                 32,
-                                &bases.luma8x32.reconstruct_scan(pred, &lev, &SCAN8X32),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN8X32,
+                                    8,
+                                    32,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let dc_level = lev[0] as i32;
                             let tu: Vec<Coeff> = if dc_level != 0 {
@@ -344,7 +368,15 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &bases.luma32x8.reconstruct_scan(pred, &lev, &SCAN32X8),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN32X8,
+                                    32,
+                                    8,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let dc_level = lev[0] as i32;
                             let tu: Vec<Coeff> = if dc_level != 0 {
@@ -386,7 +418,15 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 16,
-                                &bases.luma16x16.reconstruct_scan(pred, &lev, &SCAN16),
+                                &crate::av2::itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    qstep_i,
+                                    &SCAN16,
+                                    16,
+                                    16,
+                                    self.bit_depth as i32,
+                                ),
                             );
                             let dc_level = lev[0] as i32;
                             let tu: Vec<Coeff> = if dc_level != 0 {

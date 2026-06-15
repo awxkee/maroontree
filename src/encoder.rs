@@ -527,15 +527,17 @@ pub fn encode_still_lossy_420<T: Pixel>(
     let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
 
     for row in 0..ch {
-        for c in 0..cw {
+        let cb_r = &mut cb[row * cw..row * cw + cw];
+        let cr_r = &mut cr[row * cw..row * cw + cw];
+        for (c, (cb, cr)) in cb_r.iter_mut().zip(cr_r.iter_mut()).enumerate() {
             let (x0, x1) = (2 * c, (2 * c + 1).min(w - 1));
             let (y0, y1) = (2 * row, (2 * row + 1).min(h - 1));
 
             let avg_q =
                 |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
 
-            cb[row * cw + c] = ((avg_q(&fcb_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
-            cr[row * cw + c] = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+            *cb = ((avg_q(&fcb_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+            *cr = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
         }
     }
     crate::av1real::encode_av1_lossy_image_420(
