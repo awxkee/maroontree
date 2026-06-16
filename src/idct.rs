@@ -352,6 +352,51 @@ pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     tmp
 }
 
+/// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
+/// inverse for TX_8X8 **IDTX** (identity in both dimensions). Same per-size
+/// orchestration as `idct_dequant_8x8` (dequant, transpose, row pass,
+/// `(t+1)>>1` clip, col pass, `(t+8)>>4`); the 1-D kernel is dav1d's
+/// `inv_identity8_1d` which multiplies each lane by 2 with no internal clamp
+/// (`dav1d_inv_identity8_1d_c`). Because the shifts and clip ranges are per
+/// transform-size (not per type), this is bit-identical to dav1d's TX_8X8 IDTX
+/// inverse. Net gain dequant->residual is 1/8 (x2 row, (t+1)>>1; x2 col, (t+8)>>4).
+pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+    let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    // Row pass: identity (x2), no internal clamp, then the per-size (t+1)>>1 clip.
+    for t in tmp.iter_mut() {
+        *t *= 2;
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    // Col pass: identity (x2), then the per-size (t+8)>>4 final shift.
+    for t in tmp.iter_mut() {
+        *t *= 2;
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 /// dav1d-exact integer inverse 16-point DCT (`dav1d_inv_dct16_1d_c`, tx64=0
 /// branch of `inv_dct16_1d_internal_c` in src/itx_1d.c). Operates in place on
 /// `c[0], c[s], .., c[15*s]`. Even positions are handled by `inv_dct8_1d`; the

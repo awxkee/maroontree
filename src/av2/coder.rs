@@ -214,25 +214,34 @@ fn encode_chroma_base_range(enc: &mut RangeEncoder, magnitude: u32, hi_range_ctx
 // ----- shared end-of-block coding ----------------------------------------------
 
 /// Encode the end-of-block position using the given bin/hi-bit CDFs.
-fn encode_eob(enc: &mut RangeEncoder, eob: usize, eob_bin: &[u16], eob_hi_bit: u16, esc_bits: u32) {
+fn encode_eob(
+    enc: &mut RangeEncoder,
+    eob: usize,
+    eob_bin: &[u16],
+    eob_hi_bit: u16,
+    esc_bits: u32,
+    pt_nsyms: usize,
+) {
     if eob <= 1 {
-        enc.encode_symbol(eob_bin, eob, 7);
+        enc.encode_symbol(eob_bin, eob, pt_nsyms);
         return;
     }
     let mut bin = 2usize;
     while (2usize << (bin - 1)) <= eob {
         bin += 1;
     }
-    if bin <= 6 {
-        enc.encode_symbol(eob_bin, bin, 7);
+    if bin < pt_nsyms {
+        enc.encode_symbol(eob_bin, bin, pt_nsyms);
     } else if esc_bits == 0 {
-        // No-escape eob classes (eob_multi64 / eob_multi128): the top eob_pt symbol is
-        // coded directly (decode_eob cases 2/3) with no escape literal. Use the esc
-        // helper purely to extend the stored cdf so symbol 7 has a valid upper boundary.
-        enc.encode_symbol_esc(eob_bin, bin, 7);
+        // No-escape eob classes: the top eob_pt symbol is coded directly (decode_eob
+        // cases 2/3) with no escape literal. The esc helper extends the stored cdf so
+        // the top symbol has a valid upper boundary. `pt_nsyms` is avm's eob symbol
+        // count minus one (off-by-one MIN_PROB convention) and is tx-size dependent:
+        // TX_8X8 (eob_multi_size 2, avm nsym 7) -> 6; TX_16X16+ (avm nsym 8) -> 7.
+        enc.encode_symbol_esc(eob_bin, bin, pt_nsyms);
     } else {
-        enc.encode_symbol_esc(eob_bin, 7, 7);
-        enc.encode_bypass((bin - 7) as u32, esc_bits);
+        enc.encode_symbol_esc(eob_bin, pt_nsyms, pt_nsyms);
+        enc.encode_bypass((bin - pt_nsyms) as u32, esc_bits);
     }
     let extra_bits = bin - 2;
     let hi = (eob >> extra_bits) & 1;
@@ -458,7 +467,7 @@ fn encode_intra_modes(
     has_chroma: bool,
     lossless: bool,
     partition_cdf: Option<u32>,
-    cfl_allowed: bool,
+    _cfl_allowed: bool,
 ) {
     // do_split bool (=0, PARTITION_NONE) with the leaf's per-bsize/context cdf.
     // None for non-partition-point leaves (4x4 / narrow ext blocks), which read
@@ -479,12 +488,37 @@ fn encode_intra_modes(
             // before the chroma mode. 0 = no DPCM.
             enc.encode_bool(16384, 0);
         }
-        // For CfL-allowed chroma blocks (luma <= 32x32 in 4:4:4), avm reads a leading
-        // is_cfl_mode bool from cfl_cdf[cfl_ctx] before the uv-mode symbol. This
-        // encoder never emits CfL, so cfl_ctx is always 0 (no CfL neighbours) and the
-        // bool is 0 (= not CfL): cfl_cdf[0] = 32768 - AVM_CDF2(20441) = 12327.
-        if cfl_allowed {
-            enc.encode_bool(12327, 0);
+        // CfL-allowed chroma blocks read a leading is_cfl bool (avm_read_symbol(cfl_cdf
+        // [ctx], 2)) before the uv-mode symbol. encode_bool is the verified inverse of
+        // avm_read_symbol(.,2). When CfL is chosen (enc.cfl_use): emit is_cfl=1, then
+        // cfl_index=0 (CFL_EXPLICIT), then the joint sign + per-plane magnitudes, and
+        // skip the uv-mode symbol entirely (decoder sets uv_mode = UV_CFL_PRED & returns).
+        // Otherwise emit is_cfl=0 with the neighbour context and fall through to uv-mode.
+        if enc.cfl {
+            let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
+            if enc.cfl_use {
+                enc.encode_bool(isc as u32, 1);
+                enc.encode_bool(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                enc.encode_symbol(&crate::av2::cfl::CFL_SIGN_ICDF, enc.cfl_js as usize, 8);
+                let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
+                let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
+                if su != 0 {
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u],
+                        enc.cfl_mag_u as usize,
+                        8,
+                    );
+                }
+                if sv != 0 {
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v],
+                        enc.cfl_mag_v as usize,
+                        8,
+                    );
+                }
+                return;
+            }
+            enc.encode_bool(isc as u32, 0);
         }
         // intra_uv_mode = 0 (DC chroma); uv_mode_cdf[context=0] (non-directional luma).
         enc.encode_symbol(&[23405, 11811, 9903, 8015, 6357, 4785, 2340], 0, 7);
@@ -629,6 +663,7 @@ pub(crate) fn encode_chroma_block_rect(
         } else {
             2
         },
+        if area == 64 { 6 } else { 7 },
     );
     let plane_offset = if is_u_plane { 0 } else { 4 };
     let stored = encode_chroma_tokens_scan(enc, &nonzero, eob, plane_offset, scan, area);
@@ -673,6 +708,7 @@ pub(crate) fn encode_chroma_block(
         &CHROMA_EOB_BIN_QC[enc.qc],
         CHROMA_EOB_HI_BIT_QC[enc.qc],
         2,
+        7,
     );
     let plane_offset = if is_u_plane { 0 } else { 4 };
     let stored = encode_chroma_tokens(enc, &nonzero, eob, plane_offset);
@@ -863,7 +899,7 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1);
+    encode_eob(enc, eob, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1, 7);
     if eob >= 1 {
         enc.encode_symbol(&INTRA_EXT_TX16, tx_type_idx, 6); // tx_type index
     }
@@ -936,7 +972,7 @@ pub(crate) fn encode_luma_tu32(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB_BIN_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 2);
+    encode_eob(enc, eob, &EOB_BIN_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 2, 7);
     let stored = encode_luma32_tokens(enc, &nonzero, eob);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
@@ -981,6 +1017,7 @@ pub(crate) fn encode_luma_tu_rect(
         } else {
             2
         },
+        if area == 64 { 6 } else { 7 },
     );
     // TX_16X64/TX_64X16 are intra EXT_TX_SET_LONG_SIDE_64 (7 types), so the decoder
     // reads a 4-symbol short_side tx_type when eob count > 1 (i.e. not DC-only). The
@@ -1180,7 +1217,7 @@ pub(crate) fn encode_luma_leaf_dc_class2(
     }
     enc.encode_bool(skip_cdf, 0);
     // eob count 1 (position 0): decoder's dc_skip path skips tx_type + sec_tx_type.
-    encode_eob(enc, 0, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1);
+    encode_eob(enc, 0, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1, 7);
     let mag = dc_level.unsigned_abs();
     if mag <= 4 {
         enc.encode_symbol(&LUMA16_EOB_TOK_LF_QC[enc.qc][0], (mag - 1) as usize, 4);
@@ -1523,19 +1560,19 @@ fn ctx_lf_2d_chroma(levels: &[u8], rc: usize, voff: usize) -> usize {
     let b = pidx(rc);
     let mag =
         levels[b + 1].min(5) as i32 + levels[b + 8].min(5) as i32 + levels[b + 9].min(5) as i32;
-    (((mag + 1) >> 1).min(3)) as usize + voff
+    ((mag + 1) >> 1).min(3) as usize + voff
 }
 fn ctx_2d_chroma(levels: &[u8], rc: usize, voff: usize) -> usize {
     let b = pidx(rc);
     let mag =
         levels[b + 1].min(3) as i32 + levels[b + 8].min(3) as i32 + levels[b + 9].min(3) as i32;
-    (((mag + 1) >> 1).min(3)) as usize + voff
+    ((mag + 1) >> 1).min(3) as usize + voff
 }
 fn br_ctx_2d_chroma(levels: &[u8], rc: usize) -> usize {
     let b = pidx(rc);
     let mag =
         levels[b + 1].min(5) as i32 + levels[b + 8].min(5) as i32 + levels[b + 9].min(5) as i32;
-    (((mag + 1) >> 1).min(3)) as usize
+    ((mag + 1) >> 1).min(3) as usize
 }
 fn encode_br_uv(enc: &mut RangeEncoder, level: u32, ctx: usize) {
     let over = level - 3;

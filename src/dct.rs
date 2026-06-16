@@ -547,6 +547,7 @@ pub(crate) fn dct1d_32_i32(buf: &mut [i32; 32]) {
 }
 
 #[inline]
+#[allow(unused)]
 pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
     pub(crate) type Dct = dyn Fn(&mut [i32; 1024], i32, i32) + Send + Sync;
     static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
@@ -731,6 +732,35 @@ fn dct8x16_coeffs_sel(input: &[i32; 128]) -> [i32; 128] {
 pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
     let coeffs = dct8x8_coeffs_sel(residual);
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+/// Forward TX_8X8 **IDTX** (identity): produce quantized levels + unquantized
+/// targets that pair with `iidentity_dequant_8x8`. The inverse has uniform gain
+/// 1/8 (dequant->residual), so the forward level at raster position `y + x*8`
+/// (the inverse transposes `coeff[y + x*8]` into pixel `(y,x)`) is
+/// `round(residual[y,x] * 8 / q)` with the same full-step dead-zone as
+/// `quant_q16`. Bit-exactness with dav1d is carried entirely by the inverse;
+/// this only decides which levels get coded.
+pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    let (dc_q, ac_q) = (quant.dc_q(), quant.ac_q());
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f64; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            let rc = y + x * 8;
+            let qd = if rc == 0 { dc_q } else { ac_q };
+            let num = residual[y * 8 + x] * 8;
+            tf[rc] = num as f64 / qd as f64;
+            let am = num.unsigned_abs() as i32;
+            cf[rc] = if am < qd {
+                0
+            } else {
+                let l = (am + qd / 2) / qd;
+                if num < 0 { -l } else { l }
+            };
+        }
+    }
+    (cf, tf)
 }
 
 pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {

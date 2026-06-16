@@ -85,18 +85,19 @@ fn main() {
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
-        .with_cdef(false);
+        .with_threads(1)
+        .with_cfl(false);
     for i in 0..10 {
         let instant = Instant::now();
         let encoded = black_box(
             av2_encoder
-                .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
+                .encode_image_422(black_box(&pimg), &Cicp::srgb_ycbcr())
                 .unwrap(),
         );
         println!("encoding time {:?}", instant.elapsed());
     }
     let encoded = av2_encoder
-        .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr(), 1)
+        .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
     // let out_obu = encoded.view();
     // let path = std::env::args()

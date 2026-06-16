@@ -130,11 +130,11 @@ pub(crate) fn sb_tu_contexts_64x32(
         let res = if nz.is_empty() {
             0x40u8
         } else {
-            let cul = (nz
+            let cul = nz
                 .iter()
                 .map(|&(_, l)| l.unsigned_abs())
                 .sum::<u32>()
-                .min(63)) as u8;
+                .min(63) as u8;
             let dc = nz
                 .iter()
                 .find(|&&(s, _)| s == 0)
@@ -187,7 +187,7 @@ pub(crate) fn sb_tu_contexts_pos(
         let merge_l = l.iter().fold(0u8, |acc, &b| acc | b);
         let sctx = (((merge_a & 0x3F).min(4) + (merge_l & 0x3F).min(4)) as usize + 3) >> 1;
         // avm get_txb_ctx (plane 0): a single full-block transform (block == tx)
-        // forces txb_skip_ctx = 0; the neighbour skip_contexts[top][left] formula
+        // forces txb_skip_ctx = 0; the neighbor skip_contexts[top][left] formula
         // applies only when block != tx (e.g. the 32X64 stacked TUs).
         let sctx = if block_eq_tx { 0 } else { sctx };
         let dcs: i32 = a.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>()
@@ -199,11 +199,11 @@ pub(crate) fn sb_tu_contexts_pos(
         let res = if nz.is_empty() {
             0x40u8
         } else {
-            let cul = (nz
+            let cul = nz
                 .iter()
                 .map(|&(_, l)| l.unsigned_abs())
                 .sum::<u32>()
-                .min(63)) as u8;
+                .min(63) as u8;
             let dc = nz
                 .iter()
                 .find(|&&(s, _)| s == 0)
@@ -466,9 +466,9 @@ pub(crate) fn put_block_rect(
     rec: &[f32],
 ) {
     for yy in 0..bh {
-        for xx in 0..bw {
-            plane[(y0 + yy) * w + x0 + xx] = rec[yy * bw + xx];
-        }
+        let plane_dst = &mut plane[(y0 + yy) * w + x0..(y0 + yy) * w + x0 + bw];
+        let plane_src = &rec[yy * bw..yy * bw + bw];
+        plane_dst.copy_from_slice(plane_src);
     }
 }
 pub(crate) fn levels_to_coeffs(lev: &[f32]) -> Vec<Coeff> {

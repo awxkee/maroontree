@@ -285,7 +285,18 @@ pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Ve
 pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
     let q = base_q_idx as i32;
     let lvl_y = (q / 8).clamp(0, 40);
-    let lvl_uv = (q / 10).clamp(0, 32);
+    // Chroma deblocking must not switch off ahead of luma. In 4:2:0 the chroma
+    // uses 4x4 transforms (the most block boundaries per area), so leaving its
+    // loop filter at 0 while luma is still filtered (q/10 hits 0 below base_q_idx
+    // 10, where q/8 is still >=1) leaves chroma block-boundary steps undeblocked
+    // and folds the q97 chroma curve back below q95. Floor chroma at 1 whenever
+    // luma is filtered. (AV1 only signals chroma filter levels when luma is
+    // nonzero, so gating on lvl_y also keeps the header consistent.)
+    let lvl_uv = if lvl_y > 0 {
+        (q / 10).max(1).clamp(0, 32)
+    } else {
+        0
+    };
     (lvl_y, lvl_uv)
 }
 

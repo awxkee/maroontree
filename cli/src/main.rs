@@ -5,26 +5,26 @@
  * are permitted provided that the following conditions are met:
  *
  * 1.  Redistributions of source code must retain the above copyright notice, this
- *     list of conditions and the following disclaimer.
+ * list of conditions and the following disclaimer.
  *
  * 2.  Redistributions in binary form must reproduce the above copyright notice,
- *     this list of conditions and the following disclaimer in the documentation
- *     and/or other materials provided with the distribution.
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
  *
- * 3.  Neither the name of the copyright holder nor the names of its contributors may
- *     be used to endorse or promote products derived from this software without
- *     specific prior written permission.
+ * 3.  Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
- * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
- * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
- * OF THE POSSIBILITY OF SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 //! # avif — CLI encoder
@@ -37,33 +37,37 @@
 //!   [OUTPUT]  Destination .avif  [default: INPUT stem + ".avif"]
 //!
 //! Options:
-//!   -e, --encoder <av1|av2|hevc|jxl>     Encoder backend                 [default: av1]
-//!   -q, --quality <1-100>                Encode quality (higher = better) [default: 80(AV1)/60(AV2)]
-//!       --lossless                       Pixel-perfect lossless
-//!   -c, --chroma <444|422|420>           Chroma subsampling              [default: 420]
-//!   -d, --depth <8|10|12>                Output bit depth (auto-detect from source)
-//!   -t, --threads <N>                    Worker threads; 0 = all cores   [default: all]
-//!       --no-alpha                       Discard alpha channel
-//!       --no-exif                        Strip EXIF from output
-//!       --no-icc                         Strip ICC profile from output
-//!   -s, --speed                          Encoding effort (default = slow)
-//!   -v, --verbose                        Print dimensions, timing, file size
-//!   -h, --help                           Print this help
+//!   -e, --encoder <av1|av2|hevc|jxl,vvc>     Encoder backend                 [default: av1]
+//!   -q, --quality <1-100>                    Encode quality (higher = better) [default: 80(AV1)/60(AV2)]
+//!       --lossless                           Pixel-perfect lossless
+//!   -c, --chroma <444|422|420>               Chroma subsampling              [default: 420]
+//!   -d, --depth <8|10|12>                    Output bit depth (auto-detect from source)
+//!   -t, --threads <N>                        Worker threads; 0 = all cores   [default: all]
+//!       --no-alpha                           Discard alpha channel
+//!       --no-exif                            Strip EXIF from output
+//!       --no-icc                             Strip ICC profile from output
+//!   -s, --speed                              Encoding effort (default = slow)
+//!   -v, --verbose                            Print dimensions, timing, file size
+//!   -h, --help                               Print this help
 //! ```
 
 mod av1_lossless;
 mod av1_lossy;
 mod av2_lossless;
 mod av2_lossy;
+mod box_walker;
 #[cfg(feature = "heic")]
 mod heic;
 mod jxl;
 #[cfg(feature = "heic")]
 mod orientation;
+mod raster;
+#[cfg(feature = "vvc")]
+mod vvc;
 
 use crate::av1_lossy::encode_av1;
 use crate::av2_lossy::encode_av2;
-use crate::heic::encode_hevc;
+use crate::box_walker::{ImageContainer, detect_image_container};
 use crate::jxl::{decode_jxl, encode_jxl};
 use image::{DynamicImage, Luma, Rgb, Rgba};
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
@@ -76,6 +80,7 @@ enum Encoder {
     Av2,
     Hevc,
     JpegXl,
+    Vvc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,19 +125,19 @@ Arguments:
   [OUTPUT]  Output .avif  [default: input stem + \".avif\"]
 
 Options:
-  -e, --encoder <av1|av2|hevc|jxl>  Encoder backend                 [default: av1]
-  -q, --quality <1-100>             Quality (higher = better)       [default: 80(AV1)/60(AV2)]
-      --lossless                    Pixel-perfect lossless (AV2 only)
-  -c, --chroma <444|422|420>        Chroma subsampling              [default: 420]
-  -d, --depth <8|10|12>             Output bit depth (auto from source)
-  -t, --threads <N>                 Worker threads; 0 = all cores   [default: all]
-      --no-alpha                    Discard alpha channel
-      --no-exif                     Strip EXIF metadata from output
-      --no-icc                      Strip ICC colour profile from output
-      --apply-icc                   Apply ICC profile to pixels (convert to sRGB), then strip it
-  -s, --speed                       Encoding effort (default = slow)
-  -v, --verbose                     Print timing and file stats
-  -h, --help                        Print this help"
+  -e, --encoder <av1|av2|hevc|jxl,vvc>  Encoder backend                 [default: av1]
+  -q, --quality <1-100>                 Quality (higher = better)       [default: 80(AV1)/60(AV2)]
+      --lossless                        Pixel-perfect lossless (AV2 only)
+  -c, --chroma <444|422|420>            Chroma subsampling              [default: 420]
+  -d, --depth <8|10|12>                 Output bit depth (auto from source)
+  -t, --threads <N>                     Worker threads; 0 = all cores   [default: all]
+      --no-alpha                        Discard alpha channel
+      --no-exif                         Strip EXIF metadata from output
+      --no-icc                          Strip ICC colour profile from output
+      --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
+  -s, --speed                           Encoding effort (default = slow)
+  -v, --verbose                         Print timing and file stats
+  -h, --help                            Print this help"
     );
     std::process::exit(0);
 }
@@ -196,6 +201,7 @@ fn parse_args() -> Args {
                 "av2" => encoder = Encoder::Av2,
                 "hevc" | "heic" | "heif" => encoder = Encoder::Hevc,
                 "jxl" | "jpegxl" | "jpeg-xl" => encoder = Encoder::JpegXl,
+                "vvc" => encoder = Encoder::Vvc,
                 other => die(format!("unknown encoder '{other}'; use av1 or av2")),
             },
             "-q" | "--quality" => {
@@ -227,7 +233,7 @@ fn parse_args() -> Args {
             "-s" | "--speed" => {
                 speed = match args.next().unwrap_or_default().as_str() {
                     "slow" => EncodingEffort::Slow,
-                    "medium" => EncodingEffort::Fast,
+                    "medium" => EncodingEffort::Medium,
                     "fast" => EncodingEffort::Fast,
                     other => die(format!(
                         "unsupported speed '{other}'; use slow, medium, or fast"
@@ -274,6 +280,7 @@ fn parse_args() -> Args {
                 Encoder::Av2 => 60,
                 Encoder::Hevc => 80,
                 Encoder::JpegXl => 70,
+                Encoder::Vvc => 60,
             },
             Some(v) => v,
         },
@@ -311,6 +318,7 @@ fn is_gray(ct: image::ColorType) -> bool {
 fn scale16_to_10(src: &[u16]) -> Vec<u16> {
     src.iter().map(|&v| v >> 6).collect()
 }
+
 fn scale16_to_12(src: &[u16]) -> Vec<u16> {
     src.iter().map(|&v| v >> 4).collect()
 }
@@ -473,14 +481,65 @@ fn apply_icc_to_image(
         }
     }
 }
-
-#[cfg(feature = "heic")]
 fn is_heif_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "heic" | "heif")
 }
 
 fn is_jxl_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "jxl" | "jpegxl")
+}
+
+fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
+    let mut have_icc: Option<Vec<u8>> = None;
+
+    let fmt = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    let mut _image_container = ImageContainer::Unknown;
+    if let Some(ext) = fmt.as_ref()
+        && is_heif_format(ext)
+    {
+        _image_container = detect_image_container(path);
+    }
+
+    println!(
+        "Image container is {:?}, ext {:?}, is heif {:?}",
+        _image_container,
+        fmt,
+        if let Some(ext) = fmt.as_ref() {
+            is_heif_format(&ext)
+        } else {
+            false
+        }
+    );
+
+    let img = match fmt {
+        #[cfg(feature = "heic")]
+        Some(_) if _image_container == ImageContainer::Heic => {
+            use crate::heic::decode_heic_file_url;
+            decode_heic_file_url(path)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
+        }
+        #[cfg(feature = "vvc")]
+        Some(_) if _image_container == ImageContainer::Vvc => {
+            use crate::vvc::decode_heic_vvc_file_url;
+            decode_heic_vvc_file_url(path)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
+        }
+
+        Some(fmt) if is_jxl_format(&fmt) => {
+            let (decoded, icc) = decode_jxl(path)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
+            have_icc = icc;
+            decoded
+        }
+
+        _ => image::open(path)
+            .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display()))),
+    };
+
+    (img, have_icc)
 }
 
 fn main() {
@@ -494,42 +553,7 @@ fn main() {
         }
     }
 
-    #[cfg(feature = "heic")]
-    let format = args
-        .input
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-
-    let mut have_icc: Option<Vec<u8>> = None;
-
-    let img: DynamicImage;
-    #[cfg(feature = "heic")]
-    if let Some(format) = format.as_ref()
-        && is_heif_format(&format)
-    {
-        use crate::heic::decode_heic_file_url;
-        img = decode_heic_file_url(&args.input)
-            .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
-    } else {
-        if let Some(format) = format.as_ref()
-            && is_jxl_format(&format)
-        {
-            let (img1, prof) = decode_jxl(&args.input)
-                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())));
-            img = img1;
-            have_icc = prof;
-        } else {
-            img = image::open(&args.input)
-                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", args.input.display())))
-        }
-    }
-    #[cfg(not(feature = "heic"))]
-    {
-        img = image::open(&args.input)
-            .unwrap_or_else(|e| crate::die(format!("cannot open '{}': {e}", args.input.display())));
-    }
-
+    let (img, have_icc) = load_image(&args.input);
     let color_type = img.color();
     let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
         Depth::D10
@@ -549,7 +573,7 @@ fn main() {
     }
 
     // Apply ICC profile to pixel data via moxcms, then discard the profile so
-    // it is not embedded in the output.  The encoded image will be plain sRGB.
+    // it is not embedded in the output. The encoded image will be plain sRGB.
     let (img, icc_bytes) = if args.apply_icc {
         match raw_icc {
             Some(ref icc) => {
@@ -600,43 +624,77 @@ fn main() {
 
     let t0 = Instant::now();
 
-    let avif_bytes = match args.encoder {
-        Encoder::Av1 => encode_av1(
-            &img,
-            &args,
-            color_type,
-            effective_depth,
-            icc_bytes.as_deref(),
-            exif_bytes.as_deref(),
-        )
-        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
-        Encoder::Av2 => encode_av2(
-            &img,
-            &args,
-            color_type,
-            effective_depth,
-            icc_bytes.as_deref(),
-            exif_bytes.as_deref(),
-        )
-        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
-        Encoder::Hevc => encode_hevc(
-            &img,
-            &args,
-            color_type,
-            effective_depth,
-            icc_bytes.as_deref(),
-            exif_bytes.as_deref(),
-        )
-        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
-        Encoder::JpegXl => encode_jxl(
-            &img,
-            &args,
-            color_type,
-            effective_depth,
-            icc_bytes.as_deref(),
-            exif_bytes.as_deref(),
-        )
-        .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+    let avif_bytes = if let Some(rf) = raster::raster_output_format(&args.output) {
+        raster::encode_raster(&img, rf, &args, icc_bytes.as_deref(), exif_bytes.as_deref())
+            .unwrap_or_else(|e| die(format!("encode failed: {e}")))
+    } else {
+        match args.encoder {
+            Encoder::Av1 => encode_av1(
+                &img,
+                &args,
+                color_type,
+                effective_depth,
+                icc_bytes.as_deref(),
+                exif_bytes.as_deref(),
+            )
+            .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+            Encoder::Av2 => encode_av2(
+                &img,
+                &args,
+                color_type,
+                effective_depth,
+                icc_bytes.as_deref(),
+                exif_bytes.as_deref(),
+            )
+            .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+            Encoder::Hevc => {
+                #[cfg(not(feature = "heic"))]
+                {
+                    die("to use heic container compile with heic support")
+                }
+                #[cfg(feature = "heic")]
+                {
+                    use crate::heic::encode_hevc;
+                    encode_hevc(
+                        &img,
+                        &args,
+                        color_type,
+                        effective_depth,
+                        icc_bytes.as_deref(),
+                        exif_bytes.as_deref(),
+                    )
+                    .unwrap_or_else(|e| die(format!("encode failed: {e}")))
+                }
+            }
+            Encoder::JpegXl => encode_jxl(
+                &img,
+                &args,
+                color_type,
+                effective_depth,
+                icc_bytes.as_deref(),
+                exif_bytes.as_deref(),
+            )
+            .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
+            Encoder::Vvc => {
+                #[cfg(not(feature = "vvc"))]
+                {
+                    die("to use heif with vvc container compile with 'vvc' support")
+                }
+                #[cfg(feature = "vvc")]
+                {
+                    use crate::vvc::encode_vvc;
+                    encode_vvc(
+                        &img,
+                        &args,
+                        color_type,
+                        effective_depth,
+                        icc_bytes.as_deref(),
+                        exif_bytes.as_deref(),
+                    )
+                    .unwrap_or_else(|e| die(format!("encode failed: {e}")))
+                }
+            }
+        }
     };
 
     let elapsed = t0.elapsed();

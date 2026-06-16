@@ -97,6 +97,37 @@ pub(crate) fn reconstruct_chroma(
     out
 }
 
+/// As `reconstruct_chroma`, but the prediction base is a per-pixel block (`pred[i]`)
+/// rather than a flat DC scalar — used for CfL, whose predictor is dc + alpha*luma_ac.
+/// `pred` must be `w*h` in raster order and already clipped to bit depth.
+pub(crate) fn reconstruct_chroma_cfl(
+    pred: &[i32],
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    bd: i32,
+) -> Vec<f32> {
+    let (cw, ch) = (w.min(32), h.min(32));
+    let txs = dc_tx_scale(w, h);
+    let tx = dc_tx_index(w, h);
+    let mut coeff = vec![0i32; cw * ch];
+    for (&l, &rc) in lev.iter().zip(scan.iter()) {
+        if l != 0.0 {
+            let (col, row) = (rc as usize >> 5, rc as usize & 31);
+            let li = l as i64;
+            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let rounded = (mag + (1 << 2)) >> 3;
+            let dqmag = (rounded >> txs) as i32;
+            coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
+        }
+    }
+    let mut out = vec![0f32; w * h];
+    crate::av2::av2_itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |i| pred[i]);
+    out
+}
+
 #[rustfmt::skip]
 pub(crate) fn reconstruct_luma16_adst(
     pred: &[f32],

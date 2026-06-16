@@ -87,6 +87,7 @@ pub(super) fn code_422_chroma_tu(
     quant: QuantCtx,
     nb: ChromaNeighbors,
     bd: i32,
+    cfl: Option<&crate::av2::cfl::CflChoice>,
 ) -> (bool, bool) {
     let ChromaPlanes {
         rec_u: recu,
@@ -107,36 +108,85 @@ pub(super) fn code_422_chroma_tu(
     } = spec;
     let QuantCtx { qc, neutral, qstep } = quant;
     let ChromaNeighbors { ua, ul, va, vl } = nb;
-    let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
-    let levu = basis.project_scan(
-        &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
-        0.0,
-        scan,
-    );
-    put_block_rect(
-        recu,
-        pcw,
-        cy,
-        cx,
-        cw,
-        ch,
-        &recon_422_chroma(predu, &levu, qstep, scan, cw, ch, basis, bd),
-    );
-    let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
-    let levv = basis.project_scan(
-        &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
-        0.0,
-        scan,
-    );
-    put_block_rect(
-        recv,
-        pcw,
-        cy,
-        cx,
-        cw,
-        ch,
-        &recon_422_chroma(predv, &levv, qstep, scan, cw, ch, basis, bd),
-    );
+    let (levu, levv) = if let Some(cflc) = cfl {
+        // CfL: residual against the per-pixel prediction; reconstruct with that base.
+        let n = cw * ch;
+        let mut ru = vec![0f32; n];
+        let mut rv = vec![0f32; n];
+        for r in 0..ch {
+            let b = (cy + r) * pcw + cx;
+            let ru_d = &mut ru[r * cw..];
+            let rv_d = &mut rv[r * cw..];
+            let up_s = &up[b..b + cw];
+            let vp_s = &vp[b..b + cw];
+            let pred_us = &cflc.pred_u[r * cw..r * cw + cw];
+            let pred_vs = &cflc.pred_v[r * cw..r * cw + cw];
+            for (((((ru, rv), &up), &vp), &pred_us), &pred_vs) in ru_d[..cw]
+                .iter_mut()
+                .zip(rv_d[..cw].iter_mut())
+                .zip(up_s.iter())
+                .zip(vp_s.iter())
+                .zip(pred_us.iter())
+                .zip(pred_vs.iter())
+            {
+                *ru = up - pred_us as f32;
+                *rv = vp - pred_vs as f32;
+            }
+        }
+        let levu = basis.project_scan(&ru, 0.0, scan);
+        let levv = basis.project_scan(&rv, 0.0, scan);
+        put_block_rect(
+            recu,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &itx422::reconstruct_chroma_cfl(&cflc.pred_u, &levu, qstep, scan, cw, ch, bd),
+        );
+        put_block_rect(
+            recv,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &itx422::reconstruct_chroma_cfl(&cflc.pred_v, &levv, qstep, scan, cw, ch, bd),
+        );
+        (levu, levv)
+    } else {
+        let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
+        let levu = basis.project_scan(
+            &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
+            0.0,
+            scan,
+        );
+        put_block_rect(
+            recu,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &recon_422_chroma(predu, &levu, qstep, scan, cw, ch, basis, bd),
+        );
+        let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
+        let levv = basis.project_scan(
+            &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
+            0.0,
+            scan,
+        );
+        put_block_rect(
+            recv,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &recon_422_chroma(predv, &levv, qstep, scan, cw, ch, basis, bd),
+        );
+        (levu, levv)
+    };
     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
     encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_bin, eob_hi, area);

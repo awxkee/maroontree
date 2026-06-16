@@ -801,14 +801,6 @@ pub(crate) fn cctx(u: &mut [i32], v: &mut [i32], sina: i32, cosa: i32, bd: i32) 
     }
 }
 
-// ============================================================================
-// Lane-parallel (SIMD) inverse-transform path.
-// The 1-D passes run 4 transforms at once (one transform per SIMD lane); fill,
-// rect2 prescale, intermediate round-clip and the output stay scalar. The DCT
-// kernels use the SAME flat even/odd butterflies as the scalar `inv_dct16` /
-// `inv_dct32` (just over `V` instead of `i32`), so the lane path is bit-exact
-// to the scalar path. Dispatched from `txfm_passes` on aarch64+neon.
-// ============================================================================
 #[allow(dead_code)]
 pub(crate) trait Lane: Copy {
     fn add(self, o: Self) -> Self;

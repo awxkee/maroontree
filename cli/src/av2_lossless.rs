@@ -73,37 +73,27 @@ pub(crate) fn encode_av2_lossless_image(
     let enc = Av2Encoder::new(0)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
-        .with_speed(args.speed.to_maroontreee());
+        .with_speed(args.speed.to_maroontreee())
+        .with_threads(args.threads);
     let alpha_enc = Av2Encoder::new(0)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
-        .with_speed(args.speed.to_maroontreee());
+        .with_speed(args.speed.to_maroontreee())
+        .with_threads(args.threads);
 
     if gray {
         let frame = match effective_depth {
             Depth::D8 => {
                 let l = img.to_luma8().into_raw();
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Eight, &l)?,
-                    &color,
-                    args.threads,
-                )?
+                enc.encode_image_400(&PlanarImage::from_luma(w, h, BitDepth::Eight, &l)?, &color)?
             }
             Depth::D10 => {
                 let l = scale16_to_10(img.to_luma16().as_raw());
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Ten, &l)?,
-                    &color,
-                    args.threads,
-                )?
+                enc.encode_image_400(&PlanarImage::from_luma(w, h, BitDepth::Ten, &l)?, &color)?
             }
             Depth::D12 => {
                 let l = scale16_to_12(img.to_luma16().as_raw());
-                enc.encode_image_400(
-                    &PlanarImage::from_luma(w, h, BitDepth::Twelve, &l)?,
-                    &color,
-                    args.threads,
-                )?
+                enc.encode_image_400(&PlanarImage::from_luma(w, h, BitDepth::Twelve, &l)?, &color)?
             }
         };
         return Ok(Av2Encoder::wrap_avif(
@@ -132,7 +122,7 @@ pub(crate) fn encode_av2_lossless_image(
                 vec![],
             ],
         };
-        enc.encode_image_444(&planar_image, &color, args.threads)
+        enc.encode_image_444(&planar_image, &color)
             .map_err(|x| anyhow::anyhow!(x))
     };
 
@@ -175,7 +165,7 @@ pub(crate) fn encode_av2_lossless_image(
                 vec![],
             ],
         };
-        enc.encode_image_444(&planar_image, &color, args.threads)
+        enc.encode_image_444(&planar_image, &color)
             .map_err(|x| anyhow::anyhow!(x))
     };
 
@@ -192,11 +182,8 @@ pub(crate) fn encode_av2_lossless_image(
         } else {
             let a = extract_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
             let frame = encode_color_8()?;
-            let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Eight, &a)?,
-                &color,
-                args.threads,
-            )?;
+            let alpha_frame = alpha_enc
+                .encode_yuv400(&PlanarImage::from_luma(w, h, BitDepth::Eight, &a)?, &color)?;
             Ok(Av2Encoder::wrap_avif_alpha(
                 &frame,
                 &alpha_frame,
@@ -221,11 +208,8 @@ pub(crate) fn encode_av2_lossless_image(
         } else {
             let a = extract_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
             let frame = encode_color_16(10)?;
-            let alpha_frame = alpha_enc.encode_yuv400(
-                &PlanarImage::from_luma(w, h, BitDepth::Ten, &a)?,
-                &color,
-                args.threads,
-            )?;
+            let alpha_frame = alpha_enc
+                .encode_yuv400(&PlanarImage::from_luma(w, h, BitDepth::Ten, &a)?, &color)?;
             Ok(Av2Encoder::wrap_avif_alpha(
                 &frame,
                 &alpha_frame,
@@ -250,11 +234,8 @@ pub(crate) fn encode_av2_lossless_image(
     } else {
         let a = extract_alpha(&scale16_to_12(img.to_rgba16().as_raw()), w, h);
         let frame = encode_color_16(12)?;
-        let alpha_frame = alpha_enc.encode_yuv400(
-            &PlanarImage::from_luma(w, h, BitDepth::Twelve, &a)?,
-            &color,
-            args.threads,
-        )?;
+        let alpha_frame = alpha_enc
+            .encode_yuv400(&PlanarImage::from_luma(w, h, BitDepth::Twelve, &a)?, &color)?;
         Ok(Av2Encoder::wrap_avif_alpha(
             &frame,
             &alpha_frame,
