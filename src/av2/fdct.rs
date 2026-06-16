@@ -1,15 +1,34 @@
-//! Forward DCT-II transforms ported from avm (`av2/encoder/hybrid_fwd_txfm.c`,
-//! `av2/common/txb_common.c`). These are the exact analysis duals of the avm
-//! inverse transforms replicated in `av2::av2_itx`, so `inv(fwd(x)) == x` by
-//! construction — eliminating the projection-basis reconstruction ceiling.
-//!
-//! The 32-pt DCT is avm's partial butterfly: an even/odd fold (`a/b`), the even
-//! half folded twice more (`c/d` → `e/f` → `g/h`), then a reduced kernel-matrix
-//! multiply per output frequency. Integer pipeline, matching avm bit-for-bit.
+/*
+ * Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * 1.  Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3.  Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
 use std::cell::RefCell;
 
-// avm forward DCT-II 32-pt kernel: tx_kernel_dct2_size32[FWD_TXFM] (av2/common/txb_common.c)
 #[rustfmt::skip]
 pub(crate) static DCT32_FWD_KERNEL: [i8; 1024] = [
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
@@ -54,9 +73,8 @@ pub(crate) static DCT32_FWD_KERNEL: [i8; 1024] = [
 fn fdct32_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     debug_assert!(shift > 0);
     let add = 1 << (shift - 1);
-    let km = &DCT32_FWD_KERNEL;
     // kernel row `k`, column `col`
-    let m = |k: usize, col: usize| km[k * 32 + col] as i32;
+    let m = |k: usize, col: usize| DCT32_FWD_KERNEL[k * 32 + col] as i32;
 
     for j in 0..line {
         let col = |k: usize| src[k * line + j];
@@ -184,8 +202,7 @@ fn fdct64_1d(
     zero_line: usize,
 ) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-    let km = &DCT64_FWD_KERNEL;
-    let m = |k: usize, c: usize| km[k * 64 + c] as i32;
+    let m = |k: usize, c: usize| DCT64_FWD_KERNEL[k * 64 + c] as i32;
     let zo = zero_line != 0;
     let top = if zo { 32 } else { 64 };
     for j in 0..(line - skip_line) {
@@ -302,8 +319,7 @@ pub(crate) static DCT16_FWD_KERNEL: [i8; 256] = [
 /// 1-D forward DCT-II, 16 point (avm `fwd_txfm_dct2_size16_c`). Column-strided I/O.
 fn fdct16_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-    let km = &DCT16_FWD_KERNEL;
-    let m = |k: usize, c: usize| km[k * 16 + c] as i32;
+    let m = |k: usize, c: usize| DCT16_FWD_KERNEL[k * 16 + c] as i32;
     for j in 0..line {
         let s = |k: usize| src[k * line + j];
         let mut a = [0i32; 8];
@@ -357,13 +373,12 @@ pub(crate) static ADST16_FWD_KERNEL: [i8; 256] = [
 
 fn fadst16_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-    let km = &ADST16_FWD_KERNEL;
     for i in 0..line {
         let o = &mut dst[i * 16..i * 16 + 16];
         for j in 0..16 {
             let mut sum = 0i32;
             for k in 0..16 {
-                sum += src[k * line + i] * km[j * 16 + k] as i32;
+                sum += src[k * line + i] * ADST16_FWD_KERNEL[j * 16 + k] as i32;
             }
             o[j] = (sum + add) >> shift;
         }
@@ -409,8 +424,7 @@ pub(crate) static DCT4_FWD_KERNEL: [i8; 16] = [
 /// 1-D forward DCT-II, 8 point (avm `fwd_txfm_dct2_size8_c`). Column-strided I/O.
 fn fdct8_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-    let km = &DCT8_FWD_KERNEL;
-    let m = |k: usize, c: usize| km[k * 8 + c] as i32;
+    let m = |k: usize, c: usize| DCT8_FWD_KERNEL[k * 8 + c] as i32;
     for j in 0..line {
         let s = |k: usize| src[k * line + j];
         let mut a = [0i32; 4];

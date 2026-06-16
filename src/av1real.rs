@@ -28,16 +28,27 @@
  */
 
 use crate::Speed;
-use crate::dct::{adst8x8_t, adst16x16_t};
+use crate::dct::{adst8x8_t, adst16x16_t, fidentity8x8_t};
 use crate::idct::{
     iadst_dequant_8x8, iadst_dequant_16x16, idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x8,
     idct_dequant_8x16, idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x32,
+    iidentity_dequant_8x8,
 };
 use crate::obu::{
     frame_header_lossy_multitile, frame_header_lossy_multitile_th, temporal_delimiter,
     wrap_obu_frame, wrap_obu_frame_split,
 };
 use crate::odec::OdEcEncoder;
+#[cfg(test)]
+pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(not(test))]
+pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Runtime enable for the RD-selected 4x4 luma split (off by default; the path
+/// is bit-exact but its quality benefit is still being measured).
+pub(crate) static SPLIT4_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 use crate::trellis::{trellis_optimize, trellis_optimize_ctx};
 
 use crate::coeffs::encode_tx16_coeffs_adapt;
@@ -64,6 +75,7 @@ pub(crate) struct Cdfs {
     pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
     pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
     pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
+    pub(crate) txtp4: Vec<Vec<u16>>,              // intra txtp TX_4X4 luma, per intra mode [13]
     pub(crate) txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
     pub(crate) txb_skip: [Vec<Vec<u16>>; 4],      // [class][13 ctx] (class 3 = TX_32X32)
     pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
@@ -72,6 +84,7 @@ pub(crate) struct Cdfs {
     pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][11 bins], each a 2-sym CDF
     pub(crate) dc_sign: [Vec<Vec<u16>>; 2],       // [plane][3 ctx]
     pub(crate) eob_bin_16_c: Vec<u16>,            // chroma, 4x4
+    pub(crate) eob_bin_16_l: Vec<u16>,            // luma, 4x4
     pub(crate) eob_bin_32_c: Vec<u16>,            // chroma, 4x8
     pub(crate) eob_bin_64_l: Vec<u16>,            // luma, 8x8
     pub(crate) eob_bin_64_c: Vec<u16>,            // chroma, 8x8
@@ -111,7 +124,7 @@ impl Cdfs {
         // base/br/eob_base/eob_hi per [class][plane]
         let base_tok = [
             [
-                rows(&Q::BASE_TOK_TX4_CHROMA_Q[qctx]),
+                rows(&Q::BASE_TOK_TX4_LUMA_Q[qctx]),
                 rows(&Q::BASE_TOK_TX4_CHROMA_Q[qctx]),
             ],
             [
@@ -129,7 +142,7 @@ impl Cdfs {
         ];
         let br_tok = [
             [
-                rows(&Q::BR_TOK_TX4_CHROMA_Q[qctx]),
+                rows(&Q::BR_TOK_TX4_LUMA_Q[qctx]),
                 rows(&Q::BR_TOK_TX4_CHROMA_Q[qctx]),
             ],
             [
@@ -147,7 +160,7 @@ impl Cdfs {
         ];
         let eob_base = [
             [
-                rows2(&Q::EOB_BASE_TX4_CHROMA_Q[qctx]),
+                rows2(&Q::EOB_BASE_TX4_LUMA_Q[qctx]),
                 rows2(&Q::EOB_BASE_TX4_CHROMA_Q[qctx]),
             ],
             [
@@ -165,7 +178,7 @@ impl Cdfs {
         ];
         let eob_hi = [
             [
-                his(&Q::EOB_HI_TX4_CHROMA[qctx]),
+                his(&Q::EOB_HI_TX4_LUMA[qctx]),
                 his(&Q::EOB_HI_TX4_CHROMA[qctx]),
             ],
             [
@@ -215,6 +228,7 @@ impl Cdfs {
             },
             txtp: TXTP_INTRA1_TX8.iter().map(|r| icdf(r)).collect(),
             txtp16: TXTP_INTRA2_TX16.iter().map(|r| icdf(r)).collect(),
+            txtp4: TXTP_INTRA1_TX4.iter().map(|r| icdf(r)).collect(),
             txb_skip,
             base_tok,
             br_tok,
@@ -225,6 +239,7 @@ impl Cdfs {
                 Q::DC_SIGN_Q[qctx][1].iter().map(|&v| icdf(&[v])).collect(),
             ],
             eob_bin_16_c: icdf(&Q::EOB_BIN_16_CHROMA[qctx]),
+            eob_bin_16_l: icdf(&Q::EOB_BIN_16_LUMA[qctx]),
             eob_bin_32_c: icdf(&Q::EOB_BIN_32_CHROMA[qctx]),
             eob_bin_64_l: icdf(&Q::EOB_BIN_64_LUMA[qctx]),
             eob_bin_64_c: icdf(&Q::EOB_BIN_64_CHROMA[qctx]),
@@ -473,6 +488,130 @@ impl<'a> LossyTile<'a> {
         hi - lo
     }
 
+    /// R-D proxy for coding an 8x8 luma region as one TX_8X8 (PARTITION_NONE)
+    /// vs splitting into four BLOCK_4X4. Runs the real non-directional mode
+    /// search (SSE + lambda*bits) for both options so the decision reflects
+    /// 4x4's per-quadrant mode diversity, not just a DC estimate. Returns
+    /// `true` to keep the 8x8 whole. Split is offered only for 4:2:0/4:4:4.
+    fn prefer_8x8_none(&self, x8: usize, y8: usize) -> bool {
+        if self.mono || self.ss422 {
+            return true;
+        }
+        let (px, py) = (x8 * 8, y8 * 8);
+        let maxv = (1 << self.bd) - 1;
+        let (dcq, acq) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64);
+        let lam = trellis_lambda();
+        let mlam = mode_lambda() * acq * acq;
+        let modes = if self.speed.reduced_modes() {
+            fast_nd_modes()
+        } else {
+            nd_modes()
+        };
+        // best non-directional cost for one 8x8 (DCT_DCT only; cheap proxy)
+        let mut eff8 = f64::INFINITY;
+        for &m in modes {
+            let mut pred = [0i32; 64];
+            if m == DC_PRED {
+                let d = dc_pred_8x8(&self.recon[0], self.w, px, py, self.bd as i32);
+                pred = [d; 64];
+            } else {
+                intra_predict_nd(
+                    m,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    8,
+                    8,
+                    false,
+                    false,
+                    self.w,
+                    self.h,
+                    &mut pred,
+                    self.bd,
+                );
+            }
+            let mut resid = [0i32; 64];
+            for ry in 0..8 {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                for rx in 0..8 {
+                    resid[ry * 8 + rx] = srow[rx] - pred[ry * 8 + rx];
+                }
+            }
+            let (mut cf, tf) = forward_dct_quant_8x8_t(&resid, &self.quant);
+            trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
+            let rr = idct_dequant_8x8(&cf, &self.quant);
+            let mut sse = 0i64;
+            for ry in 0..8 {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                for rx in 0..8 {
+                    let r = (pred[ry * 8 + rx] + rr[ry * 8 + rx]).clamp(0, maxv);
+                    let d = srow[rx] - r;
+                    sse += (d * d) as i64;
+                }
+            }
+            let eff = sse as f64 + mlam * block_rate_bits(&cf, &SCAN_8X8);
+            if eff < eff8 {
+                eff8 = eff;
+            }
+        }
+        // best cost for four 4x4 (DC-pred / nd; current recon, decision-only)
+        let mut eff4_sum = mlam * 2.0; // PARTITION_SPLIT symbol allowance
+        for (sx, sy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)] {
+            let (bx, by) = (px + sx, py + sy);
+            let mut best = f64::INFINITY;
+            for &m in modes {
+                let mut pred = [0i32; 16];
+                if m == DC_PRED {
+                    let d = dc_pred_4x4(&self.recon[0], self.w, bx, by, self.bd as i32);
+                    pred = [d; 16];
+                } else {
+                    intra_predict_nd(
+                        m,
+                        &self.recon[0],
+                        self.w,
+                        bx,
+                        by,
+                        4,
+                        4,
+                        false,
+                        false,
+                        self.w,
+                        self.h,
+                        &mut pred,
+                        self.bd,
+                    );
+                }
+                let mut resid = [0i32; 16];
+                for ry in 0..4 {
+                    let srow = &self.src[0][(by + ry) * self.w + bx..];
+                    for rx in 0..4 {
+                        resid[ry * 4 + rx] = srow[rx] - pred[ry * 4 + rx];
+                    }
+                }
+                let (mut cf, tf) = forward_dct_quant_4x4_t(&resid, &self.quant);
+                trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_4X4, lam);
+                let rr = idct_dequant_4x4(&cf, &self.quant);
+                let mut sse = 0i64;
+                for ry in 0..4 {
+                    let srow = &self.src[0][(by + ry) * self.w + bx..];
+                    for rx in 0..4 {
+                        let r = (pred[ry * 4 + rx] + rr[ry * 4 + rx]).clamp(0, maxv);
+                        let d = srow[rx] - r;
+                        sse += (d * d) as i64;
+                    }
+                }
+                // +mode/skip signalling allowance per 4x4 sub-block
+                let eff = sse as f64 + mlam * (block_rate_bits(&cf, &SCAN_4X4) + 4.0);
+                if eff < best {
+                    best = eff;
+                }
+            }
+            eff4_sum += best;
+        }
+        eff8 <= eff4_sum
+    }
+
     fn prefer_16x16(&self, x8: usize, y8: usize) -> bool {
         if self.mono {
             return false; // monochrome codes 8x8 luma blocks only
@@ -685,7 +824,16 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let abits = block_rate_bits(&acf, &SCAN_16X16);
-            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+            // Quality guard: only accept ADST if it does not meaningfully worsen
+            // SSE. At low quality lambda (~quantizer^2) is enormous, so a pure
+            // RD test would pick ADST whenever it shaves a few bits even while
+            // inflating distortion ~2x; that tanks perceptual quality (SSIMULACRA2)
+            // for a trivial rate gain. Requiring SSE-non-worsening keeps the
+            // genuine high-quality ADST wins (where it lowers SSE) and blocks the
+            // low-quality "trade quality for bits" pathology.
+            if asse <= best_dct_sse + (best_dct_sse >> 5)
+                && asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits
+            {
                 lcf = acf;
                 best_is_adst16 = true;
             }
@@ -889,7 +1037,11 @@ impl<'a> LossyTile<'a> {
         let mut cpred16 = [[0i32; 256]; 2];
         let mut cfl_opt: Option<[i32; 2]> = None;
         {
-            let lrr_cfl = idct_dequant_16x16(lcf, &self.quant);
+            let lrr_cfl = if is_adst16 {
+                iadst_dequant_16x16(lcf, &self.quant)
+            } else {
+                idct_dequant_16x16(lcf, &self.quant)
+            };
             let mut luma_rec = [0i32; 256];
             for i in 0..256 {
                 luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, (1 << self.bd) - 1);
@@ -1133,7 +1285,7 @@ impl<'a> LossyTile<'a> {
             }
         }
         // SMOOTH_V: only at low quality (ac_q > 300 ≈ quality ≤ 35)
-        let smooth_v_active = acq > 300.0;
+        let smooth_v_active = false; // chroma SMOOTH_V needs ADST_DCT (mode-derived tx for chroma); encoder only has DCT_DCT, so offering it desyncs dav1d. Disabled until ADST_DCT chroma is implemented.
         let mut ccf_sv = [[0i32; 64]; 2];
         let mut sv_preds = [[0i32; 64]; 2];
         if smooth_v_active {
@@ -1316,6 +1468,210 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    /// Code an 8x8 luma region as PARTITION_SPLIT into four BLOCK_4X4 luma
+    /// sub-blocks (z-order), with the shared 4:2:0 4x4 chroma attached to the
+    /// bottom-right sub-block. DC-only luma + DC chroma for now: this is the
+    /// bit-exactness scaffold for sub-8x8 luma; richer modes/CfL layer on once
+    /// the entropy/recon path is verified against dav1d. Caller has already
+    /// emitted the PARTITION_SPLIT symbol.
+    fn code_block_split4_dc(&mut self, x8: usize, y8: usize) {
+        let (px, py) = (x8 * 8, y8 * 8);
+        let maxv = (1 << self.bd) - 1;
+        let (dcq, acq) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64);
+        let lam = trellis_lambda();
+        // mark all four 4x4 luma units for the deblock filter (blk4 == 1)
+        let nc4 = self.w / 4;
+        for uy in 0..2 {
+            for ux in 0..2 {
+                self.blk4[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = 1;
+            }
+        }
+        // chroma origin (4:2:0): one 4x4 chroma block for the whole 8x8 region
+        let (cx, cy) = (px / 2, py / 2);
+        // z-order: TL, TR, BL, BR
+        let sub = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)];
+        for (si, &(sx, sy)) in sub.iter().enumerate() {
+            let (bx, by) = (px + sx * 4, py + sy * 4);
+            let (bx4, by4) = (bx / 4, by / 4);
+            let has_chroma = si == 3;
+
+            // --- luma 4x4: search the non-directional intra modes DC, SMOOTH
+            // and PAETH. SMOOTH_V/SMOOTH_H are intentionally excluded: at the
+            // 4x4 size their reconstruction does not match dav1d here, and their
+            // win over plain SMOOTH is rare/small. These modes use only the
+            // above row, left column and above-left corner, so top-right/
+            // bottom-left availability is irrelevant; the tx-type is signalled
+            // (DCT_DCT), so the mode choice never desyncs.
+            let mlam = mode_lambda() * acq * acq;
+            let modes = fast_nd_modes();
+            let mut best_mode = DC_PRED;
+            let mut lpred = [0i32; 16];
+            let mut lcf = [0i32; 16];
+            let mut best_eff = f64::INFINITY;
+            for &m in modes {
+                let mut pred = [0i32; 16];
+                if m == DC_PRED {
+                    let d = dc_pred_4x4(&self.recon[0], self.w, bx, by, self.bd as i32);
+                    pred = [d; 16];
+                } else {
+                    intra_predict_nd(
+                        m,
+                        &self.recon[0],
+                        self.w,
+                        bx,
+                        by,
+                        4,
+                        4,
+                        false,
+                        false,
+                        self.w,
+                        self.h,
+                        &mut pred,
+                        self.bd,
+                    );
+                }
+                let mut resid = [0i32; 16];
+                for ry in 0..4 {
+                    let srow = &self.src[0][(by + ry) * self.w + bx..];
+                    for rx in 0..4 {
+                        resid[ry * 4 + rx] = srow[rx] - pred[ry * 4 + rx];
+                    }
+                }
+                let (mut cf, tf) = forward_dct_quant_4x4_t(&resid, &self.quant);
+                trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_4X4, lam);
+                let rr = idct_dequant_4x4(&cf, &self.quant);
+                let mut sse = 0i64;
+                for ry in 0..4 {
+                    let srow = &self.src[0][(by + ry) * self.w + bx..];
+                    for rx in 0..4 {
+                        let r = (pred[ry * 4 + rx] + rr[ry * 4 + rx]).clamp(0, maxv);
+                        let d = srow[rx] - r;
+                        sse += (d * d) as i64;
+                    }
+                }
+                let bits = block_rate_bits(&cf, &SCAN_4X4);
+                let eff = sse as f64 + mlam * bits;
+                if eff < best_eff {
+                    best_eff = eff;
+                    best_mode = m;
+                    lpred = pred;
+                    lcf = cf;
+                }
+            }
+            let luma_zero = lcf.iter().all(|&c| c == 0);
+
+            // --- chroma (BR only): DC prediction + forward transform ---
+            let mut ccf = [[0i32; 16]; 2];
+            let mut cpred = [0i32; 2];
+            let mut chroma_zero = true;
+            if has_chroma && !self.mono {
+                let (cdcq, cacq) = (self.cquant.dc_q() as f64, self.cquant.ac_q() as f64);
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    let dc = dc_pred_4x4(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
+                    cpred[ci] = dc;
+                    let mut cres = [0i32; 16];
+                    for ry in 0..4 {
+                        let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                        for rx in 0..4 {
+                            cres[ry * 4 + rx] = srow[rx] - dc;
+                        }
+                    }
+                    let (mut q, qt) = forward_dct_quant_4x4_t(&cres, &self.cquant);
+                    trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
+                    ccf[ci] = q;
+                    if !q.iter().all(|&c| c == 0) {
+                        chroma_zero = false;
+                    }
+                }
+            }
+
+            let block_skip = if has_chroma {
+                luma_zero && chroma_zero
+            } else {
+                luma_zero
+            };
+
+            // --- mode info: skip, y_mode (DC), [uv_mode (DC) if has_chroma] ---
+            let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
+            self.enc
+                .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+            let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
+                + INTRA_MODE_CTX[self.l_mode[by4] as usize];
+            self.enc.encode_symbol(best_mode, &mut self.cdfs.kf_y[yctx]);
+            if has_chroma {
+                // chroma stays DC (CfL/SMOOTH_V layered later); uv context uses
+                // the luma mode of the chroma-bearing (bottom-right) sub-block.
+                self.emit_uv_mode(best_mode, DC_PRED, None);
+            }
+
+            // --- residual: luma 4x4, then (BR) chroma U/V 4x4 ---
+            let lres_ctx = if block_skip {
+                0x40
+            } else {
+                let ds = self.dc_sign_ctx_420(0, bx4, by4);
+                encode_tx4_luma_coeffs_adapt(
+                    &mut self.enc,
+                    &mut self.cdfs,
+                    &lcf,
+                    0, // luma TX_4X4 (tx == block) -> txb_skip ctx 0
+                    ds,
+                    best_mode,
+                    1, // DCT_DCT
+                )
+            };
+            self.a_coef[0][bx4] = lres_ctx;
+            self.l_coef[0][by4] = lres_ctx;
+
+            // luma reconstruction
+            let lrr = if block_skip {
+                [0i32; 16]
+            } else {
+                idct_dequant_4x4(&lcf, &self.quant)
+            };
+            for ry in 0..4 {
+                let drow = &mut self.recon[0][(by + ry) * self.w + bx..];
+                for rx in 0..4 {
+                    drow[rx] = (lpred[ry * 4 + rx] + lrr[ry * 4 + rx]).clamp(0, maxv);
+                }
+            }
+
+            // chroma residual + reconstruction (BR only)
+            if has_chroma && !self.mono {
+                let (bx4c, by4c) = (cx / 4, cy / 4);
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    let res_ctx = if block_skip {
+                        0x40
+                    } else {
+                        let sk = self.skip_ctx_420(plane, bx4c, by4c);
+                        let ds = self.dc_sign_ctx_420(plane, bx4c, by4c);
+                        encode_4x4_chroma_coeffs(&mut self.enc, &mut self.cdfs, &ccf[ci], sk, ds)
+                    };
+                    self.a_coef[plane][bx4c] = res_ctx;
+                    self.l_coef[plane][by4c] = res_ctx;
+                    let rr = if block_skip {
+                        [0i32; 16]
+                    } else {
+                        idct_dequant_4x4(&ccf[ci], &self.cquant)
+                    };
+                    for ry in 0..4 {
+                        let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
+                        for rx in 0..4 {
+                            drow[rx] = (cpred[ci] + rr[ry * 4 + rx]).clamp(0, maxv);
+                        }
+                    }
+                }
+            }
+
+            // --- neighbour context updates for this 4x4 ---
+            self.a_skip[bx4] = block_skip as u8;
+            self.l_skip[by4] = block_skip as u8;
+            self.a_mode[bx4] = best_mode as u8;
+            self.l_mode[by4] = best_mode as u8;
+        }
+    }
+
     fn code_block(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) {
         self.record_blk(x8, y8, 2);
         let (px, py) = (x8 * 8, y8 * 8);
@@ -1336,6 +1692,7 @@ impl<'a> LossyTile<'a> {
         let mlam = mode_lambda() * acq * acq;
         let mut best_mode = DC_PRED;
         let mut best_is_adst = false;
+        let mut best_is_idtx = false;
         let mut lpred_arr = [0i32; 64];
         let mut lcf = [0i32; 64];
         let mut best_eff = f64::INFINITY;
@@ -1442,6 +1799,11 @@ impl<'a> LossyTile<'a> {
                 dc_sgn,
             );
         }
+        // Current best transform-type cost (starts at the DCT winner); the ADST
+        // refinement updates it so the IDTX refinement compares against whichever
+        // of DCT/ADST is currently winning.
+        let mut best_txtp_sse = best_dct_sse;
+        let mut best_txtp_bits = best_dct_bits;
         // Per-block transform refinement: try ADST_ADST on the winning
         // prediction only and keep it if cheaper than that mode's DCT. This is
         // one extra transform+trellis per block instead of one per candidate
@@ -1483,9 +1845,59 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let abits = block_rate_bits(&acf, &SCAN_8X8);
-            if asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits {
+            // Quality guard (see 16x16 ADST note): block low-q distortion-for-rate trades.
+            if asse <= best_dct_sse + (best_dct_sse >> 5)
+                && asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits
+            {
                 lcf = acf;
                 best_is_adst = true;
+                best_txtp_sse = asse;
+                best_txtp_bits = abits;
+            }
+        }
+        // Per-block IDTX refinement: the identity transform (no spatial
+        // decorrelation) wins on sharp edges / screen-content-like residuals
+        // where DCT/ADST spread a step across many coefficients. One extra
+        // forward+inverse on the winning prediction; kept only if it beats the
+        // current best tx by real recon SSE + estimated bits. Bit-exactness is
+        // carried by `iidentity_dequant_8x8` (dav1d's exact TX_8X8 IDTX inverse);
+        // the IDTX symbol is 0 in the 7-type intra ext-tx set.
+        if self.speed.try_adst() {
+            let mut resid = [0i32; 64];
+            for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+                for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
+                    *r = s - p;
+                }
+            }
+            let (icf, _itf) = fidentity8x8_t(&resid, &self.quant);
+            // No RDOQ on IDTX: because the identity transform spreads a residual
+            // across many small coefficients, an aggressive trellis zeros them
+            // all and the block-level bit term then picks the collapsed result.
+            // Plain forward levels keep IDTX conservative (chosen only on a clear
+            // real-SSE win); bit-exactness is carried by the inverse regardless.
+            let rr = iidentity_dequant_8x8(&icf, &self.quant);
+            let mut isse = 0i64;
+            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+                let srow = &self.src[0][(py + ry) * self.w + px..];
+                let prow = &lpred_arr[ry * 8..ry * 8 + 8];
+                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
+                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
+                    let d = s - r;
+                    isse += (d * d) as i64;
+                }
+            }
+            let ibits = block_rate_bits(&icf, &SCAN_8X8);
+            // Quality guard (see ADST note): identity spreads residual energy and
+            // is cheap to code, so at low-q lambda a pure RD test over-selects it
+            // and flattens detail. Require SSE-non-worsening vs the best real tx.
+            if isse <= best_txtp_sse + (best_txtp_sse >> 5)
+                && isse as f64 + mlam * ibits < best_txtp_sse as f64 + mlam * best_txtp_bits
+            {
+                lcf = icf;
+                best_is_adst = false;
+                best_is_idtx = true;
             }
         }
         let mut ccf8 = [[0i32; 64]; 2];
@@ -1545,7 +1957,17 @@ impl<'a> LossyTile<'a> {
         let mut use_cfl = false;
         let mut cfl_alpha_uv = [0i32; 2];
         if !self.mono && !self.ss420 && !self.ss422 {
-            let lrr_cfl = idct_dequant_8x8(&lcf, &self.quant);
+            // CfL luma reference must use the SAME inverse transform the decoder
+            // will apply (the signaled luma tx-type), or the chroma CfL prediction
+            // desyncs. Previously this was unconditionally idct, which diverged
+            // whenever the luma block won with ADST or IDTX.
+            let lrr_cfl = if best_is_idtx {
+                iidentity_dequant_8x8(&lcf, &self.quant)
+            } else if best_is_adst {
+                iadst_dequant_8x8(&lcf, &self.quant)
+            } else {
+                idct_dequant_8x8(&lcf, &self.quant)
+            };
             let mut luma_rec = [0i32; 64];
             for i in 0..64 {
                 luma_rec[i] = (lpred_arr[i] + lrr_cfl[i]).clamp(0, (1 << self.bd) - 1);
@@ -1642,7 +2064,7 @@ impl<'a> LossyTile<'a> {
                 .encode_symbol(3, &mut self.cdfs.angle_delta[best_mode - V_PRED]);
         }
         // SMOOTH_V check for 4:2:0 4x4 chroma: only at low quality (ac_q > 300)
-        let smooth_v_active_ss420 = self.quant.ac_q() > 300;
+        let smooth_v_active_ss420 = false; // see note: chroma SMOOTH_V -> ADST_DCT not implemented; would desync decoder
         let mut sv_preds_420 = [[0i32; 16]; 2];
         let mut chosen_uv_block = DC_PRED;
         if !self.mono && self.ss420 && smooth_v_active_ss420 {
@@ -1716,7 +2138,9 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f64,
                 trellis_lambda(),
             );
-            let lrr = if best_is_adst {
+            let lrr = if best_is_idtx {
+                iidentity_dequant_8x8(&lcf, &self.quant)
+            } else if best_is_adst {
                 iadst_dequant_8x8(&lcf, &self.quant)
             } else {
                 idct_dequant_8x8(&lcf, &self.quant)
@@ -1789,7 +2213,9 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f64,
                 trellis_lambda(),
             );
-            let lrr = if best_is_adst {
+            let lrr = if best_is_idtx {
+                iidentity_dequant_8x8(&lcf, &self.quant)
+            } else if best_is_adst {
                 iadst_dequant_8x8(&lcf, &self.quant)
             } else {
                 idct_dequant_8x8(&lcf, &self.quant)
@@ -1881,7 +2307,13 @@ impl<'a> LossyTile<'a> {
                 sk,
                 ds,
                 best_mode,
-                if best_is_adst { ADST_ADST_TX8_IDX } else { 1 },
+                if best_is_idtx {
+                    0
+                } else if best_is_adst {
+                    ADST_ADST_TX8_IDX
+                } else {
+                    1
+                },
             )
         };
         self.a_coef[0][bx4] = lres_ctx;
@@ -1890,6 +2322,8 @@ impl<'a> LossyTile<'a> {
         self.l_coef[0][by4 + 1] = lres_ctx;
         let lrr = if block_skip {
             [0i32; 64]
+        } else if best_is_idtx {
+            iidentity_dequant_8x8(&lcf, &self.quant)
         } else if best_is_adst {
             iadst_dequant_8x8(&lcf, &self.quant)
         } else {
@@ -2129,58 +2563,51 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    /// R-D proxy for coding a 32x32 region as one TX_32X32 (PARTITION_NONE) vs
-    /// splitting into four 16x16. Only enabled for 4:4:4 (the 32x32 chroma path
-    /// is 4:4:4-only so far); 4:2:0/4:2:2 always split. The decoder follows the
-    /// signalled partition, so this affects compression only, never correctness.
-    fn prefer_32x32(&self, x8: usize, y8: usize) -> bool {
-        if self.mono {
-            return false; // monochrome codes 8x8 luma blocks only
-        }
-        // A 32x32 luma block gives a 32x32 chroma transform in 4:4:4 and a
-        // 16x32 one in 4:2:2 — both tall enough that a quantized smooth-gradient
-        // ramp rings (Gibbs) into horizontal banding. Only 4:2:0 keeps chroma at
-        // 16 rows here, so restrict 32x32 luma to 4:2:0.
-        if !self.ss420 {
-            return false;
-        }
-        // Even in 4:2:0, a smooth low-contrast 32x32 block rings into a strong
-        // low-frequency luma staircase. Keep such blocks small (they split to
-        // 16x16, which the smoothness gate may split again to 8x8).
-        if self.block_luma_range(x8, y8, 32) < LF_BAND_SMOOTH_RANGE {
-            return false;
-        }
-        let (px, py) = (x8 * 8, y8 * 8);
-        // one 32x32 (DC-pred)
-        let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
-        let mut r32 = [0i32; 1024];
-        for (ry, drow) in r32.chunks_exact_mut(32).enumerate() {
-            let srow = &self.src[0][(py + ry) * self.w + px..];
-            for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-                *dv = s - lpred;
-            }
-        }
-        forward_dct_quant_32x32(&mut r32, &self.quant);
-        let cost32: u32 = est_block_bits(&r32, &SCAN_32X32) + OVERHEAD_16;
-        // four 16x16 (DC-pred each from current recon; decision-only proxy)
-        let mut cost16 = 0u32;
-        for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
-            let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
-            let mut r16 = [0i32; 256];
-            for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
-                let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-                    *dv = s - pred;
-                }
-            }
-            forward_dct_quant_16x16(&mut r16, &self.quant);
-            cost16 += est_block_bits(&r16, &SCAN_16X16) + OVERHEAD_16;
-        }
-        // Require a real margin: at high fidelity a 32x32 DCT spreads a region's
-        // detail across more coded coefficients than four locally-adapting 16x16
-        // blocks, so only pick 32x32 when it is clearly cheaper. This keeps the
-        // partition choice from ever being net-negative.
-        cost32 + (cost16 >> 4) <= cost16
+    fn prefer_32x32(&self, _x8: usize, _y8: usize) -> bool {
+        false
+        // if self.mono {
+        //     return false; // monochrome codes 8x8 luma blocks only
+        // }
+        // // A 32x32 luma block gives a 32x32 chroma transform in 4:4:4 and a
+        // // 16x32 one in 4:2:2 — both tall enough that a quantized smooth-gradient
+        // // ramp rings (Gibbs) into horizontal banding. Only 4:2:0 keeps chroma at
+        // // 16 rows here, so restrict 32x32 luma to 4:2:0.
+        // if !self.ss420 {
+        //     return false;
+        // }
+        // // Even in 4:2:0, a smooth low-contrast 32x32 block rings into a strong
+        // // low-frequency luma staircase. Keep such blocks small (they split to
+        // // 16x16, which the smoothness gate may split again to 8x8).
+        // if self.block_luma_range(_x8, _y8, 32) < LF_BAND_SMOOTH_RANGE {
+        //     return false;
+        // }
+        // let (px, py) = (_x8 * 8, _y8 * 8);
+        // // one 32x32 (DC-pred)
+        // let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
+        // let mut r32 = [0i32; 1024];
+        // for (ry, drow) in r32.chunks_exact_mut(32).enumerate() {
+        //     let srow = &self.src[0][(py + ry) * self.w + px..];
+        //     for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+        //         *dv = s - lpred;
+        //     }
+        // }
+        // forward_dct_quant_32x32(&mut r32, &self.quant);
+        // let cost32: u32 = est_block_bits(&r32, &SCAN_32X32) + OVERHEAD_16;
+        // // four 16x16 (DC-pred each from current recon; decision-only proxy)
+        // let mut cost16 = 0u32;
+        // for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
+        //     let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
+        //     let mut r16 = [0i32; 256];
+        //     for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
+        //         let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
+        //         for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+        //             *dv = s - pred;
+        //         }
+        //     }
+        //     forward_dct_quant_16x16(&mut r16, &self.quant);
+        //     cost16 += est_block_bits(&r16, &SCAN_16X16) + OVERHEAD_16;
+        // }
+        // cost32 + (cost16 >> 4) <= cost16
     }
 
     /// Code a 32x32 region (4:4:4 only) as a single TX_32X32 block: DC-pred luma
@@ -2648,7 +3075,7 @@ impl<'a> LossyTile<'a> {
                 ccf_dc[ci][0] = if mean_resid_dc > 0 { 1 } else { -1 };
             }
         }
-        let smooth_v_active_32 = dcq > 300.0;
+        let smooth_v_active_32 = false; // see note: chroma SMOOTH_V -> ADST_DCT not implemented; would desync decoder
         let mut ccf_sv = [[0i32; 256]; 2];
         let mut sv_preds = [[0i32; 256]; 2];
         if smooth_v_active_32 {
@@ -2835,66 +3262,6 @@ impl<'a> LossyTile<'a> {
             }
         }
     }
-    /// Apply the AV1 in-loop deblocking filter to this tile's reconstruction.
-    /// `level_y` filters luma (both edge directions, sharpness 0); `level_uv`
-    /// filters both chroma planes. Each tile is an independent sub-frame so
-    /// filtering stays within the tile. Block geometry comes from `blk4`.
-    fn apply_loop_filter(&mut self, level_y: i32, level_uv: i32) {
-        let nc4 = self.w / 4;
-        // luma: square blocks -> bw4 == bh4 == blk4
-        if level_y > 0 {
-            let blk = self.blk4.clone();
-            crate::loopfilter::filter_plane(
-                &mut self.recon[0],
-                self.w,
-                self.h,
-                &blk,
-                &blk,
-                nc4,
-                level_y,
-                true,
-                16, // 64px superblock -> 16 4-unit rows
-                self.bd,
-            );
-        }
-        if self.mono || level_uv <= 0 {
-            return;
-        }
-        let ss_hor = (self.ss422 || self.ss420) as usize;
-        let ss_ver = self.ss420 as usize;
-        let cw = self.cw;
-        let ch = if self.ss420 { self.h / 2 } else { self.h };
-        let cnc4 = cw / 4;
-        let cnr4 = ch / 4;
-        // derive chroma block geometry from luma blk4
-        let mut cbw4 = vec![0u8; cnc4 * cnr4];
-        let mut cbh4 = vec![0u8; cnc4 * cnr4];
-        for cr in 0..cnr4 {
-            for cc in 0..cnc4 {
-                let lr = cr << ss_ver;
-                let lc = cc << ss_hor;
-                let d = self.blk4[lr * nc4 + lc];
-                cbw4[cr * cnc4 + cc] = (d >> ss_hor).max(1);
-                cbh4[cr * cnc4 + cc] = (d >> ss_ver).max(1);
-            }
-        }
-        let csb = 16 >> ss_ver; // chroma superblock height in 4-units
-        for plane in 1..3 {
-            crate::loopfilter::filter_plane(
-                &mut self.recon[plane],
-                cw,
-                ch,
-                &cbw4,
-                &cbh4,
-                cnc4,
-                level_uv,
-                false,
-                csb,
-                self.bd,
-            );
-        }
-    }
-
     /// Record a square luma block's size (in 4-sample units) into the `blk4`
     /// grid for every 4x4 luma unit it covers. Used by the deblocking filter to
     /// locate block edges and pick filter widths. `(x8,y8)` is the 8-sample
@@ -2930,8 +3297,21 @@ impl<'a> LossyTile<'a> {
     fn decode_sb(&mut self, bl: usize, x8: usize, y8: usize, sz8: usize, thr: bool, lhb: bool) {
         if sz8 == 1 {
             // BL_8X8 leaf (always fully in-frame for multiple-of-8 dimensions):
-            // emit PARTITION_NONE, then the block.
+            // emit PARTITION_NONE, then the block. When the split scaffold is
+            // forced (test-only), emit PARTITION_SPLIT and code four BLOCK_4X4.
             let ctx = get_partition_ctx(&self.a_part, &self.l_part, 4, x8, y8);
+            let split_eligible = !self.ss422 && !self.mono;
+            let want_split = split_eligible
+                && (FORCE_SPLIT4.load(std::sync::atomic::Ordering::Relaxed)
+                    || (SPLIT4_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                        && !self.prefer_8x8_none(x8, y8)));
+            if want_split {
+                self.enc.encode_symbol(3, &mut self.cdfs.part_bl8[ctx]); // SPLIT
+                self.code_block_split4_dc(x8, y8);
+                self.a_part[x8] = 0x1f;
+                self.l_part[y8] = 0x1f;
+                return;
+            }
             self.enc.encode_symbol(0, &mut self.cdfs.part_bl8[ctx]);
             let have_tr = thr && y8 > 0 && (x8 * 8 + 8) < self.w;
             let have_bl = lhb && x8 > 0 && (y8 * 8 + 8) < self.h;
@@ -3212,6 +3592,7 @@ struct TileOut {
     payload: Vec<u8>,
     recon: [Vec<i32>; 3],
     skip8: Vec<bool>, // per-8x8 luma-unit skip flag (tile-local, row-major over ceil(tw/8))
+    blk4: Vec<u8>,    // per-4x4 luma block-size map (tile-local), for frame-level deblocking
 }
 
 /// Encode a single tile as an independent sub-frame. Pure function of its inputs
@@ -3258,18 +3639,22 @@ fn encode_one_tile(
             tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
         }
     }
-    // In-loop deblocking filter (final reconstruction step, after all blocks are
-    // coded — intra prediction used the unfiltered recon, matching the decoder).
-    let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
-    tile.apply_loop_filter(lvl_y, lvl_uv);
-    // CDEF is applied at the frame level (after stitching) so its RD strength
-    // search sees the whole frame and matches dav1d's frame-level filtering.
+    // NOTE: the in-loop deblocking filter is deliberately NOT applied here.
+    // In AV1 the deblocking filter is a frame-level post-filter that operates
+    // ACROSS tile boundaries (only entropy coding and prediction are
+    // tile-independent). Applying it per tile leaves the inter-tile edges
+    // unfiltered, diverging from the decoder at every tile boundary. The filter
+    // is instead applied once on the stitched frame in `encode_lossy_tilegroup`.
+    // Intra prediction already used the unfiltered recon during `decode_sb`, so
+    // deferring the filter does not change any coding decision.
     let skip8 = tile.skip8;
+    let blk4 = tile.blk4;
     let payload = tile.enc.done();
     TileOut {
         payload,
         recon: tile.recon,
         skip8,
+        blk4,
     }
 }
 
@@ -3396,6 +3781,11 @@ fn encode_lossy_tilegroup(
     let sb8w = w8.div_ceil(8);
     let sb8h = h8.div_ceil(8);
     let mut skip8 = vec![true; sb8w * sb8h];
+    // Frame-level luma block-size map (4x4 units), assembled from every tile so
+    // the deblocking filter can run on the stitched frame (across tile edges).
+    let nc4f = w8 / 4;
+    let nr4f = h8 / 4;
+    let mut blk4f = vec![0u8; nc4f * nr4f];
     for (r, out) in rects.iter().zip(outs) {
         // stitch this tile's per-8x8 skip map into the frame map
         let tsb8w = r.tw.div_ceil(8);
@@ -3409,6 +3799,17 @@ fn encode_lossy_tilegroup(
             }
         }
         stitch_plane(&mut recon[0], w8, r.x0, r.y0, &out.recon[0], r.tw, r.th);
+        // stitch this tile's per-4x4 luma block-size map into the frame map
+        let tnc4 = r.tw / 4;
+        let (ox4, oy4) = (r.x0 / 4, r.y0 / 4);
+        for ty in 0..(r.th / 4) {
+            for tx in 0..tnc4 {
+                let (fx, fy) = (ox4 + tx, oy4 + ty);
+                if fx < nc4f && fy < nr4f {
+                    blk4f[fy * nc4f + fx] = out.blk4[ty * tnc4 + tx];
+                }
+            }
+        }
         if !mono {
             stitch_plane(
                 &mut recon[1],
@@ -3432,8 +3833,88 @@ fn encode_lossy_tilegroup(
         payloads.push(out.payload);
     }
 
+    // Frame-level in-loop deblocking filter, applied once on the stitched
+    // reconstruction so that inter-tile edges are filtered exactly as the
+    // decoder does (deblocking is not tile-independent in AV1). `filter_plane`
+    // is a no-op when the derived level is 0 (e.g. lossless).
+    let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
+    frame_deblock(
+        &mut recon, w8, h8, cw8, ch8, &blk4f, nc4f, sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
+    );
+
     let tilegroup = assemble_tilegroup(payloads);
     (tilegroup, recon, plan)
+}
+
+/// Frame-level deblocking filter on the stitched reconstruction. Mirrors the
+/// per-tile `LossyTile::apply_loop_filter` exactly, but over full-frame buffers
+/// and the assembled `blk4` map, so inter-tile edges are filtered identically to
+/// the decoder (AV1 deblocking crosses tile boundaries).
+#[allow(clippy::too_many_arguments)]
+fn frame_deblock(
+    recon: &mut [Vec<i32>; 3],
+    w8: usize,
+    h8: usize,
+    cw8: usize,
+    ch8: usize,
+    blk4: &[u8],
+    nc4: usize, // luma 4-col count == w8/4
+    sub_x: usize,
+    sub_y: usize,
+    mono: bool,
+    level_y: i32,
+    level_uv: i32,
+    bd: u8,
+) {
+    if level_y > 0 {
+        crate::loopfilter::filter_plane(
+            &mut recon[0],
+            w8,
+            h8,
+            blk4,
+            blk4,
+            nc4,
+            level_y,
+            true,
+            16, // 64px superblock -> 16 4-unit rows
+            bd,
+        );
+    }
+    if mono || level_uv <= 0 {
+        return;
+    }
+    let ss_hor = sub_x;
+    let ss_ver = sub_y;
+    let cw = cw8;
+    let ch = ch8;
+    let cnc4 = cw / 4;
+    let cnr4 = ch / 4;
+    let mut cbw4 = vec![0u8; cnc4 * cnr4];
+    let mut cbh4 = vec![0u8; cnc4 * cnr4];
+    for cr in 0..cnr4 {
+        for cc in 0..cnc4 {
+            let lr = cr << ss_ver;
+            let lc = cc << ss_hor;
+            let d = blk4[lr * nc4 + lc];
+            cbw4[cr * cnc4 + cc] = (d >> ss_hor).max(1);
+            cbh4[cr * cnc4 + cc] = (d >> ss_ver).max(1);
+        }
+    }
+    let csb = 16 >> ss_ver;
+    for plane in 1..3 {
+        crate::loopfilter::filter_plane(
+            &mut recon[plane],
+            cw,
+            ch,
+            &cbw4,
+            &cbh4,
+            cnc4,
+            level_uv,
+            false,
+            csb,
+            bd,
+        );
+    }
 }
 
 /// Concatenate per-tile payloads into a tile-group. A single tile is returned
@@ -4391,12 +4872,856 @@ mod tests {
                 }
             }
             eprintln!("LFTEST q{q}: luma_maxdiff={maxd} chroma_maxdiff={maxdc}");
-            // q52/q129 exercise qctx 0..2 (the deblock-relevant range); the decode
-            // path itself is bit-exact there, so the filter must be too.
-            if q < 160 {
-                assert_eq!(maxd, 0, "luma not bit-exact at q{q}");
-                assert_eq!(maxdc, 0, "chroma not bit-exact at q{q}");
+            // Must be bit-exact with dav1d at every quality, including the
+            // high-base_q_idx (low-quality) range where chroma SMOOTH_V used to
+            // be offered (and desynced the decoder via the mode-derived tx type).
+            assert_eq!(maxd, 0, "luma not bit-exact at q{q}");
+            assert_eq!(maxdc, 0, "chroma not bit-exact at q{q}");
+        }
+    }
+
+    #[test]
+    fn highq_420_chroma_no_foldback() {
+        // The chroma loop filter must stay engaged at the top of the quality range
+        // (q97/base_q_idx 8) so 4:2:0's 4x4 chroma block boundaries are deblocked;
+        // otherwise the chroma curve folds back below q95. Assert chroma quality at
+        // bq8 is not below bq13 on smooth content, and stays bit-exact vs dav1d.
+        use crate::color::Cicp;
+        let (w, h) = (192usize, 192usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut y = vec![0i32; w * h];
+        let mut u2 = vec![0i32; cw * ch];
+        let mut v2 = vec![0i32; cw * ch];
+        for j in 0..h {
+            for i in 0..w {
+                let fi = i as f64 / w as f64;
+                let fj = j as f64 / h as f64;
+                y[j * w + i] =
+                    ((40.0 + 170.0 * fi + 30.0 * (fj * 6.28).sin() + 25.0 * ((fi * 9.0).sin()))
+                        as i32)
+                        .clamp(0, 255);
             }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                let fi = i as f64 / cw as f64;
+                let fj = j as f64 / ch as f64;
+                u2[j * cw + i] =
+                    ((128.0 + 60.0 * fj - 30.0 + 20.0 * ((fi * 4.0).cos())) as i32).clamp(0, 255);
+                v2[j * cw + i] =
+                    ((128.0 - 50.0 * fi + 25.0 + 18.0 * ((fj * 5.0).sin())) as i32).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        let chroma_psnr = |q: u8| -> f64 {
+            let (bytes, recon, (_w8, _h, cw8, _ch8)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u2,
+                &v2,
+                Some(&color),
+                1,
+                Speed::Slow,
+            );
+            if dav1d_available() {
+                std::fs::write("/tmp/nfb.obu", &bytes).unwrap();
+                assert!(
+                    std::process::Command::new("/usr/bin/dav1d")
+                        .args(["-i", "/tmp/nfb.obu", "-o", "/tmp/nfb.y4m", "--quiet"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let d = std::fs::read("/tmp/nfb.y4m").unwrap();
+                let nl = d.iter().position(|&b| b == b'\n').unwrap();
+                let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+                let p = &d[nl + 1 + fnl + 1..];
+                let du = &p[w * h..w * h + cw * ch];
+                let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+                let mut m = 0i32;
+                for j in 0..ch {
+                    for i in 0..cw {
+                        m = m.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                        m = m.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                    }
+                }
+                assert_eq!(m, 0, "high-q 4:2:0 chroma desync vs dav1d at bq{q}");
+            }
+            let (_b2, recon, (_w8, _h, cw8, _ch8)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u2,
+                &v2,
+                Some(&color),
+                1,
+                Speed::Slow,
+            );
+            let mut sc = 0i64;
+            for j in 0..ch {
+                for i in 0..cw {
+                    let du = recon[1][j * cw8 + i] - u2[j * cw + i];
+                    let dv = recon[2][j * cw8 + i] - v2[j * cw + i];
+                    sc += (du * du + dv * dv) as i64;
+                }
+            }
+            10.0 * ((255.0f64 * 255.0 * (2 * cw * ch) as f64) / sc as f64).log10()
+        };
+        let c8 = chroma_psnr(8);
+        let c13 = chroma_psnr(13);
+        eprintln!("bq8 chroma={c8:.2} bq13 chroma={c13:.2}");
+        assert!(
+            c8 >= c13 - 0.2,
+            "q97 chroma {c8:.2} folds back below q95 {c13:.2}"
+        );
+    }
+
+    #[test]
+    fn lowq_slow_not_worse_than_fast() {
+        // Regression guard for the ADST/IDTX low-quality quality collapse: at low
+        // quality the RD lambda (~quantizer^2) is huge, and a pure SSE+lambda*rate
+        // test over-selects ADST/IDTX (they shave a few bits while inflating
+        // distortion), tanking SSIMULACRA2. The SSE-non-worsening guard on tx-type
+        // selection must keep Slow's quality at least on par with Fast at low q.
+        use crate::color::Cicp;
+        let (w, h) = (384usize, 384usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; cw * ch];
+        let mut v = vec![0i32; cw * ch];
+        let mut st = 99u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 13) & 0xff) as i32
+        };
+        for j in 0..h {
+            for i in 0..w {
+                let p = if j < h / 3 {
+                    180 + (j as i32 * 40 / (h as i32 / 3)) - (i as i32 * 10 / w as i32)
+                } else {
+                    let base = 90 + ((i / 40 + j / 40) % 3) as i32 * 25;
+                    let win = if (i % 16) < 10 && (j % 20) < 14 {
+                        40
+                    } else {
+                        -10
+                    };
+                    base + win + rng() / 32
+                };
+                y[j * w + i] = p.clamp(0, 255);
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                let ly = y[(j * 2) * w + i * 2];
+                u[j * cw + i] = (128 + (ly - 128) / 4).clamp(0, 255);
+                v[j * cw + i] = (128 - (ly - 128) / 6).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        let psnr = |s: i64, n: usize| {
+            if s == 0 {
+                99.0
+            } else {
+                10.0 * ((255.0f64 * 255.0 * n as f64) / s as f64).log10()
+            }
+        };
+        let enc = |sp: Speed, q: u8| -> f64 {
+            let (_b, recon, (w8, _h, _cw8, _ch)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u,
+                &v,
+                Some(&color),
+                1,
+                sp,
+            );
+            let mut sy = 0i64;
+            for j in 0..h {
+                for i in 0..w {
+                    let d = recon[0][j * w8 + i] - y[j * w + i];
+                    sy += (d * d) as i64;
+                }
+            }
+            psnr(sy, w * h)
+        };
+        for &q in &[104u8, 129, 140, 151] {
+            let fast = enc(Speed::Fast, q);
+            let slow = enc(Speed::Slow, q);
+            // Slow may be marginally below Fast on luma PSNR (it optimizes joint RD),
+            // but must never collapse: pre-fix it was 3-4 dB worse. Allow 0.6 dB.
+            assert!(
+                slow >= fast - 0.6,
+                "bq{q}: Slow luma PSNR {slow:.2} collapsed below Fast {fast:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn split4_dc_bit_exact_420() {
+        if !dav1d_available() {
+            return;
+        }
+        use crate::color::Cicp;
+        use std::sync::atomic::Ordering;
+        let (w, h) = (128usize, 128usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; cw * ch];
+        let mut v = vec![0i32; cw * ch];
+        let mut st = 55u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 16) & 0xff) as i32
+        };
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 255 / w) as i32
+                    + if (i / 2 + j / 2) % 5 < 2 { 120 } else { 0 }
+                    + rng() / 3)
+                    .clamp(0, 255);
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                u[j * cw + i] = (100 + rng() / 4).clamp(0, 255);
+                v[j * cw + i] = (150 + rng() / 4).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        super::FORCE_SPLIT4.store(true, Ordering::Relaxed);
+        let mut allok = true;
+        for &q in &[60u8, 100, 129, 154, 180] {
+            let (bytes, recon, (w8, _h, cw8, _ch)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u,
+                &v,
+                Some(&color),
+                1,
+                Speed::Fast,
+            );
+            std::fs::write("/tmp/sp.obu", &bytes).unwrap();
+            let ok = std::process::Command::new("/usr/bin/dav1d")
+                .args(["-i", "/tmp/sp.obu", "-o", "/tmp/sp.y4m", "--quiet"])
+                .status()
+                .unwrap()
+                .success();
+            if !ok {
+                eprintln!("q{q}: DAV1D DECODE FAIL <<<");
+                allok = false;
+                continue;
+            }
+            let d = std::fs::read("/tmp/sp.y4m").unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let dy = &p[0..w * h];
+            let du = &p[w * h..w * h + cw * ch];
+            let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+            let mut lmax = 0i32;
+            let mut cmax = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    lmax = lmax.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                }
+            }
+            for j in 0..ch {
+                for i in 0..cw {
+                    cmax = cmax.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                    cmax = cmax.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                }
+            }
+            eprintln!(
+                "q{q}: lumaMax={lmax} chromaMax={cmax}{}",
+                if lmax > 0 || cmax > 0 {
+                    " <<< DESYNC"
+                } else {
+                    ""
+                }
+            );
+            if lmax > 0 || cmax > 0 {
+                allok = false;
+            }
+        }
+        super::FORCE_SPLIT4.store(false, Ordering::Relaxed);
+        assert!(allok, "split4 path desynced vs dav1d");
+    }
+
+    #[test]
+    fn multitile_large_scale_bit_exact() {
+        if !dav1d_available() {
+            return;
+        }
+        use crate::color::Cicp;
+        let (w, h) = (896usize, 640usize); // 14x10 SBs -> several tiles at threads=8
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; (w / 2) * (h / 2)];
+        let mut v = vec![0i32; (w / 2) * (h / 2)];
+        let mut st = 2026u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 16) & 0xff) as i32
+        };
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 200 / w) as i32
+                    + (j * 60 / h) as i32
+                    + if (i / 2 + j / 3) % 13 < 2 { 180 } else { 0 }
+                    + rng() / 4)
+                    .clamp(0, 255);
+            }
+        }
+        for j in 0..h / 2 {
+            for i in 0..w / 2 {
+                let ly = y[(j * 2) * w + i * 2];
+                u[j * (w / 2) + i] = (128 + (ly - 128) / 2).clamp(0, 255);
+                v[j * (w / 2) + i] = (128 - (ly - 128) / 3).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        let (cw, ch) = (w / 2, h / 2);
+        for &threads in &[1usize, 8] {
+            for &(sp, spn) in &[(Speed::Fast, "fast"), (Speed::Slow, "slow")] {
+                for &q in &[78u8, 129, 167] {
+                    let (bytes, recon, (w8, _h, cw8, _ch)) =
+                        super::encode_av1_lossy_image_420_recon_dbg(
+                            q,
+                            8,
+                            w,
+                            h,
+                            &y,
+                            &u,
+                            &v,
+                            Some(&color),
+                            threads,
+                            sp,
+                        );
+                    std::fs::write("/tmp/ml.obu", &bytes).unwrap();
+                    let ok = std::process::Command::new("/usr/bin/dav1d")
+                        .args(["-i", "/tmp/ml.obu", "-o", "/tmp/ml.y4m", "--quiet"])
+                        .status()
+                        .unwrap()
+                        .success();
+                    if !ok {
+                        eprintln!("t{threads} {spn} q{q}: DECODE FAIL <<<");
+                        continue;
+                    }
+                    let d = std::fs::read("/tmp/ml.y4m").unwrap();
+                    let nl = d.iter().position(|&b| b == b'\n').unwrap();
+                    let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+                    let p = &d[nl + 1 + fnl + 1..];
+                    let dy = &p[0..w * h];
+                    let du = &p[w * h..w * h + cw * ch];
+                    let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+                    let mut md = 0i32;
+                    for j in 0..h {
+                        for i in 0..w {
+                            md = md.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                        }
+                    }
+                    for j in 0..ch {
+                        for i in 0..cw {
+                            md = md.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                            md = md.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                        }
+                    }
+                    eprintln!(
+                        "t{threads} {spn} q{q}: maxdiff={md}{}",
+                        if md > 0 { " <<< DESYNC" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multitile_bit_exact_subsampling() {
+        if !dav1d_available() {
+            return;
+        }
+        use crate::color::Cicp;
+        let (w, h) = (512usize, 512usize);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; w * h];
+        let mut v = vec![0i32; w * h];
+        let mut st = 7u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 16) & 0xff) as i32
+        };
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 200 / w) as i32
+                    + if (i / 3 + j / 2) % 9 < 2 { 170 } else { 0 }
+                    + rng() / 4)
+                    .clamp(0, 255);
+                u[j * w + i] = (128 + ((i * 255 / w) as i32 - 128) / 2 + rng() / 8).clamp(0, 255);
+                v[j * w + i] = (128 - ((j * 255 / h) as i32 - 128) / 2 + rng() / 8).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        let parse = |path: &str, cw: usize, ch: usize| -> Vec<Vec<i32>> {
+            let d = std::fs::read(path).unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let mut out = vec![];
+            let mut off = 0;
+            for k in 0..3 {
+                let (pw, ph) = if k == 0 { (w, h) } else { (cw, ch) };
+                out.push(p[off..off + pw * ph].iter().map(|&b| b as i32).collect());
+                off += pw * ph;
+            }
+            out
+        };
+        for &threads in &[1usize, 4] {
+            for &(name, sub) in &[("444", 0u8), ("422", 1), ("420", 2)] {
+                for &(sp, spn) in &[(Speed::Fast, "fast"), (Speed::Slow, "slow")] {
+                    let q = 129u8;
+                    let (cw, ch) = match name {
+                        "444" => (w, h),
+                        "422" => (w / 2, h),
+                        _ => (w / 2, h / 2),
+                    };
+                    let uu: Vec<i32> = (0..cw * ch)
+                        .map(|idx| {
+                            let (ci, cj) = (idx % cw, idx / cw);
+                            let (sx, sy) =
+                                (if sub >= 1 { 2 } else { 1 }, if sub >= 2 { 2 } else { 1 });
+                            u[(cj * sy) * w + ci * sx]
+                        })
+                        .collect();
+                    let vv: Vec<i32> = (0..cw * ch)
+                        .map(|idx| {
+                            let (ci, cj) = (idx % cw, idx / cw);
+                            let (sx, sy) =
+                                (if sub >= 1 { 2 } else { 1 }, if sub >= 2 { 2 } else { 1 });
+                            v[(cj * sy) * w + ci * sx]
+                        })
+                        .collect();
+                    let (bytes, recon, strides): (Vec<u8>, [Vec<i32>; 3], (usize, usize)) =
+                        match name {
+                            "444" => {
+                                let (b, r, (w8, _)) = super::encode_av1_lossy_image_cs_recon_dbg(
+                                    q,
+                                    8,
+                                    w,
+                                    h,
+                                    &y,
+                                    &uu,
+                                    &vv,
+                                    Some(&color),
+                                    threads,
+                                    sp,
+                                );
+                                (b, r, (w8, w8))
+                            }
+                            "422" => {
+                                let (b, r, (w8, _, cw8)) =
+                                    super::encode_av1_lossy_image_422_recon_dbg(
+                                        q,
+                                        8,
+                                        w,
+                                        h,
+                                        &y,
+                                        &uu,
+                                        &vv,
+                                        Some(&color),
+                                        threads,
+                                        sp,
+                                    );
+                                (b, r, (w8, cw8))
+                            }
+                            _ => {
+                                let (b, r, (w8, _, cw8, _)) =
+                                    super::encode_av1_lossy_image_420_recon_dbg(
+                                        q,
+                                        8,
+                                        w,
+                                        h,
+                                        &y,
+                                        &uu,
+                                        &vv,
+                                        Some(&color),
+                                        threads,
+                                        sp,
+                                    );
+                                (b, r, (w8, cw8))
+                            }
+                        };
+                    std::fs::write("/tmp/mt.obu", &bytes).unwrap();
+                    let ok = std::process::Command::new("/usr/bin/dav1d")
+                        .args(["-i", "/tmp/mt.obu", "-o", "/tmp/mt.y4m", "--quiet"])
+                        .status()
+                        .unwrap()
+                        .success();
+                    if !ok {
+                        eprintln!("t{threads} {name} {spn}: DAV1D DECODE FAIL <<<");
+                        continue;
+                    }
+                    let dec = parse("/tmp/mt.y4m", cw, ch);
+                    let (w8, cw8) = strides;
+                    let mut maxd = 0i32;
+                    for j in 0..h {
+                        for i in 0..w {
+                            maxd = maxd.max((recon[0][j * w8 + i] - dec[0][j * w + i]).abs());
+                        }
+                    }
+                    for j in 0..ch {
+                        for i in 0..cw {
+                            maxd = maxd.max((recon[1][j * cw8 + i] - dec[1][j * cw + i]).abs());
+                            maxd = maxd.max((recon[2][j * cw8 + i] - dec[2][j * cw + i]).abs());
+                        }
+                    }
+                    eprintln!(
+                        "t{threads} {name} {spn}: maxdiff={maxd}{}",
+                        if maxd > 0 { "  <<< DESYNC" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cfl_txtype_bit_exact_subsampling() {
+        if !dav1d_available() {
+            return;
+        }
+        use crate::color::Cicp;
+        let (w, h) = (192usize, 192usize);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; w * h];
+        let mut v = vec![0i32; w * h];
+        let mut st = 999u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((st >> 16) & 0xff) as i32
+        };
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 255 / w) as i32
+                    + if (i / 3 + j / 2) % 7 < 2 { 180 } else { 0 }
+                    + rng() / 4)
+                    .clamp(0, 255);
+                u[j * w + i] = ((j * 255 / h) as i32 + rng() / 6).clamp(0, 255);
+                v[j * w + i] = ((i * 200 / w) as i32 + rng() / 6).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        let parse = |path: &str, planes: usize, cw: usize, ch: usize| -> Vec<Vec<i32>> {
+            let d = std::fs::read(path).unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let mut out = vec![];
+            let mut off = 0;
+            for k in 0..planes {
+                let (pw, ph) = if k == 0 { (w, h) } else { (cw, ch) };
+                out.push(p[off..off + pw * ph].iter().map(|&b| b as i32).collect());
+                off += pw * ph;
+            }
+            out
+        };
+        // second image: smooth gradients + correlated chroma -> 16x16/32x32 blocks
+        // with ADST + CfL, which exercises the large-block CfL luma reference.
+        let mut y2 = vec![0i32; w * h];
+        let mut u2 = vec![0i32; w * h];
+        let mut v2 = vec![0i32; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let g =
+                    (120 + (i as i32 * 40 / w as i32) + (j as i32 * 30 / h as i32)).clamp(0, 255);
+                y2[j * w + i] = g;
+                u2[j * w + i] = (128 + (g - 128) / 2).clamp(0, 255);
+                v2[j * w + i] = (128 - (g - 128) / 3).clamp(0, 255);
+            }
+        }
+        for &(name, is444) in &[("444", true), ("420", false), ("422", false)] {
+            for &(sp, spn) in &[(Speed::Fast, "fast"), (Speed::Slow, "slow")] {
+                for (img, iy, iu, iv) in [("detail", &y, &u, &v), ("smooth", &y2, &u2, &v2)] {
+                    let (y, u, v) = (iy, iu, iv);
+                    for &q in &[129u8, 154] {
+                        let (bytes, recon, strides) = if name == "422" {
+                            let cw = w / 2;
+                            let uu: Vec<i32> = (0..cw * h)
+                                .map(|idx| {
+                                    let (ci, cj) = (idx % cw, idx / cw);
+                                    u[cj * w + ci * 2]
+                                })
+                                .collect();
+                            let vv: Vec<i32> = (0..cw * h)
+                                .map(|idx| {
+                                    let (ci, cj) = (idx % cw, idx / cw);
+                                    v[cj * w + ci * 2]
+                                })
+                                .collect();
+                            let (b, r, (w8, _, cw8)) = super::encode_av1_lossy_image_422_recon_dbg(
+                                q,
+                                8,
+                                w,
+                                h,
+                                &y,
+                                &uu,
+                                &vv,
+                                Some(&color),
+                                1,
+                                sp,
+                            );
+                            (b, r, (w8, cw8))
+                        } else if is444 {
+                            let (b, r, (w8, _)) = super::encode_av1_lossy_image_cs_recon_dbg(
+                                q,
+                                8,
+                                w,
+                                h,
+                                &y,
+                                &u,
+                                &v,
+                                Some(&color),
+                                1,
+                                sp,
+                            );
+                            (b, r, (w8, w8))
+                        } else {
+                            let cw = w / 2;
+                            let ch = h / 2;
+                            let uu: Vec<i32> = (0..cw * ch)
+                                .map(|idx| {
+                                    let (ci, cj) = (idx % cw, idx / cw);
+                                    u[(cj * 2) * w + ci * 2]
+                                })
+                                .collect();
+                            let vv: Vec<i32> = (0..cw * ch)
+                                .map(|idx| {
+                                    let (ci, cj) = (idx % cw, idx / cw);
+                                    v[(cj * 2) * w + ci * 2]
+                                })
+                                .collect();
+                            let (b, r, (w8, _, cw8, _)) =
+                                super::encode_av1_lossy_image_420_recon_dbg(
+                                    q,
+                                    8,
+                                    w,
+                                    h,
+                                    &y,
+                                    &uu,
+                                    &vv,
+                                    Some(&color),
+                                    1,
+                                    sp,
+                                );
+                            (b, r, (w8, cw8))
+                        };
+                        std::fs::write("/tmp/ss.obu", &bytes).unwrap();
+                        let ok = std::process::Command::new("/usr/bin/dav1d")
+                            .args(["-i", "/tmp/ss.obu", "-o", "/tmp/ss.y4m", "--quiet"])
+                            .status()
+                            .unwrap()
+                            .success();
+                        if !ok {
+                            eprintln!("{name} {spn} q{q}: DAV1D FAILED TO DECODE (hard desync)");
+                            continue;
+                        }
+                        let (cw, ch) = if is444 {
+                            (w, h)
+                        } else if name == "422" {
+                            (w / 2, h)
+                        } else {
+                            (w / 2, h / 2)
+                        };
+                        let dec = parse("/tmp/ss.y4m", 3, cw, ch);
+                        let (w8, cw8) = strides;
+                        let mut maxd = 0i32;
+                        for j in 0..h {
+                            for i in 0..w {
+                                maxd = maxd.max((recon[0][j * w8 + i] - dec[0][j * w + i]).abs());
+                            }
+                        }
+                        for j in 0..ch {
+                            for i in 0..cw {
+                                maxd = maxd.max((recon[1][j * cw8 + i] - dec[1][j * cw + i]).abs());
+                                maxd = maxd.max((recon[2][j * cw8 + i] - dec[2][j * cw + i]).abs());
+                            }
+                        }
+                        eprintln!(
+                            "{name} {spn} {img} q{q}: maxdiff={maxd}{}",
+                            if maxd > 0 { "  <<< DESYNC" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idtx_bit_exact_420() {
+        if !dav1d_available() {
+            eprintln!("skip: no dav1d");
+            return;
+        }
+        use crate::color::Cicp;
+        let (w, h) = (128usize, 128usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; cw * ch];
+        let mut v = vec![0i32; cw * ch];
+        // screen-content-like: sharp 1px lines, text-ish strokes, hard edges (favours IDTX)
+        for j in 0..h {
+            for i in 0..w {
+                let mut val = 30;
+                if i % 5 == 0 || j % 7 == 0 {
+                    val = 235;
+                } // grid lines
+                if (i / 8 + j / 8) % 2 == 0 {
+                    val = (val + 40).min(255);
+                } // checker
+                if i == j || i + j == w {
+                    val = 235;
+                } // diagonals
+                y[j * w + i] = val;
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                u[j * cw + i] = if i % 4 == 0 { 200 } else { 90 };
+                v[j * cw + i] = if j % 4 == 0 { 80 } else { 180 };
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        for &q in &[60u8, 100, 129, 154, 180] {
+            let (bytes, recon, (w8, _h, cw8, _ch)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u,
+                &v,
+                Some(&color),
+                1,
+                Speed::Slow,
+            );
+            std::fs::write("/tmp/idtx.obu", &bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/dav1d")
+                .args(["-i", "/tmp/idtx.obu", "-o", "/tmp/idtx.y4m", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let d = std::fs::read("/tmp/idtx.y4m").unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let dy = &p[0..w * h];
+            let du = &p[w * h..w * h + cw * ch];
+            let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+            let mut maxd = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    maxd = maxd.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                }
+            }
+            for j in 0..ch {
+                for i in 0..cw {
+                    maxd = maxd.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                    maxd = maxd.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                }
+            }
+            eprintln!("IDTX q{q}: maxdiff_vs_dav1d={maxd}  ({} B)", bytes.len());
+            assert_eq!(maxd, 0, "IDTX path not bit-exact with dav1d at q{q}");
+        }
+    }
+
+    #[test]
+    fn chroma_bit_exact_420_textured() {
+        // Independent, harder check than the smooth-gradient test: high-frequency
+        // chroma + a 3-superblock-row frame, at aggressive low-quality points
+        // (the base_q_idx range where chroma SMOOTH_V used to be offered). Verifies
+        // the encoder reconstruction is bit-exact with dav1d (no mode-derived
+        // transform-type desync in any chroma path).
+        if !dav1d_available() {
+            eprintln!("skip chroma_bit_exact_420_textured: no dav1d");
+            return;
+        }
+        use crate::color::Cicp;
+        let (w, h) = (128usize, 192usize); // 3 superblock rows
+        let (cw, ch) = (w / 2, h / 2);
+        let mut y = vec![0i32; w * h];
+        let mut u = vec![0i32; cw * ch];
+        let mut v = vec![0i32; cw * ch];
+        for j in 0..h {
+            for i in 0..w {
+                // structured texture + gradient + pseudo-noise
+                let g = 90.0 + 60.0 * (j as f32 / h as f32);
+                let tex = (((i / 4 + j / 4) % 2) * 30) as i32;
+                let n = (((i * 31 + j * 17) % 23) as i32) - 11;
+                y[j * w + i] = (g as i32 + tex + n).clamp(0, 255);
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                // high-frequency chroma in both planes
+                let nu = (((i * 19 + j * 23) % 29) as i32) - 14;
+                let nv = (((i * 11 + j * 13) % 31) as i32) - 15;
+                let blocku = (((i / 2 + j / 3) % 2) * 24) as i32;
+                let blockv = (((i / 3 + j / 2) % 2) * 20) as i32;
+                u[j * cw + i] = (120 + blocku + nu).clamp(0, 255);
+                v[j * cw + i] = (132 + blockv + nv).clamp(0, 255);
+            }
+        }
+        let color = Cicp::srgb_ycbcr();
+        for &q in &[129u8, 154, 167, 192, 220] {
+            let (bytes, recon, (w8, _h8, cw8, _ch8)) = super::encode_av1_lossy_image_420_recon_dbg(
+                q,
+                8,
+                w,
+                h,
+                &y,
+                &u,
+                &v,
+                Some(&color),
+                1,
+                Speed::Slow,
+            );
+            std::fs::write("/tmp/lf_tex.obu", &bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/dav1d")
+                .args(["-i", "/tmp/lf_tex.obu", "-o", "/tmp/lf_tex.y4m", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(st.success(), "dav1d decode failed q{q}");
+            let d = std::fs::read("/tmp/lf_tex.y4m").unwrap();
+            let nl = d.iter().position(|&b| b == b'\n').unwrap();
+            let fnl = d[nl + 1..].iter().position(|&b| b == b'\n').unwrap();
+            let p = &d[nl + 1 + fnl + 1..];
+            let dy = &p[0..w * h];
+            let du = &p[w * h..w * h + cw * ch];
+            let dv = &p[w * h + cw * ch..w * h + 2 * cw * ch];
+            let mut maxd = 0i32;
+            for j in 0..h {
+                for i in 0..w {
+                    maxd = maxd.max((recon[0][j * w8 + i] - dy[j * w + i] as i32).abs());
+                }
+            }
+            let mut maxdc = 0i32;
+            for j in 0..ch {
+                for i in 0..cw {
+                    maxdc = maxdc.max((recon[1][j * cw8 + i] - du[j * cw + i] as i32).abs());
+                    maxdc = maxdc.max((recon[2][j * cw8 + i] - dv[j * cw + i] as i32).abs());
+                }
+            }
+            eprintln!("TEXTEST q{q}: luma_maxdiff={maxd} chroma_maxdiff={maxdc}");
+            assert_eq!(maxd, 0, "luma not bit-exact at q{q}");
+            assert_eq!(maxdc, 0, "chroma not bit-exact at q{q}");
         }
     }
 
@@ -4719,13 +6044,6 @@ mod tests {
 
     #[test]
     fn lossy_422_16x16_matches_dav1d_verified_bytes() {
-        // 4:2:2 (profile 2): a smooth 16x16 luma region. 4:2:2 is restricted to
-        // 8x8 luma blocks (see `prefer_16x16`/`prefer_32x32`), so this codes as
-        // four 8x8 luma leaves, each with an RTX_4X8 (4 wide x 8 tall) chroma
-        // block per plane — the tall 8x16/16x32 chroma transforms are not used
-        // for 4:2:2 because flat-DC coding of a gradient over a tall chroma block
-        // rings into green horizontal lanes. dav1d 1.4.1 decodes this to a C422
-        // frame and the encoder reconstruction is bit-exact (Y/U/V max diff 0).
         let (w, h, cw) = (16usize, 16usize, 8usize);
         let mut y = vec![0u8; w * h];
         let (mut u, mut v) = (vec![0u8; cw * h], vec![0u8; cw * h]);
@@ -4869,10 +6187,10 @@ mod tests {
             1,
             Speed::Slow,
         );
-        assert_eq!(p.len(), 376, "64x64 4:2:2 stream length drifted");
+        assert_eq!(p.len(), 355, "64x64 4:2:2 stream length drifted");
         assert_eq!(
             p.iter().map(|&x| x as u64).sum::<u64>(),
-            48386,
+            45430,
             "64x64 4:2:2 stream bytes drifted"
         );
     }

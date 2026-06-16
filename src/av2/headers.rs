@@ -25,6 +25,8 @@ pub(crate) struct Config {
     /// When set, emit a `coded_lossless` frame: base_q forced to 0, in-loop filters and
     /// the tx-mode bit omitted (avm forces `ONLY_4X4`). See [`frame_header`].
     pub(crate) lossless: bool,
+    /// Enable CfL chroma-from-luma signalling. Experimental, bitstream-affecting.
+    pub(crate) cfl: bool,
 }
 
 /// LEB128-encode an unsigned value.
@@ -93,7 +95,7 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     b.write_bit(0);
     b.write_bit(0);
     b.write_bit(0);
-    b.write_bit(0); // dip, edge filter, mrl, cfl
+    b.write_bit(config.cfl as u32); // dip, edge filter, mrl, cfl_intra (this bit = enable_cfl_intra)
     if has_chroma {
         b.write_bits(0, 2); // cfl downsample filter index
     }

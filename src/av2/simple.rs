@@ -44,13 +44,12 @@ fn encode_rgb_color<T: Pixel>(
     img: &PlanarImage<T>,
     chroma: ChromaFormat,
     color: &Cicp,
-    threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     match chroma {
-        ChromaFormat::Yuv444 => enc.encode_image_444(img, color, threads),
-        ChromaFormat::Yuv422 => enc.encode_image_422(img, color, threads),
-        ChromaFormat::Yuv420 => enc.encode_image_420(img, color, threads),
-        ChromaFormat::Monochrome => enc.encode_image_400(img, color, threads),
+        ChromaFormat::Yuv444 => enc.encode_image_444(img, color),
+        ChromaFormat::Yuv422 => enc.encode_image_422(img, color),
+        ChromaFormat::Yuv420 => enc.encode_image_420(img, color),
+        ChromaFormat::Monochrome => enc.encode_image_400(img, color),
     }
 }
 
@@ -61,13 +60,12 @@ fn encode_yuv_color<T: Pixel>(
     img: &PlanarImage<T>,
     chroma: ChromaFormat,
     color: &Cicp,
-    threads: usize,
 ) -> Result<Av2Frame, EncodeError> {
     match chroma {
-        ChromaFormat::Yuv444 => enc.encode_yuv444(img, color, threads),
-        ChromaFormat::Yuv422 => enc.encode_yuv422(img, color, threads),
-        ChromaFormat::Yuv420 => enc.encode_yuv420(img, color, threads),
-        ChromaFormat::Monochrome => enc.encode_yuv400(img, color, threads),
+        ChromaFormat::Yuv444 => enc.encode_yuv444(img, color),
+        ChromaFormat::Yuv422 => enc.encode_yuv422(img, color),
+        ChromaFormat::Yuv420 => enc.encode_yuv420(img, color),
+        ChromaFormat::Monochrome => enc.encode_yuv400(img, color),
     }
 }
 
@@ -83,7 +81,7 @@ fn encode_alpha<T: Pixel>(
     // base_q_idx = 0 ⇒ the mono path takes its lossless branch.
     Av2Encoder::with_bit_depth(0, bit_depth.bits())
         .with_threads(threads)
-        .encode_image_400(alpha_mono, color, threads)
+        .encode_image_400(alpha_mono, color)
 }
 
 /// Common preamble: enforce the expected bit depth, validate dims + config, and
@@ -105,7 +103,8 @@ fn prepare(
             .with_tiles(8, 8)
             .with_txpart(TxPart::ThreeWay)
             .with_speed(cfg.speed)
-            .with_threads(cfg.threads),
+            .with_threads(cfg.threads)
+            .with_cfl(true),
     )
 }
 
@@ -164,7 +163,7 @@ fn rgb_core<T: Pixel>(
     validate_buf(&img.planes[1], w as u32, h as u32, 1)?;
     validate_buf(&img.planes[2], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
+    let frame = encode_rgb_color(&enc, img, cfg.chroma, &color)?;
     Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
@@ -181,7 +180,7 @@ fn rgba_drop_core<T: Pixel>(
     validate_buf(&img.planes[2], w as u32, h as u32, 1)?;
     validate_buf(&img.planes[3], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
+    let frame = encode_rgb_color(&enc, img, cfg.chroma, &color)?;
     Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
@@ -197,7 +196,7 @@ fn rgba_alpha_core<T: Pixel>(
     validate_buf(&img.planes[2], w as u32, h as u32, 1)?;
     validate_buf(&img.planes[3], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let color_frame = encode_rgb_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
+    let color_frame = encode_rgb_color(&enc, img, cfg.chroma, &color)?;
     let alpha_frame = encode_alpha(&img.packed_alpha_4(), img.bit_depth, &color, cfg.threads)?;
     Av2Encoder::wrap_avif_alpha(
         &color_frame,
@@ -218,7 +217,7 @@ fn gray_core<T: Pixel>(
     let enc = prepare_lossless_capable(img.bit_depth, want, w, h, cfg)?;
     validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let frame = enc.encode_image_400(img, &color, cfg.threads)?;
+    let frame = enc.encode_image_400(img, &color)?;
     Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
@@ -236,7 +235,7 @@ fn yuv_core<T: Pixel>(
     };
     img.validate_with(cfg.chroma)?;
     let color = resolve_color(cfg);
-    let frame = encode_yuv_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
+    let frame = encode_yuv_color(&enc, img, cfg.chroma, &color)?;
     Av2Encoder::wrap_avif(&frame, icc(cfg), exif(cfg), orientation(cfg), clli(cfg))
 }
 
@@ -255,7 +254,7 @@ fn yuva_alpha_core<T: Pixel>(
     img.validate_with(cfg.chroma)?;
     validate_buf(&img.planes[3], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let color_frame = encode_yuv_color(&enc, img, cfg.chroma, &color, cfg.threads)?;
+    let color_frame = encode_yuv_color(&enc, img, cfg.chroma, &color)?;
     let alpha_frame = encode_alpha(&img.packed_alpha_4(), img.bit_depth, &color, cfg.threads)?;
     Av2Encoder::wrap_avif_alpha(
         &color_frame,
@@ -277,7 +276,7 @@ fn gray_alpha_core<T: Pixel>(
     validate_buf(&img.planes[0], w as u32, h as u32, 1)?;
     validate_buf(&img.planes[1], w as u32, h as u32, 1)?;
     let color = resolve_color(cfg);
-    let color_frame = enc.encode_image_400(img, &color, cfg.threads)?;
+    let color_frame = enc.encode_image_400(img, &color)?;
     let alpha_frame = encode_alpha(&img.packed_alpha_2(), img.bit_depth, &color, cfg.threads)?;
     Av2Encoder::wrap_avif_alpha(
         &color_frame,

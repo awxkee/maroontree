@@ -384,3 +384,118 @@ pub(crate) fn apply_orientation(
         other => apply_orientation(ImageRgba8(other.to_rgba8()), orientation),
     }
 }
+
+/// Apply EXIF orientation to a `DynamicImage`, consuming it and returning
+/// the corrected image.  After this the orientation is baked into pixels,
+/// so the EXIF tag should be reset to 1 on output.
+#[cfg(feature = "vvc")]
+pub(crate) fn apply_orientation_vvc(
+    img: image::DynamicImage,
+    orientation: garnetash::Orientation,
+) -> image::DynamicImage {
+    let op = match orientation {
+        garnetash::Orientation::Normal => return img,
+        garnetash::Orientation::FlipH => Op::Flip,
+        garnetash::Orientation::FlipV => Op::Flop,
+        garnetash::Orientation::Rotate180 => Op::Rotate180,
+        garnetash::Orientation::Rotate90 => Op::Transpose(FlipMode::Flip, FlopMode::Flop),
+        garnetash::Orientation::Rotate270 => Op::Transpose(FlipMode::NoFlip, FlopMode::NoFlop),
+        garnetash::Orientation::Transpose => Op::Transpose(FlipMode::NoFlip, FlopMode::Flop),
+        garnetash::Orientation::Transverse => Op::Transpose(FlipMode::Flip, FlopMode::NoFlop),
+    };
+
+    let (width, height) = img.dimensions();
+    let (w, h) = (width as usize, height as usize);
+    let (out_w, out_h) = match orientation {
+        garnetash::Orientation::Transpose => (h, w),
+        garnetash::Orientation::Rotate90 => (h, w),
+        garnetash::Orientation::Rotate270 => (h, w),
+        _ => (w, h),
+    };
+
+    use image::DynamicImage::*;
+    match img {
+        ImageLuma8(buf) => ImageLuma8(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, plane_u8, buf.as_raw(), w, h, 1, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageLumaA8(buf) => ImageLumaA8(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, plane_alpha_u8, buf.as_raw(), w, h, 2, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgb8(buf) => ImageRgb8(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgb_u8, buf.as_raw(), w, h, 3, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgba8(buf) => ImageRgba8(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgba_u8, buf.as_raw(), w, h, 4, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageLuma16(buf) => ImageLuma16(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, plane_u16, buf.as_raw(), w, h, 1, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageLumaA16(buf) => ImageLumaA16(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, plane_alpha_u16, buf.as_raw(), w, h, 2, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgb16(buf) => ImageRgb16(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgb_u16, buf.as_raw(), w, h, 3, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgba16(buf) => ImageRgba16(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgba_u16, buf.as_raw(), w, h, 4, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgb32F(buf) => ImageRgb32F(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgb_f32, buf.as_raw(), w, h, 3, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        ImageRgba32F(buf) => ImageRgba32F(
+            image::ImageBuffer::from_raw(
+                out_w as u32,
+                out_h as u32,
+                apply_op!(op, rgba_f32, buf.as_raw(), w, h, 4, out_w, out_h),
+            )
+            .unwrap(),
+        ),
+        // fallback for any future variants
+        other => apply_orientation_vvc(ImageRgba8(other.to_rgba8()), orientation),
+    }
+}

@@ -36,21 +36,6 @@ use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
 use crate::{BitDepth, ChromaFormat, EncodeConfig, isobmff};
 
-/// A planar image with a fixed four-plane layout.
-///
-/// `planes[0..3]` are the full-resolution colour planes; for identity RGB they
-/// hold G, B, R (AV1 GBR ordering), and for pre-converted YCbCr they hold
-/// Y, Cb, Cr. `planes[3]` is the optional alpha plane.
-///
-/// A plane that is not present is stored as an empty `Vec`:
-/// * monochrome (4:0:0) uses only `planes[0]`;
-/// * subsampled chroma sizes are validated by the `validate_*` methods;
-/// * an image without alpha has an empty `planes[3]` (see [`Self::has_alpha`]).
-///
-/// Carrying alpha as the fourth plane lets a single deinterleave
-/// ([`Self::from_interleaved_rgba`] / [`Self::from_interleaved_gray_alpha`])
-/// populate the whole image, instead of splitting interleaved input into a
-/// colour buffer plus a side alpha buffer at every call site.
 pub struct PlanarImage<T: Pixel> {
     pub width: usize,
     pub height: usize,

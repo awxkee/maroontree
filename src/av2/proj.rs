@@ -331,8 +331,6 @@ impl Basis {
     }
 }
 
-/// The 16 KB 1D bases are embedded directly in the binary, so the default encode
-
 /// Build the full transform-basis table. Every basis runs the avm forward DCT/ADST;
 /// `.fwd` selects which, `qstep` is set later by [`Bases::rescaled_to_q`].
 pub(crate) fn default_bases() -> Bases {

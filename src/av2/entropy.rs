@@ -26,13 +26,19 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-pub(crate) static MIN_PROB: [[u16; 8]; 7] = [
+pub(crate) static MIN_PROB: [[u16; 8]; 8] = [
     [63, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
     [47, 87, 65535, 65535, 65535, 65535, 65535, 65535],
     [31, 63, 95, 65535, 65535, 65535, 65535, 65535],
     [31, 55, 79, 103, 65535, 65535, 65535, 65535],
     [23, 47, 63, 87, 111, 65535, 65535, 65535],
     [23, 39, 55, 79, 95, 111, 65535, 65535],
+    [15, 31, 47, 63, 79, 95, 111, 65535],
+    // nsyms = 8 (CfL joint-sign / alpha-magnitude). The avm decoder scales with
+    // av2_prob_inc_tbl[nsym-2] = row 6 for nsyms=8. Matching boundary(k) gives
+    // MIN_PROB[7][k] = 127 - 8*av2_prob_inc_tbl[6][k] (the low-7-bit |127 vs >>7<<4
+    // terms cancel exactly), inc_tbl[6] = {14,12,10,8,6,4,2,0} ->
+    // {15,31,47,63,79,95,111, sentinel}. Verified bit-exact vs avm od_ec_prob_scale.
     [15, 31, 47, 63, 79, 95, 111, 65535],
 ];
 
@@ -125,6 +131,20 @@ pub(crate) struct RangeEncoder {
     /// CDF band avmdec loads (0:q<=90, 1:91..140, 2:141..190, 3:>=191).
     /// Defaults to 1 so legacy q120 paths are unchanged.
     pub(crate) qc: usize,
+    /// Emit CfL (chroma-from-luma) signalling for chroma-ref blocks. Set per encode
+    /// from the tuning flag; false keeps the bitstream byte-identical.
+    pub(crate) cfl: bool,
+    /// Per-block CfL state, set just before the block's mode encode. `cfl_ctx` is the
+    /// is_cfl neighbour context (0..2). `cfl_use` selects CfL (uv_mode = UV_CFL_PRED);
+    /// when true, `cfl_js`/`cfl_mag_u`/`cfl_mag_v` + `cfl_ctx_u`/`cfl_ctx_v` carry the
+    /// resolved joint-sign, per-plane magnitude indices and alpha-cdf contexts.
+    pub(crate) cfl_ctx: usize,
+    pub(crate) cfl_use: bool,
+    pub(crate) cfl_js: u8,
+    pub(crate) cfl_mag_u: u8,
+    pub(crate) cfl_mag_v: u8,
+    pub(crate) cfl_ctx_u: usize,
+    pub(crate) cfl_ctx_v: usize,
 }
 
 impl RangeEncoder {
@@ -135,6 +155,14 @@ impl RangeEncoder {
             count: -9,
             output: vec![],
             qc: 1,
+            cfl: false,
+            cfl_ctx: 0,
+            cfl_use: false,
+            cfl_js: 0,
+            cfl_mag_u: 0,
+            cfl_mag_v: 0,
+            cfl_ctx_u: 0,
+            cfl_ctx_v: 0,
         }
     }
 

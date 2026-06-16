@@ -30,6 +30,8 @@ mod av2_itx;
 mod avif;
 mod cdfs_qctx;
 mod cdfx_4tx;
+#[allow(dead_code)]
+mod cfl;
 mod chroma422;
 mod coder;
 mod csc;
@@ -157,6 +159,8 @@ pub struct Tuning {
     pub deblock: bool,
     /// Enable the in-loop CDEF (directional de-ring).
     pub cdef: bool,
+    /// Enable AV2 chroma-from-luma (CfL) intra prediction. Experimental; bitstream-affecting.
+    pub cfl: bool,
 }
 
 impl Default for Tuning {
@@ -169,6 +173,7 @@ impl Default for Tuning {
             part_lambda_c: 0.0001,
             deblock: true,
             cdef: false,
+            cfl: false,
         }
     }
 }
@@ -394,6 +399,12 @@ impl Av2Encoder {
         self
     }
 
+    /// Enable AV2 chroma-from-luma (CfL) intra prediction (experimental). Off by default.
+    pub fn with_cfl(mut self, on: bool) -> Self {
+        self.tune.cfl = on;
+        self
+    }
+
     /// Current tuning.
     pub fn tuning(&self) -> Tuning {
         self.tune
@@ -422,6 +433,7 @@ impl Av2Encoder {
             },
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
+            cfl: self.tune.cfl && self.base_q_idx != 0,
         }
     }
 

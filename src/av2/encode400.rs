@@ -237,7 +237,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -276,7 +276,7 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -368,7 +368,7 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -456,7 +456,6 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &Cicp,
-        threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_400()?;
         let width = planar_image.width;
@@ -472,14 +471,22 @@ impl Av2Encoder {
         let config = self.config(layout);
 
         if config.lossless {
-            return Ok(
-                self.encode_yuv400_lossless(&yp, pw, ph, width, height, &config, color, threads)
-            );
+            return Ok(self.encode_yuv400_lossless(
+                &yp,
+                pw,
+                ph,
+                width,
+                height,
+                &config,
+                color,
+                self.threads,
+            ));
         }
 
         let mut recy = vec![0f32; pw * ph];
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
@@ -547,7 +554,7 @@ impl Av2Encoder {
                     sb_x,
                     &bases.luma,
                     qstep_i,
-                    &crate::av2::tables::SCAN,
+                    &tables::SCAN,
                     neutral,
                     qc,
                     self.tune.rdoq_lambda,
@@ -595,7 +602,8 @@ impl Av2Encoder {
         threads: usize,
     ) -> Av2Frame {
         let mut enc = RangeEncoder::new();
-        enc.qc = get_q_ctx(self.base_q_idx); // base_q=0 -> q-context 0
+        enc.qc = get_q_ctx(self.base_q_idx);
+        enc.cfl = self.tune.cfl && self.base_q_idx != 0; // base_q=0 -> q-context 0
         let neutral = self.dc_neutral();
         let sb_cols = pw / 64;
         let sb_rows = ph / 64;
@@ -707,7 +715,6 @@ impl Av2Encoder {
         &self,
         img: &PlanarImage<T>,
         color: &Cicp,
-        threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_400()?;
         validate_dims(img.width as u32, img.height as u32)?;
@@ -720,7 +727,6 @@ impl Av2Encoder {
                 planes: [plane, Vec::new(), Vec::new(), Vec::new()],
             },
             color,
-            threads,
         )
     }
 }

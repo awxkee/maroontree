@@ -832,6 +832,122 @@ pub(crate) fn encode_4x4_chroma_coeffs(
     res_ctx
 }
 
+/// 4x4 LUMA coefficient coder (TX_4X4, plane 0) with intra tx-type signalling.
+/// Mirrors `encode_4x4_chroma_coeffs` but on the luma coef CDFs and emits the
+/// `txtp4` symbol (IDTX=0/DCT_DCT=1/ADST_ADST=4) after `all_zero=0`.
+pub(crate) fn encode_tx4_luma_coeffs_adapt(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 16],
+    skip_ctx: usize,
+    dcs_ctx: usize,
+    y_mode: usize,
+    txtp: usize,
+) -> u8 {
+    let mut eob = 0usize;
+    let mut cul: u32 = 0u32;
+    for (i, &rc) in SCAN_4X4.iter().enumerate() {
+        let v = cf[rc].unsigned_abs();
+        cul += v;
+        if v != 0 {
+            eob = i;
+        }
+    }
+    if cul == 0 {
+        enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
+        return 0x40;
+    }
+    enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
+    enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]); // luma TX_4X4: 0=IDTX,1=DCT_DCT,4=ADST_ADST
+
+    let dc_sign_bits: u8 = if cf[0] == 0 {
+        1 << 6
+    } else if cf[0] < 0 {
+        0
+    } else {
+        2 << 6
+    };
+    let res_ctx = (cul.min(63) as u8) | dc_sign_bits;
+    if eob == 0 {
+        encode_dc_tail(
+            enc,
+            cf[0],
+            &mut cdfs.eob_bin_16_l,
+            &mut cdfs.eob_base[0][0][0],
+            &mut cdfs.dc_sign[0][dcs_ctx],
+            &mut cdfs.br_tok[0][0][0],
+        );
+        return res_ctx;
+    }
+    // eob_pt
+    let eob_bin = if eob < 2 {
+        eob
+    } else {
+        32 - (eob as u32).leading_zeros() as usize
+    };
+    enc.encode_symbol(eob_bin, &mut cdfs.eob_bin_16_l);
+    if eob_bin > 1 {
+        let nbits = eob_bin - 2;
+        let hi = (eob >> nbits) & 1;
+        enc.encode_symbol(hi, &mut cdfs.eob_hi[0][0][eob_bin]);
+        for b in (0..nbits).rev() {
+            enc.encode_bool((eob >> b) & 1 == 1, 16384);
+        }
+    }
+    let mut levels = [0u8; 80];
+    // eob-ctx thresholds: sw*sh = imin(w,8)*imin(h,8) = 1*1 = 1
+    let ctx_e = 1 + (eob > 2) as usize + (eob > 4) as usize;
+    let rc = SCAN_4X4[eob];
+    let (ex, ey) = (rc >> 2, rc & 3);
+    let m = cf[rc].unsigned_abs();
+    let eob_tok = m.min(3) - 1;
+    enc.encode_symbol(eob_tok as usize, &mut cdfs.eob_base[0][0][ctx_e]);
+    if eob_tok == 2 {
+        let bc = if (ex | ey) > 1 { 14 } else { 7 };
+        encode_hi_tok(enc, m, &mut cdfs.br_tok[0][0][bc]);
+    }
+    levels[ex * 4 + ey] = level_byte(m);
+    for i in (1..eob).rev() {
+        let rc_i = SCAN_4X4[i];
+        let (x, y) = (rc_i >> 2, rc_i & 3);
+        let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 4);
+        let m = cf[rc_i].unsigned_abs();
+        let tok = m.min(3);
+        enc.encode_symbol(tok as usize, &mut cdfs.base_tok[0][0][ctx]);
+        if tok == 3 {
+            let mag = hi_mag & 63;
+            let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
+            encode_hi_tok(enc, m, &mut cdfs.br_tok[0][0][bc as usize]);
+        }
+        levels[x * 4 + y] = level_byte(m);
+    }
+    // DC
+    let dm = cf[0].unsigned_abs();
+    let dc_tok = dm.min(3);
+    enc.encode_symbol(dc_tok as usize, &mut cdfs.base_tok[0][0][0]);
+    if dc_tok == 3 {
+        let mag = (levels[1] as u32 + levels[4] as u32 + levels[5] as u32) & 63;
+        let bc = if mag > 12 { 6 } else { (mag + 1) >> 1 };
+        encode_hi_tok(enc, dm, &mut cdfs.br_tok[0][0][bc as usize]);
+    }
+    if cf[0] != 0 {
+        enc.encode_symbol((cf[0] < 0) as usize, &mut cdfs.dc_sign[0][dcs_ctx]);
+        if dm >= 15 {
+            encode_golomb(enc, dm - 15);
+        }
+    }
+    for i in 1..=eob {
+        let c = cf[SCAN_4X4[i]];
+        if c != 0 {
+            enc.encode_bool(c < 0, 16384);
+            if c.unsigned_abs() >= 15 {
+                encode_golomb(enc, c.unsigned_abs() - 15);
+            }
+        }
+    }
+    res_ctx
+}
+
 /// 4:2:2 chroma coefficient coder for an `RTX_16X32` block (16 wide x 32 tall,
 /// 512 coeffs, `cf[fx*32+fy]`). `txsize_sqr_up[RTX_16X32] = TX_32X32`, so the
 /// base/br/eob-base/eob-hi/dc-sign/skip CDFs are coef-CDF class `ctx=3`; only

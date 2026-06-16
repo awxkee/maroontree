@@ -206,8 +206,7 @@ pub(crate) fn forward_dct_quant_16x16_t(
     dct16x16_t(residual, q)
 }
 
-/// Forward DCT + quantize a 32x32 residual via the shared integer DCT in
-/// `crate::dct`. Recon is the exact integer inverse.
+#[allow(unused)]
 pub(crate) fn forward_dct_quant_32x32(residual: &mut [i32; 1024], q: &impl Dct) {
     dct32x32(residual, q)
 }
@@ -242,7 +241,6 @@ pub(crate) fn forward_dct_quant_16x32_t(
     dct16x32_t(residual, q)
 }
 
-/// As [`forward_dct_quant_4x4`] but also returns the pre-round real targets.
 pub(crate) fn forward_dct_quant_4x4_t(
     residual: &[i32; 16],
     q: &impl Dct,

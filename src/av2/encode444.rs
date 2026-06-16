@@ -26,8 +26,8 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 use super::*;
+use crate::av2::cfl::{cfl_decide_64, cfl_prediction};
 
 /// Resolve the requested tile grid (`Tuning::tile_cols/rows`) into (log2_cols,
 /// log2_rows). Rounds each request up to a power of two and clamps to the available
@@ -192,7 +192,6 @@ impl Av2Encoder {
         &self,
         planar_image: &PlanarImage<T>,
         color: &Cicp,
-        threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         planar_image.validate_444()?;
         let width = planar_image.width;
@@ -202,7 +201,7 @@ impl Av2Encoder {
         let cb = &planar_image.planes[1];
         let cr = &planar_image.planes[2];
         if self.base_q_idx == 0 {
-            return self.encode_yuv444_lossless(planar_image, color, threads);
+            return self.encode_yuv444_lossless(planar_image, color, self.threads);
         }
         let to_plane = |s: &[T]| s.iter().map(|p| p.to_f32()).collect::<Vec<f32>>();
         let (yf, cbf, crf) = (to_plane(y), to_plane(cb), to_plane(cr));
@@ -212,7 +211,16 @@ impl Av2Encoder {
             tile_grid_for(self.tune.tile_cols, self.tune.tile_rows, width, height)
         {
             return Ok(self.encode_444_tiled(
-                &yf, &cbf, &crf, width, height, &config, color, log2c, log2r, threads,
+                &yf,
+                &cbf,
+                &crf,
+                width,
+                height,
+                &config,
+                color,
+                log2c,
+                log2r,
+                self.threads,
             ));
         }
         let enc = self.encode_444_core(&yf, &cbf, &crf, width, height);
@@ -250,13 +258,14 @@ impl Av2Encoder {
         let mut recv = vec![0f32; pw * ph];
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let mut above = vec![0x40u8; pw / 4 + 16];
         let mut left = vec![0x40u8; ph / 4 + 16];
         let sb_cols = pw / 64;
         let sb_rows = ph / 64;
-        // Per-mi chroma neighbour coeff-presence (mirrors the luma above/left arrays):
+        // Per-mi chroma neighbor coeff-presence (mirrors the luma above/left arrays):
         // `*_above[mi_col]` / `*_left[mi_row]` hold whether the most recent TU covering
         // that column/row had U/V coeffs. Per-mi (not per-SB) so that multiple chroma
         // TUs within one SB — e.g. the two vertically stacked 8×32 residue-2 leaves —
@@ -265,7 +274,12 @@ impl Av2Encoder {
         let mut v_above = vec![0i32; tmc as usize + 16];
         let mut u_left = vec![0i32; tmr as usize + 16];
         let mut v_left = vec![0i32; tmr as usize + 16];
-        let qstep_i = crate::av2::quant::qstep(self.base_q_idx as u32) as i32;
+        // Per-mi CfL-usage neighbors for get_cfl_ctx: `cfl_above[mi_col]` / `cfl_left
+        // [mi_row]` hold whether the chroma block covering that column/row used CfL
+        // (uv_mode == UV_CFL_PRED). is_cfl context = above_used + left_used (0..2).
+        let mut cfl_above = vec![0i32; tmc as usize + 16];
+        let mut cfl_left = vec![0i32; tmr as usize + 16];
+        let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
         // Bottom-edge force-split: the last SB row is 32 px tall in frame, so each
         // 64X64 force-splits HORZ (implied, no bits) into a top 64X32 leaf coded by
         // the partition leaf path. Partition context `above_pctx` persists down
@@ -330,7 +344,7 @@ impl Av2Encoder {
                         sb_x,
                         &bases.luma,
                         qstep_i,
-                        &crate::av2::tables::SCAN,
+                        &tables::SCAN,
                         neutral,
                         qc,
                         rdoq_lambda,
@@ -480,6 +494,43 @@ impl Av2Encoder {
                     }
                     // ---- commit winner ----
                     restore(&mut recy, &snap_best);
+                    // CfL decision (4:4:4 whole-64 fast path). recy is final here; recu/
+                    // recv hold the neighbour reconstructions for the DC prediction. The
+                    // is_cfl context comes from CfL-usage neighbours. This sets the
+                    // per-block CfL state consumed by encode_intra_modes during the
+                    // luma-block encode below (which emits is_cfl + alphas).
+                    let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
+                    let cfl_l = if fmc > 0 { cfl_left[fmr] } else { 0 };
+                    enc.cfl_ctx = (cfl_a + cfl_l) as usize;
+                    let cfl_choice = if enc.cfl {
+                        cfl_decide_64(
+                            &recy,
+                            &up,
+                            &vp,
+                            &recu,
+                            &recv,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            self.bit_depth as i32,
+                            neutral,
+                            &bases.chroma444,
+                            qstep_i,
+                            lambda,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(ref ch) = cfl_choice {
+                        enc.cfl_use = true;
+                        enc.cfl_js = ch.js;
+                        enc.cfl_mag_u = ch.mag_u;
+                        enc.cfl_mag_v = ch.mag_v;
+                        enc.cfl_ctx_u = ch.ctx_u;
+                        enc.cfl_ctx_v = ch.ctx_v;
+                    } else {
+                        enc.cfl_use = false;
+                    }
                     match best {
                         Part::Vert4 => {
                             let mut skip_cdfs = [0u32; 4];
@@ -556,46 +607,91 @@ impl Av2Encoder {
                             );
                         }
                     }
-                    let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
-                    let levu = bases
-                        .chroma444
-                        .project(&get_residual(&up, pw, sb_y, sb_x, 64, predu), 0.0);
-                    put_block(
-                        &mut recu,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        64,
-                        &crate::av2::itx422::reconstruct_chroma(
-                            predu,
-                            &levu,
-                            qstep_i,
-                            &crate::av2::tables::SCAN,
+                    let bd = self.bit_depth as i32;
+                    let (levu, levv) = if let Some(ref ch) = cfl_choice {
+                        // CfL: residual against the per-pixel prediction; reconstruct
+                        // with that prediction as the base.
+                        let mut ru = [0f32; 64 * 64];
+                        let mut rv = [0f32; 64 * 64];
+                        cfl_prediction::<64>(pw, &up, &vp, sb_y, sb_x, &ch, &mut ru, &mut rv);
+                        let levu = bases.chroma444.project(&ru, 0.0);
+                        let levv = bases.chroma444.project(&rv, 0.0);
+                        put_block(
+                            &mut recu,
+                            pw,
+                            sb_y,
+                            sb_x,
                             64,
+                            &itx422::reconstruct_chroma_cfl(
+                                &ch.pred_u,
+                                &levu,
+                                qstep_i,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        put_block(
+                            &mut recv,
+                            pw,
+                            sb_y,
+                            sb_x,
                             64,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
-                    let levv = bases
-                        .chroma444
-                        .project(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), 0.0);
-                    put_block(
-                        &mut recv,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        64,
-                        &crate::av2::itx422::reconstruct_chroma(
-                            predv,
-                            &levv,
-                            qstep_i,
-                            &crate::av2::tables::SCAN,
+                            &itx422::reconstruct_chroma_cfl(
+                                &ch.pred_v,
+                                &levv,
+                                qstep_i,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        (levu, levv)
+                    } else {
+                        let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
+                        let levu = bases
+                            .chroma444
+                            .project(&get_residual(&up, pw, sb_y, sb_x, 64, predu), 0.0);
+                        put_block(
+                            &mut recu,
+                            pw,
+                            sb_y,
+                            sb_x,
                             64,
+                            &itx422::reconstruct_chroma(
+                                predu,
+                                &levu,
+                                qstep_i,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
+                        let levv = bases
+                            .chroma444
+                            .project(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), 0.0);
+                        put_block(
+                            &mut recv,
+                            pw,
+                            sb_y,
+                            sb_x,
                             64,
-                            self.bit_depth as i32,
-                        ),
-                    );
+                            &crate::av2::itx422::reconstruct_chroma(
+                                predv,
+                                &levv,
+                                qstep_i,
+                                &crate::av2::tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        (levu, levv)
+                    };
                     let ucoeffs = levels_to_coeffs(&levu);
                     let vcoeffs = levels_to_coeffs(&levv);
                     let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
@@ -605,13 +701,16 @@ impl Av2Encoder {
                         CHROMA_SKIP_V_QC[qc][(6 * (u_present as i32) + va + vl) as usize] as u32;
                     encode_chroma_block(&mut enc, &vcoeffs, v_skip, false);
                     let v_present = vcoeffs.iter().any(|&(_, l)| l != 0);
+                    let cfl_used = cfl_choice.is_some() as i32;
                     for c in fmc..fmc + 16 {
                         u_above[c] = u_present as i32;
                         v_above[c] = v_present as i32;
+                        cfl_above[c] = cfl_used;
                     }
                     for r in fmr..fmr + 16 {
                         u_left[r] = u_present as i32;
                         v_left[r] = v_present as i32;
+                        cfl_left[r] = cfl_used;
                     }
                     continue;
                 }
@@ -649,6 +748,12 @@ impl Av2Encoder {
                     let ul = if lmc > 0 { u_left[lmr] } else { 0 };
                     let va = if lmr > 0 { v_above[lmc] } else { 0 };
                     let vl = if lmc > 0 { v_left[lmr] } else { 0 };
+                    {
+                        let cfl_a = if lmr > 0 { cfl_above[lmc] } else { 0 };
+                        let cfl_l = if lmc > 0 { cfl_left[lmr] } else { 0 };
+                        enc.cfl_ctx = (cfl_a + cfl_l) as usize;
+                        enc.cfl_use = false;
+                    }
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
                             let (tus, mode_idx) = encode_luma_sb(
@@ -671,6 +776,36 @@ impl Av2Encoder {
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
                             );
+                            // CfL decision (partition-walk whole-64 leaf). recy is final
+                            // after encode_luma_sb; this sets the per-block CfL state read
+                            // by encode_intra_modes during the luma encode just below.
+                            let cfl_choice = if enc.cfl {
+                                cfl_decide_64(
+                                    &recy,
+                                    &up,
+                                    &vp,
+                                    &recu,
+                                    &recv,
+                                    pw,
+                                    sb_y,
+                                    sb_x,
+                                    self.bit_depth as i32,
+                                    neutral,
+                                    &bases.chroma444,
+                                    qstep_i,
+                                    leaf::part_lambda(qstep_i, part_lambda_c),
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some(ref ch) = cfl_choice {
+                                enc.cfl_use = true;
+                                enc.cfl_js = ch.js;
+                                enc.cfl_mag_u = ch.mag_u;
+                                enc.cfl_mag_v = ch.mag_v;
+                                enc.cfl_ctx_u = ch.ctx_u;
+                                enc.cfl_ctx_v = ch.ctx_v;
+                            }
                             encode_luma_block_split(
                                 &mut enc,
                                 &tus,
@@ -680,46 +815,91 @@ impl Av2Encoder {
                                 true,
                                 pc,
                             );
-                            let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
-                            let levu = bases
-                                .chroma444
-                                .project(&get_residual(&up, pw, sb_y, sb_x, 64, predu), 0.0);
-                            put_block(
-                                &mut recu,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                64,
-                                &crate::av2::itx422::reconstruct_chroma(
-                                    predu,
-                                    &levu,
-                                    qstep_i,
-                                    &crate::av2::tables::SCAN,
+                            let bd = self.bit_depth as i32;
+                            let (levu, levv) = if let Some(ref ch) = cfl_choice {
+                                let mut ru = [0f32; 64 * 64];
+                                let mut rv = [0f32; 64 * 64];
+                                cfl_prediction::<64>(
+                                    pw, &up, &vp, sb_y, sb_x, &ch, &mut ru, &mut rv,
+                                );
+                                let levu = bases.chroma444.project(&ru, 0.0);
+                                let levv = bases.chroma444.project(&rv, 0.0);
+                                put_block(
+                                    &mut recu,
+                                    pw,
+                                    sb_y,
+                                    sb_x,
                                     64,
+                                    &itx422::reconstruct_chroma_cfl(
+                                        &ch.pred_u,
+                                        &levu,
+                                        qstep_i,
+                                        &tables::SCAN,
+                                        64,
+                                        64,
+                                        bd,
+                                    ),
+                                );
+                                put_block(
+                                    &mut recv,
+                                    pw,
+                                    sb_y,
+                                    sb_x,
                                     64,
-                                    self.bit_depth as i32,
-                                ),
-                            );
-                            let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
-                            let levv = bases
-                                .chroma444
-                                .project(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), 0.0);
-                            put_block(
-                                &mut recv,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                64,
-                                &crate::av2::itx422::reconstruct_chroma(
-                                    predv,
-                                    &levv,
-                                    qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &itx422::reconstruct_chroma_cfl(
+                                        &ch.pred_v,
+                                        &levv,
+                                        qstep_i,
+                                        &tables::SCAN,
+                                        64,
+                                        64,
+                                        bd,
+                                    ),
+                                );
+                                (levu, levv)
+                            } else {
+                                let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
+                                let levu = bases
+                                    .chroma444
+                                    .project(&get_residual(&up, pw, sb_y, sb_x, 64, predu), 0.0);
+                                put_block(
+                                    &mut recu,
+                                    pw,
+                                    sb_y,
+                                    sb_x,
                                     64,
+                                    &itx422::reconstruct_chroma(
+                                        predu,
+                                        &levu,
+                                        qstep_i,
+                                        &tables::SCAN,
+                                        64,
+                                        64,
+                                        bd,
+                                    ),
+                                );
+                                let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
+                                let levv = bases
+                                    .chroma444
+                                    .project(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), 0.0);
+                                put_block(
+                                    &mut recv,
+                                    pw,
+                                    sb_y,
+                                    sb_x,
                                     64,
-                                    self.bit_depth as i32,
-                                ),
-                            );
+                                    &itx422::reconstruct_chroma(
+                                        predv,
+                                        &levv,
+                                        qstep_i,
+                                        &tables::SCAN,
+                                        64,
+                                        64,
+                                        bd,
+                                    ),
+                                );
+                                (levu, levv)
+                            };
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
                             let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
                             encode_chroma_block(&mut enc, &uc, u_skip, true);
@@ -740,7 +920,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
-                                &crate::av2::tables::SCAN,
+                                &tables::SCAN,
                                 neutral,
                                 qc,
                                 rdoq_lambda,
@@ -774,11 +954,11 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     64,
                                     32,
                                     self.bit_depth as i32,
@@ -805,11 +985,11 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     64,
                                     32,
                                     self.bit_depth as i32,
@@ -835,7 +1015,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
-                                &crate::av2::tables::SCAN,
+                                &tables::SCAN,
                                 neutral,
                                 qc,
                                 rdoq_lambda,
@@ -879,11 +1059,11 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     32,
                                     64,
                                     self.bit_depth as i32,
@@ -910,11 +1090,11 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     32,
                                     64,
                                     self.bit_depth as i32,
@@ -940,7 +1120,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
-                                &crate::av2::tables::SCAN,
+                                &tables::SCAN,
                                 neutral,
                                 qc,
                                 rdoq_lambda,
@@ -973,11 +1153,11 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     32,
                                     32,
                                     self.bit_depth as i32,
@@ -993,20 +1173,18 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
-                                    &crate::av2::tables::SCAN,
+                                    &tables::SCAN,
                                     32,
                                     32,
                                     self.bit_depth as i32,
                                 ),
                             );
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-                            let u_skip = crate::av2::cdfs_qctx::CHROMA_SKIP_TX32_QC[qc]
-                                [(6 + ua + ul) as usize]
-                                as u32;
+                            let u_skip = CHROMA_SKIP_TX32_QC[qc][(6 + ua + ul) as usize] as u32;
                             encode_chroma_block(&mut enc, &uc, u_skip, true);
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
                             let v_skip =
@@ -1039,7 +1217,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -1078,7 +1256,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
@@ -1110,7 +1288,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 64,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
@@ -1172,7 +1350,7 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -1209,7 +1387,7 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
@@ -1241,7 +1419,7 @@ impl Av2Encoder {
                                 sb_x,
                                 64,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
@@ -1355,7 +1533,7 @@ impl Av2Encoder {
                                 sb_x,
                                 8,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
@@ -1387,7 +1565,7 @@ impl Av2Encoder {
                                 sb_x,
                                 8,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
@@ -1452,7 +1630,7 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -1497,7 +1675,7 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
@@ -1529,7 +1707,7 @@ impl Av2Encoder {
                                 sb_x,
                                 32,
                                 8,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
                                     qstep_i,
@@ -1635,7 +1813,7 @@ impl Av2Encoder {
                             // cdf), so it only wins on a clear distortion gain.
                             let lev_ad =
                                 bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
-                            let rec_ad = crate::av2::itx422::reconstruct_luma16_adst(
+                            let rec_ad = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
                                 &lev_ad,
                                 qstep_i,
@@ -1649,7 +1827,7 @@ impl Av2Encoder {
                             // inverse row_adst=true, col_adst=false; ~2.7 extra bits).
                             let lev_da =
                                 bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
-                            let rec_da = crate::av2::itx422::reconstruct_luma16_adst(
+                            let rec_da = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
                                 &lev_da,
                                 qstep_i,
@@ -1716,7 +1894,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
                                     qstep_i,
@@ -1787,13 +1965,18 @@ impl Av2Encoder {
                         }
                         other => unreachable!("unsupported lossy leaf {:?}", other),
                     };
+                    // CfL-usage neighbour update: enc.cfl_use holds this leaf's decision
+                    // (true only for a (16,16) leaf that picked CfL; false otherwise).
+                    let cfl_used = enc.cfl_use as i32;
                     for c in lmc..lmc + bw_mi {
                         u_above[c] = u_present as i32;
                         v_above[c] = v_present as i32;
+                        cfl_above[c] = cfl_used;
                     }
                     for r in lmr..lmr + bh_mi {
                         u_left[r] = u_present as i32;
                         v_left[r] = v_present as i32;
+                        cfl_left[r] = cfl_used;
                     }
                 }
             }
@@ -1927,6 +2110,7 @@ impl Av2Encoder {
         let config = self.config(Layout::I444);
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         let neutral = self.dc_neutral();
         let (sb_cols, sb_rows) = (pw / 64, ph / 64);
         // mi grid is 8px-aligned; recursion handles every boundary -> always exact.
@@ -2088,7 +2272,6 @@ impl Av2Encoder {
         &self,
         img: &PlanarImage<T>,
         color: &Cicp,
-        threads: usize,
     ) -> Result<Av2Frame, EncodeError> {
         img.validate_444()?;
         validate_dims(img.width as u32, img.height as u32)?;
@@ -2119,7 +2302,6 @@ impl Av2Encoder {
                 planes: [y, cb, cr, Vec::new()],
             },
             color,
-            threads,
         )
     }
 }
