@@ -77,7 +77,7 @@ fn main() {
         img.width() as usize,
         img.height() as usize,
         BitDepth::Eight,
-        &img
+        &img,
     )
     .unwrap();
     let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(70), 8)

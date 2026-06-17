@@ -107,16 +107,16 @@ fn finalize<T: Copy + Default, const N: usize>(
 
 pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifError> {
     use yuv::{
-        i010_alpha_to_rgba10, i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10,
-        i210_to_rgb10, i212_alpha_to_rgba12, i212_to_rgb12, i410_alpha_to_rgba10, i410_to_rgb10,
+        YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, i010_alpha_to_rgba10,
+        i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10, i210_to_rgb10,
+        i212_alpha_to_rgba12, i212_to_rgb12, i410_alpha_to_rgba10, i410_to_rgb10,
         i412_alpha_to_rgba12, i412_to_rgb12, icgc010_alpha_to_rgba10, icgc010_to_rgb10,
         icgc012_alpha_to_rgba12, icgc012_to_rgb12, icgc210_alpha_to_rgba10, icgc210_to_rgb10,
         icgc212_alpha_to_rgba12, icgc212_to_rgb12, icgc410_alpha_to_rgba10, icgc410_to_rgb10,
         icgc412_alpha_to_rgba12, icgc412_to_rgb12, ycgco420_alpha_to_rgba, ycgco420_to_rgb,
         ycgco422_alpha_to_rgba, ycgco422_to_rgb, ycgco444_alpha_to_rgba, ycgco444_to_rgb,
         yuv420_alpha_to_rgba, yuv420_to_rgb, yuv422_alpha_to_rgba, yuv422_to_rgb,
-        yuv444_alpha_to_rgba, yuv444_to_rgb, YuvPlanarImage, YuvPlanarImageWithAlpha,
-        YuvRange, YuvStandardMatrix,
+        yuv444_alpha_to_rgba, yuv444_to_rgb,
     };
 
     let data_vec = fs::read(file).map_err(|x| AvifError::Io(x.to_string()))?;
