@@ -30,6 +30,7 @@ use crate::orientation::apply_orientation_tealdust;
 use image::{DynamicImage, Luma};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 use tealdust::{
     AvifImage, ColorInfo, ColorPrimaries, MatrixCoefficients, Orientation, PixelLayout,
     TransferCharacteristics,
@@ -56,7 +57,7 @@ enum Subsampling {
     Sampled,
 }
 
-pub(crate) fn le_u16(bytes: &[u8], width: u32, stride: u32, sampling: Subsampling) -> Vec<u16> {
+fn le_u16(bytes: &[u8], width: u32, stride: u32, sampling: Subsampling) -> Vec<u16> {
     bytes
         .chunks_exact(stride as usize)
         .flat_map(|row| {
@@ -106,16 +107,16 @@ fn finalize<T: Copy + Default, const N: usize>(
 
 pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifError> {
     use yuv::{
-        YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, i010_alpha_to_rgba10,
-        i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10, i210_to_rgb10,
-        i212_alpha_to_rgba12, i212_to_rgb12, i410_alpha_to_rgba10, i410_to_rgb10,
+        i010_alpha_to_rgba10, i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10,
+        i210_to_rgb10, i212_alpha_to_rgba12, i212_to_rgb12, i410_alpha_to_rgba10, i410_to_rgb10,
         i412_alpha_to_rgba12, i412_to_rgb12, icgc010_alpha_to_rgba10, icgc010_to_rgb10,
         icgc012_alpha_to_rgba12, icgc012_to_rgb12, icgc210_alpha_to_rgba10, icgc210_to_rgb10,
         icgc212_alpha_to_rgba12, icgc212_to_rgb12, icgc410_alpha_to_rgba10, icgc410_to_rgb10,
         icgc412_alpha_to_rgba12, icgc412_to_rgb12, ycgco420_alpha_to_rgba, ycgco420_to_rgb,
         ycgco422_alpha_to_rgba, ycgco422_to_rgb, ycgco444_alpha_to_rgba, ycgco444_to_rgb,
         yuv420_alpha_to_rgba, yuv420_to_rgb, yuv422_alpha_to_rgba, yuv422_to_rgb,
-        yuv444_alpha_to_rgba, yuv444_to_rgb,
+        yuv444_alpha_to_rgba, yuv444_to_rgb, YuvPlanarImage, YuvPlanarImageWithAlpha,
+        YuvRange, YuvStandardMatrix,
     };
 
     let data_vec = fs::read(file).map_err(|x| AvifError::Io(x.to_string()))?;
@@ -125,7 +126,9 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     let image_info = decoder
         .image_info()
         .map_err(|e| AvifError::Io(e.to_string()))?;
+    let instant = Instant::now();
     let image = decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?;
+    println!("decoding time {:?}", instant.elapsed());
 
     let w = image_info.width;
     let h = image_info.height;
@@ -176,18 +179,38 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     } else {
         1
     };
+    let sampled_horizontally = image_info.pixel_layout == PixelLayout::I420
+        || image_info.pixel_layout == PixelLayout::I422;
 
     let mut c_stride = image.strides[1] as u32;
 
     let img = if high_bit {
         let y16 = le_u16(&image.planes[0], w, y_stride, Subsampling::Full);
-        let cb16 = le_u16(&image.planes[1], w, c_stride, Subsampling::Sampled);
-        let cr16 = le_u16(&image.planes[2], w, c_stride, Subsampling::Sampled);
+        let cb16 = le_u16(
+            &image.planes[1],
+            w,
+            c_stride,
+            if sampled_horizontally {
+                Subsampling::Sampled
+            } else {
+                Subsampling::Full
+            },
+        );
+        let cr16 = le_u16(
+            &image.planes[2],
+            w,
+            c_stride,
+            if sampled_horizontally {
+                Subsampling::Sampled
+            } else {
+                Subsampling::Full
+            },
+        );
         let alpha16: Option<Vec<u16>> = image
             .alpha
             .as_ref()
             .map(|a| le_u16(&a.data, w, a.stride as u32, Subsampling::Full));
-        c_stride = w;
+        c_stride = w.div_ceil(sub_w);
         y_stride = w;
 
         if is_ycgco {

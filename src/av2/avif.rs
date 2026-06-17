@@ -96,9 +96,6 @@ impl Av2Format {
             4
         }
     }
-    fn chroma_sub(&self, x: bool, y: bool) -> bool {
-        self.chroma_sub_x == x && self.chroma_sub_y == y
-    }
 }
 
 /// Pick an `seq_level_idx_0` large enough for the picture (same thresholds as the
