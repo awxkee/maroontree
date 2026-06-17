@@ -42,9 +42,9 @@ use std::sync::{Arc, OnceLock};
 pub(crate) const WC4_0: i32 = 35468; // 0.541196  * 65536
 pub(crate) const WC4_1: i32 = 85627; // 1.306563  * 65536
 pub(crate) const WC8_0: i32 = 33410; // k=0: 0.5097956
-pub(crate) const WC8_1: i32 = 39410; // k=1: 0.6013449  WAS 39393 ✗
+pub(crate) const WC8_1: i32 = 39410; // k=1: 0.6013449
 pub(crate) const WC8_2: i32 = 58981; // k=2: 0.8999762
-pub(crate) const WC8_3: i32 = 167963; // k=3: 2.5629154  WAS 167982 ✗
+pub(crate) const WC8_3: i32 = 167963; // k=3: 2.5629154
 pub(crate) const SQRT2: i32 = 92682; // 1.414214  * 65536
 
 /// Multiply a Q15 data value by a Q0.16 coefficient, returning Q15.
@@ -485,22 +485,8 @@ pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
 }
 
 pub(crate) const WC32: [i32; 16] = [
-    32808,  // k= 0: 0.5006030
-    33127,  // k= 1: 0.5054710  WAS 33393 ✗
-    33780,  // k= 2: 0.5154473  WAS 34236 ✗
-    34802,  // k= 3: 0.5310426  WAS 35468 ✗
-    36248,  // k= 4: 0.5531039  WAS 37144 ✗
-    38203,  // k= 5: 0.5829350  WAS 39367 ✗
-    40796,  // k= 6: 0.6225041  WAS 42391 ✗
-    44224,  // k= 7: 0.6748083  WAS 46341 ✗
-    48794,  // k= 8: 0.7445363  WAS 51638 ✗
-    55008,  // k= 9: 0.8393496  WAS 58981 ✗
-    63738,  // k=10: 0.9725682  WAS 69496 ✗
-    76640,  // k=11: 1.1694399  WAS 85627 ✗
-    97266,  // k=12: 1.4841646  WAS 112863 ✗
-    134859, // k=13: 2.0577810  WAS 167982 ✗
-    223321, // k=14: 3.4076084  WAS 334233 ✗
-    667812, // k=15: 10.190008  WAS 667829 ✗
+    32808, 33127, 33780, 34802, 36248, 38203, 40796, 44224, 48794, 55008, 63738, 76640, 97266,
+    134859, 223321, 667812,
 ];
 
 #[inline(always)]
@@ -1248,12 +1234,6 @@ mod tests {
     }
 }
 
-/// aarch64+neon ONLY consistency guard. The scalar transforms are the
-/// bit-exact reference (validated against dav1d on x86); the NEON forward path
-/// is only trustworthy if it is bit-identical to scalar for every input. This
-/// test enforces that invariant end-to-end (forward coeffs + dead-zone+round
-/// quant). It cannot be built or run on x86; run it on real aarch64 hardware
-/// (`cargo test --features neon neon_matches_scalar`) before shipping NEON.
 #[cfg(all(target_arch = "aarch64", feature = "neon", test))]
 mod neon_consistency {
     use super::*;

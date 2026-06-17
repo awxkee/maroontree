@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::util::FastRound;
 
 /// avm chroma/DC-leaf tx_scale: `0` when `log2(w)+log2(h) <= 8`, else `(sum-7)/2`.
 /// Validated against every `reconstruct_chroma_rect` size and the luma tx_scales.
@@ -91,7 +92,7 @@ pub(crate) fn reconstruct_chroma(
             coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let p = pred.round() as i32;
+    let p = pred.fast_round() as i32;
     let mut out = vec![0f32; w * h];
     crate::av2::av2_itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| p);
     out

@@ -26,78 +26,76 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::orientation::apply_orientation_vvc;
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
-use garnetash::{ChromaFormat, DecodedImage, MatrixCoefficients};
+use crate::orientation::apply_orientation_tealdust;
 use image::{DynamicImage, Luma};
 use std::fs;
-use std::ops::Range;
 use std::path::PathBuf;
+use tealdust::{
+    AvifImage, ColorInfo, ColorPrimaries, MatrixCoefficients, Orientation, PixelLayout,
+    TransferCharacteristics,
+};
 use thiserror::Error;
 
-pub(crate) fn expand_to_16bit(buffer: &mut [u16], is12_bit: bool) {
-    if is12_bit {
-        for px in buffer.iter_mut() {
-            *px = (*px << 4) | (*px >> 8);
-        }
-    } else {
-        for px in buffer.iter_mut() {
-            *px = (*px << 6) | (*px >> 4);
-        }
-    }
-}
-
 #[derive(Error, Debug)]
-pub enum VvcError {
+pub enum AvifError {
     #[error("An error happened while decoding: heic`{0}`")]
     Format(String),
     #[error("Cannot read file due to an error:`{0}`")]
     Io(String),
 }
 
-/// Chroma subsampling factors `(SubWidthC, SubHeightC)` for a format.
-fn sub_factors(chroma: ChromaFormat) -> (u32, u32) {
-    match chroma {
-        ChromaFormat::Yuv420 => (2, 2),
-        ChromaFormat::Yuv422 => (2, 1),
-        ChromaFormat::Yuv444 | ChromaFormat::Monochrome => (1, 1),
-    }
+struct FinalizedView<T> {
+    data: Vec<T>,
+    width: usize,
+    height: usize,
 }
 
-/// Byte ranges of the Y, Cb and Cr planes inside garnetash's packed `planes`
-/// buffer. garnetash stores the luma plane (`width × height`) first, then — for
-/// non-monochrome — Cb and Cr at chroma resolution, with each sample one byte at
-/// 8-bit and a little-endian `u16` at 10/12-bit. `bps` is the bytes-per-sample.
-fn plane_ranges(
-    width: u32,
-    height: u32,
-    chroma: ChromaFormat,
-    bps: usize,
-) -> (Range<usize>, Range<usize>, Range<usize>) {
-    let (sub_w, sub_h) = sub_factors(chroma);
-    let cw = width.div_ceil(sub_w) as usize;
-    let ch = height.div_ceil(sub_h) as usize;
-    let y_len = width as usize * height as usize * bps;
-    let c_len = cw * ch * bps;
-    (
-        0..y_len,
-        y_len..y_len + c_len,
-        y_len + c_len..y_len + 2 * c_len,
-    )
-}
-
-/// Reinterpret a little-endian `u16` byte plane (as garnetash packs >8-bit
-/// samples) into a `Vec<u16>` the `yuv` crate can consume.
-pub(crate) fn le_u16(bytes: &[u8]) -> Vec<u16> {
+pub(crate) fn le_u16(bytes: &[u8], width: u32, stride: u32) -> Vec<u16> {
     bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .chunks_exact(stride as usize)
+        .flat_map(|row| {
+            row[..width as usize * 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        })
         .collect()
 }
 
-pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, VvcError> {
+fn finalize<T: Copy + Default, const N: usize>(
+    mut data: Vec<T>,
+    avif_image: &AvifImage,
+) -> Result<FinalizedView<T>, AvifError> {
+    let mut width = avif_image.width as usize;
+    let mut height = avif_image.height as usize;
+
+    // clap is defined in coded space, so crop BEFORE orientation (clap → irot → imir).
+    if let Some(clap) = avif_image.clean_aperture.as_ref() {
+        if let Some((left, top, cw, ch)) = clap.to_crop_rect(avif_image.width, avif_image.height) {
+            if cw as usize != width || ch as usize != height {
+                let (src_stride, dst_stride) = (width * N, cw as usize * N);
+                let mut cropped = vec![T::default(); cw as usize * ch as usize * N];
+                for row in 0..ch {
+                    let s = (top + row) as usize * src_stride + left as usize * N;
+                    let d = row as usize * dst_stride;
+                    cropped[d..d + dst_stride].copy_from_slice(&data[s..s + dst_stride]);
+                }
+                data = cropped;
+                width = cw as usize;
+                height = ch as usize;
+            }
+        }
+    }
+
+    Ok(FinalizedView {
+        data,
+        width,
+        height,
+    })
+}
+
+pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifError> {
     use yuv::{
         YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, i010_alpha_to_rgba10,
         i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10, i210_to_rgb10,
@@ -111,59 +109,77 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
         yuv444_alpha_to_rgba, yuv444_to_rgb,
     };
 
-    // garnetash decodes the HEIF (or raw `.266`) directly to planar YCbCr.
-    let dec = garnetash::decode(&fs::read(file).map_err(|x| VvcError::Io(x.to_string()))?)
-        .map_err(|e| VvcError::Format(format!("garnetash: {e}")))?;
+    let data_vec = fs::read(file).map_err(|x| AvifError::Io(x.to_string()))?;
+    let mut decoder = tealdust::AvifDecoder::new(&data_vec)
+        .map_err(|e| AvifError::Format(format!("garnetash: {e}")))?;
 
-    let w = dec.width;
-    let h = dec.height;
-    let bit_depth = dec.bit_depth.bits() as u32;
+    let image_info = decoder
+        .image_info()
+        .map_err(|e| AvifError::Io(e.to_string()))?;
+    let image = decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?;
+
+    let w = image_info.width;
+    let h = image_info.height;
+    let bit_depth = image_info.bits_per_component as u32;
     let high_bit = bit_depth > 8;
     let is_12 = bit_depth >= 12;
 
     // Chroma subsampling factors → tight plane strides.
-    let (sub_w, sub_h) = sub_factors(dec.chroma);
-    let y_stride = w;
-    let c_stride = w.div_ceil(sub_w);
+    let mut y_stride = image.strides[0] as u32;
 
-    let mut matrix = YuvStandardMatrix::Bt601;
-    let mut range = YuvRange::Full;
     let mut is_ycgco = false;
-    if let Some(enc) = &dec.color.cicp {
-        matrix = match enc.matrix {
-            MatrixCoefficients::Bt709 => YuvStandardMatrix::Bt709,
-            MatrixCoefficients::Bt2020Ncl | MatrixCoefficients::Bt2020Cl => {
-                YuvStandardMatrix::Bt2020
-            }
-            MatrixCoefficients::YCgCo => {
-                is_ycgco = true;
-                YuvStandardMatrix::Bt601
-            }
-            // Smpte170m / Bt470Bg / Fcc / Smpte240m / Identity / Unspecified / …
-            _ => YuvStandardMatrix::Bt601,
-        };
-        range = if enc.full_range {
-            YuvRange::Full
-        } else {
-            YuvRange::Limited
-        };
-    }
+    let cicp = image_info.color_info.unwrap_or(ColorInfo {
+        color_primaries: ColorPrimaries::Bt709,
+        matrix_coefficients: MatrixCoefficients::Smpte240,
+        transfer_characteristics: TransferCharacteristics::Srgb,
+        full_range: true,
+    });
+    let matrix = match cicp.matrix_coefficients {
+        MatrixCoefficients::Bt709 => YuvStandardMatrix::Bt709,
+        MatrixCoefficients::Bt2020Ncl | MatrixCoefficients::Bt2020Cl => YuvStandardMatrix::Bt2020,
+        MatrixCoefficients::YCgCo => {
+            is_ycgco = true;
+            YuvStandardMatrix::Bt601
+        }
+        _ => YuvStandardMatrix::Bt601,
+    };
+    let range = if cicp.full_range {
+        YuvRange::Full
+    } else {
+        YuvRange::Limited
+    };
 
-    if dec.chroma == ChromaFormat::Monochrome {
-        return finish_monochrome(&dec, w, h, high_bit, is_12);
+    if image_info.pixel_layout == PixelLayout::I400 {
+        return finish_monochrome(&image, w, h, high_bit, is_12);
     }
 
     let rgb_stride = w * 3;
     let rgba_stride = w * 4;
-    let bps = if high_bit { 2 } else { 1 };
-    let (yr, cbr, crr) = plane_ranges(w, h, dec.chroma, bps);
+    let sub_w = if image_info.pixel_layout == PixelLayout::I420
+        || image_info.pixel_layout == PixelLayout::I422
+    {
+        2
+    } else {
+        1
+    };
+    let sub_h = if image_info.pixel_layout == PixelLayout::I420 {
+        2
+    } else {
+        1
+    };
+
+    let mut c_stride = image.strides[1] as u32;
 
     let img = if high_bit {
-        // Unpack the LE-u16 planes the `yuv` crate expects.
-        let y16 = le_u16(&dec.planes[yr]);
-        let cb16 = le_u16(&dec.planes[cbr]);
-        let cr16 = le_u16(&dec.planes[crr]);
-        let alpha16: Option<Vec<u16>> = dec.alpha.as_ref().map(|a| le_u16(&a.planes));
+        let y16 = le_u16(&image.planes[0], w, y_stride);
+        let cb16 = le_u16(&image.planes[1], w, c_stride);
+        let cr16 = le_u16(&image.planes[2], w, c_stride);
+        let alpha16: Option<Vec<u16>> = image
+            .alpha
+            .as_ref()
+            .map(|a| le_u16(&a.data, w, a.stride as u32));
+        c_stride = w;
+        y_stride = w;
 
         if is_ycgco {
             if let Some(a) = alpha16.as_deref() {
@@ -188,9 +204,14 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                     (2, 1, true) => icgc212_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
                     (_, _, true) => icgc412_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
                 }
-                .map_err(|e| VvcError::Format(format!("icgc→rgba16: {e}")))?;
-                expand_to_16bit(&mut out, is_12);
-                rgba16_image(w, h, out)?
+                .map_err(|e| AvifError::Format(format!("icgc→rgba16: {e}")))?;
+                let mut final_view = finalize::<u16, 4>(out, &image)?;
+                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                rgba16_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
             } else {
                 let yuv = YuvPlanarImage {
                     y_plane: &y16,
@@ -211,9 +232,14 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                     (2, 1, true) => icgc212_to_rgb12(&yuv, &mut out, w * 3, range),
                     (_, _, true) => icgc412_to_rgb12(&yuv, &mut out, w * 3, range),
                 }
-                .map_err(|e| VvcError::Format(format!("icgc→rgb16: {e}")))?;
-                expand_to_16bit(&mut out, is_12);
-                rgb16_image(w, h, out)?
+                .map_err(|e| AvifError::Format(format!("icgc→rgb16: {e}")))?;
+                let mut final_view = finalize::<u16, 3>(out, &image)?;
+                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                rgb16_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
             }
         } else if let Some(a) = alpha16.as_deref() {
             let yuva = YuvPlanarImageWithAlpha {
@@ -237,9 +263,14 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                 (2, 1, true) => i212_alpha_to_rgba12(&yuva, &mut out, w * 4, range, matrix),
                 (_, _, true) => i412_alpha_to_rgba12(&yuva, &mut out, w * 4, range, matrix),
             }
-            .map_err(|e| VvcError::Format(format!("yuv→rgba16: {e}")))?;
-            expand_to_16bit(&mut out, is_12);
-            rgba16_image(w, h, out)?
+            .map_err(|e| AvifError::Format(format!("yuv→rgba16: {e}")))?;
+            let mut final_view = finalize::<u16, 4>(out, &image)?;
+            crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+            rgba16_image(
+                final_view.width as u32,
+                final_view.height as u32,
+                final_view.data,
+            )?
         } else {
             let yuv = YuvPlanarImage {
                 y_plane: &y16,
@@ -260,16 +291,21 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                 (2, 1, true) => i212_to_rgb12(&yuv, &mut out, w * 3, range, matrix),
                 (_, _, true) => i412_to_rgb12(&yuv, &mut out, w * 3, range, matrix),
             }
-            .map_err(|e| VvcError::Format(format!("yuv→rgb16: {e}")))?;
-            expand_to_16bit(&mut out, is_12);
-            rgb16_image(w, h, out)?
+            .map_err(|e| AvifError::Format(format!("yuv→rgb16: {e}")))?;
+            let mut final_view = finalize::<u16, 3>(out, &image)?;
+            crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+            rgb16_image(
+                final_view.width as u32,
+                final_view.height as u32,
+                final_view.data,
+            )?
         }
     } else {
         // 8-bit planes can be sliced straight out of the packed buffer.
-        let y8 = &dec.planes[yr];
-        let cb8 = &dec.planes[cbr];
-        let cr8 = &dec.planes[crr];
-        let alpha8: Option<&[u8]> = dec.alpha.as_ref().map(|a| a.planes.as_slice());
+        let y8 = &image.planes[0];
+        let cb8 = &image.planes[1];
+        let cr8 = &image.planes[2];
+        let alpha8: Option<&[u8]> = image.alpha.as_ref().map(|a| a.data.as_slice());
 
         if is_ycgco {
             if let Some(a) = alpha8 {
@@ -281,7 +317,7 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                     v_plane: cr8,
                     v_stride: c_stride,
                     a_plane: a,
-                    a_stride: y_stride,
+                    a_stride: image.alpha.as_ref().map(|x| x.stride as u32).unwrap_or(w),
                     width: w,
                     height: h,
                 };
@@ -291,8 +327,13 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                     (2, 1) => ycgco422_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
                     _ => ycgco444_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
                 }
-                .map_err(|e| VvcError::Format(format!("ycgco→rgba: {e}")))?;
-                rgba8_image(w, h, rgba)?
+                .map_err(|e| AvifError::Format(format!("ycgco→rgba: {e}")))?;
+                let final_view = finalize::<u8, 4>(rgba, &image)?;
+                rgba8_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
             } else {
                 let yuv = YuvPlanarImage {
                     y_plane: y8,
@@ -310,8 +351,13 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                     (2, 1) => ycgco422_to_rgb(&yuv, &mut rgb, rgb_stride, range),
                     _ => ycgco444_to_rgb(&yuv, &mut rgb, rgb_stride, range),
                 }
-                .map_err(|e| VvcError::Format(format!("ycgco→rgb: {e}")))?;
-                rgb8_image(w, h, rgb)?
+                .map_err(|e| AvifError::Format(format!("ycgco→rgb: {e}")))?;
+                let final_view = finalize::<u8, 3>(rgb, &image)?;
+                rgb8_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
             }
         } else if let Some(a) = alpha8 {
             let yuv = YuvPlanarImageWithAlpha {
@@ -322,7 +368,7 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                 v_plane: cr8,
                 v_stride: c_stride,
                 a_plane: a,
-                a_stride: y_stride,
+                a_stride: image.alpha.as_ref().map(|x| x.stride as u32).unwrap_or(w),
                 width: w,
                 height: h,
             };
@@ -332,8 +378,13 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                 (2, 1) => yuv422_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range, matrix, false),
                 _ => yuv444_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range, matrix, false),
             }
-            .map_err(|e| VvcError::Format(format!("yuv→rgba: {e}")))?;
-            rgba8_image(w, h, rgba)?
+            .map_err(|e| AvifError::Format(format!("yuv→rgba: {e}")))?;
+            let final_view = finalize::<u8, 4>(rgba, &image)?;
+            rgba8_image(
+                final_view.width as u32,
+                final_view.height as u32,
+                final_view.data,
+            )?
         } else {
             let yuv = YuvPlanarImage {
                 y_plane: y8,
@@ -351,36 +402,44 @@ pub(crate) fn decode_heic_vvc_file_url(file: &PathBuf) -> Result<DynamicImage, V
                 (2, 1) => yuv422_to_rgb(&yuv, &mut rgb, rgb_stride, range, matrix),
                 _ => yuv444_to_rgb(&yuv, &mut rgb, rgb_stride, range, matrix),
             }
-            .map_err(|e| VvcError::Format(format!("yuv→rgb: {e}")))?;
-            rgb8_image(w, h, rgb)?
+            .map_err(|e| AvifError::Format(format!("yuv→rgb: {e}")))?;
+            let final_view = finalize::<u8, 3>(rgb, &image)?;
+            rgb8_image(
+                final_view.width as u32,
+                final_view.height as u32,
+                final_view.data,
+            )?
         }
     };
 
-    Ok(apply_orientation_vvc(img, dec.orientation))
+    Ok(apply_orientation_tealdust(
+        img,
+        image_info.orientation.unwrap_or(Orientation::Normal),
+    ))
 }
 
-fn rgb8_image(w: u32, h: u32, buf: Vec<u8>) -> Result<DynamicImage, VvcError> {
+fn rgb8_image(w: u32, h: u32, buf: Vec<u8>) -> Result<DynamicImage, AvifError> {
     Ok(DynamicImage::ImageRgb8(
         image::RgbImage::from_raw(w, h, buf)
-            .ok_or_else(|| VvcError::Format("HEIC RGB mismatch".into()))?,
+            .ok_or_else(|| AvifError::Format("HEIC RGB mismatch".into()))?,
     ))
 }
-fn rgba8_image(w: u32, h: u32, buf: Vec<u8>) -> Result<DynamicImage, VvcError> {
+fn rgba8_image(w: u32, h: u32, buf: Vec<u8>) -> Result<DynamicImage, AvifError> {
     Ok(DynamicImage::ImageRgba8(
         image::RgbaImage::from_raw(w, h, buf)
-            .ok_or_else(|| VvcError::Format("HEIC RGBA mismatch".into()))?,
+            .ok_or_else(|| AvifError::Format("HEIC RGBA mismatch".into()))?,
     ))
 }
-fn rgb16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, VvcError> {
+fn rgb16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, AvifError> {
     Ok(DynamicImage::ImageRgb16(
         image::ImageBuffer::from_raw(w, h, buf)
-            .ok_or_else(|| VvcError::Format("HEIC RGB16 mismatch".into()))?,
+            .ok_or_else(|| AvifError::Format("HEIC RGB16 mismatch".into()))?,
     ))
 }
-fn rgba16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, VvcError> {
+fn rgba16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, AvifError> {
     Ok(DynamicImage::ImageRgba16(
         image::ImageBuffer::from_raw(w, h, buf)
-            .ok_or_else(|| VvcError::Format("HEIC RGBA16 mismatch".into()))?,
+            .ok_or_else(|| AvifError::Format("HEIC RGBA16 mismatch".into()))?,
     ))
 }
 
@@ -388,126 +447,50 @@ fn rgba16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, VvcError>
 /// `planes` (the whole buffer, no chroma) and any alpha as a separate monochrome
 /// `DecodedImage` in `dec.alpha`.
 fn finish_monochrome(
-    dec: &DecodedImage,
+    dec: &AvifImage,
     w: u32,
     h: u32,
     high_bit: bool,
     is_12: bool,
-) -> Result<DynamicImage, VvcError> {
+) -> Result<DynamicImage, AvifError> {
     let img = if high_bit {
-        let mut y = le_u16(&dec.planes);
-        expand_to_16bit(&mut y, is_12);
+        let mut y = le_u16(&dec.planes[0], dec.width, dec.strides[0] as u32);
+        crate::vvc::expand_to_16bit(&mut y, is_12);
         DynamicImage::ImageLuma16(
             image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, y)
-                .ok_or_else(|| VvcError::Format("HEIC Luma16 mismatch".into()))?,
+                .ok_or_else(|| AvifError::Format("HEIC Luma16 mismatch".into()))?,
         )
     } else if let Some(alpha) = dec.alpha.as_ref() {
         // Interleave luma + alpha into a LumaA8 image.
-        let y = &dec.planes;
-        let a = &alpha.planes;
+        let y = &dec.planes[0];
         let mut ya = vec![0u8; w as usize * h as usize * 2];
-        for ((dst, &yv), &av) in ya.chunks_exact_mut(2).zip(y.iter()).zip(a.iter()) {
-            dst[0] = yv;
-            dst[1] = av;
+        for ((dst, y), a) in ya
+            .chunks_exact_mut(w as usize * 2)
+            .zip(y.chunks_exact(dec.strides[0]))
+            .zip(alpha.data.chunks_exact(alpha.stride))
+        {
+            let y = &y[..w as usize];
+            let a = &a[..w as usize];
+            for ((dst, &yv), &av) in dst
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(y.iter())
+                .zip(a.iter())
+            {
+                dst[0] = yv;
+                dst[1] = av;
+            }
         }
         DynamicImage::ImageLumaA8(
             image::GrayAlphaImage::from_raw(w, h, ya)
-                .ok_or_else(|| VvcError::Format("HEIC LumaA8 mismatch".into()))?,
+                .ok_or_else(|| AvifError::Format("HEIC LumaA8 mismatch".into()))?,
         )
     } else {
         DynamicImage::ImageLuma8(
-            image::GrayImage::from_raw(w, h, dec.planes.clone())
-                .ok_or_else(|| VvcError::Format("HEIC Luma8 mismatch".into()))?,
+            image::GrayImage::from_raw(w, h, dec.planes[0].clone())
+                .ok_or_else(|| AvifError::Format("HEIC Luma8 mismatch".into()))?,
         )
     };
-    Ok(apply_orientation_vvc(img, dec.orientation))
-}
-
-pub(crate) fn encode_vvc(
-    img: &DynamicImage,
-    args: &Args,
-    color_type: image::ColorType,
-    effective_depth: Depth,
-    icc: Option<&[u8]>,
-    exif: Option<&[u8]>,
-) -> Result<Vec<u8>, anyhow::Error> {
-    let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
-        Chroma::C444 => garnetash::ChromaFormat::Yuv444,
-        Chroma::C422 => garnetash::ChromaFormat::Yuv422,
-        Chroma::C420 => garnetash::ChromaFormat::Yuv420,
-    };
-
-    let mut cfg = garnetash::EncodeConfig::new()
-        .with_quality(args.quality)
-        .with_chroma(chroma_fmt)
-        .with_threads(args.threads)
-        .with_aq(true)
-        .with_mtt(true)
-        .with_lfnst(true)
-        .with_dep_quant(true)
-        .with_mts(true);
-
-    if let Some(icc) = icc {
-        cfg = cfg.with_icc_profile(icc.to_vec());
-    }
-    if let Some(exif) = exif {
-        cfg = cfg.with_exif(exif.to_vec());
-    }
-
-    if args.lossless {
-        cfg = cfg.with_lossless(true);
-    }
-
-    let gray = is_gray(color_type);
-    let alpha = has_alpha_channel(color_type) && !args.no_alpha;
-    Ok(match (effective_depth, gray, alpha) {
-        (Depth::D8, true, _) => {
-            garnetash::encode_gray(img.to_luma8().as_raw(), img.width(), img.height(), &cfg)?
-        }
-        (Depth::D8, false, false) => {
-            garnetash::encode_rgb(img.to_rgb8().as_raw(), img.width(), img.height(), &cfg)?
-        }
-        (Depth::D8, false, true) => garnetash::encode_rgba_with_alpha(
-            img.to_rgba8().as_raw(),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D10, true, _) => garnetash::encode_gray10(
-            &scale16_to_10(img.to_luma16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D10, false, false) => garnetash::encode_rgb10(
-            &scale16_to_10(img.to_rgb16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D10, false, true) => garnetash::encode_rgba10_with_alpha(
-            &scale16_to_10(img.to_rgba16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D12, true, _) => garnetash::encode_gray12(
-            &scale16_to_12(img.to_luma16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D12, false, false) => garnetash::encode_rgb12(
-            &scale16_to_12(img.to_rgb16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-        (Depth::D12, false, true) => garnetash::encode_rgba12_with_alpha(
-            &scale16_to_12(img.to_rgba16().as_raw()),
-            img.width(),
-            img.height(),
-            &cfg,
-        )?,
-    })
+    Ok(apply_orientation_tealdust(img, dec.orientation))
 }

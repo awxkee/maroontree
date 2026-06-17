@@ -70,16 +70,30 @@ pub(crate) fn encode_av2_lossless_image(
         return Err("Chroma mode is not supported for lossless".into());
     }
 
-    let enc = Av2Encoder::new(0)
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay)
-        .with_speed(args.speed.to_maroontreee())
-        .with_threads(args.threads);
-    let alpha_enc = Av2Encoder::new(0)
-        .with_tiles(8, 8)
-        .with_txpart(TxPart::ThreeWay)
-        .with_speed(args.speed.to_maroontreee())
-        .with_threads(args.threads);
+    let enc = Av2Encoder::with_bit_depth(
+        0,
+        match effective_depth {
+            Depth::D8 => 8,
+            Depth::D10 => 10,
+            Depth::D12 => 12,
+        },
+    )
+    .with_tiles(8, 8)
+    .with_txpart(TxPart::ThreeWay)
+    .with_speed(args.speed.to_maroontreee())
+    .with_threads(args.threads);
+    let alpha_enc = Av2Encoder::with_bit_depth(
+        0,
+        match effective_depth {
+            Depth::D8 => 8,
+            Depth::D10 => 10,
+            Depth::D12 => 12,
+        },
+    )
+    .with_tiles(8, 8)
+    .with_txpart(TxPart::ThreeWay)
+    .with_speed(args.speed.to_maroontreee())
+    .with_threads(args.threads);
 
     if gray {
         let frame = match effective_depth {

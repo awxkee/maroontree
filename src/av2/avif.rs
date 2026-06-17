@@ -65,6 +65,7 @@ fn write_fullbox(buf: &mut Vec<u8>, cc: &[u8; 4], ver: u8, flags: u32) -> usize 
     buf.push(flags as u8);
     s
 }
+
 /// Backfill a box's size field now that its contents are complete.
 fn patch(buf: &mut [u8], start: usize) {
     let size = (buf.len() - start) as u32;
