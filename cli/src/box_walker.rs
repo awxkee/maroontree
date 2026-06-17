@@ -171,9 +171,6 @@ fn detect_container(bytes: &[u8]) -> ImageContainer {
         if brand_matches(major, HEVC_MAJOR_BRANDS) {
             return ImageContainer::Heic;
         }
-        if brand_matches(major, AV1_MAJOR_BRANDS) {
-            return ImageContainer::Avif;
-        }
 
         if brand_matches(major, UMBRELLA_BRANDS) {
             let box_end = ftyp_box_size(bytes).unwrap_or(bytes.len().min(512));

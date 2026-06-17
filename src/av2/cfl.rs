@@ -29,6 +29,7 @@
 use crate::av2::helpers::dc_pred;
 use crate::av2::proj::Basis;
 use crate::av2::{itx422, tables};
+use crate::util::FastRound;
 
 pub(crate) const CFL_ADD_BITS_ALPHA: i32 = 5;
 pub(crate) const CFL_ALPHABET_SIZE: u8 = 8; // magnitude indices 0..=7 -> |alpha| 1..=8
@@ -294,7 +295,7 @@ pub(crate) fn cfl_avg_l(
     let have_left = sb_x > 0;
     let ss_h = if cw > 32 { 2 } else { 1 };
     let ss_v = if ch > 32 { 2 } else { 1 };
-    let l = |y: usize, x: usize| -> i64 { recy[y * pw + x].round() as i64 };
+    let l = |y: usize, x: usize| -> i64 { recy[y * pw + x].fast_round() as i64 };
     let mut sum: i64 = 0;
     let mut count: i64 = 0;
     if have_top {
@@ -370,7 +371,7 @@ pub(crate) fn cfl_decide(
     ssy: bool,
     avg_l: i32,
     bd: i32,
-    chroma: &crate::av2::proj::Basis,
+    chroma: &Basis,
     qstep: i32,
     lambda: f64,
 ) -> Option<CflChoice> {
@@ -383,18 +384,18 @@ pub(crate) fn cfl_decide(
         let luma_s = &mut luma[r * lw..];
         let recy_s = &recy[b..];
         for (l, &r) in luma_s[..lw].iter_mut().zip(recy_s.iter()) {
-            *l = r.round() as i32;
+            *l = r.fast_round() as i32;
         }
     }
     let luma_q3 = subsample_luma_q3(&luma, lw, cw, ch, ssx, ssy);
     let ac: Vec<i32> = luma_q3.iter().map(|&v| v - avg_l).collect();
-    let su: Vec<i32> = src_u.iter().map(|&s| s.round() as i32).collect();
-    let sv: Vec<i32> = src_v.iter().map(|&s| s.round() as i32).collect();
-    let dc_u = dc_u_f.round() as i32;
-    let dc_v = dc_v_f.round() as i32;
+    let su: Vec<i32> = src_u.iter().map(|&s| s.fast_round() as i32).collect();
+    let sv: Vec<i32> = src_v.iter().map(|&s| s.fast_round() as i32).collect();
+    let dc_u = dc_u_f.fast_round() as i32;
+    let dc_v = dc_v_f.fast_round() as i32;
     let cand = cfl_candidate(&su, &sv, &ac, dc_u, dc_v, bd)?;
 
-    let scan = &crate::av2::tables::SCAN;
+    let scan = &tables::SCAN;
     let coeff_bits = |lev: &[f32]| -> f64 {
         lev.iter()
             .filter(|&&x| x != 0.0)
@@ -415,9 +416,9 @@ pub(crate) fn cfl_decide(
     let lev_dc_u = chroma.project(&res_dc_u, 0.0);
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
     let rec_dc_u =
-        crate::av2::itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
+        itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
     let rec_dc_v =
-        crate::av2::itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
+        itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
     let j_dc = sse(src_u, &rec_dc_u)
         + sse(src_v, &rec_dc_v)
         + lambda * (coeff_bits(&lev_dc_u) + coeff_bits(&lev_dc_v));
@@ -433,7 +434,7 @@ pub(crate) fn cfl_decide(
         .collect();
     let lev_cf_u = chroma.project(&res_cf_u, 0.0);
     let lev_cf_v = chroma.project(&res_cf_v, 0.0);
-    let rec_cf_u = crate::av2::itx422::reconstruct_chroma_cfl(
+    let rec_cf_u = itx422::reconstruct_chroma_cfl(
         &cand.pred_u,
         &lev_cf_u,
         qstep,
@@ -442,7 +443,7 @@ pub(crate) fn cfl_decide(
         ch,
         bd,
     );
-    let rec_cf_v = crate::av2::itx422::reconstruct_chroma_cfl(
+    let rec_cf_v = itx422::reconstruct_chroma_cfl(
         &cand.pred_v,
         &lev_cf_v,
         qstep,
@@ -548,7 +549,7 @@ fn cfl_avg_l_444(
         let base = (sb_y - 1) * pw + sb_x;
         let mut i = 0;
         while i < w {
-            sum += (recy[base + i].round() as i64) << 3;
+            sum += (recy[base + i].fast_round() as i64) << 3;
             count += 1;
             i += ss_hor;
         }
@@ -556,7 +557,7 @@ fn cfl_avg_l_444(
     if have_left {
         let mut i = 0;
         while i < h {
-            sum += (recy[(sb_y + i) * pw + sb_x - 1].round() as i64) << 3;
+            sum += (recy[(sb_y + i) * pw + sb_x - 1].fast_round() as i64) << 3;
             count += 1;
             i += ss_ver;
         }
@@ -616,9 +617,9 @@ pub(crate) fn cfl_decide_64(
             .zip(up.iter())
             .zip(vp.iter())
         {
-            *luma = recy.round() as i32;
-            *su = up.round() as i32;
-            *sv = vp.round() as i32;
+            *luma = recy.fast_round() as i32;
+            *su = up.fast_round() as i32;
+            *sv = vp.fast_round() as i32;
             *suf = up;
             *svf = vp;
         }
@@ -628,8 +629,8 @@ pub(crate) fn cfl_decide_64(
     let ac: Vec<i32> = luma_q3.iter().map(|&v| v - avg_l).collect();
     let predu_f = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
     let predv_f = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
-    let dc_u = predu_f.round() as i32;
-    let dc_v = predv_f.round() as i32;
+    let dc_u = predu_f.fast_round() as i32;
+    let dc_v = predv_f.fast_round() as i32;
     let cand = cfl_candidate(&su, &sv, &ac, dc_u, dc_v, bd)?;
 
     let coeff_bits = |lev: &[f32]| -> f64 {

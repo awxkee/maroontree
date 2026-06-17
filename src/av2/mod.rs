@@ -189,7 +189,7 @@ pub struct Av2Encoder {
     base_q_idx: u8,
     bit_depth: u8,
     tune: Tuning,
-    speed: crate::Speed,
+    speed: Speed,
     /// Worker-thread budget for tile/superblock parallelism (`0`/`1` = serial).
     /// Sourced from `EncodeConfig::threads` via [`Av2Encoder::with_threads`].
     threads: usize,

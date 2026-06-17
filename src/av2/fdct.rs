@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::util::FastRound;
 use std::cell::RefCell;
 
 #[rustfmt::skip]
@@ -275,17 +276,17 @@ pub(crate) fn quantize_to_levels(
     thresh: f32,
     scan: &[u16],
 ) -> (Vec<f32>, Vec<f32>) {
-    let inv_q = factor / qstep as f64;
-    let th = thresh as f64;
+    let inv_q = (factor / qstep as f64) as f32;
+    let th = thresh;
     let mut lev = vec![0f32; scan.len()];
     let mut prm = vec![0f32; scan.len()];
-    for (k, &rc) in scan.iter().enumerate() {
+    for ((&rc, prm), lev) in scan.iter().zip(prm.iter_mut()).zip(lev.iter_mut()) {
         let rc = rc as usize;
-        let pr = coeff[(rc & 31) * n + (rc >> 5)] as f64 * inv_q;
+        let pr = coeff[(rc & 31) * n + (rc >> 5)] as f32 * inv_q;
         let a = pr.abs();
-        prm[k] = a as f32;
+        *prm = a;
         if a >= th {
-            lev[k] = pr.round() as f32;
+            *lev = pr.fast_round();
         }
     }
     (lev, prm)

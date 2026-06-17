@@ -77,27 +77,18 @@ fn main() {
         img.width() as usize,
         img.height() as usize,
         BitDepth::Eight,
-        &img.to_vec(),
+        &img,
     )
     .unwrap();
-    let av2_encoder = Av2Encoder::new(av2_map_quality(53))
+    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(70), 8)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
         .with_threads(1)
         .with_cfl(false);
-    for i in 0..10 {
-        let instant = Instant::now();
-        let encoded = black_box(
-            av2_encoder
-                .encode_image_422(black_box(&pimg), &Cicp::srgb_ycbcr())
-                .unwrap(),
-        );
-        println!("encoding time {:?}", instant.elapsed());
-    }
     let encoded = av2_encoder
-        .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
+        .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
     // let out_obu = encoded.view();
     // let path = std::env::args()

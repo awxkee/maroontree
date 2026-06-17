@@ -26,61 +26,35 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#![allow(clippy::manual_clamp)]
 
-mod av1_coefs;
-mod av1_tables;
-mod av1_tile;
-mod av1_wht;
-mod av1real;
-mod av2;
-mod avif;
-mod bitwriter;
-mod cdf_tables;
-mod coef_q;
-pub mod coeff;
-mod coeffs;
-mod color;
-mod cost;
-mod dct;
-mod encoder;
-mod err;
-mod idct;
-mod intrapred;
-mod isobmff;
-mod loopfilter;
-mod metadata;
-mod msac_enc;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod obu;
-mod odec;
-mod pixel;
-mod quant;
-mod rangecoder;
-mod tables;
-mod transform;
-mod trellis;
-mod util;
-
-pub mod av2_image {
-    pub use crate::av2::simple::*;
+pub(crate) trait FastRound {
+    fn fast_round(self) -> Self;
 }
-pub use av2::{Av2Encoder, Av2Frame, Tuning, TxPart, av2_map_quality};
-pub use avif::{
-    ChromaFormat, EncodeConfig, Speed, encode_gray_alpha8, encode_gray_alpha10,
-    encode_gray_alpha12, encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10,
-    encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10, encode_rgba10_with_alpha,
-    encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10, encode_yuv12,
-    encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
-};
-pub use color::{
-    ChromaSamplePosition, Cicp, ColorMetadata, ItutT35, MasteringDisplay, MatrixCoefficients,
-    Primaries, TransferFunction,
-};
-pub use encoder::{
-    PlanarImage, encode_lossless, encode_lossless_gray, encode_lossless_gray_alpha,
-    encode_lossless_gray_obu, encode_lossless_obu, encode_lossless_with_alpha,
-};
-pub use metadata::{ContentLightLevel, Metadata, Orientation};
-pub use pixel::{BitDepth, Pixel};
+
+impl FastRound for f32 {
+    fn fast_round(self) -> Self {
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse4.1"
+        ))]
+        {
+            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
+            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.round()
+        }
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse4.1"
+            )
+        )))]
+        {
+            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
+            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
+        }
+    }
+}

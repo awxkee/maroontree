@@ -53,6 +53,7 @@
 
 mod av1_lossless;
 mod av1_lossy;
+mod av2_decode;
 mod av2_lossless;
 mod av2_lossy;
 mod box_walker;
@@ -485,6 +486,10 @@ fn is_heif_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "heic" | "heif")
 }
 
+fn is_avif_format(fmt: &str) -> bool {
+    matches!(fmt.to_lowercase().as_str(), "avif" | "avis")
+}
+
 fn is_jxl_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "jxl" | "jpegxl")
 }
@@ -498,7 +503,7 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
         .map(|e| e.to_lowercase());
     let mut _image_container = ImageContainer::Unknown;
     if let Some(ext) = fmt.as_ref()
-        && is_heif_format(ext)
+        && (is_heif_format(ext) || is_avif_format(ext))
     {
         _image_container = detect_image_container(path);
     }
@@ -525,6 +530,12 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
         Some(_) if _image_container == ImageContainer::Vvc => {
             use crate::vvc::decode_heic_vvc_file_url;
             decode_heic_vvc_file_url(path)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
+        }
+
+        Some(_) if _image_container == ImageContainer::Av2 => {
+            use crate::av2_decode::decode_av2_file_url;
+            decode_av2_file_url(path)
                 .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
         }
 

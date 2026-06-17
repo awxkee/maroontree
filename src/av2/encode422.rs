@@ -141,7 +141,7 @@ impl Av2Encoder {
                         sb_x,
                         &bases.luma,
                         qstep_i,
-                        &crate::av2::tables::SCAN,
+                        &tables::SCAN,
                         neutral,
                         qc,
                         self.tune.rdoq_lambda,

@@ -28,6 +28,7 @@
  */
 
 use crate::av2::quant::{BASE_Q, qstep};
+use crate::util::FastRound;
 use std::cell::RefCell;
 
 pub(crate) struct Basis {
@@ -266,7 +267,7 @@ impl Basis {
                 FWD_SCRATCH.with(|cell| {
                     let s = &mut *cell.borrow_mut();
                     for (d, &v) in s.resid[..n].iter_mut().zip(resid) {
-                        *d = v.round() as i32;
+                        *d = v.fast_round() as i32;
                     }
                     let nc = fdct_rect(&s.resid[..n], w, h, s.out.as_mut_slice());
                     quantize_to_levels(&s.out[..nc], cw, q, factor, thresh, scan)
@@ -281,7 +282,7 @@ impl Basis {
                 };
                 let mut r = [0i32; 256];
                 for (d, &s) in r.iter_mut().zip(resid) {
-                    *d = s.round() as i32;
+                    *d = s.fast_round() as i32;
                 }
                 quantize_to_levels(&fwd16x16(&r, col_adst, row_adst), 16, q, 8.0, thresh, scan)
             }
