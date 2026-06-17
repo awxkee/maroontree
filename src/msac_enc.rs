@@ -31,7 +31,7 @@ type EcWin = u32;
 const EC_PROB_SHIFT: u32 = 6;
 const EC_MIN_PROB: u32 = 4;
 
-pub struct Writer {
+pub(crate) struct Writer {
     rng: u16,
     cnt: i16,
     low: EcWin,
@@ -45,7 +45,7 @@ impl Default for Writer {
 }
 
 impl Writer {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Writer {
             rng: 0x8000,
             cnt: -9,
@@ -93,7 +93,7 @@ impl Writer {
     }
 
     /// Encode symbol `s` against an inverse-cdf of length `n` (n = #symbols).
-    pub fn symbol(&mut self, s: u32, cdf: &[u16]) {
+    pub(crate) fn symbol(&mut self, s: u32, cdf: &[u16]) {
         let s = s as usize;
         let n = cdf.len();
         let nms = n - s;
@@ -107,25 +107,25 @@ impl Writer {
     }
 
     /// Encode a single bool with probability-of-true `f` (Q15).
-    pub fn bool(&mut self, val: bool, f: u16) {
+    pub(crate) fn bool(&mut self, val: bool, f: u16) {
         // symbol() over inverse-cdf [f, 0]: symbol 0 = false occupies [f,32768)?
         // rav1e: self.symbol(val as u32, &[f, 0]). cdf=[f,0], n=2.
         self.symbol(val as u32, &[f, 0]);
     }
 
     /// Equiprobable bit.
-    pub fn bit(&mut self, b: u16) {
+    pub(crate) fn bit(&mut self, b: u16) {
         self.bool(b == 1, 16384);
     }
 
     /// Raw literal, MSB first, equiprobable.
-    pub fn literal(&mut self, bits: u8, v: u32) {
+    pub(crate) fn literal(&mut self, bits: u8, v: u32) {
         for i in (0..bits).rev() {
             self.bit(((v >> i) & 1) as u16);
         }
     }
 
-    pub fn write_golomb(&mut self, level: u32) {
+    pub(crate) fn write_golomb(&mut self, level: u32) {
         let x = level + 1;
         let length = 32 - x.leading_zeros();
         for _ in 0..length - 1 {
