@@ -415,10 +415,8 @@ pub(crate) fn cfl_decide(
     let res_dc_v: Vec<f32> = src_v.iter().map(|&s| s - dc_v_f).collect();
     let lev_dc_u = chroma.project(&res_dc_u, 0.0);
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
-    let rec_dc_u =
-        itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
-    let rec_dc_v =
-        itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
+    let rec_dc_u = itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
+    let rec_dc_v = itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
     let j_dc = sse(src_u, &rec_dc_u)
         + sse(src_v, &rec_dc_v)
         + lambda * (coeff_bits(&lev_dc_u) + coeff_bits(&lev_dc_v));
@@ -434,24 +432,8 @@ pub(crate) fn cfl_decide(
         .collect();
     let lev_cf_u = chroma.project(&res_cf_u, 0.0);
     let lev_cf_v = chroma.project(&res_cf_v, 0.0);
-    let rec_cf_u = itx422::reconstruct_chroma_cfl(
-        &cand.pred_u,
-        &lev_cf_u,
-        qstep,
-        scan,
-        cw,
-        ch,
-        bd,
-    );
-    let rec_cf_v = itx422::reconstruct_chroma_cfl(
-        &cand.pred_v,
-        &lev_cf_v,
-        qstep,
-        scan,
-        cw,
-        ch,
-        bd,
-    );
+    let rec_cf_u = itx422::reconstruct_chroma_cfl(&cand.pred_u, &lev_cf_u, qstep, scan, cw, ch, bd);
+    let rec_cf_v = itx422::reconstruct_chroma_cfl(&cand.pred_v, &lev_cf_v, qstep, scan, cw, ch, bd);
     let alpha_bits = 2.0
         + 3.0
         + if cand.sign_u != 0 { 3.0 } else { 0.0 }

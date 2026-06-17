@@ -72,15 +72,15 @@ fn main() {
     //     .unwrap();
     //     println!("encoding time {:?}", instant.elapsed());
     // }
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgb16();
     let pimg = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
-        BitDepth::Eight,
-        &img,
+        BitDepth::Ten,
+        &img.iter().map(|&x| x >> 6).collect::<Vec<_>>(),
     )
     .unwrap();
-    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(70), 8)
+    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(70), 10)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)

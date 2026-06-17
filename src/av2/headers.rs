@@ -200,7 +200,10 @@ pub(crate) fn frame_header(
         // tile data. So we write only tile_size_bytes_minus_1.
         b.write_bits((tsb - 1) as u32, 2); // tile_size_bytes_minus_1
     }
-    b.write_bits(if config.lossless { 0 } else { config.base_q }, 8);
+    // AV2 frame_header quant.yac is 8 bits for 8-bit streams and 9 bits for
+    // high-bit-depth streams. The decoder reads 8 + (seqhdr.hbd != 0) bits.
+    let q_bits = 8 + u32::from(config.bit_depth > 8);
+    b.write_bits(if config.lossless { 0 } else { config.base_q }, q_bits);
     b.write_bit(0);
     b.write_bit(0);
     b.write_bit(0); // segmentation, qm, delta-q (off)

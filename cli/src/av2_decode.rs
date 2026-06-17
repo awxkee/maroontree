@@ -50,11 +50,20 @@ struct FinalizedView<T> {
     height: usize,
 }
 
-pub(crate) fn le_u16(bytes: &[u8], width: u32, stride: u32) -> Vec<u16> {
+#[derive(Debug, Copy, Clone)]
+enum Subsampling {
+    Full,
+    Sampled,
+}
+
+pub(crate) fn le_u16(bytes: &[u8], width: u32, stride: u32, sampling: Subsampling) -> Vec<u16> {
     bytes
         .chunks_exact(stride as usize)
         .flat_map(|row| {
-            row[..width as usize * 2]
+            row[..match sampling {
+                Subsampling::Full => width as usize,
+                Subsampling::Sampled => (width as usize).div_ceil(2),
+            } * 2]
                 .as_chunks::<2>()
                 .0
                 .iter()
@@ -171,13 +180,13 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     let mut c_stride = image.strides[1] as u32;
 
     let img = if high_bit {
-        let y16 = le_u16(&image.planes[0], w, y_stride);
-        let cb16 = le_u16(&image.planes[1], w, c_stride);
-        let cr16 = le_u16(&image.planes[2], w, c_stride);
+        let y16 = le_u16(&image.planes[0], w, y_stride, Subsampling::Full);
+        let cb16 = le_u16(&image.planes[1], w, c_stride, Subsampling::Sampled);
+        let cr16 = le_u16(&image.planes[2], w, c_stride, Subsampling::Sampled);
         let alpha16: Option<Vec<u16>> = image
             .alpha
             .as_ref()
-            .map(|a| le_u16(&a.data, w, a.stride as u32));
+            .map(|a| le_u16(&a.data, w, a.stride as u32, Subsampling::Full));
         c_stride = w;
         y_stride = w;
 
@@ -454,7 +463,12 @@ fn finish_monochrome(
     is_12: bool,
 ) -> Result<DynamicImage, AvifError> {
     let img = if high_bit {
-        let mut y = le_u16(&dec.planes[0], dec.width, dec.strides[0] as u32);
+        let mut y = le_u16(
+            &dec.planes[0],
+            dec.width,
+            dec.strides[0] as u32,
+            Subsampling::Full,
+        );
         crate::vvc::expand_to_16bit(&mut y, is_12);
         DynamicImage::ImageLuma16(
             image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, y)
