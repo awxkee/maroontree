@@ -79,8 +79,9 @@ pub(super) fn predict_luma(
     } else {
         0
     };
-    let (ab, lf, corner) =
-        intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
+    let (ab, lf, corner) = intrapred::build_refs(
+        recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,
+    );
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
     } else if m == 2 {
@@ -270,8 +271,9 @@ pub(super) fn predict_luma_leaf32(
     } else {
         0
     };
-    let (ab, lf, corner) =
-        intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, 0);
+    let (ab, lf, corner) = intrapred::build_refs(
+        recy, pw, y0, x0, 32, have_above, have_left, tr_px, 0, neutral,
+    );
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
     } else if m == 2 {
@@ -403,8 +405,9 @@ pub(super) fn predict_luma_leaf_tu(
     let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
     let bl_ok = i == 0 && have_left && bottom_available && yd > 0;
     let bl_px = if bl_ok { yd.min(32).max(0) as usize } else { 0 };
-    let (ab, lf, corner) =
-        intrapred::build_refs(recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px);
+    let (ab, lf, corner) = intrapred::build_refs(
+        recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,
+    );
     if m == 1 {
         intrapred::smooth(32, &ab, &lf)
     } else if m == 2 {

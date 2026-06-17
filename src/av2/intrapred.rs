@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::util::FastRound;
 
 #[inline]
 fn blk_size_log2(n: usize) -> i32 {
@@ -318,8 +319,15 @@ pub(crate) fn build_refs(
     have_left: bool,
     tr_px: usize, // available top-right pixels (0 = none)
     bl_px: usize, // available bottom-left pixels (0 = none)
+    neutral: f32,
 ) -> (Vec<i32>, Vec<i32>, i32) {
-    const BASE: i32 = 128; // 128 << (bd-8), bd=8
+    // AVM initializes missing intra references to the mid-sample value for
+    // the coded bit depth: 128 for 8-bit, 512 for 10-bit, 2048 for 12-bit.
+    // Using the 8-bit constant for high-bit-depth streams makes the encoder
+    // subtract too-small predictors. The decoder then adds those residuals
+    // to its correct high-bit-depth predictor, producing bright rectangular
+    // blocks along frame/tile/partition edges.
+    let base: i32 = neutral.fast_round() as i32;
     let g = |y: usize, x: usize| (rec[y * pw + x] + 0.5) as i32;
     let mut above = vec![0i32; 2 * bs];
     let mut left = vec![0i32; 2 * bs];
@@ -350,7 +358,7 @@ pub(crate) fn build_refs(
         }
     } else {
         for s in above.iter_mut() {
-            *s = BASE - 1;
+            *s = base - 1;
         }
     }
 
@@ -379,7 +387,7 @@ pub(crate) fn build_refs(
         }
     } else {
         for s in left.iter_mut() {
-            *s = BASE + 1;
+            *s = base + 1;
         }
     }
 
@@ -390,7 +398,7 @@ pub(crate) fn build_refs(
     } else if n_left > 0 {
         g(y0, x0 - 1)
     } else {
-        BASE
+        base
     };
 
     (above, left, corner)

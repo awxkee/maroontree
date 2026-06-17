@@ -85,14 +85,15 @@ impl Av2Format {
     fn channels(&self) -> u8 {
         if self.monochrome { 1 } else { 3 }
     }
-    /// seq_profile, mirroring AV1's mapping (444→1, 422 or 12-bit→2, else 0).
+    /// AV2 seq_profile_idc, matching the bitstream sequence header:
+    /// 0 = 4:2:0/monochrome, 3 = 4:2:2, 4 = 4:4:4.
     fn seq_profile(&self) -> u8 {
-        if self.bit_depth == 12 || self.chroma_sub(true, false) {
-            2
-        } else if !self.chroma_sub_x && !self.chroma_sub_y && !self.monochrome {
-            1
-        } else {
+        if self.monochrome || (self.chroma_sub_x && self.chroma_sub_y) {
             0
+        } else if self.chroma_sub_x {
+            3
+        } else {
+            4
         }
     }
     fn chroma_sub(&self, x: bool, y: bool) -> bool {
