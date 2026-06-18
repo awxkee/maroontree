@@ -447,7 +447,8 @@ pub(crate) fn encode_vvc(
         .with_dep_quant(true)
         .with_mts(true)
         .with_dual_tree(true)
-        .with_cclm(true);
+        .with_cclm(true)
+        .with_deblocking(true);
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());

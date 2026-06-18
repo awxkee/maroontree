@@ -130,6 +130,12 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     let image = decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?;
     println!("decoding time {:?}", instant.elapsed());
 
+    for i in 0..10 {
+        let instant = Instant::now();
+        let image = decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?;
+        println!("decoding time {:?}", instant.elapsed());
+    }
+
     let w = image_info.width;
     let h = image_info.height;
     let bit_depth = image_info.bits_per_component as u32;

@@ -95,7 +95,7 @@ impl Av2Encoder {
                     let sb_x = _lmc * 4;
                     match (bw_mi, bh_mi) {
                         (16, 16) => {
-                            let (tus, mode_idx) = encode_luma_sb(
+                            let (tus, mode_idx, _) = encode_luma_sb(
                                 recy,
                                 yp,
                                 pw,
@@ -111,6 +111,7 @@ impl Av2Encoder {
                                 self.tune.rdoq_lambda,
                                 self.speed,
                                 self.bit_depth as i32,
+                                false, // non-directional path
                             );
                             let (skip_cdfs, dc_sign_ctxs) =
                                 sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -544,7 +545,7 @@ impl Av2Encoder {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let (tus, mode_idx) = encode_luma_sb(
+                let (tus, mode_idx, _) = encode_luma_sb(
                     &mut recy,
                     &yp,
                     pw,
@@ -560,6 +561,7 @@ impl Av2Encoder {
                     self.tune.rdoq_lambda,
                     self.speed,
                     self.bit_depth as i32,
+                    false, // non-directional path
                 );
                 let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                     &tus,
