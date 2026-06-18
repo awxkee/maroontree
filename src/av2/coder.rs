@@ -461,6 +461,209 @@ fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
 // ----- luma block ---------------------------------------------------------------
 
 /// Encode the intra mode information that precedes a luma block's coefficients.
+// ---- AV2 directional luma intra mode coding (conformant to the decoder) -----
+// Internal luma mode index: 0=DC 1=SMOOTH 2=SMOOTH_V 3=SMOOTH_H 4=PAETH, and
+// 5=V 6=H 7=D45 8=D135 9=D113 10=D157 11=D203 12=D67 (angle_delta = 0).
+
+#[rustfmt::skip]
+static REORDERED_DIR_Y_MODE: [u8; 8] = [3, 8, 1, 5, 4, 6, 2, 7];
+#[rustfmt::skip]
+static DEFAULT_MODE_LIST_Y: [u8; 56] = [
+    17, 45, 3, 10, 24, 31, 38, 52, 15, 19, 43, 47, 1, 5, 8, 12, 22, 26, 29, 33, 36, 40, 50, 54,
+    16, 18, 44, 46, 2, 4, 9, 11, 23, 25, 30, 32, 37, 39, 51, 53, 14, 20, 42, 48, 0, 6, 7, 13, 21,
+    27, 28, 34, 35, 41, 49, 55,
+];
+// default (static, disable_cdf_update) ICDFs, per neighbour-directional context
+#[rustfmt::skip]
+static Y_IDX0: [[u16; 7]; 3] = [
+    [17593, 12693, 11040, 8670, 6363, 5113, 3908],
+    [22654, 17811, 15953, 13641, 12621, 7185, 5599],
+    [27132, 23764, 22312, 20646, 20024, 12443, 7161],
+];
+#[rustfmt::skip]
+static Y_IDX1: [[u16; 5]; 3] = [
+    [20025, 14596, 12574, 9120, 6349],
+    [23792, 16684, 11941, 8173, 4272],
+    [23984, 18212, 13058, 7865, 4044],
+];
+static Y_SET_ICDF: [u16; 3] = [3905, 1746, 1044];
+// intra_uv_mode ICDF, ctx 0 = non-directional luma, ctx 1 = directional luma
+#[rustfmt::skip]
+static UV_MODE: [[u16; 7]; 2] = [
+    [23405, 11811, 9903, 8015, 6357, 4785, 2340],
+    [11486, 9158, 4560, 3457, 2420, 1610, 1277],
+];
+
+const NO_MIDX: u8 = 0xff;
+
+fn internal_dir_to_ymode(m: usize) -> u8 {
+    match m {
+        5 => 1,
+        6 => 2,
+        7 => 3,
+        8 => 4,
+        9 => 5,
+        10 => 6,
+        11 => 7,
+        _ => 8,
+    }
+}
+fn nominal_midx(y_mode: u8) -> u8 {
+    let p = REORDERED_DIR_Y_MODE
+        .iter()
+        .position(|&m| m == y_mode)
+        .unwrap();
+    (p * 7 + 3) as u8
+}
+
+/// Build the neighbour-adaptive directional mode list (decode.rs:4736-4790).
+/// `lmidx`/`amidx` = left/above block midx (NO_MIDX if absent/non-directional).
+/// Built in full (prefix-stable), so the position of a target midx is its dir_idx.
+fn build_dir_list_y(bw4: usize, bh4: usize, lmidx: u8, amidx: u8) -> Vec<u8> {
+    if bw4 * bh4 <= 2 {
+        return DEFAULT_MODE_LIST_Y.to_vec();
+    }
+    let mut list = [0u8; 56];
+    let mut mask = 0u64;
+    let mut ptr = 0usize;
+    if lmidx != NO_MIDX {
+        list[ptr] = lmidx;
+        mask |= 1 << lmidx;
+        ptr += 1;
+    }
+    if amidx != NO_MIDX && (ptr == 0 || amidx != list[0]) {
+        list[ptr] = amidx;
+        mask |= 1 << amidx;
+        ptr += 1;
+    }
+    let n_dirs = ptr;
+    if n_dirs == 0 {
+        return DEFAULT_MODE_LIST_Y.to_vec();
+    }
+    if bw4 * bh4 > 4 {
+        for i in 1..5i32 {
+            for n in 0..n_dirs {
+                let c = list[n] as i32;
+                for d in [-i, i] {
+                    let dm = ((c + d + 56) % 56) as u8;
+                    if mask & (1 << dm) == 0 {
+                        list[ptr] = dm;
+                        mask |= 1 << dm;
+                        ptr += 1;
+                    }
+                }
+            }
+        }
+    }
+    for &fm in DEFAULT_MODE_LIST_Y.iter() {
+        if mask & (1 << fm) == 0 {
+            list[ptr] = fm;
+            ptr += 1;
+        }
+    }
+    list[..ptr].to_vec()
+}
+
+/// Emit the luma y_mode (and DC chroma) for a 64x64 PARTITION_NONE block,
+/// supporting the directional modes. Returns the block's `midx` (NO_MIDX for
+/// non-directional) so the caller can store it for neighbour context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_intra_modes_dir(
+    enc: &mut RangeEncoder,
+    mode_idx: usize,
+    angle_delta: i8,
+    has_chroma: bool,
+    partition_cdf: Option<u32>,
+    bw4: usize,
+    bh4: usize,
+    lmidx: u8,
+    amidx: u8,
+) -> u8 {
+    if let Some(cdf) = partition_cdf {
+        enc.encode_bool(cdf, 0);
+    }
+    let midx;
+    if mode_idx < 5 {
+        // non-directional: set 0, idx0[ctx], symbol = mode_idx (0..4). The idx0
+        // context counts directional neighbours and must match the decoder even
+        // for non-directional blocks adjacent to directional ones.
+        let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
+        enc.encode_symbol(&Y_SET_ICDF, 0, 3);
+        enc.encode_symbol(&Y_IDX0[y_ctx], mode_idx, 7);
+        midx = NO_MIDX;
+    } else {
+        let y_mode = internal_dir_to_ymode(mode_idx);
+        // target midx encodes both mode and angle delta: nominal (pos*7+3) + delta.
+        let target = (nominal_midx(y_mode) as i32 + angle_delta as i32) as u8;
+        let list = build_dir_list_y(bw4, bh4, lmidx, amidx);
+        let dir_idx = list
+            .iter()
+            .position(|&m| m == target)
+            .expect("target midx in list");
+        let y_mode_idx = dir_idx + 5;
+        let y_set = (y_mode_idx + 3) / 16; // 0 for 5..=12, else 1/2/3
+        let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
+        // y_set: escape (last) symbol of the 4-symbol alphabet is value 3.
+        if y_set == 3 {
+            enc.encode_symbol_esc(&Y_SET_ICDF, 3, 3);
+        } else {
+            enc.encode_symbol(&Y_SET_ICDF, y_set, 3);
+        }
+        if y_set == 0 {
+            if y_mode_idx < 7 {
+                enc.encode_symbol(&Y_IDX0[y_ctx], y_mode_idx, 7);
+            } else {
+                // idx0 == 7 is the escape (last) symbol of the 8-symbol alphabet.
+                enc.encode_symbol_esc(&Y_IDX0[y_ctx], 7, 7);
+                let i1 = y_mode_idx - 7;
+                if i1 == 5 {
+                    enc.encode_symbol_esc(&Y_IDX1[y_ctx], 5, 5);
+                } else {
+                    enc.encode_symbol(&Y_IDX1[y_ctx], i1, 5);
+                }
+            }
+        } else {
+            let bits = (y_mode_idx - (y_set * 16 - 3)) as u32;
+            enc.encode_bypass(bits, 4);
+        }
+        midx = target;
+    }
+    if has_chroma {
+        if enc.cfl {
+            let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
+            if enc.cfl_use {
+                enc.encode_bool(isc as u32, 1);
+                enc.encode_bool(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                enc.encode_symbol(&crate::av2::cfl::CFL_SIGN_ICDF, enc.cfl_js as usize, 8);
+                let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
+                let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
+                if su != 0 {
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u],
+                        enc.cfl_mag_u as usize,
+                        8,
+                    );
+                }
+                if sv != 0 {
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v],
+                        enc.cfl_mag_v as usize,
+                        8,
+                    );
+                }
+                return midx;
+            }
+            enc.encode_bool(isc as u32, 0);
+        }
+        // DC chroma. uv_mode_ctx = (luma is directional); with ctx=1 the DC index
+        // is shifted by one ("slot 0" encodes same-as-luma).
+        let uv_ctx = (midx != NO_MIDX) as usize;
+        let uv_idx = uv_ctx; // DC = REORDERED_NONDIR[0]; idx = uv_ctx + 0
+        enc.encode_symbol(&UV_MODE[uv_ctx], uv_idx, 7);
+    }
+    midx
+}
+
 fn encode_intra_modes(
     enc: &mut RangeEncoder,
     mode_idx: usize,
@@ -1056,6 +1259,44 @@ pub(crate) fn encode_luma_block_split(
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
     }
     cul
+}
+
+/// Directional-aware 64x64 PARTITION_NONE emit. Identical to
+/// `encode_luma_block_split` but routes the y_mode through the directional
+/// coder (so internal modes 5..=12 emit conformantly) and returns the block's
+/// `midx` for neighbour context. `lmidx`/`amidx` are the left/above SB midx
+/// (NO_MIDX if absent or non-directional); bw4=bh4=16 for a 64x64 block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_block_split_dir(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 4],
+    skip_cdfs: &[u32; 4],
+    dc_sign_ctxs: &[usize; 4],
+    mode_idx: usize,
+    angle_delta: i8,
+    has_chroma: bool,
+    part_cdf: u32,
+    lmidx: u8,
+    amidx: u8,
+) -> ([u32; 4], u8) {
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        Some(part_cdf),
+        16,
+        16,
+        lmidx,
+        amidx,
+    );
+    enc.encode_bool(TX_SPLIT_64 as u32, 1);
+    enc.encode_symbol(&TX_PART_2D_64, 0, 6);
+    let mut cul = [0u32; 4];
+    for i in 0..4 {
+        cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
+    }
+    (cul, midx)
 }
 
 /// Encode a 64x64 intra luma block as tx-partition VERT4 → four side-by-side

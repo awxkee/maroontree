@@ -35,6 +35,8 @@ mod cfl;
 mod chroma422;
 mod coder;
 mod csc;
+#[allow(dead_code)]
+mod directional;
 mod encode400;
 mod encode420;
 mod encode422;
@@ -69,9 +71,9 @@ use crate::av2::chroma422::{
 use crate::av2::coder::{
     Coeff, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
     encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
-    encode_luma_block_vert4, encode_luma_leaf_16x16_full, encode_luma_leaf_16x64,
-    encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
-    encode_luma_leaf_dc_class2,
+    encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_16x16_full,
+    encode_luma_leaf_16x64, encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16,
+    encode_luma_leaf_64x32, encode_luma_leaf_dc_class2,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,

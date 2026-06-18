@@ -121,7 +121,7 @@ impl Av2Encoder {
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
                             // 64x64 luma → 32x32 chroma (TX_32X32, eob 1024, skip TX32).
-                            let (tus, mode_idx) = encode_luma_sb(
+                            let (tus, mode_idx, _) = encode_luma_sb(
                                 recy,
                                 yp,
                                 pw,
@@ -137,6 +137,7 @@ impl Av2Encoder {
                                 self.tune.rdoq_lambda,
                                 self.speed,
                                 self.bit_depth as i32,
+                                false, // partition path: keep non-directional (not wired)
                             );
                             let (skip_cdfs, dc_sign_ctxs) =
                                 sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -847,11 +848,12 @@ impl Av2Encoder {
             return enc;
         }
 
+        let mut midx_grid = vec![0xff_u8; sb_cols * sb_rows];
         for row in 0..sb_rows {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
-                let (tus, mode_idx) = encode_luma_sb(
+                let (tus, mode_idx, adelta) = encode_luma_sb(
                     &mut recy,
                     &yp,
                     pw,
@@ -867,6 +869,7 @@ impl Av2Encoder {
                     self.tune.rdoq_lambda,
                     self.speed,
                     self.bit_depth as i32,
+                    true, // allow directional intra modes (core path)
                 );
                 let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                     &tus,
@@ -933,15 +936,29 @@ impl Av2Encoder {
                 } else {
                     enc.cfl_use = false;
                 }
-                encode_luma_block_split(
+                let lmidx = if col > 0 {
+                    midx_grid[row * sb_cols + col - 1]
+                } else {
+                    0xff
+                };
+                let amidx = if row > 0 {
+                    midx_grid[(row - 1) * sb_cols + col]
+                } else {
+                    0xff
+                };
+                let (_cul, sb_midx) = encode_luma_block_split_dir(
                     &mut enc,
                     &tus,
                     &skip_cdfs,
                     &dc_sign_ctxs,
                     mode_idx,
+                    adelta,
                     true,
                     12276,
+                    lmidx,
+                    amidx,
                 );
+                midx_grid[row * sb_cols + col] = sb_midx;
 
                 let bd = self.bit_depth as i32;
                 let (levu, levv) = if let Some(ref ch) = cfl_choice {

@@ -131,7 +131,7 @@ impl Av2Encoder {
                     let ul = if fmc > 0 { u_left[fmr] } else { 0 };
                     let va = if fmr > 0 { v_above[fmc] } else { 0 };
                     let vl = if fmc > 0 { v_left[fmr] } else { 0 };
-                    let (tus, mode_idx) = encode_luma_sb(
+                    let (tus, mode_idx, _) = encode_luma_sb(
                         &mut recy,
                         &yp,
                         pw,
@@ -147,6 +147,7 @@ impl Av2Encoder {
                         self.tune.rdoq_lambda,
                         self.speed,
                         self.bit_depth as i32,
+                        false, // non-directional path
                     );
                     let (skip_cdfs, dc_sign_ctxs) =
                         sb_tu_contexts(&tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr);
@@ -366,7 +367,7 @@ impl Av2Encoder {
                     enc.cfl_use = false;
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
-                            let (tus, mode_idx) = encode_luma_sb(
+                            let (tus, mode_idx, _) = encode_luma_sb(
                                 &mut recy,
                                 &yp,
                                 pw,
@@ -382,6 +383,7 @@ impl Av2Encoder {
                                 self.tune.rdoq_lambda,
                                 self.speed,
                                 self.bit_depth as i32,
+                                false, // non-directional path
                             );
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,

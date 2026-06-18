@@ -119,6 +119,13 @@ impl Speed {
         !matches!(self, Speed::Fast)
     }
 
+    /// Whether the directional angle-delta search (Δ = ±1..±3) is run. Only
+    /// [`Speed::Slow`] does; the faster tiers trial nominal angles (Δ=0) only,
+    /// since each directional mode otherwise costs 7× the RD candidates.
+    pub(crate) fn try_angle_deltas(self) -> bool {
+        matches!(self, Speed::Slow)
+    }
+
     /// Whether the intra candidate set is reduced. Only [`Speed::Fast`] does.
     pub(crate) fn reduced_modes(self) -> bool {
         matches!(self, Speed::Fast)

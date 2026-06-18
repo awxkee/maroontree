@@ -30,6 +30,43 @@
 use super::*;
 use crate::Speed;
 
+fn dispatch_intra_pred(
+    m: usize,
+    adelta: i32,
+    ab: &[i32],
+    lf: &[i32],
+    corner: i32,
+    have_top: bool,
+    have_left: bool,
+    max_w: i32,
+    max_h: i32,
+) -> Vec<f32> {
+    use directional::Dir::*;
+    let dir = match m {
+        1 => return intrapred::smooth(32, ab, lf),
+        2 => return intrapred::smooth_v(32, ab, lf),
+        3 => return intrapred::smooth_h(32, ab, lf),
+        4 => return intrapred::paeth(32, ab, lf, corner),
+        5 => V,
+        6 => H,
+        7 => D45,
+        8 => D135,
+        9 => D113,
+        10 => D157,
+        11 => D203,
+        _ => D67,
+    };
+    // seq_intra_edge_filter is not enabled in our bitstream header, so the
+    // decoder never filters the reference edge. The encoder must match: passing
+    // edge_filter=false keeps the references unfiltered for every directional
+    // mode (z1/z2/z3). Applying it here (the old hardcoded `true`) corrupted
+    // every edge-filtered diagonal/delta block — V/H copies were immune, which
+    // is why only diagonals diverged.
+    directional::directional(
+        dir, adelta, 32, ab, lf, corner, true, have_top, have_left, false, max_w, max_h,
+    )
+}
+
 /// Build the prediction block for luma candidate `m` (0=DC, 1=SMOOTH, 4=PAETH)
 /// at TX index `i` (raster within the 64x64 SB) and pixel origin `(y0,x0)`.
 #[allow(clippy::too_many_arguments)]
@@ -42,6 +79,7 @@ pub(super) fn predict_luma(
     y0: usize,
     x0: usize,
     m: usize,
+    adelta: i32,
     neutral: f32,
 ) -> Vec<f32> {
     if m == 0 {
@@ -82,15 +120,17 @@ pub(super) fn predict_luma(
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,
     );
-    if m == 1 {
-        intrapred::smooth(32, &ab, &lf)
-    } else if m == 2 {
-        intrapred::smooth_v(32, &ab, &lf)
-    } else if m == 3 {
-        intrapred::smooth_h(32, &ab, &lf)
-    } else {
-        intrapred::paeth(32, &ab, &lf, corner)
-    }
+    dispatch_intra_pred(
+        m,
+        adelta,
+        &ab,
+        &lf,
+        corner,
+        have_above,
+        have_left,
+        32 + tr_px as i32,
+        32 + bl_px as i32,
+    )
 }
 
 /// Encode one 64x64 luma superblock as a single PARTITION_NONE block with a
@@ -146,69 +186,98 @@ pub(super) fn encode_luma_sb(
     rdoq_lambda: f64,
     speed: Speed,
     bd: i32,
-) -> ([Vec<Coeff>; 4], usize) {
+    allow_dir: bool,
+) -> ([Vec<Coeff>; 4], usize, i8) {
     const POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
+    let mut best_delta = 0i32;
     let mut best_tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut best_region = vec![0f32; 64 * 64];
     // Fast reduces the intra candidate set; non-Full tiers rank candidates with a
     // cheap coeff cost (RDOQ disabled) and re-RDOQ the winner only.
-    let cands: &[usize] = if speed.reduced_modes() {
-        &[0usize, 1, 2]
+    let base_modes: &[usize] = if speed.reduced_modes() {
+        if allow_dir {
+            &[0usize, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12]
+        } else {
+            &[0usize, 1, 2]
+        }
+    } else if allow_dir {
+        &[0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     } else {
         &[0usize, 1, 2, 3, 4]
     };
+    // Directional modes trial all angle deltas (Δ = -3..=3, ×3°) only on the
+    // Slow tier; faster tiers use the nominal angle (Δ=0) to avoid 7× the
+    // directional RD candidates. Non-directional modes are always Δ=0.
+    let dir_deltas: &[i32] = if speed.try_angle_deltas() {
+        &[0, -1, 1, -2, 2, -3, 3]
+    } else {
+        &[0]
+    };
+    let mut cands: Vec<(usize, i32)> = Vec::new();
+    for &m in base_modes {
+        if m >= 5 {
+            for &d in dir_deltas {
+                cands.push((m, d));
+            }
+        } else {
+            cands.push((m, 0));
+        }
+    }
     let search_lambda = if speed.per_candidate_rdoq() {
         rdoq_lambda
     } else {
         0.0
     };
-    // Encode one mode into `recy`, returning its TU coeffs and RD cost.
-    let encode_mode = |recy: &mut [f32], m: usize, lambda: f64| -> ([Vec<Coeff>; 4], f64) {
-        let mut resid = vec![0f32; 1024];
-        let mut cost = 0f64;
-        let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for (i, &(ty, tx)) in POS.iter().enumerate() {
-            let (y0, x0) = (sb_y + ty, sb_x + tx);
-            let pblk = predict_luma(recy, pw, width, height, i, y0, x0, m, neutral);
-            for r in 0..32 {
-                let base = (y0 + r) * pw + x0;
-                for c in 0..32 {
-                    resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+    // Encode one (mode, angle_delta) into `recy`, returning its TU coeffs and RD cost.
+    let encode_mode =
+        |recy: &mut [f32], m: usize, adelta: i32, lambda: f64| -> ([Vec<Coeff>; 4], f64) {
+            let mut resid = vec![0f32; 1024];
+            let mut cost = 0f64;
+            let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            for (i, &(ty, tx)) in POS.iter().enumerate() {
+                let (y0, x0) = (sb_y + ty, sb_x + tx);
+                let pblk = predict_luma(recy, pw, width, height, i, y0, x0, m, adelta, neutral);
+                for r in 0..32 {
+                    let base = (y0 + r) * pw + x0;
+                    for c in 0..32 {
+                        resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                    }
                 }
+                let lev = if lambda > 0.0 {
+                    // Trellis RDOQ: pick coefficient levels by real rate-distortion
+                    // (rate = true coded bits), then RD-trim the EOB.
+                    let (mut l, prm) = luma.project_with_prm(&resid);
+                    cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+                    l
+                } else {
+                    let l = luma.project(&resid, 0.0);
+                    cost += l
+                        .iter()
+                        .filter(|&&v| v != 0.0)
+                        .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                        .sum::<f64>();
+                    l
+                };
+                let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
+                put_block(recy, pw, y0, x0, 32, &rb);
+                tus[i] = levels_to_coeffs(&lev);
             }
-            let lev = if lambda > 0.0 {
-                // Trellis RDOQ: pick coefficient levels by real rate-distortion
-                // (rate = true coded bits), then RD-trim the EOB.
-                let (mut l, prm) = luma.project_with_prm(&resid);
-                cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
-                l
-            } else {
-                let l = luma.project(&resid, 0.0);
-                cost += l
-                    .iter()
-                    .filter(|&&v| v != 0.0)
-                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                    .sum::<f64>();
-                l
-            };
-            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
-            put_block(recy, pw, y0, x0, 32, &rb);
-            tus[i] = levels_to_coeffs(&lev);
-        }
-        // Mode-signaling cost (once per 64x64 block). DC is cheapest to signal;
-        // SMOOTH/PAETH cost a few extra bits, so only win when they earn them.
-        if m != 0 {
-            cost += 6.0;
-        }
-        (tus, cost)
-    };
-    for &m in cands {
-        let (tus, cost) = encode_mode(recy, m, search_lambda);
+            // Mode-signaling cost (once per 64x64 block). DC is cheapest; SMOOTH/PAETH
+            // and directional cost a few extra bits (directional a bit more for the
+            // set/idx symbols), so only win when they earn them.
+            if m != 0 {
+                cost += if m >= 5 { 9.0 } else { 6.0 };
+            }
+            (tus, cost)
+        };
+    for &(m, d) in &cands {
+        let (tus, cost) = encode_mode(recy, m, d, search_lambda);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;
+            best_delta = d;
             best_tus = tus;
             for ry in 0..64 {
                 let dst = ry * 64;
@@ -226,13 +295,11 @@ pub(super) fn encode_luma_sb(
             recy[dst..dst + 64].copy_from_slice(&best_region[src..src + 64]);
         }
     } else {
-        // Winner-only RDOQ: re-encode the chosen mode with real RDOQ. `recy` ends
-        // holding this reconstruction and the coeffs come from the same levels, so
-        // bitstream and recon stay consistent by construction.
-        let (tus, _) = encode_mode(recy, best_mode, rdoq_lambda);
+        // Winner-only RDOQ: re-encode the chosen mode with real RDOQ.
+        let (tus, _) = encode_mode(recy, best_mode, best_delta, rdoq_lambda);
         best_tus = tus;
     }
-    (best_tus, best_mode)
+    (best_tus, best_mode, best_delta as i8)
 }
 
 /// Intra prediction for one TX_32X32 of a bottom-edge 64x32 luma leaf. `ti` is the
@@ -274,15 +341,17 @@ pub(super) fn predict_luma_leaf32(
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, 0, neutral,
     );
-    if m == 1 {
-        intrapred::smooth(32, &ab, &lf)
-    } else if m == 2 {
-        intrapred::smooth_v(32, &ab, &lf)
-    } else if m == 3 {
-        intrapred::smooth_h(32, &ab, &lf)
-    } else {
-        intrapred::paeth(32, &ab, &lf, corner)
-    }
+    dispatch_intra_pred(
+        m,
+        0,
+        &ab,
+        &lf,
+        corner,
+        have_above,
+        have_left,
+        32 + tr_px as i32,
+        32,
+    )
 }
 
 /// Project + trial-code a bottom-edge 64x32 luma leaf as two side-by-side TX_32X32.
@@ -408,15 +477,17 @@ pub(super) fn predict_luma_leaf_tu(
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,
     );
-    if m == 1 {
-        intrapred::smooth(32, &ab, &lf)
-    } else if m == 2 {
-        intrapred::smooth_v(32, &ab, &lf)
-    } else if m == 3 {
-        intrapred::smooth_h(32, &ab, &lf)
-    } else {
-        intrapred::paeth(32, &ab, &lf, corner)
-    }
+    dispatch_intra_pred(
+        m,
+        0,
+        &ab,
+        &lf,
+        corner,
+        have_above,
+        have_left,
+        32 + tr_px as i32,
+        32 + bl_px as i32,
+    )
 }
 
 /// Project + trial-code a right-edge 32x64 luma leaf as two stacked TX_32X32
@@ -468,7 +539,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
-            let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
+            let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
             put_block(recy, pw, y0, x0, 32, &rb);
             tus[k] = levels_to_coeffs(&lev);
         }

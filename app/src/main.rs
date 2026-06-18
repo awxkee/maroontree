@@ -31,11 +31,18 @@ use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
     TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
 };
+use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
+    // let data_vec = fs::read("out10_avif.avif").unwrap();
+    // let mut decoder = tealdust::AvifDecoder::new(&data_vec).unwrap();
+    // let image_info = decoder
+    //     .image_info().unwrap();
+    // let instant = Instant::now();
+    // let image = decoder.decode().unwrap();
     // let (w, h) = (64usize, 64usize);
     // let mut rgb = vec![0u8; w * h * 3];
     // for y in 0..h {
@@ -90,20 +97,27 @@ fn main() {
     let encoded = av2_encoder
         .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
-    // let out_obu = encoded.view();
-    // let path = std::env::args()
-    //     .nth(1)
-    //     .unwrap_or_else(|| "out10.avif".into());
-    // let mut f = std::fs::File::create(&path).unwrap();
-    // f.write_all(&out).unwrap();
-    // eprintln!("wrote {} bytes to {}", out.len(), path);
-    //
-    // let path = std::env::args()
-    //     .nth(1)
-    //     .unwrap_or_else(|| "out10_av2.obu".into());
-    // let mut f = std::fs::File::create(&path).unwrap();
-    // f.write_all(&out_obu).unwrap();
-    //
+    for i in 0..10 {
+        let instant = Instant::now();
+        let encoded = av2_encoder
+            .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
+            .unwrap();
+        println!("Encoded in {}ms", instant.elapsed().as_millis());
+    }
+    // // let out_obu = encoded.view();
+    // // let path = std::env::args()
+    // //     .nth(1)
+    // //     .unwrap_or_else(|| "out10.avif".into());
+    // // let mut f = std::fs::File::create(&path).unwrap();
+    // // f.write_all(&out).unwrap();
+    // // eprintln!("wrote {} bytes to {}", out.len(), path);
+    // //
+    // // let path = std::env::args()
+    // //     .nth(1)
+    // //     .unwrap_or_else(|| "out10_av2.obu".into());
+    // // let mut f = std::fs::File::create(&path).unwrap();
+    // // f.write_all(&out_obu).unwrap();
+    // //
     let encoded_avif_av2 =
         Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
     let path = std::env::args()
