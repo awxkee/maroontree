@@ -30,6 +30,13 @@
 use super::*;
 use crate::Speed;
 
+/// Build a 32x32 luma predictor for candidate mode `m` from prepared edges.
+///   0=DC (handled by callers), 1=SMOOTH, 2=SMOOTH_V, 3=SMOOTH_H, 4=PAETH,
+///   5=V, 6=H, 7=D45, 8=D135, 9=D113, 10=D157, 11=D203, 12=D67.
+/// Directional modes are conformant to the decoder (4-tap luma + intra-edge
+/// filter); `have_top`/`have_left` and the available-extension bounds gate the
+/// normative edge filter. `edge_filter` should track the sequence header flag
+/// (true on AVM main profile).
 fn dispatch_intra_pred(
     m: usize,
     adelta: i32,
@@ -180,6 +187,12 @@ pub(super) fn encode_luma_sb(
     sb_x: usize,
     luma: &Basis,
     qstep: i32,
+    // Per-superblock residual pre-scale for adaptive quantization. The luma
+    // `Basis` projects at the frame base qstep; scaling the residual by
+    // qstep_base / qstep_sb before projection yields levels quantized at the
+    // SB's qstep (projection is linear), which reconstruct_luma(qstep_sb) then
+    // dequantizes consistently. 1.0 reproduces the base-qstep behaviour.
+    resid_scale: f32,
     scan: &[u16],
     neutral: f32,
     qc: usize,
@@ -242,7 +255,7 @@ pub(super) fn encode_luma_sb(
                 for r in 0..32 {
                     let base = (y0 + r) * pw + x0;
                     for c in 0..32 {
-                        resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                        resid[r * 32 + c] = (yp[base + c] - pblk[r * 32 + c]) * resid_scale;
                     }
                 }
                 let lev = if lambda > 0.0 {
@@ -260,7 +273,7 @@ pub(super) fn encode_luma_sb(
                         .sum::<f64>();
                     l
                 };
-                let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
+                let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
                 put_block(recy, pw, y0, x0, 32, &rb);
                 tus[i] = levels_to_coeffs(&lev);
             }

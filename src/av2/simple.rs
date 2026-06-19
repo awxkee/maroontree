@@ -104,7 +104,8 @@ fn prepare(
             .with_txpart(TxPart::ThreeWay)
             .with_speed(cfg.speed)
             .with_threads(cfg.threads)
-            .with_cfl(true),
+            .with_cfl(true)
+            .with_aq(cfg.adaptive_quant),
     )
 }
 
@@ -129,7 +130,8 @@ fn prepare_lossless_capable(
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_speed(cfg.speed)
-        .with_threads(cfg.threads))
+        .with_threads(cfg.threads)
+        .with_aq(cfg.adaptive_quant))
 }
 
 #[inline]

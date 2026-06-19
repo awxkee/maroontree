@@ -28,6 +28,7 @@
  */
 use super::*;
 use crate::av2::cfl::{cfl_partition_prediction, cfl_prediction};
+use crate::util::FastRound;
 
 impl Av2Encoder {
     #[allow(clippy::too_many_arguments)]
@@ -90,6 +91,11 @@ impl Av2Encoder {
                     above_pctx,
                     left_pctx,
                 );
+                // Arm this SB's delta-Q once; the first leaf's mode emitter consumes it
+                // (after its partition bit), so it is coded exactly once per SB. Edge
+                // SBs on the partition path stay quantization-neutral (signaled = 0).
+                enc.delta_q_signaled = 0;
+                enc.delta_q_pending = enc.delta_q_present;
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
@@ -131,6 +137,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
+                                1.0, // resid_scale: no AQ on this path
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -769,9 +776,15 @@ impl Av2Encoder {
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
+        // Per-tile running qindex accumulator (decoder `ts.last_qidx`, reset to the
+        // frame base at each tile start).
+        let aq_res_log2: i32 = 2;
+        let mut last_qidx: i32 = self.base_q_idx as i32;
+        let qstep_base = qstep_i;
         let mut above = vec![0x40u8; pw / 4 + 16];
         let mut left = vec![0x40u8; ph / 4 + 16];
         let sb_cols = pw / 64;
@@ -849,10 +862,47 @@ impl Av2Encoder {
         }
 
         let mut midx_grid = vec![0xff_u8; sb_cols * sb_rows];
+        // Adaptive-quantization reference: center the per-SB qindex delta on this
+        // tile's mean log-activity so the deltas are zero-mean (flat SBs get finer
+        // q, busy SBs coarser) without a net quantizer bias that would just trade
+        // size for PSNR. Computed in a cheap pre-pass over the tile's SBs.
+        let aq_ref: f32 = if enc.delta_q_present {
+            let mut sum = 0f32;
+            let mut cnt = 0f32;
+            for row in 0..sb_rows {
+                for col in 0..sb_cols {
+                    sum += sb_activity(&yp, pw, row * 64, col * 64, width, height);
+                    cnt += 1.0;
+                }
+            }
+            if cnt > 0.0 { sum / cnt } else { 5.0 }
+        } else {
+            5.0
+        };
         for row in 0..sb_rows {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
+                // Adaptive quantization: derive this SB's qindex from source luma
+                // activity, signal the (clamped) delta from the running last_qidx,
+                // and quantize + reconstruct luma & chroma at the new qindex. With
+                // AQ off, sb_qstep == qstep_i and the residual scale is identity.
+                let (sb_qstep, sb_resid_scale) = if enc.delta_q_present {
+                    let act = sb_activity(&yp, pw, sb_y, sb_x, width, height);
+                    let target = aq_target_qidx(self.base_q_idx as i32, act, aq_ref);
+                    let step = 1i32 << aq_res_log2;
+                    let sig = (((target - last_qidx) as f32) / step as f32)
+                        .fast_round()
+                        .clamp(-6.0, 6.0) as i32;
+                    let newq = (last_qidx + sig * step).clamp(1, 255);
+                    last_qidx = newq;
+                    enc.delta_q_signaled = sig;
+                    let qs = quant::qstep(newq as u32) as i32;
+                    (qs, qstep_base as f32 / qs as f32)
+                } else {
+                    enc.delta_q_signaled = 0;
+                    (qstep_i, 1.0f32)
+                };
                 let (tus, mode_idx, adelta) = encode_luma_sb(
                     &mut recy,
                     &yp,
@@ -862,7 +912,8 @@ impl Av2Encoder {
                     sb_y,
                     sb_x,
                     &bases.luma,
-                    qstep_i,
+                    sb_qstep,
+                    sb_resid_scale,
                     &tables::SCAN,
                     neutral,
                     qc,
@@ -946,6 +997,9 @@ impl Av2Encoder {
                 } else {
                     0xff
                 };
+                // Arm this SB's delta-Q (value already set above); the mode emitter
+                // consumes it after the partition bit, exactly once per SB.
+                enc.delta_q_pending = enc.delta_q_present;
                 let (_cul, sb_midx) = encode_luma_block_split_dir(
                     &mut enc,
                     &tus,
@@ -965,8 +1019,12 @@ impl Av2Encoder {
                     let mut ru = [0f32; 32 * 32];
                     let mut rv = [0f32; 32 * 32];
                     cfl_prediction::<32>(pcw, &up, &vp, cy, cx, &ch, &mut ru, &mut rv);
-                    let levu = bases.chroma420.project(ru.as_slice(), 0.0);
-                    let levv = bases.chroma420.project(rv.as_slice(), 0.0);
+                    let levu = bases
+                        .chroma420
+                        .project(&scale_resid(&ru, sb_resid_scale), 0.0);
+                    let levv = bases
+                        .chroma420
+                        .project(&scale_resid(&rv, sb_resid_scale), 0.0);
                     put_block(
                         &mut recu,
                         pcw,
@@ -976,7 +1034,7 @@ impl Av2Encoder {
                         &itx422::reconstruct_chroma_cfl(
                             &ch.pred_u,
                             &levu,
-                            qstep_i,
+                            sb_qstep,
                             &tables::SCAN,
                             32,
                             32,
@@ -992,7 +1050,7 @@ impl Av2Encoder {
                         &itx422::reconstruct_chroma_cfl(
                             &ch.pred_v,
                             &levv,
-                            qstep_i,
+                            sb_qstep,
                             &tables::SCAN,
                             32,
                             32,
@@ -1002,9 +1060,10 @@ impl Av2Encoder {
                     (levu, levv)
                 } else {
                     let predu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
-                    let levu = bases
-                        .chroma420
-                        .project(&get_residual(&up, pcw, cy, cx, 32, predu), 0.0);
+                    let levu = bases.chroma420.project(
+                        &scale_resid(&get_residual(&up, pcw, cy, cx, 32, predu), sb_resid_scale),
+                        0.0,
+                    );
                     put_block(
                         &mut recu,
                         pcw,
@@ -1014,7 +1073,7 @@ impl Av2Encoder {
                         &itx422::reconstruct_chroma(
                             predu,
                             &levu,
-                            qstep_i,
+                            sb_qstep,
                             &tables::SCAN,
                             32,
                             32,
@@ -1022,9 +1081,10 @@ impl Av2Encoder {
                         ),
                     );
                     let predv = dc_pred(&recv, pcw, cy, cx, 32, neutral);
-                    let levv = bases
-                        .chroma420
-                        .project(&get_residual(&vp, pcw, cy, cx, 32, predv), 0.0);
+                    let levv = bases.chroma420.project(
+                        &scale_resid(&get_residual(&vp, pcw, cy, cx, 32, predv), sb_resid_scale),
+                        0.0,
+                    );
                     put_block(
                         &mut recv,
                         pcw,
@@ -1034,7 +1094,7 @@ impl Av2Encoder {
                         &itx422::reconstruct_chroma(
                             predv,
                             &levv,
-                            qstep_i,
+                            sb_qstep,
                             &tables::SCAN,
                             32,
                             32,
@@ -1233,5 +1293,62 @@ impl Av2Encoder {
             },
             color,
         )
+    }
+}
+
+/// Mean luma "activity" of a superblock's source pixels, used to drive adaptive
+/// quantization. Returns log(1 + variance) of the (up to) 64x64 source region at
+/// `(sb_y, sb_x)`, clamped to the available tile extent. Higher = more texture.
+fn sb_activity(
+    yp: &[f32],
+    pw: usize,
+    sb_y: usize,
+    sb_x: usize,
+    width: usize,
+    height: usize,
+) -> f32 {
+    let h = height.saturating_sub(sb_y).min(64);
+    let w = width.saturating_sub(sb_x).min(64);
+    if h == 0 || w == 0 {
+        return 0.0;
+    }
+    let mut sum = 0f64;
+    let mut sum2 = 0f64;
+    for r in 0..h {
+        let base = (sb_y + r) * pw + sb_x;
+        let yp = &yp[base..base + w];
+        for &c in yp.iter() {
+            let v = c as f64;
+            sum += v;
+            sum2 += v * v;
+        }
+    }
+    let n = (h * w) as f64;
+    let mean = sum / n;
+    let var = (sum2 / n - mean * mean).max(0.0);
+    (1.0 + var).ln() as f32
+}
+
+/// Map superblock activity to a target qindex, centered on the tile's mean
+/// activity `ref_act`. Flat regions (below-average activity, where banding and
+/// blocking are most visible) get a finer quantizer; busy/textured regions (where
+/// artifacts are masked) get a coarser one. Zero-mean by construction, so the
+/// average quantizer tracks the frame base. The delta is clamped to
+/// +/-`AQ_MAX_QIDX_DELTA` so a single SB never swings the quantizer too hard.
+fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
+    const SLOPE: f32 = 2.0;
+    const AQ_MAX_QIDX_DELTA: f32 = 20.0;
+    let delta = ((activity - ref_act) * SLOPE).clamp(-AQ_MAX_QIDX_DELTA, AQ_MAX_QIDX_DELTA);
+    (base_q + delta.fast_round() as i32).clamp(1, 255)
+}
+
+/// Scale a residual block by `s` (identity-fast for `s == 1.0`). Used to quantize
+/// at a per-SB qstep via the linear projection: levels = project(resid * (qstep_base
+/// / qstep_sb)) == quantize-at-qstep_sb.
+fn scale_resid(v: &[f32], s: f32) -> Vec<f32> {
+    if s == 1.0 {
+        v.to_vec()
+    } else {
+        v.iter().map(|&x| x * s).collect()
     }
 }

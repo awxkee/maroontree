@@ -162,6 +162,7 @@ pub struct EncodeConfig {
     pub threads: usize,
     /// RDO effort (AV1 lossy path). See [`Speed`]; defaults to [`Speed::Slow`].
     pub speed: Speed,
+    pub adaptive_quant: bool,
 }
 
 impl Default for EncodeConfig {
@@ -174,6 +175,7 @@ impl Default for EncodeConfig {
             metadata: Metadata::default(),
             threads: 1,
             speed: Speed::Slow,
+            adaptive_quant: true,
         }
     }
 }
@@ -232,6 +234,11 @@ impl EncodeConfig {
     /// Set the RDO effort level (AV1 lossy path). See [`Speed`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        self
+    }
+
+    pub fn with_adaptive_quant(mut self, v: bool) -> Self {
+        self.adaptive_quant = v;
         self
     }
 

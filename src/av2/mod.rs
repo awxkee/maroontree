@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod aq;
 mod av2_itx;
 mod avif;
 mod cdfs_qctx;
@@ -163,6 +164,9 @@ pub struct Tuning {
     pub cdef: bool,
     /// Enable AV2 chroma-from-luma (CfL) intra prediction. Experimental; bitstream-affecting.
     pub cfl: bool,
+    /// Enable per-superblock adaptive quantization (variance-driven delta-Q).
+    /// Bitstream-affecting; spends fewer bits on busy SBs and more on flat ones.
+    pub aq: bool,
 }
 
 impl Default for Tuning {
@@ -176,6 +180,7 @@ impl Default for Tuning {
             deblock: true,
             cdef: false,
             cfl: false,
+            aq: false,
         }
     }
 }
@@ -407,6 +412,12 @@ impl Av2Encoder {
         self
     }
 
+    /// Enable per-superblock adaptive quantization (variance-driven delta-Q).
+    pub fn with_aq(mut self, on: bool) -> Self {
+        self.tune.aq = on;
+        self
+    }
+
     /// Current tuning.
     pub fn tuning(&self) -> Tuning {
         self.tune
@@ -436,6 +447,10 @@ impl Av2Encoder {
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
             cfl: self.tune.cfl && self.base_q_idx != 0,
+            // Adaptive quantization: on for lossy frames when tuned on. res_log2=2
+            // (qindex step 4) keeps |signaled| <= 6 covering a +/-24 qindex span.
+            aq: self.tune.aq && self.base_q_idx != 0,
+            aq_res_log2: 2,
         }
     }
 

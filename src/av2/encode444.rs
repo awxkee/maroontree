@@ -259,6 +259,7 @@ impl Av2Encoder {
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let mut above = vec![0x40u8; pw / 4 + 16];
@@ -291,6 +292,16 @@ impl Av2Encoder {
         let needs_partition = native_mi.is_some() && lossy_needs_partition(width, height);
         let mut above_pctx = vec![0u8; tmc as usize + 16];
         let mut left_pctx = vec![0u8; 16];
+        let mut aqs = aq::AqState::new(
+            enc.delta_q_present,
+            self.base_q_idx as i32,
+            qstep_i,
+            if enc.delta_q_present && !needs_partition {
+                aq::tile_ref_activity(&yp, pw, sb_rows, sb_cols, width, height)
+            } else {
+                0.0
+            },
+        );
 
         for row in 0..sb_rows {
             left_pctx.iter_mut().for_each(|p| *p = 0);
@@ -309,6 +320,8 @@ impl Av2Encoder {
                 if !needs_partition {
                     // Fast path: whole 64X64 SB. RD-choose luma tx-partition between
                     // SPLIT (4×TX_32X32) and VERT4 (4×TX_16X64), cheap SSE + rate proxy.
+                    let (sb_qstep, sb_resid_scale) =
+                        aqs.per_sb(&mut enc, &yp, pw, sb_y, sb_x, width, height);
                     let sse_region = |rec: &[f32]| -> f64 {
                         let mut s = 0f64;
                         for r in 0..64 {
@@ -343,7 +356,8 @@ impl Av2Encoder {
                         sb_y,
                         sb_x,
                         &bases.luma,
-                        qstep_i,
+                        sb_qstep,
+                        sb_resid_scale,
                         &tables::SCAN,
                         neutral,
                         qc,
@@ -406,7 +420,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x64.project_scan(
-                                &get_residual_rect(&yp, pw, sb_y, x0, 16, 64, predv),
+                                &aq::scale_resid(
+                                    &get_residual_rect(&yp, pw, sb_y, x0, 16, 64, predv),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN16X32,
                             );
@@ -421,7 +438,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_luma_16x64(
                                     &pred_flat,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN16X32,
                                     self.bit_depth as i32,
                                 ),
@@ -459,7 +476,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma64x16.project_scan(
-                                &get_residual_rect(&yp, pw, y0, sb_x, 64, 16, predh),
+                                &aq::scale_resid(
+                                    &get_residual_rect(&yp, pw, y0, sb_x, 64, 16, predh),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN32X16,
                             );
@@ -474,7 +494,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_luma_64x16(
                                     &pred_flat,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN32X16,
                                     self.bit_depth as i32,
                                 ),
@@ -532,6 +552,7 @@ impl Av2Encoder {
                     } else {
                         enc.cfl_use = false;
                     }
+                    enc.delta_q_pending = enc.delta_q_present;
                     match best {
                         Part::Vert4 => {
                             let mut skip_cdfs = [0u32; 4];
@@ -615,8 +636,12 @@ impl Av2Encoder {
                         let mut ru = [0f32; 64 * 64];
                         let mut rv = [0f32; 64 * 64];
                         cfl_prediction::<64>(pw, &up, &vp, sb_y, sb_x, &ch, &mut ru, &mut rv);
-                        let levu = bases.chroma444.project(&ru, 0.0);
-                        let levv = bases.chroma444.project(&rv, 0.0);
+                        let levu = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
+                        let levv = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
                         put_block(
                             &mut recu,
                             pw,
@@ -626,7 +651,7 @@ impl Av2Encoder {
                             &itx422::reconstruct_chroma_cfl(
                                 &ch.pred_u,
                                 &levu,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 64,
                                 64,
@@ -642,7 +667,7 @@ impl Av2Encoder {
                             &itx422::reconstruct_chroma_cfl(
                                 &ch.pred_v,
                                 &levv,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 64,
                                 64,
@@ -652,9 +677,13 @@ impl Av2Encoder {
                         (levu, levv)
                     } else {
                         let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
-                        let levu = bases
-                            .chroma444
-                            .project(&get_residual(&up, pw, sb_y, sb_x, 64, predu), 0.0);
+                        let levu = bases.chroma444.project(
+                            &aq::scale_resid(
+                                &get_residual(&up, pw, sb_y, sb_x, 64, predu),
+                                sb_resid_scale,
+                            ),
+                            0.0,
+                        );
                         put_block(
                             &mut recu,
                             pw,
@@ -664,7 +693,7 @@ impl Av2Encoder {
                             &itx422::reconstruct_chroma(
                                 predu,
                                 &levu,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 64,
                                 64,
@@ -672,9 +701,13 @@ impl Av2Encoder {
                             ),
                         );
                         let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
-                        let levv = bases
-                            .chroma444
-                            .project(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), 0.0);
+                        let levv = bases.chroma444.project(
+                            &aq::scale_resid(
+                                &get_residual(&vp, pw, sb_y, sb_x, 64, predv),
+                                sb_resid_scale,
+                            ),
+                            0.0,
+                        );
                         put_block(
                             &mut recv,
                             pw,
@@ -684,7 +717,7 @@ impl Av2Encoder {
                             &crate::av2::itx422::reconstruct_chroma(
                                 predv,
                                 &levv,
-                                qstep_i,
+                                sb_qstep,
                                 &crate::av2::tables::SCAN,
                                 64,
                                 64,
@@ -726,6 +759,9 @@ impl Av2Encoder {
                     &mut above_pctx,
                     &mut left_pctx,
                 );
+                // Edge SBs: quantization-neutral, but emit delta_q (0) once per SB.
+                enc.delta_q_signaled = 0;
+                enc.delta_q_pending = enc.delta_q_present;
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
@@ -767,6 +803,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 qstep_i,
+                                1.0, // resid_scale: no AQ on this path
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
