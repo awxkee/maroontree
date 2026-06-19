@@ -27,6 +27,11 @@ pub(crate) struct Config {
     pub(crate) lossless: bool,
     /// Enable CfL chroma-from-luma signalling. Experimental, bitstream-affecting.
     pub(crate) cfl: bool,
+    /// Adaptive quantization: when set, `delta_q_present` is signalled in the
+    /// frame header and every superblock carries a per-SB quantizer delta.
+    /// `aq_res_log2` is the delta-Q resolution (qindex step = 1 << res_log2).
+    pub(crate) aq: bool,
+    pub(crate) aq_res_log2: u8,
 }
 
 /// LEB128-encode an unsigned value.
@@ -205,8 +210,16 @@ pub(crate) fn frame_header(
     let q_bits = 8 + u32::from(config.bit_depth > 8);
     b.write_bits(if config.lossless { 0 } else { config.base_q }, q_bits);
     b.write_bit(0);
-    b.write_bit(0);
-    b.write_bit(0); // segmentation, qm, delta-q (off)
+    b.write_bit(0); // segmentation.enabled = 0, qm.enabled = 0
+    // delta_q_params: present flag (gated on quant.yac != 0, true for lossy),
+    // then 2-bit res_log2. The decoder reads no delta_lf here (AVM continues with
+    // TCQ/parity), so this inserts exactly present(+res) with no further change.
+    if config.aq && !config.lossless {
+        b.write_bit(1); // delta_q_present = 1
+        b.write_bits(config.aq_res_log2 as u32, 2);
+    } else {
+        b.write_bit(0); // delta_q_present = 0
+    }
 
     if config.lossless {
         // coded_lossless: setup_loopfilter returns early, guided-deblock/CDEF/CCSO are

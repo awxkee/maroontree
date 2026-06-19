@@ -66,6 +66,16 @@ impl Av2Encoder {
             left_pctx,
         } = nb;
         let bases = &self.bases;
+        let mut aqs = aq::AqState::new(
+            enc.delta_q_present,
+            self.base_q_idx as i32,
+            qstep_i,
+            if enc.delta_q_present {
+                aq::tile_ref_activity(yp, pw, sb_rows, sb_cols, width, height)
+            } else {
+                0.0
+            },
+        );
         for row in 0..sb_rows {
             left_pctx.iter_mut().for_each(|p| *p = 0);
             for col in 0..sb_cols {
@@ -77,6 +87,16 @@ impl Av2Encoder {
                     above_pctx,
                     left_pctx,
                 );
+                // Whole-64 interior SBs get AQ (the (16,16) leaf below); split edge
+                // SBs stay quantization-neutral. delta_q is emitted once per SB.
+                let whole_sb = col * 64 + 64 <= width && row * 64 + 64 <= height;
+                let (sb_qstep, sb_resid_scale) = if whole_sb {
+                    aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height)
+                } else {
+                    enc.delta_q_signaled = 0;
+                    (qstep_i, 1.0f32)
+                };
+                enc.delta_q_pending = enc.delta_q_present;
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, _lmr, _lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
@@ -104,7 +124,8 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
+                                sb_resid_scale,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -488,6 +509,7 @@ impl Av2Encoder {
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
@@ -541,10 +563,22 @@ impl Av2Encoder {
             return Ok(self.finish(enc, &config, pw, ph, width, height, color));
         }
 
+        let mut aqs = aq::AqState::new(
+            enc.delta_q_present,
+            self.base_q_idx as i32,
+            qstep_i,
+            if enc.delta_q_present {
+                aq::tile_ref_activity(&yp, pw, sb_rows, sb_cols, width, height)
+            } else {
+                0.0
+            },
+        );
         for row in 0..sb_rows {
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
+                let (sb_qstep, sb_resid_scale) =
+                    aqs.per_sb(&mut enc, &yp, pw, sb_y, sb_x, width, height);
                 let (tus, mode_idx, _) = encode_luma_sb(
                     &mut recy,
                     &yp,
@@ -554,7 +588,8 @@ impl Av2Encoder {
                     sb_y,
                     sb_x,
                     &bases.luma,
-                    qstep_i,
+                    sb_qstep,
+                    sb_resid_scale,
                     &tables::SCAN,
                     neutral,
                     qc,
@@ -573,6 +608,7 @@ impl Av2Encoder {
                     (pw / 4) as i64,
                     (ph / 4) as i64,
                 );
+                enc.delta_q_pending = enc.delta_q_present;
                 encode_luma_block_split(
                     &mut enc,
                     &tus,

@@ -131,6 +131,19 @@ pub(crate) struct RangeEncoder {
     /// CDF band avmdec loads (0:q<=90, 1:91..140, 2:141..190, 3:>=191).
     /// Defaults to 1 so legacy q120 paths are unchanged.
     pub(crate) qc: usize,
+    /// Per-superblock adaptive-quantization (delta-Q) signalling. When
+    /// `delta_q_present` is set, every SB emits a delta-Q symbol right after its
+    /// partition bit; `delta_q_signaled` is the value to emit for the current SB
+    /// (signaled units = qindex-delta / 2^res_log2, magnitude <= 6, sign carried
+    /// by a bypass bit). Matches the decoder's `have_delta_q` (always true for
+    /// intra luma, where skip_txfm == 0).
+    pub(crate) delta_q_present: bool,
+    pub(crate) delta_q_signaled: i32,
+    /// Set by the caller just before emitting the SB's first leaf; the mode
+    /// emitter consumes it (emits the delta-Q symbol after the partition bit and
+    /// clears the flag), so delta-Q is coded exactly once per SB regardless of
+    /// how the SB partitions.
+    pub(crate) delta_q_pending: bool,
     /// Emit CfL (chroma-from-luma) signalling for chroma-ref blocks. Set per encode
     /// from the tuning flag; false keeps the bitstream byte-identical.
     pub(crate) cfl: bool,
@@ -155,6 +168,9 @@ impl RangeEncoder {
             count: -9,
             output: vec![],
             qc: 1,
+            delta_q_present: false,
+            delta_q_signaled: 0,
+            delta_q_pending: false,
             cfl: false,
             cfl_ctx: 0,
             cfl_use: false,

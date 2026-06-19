@@ -458,8 +458,6 @@ fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
         .unwrap_or(0)
 }
 
-// ----- luma block ---------------------------------------------------------------
-
 /// Encode the intra mode information that precedes a luma block's coefficients.
 // ---- AV2 directional luma intra mode coding (conformant to the decoder) -----
 // Internal luma mode index: 0=DC 1=SMOOTH 2=SMOOTH_V 3=SMOOTH_H 4=PAETH, and
@@ -487,6 +485,27 @@ static Y_IDX1: [[u16; 5]; 3] = [
     [23984, 18212, 13058, 7865, 4044],
 ];
 static Y_SET_ICDF: [u16; 3] = [3905, 1746, 1044];
+
+/// Per-superblock delta-Q symbol CDF (decoder `cdf_m.delta_q()`, 8 symbols /
+/// 7 thresholds; values are the decoder defaults, trailing count dropped).
+/// We only ever emit magnitudes 0..=6, so the escape symbol (7) is never used.
+static DELTA_Q_ICDF: [u16; 7] = [16174, 9443, 6344, 4543, 3410, 2669, 2155];
+
+pub(crate) fn emit_delta_q(enc: &mut RangeEncoder, signaled: i32) {
+    let a = signaled.unsigned_abs() as usize;
+    debug_assert!(a <= 6, "delta_q magnitude {a} would hit the escape symbol");
+    enc.encode_symbol(&DELTA_Q_ICDF, a, 7);
+    if a != 0 {
+        enc.encode_bypass((signaled < 0) as u32, 1);
+    }
+}
+
+pub(crate) fn maybe_emit_delta_q(enc: &mut RangeEncoder) {
+    if enc.delta_q_present && enc.delta_q_pending {
+        emit_delta_q(enc, enc.delta_q_signaled);
+        enc.delta_q_pending = false;
+    }
+}
 // intra_uv_mode ICDF, ctx 0 = non-directional luma, ctx 1 = directional luma
 #[rustfmt::skip]
 static UV_MODE: [[u16; 7]; 2] = [
@@ -582,6 +601,7 @@ pub(crate) fn encode_intra_modes_dir(
     if let Some(cdf) = partition_cdf {
         enc.encode_bool(cdf, 0);
     }
+    maybe_emit_delta_q(enc);
     let midx;
     if mode_idx < 5 {
         // non-directional: set 0, idx0[ctx], symbol = mode_idx (0..4). The idx0
@@ -678,6 +698,7 @@ fn encode_intra_modes(
     if let Some(cdf) = partition_cdf {
         enc.encode_bool(cdf, 0);
     }
+    maybe_emit_delta_q(enc);
     if lossless {
         // Lossless intra reads use_dpcm_y (dpcm_cdf, AVM_CDF2(16384)) before the luma
         // mode. 0 = no DPCM, then the normal intra-mode path follows.
