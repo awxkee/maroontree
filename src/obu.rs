@@ -228,6 +228,7 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    aq: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -238,6 +239,7 @@ pub(crate) fn frame_header_lossy_multitile(
         tile_rows_log2,
         false,
         mono,
+        aq,
     )
 }
 
@@ -253,6 +255,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    aq: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -263,6 +266,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         tile_rows_log2,
         true,
         mono,
+        aq,
     )
 }
 
@@ -310,6 +314,7 @@ fn frame_header_lossy_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
+    aq: bool,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -347,8 +352,17 @@ fn frame_header_lossy_impl(
     w.flag(false); // using_qmatrix
     // segmentation_params()
     w.flag(false); // segmentation_enabled
-    // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded)
-    w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
+    // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded). When
+    // adaptive quantization is on, signal superblock delta-Q: present=1 plus a
+    // 2-bit delta_q_res, then delta_lf_present=0 (allow_intrabc is 0 here, so the
+    // delta_lf_present flag is coded and we leave loop-filter deltas off).
+    if aq {
+        w.flag(true); // delta_q_present = 1
+        w.f(crate::av1real::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
+        w.flag(false); // delta_lf_present = 0
+    } else {
+        w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
+    }
     // CodedLossless = 0 => loop_filter_params():
     let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
     w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)

@@ -94,6 +94,7 @@ pub(crate) struct Cdfs {
     pub(crate) eob_bin_1024_l: Vec<u16>,          // luma, 32x32 (class 3, 1024 coeffs)
     pub(crate) eob_bin_1024_c: Vec<u16>,          // chroma, 32x32 (class 3, 1024 coeffs)
     pub(crate) eob_bin_512_c: Vec<u16>,           // chroma, RTX_16X32 (class 3, 512 coeffs)
+    pub(crate) delta_q: Vec<u16>,                 // superblock delta-q magnitude (4 symbols)
 }
 
 impl Cdfs {
@@ -249,6 +250,165 @@ impl Cdfs {
             eob_bin_1024_l: icdf(&Q::EOB_BIN_1024_LUMA[qctx]),
             eob_bin_1024_c: icdf(&Q::EOB_BIN_1024_CHROMA[qctx]),
             eob_bin_512_c: icdf(&Q::EOB_BIN_512_CHROMA[qctx]),
+            // AV1 Default_Delta_Q_Cdf = AOM_CDF4(28160, 32120, 32677); a single
+            // (context-free) 4-symbol CDF for the delta-q magnitude token. Adapts
+            // like every other symbol via OdEcEncoder::encode_symbol.
+            delta_q: icdf(&[28160, 32120, 32677]),
+        }
+    }
+}
+
+// ============================ Adaptive quantization ==========================
+//
+// Variance-based adaptive quantization for AV1, signalled through the standard
+// superblock delta-Q mechanism (frame header `delta_q_present = 1`, and a
+// `read_delta_qindex()` token in the first block of every superblock). The
+// quantizer is reallocated per 64x64 superblock from local luma activity: flat
+// regions (smooth sky / water, where banding and blocking are most visible) get
+// a finer quantizer, busy/textured regions (where quantization error is masked)
+// get a coarser one. The deltas are centred on the per-tile mean activity, so
+// the average quantizer still tracks the requested base_q_idx and the rate stays
+// close to the non-AQ encode while perceived quality improves.
+//
+// This mirrors the AV2 path in `av2/aq.rs`; the only real difference is the
+// transport (AV1's `read_delta_qindex` symbol vs AV2's delta-q signalling) and
+// the fixed-point luma plane (`i32` here, `f32` there).
+
+/// log-resolution of the delta-q step: the signalled `delta_q_res` is `1 << this`
+/// (so a step of 4 qindex units). Matches `av2/aq.rs::AQ_RES_LOG2`.
+const AQ_RES_LOG2: u8 = 2;
+/// Same value, exposed for the frame-header writer (`delta_q_res`) so the
+/// signalled resolution always matches the per-SB step used by the encoder.
+pub(crate) const AQ_DELTA_Q_RES_LOG2: u8 = AQ_RES_LOG2;
+/// Spec limit: a single `read_delta_qindex` token without the literal-extension
+/// escape can carry magnitudes 0..=2 directly; we keep the per-SB step within a
+/// modest range and never need the `DELTA_Q_SMALL` escape (3+).
+const AQ_MAX_STEPS: i32 = 12;
+/// qindex per unit of log-activity (how hard flat vs busy regions are pushed).
+/// Tuned on photographic stills; override at run time with `AQ_SLOPE`.
+const AQ_SLOPE: f32 = 5.0;
+/// per-superblock qindex delta clamp, before res-quantization.
+const AQ_MAX_DELTA: f32 = 28.0;
+
+/// Mean+variance of the (up to) 64x64 luma region whose top-left is
+/// `(sb_x, sb_y)`, returned as `ln(1 + variance)` — a perceptually reasonable
+/// "activity" that compresses the huge dynamic range of raw variance. Operates
+/// on the padded `i32` luma plane of stride `pw`.
+fn sb_activity(
+    yp: &[i32],
+    pw: usize,
+    sb_y: usize,
+    sb_x: usize,
+    width: usize,
+    height: usize,
+) -> f32 {
+    let h = height.saturating_sub(sb_y).min(64);
+    let w = width.saturating_sub(sb_x).min(64);
+    if h == 0 || w == 0 {
+        return 0.0;
+    }
+    let mut sum = 0i64;
+    let mut sum2 = 0i64;
+    for r in 0..h {
+        let base = (sb_y + r) * pw + sb_x;
+        for &c in &yp[base..base + w] {
+            let v = c as i64;
+            sum += v;
+            sum2 += v * v;
+        }
+    }
+    let n = (h * w) as f64;
+    let mean = sum as f64 / n;
+    let var = (sum2 as f64 / n - mean * mean).max(0.0);
+    (1.0 + var).ln() as f32
+}
+
+/// Mean activity over every superblock of the tile — the reference the per-SB
+/// deltas are centred on, so the deltas are (approximately) zero-mean and the
+/// average quantizer tracks the base.
+fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
+    let mut sum = 0f32;
+    let mut cnt = 0f32;
+    for sb_y in (0..h).step_by(64) {
+        for sb_x in (0..w).step_by(64) {
+            sum += sb_activity(yp, pw, sb_y, sb_x, w, h);
+            cnt += 1.0;
+        }
+    }
+    if cnt > 0.0 { sum / cnt } else { 5.0 }
+}
+
+/// Map a superblock's `activity` to a target qindex, centred on the tile mean
+/// `ref_act`. Below-average activity (flat) → finer quantizer (lower qindex);
+/// above-average (busy) → coarser. Clamped to a sane qindex range.
+///
+/// `AQ_SLOPE` / `AQ_MAX_DELTA`, and an asymmetry factor applied to the coarsening
+/// (positive-delta) side, can be overridden at run time via the `AQ_SLOPE`,
+/// `AQ_MAX_DELTA` and `AQ_COARSEN_SCALE` environment variables — used only for
+/// offline calibration sweeps; unset they fall back to the compiled defaults.
+fn aq_params() -> (f32, f32, f32) {
+    use std::sync::OnceLock;
+    static P: OnceLock<(f32, f32, f32)> = OnceLock::new();
+    *P.get_or_init(|| {
+        let get = |k: &str, d: f32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(d)
+        };
+        (
+            get("AQ_SLOPE", AQ_SLOPE),
+            get("AQ_MAX_DELTA", AQ_MAX_DELTA),
+            get("AQ_COARSEN_SCALE", 1.0),
+        )
+    })
+}
+
+fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
+    let (slope, maxd, coarsen) = aq_params();
+    let mut delta = (activity - ref_act) * slope;
+    if delta > 0.0 {
+        // Busy/textured: quantization error is masked, so coarsening is "free"
+        // perceptually. `coarsen` < 1 spends fewer of those saved bits there and
+        // more refining flats (better for perceptual/SSIM); = 1 is pure variance.
+        delta *= coarsen;
+    }
+    let delta = delta.clamp(-maxd, maxd);
+    (base_q + delta.round() as i32).clamp(1, 255)
+}
+
+/// Per-tile adaptive-quantization state held on the [`LossyTile`]. When
+/// `enabled` is false every method is a no-op and the tile quantizes at the
+/// fixed base, byte-identical to the pre-AQ encoder.
+struct AqCtx {
+    enabled: bool,
+    /// frame `base_q_idx`: the anchor the per-SB deltas are measured from and the
+    /// value `CurrentQIndex` is reset to at tile start.
+    base_q: u8,
+    /// `delta_q_res` (log2): the per-SB step is `1 << res_log2` qindex units.
+    res_log2: u8,
+    /// decoder `CurrentQIndex`, updated by each signalled delta; reset to `base_q`
+    /// at the start of the tile (delta-Q does not persist across tiles).
+    cur_qidx: i32,
+    /// tile mean activity, the zero-delta reference (see [`tile_ref_activity`]).
+    ref_act: f32,
+    /// armed at the start of each superblock; the first coded block emits the
+    /// `read_delta_qindex` token and disarms it (spec `ReadDeltas`).
+    read_deltas: bool,
+    /// `reducedDeltaQIndex` (pre-`<<res`) to emit at the first block of the SB.
+    pending: i32,
+}
+
+impl AqCtx {
+    fn off() -> Self {
+        AqCtx {
+            enabled: false,
+            base_q: 0,
+            res_log2: 0,
+            cur_qidx: 0,
+            ref_act: 0.0,
+            read_deltas: false,
+            pending: 0,
         }
     }
 }
@@ -284,6 +444,8 @@ struct LossyTile<'a> {
     /// RDO effort: [`Speed::Slow`] (default) or [`Speed::Fast`] (winner-only
     /// RDOQ, DCT-only transform choice, reduced intra mode set).
     speed: Speed,
+    /// Adaptive-quantization state; `AqCtx::off()` unless enabled per tile.
+    aq: AqCtx,
 }
 
 impl<'a> LossyTile<'a> {
@@ -313,6 +475,7 @@ impl<'a> LossyTile<'a> {
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
             speed: Speed::Slow,
+            aq: AqCtx::off(),
         }
     }
 
@@ -346,6 +509,7 @@ impl<'a> LossyTile<'a> {
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
             speed: Speed::Slow,
+            aq: AqCtx::off(),
         }
     }
 
@@ -378,6 +542,7 @@ impl<'a> LossyTile<'a> {
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
             speed: Speed::Slow,
+            aq: AqCtx::off(),
         }
     }
 
@@ -410,6 +575,7 @@ impl<'a> LossyTile<'a> {
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
             speed: Speed::Slow,
+            aq: AqCtx::off(),
         }
     }
 
@@ -665,6 +831,76 @@ impl<'a> LossyTile<'a> {
     fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         self
+    }
+
+    /// Turn on variance-based adaptive quantization for this tile. `ref_act` is
+    /// the tile mean activity (see [`tile_ref_activity`]); the running
+    /// `CurrentQIndex` starts at the frame base. Must be paired with a frame
+    /// header that signals `delta_q_present = 1` and the matching `delta_q_res`.
+    fn enable_aq(&mut self, base_q: u8, ref_act: f32) {
+        self.aq = AqCtx {
+            enabled: true,
+            base_q,
+            res_log2: AQ_RES_LOG2,
+            cur_qidx: base_q as i32,
+            ref_act,
+            read_deltas: false,
+            pending: 0,
+        };
+    }
+
+    /// Begin a superblock at luma pixel `(sb_x, sb_y)`: pick the SB's quantizer
+    /// from its local activity, retarget `self.quant`/`self.cquant`, and arm the
+    /// `read_delta_qindex` token that the SB's first coded block will emit. No-op
+    /// when AQ is disabled, so the non-AQ path is byte-identical.
+    fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
+        if !self.aq.enabled {
+            return;
+        }
+        let act = sb_activity(&self.src[0], self.w, sb_y, sb_x, self.w, self.h);
+        let target = aq_target_qidx(self.aq.base_q as i32, act, self.aq.ref_act);
+        let step = 1i32 << self.aq.res_log2;
+        let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
+            .round()
+            .clamp(-(AQ_MAX_STEPS as f32), AQ_MAX_STEPS as f32) as i32;
+        // The decoder applies Clip3(1,255, cur + steps*step); mirror it exactly so
+        // both sides agree on the new qindex even when the clamp bites.
+        let newq = (self.aq.cur_qidx + steps * step).clamp(1, 255);
+        self.aq.cur_qidx = newq;
+        self.aq.pending = steps;
+        self.aq.read_deltas = true;
+        self.quant = Quant::new(newq as u8, self.bd);
+        self.cquant = Quant::new_chroma(newq as u8, self.bd);
+    }
+
+    /// Emit the `read_delta_qindex()` token for the first block of a superblock,
+    /// if armed (spec `ReadDeltas`). Codes the magnitude with the adaptive
+    /// `delta_q` CDF, the `DELTA_Q_SMALL` literal escape for magnitudes >= 3, and
+    /// the equiprobable sign bit. Called immediately after the block-skip symbol,
+    /// matching `intra_frame_mode_info()` ordering (no in-block segment/cdef token
+    /// precedes it here). No-op when AQ is off or already emitted for this SB.
+    fn code_delta_q_if_armed(&mut self) {
+        if !self.aq.read_deltas {
+            return;
+        }
+        self.aq.read_deltas = false;
+        let m = self.aq.pending.unsigned_abs() as i32;
+        const DELTA_Q_SMALL: usize = 3;
+        if m < DELTA_Q_SMALL as i32 {
+            self.enc.encode_symbol(m as usize, &mut self.cdfs.delta_q);
+        } else {
+            self.enc
+                .encode_symbol(DELTA_Q_SMALL, &mut self.cdfs.delta_q);
+            // m = abs_bits + (1 << rem) + 1, rem = floor(log2(m-1)) >= 1.
+            let v = (m - 1) as u32;
+            let rem = 31 - v.leading_zeros(); // floor(log2(v))
+            let abs_bits = v - (1 << rem);
+            self.enc.encode_literal(rem - 1, 3); // delta_q_rem_bits (pre-increment)
+            self.enc.encode_literal(abs_bits, rem); // delta_q_abs_bits
+        }
+        if m != 0 {
+            self.enc.encode_literal((self.aq.pending < 0) as u32, 1); // sign
+        }
     }
 
     fn code_block16(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) {
@@ -944,6 +1180,9 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        // AV1 read_delta_qindex(): first block of the SB emits the per-SB
+        // delta-q token here (after skip, before the luma mode).
+        self.code_delta_q_if_armed();
         self.mark_skip8(x8, y8, 2, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
@@ -1596,6 +1835,9 @@ impl<'a> LossyTile<'a> {
             let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
             self.enc
                 .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+            // AV1 read_delta_qindex(): first block of the SB emits the per-SB
+            // delta-q token here (after skip, before the luma mode).
+            self.code_delta_q_if_armed();
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(best_mode, &mut self.cdfs.kf_y[yctx]);
@@ -2054,6 +2296,9 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        // AV1 read_delta_qindex(): first block of the SB emits the per-SB
+        // delta-q token here (after skip, before the luma mode).
+        self.code_delta_q_if_armed();
         self.mark_skip8(x8, y8, 1, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
@@ -2564,50 +2809,38 @@ impl<'a> LossyTile<'a> {
     }
 
     fn prefer_32x32(&self, _x8: usize, _y8: usize) -> bool {
-        false
-        // if self.mono {
-        //     return false; // monochrome codes 8x8 luma blocks only
-        // }
-        // // A 32x32 luma block gives a 32x32 chroma transform in 4:4:4 and a
-        // // 16x32 one in 4:2:2 — both tall enough that a quantized smooth-gradient
-        // // ramp rings (Gibbs) into horizontal banding. Only 4:2:0 keeps chroma at
-        // // 16 rows here, so restrict 32x32 luma to 4:2:0.
-        // if !self.ss420 {
-        //     return false;
-        // }
-        // // Even in 4:2:0, a smooth low-contrast 32x32 block rings into a strong
-        // // low-frequency luma staircase. Keep such blocks small (they split to
-        // // 16x16, which the smoothness gate may split again to 8x8).
-        // if self.block_luma_range(_x8, _y8, 32) < LF_BAND_SMOOTH_RANGE {
-        //     return false;
-        // }
-        // let (px, py) = (_x8 * 8, _y8 * 8);
-        // // one 32x32 (DC-pred)
-        // let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
-        // let mut r32 = [0i32; 1024];
-        // for (ry, drow) in r32.chunks_exact_mut(32).enumerate() {
-        //     let srow = &self.src[0][(py + ry) * self.w + px..];
-        //     for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-        //         *dv = s - lpred;
-        //     }
-        // }
-        // forward_dct_quant_32x32(&mut r32, &self.quant);
-        // let cost32: u32 = est_block_bits(&r32, &SCAN_32X32) + OVERHEAD_16;
-        // // four 16x16 (DC-pred each from current recon; decision-only proxy)
-        // let mut cost16 = 0u32;
-        // for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
-        //     let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
-        //     let mut r16 = [0i32; 256];
-        //     for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
-        //         let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
-        //         for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-        //             *dv = s - pred;
-        //         }
-        //     }
-        //     forward_dct_quant_16x16(&mut r16, &self.quant);
-        //     cost16 += est_block_bits(&r16, &SCAN_16X16) + OVERHEAD_16;
-        // }
-        // cost32 + (cost16 >> 4) <= cost16
+        let policy = tx32_policy();
+        if policy == 0 || self.mono || !self.ss420 {
+            return false;
+        }
+        if policy == 1 && self.block_luma_range(_x8, _y8, 32) < tx32_smooth_gate() {
+            return false;
+        }
+        let (px, py) = (_x8 * 8, _y8 * 8);
+        let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
+        let mut r32 = [0i32; 1024];
+        for (ry, drow) in r32.chunks_exact_mut(32).enumerate() {
+            let srow = &self.src[0][(py + ry) * self.w + px..];
+            for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                *dv = s - lpred;
+            }
+        }
+        forward_dct_quant_32x32(&mut r32, &self.quant);
+        let cost32: u32 = est_block_bits(&r32, &SCAN_32X32) + OVERHEAD_16;
+        let mut cost16 = 0u32;
+        for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
+            let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
+            let mut r16 = [0i32; 256];
+            for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
+                let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
+                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                    *dv = s - pred;
+                }
+            }
+            forward_dct_quant_16x16(&mut r16, &self.quant);
+            cost16 += est_block_bits(&r16, &SCAN_16X16) + OVERHEAD_16;
+        }
+        cost32 + (cost16 >> 4) <= cost16
     }
 
     /// Code a 32x32 region (4:4:4 only) as a single TX_32X32 block: DC-pred luma
@@ -2755,6 +2988,9 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        // AV1 read_delta_qindex(): first block of the SB emits the per-SB
+        // delta-q token here (after skip, before the luma mode).
+        self.code_delta_q_if_armed();
         self.mark_skip8(x8, y8, 4, block_skip);
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
@@ -3398,15 +3634,15 @@ impl<'a> LossyTile<'a> {
     }
 }
 
-/// Encode a **lossy** 4:4:4 still of arbitrary size (width and height multiples
-/// of 64). `planes` are luma (G), U (B), V (R), each a `w*h` raster of 0..=255.
-/// The frame is tiled into 64x64 superblocks (raster order, single tile); each
-/// superblock is split uniformly into 8x8 blocks coded DC_PRED + TX_8X8
-/// (DCT_DCT) and quantized by `base_q_idx` (keep `<= 20` for coefficient qctx 0).
-/// Round `n` up to the next multiple of 8.
-/// Source luma peak-to-peak range below which a block is treated as a smooth
-/// gradient and kept on small (8x8) transforms to avoid low-frequency banding.
-/// Real texture/edges exceed this, so they still use efficient large transforms.
+fn tx32_policy() -> u32 {
+    2
+}
+
+#[inline]
+fn tx32_smooth_gate() -> i32 {
+    LF_BAND_SMOOTH_RANGE
+}
+
 const LF_BAND_SMOOTH_RANGE: i32 = 32;
 
 pub(crate) fn align8(n: usize) -> usize {
@@ -3610,6 +3846,7 @@ fn encode_one_tile(
     src: &[Vec<i32>; 3],
     r: &TileRect,
     speed: Speed,
+    aq: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -3634,8 +3871,15 @@ fn encode_one_tile(
         }
     }
     .with_speed(speed);
+    if aq {
+        // Center the per-SB deltas on this tile's mean activity so the average
+        // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
+        let ref_act = tile_ref_activity(&tile.src[0], tile.w, tile.w, tile.h);
+        tile.enable_aq(base_q_idx, ref_act);
+    }
     for sb_y in (0..r.th).step_by(64) {
         for sb_x in (0..r.tw).step_by(64) {
+            tile.aq_begin_sb(sb_x, sb_y);
             tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
         }
     }
@@ -3701,6 +3945,7 @@ fn encode_lossy_tilegroup(
     mono: bool,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3747,7 +3992,11 @@ fn encode_lossy_tilegroup(
     let outs: Vec<TileOut> = if nthreads <= 1 || n <= 1 {
         rects
             .iter()
-            .map(|r| encode_one_tile(base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed))
+            .map(|r| {
+                encode_one_tile(
+                    base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq,
+                )
+            })
             .collect()
     } else {
         let mut slots: Vec<Option<TileOut>> = (0..n).map(|_| None).collect();
@@ -3757,7 +4006,7 @@ fn encode_lossy_tilegroup(
                 scope.spawn(move || {
                     for (r, o) in rs.iter().zip(os.iter_mut()) {
                         *o = Some(encode_one_tile(
-                            base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed,
+                            base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq,
                         ));
                     }
                 });
@@ -3901,6 +4150,7 @@ fn frame_deblock(
         }
     }
     let csb = 16 >> ss_ver;
+    #[allow(clippy::needless_range_loop)]
     for plane in 1..3 {
         crate::loopfilter::filter_plane(
             &mut recon[plane],
@@ -3945,7 +4195,13 @@ fn assemble_tilegroup(payloads: Vec<Vec<u8>>) -> Vec<u8> {
 /// (type 3) + `OBU_TILE_GROUP` (type 4), which strict parsers (ffmpeg's
 /// `av1_frame_merge` BSF) handle reliably where a multi-tile combined
 /// `OBU_FRAME` does not.
-fn assemble_frame_obus(base_q_idx: u8, plan: &Tiling, tilegroup: &[u8], mono: bool) -> Vec<u8> {
+fn assemble_frame_obus(
+    base_q_idx: u8,
+    plan: &Tiling,
+    tilegroup: &[u8],
+    mono: bool,
+    aq: bool,
+) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = frame_header_lossy_multitile_th(
             base_q_idx,
@@ -3954,11 +4210,19 @@ fn assemble_frame_obus(base_q_idx: u8, plan: &Tiling, tilegroup: &[u8], mono: bo
             plan.tcl,
             plan.trl,
             mono,
+            aq,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
-        let fh =
-            frame_header_lossy_multitile(base_q_idx, &plan.cols_incr, &plan.rows_incr, 0, 0, mono);
+        let fh = frame_header_lossy_multitile(
+            base_q_idx,
+            &plan.cols_incr,
+            &plan.rows_incr,
+            0,
+            0,
+            mono,
+            aq,
+        );
         wrap_obu_frame(&fh, tilegroup)
     }
 }
@@ -4227,8 +4491,10 @@ pub(crate) fn encode_av1_lossy_image_cs(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_cs_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads, speed).0
+    encode_av1_lossy_image_cs_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq)
+        .0
 }
 
 /// Debug variant of [`encode_av1_lossy_image_cs`] (4:4:4) returning the padded
@@ -4245,6 +4511,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -4254,15 +4521,16 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
         pad_to_mult8(u, w, h, w8, h8),
         pad_to_mult8(v, w, h, w8, h8),
     ];
-    let (payload, recon, plan) =
-        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed);
+    let (payload, recon, plan) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq,
+    );
     let profile = if bd == 12 { 2 } else { 1 };
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp(
         w as u32, h as u32, profile, bd, color,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
     (bytes, recon, (w8, h8))
 }
 
@@ -4282,8 +4550,12 @@ pub(crate) fn encode_av1_lossy_image_422(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_422_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads, speed).0
+    encode_av1_lossy_image_422_recon_dbg(
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq,
+    )
+    .0
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -4298,6 +4570,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -4309,14 +4582,15 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan) =
-        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed);
+    let (payload, recon, plan) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq,
+    );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, 2, bd, color, 1, 0,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
     (bytes, recon, (w8, h8, cw8))
 }
 
@@ -4336,8 +4610,12 @@ pub(crate) fn encode_av1_lossy_image_420(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_420_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads, speed).0
+    encode_av1_lossy_image_420_recon_dbg(
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq,
+    )
+    .0
 }
 
 /// Debug variant of [`encode_av1_lossy_image_420`] also returning the encoder's
@@ -4355,6 +4633,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     color: Option<&crate::color::Cicp>,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -4366,15 +4645,16 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan) =
-        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed);
+    let (payload, recon, plan) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq,
+    );
     let profile = if bd == 12 { 2 } else { 0 };
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, profile, bd, color, 1, 1,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
     (bytes, recon, (w8, h8, cw8, ch8))
 }
 
@@ -4388,9 +4668,10 @@ pub(crate) fn encode_av1_mono_image(
     full_range: bool,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> Vec<u8> {
     let (bytes, _recon, _w8, _h8) =
-        encode_av1_mono_image_recon_dbg(base_q_idx, bd, w, h, luma, full_range, threads, speed);
+        encode_av1_mono_image_recon_dbg(base_q_idx, bd, w, h, luma, full_range, threads, speed, aq);
     bytes
 }
 
@@ -4405,19 +4686,20 @@ pub(crate) fn encode_av1_mono_image_recon_dbg(
     full_range: bool,
     threads: usize,
     speed: Speed,
+    aq: bool,
 ) -> (Vec<u8>, Vec<i32>, usize, usize) {
     assert_eq!(luma.len(), w * h, "luma plane must be w*h");
     assert!(w > 0 && h > 0, "width/height must be non-zero");
     let (w8, h8) = (align8(w), align8(h));
     let src = [pad_to_mult8(luma, w, h, w8, h8), Vec::new(), Vec::new()];
     let (payload, recon, plan) =
-        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed);
+        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mono(
         w as u32, h as u32, bd, full_range,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, true));
+    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, true, aq));
     let [luma_recon, _, _] = recon;
     (bytes, luma_recon, w8, h8)
 }
@@ -4454,6 +4736,7 @@ mod tests {
             Some(&color),
             1,
             Speed::Slow,
+            false,
         );
         // Count chroma row-mean boundary jumps (>=1 count at 16/32 multiples)
         let mut bj = 0;
@@ -4523,6 +4806,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             std::fs::write("/tmp/lf422.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
@@ -4591,6 +4875,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             std::fs::write("/tmp/lf444.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
@@ -4687,6 +4972,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
             let (up, us) = analyze(&r[1], w8, &fu, w, w, h);
@@ -4726,6 +5012,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
             let (up, us) = analyze(&r[1], cw8, &u, cw, cw, ch);
@@ -4755,6 +5042,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             let (yp, ys) = analyze(&r[0], w8, &fy, w, w, h);
             let (up, us) = analyze(&r[1], cw8, &u, cw, cw, h);
@@ -4813,6 +5101,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             std::fs::write("/tmp/lf_v.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
@@ -4925,6 +5214,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             if dav1d_available() {
                 std::fs::write("/tmp/nfb.obu", &bytes).unwrap();
@@ -4961,6 +5251,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             let mut sc = 0i64;
             for j in 0..ch {
@@ -5042,6 +5333,7 @@ mod tests {
                 Some(&color),
                 1,
                 sp,
+                false,
             );
             let mut sy = 0i64;
             for j in 0..h {
@@ -5110,6 +5402,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Fast,
+                false,
             );
             std::fs::write("/tmp/sp.obu", &bytes).unwrap();
             let ok = std::process::Command::new("/usr/bin/dav1d")
@@ -5206,6 +5499,7 @@ mod tests {
                             Some(&color),
                             threads,
                             sp,
+                            false,
                         );
                     std::fs::write("/tmp/ml.obu", &bytes).unwrap();
                     let ok = std::process::Command::new("/usr/bin/dav1d")
@@ -5324,6 +5618,7 @@ mod tests {
                                     Some(&color),
                                     threads,
                                     sp,
+                                    false,
                                 );
                                 (b, r, (w8, w8))
                             }
@@ -5340,6 +5635,7 @@ mod tests {
                                         Some(&color),
                                         threads,
                                         sp,
+                                        false,
                                     );
                                 (b, r, (w8, cw8))
                             }
@@ -5356,6 +5652,7 @@ mod tests {
                                         Some(&color),
                                         threads,
                                         sp,
+                                        false,
                                     );
                                 (b, r, (w8, cw8))
                             }
@@ -5477,6 +5774,7 @@ mod tests {
                                 Some(&color),
                                 1,
                                 sp,
+                                false,
                             );
                             (b, r, (w8, cw8))
                         } else if is444 {
@@ -5491,6 +5789,7 @@ mod tests {
                                 Some(&color),
                                 1,
                                 sp,
+                                false,
                             );
                             (b, r, (w8, w8))
                         } else {
@@ -5520,6 +5819,7 @@ mod tests {
                                     Some(&color),
                                     1,
                                     sp,
+                                    false,
                                 );
                             (b, r, (w8, cw8))
                         };
@@ -5611,6 +5911,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             std::fs::write("/tmp/idtx.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
@@ -5692,6 +5993,7 @@ mod tests {
                 Some(&color),
                 1,
                 Speed::Slow,
+                false,
             );
             std::fs::write("/tmp/lf_tex.obu", &bytes).unwrap();
             let st = std::process::Command::new("/usr/bin/dav1d")
@@ -5791,7 +6093,7 @@ mod tests {
         let (w, h) = (128usize, 96usize);
         let luma: Vec<i32> = (0..w * h).map(|i| (i % 256) as i32).collect();
         let (small, _r, _w8, _h8) =
-            encode_av1_mono_image_recon_dbg(24, 8, w, h, &luma, true, 1, Speed::Slow);
+            encode_av1_mono_image_recon_dbg(24, 8, w, h, &luma, true, 1, Speed::Slow, false);
         let st = obu_types(&small);
         assert!(st.contains(&6), "mono single tile -> OBU_FRAME (6): {st:?}");
         assert!(
@@ -5805,7 +6107,7 @@ mod tests {
         let (bw, bh) = (4160usize, 64usize);
         let bl: Vec<i32> = (0..bw * bh).map(|i| (i % 251) as i32).collect();
         let (big, _r2, _w82, _h82) =
-            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 1, Speed::Slow);
+            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 1, Speed::Slow, false);
         let bt = obu_types(&big);
         assert!(
             bt.contains(&3) && bt.contains(&4),
@@ -5817,9 +6119,9 @@ mod tests {
         );
 
         let (s1, r1, _, _) =
-            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 1, Speed::Slow);
+            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 1, Speed::Slow, false);
         let (s2, r2, _, _) =
-            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 2, Speed::Slow);
+            encode_av1_mono_image_recon_dbg(24, 8, bw, bh, &bl, true, 2, Speed::Slow, false);
         assert_eq!(
             s1, s2,
             "threaded mono bytes must match serial (same tiling)"
@@ -5860,6 +6162,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb()),
             1,
             Speed::Slow,
+            false,
         );
         let par2a = encode_av1_lossy_image_420(
             80,
@@ -5872,6 +6175,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb()),
             2,
             Speed::Slow,
+            false,
         );
         let par2b = encode_av1_lossy_image_420(
             80,
@@ -5884,6 +6188,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb()),
             2,
             Speed::Slow,
+            false,
         );
         assert_eq!(
             serial, par2a,
@@ -5939,6 +6244,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb()),
             1,
             Speed::Slow,
+            false,
         );
         assert!(
             obu_types(&serial).contains(&6),
@@ -5957,6 +6263,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb()),
             4,
             Speed::Slow,
+            false,
         );
         let tt = obu_types(&threaded);
         assert!(
@@ -5997,6 +6304,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(bytes.len(), 50, "4:2:0 stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
@@ -6036,6 +6344,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(bytes.len(), 265, "4:2:0 8x8-leaves stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
@@ -6069,6 +6378,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(bytes.len(), 74, "4:2:2 stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
@@ -6108,6 +6418,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(bytes.len(), 338, "4:2:2 8x8-leaves stream length drifted");
         let sum: u32 = bytes.iter().map(|&x| x as u32).sum();
@@ -6145,6 +6456,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(p.len(), 139, "32x32 4:2:0 stream length drifted");
         assert_eq!(
@@ -6186,6 +6498,7 @@ mod tests {
             Some(&crate::color::Cicp::srgb_ycbcr()),
             1,
             Speed::Slow,
+            false,
         );
         assert_eq!(p.len(), 355, "64x64 4:2:2 stream length drifted");
         assert_eq!(

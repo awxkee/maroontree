@@ -141,6 +141,7 @@ impl AqState {
     /// SB's luma and chroma (pass `resid_scale` to `encode_luma_sb` / `scale_resid`
     /// and reconstruct at `qstep_sb`). When AQ is off this is `(qstep_base, 1.0)`
     /// and signals 0. The caller still arms `enc.delta_q_pending` before the mode.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn per_sb(
         &mut self,
         enc: &mut RangeEncoder,

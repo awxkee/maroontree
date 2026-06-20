@@ -305,7 +305,7 @@ pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-static ADST16_FWD_Q12: [[i32; 16]; 16] = [
+static ADST16_FWD_Q12: [[i16; 16]; 16] = [
     [
         284, 850, 1408, 1951, 2477, 2978, 3451, 3891, 4294, 4653, 4969, 5236, 5455, 5619, 5731,
         5788,
@@ -557,12 +557,13 @@ pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
 /// `out[u*32 + v]`, DC at index 0. Reused by [`dct32x32_scalar`] and [`dct32x32_t`].
 #[inline]
 fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
+    const B: i32 = 6;
     let mut tmp = [0i32; 1024];
-    // Column-wise 1D DCT
+    // Column-wise 1D DCT (on the B-bit-headroom residual)
     for u in 0..32 {
         let mut col = [0i32; 32];
         for i in 0..32 {
-            col[i] = input[i * 32 + u];
+            col[i] = input[i * 32 + u] << B;
         }
         dct1d_32_i32(&mut col);
         for v in 0..32 {
@@ -574,9 +575,9 @@ fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     for v in 0..32 {
         let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
         dct1d_32_i32(&mut row);
-        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
         for u in 0..32 {
-            out[u * 32 + v] = mul_q16(row[u], 16384);
+            let prod = (row[u] as i64) * 16384;
+            out[u * 32 + v] = ((prod + (1i64 << (15 + B))) >> (16 + B)) as i32;
         }
     }
     out

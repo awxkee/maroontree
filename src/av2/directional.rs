@@ -85,6 +85,7 @@ fn filter_strength(wh: i32, angle: i32) -> i32 {
 }
 
 /// 5-tap intra-edge filter (`filter_edge` in the decoder).
+#[allow(clippy::too_many_arguments)]
 fn filter_edge(
     out: &mut [i32],
     sz: usize,
@@ -129,6 +130,7 @@ fn edge_buffer(bs: usize, above: &[i32], left: &[i32], corner: i32) -> (Vec<i32>
 }
 
 /// z1: above-only directional prediction (angles 0..90), port of `ipred_z1`.
+#[allow(clippy::too_many_arguments)]
 fn z1(
     dst: &mut [i32],
     bs: usize,
@@ -207,6 +209,7 @@ fn z1(
 }
 
 /// z3: left-only directional prediction (angles 180..270), port of `ipred_z3`.
+#[allow(clippy::too_many_arguments)]
 fn z3(
     dst: &mut [i32],
     bs: usize,
@@ -278,6 +281,7 @@ fn z3(
 }
 
 /// z2: both-edge directional prediction (angles 90..180), port of `ipred_z2`.
+#[allow(clippy::too_many_arguments)]
 fn z2(
     dst: &mut [i32],
     bs: usize,

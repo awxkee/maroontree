@@ -458,13 +458,6 @@ fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
         .unwrap_or(0)
 }
 
-// ----- luma block ---------------------------------------------------------------
-
-/// Encode the intra mode information that precedes a luma block's coefficients.
-// ---- AV2 directional luma intra mode coding (conformant to the decoder) -----
-// Internal luma mode index: 0=DC 1=SMOOTH 2=SMOOTH_V 3=SMOOTH_H 4=PAETH, and
-// 5=V 6=H 7=D45 8=D135 9=D113 10=D157 11=D203 12=D67 (angle_delta = 0).
-
 #[rustfmt::skip]
 static REORDERED_DIR_Y_MODE: [u8; 8] = [3, 8, 1, 5, 4, 6, 2, 7];
 #[rustfmt::skip]
@@ -612,6 +605,7 @@ pub(crate) fn encode_intra_modes_dir(
         enc.encode_bool(cdf, 0);
     }
     maybe_emit_delta_q(enc);
+    #[allow(clippy::needless_late_init)]
     let midx;
     if mode_idx < 5 {
         // non-directional: set 0, idx0[ctx], symbol = mode_idx (0..4). The idx0
@@ -1249,6 +1243,7 @@ fn encode_luma8_tokens_scan(
 /// `do_part_cdf` / `tx_type_cdf` are passed so the exact decoder cdfs can be confirmed
 /// empirically (trace the decoder on a real 8×8 corner). `emit_tx_type` toggles the
 /// intra_ext_tx symbol for the validation pass.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_leaf_8x8(
     enc: &mut RangeEncoder,
     tu: &[Coeff],
@@ -1277,10 +1272,10 @@ pub(crate) fn encode_luma_leaf_8x8(
         0,
         6,
     );
-    if eob >= 1 {
-        if let Some((cdf, idx, nsym)) = tx_type_cdf {
-            enc.encode_symbol(cdf, idx, nsym);
-        }
+    if eob >= 1
+        && let Some((cdf, idx, nsym)) = tx_type_cdf
+    {
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1291,13 +1286,7 @@ pub(crate) fn encode_luma_leaf_8x8(
         .min(63)
 }
 
-/// Residue-4×residue-2 corner luma leaf: TX_8X16 (8 wide × 16 tall) and TX_16X8
-/// (16 wide × 8 tall) share this coder via the `scan` argument. Both are max=2/min=1
-/// intra leaves: skip ctx-2 (SKIP_TX16), eob_bin_128 (area 128, no-escape, pt_nsyms 7),
-/// the `txtp_ext(1)` (TXTP_EXT8) primary-tx symbol (idx 0 = DCT_DCT), then ENTROPY
-/// CLASS 2 tokens (LUMA16 cdfs via `encode_luma16_tokens_scan` — the decoder indexes
-/// eob_base_y_tok / base_y_tok by `t_dim.ctx`, so class-3 LUMA32 cdfs would desync).
-/// `do_part_cdf` = 12348 (TX_PART_GROUP[Bs8x16/Bs16x8] = 2).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_leaf_rect128(
     enc: &mut RangeEncoder,
     tu: &[Coeff],
@@ -1327,10 +1316,10 @@ pub(crate) fn encode_luma_leaf_rect128(
         0,
         7,
     );
-    if eob >= 1 {
-        if let Some((cdf, idx, nsym)) = tx_type_cdf {
-            enc.encode_symbol(cdf, idx, nsym);
-        }
+    if eob >= 1
+        && let Some((cdf, idx, nsym)) = tx_type_cdf
+    {
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1753,12 +1742,7 @@ pub(crate) fn encode_luma_leaf_64x16(
     )
 }
 
-/// TU coder for the long-side-32 rect transforms TX_16X32 / TX_32X16. Identical to
-/// `encode_luma_tu_rect` except the intra ext-tx set: these have tx_size_sqr_up =
-/// TX_32X32 with max side 32 (t_dim.max == 3), so the decoder reads a `txtp_long32_dct`
-/// flag BEFORE the 4-symbol short-side index. We always pick DCT_DCT, which is
-/// long32_dct = 1 (cdf default 32732) + short_idx 0 (cdf [5853,357,20]) for both
-/// orientations (TXTP_LONG_TBL[1][wh][0] == DCT_DCT).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_tu_rect_long32(
     enc: &mut RangeEncoder,
     coeffs: &[Coeff],
