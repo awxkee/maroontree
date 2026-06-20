@@ -124,6 +124,12 @@ pub(crate) struct Bases {
     /// SCAN32X8). TX_8X32/32X8 are entropy class 2 (reuse the LUMA16 token cdfs).
     pub(crate) luma8x32: Basis,
     pub(crate) luma32x8: Basis,
+    /// 16-tap-family luma corner bases (residue-4 × residue-{6,8}). `luma16x32` =
+    /// 16 wide × 32 tall (TX_16X32, coeff 16×32, SCAN16X32); `luma32x16` = 32 wide ×
+    /// 16 tall (TX_32X16, coeff 32×16, SCAN32X16). Both are EXT_TX long-side-32, so
+    /// the leaf coder emits a txtp_long32_dct flag (=1, DCT) + short-side idx 0.
+    pub(crate) luma16x32: Basis,
+    pub(crate) luma32x16: Basis,
     /// 4:2:2 chroma basis for a 32×32 luma leaf: chroma is 16 wide × 32 tall (TX_16X32,
     /// coeff region 16×32, SCAN16X32).
     pub(crate) c16x32: Basis,
@@ -137,6 +143,15 @@ pub(crate) struct Bases {
     pub(crate) c8x8: Basis,
     /// 4:2:2 8-family chroma: 8×32 luma→4×32 (TX_4X32) and 32×8 luma→16×8 (TX_16X8).
     pub(crate) c4x32: Basis,
+    /// 4:2:0 chroma for 8×32 / 32×8 luma corners: 4×16 (TX_4X16) and 16×4 (TX_16X4).
+    pub(crate) c4x16: Basis,
+    /// 4:2:2 chroma for the 8×8 luma corner: 4×8 (TX_4X8).
+    pub(crate) c4x8: Basis,
+    /// 4:2:0 chroma for the 16×8 luma corner: 8×4 (TX_8X4).
+    pub(crate) c8x4: Basis,
+    pub(crate) c16x4: Basis,
+    /// 4:2:0 chroma for the 8×8 luma corner: 4×4 (TX_4X4).
+    pub(crate) c4x4: Basis,
     pub(crate) c16x8: Basis,
 }
 
@@ -185,6 +200,8 @@ impl Bases {
         self.c8x16.max_val = mv;
         self.c8x8.max_val = mv;
         self.c4x32.max_val = mv;
+        self.c4x16.max_val = mv;
+        self.c16x4.max_val = mv;
         self.c16x8.max_val = mv;
     }
     pub(crate) fn rescaled_to_q(mut self, base_q_idx: u32) -> Bases {
@@ -209,6 +226,8 @@ impl Bases {
             self.c8x16.scale(f);
             self.c8x8.scale(f);
             self.c4x32.scale(f);
+            self.c4x16.scale(f);
+            self.c16x4.scale(f);
             self.c16x8.scale(f);
         }
         let qs = qstep(base_q_idx) as i32;
@@ -231,6 +250,8 @@ impl Bases {
         self.c8x16.qstep = qs;
         self.c8x8.qstep = qs;
         self.c4x32.qstep = qs;
+        self.c4x16.qstep = qs;
+        self.c16x4.qstep = qs;
         self.c16x8.qstep = qs;
         self
     }
@@ -355,12 +376,19 @@ pub(crate) fn default_bases() -> Bases {
         luma16x16_dct_adst: mk(DctAdst16),
         luma8x32: mk(Dct(8, 32)),
         luma32x8: mk(Dct(32, 8)),
+        luma16x32: mk(Dct(16, 32)),
+        luma32x16: mk(Dct(32, 16)),
         c16x32: mk(Dct(16, 32)),
         c8x64: mk(Dct(8, 64)),
         c32x16: mk(Dct(32, 16)),
         c8x16: mk(Dct(8, 16)),
         c8x8: mk(Dct(8, 8)),
         c4x32: mk(Dct(4, 32)),
+        c4x16: mk(Dct(4, 16)),
+        c4x8: mk(Dct(4, 8)),
+        c8x4: mk(Dct(8, 4)),
+        c16x4: mk(Dct(16, 4)),
+        c4x4: mk(Dct(4, 4)),
         c16x8: mk(Dct(16, 8)),
     }
 }

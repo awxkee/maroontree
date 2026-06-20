@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av2::cdfs_qctx::CHROMA_SKIP_TX32_QC;
+use crate::av2::cdfs_qctx::{CHROMA_SKIP_TX32_QC, SKIP_TX16_QC, SKIP_TX8_QC};
 use crate::av2::coder::Coeff;
 use crate::av2::lossless::levels_to_coeffs_4x4;
 use crate::av2::wht::fwht4x4;
@@ -263,17 +263,29 @@ pub(crate) fn sb_tu_contexts_rect(
         + l.iter().map(|&b| ((b & 0xC0) >> 6) as i32).sum::<i32>();
     // Neutral sign byte (0x40) contributes 1 each; subtract the neutral baseline.
     let sgn = dcs - (wu as i32) - (hu as i32);
-    let skip_cdf = CHROMA_SKIP_TX32_QC[qc][sctx] as u32;
+    // txb_skip cdf is selected by the TX's `ctx` field. Most rect luma leaves
+    // (16X32/32X16/16X64/64X16) are ctx=3 → CHROMA_SKIP_TX32_QC. The 8-family rect
+    // leaves (8X16/8X32/16X8/32X8, min side = 2 mi) are ctx=2 → SKIP_TX16_QC. Using the
+    // wrong class still decodes the skip *bit* as 0 but diverges the arithmetic range
+    // state, desyncing the following eob.
+    let skip_cdf = if wu.min(hu) == 2 && wu.max(hu) == 2 {
+        // 8×8 corner (TX_8X8) is ctx=1 → SKIP_TX8_QC.
+        SKIP_TX8_QC[qc][sctx] as u32
+    } else if wu.min(hu) == 2 && wu.max(hu) >= 4 {
+        SKIP_TX16_QC[qc][sctx] as u32
+    } else {
+        CHROMA_SKIP_TX32_QC[qc][sctx] as u32
+    };
     let dc_sign_ctx = ((sgn != 0) as usize) + ((sgn > 0) as usize);
     let nz: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     let res = if nz.is_empty() {
         0x40u8
     } else {
-        let cul = (nz
+        let cul = nz
             .iter()
             .map(|&(_, l)| l.unsigned_abs())
             .sum::<u32>()
-            .min(63)) as u8;
+            .min(63) as u8;
         let dc = nz
             .iter()
             .find(|&&(s, _)| s == 0)
