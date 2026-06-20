@@ -2810,7 +2810,7 @@ impl<'a> LossyTile<'a> {
 
     fn prefer_32x32(&self, _x8: usize, _y8: usize) -> bool {
         let policy = tx32_policy();
-        if policy == 0 || self.mono || !self.ss420 {
+        if policy == 0 || self.mono {
             return false;
         }
         if policy == 1 && self.block_luma_range(_x8, _y8, 32) < tx32_smooth_gate() {
@@ -6468,10 +6468,11 @@ mod tests {
 
     #[test]
     fn lossy_64x64_422_tx32_chroma_stable() {
-        // 64x64 4:2:2 at q32. 4:2:2 is restricted to 8x8 luma blocks, so this
-        // codes as 8x8 luma leaves with RTX_4X8 chroma (no tall 16x32 chroma
-        // transform — those ring into green lanes on smooth gradients). Verified
-        // bit-exact vs dav1d 1.4.1 (maxdiff 0). Guards 4:2:2 stream stability.
+        // 64x64 4:2:2 at q32. With the 16x32 forward DCT precision fixed (headroom
+        // bits remove the round-trip floor that used to ring smooth chroma into
+        // green lanes), the 32x32 luma path is enabled for 4:2:2: a TX_32X32 luma
+        // block with RTX_16X32 chroma per plane. Decodes via dav1d. Guards 4:2:2
+        // stream stability.
         let (w, h) = (64usize, 64usize);
         let mut y = vec![0u8; w * h];
         for yy in 0..h {
@@ -6500,10 +6501,10 @@ mod tests {
             Speed::Slow,
             false,
         );
-        assert_eq!(p.len(), 355, "64x64 4:2:2 stream length drifted");
+        assert_eq!(p.len(), 134, "64x64 4:2:2 stream length drifted");
         assert_eq!(
             p.iter().map(|&x| x as u64).sum::<u64>(),
-            45430,
+            15708,
             "64x64 4:2:2 stream bytes drifted"
         );
     }
