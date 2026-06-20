@@ -7,3 +7,5 @@ edition = "2024"
 maroontree = {path = "../", default-features = false}
 image = {version = "0.25.10", default-features = false, features = ["jpeg", "png"]}
 tealdust = {path = "../../tealdust"}
+dav2d = {path = "../../dav2d-rs-master"}
+criterion = "0.8.2"

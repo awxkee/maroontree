@@ -98,7 +98,12 @@ fn tile_starts(dim_px: usize, log2: usize) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
-    while start < ceil_sb && i < n {
+    // Loop bound is `full_sb` (floor SB count), matching the decoder's uniform-tiling
+    // loop `while sbx < fsbw` (obu.rs). The sentinel below extends the last tile to
+    // `ceil_sb`. Bounding on `ceil_sb` here instead would emit one extra tile whenever
+    // the per-tile size is 1 SB and the frame has a partial last SB (e.g. 456 px = 7
+    // full + 1 partial SB at log2=3: decoder makes 7 tiles, not 8), desyncing the grid.
+    while start < full_sb && i < n {
         starts.push(start);
         start += base + if extra > 0 { 1 } else { 0 };
         if extra > 0 {
@@ -364,8 +369,8 @@ impl Av2Encoder {
                         rdoq_lambda,
                         self.speed,
                         self.bit_depth as i32,
-                        false, // non-directional path
-                    );
+                    false, // non-directional path
+);
                     let j_s = sse_region(&recy)
                         + lambda
                             * (rate_proxy(&tus_s, 3.0) + if mode_idx != 0 { 6.0 } else { 0.0 });
@@ -636,12 +641,8 @@ impl Av2Encoder {
                         let mut ru = [0f32; 64 * 64];
                         let mut rv = [0f32; 64 * 64];
                         cfl_prediction::<64>(pw, &up, &vp, sb_y, sb_x, &ch, &mut ru, &mut rv);
-                        let levu = bases
-                            .chroma444
-                            .project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
-                        let levv = bases
-                            .chroma444
-                            .project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
+                        let levu = bases.chroma444.project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
+                        let levv = bases.chroma444.project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
                         put_block(
                             &mut recu,
                             pw,
@@ -677,13 +678,9 @@ impl Av2Encoder {
                         (levu, levv)
                     } else {
                         let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
-                        let levu = bases.chroma444.project(
-                            &aq::scale_resid(
-                                &get_residual(&up, pw, sb_y, sb_x, 64, predu),
-                                sb_resid_scale,
-                            ),
-                            0.0,
-                        );
+                        let levu = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&get_residual(&up, pw, sb_y, sb_x, 64, predu), sb_resid_scale), 0.0);
                         put_block(
                             &mut recu,
                             pw,
@@ -701,13 +698,9 @@ impl Av2Encoder {
                             ),
                         );
                         let predv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
-                        let levv = bases.chroma444.project(
-                            &aq::scale_resid(
-                                &get_residual(&vp, pw, sb_y, sb_x, 64, predv),
-                                sb_resid_scale,
-                            ),
-                            0.0,
-                        );
+                        let levv = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&get_residual(&vp, pw, sb_y, sb_x, 64, predv), sb_resid_scale), 0.0);
                         put_block(
                             &mut recv,
                             pw,
@@ -810,8 +803,8 @@ impl Av2Encoder {
                                 rdoq_lambda,
                                 self.speed,
                                 self.bit_depth as i32,
-                                false, // non-directional path
-                            );
+                    false, // non-directional path
+);
                             let (skip_cdfs, dc_sign_ctxs) = sb_tu_contexts(
                                 &tus, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
                             );
@@ -1510,14 +1503,11 @@ impl Av2Encoder {
                                 neutral,
                                 self.bit_depth as i32,
                             );
-                            let mut lev = bases.luma8x32.project_scan(
+                            let lev = bases.luma8x32.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 8, 32, pred),
                                 0.0,
                                 &SCAN8X32,
                             );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0; // keep DC only → eob count 1
-                            }
                             put_block_rect(
                                 &mut recy,
                                 pw,
@@ -1535,19 +1525,11 @@ impl Av2Encoder {
                                     self.bit_depth as i32,
                                 ),
                             );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
-                            };
-                            let (_s, dcs) = sb_tu_contexts_rect(
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 2, 8, true,
                             );
-                            let skip = SKIP_TX16_QC[qc][0] as u32; // class-2 skip, ctx 0
-                            encode_luma_leaf_dc_class2(
-                                &mut enc, dc_level, skip, dcs, 0, true, pc, 18958,
-                            );
+                            encode_luma_leaf_8x32(&mut enc, &tu, skip, dcs, 0, true, pc);
                             // chroma 8×32 (TX_8X32): full AC, reuse luma8x32 basis, eob
                             // class 256, class-2 U skip / shared V skip.
                             let predu = dc_pred_rect(
@@ -1654,14 +1636,11 @@ impl Av2Encoder {
                                 neutral,
                                 self.bit_depth as i32,
                             );
-                            let mut lev = bases.luma32x8.project_scan(
+                            let lev = bases.luma32x8.project_scan(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 32, 8, pred),
                                 0.0,
                                 &SCAN32X8,
                             );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0;
-                            }
                             put_block_rect(
                                 &mut recy,
                                 pw,
@@ -1679,19 +1658,11 @@ impl Av2Encoder {
                                     self.bit_depth as i32,
                                 ),
                             );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
-                            };
-                            let (_s, dcs) = sb_tu_contexts_rect(
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 8, 2, true,
                             );
-                            let skip = SKIP_TX16_QC[qc][0] as u32;
-                            encode_luma_leaf_dc_class2(
-                                &mut enc, dc_level, skip, dcs, 0, true, pc, 18958,
-                            );
+                            encode_luma_leaf_32x8(&mut enc, &tu, skip, dcs, 0, true, pc);
                             let predu = dc_pred_rect(
                                 &recu,
                                 pw,
@@ -1999,6 +1970,316 @@ impl Av2Encoder {
                                 &CHROMA_EOB256_QC[qc],
                                 CHROMA_EOB_HI_BIT_QC[qc],
                                 256,
+                            );
+                            (up_, vc.iter().any(|&(_, l)| l != 0))
+                        }
+                        (2, 2) => {
+                            // Both-axis residue-2 corner: 8×8 luma (TX_8X8) + 8×8 chroma per
+                            // plane (4:4:4, full-res, same stride/position as luma).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 8, 8, neutral, bd);
+                            let lev = bases.c8x8.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, sb_x, 8, 8, pred),
+                                0.0,
+                                &SCAN8X8,
+                            );
+                            put_block_rect(
+                                &mut recy, pw, sb_y, sb_x, 8, 8,
+                                &itx422::reconstruct_chroma(
+                                    pred, &lev, qstep_i, &SCAN8X8, 8, 8, bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 2, 2, true,
+                            );
+                            encode_luma_leaf_8x8(
+                                &mut enc, &tu, skip, dcs, 0, true, pc, 3148,
+                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                            );
+                            // chroma 8×8 per plane (TX_8X8): full AC, c8x8 basis, eob class 64.
+                            let predu = dc_pred_rect(&recu, pw, sb_y, sb_x, 8, 8, neutral, bd);
+                            let levu = bases.c8x8.project_scan(
+                                &get_residual_rect(&up, pw, sb_y, sb_x, 8, 8, predu),
+                                0.0, &SCAN8X8,
+                            );
+                            put_block_rect(
+                                &mut recu, pw, sb_y, sb_x, 8, 8,
+                                &itx422::reconstruct_chroma(
+                                    predu, &levu, qstep_i, &SCAN8X8, 8, 8, bd,
+                                ),
+                            );
+                            let uc = levels_to_coeffs(&levu);
+                            let u_skip =
+                                crate::av2::cdfs_qctx::SKIP_TX8_QC[qc][(6 + ua + ul) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &uc, u_skip, true, &SCAN8X8,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB64_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 64,
+                            );
+                            let up_ = uc.iter().any(|&(_, l)| l != 0);
+                            let predv = dc_pred_rect(&recv, pw, sb_y, sb_x, 8, 8, neutral, bd);
+                            let levv = bases.c8x8.project_scan(
+                                &get_residual_rect(&vp, pw, sb_y, sb_x, 8, 8, predv),
+                                0.0, &SCAN8X8,
+                            );
+                            put_block_rect(
+                                &mut recv, pw, sb_y, sb_x, 8, 8,
+                                &itx422::reconstruct_chroma(
+                                    predv, &levv, qstep_i, &SCAN8X8, 8, 8, bd,
+                                ),
+                            );
+                            let vc = levels_to_coeffs(&levv);
+                            let v_skip =
+                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &vc, v_skip, false, &SCAN8X8,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB64_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 64,
+                            );
+                            (up_, vc.iter().any(|&(_, l)| l != 0))
+                        }
+                        (2, 4) => {
+                            // residue-2 W × residue-4 H: 8×16 luma + 8×16 chroma per plane
+                            // (4:4:4 full-res → TX_8X16, ctx2, eob128).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
+                            let lev = bases.c8x16.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, sb_x, 8, 16, pred),
+                                0.0, &crate::av2::tables::SCAN8X16,
+                            );
+                            put_block_rect(
+                                &mut recy, pw, sb_y, sb_x, 8, 16,
+                                &itx422::reconstruct_chroma(
+                                    pred, &lev, qstep_i, &crate::av2::tables::SCAN8X16, 8, 16, bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 2, 4, true,
+                            );
+                            crate::av2::coder::encode_luma_leaf_rect128(
+                                &mut enc, &tu, skip, dcs, 0, true, pc, 12348,
+                                &crate::av2::tables::SCAN8X16,
+                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                            );
+                            let predu = dc_pred_rect(&recu, pw, sb_y, sb_x, 8, 16, neutral, bd);
+                            let levu = bases.c8x16.project_scan(
+                                &get_residual_rect(&up, pw, sb_y, sb_x, 8, 16, predu),
+                                0.0, &crate::av2::tables::SCAN8X16,
+                            );
+                            put_block_rect(
+                                &mut recu, pw, sb_y, sb_x, 8, 16,
+                                &itx422::reconstruct_chroma(
+                                    predu, &levu, qstep_i, &crate::av2::tables::SCAN8X16, 8, 16, bd,
+                                ),
+                            );
+                            let uc = levels_to_coeffs(&levu);
+                            let u_skip = SKIP_TX16_QC[qc][(6 + ua + ul) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &uc, u_skip, true, &crate::av2::tables::SCAN8X16,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB128_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 128,
+                            );
+                            let up_ = uc.iter().any(|&(_, l)| l != 0);
+                            let predv = dc_pred_rect(&recv, pw, sb_y, sb_x, 8, 16, neutral, bd);
+                            let levv = bases.c8x16.project_scan(
+                                &get_residual_rect(&vp, pw, sb_y, sb_x, 8, 16, predv),
+                                0.0, &crate::av2::tables::SCAN8X16,
+                            );
+                            put_block_rect(
+                                &mut recv, pw, sb_y, sb_x, 8, 16,
+                                &itx422::reconstruct_chroma(
+                                    predv, &levv, qstep_i, &crate::av2::tables::SCAN8X16, 8, 16, bd,
+                                ),
+                            );
+                            let vc = levels_to_coeffs(&levv);
+                            let v_skip =
+                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &vc, v_skip, false, &crate::av2::tables::SCAN8X16,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB128_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 128,
+                            );
+                            (up_, vc.iter().any(|&(_, l)| l != 0))
+                        }
+                        (4, 2) => {
+                            // residue-4 W × residue-2 H: 16×8 luma + 16×8 chroma per plane
+                            // (4:4:4 full-res → TX_16X8, ctx2, eob128).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
+                            let lev = bases.c16x8.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 8, pred),
+                                0.0, &crate::av2::tables::SCAN16X8,
+                            );
+                            put_block_rect(
+                                &mut recy, pw, sb_y, sb_x, 16, 8,
+                                &itx422::reconstruct_chroma(
+                                    pred, &lev, qstep_i, &crate::av2::tables::SCAN16X8, 16, 8, bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 2, true,
+                            );
+                            crate::av2::coder::encode_luma_leaf_rect128(
+                                &mut enc, &tu, skip, dcs, 0, true, pc, 12348,
+                                &crate::av2::tables::SCAN16X8,
+                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                            );
+                            let predu = dc_pred_rect(&recu, pw, sb_y, sb_x, 16, 8, neutral, bd);
+                            let levu = bases.c16x8.project_scan(
+                                &get_residual_rect(&up, pw, sb_y, sb_x, 16, 8, predu),
+                                0.0, &crate::av2::tables::SCAN16X8,
+                            );
+                            put_block_rect(
+                                &mut recu, pw, sb_y, sb_x, 16, 8,
+                                &itx422::reconstruct_chroma(
+                                    predu, &levu, qstep_i, &crate::av2::tables::SCAN16X8, 16, 8, bd,
+                                ),
+                            );
+                            let uc = levels_to_coeffs(&levu);
+                            let u_skip = SKIP_TX16_QC[qc][(6 + ua + ul) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &uc, u_skip, true, &crate::av2::tables::SCAN16X8,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB128_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 128,
+                            );
+                            let up_ = uc.iter().any(|&(_, l)| l != 0);
+                            let predv = dc_pred_rect(&recv, pw, sb_y, sb_x, 16, 8, neutral, bd);
+                            let levv = bases.c16x8.project_scan(
+                                &get_residual_rect(&vp, pw, sb_y, sb_x, 16, 8, predv),
+                                0.0, &crate::av2::tables::SCAN16X8,
+                            );
+                            put_block_rect(
+                                &mut recv, pw, sb_y, sb_x, 16, 8,
+                                &itx422::reconstruct_chroma(
+                                    predv, &levv, qstep_i, &crate::av2::tables::SCAN16X8, 16, 8, bd,
+                                ),
+                            );
+                            let vc = levels_to_coeffs(&levv);
+                            let v_skip =
+                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &vc, v_skip, false, &crate::av2::tables::SCAN16X8,
+                                &crate::av2::cdfs_qctx::CHROMA_EOB128_QC[qc],
+                                CHROMA_EOB_HI_BIT_QC[qc], 128,
+                            );
+                            (up_, vc.iter().any(|&(_, l)| l != 0))
+                        }
+                        (4, 8) => {
+                            // residue-4 W × residue-{6,8} H: 16×32 luma + 16×32 chroma per
+                            // plane (4:4:4 full-res → TX_16X32, ctx3, eob512).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 32, neutral, bd);
+                            let lev = bases.luma16x32.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 32, pred),
+                                0.0, &SCAN16X32,
+                            );
+                            put_block_rect(
+                                &mut recy, pw, sb_y, sb_x, 16, 32,
+                                &itx422::reconstruct_chroma(
+                                    pred, &lev, qstep_i, &SCAN16X32, 16, 32, bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 8, true,
+                            );
+                            encode_luma_leaf_16x32(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            let predu = dc_pred_rect(&recu, pw, sb_y, sb_x, 16, 32, neutral, bd);
+                            let levu = bases.luma16x32.project_scan(
+                                &get_residual_rect(&up, pw, sb_y, sb_x, 16, 32, predu),
+                                0.0, &SCAN16X32,
+                            );
+                            put_block_rect(
+                                &mut recu, pw, sb_y, sb_x, 16, 32,
+                                &itx422::reconstruct_chroma(
+                                    predu, &levu, qstep_i, &SCAN16X32, 16, 32, bd,
+                                ),
+                            );
+                            let uc = levels_to_coeffs(&levu);
+                            let u_skip = CHROMA_SKIP_TX32_QC[qc][(6 + ua + ul) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &uc, u_skip, true, &SCAN16X32,
+                                &CHROMA_EOB512_QC[qc], CHROMA_EOB_HI_BIT_QC[qc], 512,
+                            );
+                            let up_ = uc.iter().any(|&(_, l)| l != 0);
+                            let predv = dc_pred_rect(&recv, pw, sb_y, sb_x, 16, 32, neutral, bd);
+                            let levv = bases.luma16x32.project_scan(
+                                &get_residual_rect(&vp, pw, sb_y, sb_x, 16, 32, predv),
+                                0.0, &SCAN16X32,
+                            );
+                            put_block_rect(
+                                &mut recv, pw, sb_y, sb_x, 16, 32,
+                                &itx422::reconstruct_chroma(
+                                    predv, &levv, qstep_i, &SCAN16X32, 16, 32, bd,
+                                ),
+                            );
+                            let vc = levels_to_coeffs(&levv);
+                            let v_skip =
+                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &vc, v_skip, false, &SCAN16X32,
+                                &CHROMA_EOB512_QC[qc], CHROMA_EOB_HI_BIT_QC[qc], 512,
+                            );
+                            (up_, vc.iter().any(|&(_, l)| l != 0))
+                        }
+                        (8, 4) => {
+                            // residue-{6,8} W × residue-4 H: 32×16 luma + 32×16 chroma per
+                            // plane (4:4:4 full-res → TX_32X16, ctx3, eob512).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 32, 16, neutral, bd);
+                            let lev = bases.luma32x16.project_scan(
+                                &get_residual_rect(&yp, pw, sb_y, sb_x, 32, 16, pred),
+                                0.0, &SCAN32X16,
+                            );
+                            put_block_rect(
+                                &mut recy, pw, sb_y, sb_x, 32, 16,
+                                &itx422::reconstruct_chroma(
+                                    pred, &lev, qstep_i, &SCAN32X16, 32, 16, bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 8, 4, true,
+                            );
+                            encode_luma_leaf_32x16(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            let predu = dc_pred_rect(&recu, pw, sb_y, sb_x, 32, 16, neutral, bd);
+                            let levu = bases.luma32x16.project_scan(
+                                &get_residual_rect(&up, pw, sb_y, sb_x, 32, 16, predu),
+                                0.0, &SCAN32X16,
+                            );
+                            put_block_rect(
+                                &mut recu, pw, sb_y, sb_x, 32, 16,
+                                &itx422::reconstruct_chroma(
+                                    predu, &levu, qstep_i, &SCAN32X16, 32, 16, bd,
+                                ),
+                            );
+                            let uc = levels_to_coeffs(&levu);
+                            let u_skip = CHROMA_SKIP_TX32_QC[qc][(6 + ua + ul) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &uc, u_skip, true, &SCAN32X16,
+                                &CHROMA_EOB512_QC[qc], CHROMA_EOB_HI_BIT_QC[qc], 512,
+                            );
+                            let up_ = uc.iter().any(|&(_, l)| l != 0);
+                            let predv = dc_pred_rect(&recv, pw, sb_y, sb_x, 32, 16, neutral, bd);
+                            let levv = bases.luma32x16.project_scan(
+                                &get_residual_rect(&vp, pw, sb_y, sb_x, 32, 16, predv),
+                                0.0, &SCAN32X16,
+                            );
+                            put_block_rect(
+                                &mut recv, pw, sb_y, sb_x, 32, 16,
+                                &itx422::reconstruct_chroma(
+                                    predv, &levv, qstep_i, &SCAN32X16, 32, 16, bd,
+                                ),
+                            );
+                            let vc = levels_to_coeffs(&levv);
+                            let v_skip =
+                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            encode_chroma_block_rect(
+                                &mut enc, &vc, v_skip, false, &SCAN32X16,
+                                &CHROMA_EOB512_QC[qc], CHROMA_EOB_HI_BIT_QC[qc], 512,
                             );
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }

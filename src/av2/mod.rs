@@ -26,18 +26,18 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-mod aq;
 mod av2_itx;
 mod avif;
+mod aq;
 mod cdfs_qctx;
 mod cdfx_4tx;
 #[allow(dead_code)]
 mod cfl;
 mod chroma422;
-mod coder;
-mod csc;
 #[allow(dead_code)]
 mod directional;
+mod coder;
+mod csc;
 mod encode400;
 mod encode420;
 mod encode422;
@@ -61,7 +61,7 @@ mod wht;
 
 use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::{
-    CHROMA_EOB_BIN_QC, CHROMA_EOB_HI_BIT_QC, CHROMA_EOB64_QC, CHROMA_EOB128_QC, CHROMA_EOB256_QC,
+    CHROMA_EOB_BIN_QC, CHROMA_EOB_HI_BIT_QC, CHROMA_EOB32_QC, CHROMA_EOB64_QC, CHROMA_EOB128_QC, CHROMA_EOB256_QC,
     CHROMA_EOB512_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC, SKIP_TX8_QC,
     SKIP_TX16_QC,
 };
@@ -71,10 +71,12 @@ use crate::av2::chroma422::{
 };
 use crate::av2::coder::{
     Coeff, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
-    encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
-    encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_16x16_full,
-    encode_luma_leaf_16x64, encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16,
-    encode_luma_leaf_64x32, encode_luma_leaf_dc_class2,
+    encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split, encode_luma_block_split_dir,
+    encode_luma_block_vert4, encode_luma_leaf_16x16_full, encode_luma_leaf_16x32,
+    encode_luma_leaf_16x64, encode_luma_leaf_32x16, encode_luma_leaf_32x8, encode_luma_leaf_8x32,
+    encode_luma_leaf_8x8,
+    encode_luma_leaf_32x32, encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
+    encode_luma_leaf_dc_class2,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,
@@ -224,16 +226,10 @@ fn lossy_native_mi(width: usize, height: usize) -> Option<(i64, i64)> {
     if !(ok(mc) && ok(mr)) {
         return None;
     }
-    // residue-4 in one dim is supported when the perpendicular dim is a whole SB
-    // (residue 0) or also residue 4 (→ 16X16 corner). residue-2 (8-tap) is supported
-    // only as a single edge against a whole-SB perpendicular (→ 8X64 / 64X8); its
-    // corners (8X8 / 8X16 / …) are not built yet, so any residue-2 paired with a
-    // partial perpendicular falls back to padding.
-    let perp_ok4 = |a: i64, b: i64| a % 16 != 4 || b % 16 == 0 || b % 16 == 4;
-    let perp_ok2 = |a: i64, b: i64| a % 16 != 2 || b % 16 == 0;
-    if !(perp_ok4(mc, mr) && perp_ok4(mr, mc) && perp_ok2(mc, mr) && perp_ok2(mr, mc)) {
-        return None;
-    }
+    // Every even-residue combination is now natively codable in all three chroma formats:
+    // residue-2 (8-family), residue-4 (16-family), residue-{6,8} (32-family force-split),
+    // and residue-{10,12,14} (64-whole, edge-clamped). Every pairing — including the
+    // 16×32 / 32×16 (residue-4 × residue-{6,8}) corner — has a leaf arm.
     Some((mc, mr))
 }
 
@@ -249,17 +245,13 @@ fn lossy_needs_partition(width: usize, height: usize) -> bool {
 fn native_420_mi(width: usize, height: usize) -> Option<(i64, i64)> {
     let mc = (((width + 7) & !7) / 4) as i64;
     let mr = (((height + 7) & !7) / 4) as i64;
-    let ok = |m: i64| m % 16 == 0 || m % 16 >= 6 || m % 16 == 4;
+    let ok = |m: i64| m % 16 == 0 || m % 16 >= 6 || m % 16 == 4 || m % 16 == 2;
     if !(ok(mc) && ok(mr)) {
         return None;
     }
-    // residue-4 is supported either as a single edge against a whole-SB perpendicular
-    // (16×64 / 64×16 edge leaves) or as a residue-4-both-dims corner (the 16×16 luma
-    // + 8×8 chroma `(4,4)` leaf). residue-4 against residue-6+ is still unsupported.
-    let perp_ok4 = |a: i64, b: i64| a % 16 != 4 || b % 16 == 0 || b % 16 == 4;
-    if !(perp_ok4(mc, mr) && perp_ok4(mr, mc)) {
-        return None;
-    }
+    // Every even-residue combination is now natively codable: residue-2/4 (8/16 leaves),
+    // residue-{6,8} (32-family force-split), residue-{10,12,14} (64-whole, edge-clamped),
+    // and all their pairings. The corner/edge leaf arms cover every (wu,hu) tuple.
     Some((mc, mr))
 }
 
