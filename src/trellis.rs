@@ -31,14 +31,11 @@ use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
 use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
 
-/// Context-accurate RDOQ for the 2D square luma transforms (TX_8X8/16X16/32X32,
-/// `cls` 1/2/3). Unlike [`trellis_optimize`], the per-coefficient rate is the
-/// *real* coding cost: the base token cost depends on the neighbour-magnitude
-/// context (so coefficients in sparse regions are correctly cheap), the
-/// base-range/Golomb tail and the EOB signalling are priced from the live CDFs.
-/// Level reduction runs in reverse scan order so forward-neighbour contexts are
-/// stable; a final pass re-selects the EOB with accurate `eob_pt`/`eob_base`
-/// costs. Only the chosen levels change, so the result still decodes exactly.
+#[inline]
+fn trellis_lambda_scale() -> f64 {
+    2.0
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn trellis_optimize_ctx(
     cf: &mut [i32],
@@ -58,7 +55,7 @@ pub(crate) fn trellis_optimize_ctx(
         return;
     }
     let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q;
+    let lambda = lambda0 * ac_q * ac_q * trellis_lambda_scale();
     let log2w = w.trailing_zeros() as usize;
     let stride = w;
     // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
@@ -122,9 +119,6 @@ pub(crate) fn trellis_optimize_ctx(
         }
     };
 
-    // Last nonzero in scan order. `rposition` scans from the end and stops at the
-    // first hit, and iterating `scan` drops its bounds check (only `cf[rc]` is a
-    // random access). Same value as the forward max-index scan.
     let eob: i32 = scan
         .iter()
         .rposition(|&rc| cf[rc] != 0)
@@ -133,13 +127,6 @@ pub(crate) fn trellis_optimize_ctx(
         return;
     }
     let eu = eob as usize;
-
-    // Reuse scratch allocations across calls (this runs once per coded transform
-    // block, so per-call alloc+zero+free of `levels`/`pre`/`suf0`/`irate` shows
-    // up in profiles). Buffers are taken from a thread-local pool and returned at
-    // the single exit below. Entries are fully overwritten before use except the
-    // cumulative seed (`suf0[n]`) and `levels` (a sparse magnitude map
-    // that must start zeroed), which are reset explicitly.
 
     thread_local! {
         static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<f64>, Vec<f64>, Vec<f64>)> =
@@ -419,15 +406,6 @@ pub(crate) fn trellis_optimize_ctx(
     });
 }
 
-/// Rate-distortion optimized quantization (trellis / RDOQ). Given baseline
-/// rounded levels `cf` and the matching pre-round real targets `tf` (the value
-/// `cf` was rounded from, = forward coefficient * SCALE / quant-step), this
-/// lowers coefficient magnitudes and trims the end-of-block wherever doing so
-/// reduces `D + lambda*R`, where `D` is the dequantized-domain squared error
-/// (orthonormal transform, so proportional to pixel SSE) and `R` the estimated
-/// coded bits. Only the written levels change, so the decoder — which simply
-/// inverse-transforms whatever levels are coded — stays bit-exact; the caller
-/// reconstructs from this same `cf`.
 pub(crate) fn trellis_optimize(
     cf: &mut [i32],
     tf: &[f64],
@@ -440,7 +418,7 @@ pub(crate) fn trellis_optimize(
         return; // trellis disabled
     }
     let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q;
+    let lambda = lambda0 * ac_q * ac_q * trellis_lambda_scale();
     let dqf = |rc: usize| if rc == 0 { dc_q } else { ac_q };
     let d = |rc: usize, lev: i32| {
         let dq = dqf(rc);

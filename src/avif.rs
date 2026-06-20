@@ -116,7 +116,10 @@ impl Speed {
     /// Whether the winning mode is refined with an ADST_ADST transform-type
     /// search. Off only for [`Speed::Fast`] (DCT-only).
     pub(crate) fn try_adst(self) -> bool {
-        !matches!(self, Speed::Fast)
+        // The transform-type search (ADST_ADST + asymmetric ADST_DCT/DCT_ADST +
+        // IDTX) is a broadband coding-efficiency win (~-1.2% BD-rate-on-S2), so
+        // it now runs in every preset, including Fast.
+        true
     }
 
     /// Whether the directional angle-delta search (Δ = ±1..±3) is run. Only
