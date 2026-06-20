@@ -103,6 +103,29 @@ impl I32x8 {
             hi: vshrq_n_s32(self.hi, N),
         }
     }
+
+    /// Logical/arithmetic left shift by N (add headroom bits before the DCT
+    /// butterflies so the per-stage `muls_q16` truncation is relatively smaller).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shl<const N: i32>(self) -> I32x8 {
+        I32x8 {
+            lo: vshlq_n_s32(self.lo, N),
+            hi: vshlq_n_s32(self.hi, N),
+        }
+    }
+
+    /// Rounding arithmetic right shift by N (round-to-nearest, ties toward +inf —
+    /// matches the scalar `(x + (1<<(N-1))) >> N`). Used to drop the headroom in
+    /// the final normalization without the bias of a truncating shift.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shr_round<const N: i32>(self) -> I32x8 {
+        I32x8 {
+            lo: vrshrq_n_s32(self.lo, N),
+            hi: vrshrq_n_s32(self.hi, N),
+        }
+    }
 }
 
 #[inline]
@@ -466,6 +489,12 @@ pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     for group in 0..4usize {
         let col_start = group * 8;
         let mut cols = load32_i32(&input[col_start..], 32);
+        // B=6 headroom bits before the butterflies (mirrors scalar dct32x32_coeffs):
+        // keeps the per-stage muls_q16 truncation 2^B times smaller than the signal,
+        // removing the round-trip floor. Dropped (with rounding) in the final norm.
+        for c in cols.iter_mut() {
+            *c = c.shl::<6>();
+        }
         dct1d_32_v_i32(&mut cols);
         for v in 0..32usize {
             let dst_ptr = tmp_u.as_mut_ptr() as *mut i32;
@@ -503,9 +532,10 @@ pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
         dct1d_32_v_i32(&mut rows);
 
         // rows[u].lane[y] = coeff(horiz=u, vert=row_start+y) -> out[u*32 + row].
-        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4.
+        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4 AND drop
+        // the B=6 headroom bits, with round-to-nearest (2 + B = 8). Matches scalar.
         for u in 0..32usize {
-            let n = rows[u].shr::<2>();
+            let n = rows[u].shr_round::<8>();
             unsafe {
                 let dst_ptr = out.as_mut_ptr() as *mut i32;
                 let base = dst_ptr.add(u * 32 + row_start);
@@ -810,6 +840,38 @@ mod neon_vs_scalar {
         for &(dc_q, ac_q) in QUANT_PAIRS {
             let (sc, n) = run_32x32(input, dc_q, ac_q);
             assert_eq!(sc, n, "32x32 rand(12345678) dc_q={dc_q} ac_q={ac_q}");
+        }
+    }
+
+    #[test]
+    fn test_32x32_high_amplitude_parity() {
+        // The forward DCT-32 now pre-shifts the residual by B=6 headroom bits, so
+        // the cascade runs at far higher magnitudes than the ±127 used above. This
+        // guards scalar<->NEON parity (and absence of i32 overflow) at the worst
+        // case: full bd=12 residual range (±4095) in adversarial patterns.
+        let amp = 4095i32;
+        let mk = |f: &dyn Fn(usize, usize) -> i32| {
+            let mut input = [0i32; 1024];
+            for y in 0..32 {
+                for x in 0..32 {
+                    input[y * 32 + x] = f(x, y);
+                }
+            }
+            input
+        };
+        let checker = mk(&|x, y| if (x + y) & 1 == 0 { amp } else { -amp });
+        let vstripe = mk(&|x, _| if x & 1 == 0 { amp } else { -amp });
+        let mut rnd = [0i32; 1024];
+        let mut s = 0xABCD_1234u32;
+        for v in rnd.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as i32 % (2 * amp + 1) - amp;
+        }
+        for input in [checker, vstripe, rnd] {
+            for &(dc_q, ac_q) in QUANT_PAIRS {
+                let (sc, n) = run_32x32(input, dc_q, ac_q);
+                assert_eq!(sc, n, "32x32 high-amplitude dc_q={dc_q} ac_q={ac_q}");
+            }
         }
     }
 

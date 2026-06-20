@@ -37,6 +37,7 @@ use crate::Speed;
 /// filter); `have_top`/`have_left` and the available-extension bounds gate the
 /// normative edge filter. `edge_filter` should track the sequence header flag
 /// (true on AVM main profile).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_intra_pred(
     m: usize,
     adelta: i32,
