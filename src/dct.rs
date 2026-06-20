@@ -305,6 +305,66 @@ pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
+/// Forward ADST_DCT 8x8: ADST on columns (vertical), DCT on rows (horizontal).
+/// AV1 `ADST_DCT`. Stored transposed like the other 8x8 forwards.
+fn adstdct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        let c = fwd_adst8_1d(&col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = c[r];
+        }
+    }
+    let mut out = [0i32; 64];
+    for r in 0..8usize {
+        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut row);
+        for u in 0..8 {
+            out[u * 8 + r] = row[u];
+        }
+    }
+    out
+}
+
+/// Forward DCT_ADST 8x8: DCT on columns (vertical), ADST on rows (horizontal).
+/// AV1 `DCT_ADST`.
+fn dctadst8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        dct1d_8_i32(&mut col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = col[r];
+        }
+    }
+    let mut out = [0i32; 64];
+    for r in 0..8usize {
+        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let rr = fwd_adst8_1d(&row);
+        for u in 0..8 {
+            out[u * 8 + r] = rr[u];
+        }
+    }
+    out
+}
+
+pub(crate) fn adstdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    let coeffs = adstdct8x8_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+pub(crate) fn dctadst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+    let coeffs = dctadst8x8_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
 static ADST16_FWD_Q12: [[i16; 16]; 16] = [
     [
         284, 850, 1408, 1951, 2477, 2978, 3451, 3891, 4294, 4653, 4969, 5236, 5455, 5619, 5731,
@@ -413,6 +473,64 @@ pub(crate) fn adst16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
 
 pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
     let coeffs = adst16x16_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+/// Forward ADST_DCT 16x16: ADST cols (vertical), DCT rows (horizontal).
+fn adstdct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        let c = fwd_adst16_1d(&col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = c[v];
+        }
+    }
+    let mut out = [0i32; 256];
+    for v in 0..16 {
+        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut row);
+        for u in 0..16 {
+            out[u * 16 + v] = mul_q16(row[u], 32768);
+        }
+    }
+    out
+}
+
+/// Forward DCT_ADST 16x16: DCT cols (vertical), ADST rows (horizontal).
+fn dctadst16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        dct1d_16_i32(&mut col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = col[v];
+        }
+    }
+    let mut out = [0i32; 256];
+    for v in 0..16 {
+        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let rr = fwd_adst16_1d(&row);
+        for u in 0..16 {
+            out[u * 16 + v] = mul_q16(rr[u], 32768);
+        }
+    }
+    out
+}
+
+pub(crate) fn adstdct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
+    let coeffs = adstdct16x16_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
+pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
+    let coeffs = dctadst16x16_coeffs(residual);
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
@@ -721,6 +839,13 @@ pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
+/// Forward TX_8X8 **IDTX** (identity): produce quantized levels + unquantized
+/// targets that pair with `iidentity_dequant_8x8`. The inverse has uniform gain
+/// 1/8 (dequant->residual), so the forward level at raster position `y + x*8`
+/// (the inverse transposes `coeff[y + x*8]` into pixel `(y,x)`) is
+/// `round(residual[y,x] * 8 / q)` with the same full-step dead-zone as
+/// `quant_q16`. Bit-exactness with dav1d is carried entirely by the inverse;
+/// this only decides which levels get coded.
 pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
     let (dc_q, ac_q) = (quant.dc_q(), quant.ac_q());
     let mut cf = [0i32; 64];
@@ -818,6 +943,11 @@ fn dct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
 /// 16x32: residual `resid[row*16+col]` (32 tall x 16 wide). DCT-32 vertical,
 /// DCT-16 horizontal. Native (orthonormal*sqrt(512)) coefficients.
 fn dct16x32_coeffs(input: &[i32; 512]) -> [i32; 512] {
+    // B headroom bits + rounded normalization, same fix as dct32x32_coeffs: the
+    // truncating mul_q16 in the two dct1d passes otherwise floors the round-trip
+    // (~37 dB on noise, ~48 dB on a ramp). Pre-shift left by B, drop it with
+    // round-to-nearest at the end; output scale (sqrt(512)*ortho) is unchanged so
+    // the exact integer inverse and quantizer are untouched.
     const B: i32 = 6;
     let mut tmp = [0i32; 512]; // tmp[fy*16 + col], fy in 0..32
     for col in 0..16 {

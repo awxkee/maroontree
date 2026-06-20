@@ -50,8 +50,16 @@ pub(crate) const TRELLIS_LAMBDA0: f64 = 0.05;
 
 /// dav1d DTT4_IDTX_1DDCT set index for ADST_ADST at TX_8X8 intra.
 pub(crate) const ADST_ADST_TX8_IDX: usize = 4;
+/// Asymmetric ADST set indices at TX_8X8 intra (7-type DTT4_IDTX_1DDCT set:
+/// IDTX=0, DCT_DCT=1, V_DCT=2, H_DCT=3, ADST_ADST=4, ADST_DCT=5, DCT_ADST=6).
+pub(crate) const ADST_DCT_TX8_IDX: usize = 5;
+pub(crate) const DCT_ADST_TX8_IDX: usize = 6;
 /// dav1d DTT4_IDTX set index for ADST_ADST at TX_16X16 intra (5-type set).
 pub(crate) const ADST_ADST_TX16_IDX: usize = 2;
+/// Asymmetric ADST set indices at TX_16X16 intra (5-type DTT4_IDTX set:
+/// IDTX=0, DCT_DCT=1, ADST_ADST=2, ADST_DCT=3, DCT_ADST=4).
+pub(crate) const ADST_DCT_TX16_IDX: usize = 3;
+pub(crate) const DCT_ADST_TX16_IDX: usize = 4;
 
 pub(crate) fn trellis_lambda() -> f64 {
     TRELLIS_LAMBDA0

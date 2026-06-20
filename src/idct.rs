@@ -317,6 +317,80 @@ pub(crate) fn idct_dequant_8x8_scalar(levels: &[i32; 64], dequant: &IdctDequant)
 /// `(t+8)>>4`); only the 1-D kernel changes to `inv_adst8_1d`. Because the shifts
 /// and clip ranges are per transform-size (not per type), this is bit-identical
 /// to dav1d's TX_8X8 ADST_ADST inverse.
+/// Inverse ADST_DCT 8x8 (decoder): horizontal (rows) inverse DCT, then vertical
+/// (cols) inverse ADST. Matches the `adstdct8x8` forward.
+pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    for y in 0..8 {
+        inv_dct8_1d(&mut tmp[y * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for x in 0..8 {
+        inv_adst8_1d(&mut tmp[x..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse DCT_ADST 8x8 (decoder): horizontal (rows) inverse ADST, then vertical
+/// (cols) inverse DCT. Matches the `dctadst8x8` forward.
+pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    for y in 0..8 {
+        inv_adst8_1d(&mut tmp[y * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for x in 0..8 {
+        inv_dct8_1d(&mut tmp[x..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
@@ -633,6 +707,80 @@ pub(crate) fn inv_adst16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
 /// TX_16X16 ADST_ADST reconstruction (dav1d-exact). Same orchestration as
 /// `idct_dequant_16x16` (dequant, transpose, row pass, `(t+2)>>2` clip, col
 /// pass, `(t+8)>>4`); only the 1-D kernel changes to `inv_adst16_1d`.
+/// Inverse ADST_DCT 16x16: horizontal (rows) inverse DCT, vertical (cols)
+/// inverse ADST. Matches the `adstdct16x16` forward.
+pub(crate) fn iadstdct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 256];
+    for rc in 0..256 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            tmp[y * 16 + x] = coeff[y + x * 16];
+        }
+    }
+    for y in 0..16 {
+        inv_dct16_1d(&mut tmp[y * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 2) >> 2).clamp(cmin, cmax);
+    }
+    for x in 0..16 {
+        inv_adst16_1d(&mut tmp[x..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse DCT_ADST 16x16: horizontal (rows) inverse ADST, vertical (cols)
+/// inverse DCT. Matches the `dctadst16x16` forward.
+pub(crate) fn idctadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 256];
+    for rc in 0..256 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            tmp[y * 16 + x] = coeff[y + x * 16];
+        }
+    }
+    for y in 0..16 {
+        inv_adst16_1d(&mut tmp[y * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 2) >> 2).clamp(cmin, cmax);
+    }
+    for x in 0..16 {
+        inv_dct16_1d(&mut tmp[x..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 pub(crate) fn iadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());

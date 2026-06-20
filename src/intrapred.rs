@@ -253,6 +253,35 @@ pub(crate) fn intra_predict_nd(
     out: &mut [i32],
     bd: u8,
 ) {
+    intra_predict_nd_ad(
+        mode, 0, recon, stride, ox, oy, bw, bh, have_tr, have_bl, fw, fh, out, bd,
+    )
+}
+
+/// As [`intra_predict_nd`] but with an explicit AV1 `angle_delta` in
+/// `-3..=3` (steps of 3°). The delta is applied only to the six pure diagonal
+/// modes (D45/D67/D135/D113/D157/D203), whose ±9° range stays within a single
+/// z1/z2/z3 prediction path so the existing dispatch and reference setup are
+/// reused unchanged; V/H/DC/SMOOTH*/PAETH ignore it. The `DR_INTRA_DERIVATIVE`
+/// table has valid entries at every `base + delta*3` angle, so this is bit-exact
+/// with dav1d (edge filter / upsampling remain off).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn intra_predict_nd_ad(
+    mode: usize,
+    angle_delta: i32,
+    recon: &[i32],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    have_tr: bool,
+    have_bl: bool,
+    fw: usize,
+    fh: usize,
+    out: &mut [i32],
+    bd: u8,
+) {
     let have_top = oy > 0;
     let have_left = ox > 0;
     let base = 1i32 << (bd - 1);
@@ -345,7 +374,7 @@ pub(crate) fn intra_predict_nd(
         D45_PRED | VERT_LEFT_PRED => {
             // dav1d ipred_z1 (edge filter/upsampling off): project from the top
             // row (extended with top-right samples). D45 -> 45 deg, D67 -> 67 deg.
-            let angle: i32 = if mode == D45_PRED { 45 } else { 67 };
+            let angle: i32 = (if mode == D45_PRED { 45 } else { 67 }) + angle_delta * 3;
             let dx = DR_INTRA_DERIVATIVE[(angle >> 1) as usize];
             let max_base_x = (bw + bw.min(bh) - 1) as i32;
             for y in 0..bh {
@@ -370,7 +399,7 @@ pub(crate) fn intra_predict_nd(
         D203_PRED => {
             // dav1d ipred_z3 (edge filter/upsampling off): project from the left
             // column (extended with bottom-left samples). D203 -> 203 deg.
-            let angle: i32 = 203;
+            let angle: i32 = 203 + angle_delta * 3;
             let dy = DR_INTRA_DERIVATIVE[((270 - angle) >> 1) as usize];
             let max_base_y = (bh + bw.min(bh) - 1) as i32;
             for x in 0..bw {
@@ -396,11 +425,11 @@ pub(crate) fn intra_predict_nd(
         D135_PRED | D113_PRED | D157_PRED => {
             // dav1d ipred_z2 with edge filter/upsampling disabled: pure angular
             // projection from the top row, left column and corner.
-            let angle: i32 = match mode {
+            let angle: i32 = (match mode {
                 D135_PRED => 135,
                 D113_PRED => 113,
                 _ => 157,
-            };
+            }) + angle_delta * 3;
             let dy = DR_INTRA_DERIVATIVE[((angle - 90) >> 1) as usize];
             let dx = DR_INTRA_DERIVATIVE[((180 - angle) >> 1) as usize];
             // topleft[idx]: idx 0 = corner, idx>=1 = top[idx-1], idx<0 = left[-idx-1]
