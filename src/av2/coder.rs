@@ -526,10 +526,22 @@ static UV_MODE: [[u16; 7]; 2] = [
 const NO_MIDX: u8 = 0xff;
 
 fn internal_dir_to_ymode(m: usize) -> u8 {
-    match m { 5 => 1, 6 => 2, 7 => 3, 8 => 4, 9 => 5, 10 => 6, 11 => 7, _ => 8 }
+    match m {
+        5 => 1,
+        6 => 2,
+        7 => 3,
+        8 => 4,
+        9 => 5,
+        10 => 6,
+        11 => 7,
+        _ => 8,
+    }
 }
 fn nominal_midx(y_mode: u8) -> u8 {
-    let p = REORDERED_DIR_Y_MODE.iter().position(|&m| m == y_mode).unwrap();
+    let p = REORDERED_DIR_Y_MODE
+        .iter()
+        .position(|&m| m == y_mode)
+        .unwrap();
     (p * 7 + 3) as u8
 }
 
@@ -544,10 +556,14 @@ fn build_dir_list_y(bw4: usize, bh4: usize, lmidx: u8, amidx: u8) -> Vec<u8> {
     let mut mask = 0u64;
     let mut ptr = 0usize;
     if lmidx != NO_MIDX {
-        list[ptr] = lmidx; mask |= 1 << lmidx; ptr += 1;
+        list[ptr] = lmidx;
+        mask |= 1 << lmidx;
+        ptr += 1;
     }
     if amidx != NO_MIDX && (ptr == 0 || amidx != list[0]) {
-        list[ptr] = amidx; mask |= 1 << amidx; ptr += 1;
+        list[ptr] = amidx;
+        mask |= 1 << amidx;
+        ptr += 1;
     }
     let n_dirs = ptr;
     if n_dirs == 0 {
@@ -559,13 +575,20 @@ fn build_dir_list_y(bw4: usize, bh4: usize, lmidx: u8, amidx: u8) -> Vec<u8> {
                 let c = list[n] as i32;
                 for d in [-i, i] {
                     let dm = ((c + d + 56) % 56) as u8;
-                    if mask & (1 << dm) == 0 { list[ptr] = dm; mask |= 1 << dm; ptr += 1; }
+                    if mask & (1 << dm) == 0 {
+                        list[ptr] = dm;
+                        mask |= 1 << dm;
+                        ptr += 1;
+                    }
                 }
             }
         }
     }
     for &fm in DEFAULT_MODE_LIST_Y.iter() {
-        if mask & (1 << fm) == 0 { list[ptr] = fm; ptr += 1; }
+        if mask & (1 << fm) == 0 {
+            list[ptr] = fm;
+            ptr += 1;
+        }
     }
     list[..ptr].to_vec()
 }
@@ -603,7 +626,10 @@ pub(crate) fn encode_intra_modes_dir(
         // target midx encodes both mode and angle delta: nominal (pos*7+3) + delta.
         let target = (nominal_midx(y_mode) as i32 + angle_delta as i32) as u8;
         let list = build_dir_list_y(bw4, bh4, lmidx, amidx);
-        let dir_idx = list.iter().position(|&m| m == target).expect("target midx in list");
+        let dir_idx = list
+            .iter()
+            .position(|&m| m == target)
+            .expect("target midx in list");
         let y_mode_idx = dir_idx + 5;
         let y_set = (y_mode_idx + 3) / 16; // 0 for 5..=12, else 1/2/3
         let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
@@ -642,10 +668,18 @@ pub(crate) fn encode_intra_modes_dir(
                 let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
                 let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
                 if su != 0 {
-                    enc.encode_symbol(&crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u], enc.cfl_mag_u as usize, 8);
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u],
+                        enc.cfl_mag_u as usize,
+                        8,
+                    );
                 }
                 if sv != 0 {
-                    enc.encode_symbol(&crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v], enc.cfl_mag_v as usize, 8);
+                    enc.encode_symbol(
+                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v],
+                        enc.cfl_mag_v as usize,
+                        8,
+                    );
                 }
                 return midx;
             }
@@ -1135,7 +1169,11 @@ fn encode_luma8_token(
     if !high_freq {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(&LUMA8_EOB_TOK_LF_QC[enc.qc][base_ctx], (level - 1) as usize, 4);
+                enc.encode_symbol(
+                    &LUMA8_EOB_TOK_LF_QC[enc.qc][base_ctx],
+                    (level - 1) as usize,
+                    4,
+                );
             } else {
                 enc.encode_symbol_esc(&LUMA8_EOB_TOK_LF_QC[enc.qc][base_ctx], 4, 4);
                 encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
@@ -1148,7 +1186,11 @@ fn encode_luma8_token(
         }
     } else if is_eob {
         if level <= 2 {
-            enc.encode_symbol(&LUMA8_EOB_TOK_HF_QC[enc.qc][base_ctx], (level - 1) as usize, 2);
+            enc.encode_symbol(
+                &LUMA8_EOB_TOK_HF_QC[enc.qc][base_ctx],
+                (level - 1) as usize,
+                2,
+            );
         } else {
             enc.encode_symbol_esc(&LUMA8_EOB_TOK_HF_QC[enc.qc][base_ctx], 2, 2);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
@@ -1227,7 +1269,14 @@ pub(crate) fn encode_luma_leaf_8x8(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB64_LUMA_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 0, 6);
+    encode_eob(
+        enc,
+        eob,
+        &EOB64_LUMA_QC[enc.qc],
+        EOB_HI_BIT_QC[enc.qc],
+        0,
+        6,
+    );
     if eob >= 1 {
         if let Some((cdf, idx, nsym)) = tx_type_cdf {
             enc.encode_symbol(cdf, idx, nsym);
@@ -1235,7 +1284,11 @@ pub(crate) fn encode_luma_leaf_8x8(
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    nonzero.iter().map(|&(_, l)| l.unsigned_abs()).sum::<u32>().min(63)
+    nonzero
+        .iter()
+        .map(|&(_, l)| l.unsigned_abs())
+        .sum::<u32>()
+        .min(63)
 }
 
 /// Residue-4×residue-2 corner luma leaf: TX_8X16 (8 wide × 16 tall) and TX_16X8
@@ -1266,7 +1319,14 @@ pub(crate) fn encode_luma_leaf_rect128(
     }
     enc.encode_bool(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB128_LUMA_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 0, 7);
+    encode_eob(
+        enc,
+        eob,
+        &EOB128_LUMA_QC[enc.qc],
+        EOB_HI_BIT_QC[enc.qc],
+        0,
+        7,
+    );
     if eob >= 1 {
         if let Some((cdf, idx, nsym)) = tx_type_cdf {
             enc.encode_symbol(cdf, idx, nsym);
@@ -1274,7 +1334,11 @@ pub(crate) fn encode_luma_leaf_rect128(
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    nonzero.iter().map(|&(_, l)| l.unsigned_abs()).sum::<u32>().min(127)
+    nonzero
+        .iter()
+        .map(|&(_, l)| l.unsigned_abs())
+        .sum::<u32>()
+        .min(127)
 }
 
 /// Generalised luma coeff-token coder. `scan` is the coefficient scan in slimav
@@ -1442,7 +1506,15 @@ pub(crate) fn encode_luma_block_split_dir(
     amidx: u8,
 ) -> ([u32; 4], u8) {
     let midx = encode_intra_modes_dir(
-        enc, mode_idx, angle_delta, has_chroma, Some(part_cdf), 16, 16, lmidx, amidx,
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        Some(part_cdf),
+        16,
+        16,
+        lmidx,
+        amidx,
     );
     enc.encode_bool(TX_SPLIT_64 as u32, 1);
     enc.encode_symbol(&TX_PART_2D_64, 0, 6);
@@ -2263,8 +2335,7 @@ pub(crate) fn encode_chroma_tu4(
 
 /// Lossy DCT_DCT 4×4 scan (decoder `SCANS[TX_4X4]`, up-right diagonal). The lossless
 /// path uses the transposed scan; lossy DCT needs this one.
-pub(crate) static SCAN4X4_LOSSY: [u16; 16] =
-    [0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 11, 14, 15];
+pub(crate) static SCAN4X4_LOSSY: [u16; 16] = [0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 11, 14, 15];
 
 /// Same scan order as `SCAN4X4_LOSSY`, but in the encoder's packed rc = (col<<5)|row
 /// convention used by `project_scan` / `reconstruct_chroma` (which index `coeff[row*n+col]`
@@ -2310,7 +2381,10 @@ pub(crate) fn encode_chroma_tu4_scan(
         } else if lf {
             (ctx_lf_2d_chroma(&levels, rc, voff), 0)
         } else {
-            (ctx_2d_chroma(&levels, rc, voff), br_ctx_2d_chroma(&levels, rc))
+            (
+                ctx_2d_chroma(&levels, rc, voff),
+                br_ctx_2d_chroma(&levels, rc),
+            )
         };
         let sl = encode_chroma4_token(enc, mag, is_eob, base_ctx, hi_ctx, lf);
         levels[pidx(rc)] = sl as u8;
@@ -2329,7 +2403,11 @@ pub(crate) fn encode_chroma_tu4_scan(
             running_avg = encode_high_range(enc, mag - max_base_range, running_avg);
         }
     }
-    coeffs.iter().map(|&(_, l)| l.unsigned_abs()).sum::<u32>().min(63)
+    coeffs
+        .iter()
+        .map(|&(_, l)| l.unsigned_abs())
+        .sum::<u32>()
+        .min(63)
 }
 
 /// Assemble one 64x64 lossless luma superblock: partition no-split + intra mode (lossless

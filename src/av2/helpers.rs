@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av2::cdfs_qctx::{CHROMA_SKIP_TX32_QC, SKIP_TX16_QC, SKIP_TX8_QC};
+use crate::av2::cdfs_qctx::{CHROMA_SKIP_TX32_QC, SKIP_TX8_QC, SKIP_TX16_QC};
 use crate::av2::coder::Coeff;
 use crate::av2::lossless::levels_to_coeffs_4x4;
 use crate::av2::wht::fwht4x4;
