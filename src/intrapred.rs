@@ -546,11 +546,11 @@ pub(crate) fn smooth_v_pred(bw: usize, bh: usize, top: &[i32], left: &[i32], out
 }
 
 /// AV1 SMOOTH_H predictor (horizontal half), bit-exact to dav1d `ipred_smooth_h_c`.
-pub(crate) fn smooth_h_pred(bw: usize, bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
+pub(crate) fn smooth_h_pred(bw: usize, _bh: usize, top: &[i32], left: &[i32], out: &mut [i32]) {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         if bw.is_multiple_of(4) {
-            unsafe { neon::smooth_h(bw, bh, top, left, out) };
+            unsafe { neon::smooth_h(bw, _bh, top, left, out) };
             return;
         }
     }
