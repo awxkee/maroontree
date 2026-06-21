@@ -6,5 +6,4 @@ edition = "2024"
 [dependencies]
 maroontree = {path = "../", default-features = false}
 image = {version = "0.25.10", default-features = false, features = ["jpeg", "png"]}
-tealdust = {path = "../../tealdust"}
 criterion = "0.8.2"
