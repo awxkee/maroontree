@@ -17,8 +17,8 @@ hpvca = { version = "0.1.7", optional = true }
 jixel = "0.2.3"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
-garnetash = { path = "../../garnetash" }
-tealdust = { path = "../../tealdust" }
+garnetash = { git = "https://github.com/awxkee/garnetash" }
+tealdust = { git = "https://github.com/awxkee/tealdust" }
 
 [features]
 default = ["heic", "vvc"]
