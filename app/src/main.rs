@@ -37,7 +37,6 @@ use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::time::{Duration, Instant};
-use tealdust::{AvifError, Data, Settings, TealdustError};
 
 fn main() {
     // let (w, h) = (64usize, 64usize);
