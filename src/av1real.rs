@@ -4308,14 +4308,6 @@ fn plan_tiling(sb_cols: u32, sb_rows: u32, target_tiles: usize) -> Tiling {
     }
 }
 
-/// Spec-minimum `(TileColsLog2, TileRowsLog2)` (i.e. [`plan_tiling`] with a
-/// single-tile target). Retained for the tiling unit tests.
-#[cfg(test)]
-fn choose_tiling(sb_cols: u32, sb_rows: u32) -> (u32, u32) {
-    let t = plan_tiling(sb_cols, sb_rows, 1);
-    (t.tcl, t.trl)
-}
-
 /// Uniform-spacing tile start offsets (in SB units), matching the decoder's
 /// `for (startSb = 0; startSb < sbs; startSb += sizeSb)` loop. The returned vec
 /// has one entry per tile; the implied end of tile `i` is `starts[i+1]` (or

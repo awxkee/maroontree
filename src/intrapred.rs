@@ -472,12 +472,9 @@ pub(crate) fn intra_predict_nd_ad(
     }
 }
 
-/// AV1 PAETH predictor, bit-exact to dav1d `ipred_paeth_c`. NEON path uses
-/// `vabdq_s32` + `vcleq_s32` masks + `vbslq_s32` selects (no MAC — PAETH is a
-/// nearest-of-three select), scalar elsewhere.
 pub(crate) fn paeth_pred(
     bw: usize,
-    bh: usize,
+    _bh: usize,
     top: &[i32],
     left: &[i32],
     corner: i32,
@@ -486,7 +483,7 @@ pub(crate) fn paeth_pred(
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         if bw.is_multiple_of(4) {
-            unsafe { neon::paeth(bw, bh, top, left, corner, out) };
+            unsafe { neon::paeth(bw, _bh, top, left, corner, out) };
             return;
         }
     }
