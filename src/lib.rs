@@ -36,6 +36,7 @@ mod av1real;
 mod av2;
 mod avif;
 mod bitwriter;
+mod cdef;
 mod cdf_tables;
 mod coef_q;
 pub mod coeff;
