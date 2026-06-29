@@ -160,20 +160,26 @@ fn predict_4x4(
     match mode {
         1 => {
             // V_PRED
-            for orow in out.chunks_exact_mut(4) {
+            for orow in out.as_chunks_mut::<4>().0.iter_mut() {
                 orow.copy_from_slice(&top);
             }
         }
         2 => {
             // H_PRED
-            for (orow, &lv) in out.chunks_exact_mut(4).zip(left.iter()) {
+            for (orow, &lv) in out.as_chunks_mut::<4>().0.iter_mut().zip(left.iter()) {
                 orow.iter_mut().for_each(|o| *o = lv);
             }
         }
         9 => {
             // SMOOTH
             let (right, bottom) = (top[3], left[3]);
-            for ((orow, &smy), &lv) in out.chunks_exact_mut(4).zip(SM4.iter()).zip(left.iter()) {
+            for ((orow, &smy), &lv) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(SM4.iter())
+                .zip(left.iter())
+            {
                 for (o, (&tv, &smx)) in orow.iter_mut().zip(top.iter().zip(SM4.iter())) {
                     let p = smy * tv + (256 - smy) * bottom + smx * lv + (256 - smx) * right;
                     *o = (p + 256) >> 9;
@@ -183,7 +189,7 @@ fn predict_4x4(
         10 => {
             // SMOOTH_V
             let bottom = left[3];
-            for (orow, &smy) in out.chunks_exact_mut(4).zip(SM4.iter()) {
+            for (orow, &smy) in out.as_chunks_mut::<4>().0.iter_mut().zip(SM4.iter()) {
                 for (o, &tv) in orow.iter_mut().zip(top.iter()) {
                     let p = smy * tv + (256 - smy) * bottom;
                     *o = (p + 128) >> 8;
@@ -193,7 +199,7 @@ fn predict_4x4(
         11 => {
             // SMOOTH_H
             let right = top[3];
-            for (orow, &lv) in out.chunks_exact_mut(4).zip(left.iter()) {
+            for (orow, &lv) in out.as_chunks_mut::<4>().0.iter_mut().zip(left.iter()) {
                 for (o, &smx) in orow.iter_mut().zip(SM4.iter()) {
                     let p = smx * lv + (256 - smx) * right;
                     *o = (p + 128) >> 8;
@@ -202,7 +208,7 @@ fn predict_4x4(
         }
         12 => {
             // PAETH
-            for (orow, &lv) in out.chunks_exact_mut(4).zip(left.iter()) {
+            for (orow, &lv) in out.as_chunks_mut::<4>().0.iter_mut().zip(left.iter()) {
                 for (o, &tv) in orow.iter_mut().zip(top.iter()) {
                     let b = lv + tv - corner;
                     let (ld, td, cd) = ((lv - b).abs(), (tv - b).abs(), (corner - b).abs());
@@ -279,8 +285,10 @@ fn encode_plane_block(
 
             predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
             for (ry, (rrow, prow)) in resid
-                .chunks_exact_mut(4)
-                .zip(pred.chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(pred.as_chunks::<4>().0.iter())
                 .enumerate()
             {
                 let srow = &plane[(oy + ry) * stride + ox..];
@@ -317,8 +325,10 @@ fn plane_leaf_bits(
             predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
             let mut any = false;
             for (ry, (rrow, prow)) in resid
-                .chunks_exact_mut(4)
-                .zip(pred.chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(pred.as_chunks::<4>().0.iter())
                 .enumerate()
             {
                 let srow = &plane[(oy + ry) * stride + ox..];

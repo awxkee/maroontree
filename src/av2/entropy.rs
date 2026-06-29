@@ -26,6 +26,8 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::av2::cdf_state::{CdfState, update_cdf};
+
 pub(crate) static MIN_PROB: [[u16; 8]; 8] = [
     [63, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
     [47, 87, 65535, 65535, 65535, 65535, 65535, 65535],
@@ -158,6 +160,11 @@ pub(crate) struct RangeEncoder {
     pub(crate) cfl_mag_v: u8,
     pub(crate) cfl_ctx_u: usize,
     pub(crate) cfl_ctx_v: usize,
+    /// Per-tile mutable CDF working copies.  `Some` when `updating_cdf = true`
+    /// (i.e. `disable_cdf_update = 0` in the frame header).  When `None` the
+    /// encoder uses the static pre-loaded tables and the decoder runs with
+    /// `disable_cdf_update = 1` — CDFs stay fixed at their q-context defaults.
+    pub(crate) cdf_state: Option<Box<CdfState>>,
 }
 
 impl RangeEncoder {
@@ -179,7 +186,14 @@ impl RangeEncoder {
             cfl_mag_v: 0,
             cfl_ctx_u: 0,
             cfl_ctx_v: 0,
+            cdf_state: None,
         }
+    }
+
+    /// Enable adaptive CDF updating for this tile.  Must be called before
+    /// any `encode_symbol_mut` calls.  `qc` is the q-context index (0-3).
+    pub(crate) fn enable_adaptive_cdf(&mut self, qc: usize) {
+        self.cdf_state = Some(Box::new(CdfState::new(qc)));
     }
 
     fn normalize(&mut self, mut low: u64, range: u32) {
@@ -304,5 +318,1212 @@ impl RangeEncoder {
             carry = x >> 8;
         }
         bytes
+    }
+}
+
+impl RangeEncoder {
+    #[inline]
+    fn sym_static(&mut self, icdf: &[u16], s: usize, nsyms: usize) {
+        if s == nsyms {
+            self.encode_symbol_esc(icdf, s, nsyms);
+        } else {
+            self.encode_symbol(icdf, s, nsyms);
+        }
+    }
+
+    #[inline]
+    fn sym_mut_inner(
+        low: &mut u64,
+        range_ref: &mut u32,
+        count_ref: &mut i32,
+        output: &mut Vec<u16>,
+        cdf: &mut [u16],
+        s: usize,
+        nsyms_mt: usize,
+    ) {
+        let range = *range_ref;
+        let scaled_range = range >> 8;
+        let min_prob = &MIN_PROB[nsyms_mt - 1];
+        // Detect whether the original table already carried a trailing-0 sentinel
+        // (cdf_state::expand uses the same rule). If so this is an nsyms_mt-symbol
+        // no-escape alphabet (nsyms_avm = nsyms_mt); otherwise the escape adds the
+        // implicit sentinel (nsyms_avm = nsyms_mt + 1).
+        let has_sentinel = cdf[nsyms_mt - 1] == 0;
+        let nsyms_avm = if has_sentinel { nsyms_mt } else { nsyms_mt + 1 };
+        // Encode against [icdf_0 .. sentinel]; boundary(k) needs index up to nsyms_mt
+        // (the sentinel) for the escape symbol of an escape-coded table.
+        let icdf = &cdf[..=nsyms_mt];
+        let upper = if s == 0 {
+            range
+        } else {
+            Self::boundary(scaled_range, icdf, min_prob, s - 1)
+        };
+        let lower = Self::boundary(scaled_range, icdf, min_prob, s);
+        // normalize inline (mirrors RangeEncoder::normalize exactly)
+        let new_low = *low + (range - upper) as u64;
+        let new_range = upper - lower;
+        let shift = 16 - (32 - new_range.leading_zeros()) as i32;
+        let mut remaining = *count_ref + shift;
+        let mut lo = new_low;
+        if remaining >= 0 {
+            let mut bit_pos = *count_ref + 16;
+            let mut mask: u64 = (1u64 << bit_pos) - 1;
+            if remaining >= 8 {
+                output.push((lo >> bit_pos) as u16);
+                lo &= mask;
+                bit_pos -= 8;
+                mask >>= 8;
+            }
+            output.push((lo >> bit_pos) as u16);
+            remaining = bit_pos + shift - 24;
+            lo &= mask;
+        }
+        *low = lo << shift;
+        *range_ref = new_range << shift;
+        *count_ref = remaining;
+        // Adapt with AVM nsyms.
+        update_cdf(cdf, s, nsyms_avm);
+    }
+
+    // ---- luma 8x8 ---------------------------------------------------------
+    pub(crate) fn sym_luma8_hf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma8_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA8_BASE_TOK_HF_QC;
+            self.sym_static(&LUMA8_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+        }
+    }
+    pub(crate) fn sym_luma8_lf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma8_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA8_BASE_TOK_LF_QC;
+            self.sym_static(&LUMA8_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+        }
+    }
+    pub(crate) fn sym_luma8_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma8_eob_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA8_EOB_TOK_HF_QC;
+            self.sym_static(&LUMA8_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_luma8_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma8_eob_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA8_EOB_TOK_LF_QC;
+            self.sym_static(&LUMA8_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    // ---- luma 16x16 -------------------------------------------------------
+    pub(crate) fn sym_luma16_hf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma16_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA16_BASE_TOK_HF_QC;
+            self.sym_static(&LUMA16_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+        }
+    }
+    pub(crate) fn sym_luma16_lf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma16_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA16_BASE_TOK_LF_QC;
+            self.sym_static(&LUMA16_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+        }
+    }
+    pub(crate) fn sym_luma16_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma16_eob_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA16_EOB_TOK_HF_QC;
+            self.sym_static(&LUMA16_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_luma16_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma16_eob_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA16_EOB_TOK_LF_QC;
+            self.sym_static(&LUMA16_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    // ---- luma 32x32 -------------------------------------------------------
+    pub(crate) fn sym_luma32_hf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma32_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA32_BASE_TOK_HF_QC;
+            self.sym_static(&LUMA32_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+        }
+    }
+    pub(crate) fn sym_luma32_lf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma32_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA32_BASE_TOK_LF_QC;
+            self.sym_static(&LUMA32_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+        }
+    }
+    pub(crate) fn sym_luma32_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma32_eob_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA32_EOB_TOK_HF_QC;
+            self.sym_static(&LUMA32_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_luma32_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.luma32_eob_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::LUMA32_EOB_TOK_LF_QC;
+            self.sym_static(&LUMA32_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    // ---- chroma -----------------------------------------------------------
+    pub(crate) fn sym_chr_hf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_BASE_TOK_HF_QC;
+            self.sym_static(&CHROMA_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+        }
+    }
+    pub(crate) fn sym_chr_lf(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_BASE_TOK_LF_QC;
+            self.sym_static(&CHROMA_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+        }
+    }
+    pub(crate) fn sym_chr_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB_TOK_HF_QC;
+            self.sym_static(&CHROMA_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob_lf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB_TOK_LF_QC;
+            self.sym_static(&CHROMA_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    // ---- base-range carry -------------------------------------------------
+    pub(crate) fn sym_br_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.br_hf[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::BR_TOK_HF_QC;
+            self.sym_static(&BR_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_br(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.br[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::BR_TOK_QC;
+            self.sym_static(&BR_TOK_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_br(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_br[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_BR_TOK_HF_QC;
+            self.sym_static(&CHROMA_BR_TOK_HF_QC[self.qc][ctx], s, nsyms);
+        }
+    }
+    // ---- EOB bin (7-symbol, used via encode_eob) --------------------------
+    pub(crate) fn sym_eob_bin(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob_bin;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::EOB_BIN_QC;
+            self.sym_static(&EOB_BIN_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_eob64_luma(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob64_luma;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::EOB64_LUMA_QC;
+            self.sym_static(&EOB64_LUMA_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_eob128_luma(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob128_luma;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::EOB128_LUMA_QC;
+            self.sym_static(&EOB128_LUMA_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_eob256(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob256;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::EOB256_QC;
+            self.sym_static(&EOB256_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_eob512(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob512;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::EOB512_QC;
+            self.sym_static(&EOB512_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob_bin(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob_bin;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB_BIN_QC;
+            self.sym_static(&CHROMA_EOB_BIN_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob32(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob32;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB32_QC;
+            self.sym_static(&CHROMA_EOB32_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob64(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob64;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB64_QC;
+            self.sym_static(&CHROMA_EOB64_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob128(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob128;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB128_QC;
+            self.sym_static(&CHROMA_EOB128_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob256(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob256;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB256_QC;
+            self.sym_static(&CHROMA_EOB256_QC[self.qc], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_chr_eob512(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.chr_eob512;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::CHROMA_EOB512_QC;
+            self.sym_static(&CHROMA_EOB512_QC[self.qc], s, nsyms);
+        }
+    }
+    // ---- TX4 --------------------------------------------------------------
+    pub(crate) fn sym_eob16_q0(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob16_q0[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::EOB16_Q0;
+            self.sym_static(&EOB16_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_base_lf_tx4(&mut self, ctx: usize, pair: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_lf_tx4[ctx][pair];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_LF_TX4_Q0;
+            self.sym_static(&BASE_LF_TX4_Q0[ctx][pair], s, 5);
+        }
+    }
+    pub(crate) fn sym_base_tx4(&mut self, ctx: usize, pair: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_tx4[ctx][pair];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_TX4_Q0;
+            self.sym_static(&BASE_TX4_Q0[ctx][pair], s, 3);
+        }
+    }
+    pub(crate) fn sym_base_lf_eob_tx4(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_lf_eob_tx4[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_LF_EOB_TX4_Q0;
+            self.sym_static(&BASE_LF_EOB_TX4_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_base_eob_tx4(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_eob_tx4[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_EOB_TX4_Q0;
+            self.sym_static(&BASE_EOB_TX4_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_br_lf_q0(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.br_lf_q0[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BR_LF_Q0;
+            self.sym_static(&BR_LF_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_br_q0(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.br_q0[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BR_Q0;
+            self.sym_static(&BR_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_base_lf_uv(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_lf_uv[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                5,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_LF_UV_Q0;
+            self.sym_static(&BASE_LF_UV_Q0[ctx], s, 5);
+        }
+    }
+    pub(crate) fn sym_base_uv(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_uv[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_UV_Q0;
+            self.sym_static(&BASE_UV_Q0[ctx], s, 3);
+        }
+    }
+    pub(crate) fn sym_br_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.br_uv[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BR_UV_Q0;
+            self.sym_static(&BR_UV_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_base_lf_eob_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_lf_eob_uv[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_LF_EOB_UV_Q0;
+            self.sym_static(&BASE_LF_EOB_UV_Q0[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_base_eob_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.base_eob_uv[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfx_4tx::BASE_EOB_UV_Q0;
+            self.sym_static(&BASE_EOB_UV_Q0[ctx], s, nsyms);
+        }
+    }
+    // ---- intra mode -------------------------------------------------------
+    pub(crate) fn sym_y_set(&mut self, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.y_set;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdf_state::Y_SET_INIT;
+            self.sym_static(&Y_SET_INIT, s, 3);
+        }
+    }
+    pub(crate) fn sym_y_idx0(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.y_idx0[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::Y_IDX0_INIT;
+            self.sym_static(&Y_IDX0_INIT[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_y_idx1(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.y_idx1[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::Y_IDX1_INIT;
+            self.sym_static(&Y_IDX1_INIT[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_uv_mode(&mut self, ctx: usize, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.uv_mode[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::UV_MODE_INIT;
+            self.sym_static(&UV_MODE_INIT[ctx], s, nsyms);
+        }
+    }
+    pub(crate) fn sym_delta_q(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.delta_q;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::DELTA_Q_INIT;
+            self.sym_static(&DELTA_Q_INIT, s, nsyms);
+        }
+    }
+    // ---- TX partition -----------------------------------------------------
+    pub(crate) fn sym_tx_part_64(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_64;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::tables_tx32::TX_PART_2D_64;
+            self.sym_static(&TX_PART_2D_64, s, nsyms);
+        }
+    }
+    pub(crate) fn sym_tx_part_64x32(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_64x32;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::TX_PART_64X32_INIT;
+            self.sym_static(&TX_PART_64X32_INIT, s, nsyms);
+        }
+    }
+    pub(crate) fn sym_tx_part_32x64(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_32x64;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::TX_PART_32X64_INIT;
+            self.sym_static(&TX_PART_32X64_INIT, s, nsyms);
+        }
+    }
+    pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_short_side[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cdf_state::TX_SHORT_SIDE_INIT;
+            self.sym_static(&TX_SHORT_SIDE_INIT[ctx], s, 3);
+        }
+    }
+    // ---- CfL -------------------------------------------------------------
+    pub(crate) fn bool_cfl_is(&mut self, ctx: usize, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cfl_is[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_cfl_index(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cfl_index;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn sym_cfl_sign(&mut self, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cfl_sign;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                8,
+            );
+        } else {
+            use crate::av2::cfl::CFL_SIGN_ICDF;
+            self.sym_static(&CFL_SIGN_ICDF, s, 8);
+        }
+    }
+    pub(crate) fn sym_cfl_alpha(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cfl_alpha[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                8,
+            );
+        } else {
+            use crate::av2::cfl::CFL_ALPHA_ICDF;
+            self.sym_static(&CFL_ALPHA_ICDF[ctx], s, 8);
+        }
+    }
+    /// Adaptive 4x4 chroma txb_skip with an explicit plane selector and context
+    /// index, avoiding value-collision ambiguity (the neutral 16384 probability
+    /// appears at multiple contexts). `is_v` picks the V-plane table (avm
+    /// v_txb_skip); otherwise the U/luma TX4 table. `static_cdf` is still used for
+    /// the non-adaptive (static) fallback.
+    pub(crate) fn bool_txb_skip_tx4_ctx(
+        &mut self,
+        static_cdf: u32,
+        bit: u32,
+        is_v: bool,
+        ctx: usize,
+    ) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = if is_v {
+                &mut cs.skip_v[ctx]
+            } else {
+                &mut cs.skip_tx4[ctx]
+            };
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_txb_skip(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let (table, ctx) = cs.skip_slot_of(static_cdf as u16);
+            let cdf = match table {
+                0 => &mut cs.txb_skip[ctx],
+                1 => &mut cs.skip_tx64[ctx],
+                3 => &mut cs.skip_tx16[ctx],
+                4 => &mut cs.skip_tx8[ctx],
+                5 => &mut cs.skip_tx4[ctx],
+                _ => &mut cs.skip_v[ctx],
+            };
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    /// Adaptive skip with an explicit table id (0=TX32, 1=TX64, 2=V). Used where
+    /// the caller knows the table, avoiding value-collision ambiguity for the
+    /// neutral 16384 probability that appears in multiple skip tables.
+    pub(crate) fn bool_skip_tbl(&mut self, static_cdf: u32, bit: u32, table: u8) {
+        if let Some(ref mut cs) = self.cdf_state {
+            // Auto-detect the skip table (TX32 / TX64 / V) from the resolved static CDF
+            // value rather than trusting the caller's `table` hint: a chroma U block coded
+            // at TX_32X32 (e.g. a partial edge superblock) carries a CHROMA_SKIP_TX32
+            // value and must adapt the TX32 slot (avm txs_ctx=3), not the TX64 slot. The
+            // V plane is unambiguous and is selected explicitly.
+            let (slot, ctx) = if table == 2 {
+                (2u8, cs.skip_ctx_in(static_cdf as u16, 2))
+            } else {
+                cs.skip_slot_of(static_cdf as u16)
+            };
+            let cdf = match slot {
+                0 => &mut cs.txb_skip[ctx],
+                1 => &mut cs.skip_tx64[ctx],
+                3 => &mut cs.skip_tx16[ctx],
+                4 => &mut cs.skip_tx8[ctx],
+                5 => &mut cs.skip_tx4[ctx],
+                _ => &mut cs.skip_v[ctx],
+            };
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_dc_sign(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let ctx = cs.dc_sign_ctx_of(static_cdf as u16);
+            let cdf = &mut cs.dc_sign[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_eob_extra(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.eob_extra;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_do_split(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let ctx = cs.do_split_ctx_of(static_cdf as u16);
+            let cdf = &mut cs.do_split[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+
+    /// Adaptive rect_type partition bool. In static mode this is byte-identical
+    /// to encode_bool; in adaptive mode it adapts the per-context working copy
+    /// (avm rect_type_cdf), matching avmdec which adapts this symbol.
+    pub(crate) fn bool_rect_type(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let ctx = cs.rect_type_ctx_of(static_cdf as u16);
+            let cdf = &mut cs.rect_type[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    /// Adaptive tx-partition / misc bool, value-keyed (each distinct static CDF
+    /// value is a distinct avmdec context). Byte-identical to encode_bool in
+    /// static mode; adapts the per-value working copy in adaptive mode.
+    pub(crate) fn bool_txfm_part(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(cs) = self.cdf_state.as_deref_mut() {
+            let cdf = cs.txfm_bool(static_cdf as u16);
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn sym_intra_ext_tx16(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.intra_ext_tx16;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::INTRA_EXT_TX16_INIT;
+            self.sym_static(&INTRA_EXT_TX16_INIT, s, nsyms);
+        }
     }
 }

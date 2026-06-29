@@ -98,7 +98,7 @@ impl Av2Encoder {
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
-                            enc.encode_bool(*cdf, *val);
+                            enc.bool_rect_type(*cdf, *val);
                             continue;
                         }
                         partition::Op::Leaf {
@@ -214,7 +214,7 @@ impl Av2Encoder {
                                     ch: 32,
                                     basis: &bases.chroma420,
                                     scan: &tables::SCAN,
-                                    eob_bin: &CHROMA_EOB_BIN_QC[qc],
+                                    eob_cdf: EobCdf::ChrEobBin,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 1024,
                                     u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
@@ -267,7 +267,7 @@ impl Av2Encoder {
                                     ch: 16,
                                     basis: &bases.c32x16,
                                     scan: &SCAN32X16,
-                                    eob_bin: &CHROMA_EOB512_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob512,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 512,
                                     u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
@@ -332,7 +332,7 @@ impl Av2Encoder {
                                     ch: 32,
                                     basis: &bases.c16x32,
                                     scan: &crate::av2::tables::SCAN16X32,
-                                    eob_bin: &CHROMA_EOB512_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob512,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 512,
                                     u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
@@ -395,7 +395,7 @@ impl Av2Encoder {
                                     ch: 16,
                                     basis: &bases.luma16x16,
                                     scan: &SCAN16,
-                                    eob_bin: &CHROMA_EOB256_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob256,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 256,
                                     u_skip_row: &SKIP_TX16_QC[qc],
@@ -467,7 +467,7 @@ impl Av2Encoder {
                                     ch: 32,
                                     basis: &bases.luma8x32,
                                     scan: &SCAN8X32,
-                                    eob_bin: &CHROMA_EOB256_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob256,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 256,
                                     u_skip_row: &SKIP_TX16_QC[qc],
@@ -539,7 +539,7 @@ impl Av2Encoder {
                                     ch: 8,
                                     basis: &bases.luma32x8,
                                     scan: &SCAN32X8,
-                                    eob_bin: &CHROMA_EOB256_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob256,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 256,
                                     u_skip_row: &SKIP_TX16_QC[qc],
@@ -611,7 +611,7 @@ impl Av2Encoder {
                                     ch: 16,
                                     basis: &bases.c4x16,
                                     scan: &tables::SCAN4X16,
-                                    eob_bin: &CHROMA_EOB64_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob64,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 64,
                                     u_skip_row: &SKIP_TX8_QC[qc],
@@ -682,7 +682,7 @@ impl Av2Encoder {
                                     ch: 4,
                                     basis: &bases.c16x4,
                                     scan: &tables::SCAN16X4,
-                                    eob_bin: &CHROMA_EOB64_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob64,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 64,
                                     u_skip_row: &SKIP_TX8_QC[qc],
@@ -755,7 +755,7 @@ impl Av2Encoder {
                                     ch: 16,
                                     basis: &bases.c8x16,
                                     scan: &tables::SCAN8X16,
-                                    eob_bin: &CHROMA_EOB128_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob128,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 128,
                                     u_skip_row: &SKIP_TX16_QC[qc],
@@ -827,7 +827,7 @@ impl Av2Encoder {
                                     ch: 8,
                                     basis: &bases.c16x8,
                                     scan: &tables::SCAN16X8,
-                                    eob_bin: &CHROMA_EOB128_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob128,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 128,
                                     u_skip_row: &SKIP_TX16_QC[qc],
@@ -968,7 +968,7 @@ impl Av2Encoder {
                                     ch: 8,
                                     basis: &bases.c8x8,
                                     scan: &SCAN8X8,
-                                    eob_bin: &CHROMA_EOB64_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob64,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 64,
                                     u_skip_row: &SKIP_TX8_QC[qc],
@@ -1062,8 +1062,9 @@ impl Av2Encoder {
                                 ),
                             );
                             let uc = levels_to_coeffs(&levu);
-                            let u_skip = TXB_SKIP_TX4_Q0[(6 + ua + ul) as usize] as u32;
-                            encode_chroma_tu4_scan(enc, &uc, u_skip, false, &SCAN4X4_LOSSY);
+                            let u_ctx = (6 + ua + ul) as usize;
+                            let u_skip = crate::av2::cdfs_qctx::SKIP_TX4_QC[enc.qc][u_ctx] as u32;
+                            encode_chroma_tu4_scan(enc, &uc, u_skip, false, &SCAN4X4_LOSSY, u_ctx);
                             let u_nz = uc.iter().any(|&(_, l)| l != 0);
                             let predv = dc_pred_rect(recv, pcw, cy, cx, 4, 4, neutral, bd);
                             let levv = bases.c4x4.project_scan(
@@ -1089,9 +1090,9 @@ impl Av2Encoder {
                                 ),
                             );
                             let vc = levels_to_coeffs(&levv);
-                            let v_skip =
-                                V_TXB_SKIP_TX4_Q0[(6 * (u_nz as i32) + va + vl) as usize] as u32;
-                            encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY);
+                            let v_ctx = (6 * (u_nz as i32) + va + vl) as usize;
+                            let v_skip = crate::av2::cdfs_qctx::V_SKIP_TX4_QC[enc.qc][v_ctx] as u32;
+                            encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
                             (u_nz, vc.iter().any(|&(_, l)| l != 0))
                         }
                         (2, 4) => {
@@ -1153,7 +1154,7 @@ impl Av2Encoder {
                                     ch: 8,
                                     basis: &bases.c4x8,
                                     scan: &tables::SCAN4X8,
-                                    eob_bin: &crate::av2::cdfs_qctx::CHROMA_EOB32_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob32,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 32,
                                     u_skip_row: &SKIP_TX8_QC[qc],
@@ -1227,7 +1228,7 @@ impl Av2Encoder {
                                     ch: 4,
                                     basis: &bases.c8x4,
                                     scan: &tables::SCAN8X4,
-                                    eob_bin: &crate::av2::cdfs_qctx::CHROMA_EOB32_QC[qc],
+                                    eob_cdf: EobCdf::ChrEob32,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 32,
                                     u_skip_row: &SKIP_TX8_QC[qc],
@@ -1321,6 +1322,9 @@ impl Av2Encoder {
         let mut recv = vec![0f32; pcw * pch + 1];
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        if self.tune.updating_cdf && self.base_q_idx != 0 {
+            enc.enable_adaptive_cdf(enc.qc);
+        }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;

@@ -31,7 +31,6 @@ use image::{DynamicImage, Luma};
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use tealdust::{
     AvifImage, ColorInfo, ColorPrimaries, MatrixCoefficients, Orientation, PixelLayout,
     TransferCharacteristics,
@@ -127,26 +126,8 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     let image_info = decoder
         .image_info()
         .map_err(|e| AvifError::Io(e.to_string()))?;
-    let instant = Instant::now();
     let image = decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?;
-    println!("decoding time {:?}", instant.elapsed());
     let _ = black_box(decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?);
-
-    let mut total: u128 = 0;
-    let iters = 15;
-    for i in 0..iters {
-        let instant = Instant::now();
-        let _ = black_box(decoder.decode().map_err(|e| AvifError::Io(e.to_string()))?);
-        let elapsed = instant.elapsed();
-        println!("decoding time {:?}", elapsed);
-        if i > 0 {
-            total += elapsed.as_micros();
-        }
-    }
-    println!(
-        "average decoding time {:?}",
-        Duration::from_micros((total / (iters - 1)) as u64)
-    );
 
     let w = image_info.width;
     let h = image_info.height;

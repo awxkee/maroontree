@@ -29,6 +29,8 @@
 mod aq;
 mod av2_itx;
 mod avif;
+mod cdf_para;
+mod cdf_state;
 mod cdfs_qctx;
 mod cdfx_4tx;
 #[allow(dead_code)]
@@ -61,16 +63,15 @@ mod wht;
 
 use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::{
-    CHROMA_EOB_BIN_QC, CHROMA_EOB_HI_BIT_QC, CHROMA_EOB32_QC, CHROMA_EOB64_QC, CHROMA_EOB128_QC,
-    CHROMA_EOB256_QC, CHROMA_EOB512_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC,
-    SKIP_TX8_QC, SKIP_TX16_QC,
+    CHROMA_EOB_HI_BIT_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC, SKIP_TX8_QC,
+    SKIP_TX16_QC,
 };
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::chroma422::{
     ChromaNeighbors, ChromaPlanes, ChromaTxSpec, code_422_chroma_tu, recon_422_chroma,
 };
 use crate::av2::coder::{
-    Coeff, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
+    Coeff, EobCdf, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
     encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
     encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_8x8,
     encode_luma_leaf_8x32, encode_luma_leaf_16x16_full, encode_luma_leaf_16x32,
@@ -169,6 +170,7 @@ pub struct Tuning {
     /// Enable per-superblock adaptive quantization (variance-driven delta-Q).
     /// Bitstream-affecting; spends fewer bits on busy SBs and more on flat ones.
     pub aq: bool,
+    pub updating_cdf: bool,
 }
 
 impl Default for Tuning {
@@ -181,8 +183,9 @@ impl Default for Tuning {
             part_lambda_c: 0.0001,
             deblock: true,
             cdef: false,
-            cfl: false,
-            aq: false,
+            cfl: true,
+            aq: true,
+            updating_cdf: true,
         }
     }
 }
@@ -410,6 +413,19 @@ impl Av2Encoder {
         self
     }
 
+    /// Enable adaptive CDF updating during tile decode (`disable_cdf_update = 0`).
+    /// When `on = true` the AVM decoder updates its CDF tables as it decodes each
+    /// symbol, adapting probability estimates to the current frame content; this
+    /// can improve compression for complex frames but requires the decoder to run
+    /// the full symbol-update path.  When `off` (the default), CDFs stay fixed at
+    /// their q-context-loaded values — matching the existing static encoder tables.
+    /// Bitstream-affecting: toggling this changes the `disable_cdf_update` bit in
+    /// the frame header so bitstreams are not interchangeable.
+    pub fn with_updating_cdf(mut self, on: bool) -> Self {
+        self.tune.updating_cdf = on;
+        self
+    }
+
     /// Current tuning.
     pub fn tuning(&self) -> Tuning {
         self.tune
@@ -443,6 +459,9 @@ impl Av2Encoder {
             // (qindex step 4) keeps |signaled| <= 6 covering a +/-24 qindex span.
             aq: self.tune.aq && self.base_q_idx != 0,
             aq_res_log2: 2,
+            // Lossless frames always use static CDFs (AVM forces disable_cdf_update=1
+            // for coded-lossless); otherwise follow the tuning flag.
+            updating_cdf: self.tune.updating_cdf && self.base_q_idx != 0,
         }
     }
 

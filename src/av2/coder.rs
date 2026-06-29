@@ -28,7 +28,6 @@
  */
 
 use crate::av2::cdfs_qctx::*;
-use crate::av2::cdfx_4tx::*;
 use crate::av2::entropy::RangeEncoder;
 use crate::av2::lossless::SCAN_4X4;
 use crate::av2::tables::*;
@@ -188,42 +187,85 @@ fn encode_luma_base_range(
 ) {
     let limit = if high_freq { 3u32 } else { 5u32 };
     let over = level - limit;
-    let cdf = if high_freq {
-        &BR_TOK_HF_QC[enc.qc][hi_range_ctx]
+    if high_freq {
+        if over <= 2 {
+            enc.sym_br_hf(hi_range_ctx, over as usize, 3);
+        } else {
+            enc.sym_br_hf(hi_range_ctx, 3, 3);
+        }
     } else {
-        &BR_TOK_QC[enc.qc][hi_range_ctx]
-    };
-    if over <= 2 {
-        enc.encode_symbol(cdf, over as usize, 3);
-    } else {
-        enc.encode_symbol_esc(cdf, 3, 3);
+        if over <= 2 {
+            enc.sym_br(hi_range_ctx, over as usize, 3);
+        } else {
+            enc.sym_br(hi_range_ctx, 3, 3);
+        }
     }
 }
 
 /// Chroma high-frequency base-range symbol (limit 3; golomb handles the tail).
 fn encode_chroma_base_range(enc: &mut RangeEncoder, magnitude: u32, hi_range_ctx: usize) {
     let over = magnitude - 3;
-    let cdf = &CHROMA_BR_TOK_HF_QC[enc.qc][hi_range_ctx];
     if over <= 2 {
-        enc.encode_symbol(cdf, over as usize, 3);
+        enc.sym_chr_br(hi_range_ctx, over as usize, 3);
     } else {
-        enc.encode_symbol_esc(cdf, 3, 3);
+        enc.sym_chr_br(hi_range_ctx, 3, 3);
     }
 }
 
-// ----- shared end-of-block coding ----------------------------------------------
-
 /// Encode the end-of-block position using the given bin/hi-bit CDFs.
+/// Identifies which EOB CDF table to use for adaptive dispatch in encode_eob.
+#[derive(Copy, Clone)]
+pub(crate) enum EobCdf {
+    EobBin,
+    Eob64Luma,
+    Eob128Luma,
+    Eob256,
+    Eob512,
+    ChrEobBin,
+    ChrEob256,
+    ChrEob512,
+    #[allow(unused)]
+    Eob16Q0(usize), // ctx
+    ChrEob128,
+    ChrEob32,
+    ChrEob64,
+}
+
+/// Dispatch an EOB symbol to the right adaptive CDF method.
+#[inline]
+fn eob_sym(enc: &mut RangeEncoder, tbl: EobCdf, s: usize, nsyms: usize) {
+    match tbl {
+        EobCdf::EobBin => enc.sym_eob_bin(s, nsyms),
+        EobCdf::Eob64Luma => enc.sym_eob64_luma(s, nsyms),
+        EobCdf::Eob128Luma => enc.sym_eob128_luma(s, nsyms),
+        EobCdf::Eob256 => enc.sym_eob256(s, nsyms),
+        EobCdf::Eob512 => enc.sym_eob512(s, nsyms),
+        EobCdf::ChrEobBin => enc.sym_chr_eob_bin(s, nsyms),
+        EobCdf::ChrEob256 => enc.sym_chr_eob256(s, nsyms),
+        EobCdf::ChrEob512 => enc.sym_chr_eob512(s, nsyms),
+        EobCdf::Eob16Q0(ctx) => enc.sym_eob16_q0(ctx, s, nsyms),
+        EobCdf::ChrEob128 => enc.sym_chr_eob128(s, nsyms),
+        EobCdf::ChrEob32 => enc.sym_chr_eob32(s, nsyms),
+        EobCdf::ChrEob64 => enc.sym_chr_eob64(s, nsyms),
+    }
+}
+#[inline]
+fn eob_sym_esc(enc: &mut RangeEncoder, tbl: EobCdf, s: usize, nsyms: usize) {
+    // The escape extension adds a trailing zero; update_cdf is called on
+    // the base cdf (not the escape sentinel), matching AVM behaviour.
+    eob_sym(enc, tbl, s, nsyms);
+}
+
 fn encode_eob(
     enc: &mut RangeEncoder,
     eob: usize,
-    eob_bin: &[u16],
+    eob_cdf: EobCdf,
     eob_hi_bit: u16,
     esc_bits: u32,
     pt_nsyms: usize,
 ) {
     if eob <= 1 {
-        enc.encode_symbol(eob_bin, eob, pt_nsyms);
+        eob_sym(enc, eob_cdf, eob, pt_nsyms);
         return;
     }
     let mut bin = 2usize;
@@ -231,21 +273,21 @@ fn encode_eob(
         bin += 1;
     }
     if bin < pt_nsyms {
-        enc.encode_symbol(eob_bin, bin, pt_nsyms);
+        eob_sym(enc, eob_cdf, bin, pt_nsyms);
     } else if esc_bits == 0 {
         // No-escape eob classes: the top eob_pt symbol is coded directly (decode_eob
         // cases 2/3) with no escape literal. The esc helper extends the stored cdf so
         // the top symbol has a valid upper boundary. `pt_nsyms` is avm's eob symbol
         // count minus one (off-by-one MIN_PROB convention) and is tx-size dependent:
         // TX_8X8 (eob_multi_size 2, avm nsym 7) -> 6; TX_16X16+ (avm nsym 8) -> 7.
-        enc.encode_symbol_esc(eob_bin, bin, pt_nsyms);
+        eob_sym_esc(enc, eob_cdf, bin, pt_nsyms);
     } else {
-        enc.encode_symbol_esc(eob_bin, pt_nsyms, pt_nsyms);
+        eob_sym_esc(enc, eob_cdf, pt_nsyms, pt_nsyms);
         enc.encode_bypass((bin - pt_nsyms) as u32, esc_bits);
     }
     let extra_bits = bin - 2;
     let hi = (eob >> extra_bits) & 1;
-    enc.encode_bool(eob_hi_bit as u32, hi as u32);
+    enc.bool_eob_extra(eob_hi_bit as u32, hi as u32);
     if extra_bits > 0 {
         let low = eob & ((1 << extra_bits) - 1);
         for k in (0..extra_bits).rev() {
@@ -466,25 +508,6 @@ static DEFAULT_MODE_LIST_Y: [u8; 56] = [
     16, 18, 44, 46, 2, 4, 9, 11, 23, 25, 30, 32, 37, 39, 51, 53, 14, 20, 42, 48, 0, 6, 7, 13, 21,
     27, 28, 34, 35, 41, 49, 55,
 ];
-// default (static, disable_cdf_update) ICDFs, per neighbour-directional context
-#[rustfmt::skip]
-static Y_IDX0: [[u16; 7]; 3] = [
-    [17593, 12693, 11040, 8670, 6363, 5113, 3908],
-    [22654, 17811, 15953, 13641, 12621, 7185, 5599],
-    [27132, 23764, 22312, 20646, 20024, 12443, 7161],
-];
-#[rustfmt::skip]
-static Y_IDX1: [[u16; 5]; 3] = [
-    [20025, 14596, 12574, 9120, 6349],
-    [23792, 16684, 11941, 8173, 4272],
-    [23984, 18212, 13058, 7865, 4044],
-];
-static Y_SET_ICDF: [u16; 3] = [3905, 1746, 1044];
-
-/// Per-superblock delta-Q symbol CDF (decoder `cdf_m.delta_q()`, 8 symbols /
-/// 7 thresholds; values are the decoder defaults, trailing count dropped).
-/// We only ever emit magnitudes 0..=6, so the escape symbol (7) is never used.
-static DELTA_Q_ICDF: [u16; 7] = [16174, 9443, 6344, 4543, 3410, 2669, 2155];
 
 /// Emit one superblock's delta-Q (called right after the SB's partition bit,
 /// matching the decoder's read order: partition -> delta_q -> mode). `signaled`
@@ -494,7 +517,7 @@ static DELTA_Q_ICDF: [u16; 7] = [16174, 9443, 6344, 4543, 3410, 2669, 2155];
 pub(crate) fn emit_delta_q(enc: &mut RangeEncoder, signaled: i32) {
     let a = signaled.unsigned_abs() as usize;
     debug_assert!(a <= 6, "delta_q magnitude {a} would hit the escape symbol");
-    enc.encode_symbol(&DELTA_Q_ICDF, a, 7);
+    enc.sym_delta_q(a, 7);
     if a != 0 {
         enc.encode_bypass((signaled < 0) as u32, 1);
     }
@@ -509,12 +532,6 @@ pub(crate) fn maybe_emit_delta_q(enc: &mut RangeEncoder) {
         enc.delta_q_pending = false;
     }
 }
-// intra_uv_mode ICDF, ctx 0 = non-directional luma, ctx 1 = directional luma
-#[rustfmt::skip]
-static UV_MODE: [[u16; 7]; 2] = [
-    [23405, 11811, 9903, 8015, 6357, 4785, 2340],
-    [11486, 9158, 4560, 3457, 2420, 1610, 1277],
-];
 
 const NO_MIDX: u8 = 0xff;
 
@@ -602,7 +619,7 @@ pub(crate) fn encode_intra_modes_dir(
     amidx: u8,
 ) -> u8 {
     if let Some(cdf) = partition_cdf {
-        enc.encode_bool(cdf, 0);
+        enc.bool_do_split(cdf, 0);
     }
     maybe_emit_delta_q(enc);
     #[allow(clippy::needless_late_init)]
@@ -612,8 +629,8 @@ pub(crate) fn encode_intra_modes_dir(
         // context counts directional neighbours and must match the decoder even
         // for non-directional blocks adjacent to directional ones.
         let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
-        enc.encode_symbol(&Y_SET_ICDF, 0, 3);
-        enc.encode_symbol(&Y_IDX0[y_ctx], mode_idx, 7);
+        enc.sym_y_set(0);
+        enc.sym_y_idx0(y_ctx, mode_idx, 7);
         midx = NO_MIDX;
     } else {
         let y_mode = internal_dir_to_ymode(mode_idx);
@@ -629,21 +646,21 @@ pub(crate) fn encode_intra_modes_dir(
         let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
         // y_set: escape (last) symbol of the 4-symbol alphabet is value 3.
         if y_set == 3 {
-            enc.encode_symbol_esc(&Y_SET_ICDF, 3, 3);
+            enc.sym_y_set(3);
         } else {
-            enc.encode_symbol(&Y_SET_ICDF, y_set, 3);
+            enc.sym_y_set(y_set);
         }
         if y_set == 0 {
             if y_mode_idx < 7 {
-                enc.encode_symbol(&Y_IDX0[y_ctx], y_mode_idx, 7);
+                enc.sym_y_idx0(y_ctx, y_mode_idx, 7);
             } else {
                 // idx0 == 7 is the escape (last) symbol of the 8-symbol alphabet.
-                enc.encode_symbol_esc(&Y_IDX0[y_ctx], 7, 7);
+                enc.sym_y_idx0(y_ctx, 7, 7);
                 let i1 = y_mode_idx - 7;
                 if i1 == 5 {
-                    enc.encode_symbol_esc(&Y_IDX1[y_ctx], 5, 5);
+                    enc.sym_y_idx1(y_ctx, 5, 5);
                 } else {
-                    enc.encode_symbol(&Y_IDX1[y_ctx], i1, 5);
+                    enc.sym_y_idx1(y_ctx, i1, 5);
                 }
             }
         } else {
@@ -656,34 +673,26 @@ pub(crate) fn encode_intra_modes_dir(
         if enc.cfl {
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
-                enc.encode_bool(isc as u32, 1);
-                enc.encode_bool(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
-                enc.encode_symbol(&crate::av2::cfl::CFL_SIGN_ICDF, enc.cfl_js as usize, 8);
+                enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
+                enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                enc.sym_cfl_sign(enc.cfl_js as usize);
                 let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
                 let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
                 if su != 0 {
-                    enc.encode_symbol(
-                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u],
-                        enc.cfl_mag_u as usize,
-                        8,
-                    );
+                    enc.sym_cfl_alpha(enc.cfl_ctx_u, enc.cfl_mag_u as usize);
                 }
                 if sv != 0 {
-                    enc.encode_symbol(
-                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v],
-                        enc.cfl_mag_v as usize,
-                        8,
-                    );
+                    enc.sym_cfl_alpha(enc.cfl_ctx_v, enc.cfl_mag_v as usize);
                 }
                 return midx;
             }
-            enc.encode_bool(isc as u32, 0);
+            enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 0);
         }
         // DC chroma. uv_mode_ctx = (luma is directional); with ctx=1 the DC index
         // is shifted by one ("slot 0" encodes same-as-luma).
         let uv_ctx = (midx != NO_MIDX) as usize;
         let uv_idx = uv_ctx; // DC = REORDERED_NONDIR[0]; idx = uv_ctx + 0
-        enc.encode_symbol(&UV_MODE[uv_ctx], uv_idx, 7);
+        enc.sym_uv_mode(uv_ctx, uv_idx, 7);
     }
     midx
 }
@@ -700,7 +709,7 @@ fn encode_intra_modes(
     // None for non-partition-point leaves (4x4 / narrow ext blocks), which read
     // no partition bit at all.
     if let Some(cdf) = partition_cdf {
-        enc.encode_bool(cdf, 0);
+        enc.bool_do_split(cdf, 0);
     }
     maybe_emit_delta_q(enc);
     if lossless {
@@ -708,8 +717,8 @@ fn encode_intra_modes(
         // mode. 0 = no DPCM, then the normal intra-mode path follows.
         enc.encode_bool(16384, 0);
     }
-    enc.encode_symbol(&[3905, 1746, 1044], 0, 3); // intra_y mode set 0
-    enc.encode_symbol(&[17593, 12693, 11040, 8670, 6363, 5113, 3908], mode_idx, 7);
+    enc.sym_y_set(0); // intra_y mode set 0
+    enc.sym_y_idx0(0, mode_idx, 7); // simple path: set 0, idx0 ctx 0
     if has_chroma {
         if lossless {
             // Lossless intra also reads use_dpcm_uv (dpcm_uv_cdf, AVM_CDF2(16384))
@@ -725,31 +734,23 @@ fn encode_intra_modes(
         if enc.cfl {
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
-                enc.encode_bool(isc as u32, 1);
-                enc.encode_bool(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
-                enc.encode_symbol(&crate::av2::cfl::CFL_SIGN_ICDF, enc.cfl_js as usize, 8);
+                enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
+                enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                enc.sym_cfl_sign(enc.cfl_js as usize);
                 let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
                 let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
                 if su != 0 {
-                    enc.encode_symbol(
-                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_u],
-                        enc.cfl_mag_u as usize,
-                        8,
-                    );
+                    enc.sym_cfl_alpha(enc.cfl_ctx_u, enc.cfl_mag_u as usize);
                 }
                 if sv != 0 {
-                    enc.encode_symbol(
-                        &crate::av2::cfl::CFL_ALPHA_ICDF[enc.cfl_ctx_v],
-                        enc.cfl_mag_v as usize,
-                        8,
-                    );
+                    enc.sym_cfl_alpha(enc.cfl_ctx_v, enc.cfl_mag_v as usize);
                 }
                 return;
             }
-            enc.encode_bool(isc as u32, 0);
+            enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 0);
         }
         // intra_uv_mode = 0 (DC chroma); uv_mode_cdf[context=0] (non-directional luma).
-        enc.encode_symbol(&[23405, 11811, 9903, 8015, 6357, 4785, 2340], 0, 7);
+        enc.sym_uv_mode(0, 0, 7);
     }
 }
 
@@ -771,7 +772,7 @@ fn encode_luma_signs(
         let mag = level.unsigned_abs();
         let sign = if level < 0 { 1u32 } else { 0u32 };
         if x == 0 && y == 0 {
-            enc.encode_bool(DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32, sign);
+            enc.bool_dc_sign(DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32, sign);
         } else {
             enc.encode_bypass(sign, 1);
         }
@@ -820,35 +821,31 @@ fn encode_chroma_tokens_scan(
         let is_dc = scan_pos == 0;
         if is_eob && is_dc {
             if mag <= 4 {
-                enc.encode_symbol(&CHROMA_EOB_TOK_LF_QC[enc.qc][0], (mag - 1) as usize, 4);
+                enc.sym_chr_eob_lf(0, (mag - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&CHROMA_EOB_TOK_LF_QC[enc.qc][0], 4, 4);
+                enc.sym_chr_eob_lf(0, 4, 4);
             }
         } else if is_eob {
             let eob_ctx = 1 + (eob > th1) as usize + (eob > th2) as usize;
             if mag <= 2 {
-                enc.encode_symbol(
-                    &CHROMA_EOB_TOK_HF_QC[enc.qc][eob_ctx],
-                    (mag - 1) as usize,
-                    2,
-                );
+                enc.sym_chr_eob_hf(eob_ctx, (mag - 1) as usize, 2);
             } else {
-                enc.encode_symbol_esc(&CHROMA_EOB_TOK_HF_QC[enc.qc][eob_ctx], 2, 2);
+                enc.sym_chr_eob_hf(eob_ctx, 2, 2);
                 encode_chroma_base_range(enc, mag, 0);
             }
         } else if is_dc {
             let (base_ctx, _) = chroma_coeff_context(&levels, rc, 0, plane_offset);
             if mag <= 4 {
-                enc.encode_symbol(&CHROMA_BASE_TOK_LF_QC[enc.qc][base_ctx], mag as usize, 5);
+                enc.sym_chr_lf(base_ctx, mag as usize);
             } else {
-                enc.encode_symbol_esc(&CHROMA_BASE_TOK_LF_QC[enc.qc][base_ctx], 5, 5);
+                enc.sym_chr_lf(base_ctx, 5);
             }
         } else {
             let (base_ctx, hi_range_ctx) = chroma_coeff_context(&levels, rc, x + y, plane_offset);
             if mag <= 2 {
-                enc.encode_symbol(&CHROMA_BASE_TOK_HF_QC[enc.qc][base_ctx], mag as usize, 3);
+                enc.sym_chr_hf(base_ctx, mag as usize);
             } else {
-                enc.encode_symbol_esc(&CHROMA_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
+                enc.sym_chr_hf(base_ctx, 3);
                 encode_chroma_base_range(enc, mag, hi_range_ctx);
             }
         }
@@ -868,21 +865,22 @@ pub(crate) fn encode_chroma_block_rect(
     skip_cdf: u32,
     is_u_plane: bool,
     scan: &[u16],
-    eob_bin: &[u16; 7],
+    eob_cdf: EobCdf,
     eob_hi: u16,
     area: usize,
 ) {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    let skip_tbl: u8 = if is_u_plane { 1 } else { 2 };
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_skip_tbl(skip_cdf, 1, skip_tbl);
         return;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_skip_tbl(skip_cdf, 0, skip_tbl);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(
         enc,
         eob,
-        eob_bin,
+        eob_cdf,
         eob_hi,
         if area <= 128 {
             0
@@ -930,16 +928,18 @@ pub(crate) fn encode_chroma_block(
     is_u_plane: bool,
 ) {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    // U plane -> chroma skip table (id 1, TX64 for 444); V plane -> v_txb_skip (id 2).
+    let skip_tbl: u8 = if is_u_plane { 1 } else { 2 };
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_skip_tbl(skip_cdf, 1, skip_tbl);
         return;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_skip_tbl(skip_cdf, 0, skip_tbl);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(
         enc,
         eob,
-        &CHROMA_EOB_BIN_QC[enc.qc],
+        EobCdf::ChrEobBin,
         CHROMA_EOB_HI_BIT_QC[enc.qc],
         2,
         7,
@@ -964,36 +964,28 @@ fn encode_luma32_token(
     if !high_freq {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(
-                    &LUMA32_EOB_TOK_LF_QC[enc.qc][base_ctx],
-                    (level - 1) as usize,
-                    4,
-                );
+                enc.sym_luma32_eob_lf(base_ctx, (level - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&LUMA32_EOB_TOK_LF_QC[enc.qc][base_ctx], 4, 4);
+                enc.sym_luma32_eob_lf(base_ctx, 4, 4);
                 encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
             }
         } else if level <= 4 {
-            enc.encode_symbol(&LUMA32_BASE_TOK_LF_QC[enc.qc][base_ctx], level as usize, 5);
+            enc.sym_luma32_lf(base_ctx, level as usize);
         } else {
-            enc.encode_symbol_esc(&LUMA32_BASE_TOK_LF_QC[enc.qc][base_ctx], 5, 5);
+            enc.sym_luma32_lf(base_ctx, 5);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if is_eob {
         if level <= 2 {
-            enc.encode_symbol(
-                &LUMA32_EOB_TOK_HF_QC[enc.qc][base_ctx],
-                (level - 1) as usize,
-                2,
-            );
+            enc.sym_luma32_eob_hf(base_ctx, (level - 1) as usize, 2);
         } else {
-            enc.encode_symbol_esc(&LUMA32_EOB_TOK_HF_QC[enc.qc][base_ctx], 2, 2);
+            enc.sym_luma32_eob_hf(base_ctx, 2, 2);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if level <= 2 {
-        enc.encode_symbol(&LUMA32_BASE_TOK_HF_QC[enc.qc][base_ctx], level as usize, 3);
+        enc.sym_luma32_hf(base_ctx, level as usize);
     } else {
-        enc.encode_symbol_esc(&LUMA32_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
+        enc.sym_luma32_hf(base_ctx, 3);
         encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
     }
     if (level as i32) < limit {
@@ -1021,36 +1013,28 @@ fn encode_luma16_token(
     if !high_freq {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(
-                    &LUMA16_EOB_TOK_LF_QC[enc.qc][base_ctx],
-                    (level - 1) as usize,
-                    4,
-                );
+                enc.sym_luma16_eob_lf(base_ctx, (level - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&LUMA16_EOB_TOK_LF_QC[enc.qc][base_ctx], 4, 4);
+                enc.sym_luma16_eob_lf(base_ctx, 4, 4);
                 encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
             }
         } else if level <= 4 {
-            enc.encode_symbol(&LUMA16_BASE_TOK_LF_QC[enc.qc][base_ctx], level as usize, 5);
+            enc.sym_luma16_lf(base_ctx, level as usize);
         } else {
-            enc.encode_symbol_esc(&LUMA16_BASE_TOK_LF_QC[enc.qc][base_ctx], 5, 5);
+            enc.sym_luma16_lf(base_ctx, 5);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if is_eob {
         if level <= 2 {
-            enc.encode_symbol(
-                &LUMA16_EOB_TOK_HF_QC[enc.qc][base_ctx],
-                (level - 1) as usize,
-                2,
-            );
+            enc.sym_luma16_eob_hf(base_ctx, (level - 1) as usize, 2);
         } else {
-            enc.encode_symbol_esc(&LUMA16_EOB_TOK_HF_QC[enc.qc][base_ctx], 2, 2);
+            enc.sym_luma16_eob_hf(base_ctx, 2, 2);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if level <= 2 {
-        enc.encode_symbol(&LUMA16_BASE_TOK_HF_QC[enc.qc][base_ctx], level as usize, 3);
+        enc.sym_luma16_hf(base_ctx, level as usize);
     } else {
-        enc.encode_symbol_esc(&LUMA16_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
+        enc.sym_luma16_hf(base_ctx, 3);
         encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
     }
     if (level as i32) < limit {
@@ -1123,19 +1107,18 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     // 0 = DCT_DCT, 1 = ADST_ADST (mode-independent for the DC/SMOOTH/PAETH classes
     // this encoder emits). CDFs are non-adaptive (frame disable_cdf_update), so the
     // fixed icdf stays in sync regardless of which index is coded.
-    static INTRA_EXT_TX16: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE -> single TX_16X16
+    enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single TX_16X16
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1, 7);
+    encode_eob(enc, eob, EobCdf::Eob256, EOB_HI_BIT_QC[enc.qc], 1, 7);
     if eob >= 1 {
-        enc.encode_symbol(&INTRA_EXT_TX16, tx_type_idx, 6); // tx_type index
+        enc.sym_intra_ext_tx16(tx_type_idx, 6); // tx_type index
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, &SCAN16, 256);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1163,36 +1146,28 @@ fn encode_luma8_token(
     if !high_freq {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(
-                    &LUMA8_EOB_TOK_LF_QC[enc.qc][base_ctx],
-                    (level - 1) as usize,
-                    4,
-                );
+                enc.sym_luma8_eob_lf(base_ctx, (level - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&LUMA8_EOB_TOK_LF_QC[enc.qc][base_ctx], 4, 4);
+                enc.sym_luma8_eob_lf(base_ctx, 4, 4);
                 encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
             }
         } else if level <= 4 {
-            enc.encode_symbol(&LUMA8_BASE_TOK_LF_QC[enc.qc][base_ctx], level as usize, 5);
+            enc.sym_luma8_lf(base_ctx, level as usize);
         } else {
-            enc.encode_symbol_esc(&LUMA8_BASE_TOK_LF_QC[enc.qc][base_ctx], 5, 5);
+            enc.sym_luma8_lf(base_ctx, 5);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if is_eob {
         if level <= 2 {
-            enc.encode_symbol(
-                &LUMA8_EOB_TOK_HF_QC[enc.qc][base_ctx],
-                (level - 1) as usize,
-                2,
-            );
+            enc.sym_luma8_eob_hf(base_ctx, (level - 1) as usize, 2);
         } else {
-            enc.encode_symbol_esc(&LUMA8_EOB_TOK_HF_QC[enc.qc][base_ctx], 2, 2);
+            enc.sym_luma8_eob_hf(base_ctx, 2, 2);
             encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
         }
     } else if level <= 2 {
-        enc.encode_symbol(&LUMA8_BASE_TOK_HF_QC[enc.qc][base_ctx], level as usize, 3);
+        enc.sym_luma8_hf(base_ctx, level as usize);
     } else {
-        enc.encode_symbol_esc(&LUMA8_BASE_TOK_HF_QC[enc.qc][base_ctx], 3, 3);
+        enc.sym_luma8_hf(base_ctx, 3);
         encode_luma_base_range(enc, level, hi_range_ctx, high_freq);
     }
     if (level as i32) < limit {
@@ -1256,26 +1231,19 @@ pub(crate) fn encode_luma_leaf_8x8(
     tx_type_cdf: Option<(&'static [u16], usize, usize)>, // (cdf, idx, nsym)
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE -> single TX_8X8
+    enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single TX_8X8
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(
-        enc,
-        eob,
-        &EOB64_LUMA_QC[enc.qc],
-        EOB_HI_BIT_QC[enc.qc],
-        0,
-        6,
-    );
+    encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
     if eob >= 1
         && let Some((cdf, idx, nsym)) = tx_type_cdf
     {
-        enc.encode_symbol(cdf, idx, nsym);
+        enc.encode_symbol(cdf, idx, nsym); // tx-type: static (non-adaptive)
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1300,26 +1268,19 @@ pub(crate) fn encode_luma_leaf_rect128(
     tx_type_cdf: Option<(&'static [u16], usize, usize)>,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE -> single rect TX
+    enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single rect TX
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(
-        enc,
-        eob,
-        &EOB128_LUMA_QC[enc.qc],
-        EOB_HI_BIT_QC[enc.qc],
-        0,
-        7,
-    );
+    encode_eob(enc, eob, EobCdf::Eob128Luma, EOB_HI_BIT_QC[enc.qc], 0, 7);
     if eob >= 1
         && let Some((cdf, idx, nsym)) = tx_type_cdf
     {
-        enc.encode_symbol(cdf, idx, nsym);
+        enc.encode_symbol(cdf, idx, nsym); // tx-type: static (non-adaptive)
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1385,12 +1346,12 @@ pub(crate) fn encode_luma_tu32(
 ) -> u32 {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
-    encode_eob(enc, eob, &EOB_BIN_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 2, 7);
+    encode_eob(enc, eob, EobCdf::EobBin, EOB_HI_BIT_QC[enc.qc], 2, 7);
     let stored = encode_luma32_tokens(enc, &nonzero, eob);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
@@ -1412,21 +1373,21 @@ pub(crate) fn encode_luma_tu_rect(
     skip_cdf: u32,
     dc_sign_ctx: usize,
     scan: &[u16],
-    eob_bin: &[u16; 7],
+    eob_cdf: EobCdf,
     eob_hi: u16,
     area: usize,
 ) -> u32 {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(
         enc,
         eob,
-        eob_bin,
+        eob_cdf,
         eob_hi,
         if area <= 128 {
             0
@@ -1443,8 +1404,8 @@ pub(crate) fn encode_luma_tu_rect(
     // short_side_idx 0 maps to DCT_DCT for both orientations. cdf = 32768 -
     // intra_ext_tx_short_side_cdf[TX_16X16] (AVM_CDF4(26915, 32411, 32748)).
     if eob >= 1 {
-        const TX_SHORT_SIDE_16X16: [u16; 3] = [5853, 357, 20];
-        enc.encode_symbol(&TX_SHORT_SIDE_16X16, 0, 3);
+        // intra_ext_tx_short_side_cdf[TX_16X16] = index 2 → working-copy ctx 1.
+        enc.sym_tx_short_side(1, 0);
     }
     let stored = encode_luma_tokens_scan(enc, &nonzero, eob, scan, area);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1467,8 +1428,8 @@ pub(crate) fn encode_luma_block_split(
     part_cdf: u32,
 ) -> [u32; 4] {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_SPLIT_64 as u32, 1); // tx_split = 1
-    enc.encode_symbol(&TX_PART_2D_64, 0, 6); // tx_part symbol 0 = SPLIT
+    enc.bool_txfm_part(TX_SPLIT_64 as u32, 1); // tx_split = 1
+    enc.sym_tx_part_64(0, 6); // tx_part symbol 0 = SPLIT
     let mut cul = [0u32; 4];
     for i in 0..4 {
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
@@ -1505,8 +1466,8 @@ pub(crate) fn encode_luma_block_split_dir(
         lmidx,
         amidx,
     );
-    enc.encode_bool(TX_SPLIT_64 as u32, 1);
-    enc.encode_symbol(&TX_PART_2D_64, 0, 6);
+    enc.bool_txfm_part(TX_SPLIT_64 as u32, 1);
+    enc.sym_tx_part_64(0, 6);
     let mut cul = [0u32; 4];
     for i in 0..4 {
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
@@ -1530,8 +1491,8 @@ pub(crate) fn encode_luma_block_vert4(
     part_cdf: u32,
 ) -> [u32; 4] {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_SPLIT_64 as u32, 1); // do_partition = 1
-    enc.encode_symbol(&TX_PART_2D_64, 4, 6); // type symbol 4 = VERT4
+    enc.bool_txfm_part(TX_SPLIT_64 as u32, 1); // do_partition = 1
+    enc.sym_tx_part_64(4, 6); // type symbol 4 = VERT4
     let mut cul = [0u32; 4];
     for i in 0..4 {
         cul[i] = encode_luma_tu_rect(
@@ -1540,7 +1501,7 @@ pub(crate) fn encode_luma_block_vert4(
             skip_cdfs[i],
             dc_sign_ctxs[i],
             &SCAN16X32,
-            &EOB512_QC[enc.qc],
+            EobCdf::Eob512,
             EOB_HI_BIT_QC[enc.qc],
             512,
         );
@@ -1561,8 +1522,8 @@ pub(crate) fn encode_luma_block_horz4(
     part_cdf: u32,
 ) -> [u32; 4] {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_SPLIT_64 as u32, 1); // do_partition = 1
-    enc.encode_symbol(&TX_PART_2D_64, 3, 6); // type symbol 3 = HORZ4
+    enc.bool_txfm_part(TX_SPLIT_64 as u32, 1); // do_partition = 1
+    enc.sym_tx_part_64(3, 6); // type symbol 3 = HORZ4
     let mut cul = [0u32; 4];
     for i in 0..4 {
         cul[i] = encode_luma_tu_rect(
@@ -1571,7 +1532,7 @@ pub(crate) fn encode_luma_block_horz4(
             skip_cdfs[i],
             dc_sign_ctxs[i],
             &SCAN32X16,
-            &EOB512_QC[enc.qc],
+            EobCdf::Eob512,
             EOB_HI_BIT_QC[enc.qc],
             512,
         );
@@ -1583,10 +1544,6 @@ pub(crate) fn encode_luma_block_horz4(
 /// avm AVM_CDF2(15952) → 32768-15952). Both horz/vert splits are allowed for
 /// BLOCK_64X32 + TX_64X32, so a 4-way type symbol follows.
 const TX_DO_PART_64X32: u32 = 16816;
-/// 4-way tx-partition type cdf for the 64X32 group (txfm_4way_partition_type_cdf
-/// [0][0][8], avm row → 32768-row). Symbol value `VERT-1 = 2` selects
-/// TX_PARTITION_VERT, i.e. two side-by-side TX_32X32.
-static TX_PART_2D_64X32: [u16; 6] = [28067, 19266, 7810, 6355, 4602, 2639];
 
 /// Encode an intra 64x32 luma leaf as TX_PARTITION_VERT → two TX_32X32 (left,
 /// right). `part_cdf` is the leaf's do_split (PARTITION_NONE) cdf from the
@@ -1601,8 +1558,8 @@ pub(crate) fn encode_luma_leaf_64x32(
     part_cdf: u32,
 ) -> [u32; 2] {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_DO_PART_64X32, 1); // do_partition = 1
-    enc.encode_symbol(&TX_PART_2D_64X32, 2, 6); // type = VERT-1 = 2
+    enc.bool_txfm_part(TX_DO_PART_64X32, 1); // do_partition = 1
+    enc.sym_tx_part_64x32(2, 6); // type = VERT-1 = 2
     let mut cul = [0u32; 2];
     for i in 0..2 {
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
@@ -1610,10 +1567,6 @@ pub(crate) fn encode_luma_leaf_64x32(
     cul
 }
 
-/// do_partition cdf for BLOCK_32X64 = same group 6 as 64X32 → 16816.
-/// 4-way type cdf for the 32X64 group (txfm_4way_partition_type_cdf[0][0][7]);
-/// symbol `HORZ-1 = 1` selects TX_PARTITION_HORZ → two stacked TX_32X32.
-static TX_PART_2D_32X64: [u16; 6] = [30413, 15167, 11065, 6718, 4887, 1371];
 /// do_partition cdf for an intra 32X32 luma block (txfm_do_partition_cdf[0][0][5],
 /// avm AVM_CDF2(15391) → 32768-15391). The 32X32 leaf codes do_partition=0 (NONE)
 /// → a single TX_32X32; no 4-way symbol follows.
@@ -1631,8 +1584,8 @@ pub(crate) fn encode_luma_leaf_32x64(
     part_cdf: u32,
 ) -> [u32; 2] {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_DO_PART_64X32, 1); // do_partition = 1 (group 6 cdf == 16816)
-    enc.encode_symbol(&TX_PART_2D_32X64, 1, 6); // type = HORZ-1 = 1
+    enc.bool_txfm_part(TX_DO_PART_64X32, 1); // do_partition = 1 (group 6 cdf == 16816)
+    enc.sym_tx_part_32x64(1, 6); // type = HORZ-1 = 1
     let mut cul = [0u32; 2];
     for i in 0..2 {
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
@@ -1666,22 +1619,22 @@ pub(crate) fn encode_luma_leaf_dc_class2(
     do_part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(do_part_cdf, 0); // tx do_partition = NONE → single transform
+    enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE → single transform
     if dc_level == 0 {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     // eob count 1 (position 0): decoder's dc_skip path skips tx_type + sec_tx_type.
-    encode_eob(enc, 0, &EOB256_QC[enc.qc], EOB_HI_BIT_QC[enc.qc], 1, 7);
+    encode_eob(enc, 0, EobCdf::Eob256, EOB_HI_BIT_QC[enc.qc], 1, 7);
     let mag = dc_level.unsigned_abs();
     if mag <= 4 {
-        enc.encode_symbol(&LUMA16_EOB_TOK_LF_QC[enc.qc][0], (mag - 1) as usize, 4);
+        enc.sym_luma16_eob_lf(0, (mag - 1) as usize, 4);
     } else {
-        enc.encode_symbol_esc(&LUMA16_EOB_TOK_LF_QC[enc.qc][0], 4, 4);
+        enc.sym_luma16_eob_lf(0, 4, 4);
         encode_luma_base_range(enc, mag, 0, false);
     }
-    enc.encode_bool(
+    enc.bool_dc_sign(
         DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32,
         (dc_level < 0) as u32,
     );
@@ -1703,14 +1656,14 @@ pub(crate) fn encode_luma_leaf_16x64(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(18958, 0); // tx do_partition = NONE → single TX_16X64
+    enc.bool_txfm_part(18958, 0); // tx do_partition = NONE → single TX_16X64
     encode_luma_tu_rect(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN16X32,
-        &EOB512_QC[enc.qc],
+        EobCdf::Eob512,
         EOB_HI_BIT_QC[enc.qc],
         512,
     )
@@ -1729,14 +1682,14 @@ pub(crate) fn encode_luma_leaf_64x16(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(18958, 0); // tx do_partition = NONE → single TX_64X16
+    enc.bool_txfm_part(18958, 0); // tx do_partition = NONE → single TX_64X16
     encode_luma_tu_rect(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN32X16,
-        &EOB512_QC[enc.qc],
+        EobCdf::Eob512,
         EOB_HI_BIT_QC[enc.qc],
         512,
     )
@@ -1749,7 +1702,7 @@ pub(crate) fn encode_luma_tu_rect_long32(
     skip_cdf: u32,
     dc_sign_ctx: usize,
     scan: &[u16],
-    eob_bin: &[u16; 7],
+    eob_cdf: EobCdf,
     eob_hi: u16,
     area: usize,
     short_cdf: &[u16; 3],
@@ -1757,15 +1710,15 @@ pub(crate) fn encode_luma_tu_rect_long32(
 ) -> u32 {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(
         enc,
         eob,
-        eob_bin,
+        eob_cdf,
         eob_hi,
         if area <= 128 {
             0
@@ -1778,9 +1731,12 @@ pub(crate) fn encode_luma_tu_rect_long32(
     );
     if eob >= 1 {
         // txtp_long32_dct(0) default = 32732; symbol 1 = DCT on the long side.
-        enc.encode_bool(32732, 1);
-        // txtp_intra_short_1d(min) short-side index 0 → DCT short side.
-        enc.encode_symbol(short_cdf, 0, 3);
+        enc.bool_txfm_part(32732, 1);
+        // txtp_intra_short_1d(min) short-side index 0 → DCT short side. The working-copy
+        // context follows the passed short_cdf: [6068,..] = index 1 (ctx 0, 8x32/32x8),
+        // [5853,..] = index 2 (ctx 1, 16x32/32x16). avmdec adapts these separately.
+        let ss_ctx = if short_cdf[0] == 6068 { 0 } else { 1 };
+        enc.sym_tx_short_side(ss_ctx, 0);
     }
     // 8-family rect leaves (TX_8X32 / TX_32X8) are tx-size class ctx=2; their eob/base
     // coefficient-token cdfs are the ctx-2 (LUMA16) tables, NOT the ctx-3 (LUMA32) ones
@@ -1812,14 +1768,14 @@ pub(crate) fn encode_luma_leaf_16x32(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(19451, 0); // tx_split (szctx 4) = NONE → single TX_16X32
+    enc.bool_txfm_part(19451, 0); // tx_split (szctx 4) = NONE → single TX_16X32
     encode_luma_tu_rect_long32(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN16X32,
-        &EOB512_QC[enc.qc],
+        EobCdf::Eob512,
         EOB_HI_BIT_QC[enc.qc],
         512,
         &[5853, 357, 20], // txtp_intra_short_1d(min=2)
@@ -1839,14 +1795,14 @@ pub(crate) fn encode_luma_leaf_32x16(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(19451, 0); // tx_split (szctx 4) = NONE → single TX_32X16
+    enc.bool_txfm_part(19451, 0); // tx_split (szctx 4) = NONE → single TX_32X16
     encode_luma_tu_rect_long32(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN32X16,
-        &EOB512_QC[enc.qc],
+        EobCdf::Eob512,
         EOB_HI_BIT_QC[enc.qc],
         512,
         &[5853, 357, 20], // txtp_intra_short_1d(min=2)
@@ -1868,14 +1824,14 @@ pub(crate) fn encode_luma_leaf_8x32(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(18958, 0); // tx_split (szctx 8) = NONE → single TX_8X32
+    enc.bool_txfm_part(18958, 0); // tx_split (szctx 8) = NONE → single TX_8X32
     encode_luma_tu_rect_long32(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN8X32,
-        &EOB256_QC[enc.qc],
+        EobCdf::Eob256,
         EOB_HI_BIT_QC[enc.qc],
         256,
         &[6068, 608, 20], // txtp_intra_short_1d(min=1)
@@ -1895,14 +1851,14 @@ pub(crate) fn encode_luma_leaf_32x8(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(18958, 0); // tx_split (szctx 8) = NONE → single TX_32X8
+    enc.bool_txfm_part(18958, 0); // tx_split (szctx 8) = NONE → single TX_32X8
     encode_luma_tu_rect_long32(
         enc,
         tu,
         skip_cdf,
         dc_sign_ctx,
         &SCAN32X8,
-        &EOB256_QC[enc.qc],
+        EobCdf::Eob256,
         EOB_HI_BIT_QC[enc.qc],
         256,
         &[6068, 608, 20], // txtp_intra_short_1d(min=1)
@@ -1921,7 +1877,7 @@ pub(crate) fn encode_luma_leaf_32x32(
     part_cdf: u32,
 ) -> u32 {
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.encode_bool(TX_DO_PART_32X32, 0); // do_partition = 0 → single TX_32X32
+    enc.bool_txfm_part(TX_DO_PART_32X32, 0); // do_partition = 0 → single TX_32X32
     encode_luma_tu32(enc, tu, skip_cdf, dc_sign_ctx)
 }
 
@@ -2010,11 +1966,18 @@ fn br_hf_ctx(levels: &[u8], rc: usize) -> usize {
 fn encode_br4(enc: &mut RangeEncoder, level: u32, ctx: usize, lf: bool) {
     let limit = if lf { 5u32 } else { 3u32 };
     let over = level - limit;
-    let cdf = if lf { &BR_LF_Q0[ctx] } else { &BR_Q0[ctx] };
-    if over <= 2 {
-        enc.encode_symbol(cdf, over as usize, 3);
+    if lf {
+        if over <= 2 {
+            enc.sym_br_lf_q0(ctx, over as usize, 3);
+        } else {
+            enc.sym_br_lf_q0(ctx, 3, 3);
+        }
     } else {
-        enc.encode_symbol_esc(cdf, 3, 3);
+        if over <= 2 {
+            enc.sym_br_q0(ctx, over as usize, 3);
+        } else {
+            enc.sym_br_q0(ctx, 3, 3);
+        }
     }
 }
 
@@ -2031,28 +1994,28 @@ fn encode_luma4_token(
     if lf {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(&BASE_LF_EOB_TX4_Q0[base_ctx], (level - 1) as usize, 4);
+                enc.sym_base_lf_eob_tx4(base_ctx, (level - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&BASE_LF_EOB_TX4_Q0[base_ctx], 4, 4);
+                enc.sym_base_lf_eob_tx4(base_ctx, 4, 4);
                 encode_br4(enc, level, hi_ctx, true);
             }
         } else if level <= 4 {
-            enc.encode_symbol(&BASE_LF_TX4_Q0[base_ctx][0], level as usize, 5);
+            enc.sym_base_lf_tx4(base_ctx, 0, level as usize);
         } else {
-            enc.encode_symbol_esc(&BASE_LF_TX4_Q0[base_ctx][0], 5, 5);
+            enc.sym_base_lf_tx4(base_ctx, 0, 5);
             encode_br4(enc, level, hi_ctx, true);
         }
     } else if is_eob {
         if level <= 2 {
-            enc.encode_symbol(&BASE_EOB_TX4_Q0[base_ctx], (level - 1) as usize, 2);
+            enc.sym_base_eob_tx4(base_ctx, (level - 1) as usize, 2);
         } else {
-            enc.encode_symbol_esc(&BASE_EOB_TX4_Q0[base_ctx], 2, 2);
+            enc.sym_base_eob_tx4(base_ctx, 2, 2);
             encode_br4(enc, level, hi_ctx, false);
         }
     } else if level <= 2 {
-        enc.encode_symbol(&BASE_TX4_Q0[base_ctx][0], level as usize, 3);
+        enc.sym_base_tx4(base_ctx, 0, level as usize);
     } else {
-        enc.encode_symbol_esc(&BASE_TX4_Q0[base_ctx][0], 3, 3);
+        enc.sym_base_tx4(base_ctx, 0, 3);
         encode_br4(enc, level, hi_ctx, false);
     }
     if (level as i32) < limit {
@@ -2071,16 +2034,15 @@ fn encode_eob_4x4(enc: &mut RangeEncoder, eob_count: usize, plctx: usize) {
         5..=8 => (4, 5, 2),
         _ => (5, 9, 3),
     };
-    let cdf = &EOB16_Q0[plctx];
     if pt - 1 <= 3 {
-        enc.encode_symbol(cdf, pt - 1, 4);
+        enc.sym_eob16_q0(plctx, pt - 1, 4);
     } else {
-        enc.encode_symbol_esc(cdf, 4, 4);
+        enc.sym_eob16_q0(plctx, 4, 4);
     }
     if obits > 0 {
         let extra = eob_count - start;
         let msb = (extra >> (obits - 1)) & 1;
-        enc.encode_bool(EOB_HI_BIT_QC[enc.qc] as u32, msb as u32);
+        enc.bool_eob_extra(EOB_HI_BIT_QC[enc.qc] as u32, msb as u32);
         for k in (0..obits - 1).rev() {
             enc.encode_bypass(((extra >> k) & 1) as u32, 1);
         }
@@ -2140,7 +2102,7 @@ fn encode_luma4_signs(
         let mag = level.unsigned_abs();
         let sign = if level < 0 { 1u32 } else { 0u32 };
         if x == 0 && y == 0 {
-            enc.encode_bool(DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32, sign);
+            enc.bool_dc_sign(DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32, sign);
         } else {
             enc.encode_bypass(sign, 1);
         }
@@ -2159,10 +2121,10 @@ pub(crate) fn encode_luma_tu4(
     dc_sign_ctx: usize,
 ) -> u32 {
     if coeffs.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob_count = coeffs.iter().map(|&(s, _)| s).max().unwrap() + 1; // avm eob = max scan idx + 1
     encode_eob_4x4(enc, eob_count, 0); // luma plane ctx 0
     let (stored, ns) = encode_luma4_tokens(enc, coeffs, eob_count);
@@ -2200,11 +2162,10 @@ fn br_ctx_2d_chroma(levels: &[u8], rc: usize) -> usize {
 }
 fn encode_br_uv(enc: &mut RangeEncoder, level: u32, ctx: usize) {
     let over = level - 3;
-    let cdf = &BR_UV_Q0[ctx];
     if over <= 2 {
-        enc.encode_symbol(cdf, over as usize, 3);
+        enc.sym_br_uv(ctx, over as usize, 3);
     } else {
-        enc.encode_symbol_esc(cdf, 3, 3);
+        enc.sym_br_uv(ctx, 3, 3);
     }
 }
 fn encode_chroma4_token(
@@ -2218,28 +2179,28 @@ fn encode_chroma4_token(
     if lf {
         if is_eob {
             if level <= 4 {
-                enc.encode_symbol(&BASE_LF_EOB_UV_Q0[base_ctx], (level - 1) as usize, 4);
+                enc.sym_base_lf_eob_uv(base_ctx, (level - 1) as usize, 4);
             } else {
-                enc.encode_symbol_esc(&BASE_LF_EOB_UV_Q0[base_ctx], 4, 4);
+                enc.sym_base_lf_eob_uv(base_ctx, 4, 4);
             }
         } else if level <= 4 {
-            enc.encode_symbol(&BASE_LF_UV_Q0[base_ctx], level as usize, 5);
+            enc.sym_base_lf_uv(base_ctx, level as usize);
         } else {
-            enc.encode_symbol_esc(&BASE_LF_UV_Q0[base_ctx], 5, 5);
+            enc.sym_base_lf_uv(base_ctx, 5);
         }
         if level <= 4 { level as i32 } else { 5 } // chroma lf: no br, capped at 5
     } else {
         if is_eob {
             if level <= 2 {
-                enc.encode_symbol(&BASE_EOB_UV_Q0[base_ctx], (level - 1) as usize, 2);
+                enc.sym_base_eob_uv(base_ctx, (level - 1) as usize, 2);
             } else {
-                enc.encode_symbol_esc(&BASE_EOB_UV_Q0[base_ctx], 2, 2);
+                enc.sym_base_eob_uv(base_ctx, 2, 2);
                 encode_br_uv(enc, level, hi_ctx);
             }
         } else if level <= 2 {
-            enc.encode_symbol(&BASE_UV_Q0[base_ctx], level as usize, 3);
+            enc.sym_base_uv(base_ctx, level as usize);
         } else {
-            enc.encode_symbol_esc(&BASE_UV_Q0[base_ctx], 3, 3);
+            enc.sym_base_uv(base_ctx, 3);
             encode_br_uv(enc, level, hi_ctx);
         }
         if (level as i32) <= 2 {
@@ -2259,10 +2220,10 @@ pub(crate) fn encode_chroma_tu4(
     plane_v: bool,
 ) -> u32 {
     if coeffs.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip(skip_cdf, 0);
     let eob_count = coeffs.iter().map(|&(s, _)| s).max().unwrap() + 1;
     encode_eob_4x4(enc, eob_count, 2); // chroma plane ctx = 2
     let voff = if plane_v { 4 } else { 0 };
@@ -2335,12 +2296,13 @@ pub(crate) fn encode_chroma_tu4_scan(
     skip_cdf: u32,
     plane_v: bool,
     scan: &[u16],
+    skip_ctx: usize,
 ) -> u32 {
     if coeffs.is_empty() {
-        enc.encode_bool(skip_cdf, 1);
+        enc.bool_txb_skip_tx4_ctx(skip_cdf, 1, plane_v, skip_ctx);
         return 0;
     }
-    enc.encode_bool(skip_cdf, 0);
+    enc.bool_txb_skip_tx4_ctx(skip_cdf, 0, plane_v, skip_ctx);
     let eob_count = coeffs.iter().map(|&(s, _)| s).max().unwrap() + 1;
     encode_eob_4x4(enc, eob_count, 2);
     let voff = if plane_v { 4 } else { 0 };

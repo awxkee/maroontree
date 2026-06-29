@@ -174,7 +174,7 @@ fn detect_container(bytes: &[u8]) -> ImageContainer {
 
         if brand_matches(major, UMBRELLA_BRANDS) {
             let box_end = ftyp_box_size(bytes).unwrap_or(bytes.len().min(512));
-            for chunk in bytes[16..box_end].chunks_exact(4) {
+            for chunk in bytes[16..box_end].as_chunks::<4>().0.iter() {
                 if brand_matches(chunk, HEVC_MAJOR_BRANDS) {
                     return ImageContainer::Heic;
                 }

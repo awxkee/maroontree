@@ -28,6 +28,7 @@
  */
 
 use super::*;
+use crate::av2::coder::EobCdf;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn recon_422_chroma(
@@ -62,7 +63,7 @@ pub(super) struct ChromaTxSpec<'a> {
     pub(super) ch: usize,
     pub(super) basis: &'a Basis,
     pub(super) scan: &'a [u16],
-    pub(super) eob_bin: &'a [u16; 7],
+    pub(super) eob_cdf: EobCdf,
     pub(super) eob_hi: u16,
     pub(super) area: usize,
     pub(super) u_skip_row: &'a [u16; 10],
@@ -101,7 +102,7 @@ pub(super) fn code_422_chroma_tu(
         ch,
         basis,
         scan,
-        eob_bin,
+        eob_cdf,
         eob_hi,
         area,
         u_skip_row,
@@ -189,9 +190,9 @@ pub(super) fn code_422_chroma_tu(
     };
     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
-    encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_bin, eob_hi, area);
+    encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area);
     let up_ = uc.iter().any(|&(_, l)| l != 0);
     let v_skip = CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
-    encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_bin, eob_hi, area);
+    encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area);
     (up_, vc.iter().any(|&(_, l)| l != 0))
 }

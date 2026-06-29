@@ -100,7 +100,7 @@ impl Av2Encoder {
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, _lmr, _lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
-                            enc.encode_bool(*cdf, *val);
+                            enc.bool_rect_type(*cdf, *val);
                             continue;
                         }
                         partition::Op::Leaf {
@@ -508,6 +508,9 @@ impl Av2Encoder {
         let mut recy = vec![0f32; pw * ph];
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        if self.tune.updating_cdf && self.base_q_idx != 0 {
+            enc.enable_adaptive_cdf(enc.qc);
+        }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;
@@ -641,6 +644,9 @@ impl Av2Encoder {
     ) -> Av2Frame {
         let mut enc = RangeEncoder::new();
         enc.qc = get_q_ctx(self.base_q_idx);
+        if self.tune.updating_cdf && self.base_q_idx != 0 {
+            enc.enable_adaptive_cdf(enc.qc);
+        }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0; // base_q=0 -> q-context 0
         let neutral = self.dc_neutral();
         let sb_cols = pw / 64;
@@ -702,7 +708,7 @@ impl Av2Encoder {
                 for op in &ops {
                     match *op {
                         partition::Op::RectType { cdf, val } => {
-                            enc.encode_bool(cdf, val);
+                            enc.bool_rect_type(cdf, val);
                         }
                         partition::Op::Leaf {
                             mi_row,

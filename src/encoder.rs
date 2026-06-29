@@ -147,7 +147,9 @@ impl<T: Pixel> PlanarImage<T> {
         let mut b = vec![T::default(); n];
         let mut r = vec![T::default(); n];
         for (((px, g), b), r) in rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .zip(g.iter_mut())
             .zip(b.iter_mut())
             .zip(r.iter_mut())
@@ -248,7 +250,9 @@ impl<T: Pixel> PlanarImage<T> {
         let mut luma = vec![T::default(); n];
         let mut a = vec![T::default(); n];
         for ((px, luma), a) in gray_alpha
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(luma.iter_mut())
             .zip(a.iter_mut())
         {
@@ -309,7 +313,9 @@ impl<T: Pixel> PlanarImage<T> {
         let n = self.width * self.height;
         let mut out = vec![T::default(); n * 3];
         for (((dst, &r), &g), &b) in out
-            .chunks_exact_mut(3)
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
             .zip(self.planes[2].iter())
             .zip(self.planes[0].iter())
             .zip(self.planes[1].iter())
