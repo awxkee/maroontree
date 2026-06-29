@@ -345,6 +345,7 @@ pub fn encode_still_lossy<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -384,6 +385,7 @@ pub fn encode_still_lossy<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     )
 }
 
@@ -401,6 +403,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -466,6 +469,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     )
 }
 
@@ -483,6 +487,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -548,9 +553,11 @@ pub fn encode_still_lossy_420<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     img: &PlanarImage<T>,
     bit_depth: BitDepth,
@@ -559,6 +566,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
@@ -591,6 +599,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     );
     Ok(bytes)
 }
@@ -610,6 +619,7 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
         threads,
         Speed::Slow,
         false,
+        crate::av1real::VarianceBoost::off(),
     )
 }
 
@@ -620,7 +630,16 @@ pub fn encode_lossless_gray<T: Pixel>(
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
-    let obu = encode_lossy_gray_obu(img, img.bit_depth, 0, true, cfg.threads, Speed::Slow, false)?;
+    let obu = encode_lossy_gray_obu(
+        img,
+        img.bit_depth,
+        0,
+        true,
+        cfg.threads,
+        Speed::Slow,
+        false,
+        crate::av1real::VarianceBoost::off(),
+    )?;
     finalize_color(
         obu,
         img.width as u32,
@@ -749,6 +768,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         cfg.threads,
         Speed::Slow,
         false,
+        crate::av1real::VarianceBoost::off(),
     )?;
     finalize_with_alpha(
         obu,
@@ -762,9 +782,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
 }
 
 /// Encode a pre-converted 4:4:4 YCbCr still.
-///
-/// Y, Cb, Cr are full-resolution (`width × height`) samples. The AV1 bitstream
-/// carries full-range BT.601 YCbCr signaling (profile 1 for ≤10-bit, 2 for 12-bit).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_yuv444_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
@@ -773,6 +791,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
@@ -794,14 +813,13 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     );
     Ok(bytes)
 }
 
 /// Encode a pre-subsampled 4:2:2 YCbCr still.
-///
-/// `cb` and `cr` must each be `ceil(width/2) × height` samples. The AV1 bitstream
-/// uses AV1 profile 2 (4:2:2 / 12-bit profile).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_yuv422_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
@@ -810,6 +828,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
     assert!(base_q_idx != 0, "4:2:2 doesn't support lossless encoding");
@@ -831,14 +850,13 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     );
     Ok(bytes)
 }
 
 /// Encode a pre-subsampled 4:2:0 YCbCr still.
-///
-/// `cb` and `cr` must each be `ceil(width/2) × ceil(height/2)` samples. The AV1
-/// bitstream uses AV1 profile 0 (4:2:0 main profile).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_yuv420_obu<T: Pixel>(
     planar_image: &PlanarImage<T>,
     bit_depth: BitDepth,
@@ -847,6 +865,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: crate::av1real::VarianceBoost,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
@@ -868,6 +887,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
         threads,
         speed,
         aq,
+        vb,
     );
     Ok(bytes)
 }
@@ -875,6 +895,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::av1real::VarianceBoost;
 
     /// Non-multiple-of-8 sizes must not panic and must produce a non-empty
     /// stream for both very small and odd dimensions.
@@ -885,8 +906,16 @@ mod tests {
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb).unwrap();
             assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
             assert!(
-                !encode_still_lossy(&img, 16, Some(&Cicp::srgb_ycbcr()), 0, Speed::Slow, false,)
-                    .is_empty()
+                !encode_still_lossy(
+                    &img,
+                    16,
+                    Some(&Cicp::srgb_ycbcr()),
+                    0,
+                    Speed::Slow,
+                    false,
+                    VarianceBoost::off()
+                )
+                .is_empty()
             );
         }
     }

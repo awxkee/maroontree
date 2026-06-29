@@ -317,6 +317,11 @@ impl Av2Encoder {
             } else {
                 0.0
             },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
         );
 
         for row in 0..sb_rows {

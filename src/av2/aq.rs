@@ -65,6 +65,100 @@ pub(crate) fn sb_activity(
     (1.0 + var).ln() as f32
 }
 
+fn sb_subblock_variances(
+    yp: &[f32],
+    pw: usize,
+    sb_y: usize,
+    sb_x: usize,
+    width: usize,
+    height: usize,
+    out: &mut [f32; 64],
+) -> usize {
+    let mut filled = 0usize;
+    let mut acc = 0f64;
+    for by in 0..8 {
+        for bx in 0..8 {
+            let y0 = sb_y + by * 8;
+            let x0 = sb_x + bx * 8;
+            let h = height.saturating_sub(y0).min(8);
+            let w = width.saturating_sub(x0).min(8);
+            let idx = by * 8 + bx;
+            if h == 0 || w == 0 {
+                out[idx] = f32::NAN; // mark out-of-frame, patched below
+                continue;
+            }
+            let mut sum = 0f64;
+            let mut sum2 = 0f64;
+            for r in 0..h {
+                let base = (y0 + r) * pw + x0;
+                for &v in &yp[base..base + w] {
+                    let v = v as f64;
+                    sum += v;
+                    sum2 += v * v;
+                }
+            }
+            let n = (h * w) as f64;
+            let mean = sum / n;
+            let var = (sum2 / n - mean * mean).max(0.0) as f32;
+            out[idx] = var;
+            acc += var as f64;
+            filled += 1;
+        }
+    }
+    if filled == 0 {
+        out.iter_mut().for_each(|v| *v = 0.0);
+        return 0;
+    }
+    // Patch out-of-frame subblocks with the in-frame mean (neutral for the octile).
+    let mean = (acc / filled as f64) as f32;
+    for v in out.iter_mut() {
+        if v.is_nan() {
+            *v = mean;
+        }
+    }
+    filled
+}
+
+/// The representative variance of a superblock for Variance Boost: the value at the
+/// requested `octile` (1..=8) of the 64 sorted 8x8 variances. Octile 1 = the most
+/// low-variance-biased pick (boost readily), octile 8 = only the maximum (boost only
+/// when the whole SB is low-variance).
+fn sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
+    subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Octile o in 1..=8 maps to sorted index o*8 - 1 (o=1 -> 7, o=4 -> 31 (median-ish),
+    // o=6 -> 47 (SVT-AV1-PSY default), o=8 -> 63 (max)).
+    let o = octile.clamp(1, 8) as usize;
+    let idx = (o * 8 - 1).min(63);
+    subvars[idx]
+}
+
+fn variance_boost_delta(picked_var: f32, ref_log: f32, strength: f32, boost_only: bool) -> i32 {
+    // Work in log-variance: compresses the huge dynamic range of variance and matches
+    // the reference (which is a mean of log-variances).
+    let v_log = (1.0 + picked_var).ln();
+    // Low-variance threshold (curve 0): ln(1 + 256).
+    const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
+    const MAX_BOOST: f32 = 18.0; // max qindex *reduction* for the flattest SBs
+    const MAX_CUT: f32 = 10.0; // max qindex *increase* for the busiest SBs
+    // qindex per unit log-variance for each side.
+    const BOOST_SLOPE: f32 = 5.0;
+    const CUT_SLOPE: f32 = 3.0;
+
+    if v_log < LOW_LOG {
+        // Low contrast: boost (negative delta). Deeper below threshold => stronger.
+        let d = ((LOW_LOG - v_log) * BOOST_SLOPE * strength).min(MAX_BOOST);
+        -(d.fast_round() as i32)
+    } else if boost_only {
+        0
+    } else {
+        // Higher contrast: coarsen relative to the tile reference, capped. Using the
+        // reference (not the threshold) keeps well-textured frames near zero-mean.
+        let over = (v_log - ref_log.max(LOW_LOG)).max(0.0);
+        let d = (over * CUT_SLOPE * strength).min(MAX_CUT);
+        d.fast_round() as i32
+    }
+}
+
 /// Mean activity over all superblocks of a (padded) luma plane — the per-tile
 /// reference used to center the AQ deltas so they are zero-mean.
 pub(crate) fn tile_ref_activity(
@@ -84,20 +178,6 @@ pub(crate) fn tile_ref_activity(
         }
     }
     if cnt > 0.0 { sum / cnt } else { 5.0 }
-}
-
-/// Map superblock activity to a target qindex, centered on the tile mean
-/// `ref_act`. Flat regions (below-average activity, banding/blocking visible) get
-/// a finer quantizer; busy/textured regions (artifacts masked) get a coarser one.
-/// Zero-mean by construction, so the average quantizer tracks the frame base.
-///
-/// Tuning knobs: `SLOPE` (qindex per unit log-activity) and `MAX_DELTA` (per-SB
-/// clamp). Lower both for a gentle effect, raise for aggressive redistribution.
-fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
-    const SLOPE: f32 = 4.0;
-    const MAX_DELTA: f32 = 20.0;
-    let delta = ((activity - ref_act) * SLOPE).clamp(-MAX_DELTA, MAX_DELTA);
-    (base_q + delta.fast_round() as i32).clamp(1, 255)
 }
 
 /// Scale a residual block by `s` (identity-fast for `s == 1.0`). Used to quantize
@@ -121,6 +201,13 @@ pub(crate) struct AqState {
     /// Running qindex accumulator (decoder `ts.last_qidx`), reset to the frame
     /// base at each tile start.
     last_qidx: i32,
+    /// Variance Boost selectivity octile (1..=8). Default 6 (SVT-AV1-PSY default).
+    vb_octile: u8,
+    /// Variance Boost strength multiplier (1.0 = nominal).
+    vb_strength: f32,
+    /// When true, only boost low-variance SBs (net-negative, spends bits). When false
+    /// (default), also coarsen high-variance SBs to keep the rate roughly matched.
+    vb_boost_only: bool,
 }
 
 impl AqState {
@@ -133,7 +220,24 @@ impl AqState {
             qstep_base,
             ref_act,
             last_qidx: base_q,
+            vb_octile: 6,
+            vb_strength: 1.0,
+            vb_boost_only: false,
         }
+    }
+
+    /// Override the Variance Boost knobs (octile selectivity, strength, boost-only).
+    /// Returns `self` for chaining at the construction site.
+    pub(crate) fn with_variance_boost(
+        mut self,
+        octile: u8,
+        strength: f32,
+        boost_only: bool,
+    ) -> Self {
+        self.vb_octile = octile.clamp(1, 8);
+        self.vb_strength = strength.max(0.0);
+        self.vb_boost_only = boost_only;
+        self
     }
 
     /// Decide this superblock's quantizer from its `activity`, set
@@ -156,8 +260,19 @@ impl AqState {
             enc.delta_q_signaled = 0;
             return (self.qstep_base, 1.0);
         }
-        let act = sb_activity(yp, pw, sb_y, sb_x, width, height);
-        let target = aq_target_qidx(self.base_q, act, self.ref_act);
+        // Variance Boost: pick the representative 8x8 variance at the configured
+        // octile, map it to a qindex delta (boost low-contrast, coarsen high-contrast),
+        // and signal it through the same accumulator/qstep machinery as classic AQ.
+        let mut subvars = [0f32; 64];
+        let filled = sb_subblock_variances(yp, pw, sb_y, sb_x, width, height, &mut subvars);
+        let target = if filled == 0 {
+            self.base_q
+        } else {
+            let picked = sb_octile_variance(&mut subvars, self.vb_octile);
+            let delta =
+                variance_boost_delta(picked, self.ref_act, self.vb_strength, self.vb_boost_only);
+            (self.base_q + delta).clamp(1, 255)
+        };
         let step = 1i32 << AQ_RES_LOG2;
         let sig = (((target - self.last_qidx) as f32) / step as f32)
             .fast_round()

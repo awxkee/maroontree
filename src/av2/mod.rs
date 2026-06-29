@@ -86,9 +86,10 @@ use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for,
 use crate::av2::entropy::RangeEncoder;
 use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
-    dc_pred, dc_pred_rect, get_residual, get_residual_rect, levels_to_coeffs, lossless_sb_tus,
-    pad_plane, put_block, put_block_rect, sb_align, sb_tu_contexts, sb_tu_contexts_64x32,
-    sb_tu_contexts_pos, sb_tu_contexts_rect, sb_tu4_chroma_skip, sb_tu4_contexts,
+    dc_pred, dc_pred_rect, dc_pred_rect_subsampled, get_residual, get_residual_rect,
+    levels_to_coeffs, lossless_sb_tus, pad_plane, put_block, put_block_rect, sb_align,
+    sb_tu_contexts, sb_tu_contexts_64x32, sb_tu_contexts_pos, sb_tu_contexts_rect,
+    sb_tu4_chroma_skip, sb_tu4_contexts,
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;
@@ -170,6 +171,18 @@ pub struct Tuning {
     /// Enable per-superblock adaptive quantization (variance-driven delta-Q).
     /// Bitstream-affecting; spends fewer bits on busy SBs and more on flat ones.
     pub aq: bool,
+    /// Variance Boost selectivity octile (1..=8). Controls how low-variance a 64x64 SB
+    /// must be (across its 8x8 subblocks) before its quantizer is boosted. 1 = least
+    /// selective (boost readily, more bits), 8 = most selective. Default 6
+    /// (SVT-AV1-PSY default). Only active when `aq` is true.
+    pub vb_octile: u8,
+    /// Variance Boost strength multiplier (1.0 = nominal). Scales the whole qindex
+    /// modulation. Only active when `aq` is true.
+    pub vb_strength: f32,
+    /// When true, Variance Boost only *boosts* low-variance SBs (net-negative, spends
+    /// extra bits for quality). When false (default), it also coarsens high-variance
+    /// SBs so the average quantizer tracks the frame base (rate-balanced).
+    pub vb_boost_only: bool,
     pub updating_cdf: bool,
 }
 
@@ -185,17 +198,15 @@ impl Default for Tuning {
             cdef: false,
             cfl: true,
             aq: true,
+            vb_octile: 6,
+            vb_strength: 0.6,
+            vb_boost_only: true,
             updating_cdf: true,
         }
     }
 }
 
 /// A reusable still-image encoder configured for one quality.
-///
-/// `Av2Encoder::new(q)` loads the bundled q120 bases and rescales them to the target
-/// `base_q_idx` once (see [`proj::Bases::rescaled_to_q`]); the per-superblock encode
-/// then reuses that precomputed set. Lower `base_q_idx` → finer quantizer → larger,
-/// higher-quality output; higher → coarser/smaller.
 pub struct Av2Encoder {
     bases: proj::Bases,
     base_q_idx: u8,
@@ -413,14 +424,17 @@ impl Av2Encoder {
         self
     }
 
-    /// Enable adaptive CDF updating during tile decode (`disable_cdf_update = 0`).
-    /// When `on = true` the AVM decoder updates its CDF tables as it decodes each
-    /// symbol, adapting probability estimates to the current frame content; this
-    /// can improve compression for complex frames but requires the decoder to run
-    /// the full symbol-update path.  When `off` (the default), CDFs stay fixed at
-    /// their q-context-loaded values — matching the existing static encoder tables.
-    /// Bitstream-affecting: toggling this changes the `disable_cdf_update` bit in
-    /// the frame header so bitstreams are not interchangeable.
+    /// Configure Variance Boost (variance-adaptive delta-Q), the perceptual quantizer
+    /// used when AQ is enabled. `octile` (1..=8) sets selectivity (6 = default),
+    /// `strength` scales the effect (1.0 = nominal), and `boost_only` selects pure
+    /// quality-boosting (net-negative rate) vs. the default rate-balanced mode.
+    pub fn with_variance_boost(mut self, octile: u8, strength: f32, boost_only: bool) -> Self {
+        self.tune.vb_octile = octile.clamp(1, 8);
+        self.tune.vb_strength = strength.max(0.0);
+        self.tune.vb_boost_only = boost_only;
+        self
+    }
+
     pub fn with_updating_cdf(mut self, on: bool) -> Self {
         self.tune.updating_cdf = on;
         self

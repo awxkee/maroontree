@@ -108,6 +108,10 @@ pub(super) fn code_422_chroma_tu(
         u_skip_row,
     } = spec;
     let QuantCtx { qc, neutral, qstep } = quant;
+    // Variance Boost: when the SB quantizer differs from the basis (frame) qstep, scale the
+    // residual so the projection (which quantizes at `basis.qstep`) effectively quantizes at
+    // `qstep`, matching the reconstruction that dequantizes at `qstep`. Identity when equal.
+    let cscale = basis.qstep as f32 / qstep as f32;
     let ChromaNeighbors { ua, ul, va, vl } = nb;
     let (levu, levv) = if let Some(cflc) = cfl {
         // CfL: residual against the per-pixel prediction; reconstruct with that base.
@@ -134,8 +138,8 @@ pub(super) fn code_422_chroma_tu(
                 *rv = vp - pred_vs as f32;
             }
         }
-        let levu = basis.project_scan(&ru, 0.0, scan);
-        let levv = basis.project_scan(&rv, 0.0, scan);
+        let levu = basis.project_scan(&aq::scale_resid(&ru, cscale), 0.0, scan);
+        let levv = basis.project_scan(&aq::scale_resid(&rv, cscale), 0.0, scan);
         put_block_rect(
             recu,
             pcw,
@@ -158,7 +162,10 @@ pub(super) fn code_422_chroma_tu(
     } else {
         let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
         let levu = basis.project_scan(
-            &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
+            &crate::av2::aq::scale_resid(
+                &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
+                cscale,
+            ),
             0.0,
             scan,
         );
@@ -173,7 +180,10 @@ pub(super) fn code_422_chroma_tu(
         );
         let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
         let levv = basis.project_scan(
-            &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
+            &crate::av2::aq::scale_resid(
+                &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
+                cscale,
+            ),
             0.0,
             scan,
         );

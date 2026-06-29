@@ -394,7 +394,7 @@ pub(super) fn encode_luma_leaf32(
     let mut best_cost = f64::INFINITY;
     let mut best_mode = 0usize;
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
-    let mut best_region = vec![0f32; 64 * 32];
+    let mut best_region = [0f32; 64 * 32];
     let cands: &[usize] = if speed.reduced_modes() {
         &[0usize, 1, 2]
     } else {
@@ -406,7 +406,7 @@ pub(super) fn encode_luma_leaf32(
         0.0
     };
     let encode_mode = |recy: &mut [f32], m: usize, lambda: f64| -> ([Vec<Coeff>; 2], f64) {
-        let mut resid = vec![0f32; 1024];
+        let mut resid = [0f32; 1024];
         let mut cost = 0f64;
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
         for (ti, tu) in tus.iter_mut().enumerate() {
@@ -415,7 +415,8 @@ pub(super) fn encode_luma_leaf32(
             for r in 0..32 {
                 let base = (y0 + r) * pw + x0;
                 for c in 0..32 {
-                    resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                    resid[r * 32 + c] =
+                        (yp[base + c] - pblk[r * 32 + c]) * (luma.qstep as f32 / qstep as f32);
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
@@ -549,7 +550,8 @@ pub(super) fn encode_luma_leaf_v32x64(
             for r in 0..32 {
                 let base = (y0 + r) * pw + x0;
                 for c in 0..32 {
-                    resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                    resid[r * 32 + c] =
+                        (yp[base + c] - pblk[r * 32 + c]) * (luma.qstep as f32 / qstep as f32);
                 }
             }
             let lev = project_luma_rdoq(luma, &resid, scan, qc, &mut cost, lambda);
@@ -619,11 +621,12 @@ pub(super) fn encode_luma_leaf_s32x32(
     // (recon, coeffs, cost) and the winner can simply be re-projected with RDOQ.
     let encode_mode = |recy: &[f32], m: usize, lambda: f64| -> ([f32; 1024], Vec<Coeff>, f64) {
         let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, 0, 0, 0, m, neutral);
-        let mut resid = vec![0f32; 1024];
+        let mut resid = [0f32; 1024];
         for r in 0..32 {
             let base = (sb_y + r) * pw + sb_x;
             for c in 0..32 {
-                resid[r * 32 + c] = yp[base + c] - pblk[r * 32 + c];
+                resid[r * 32 + c] =
+                    (yp[base + c] - pblk[r * 32 + c]) * (luma.qstep as f32 / qstep as f32);
             }
         }
         let mut cost = 0f64;

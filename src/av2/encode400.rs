@@ -75,6 +75,11 @@ impl Av2Encoder {
             } else {
                 0.0
             },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
         );
         for row in 0..sb_rows {
             left_pctx.iter_mut().for_each(|p| *p = 0);
@@ -575,6 +580,11 @@ impl Av2Encoder {
             } else {
                 0.0
             },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
         );
         for row in 0..sb_rows {
             for col in 0..sb_cols {
