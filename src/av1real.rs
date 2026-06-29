@@ -294,6 +294,39 @@ const AQ_SLOPE: f32 = 5.0;
 /// per-superblock qindex delta clamp, before res-quantization.
 const AQ_MAX_DELTA: f32 = 28.0;
 
+/// Variance Boost configuration, carried from the encoder option down to the
+/// per-tile [`AqCtx`]. `enabled == false` selects the classic whole-SB AQ (the
+/// shipping default); when enabled the per-SB target comes from the octile of the
+/// 64 8x8-subblock variances instead. Knobs mirror `av2/mod.rs::Tuning`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VarianceBoost {
+    pub enabled: bool,
+    pub octile: u8,
+    pub strength: f32,
+    pub boost_only: bool,
+}
+
+impl VarianceBoost {
+    /// Disabled — classic whole-SB AQ, byte-identical to the pre-VB encoder.
+    pub(crate) const fn off() -> Self {
+        VarianceBoost {
+            enabled: false,
+            octile: 6,
+            strength: 1.0,
+            boost_only: false,
+        }
+    }
+
+    pub(crate) fn on() -> Self {
+        VarianceBoost {
+            enabled: true,
+            octile: 6,
+            strength: 0.6,
+            boost_only: true,
+        }
+    }
+}
+
 /// Mean+variance of the (up to) 64x64 luma region whose top-left is
 /// `(sb_x, sb_y)`, returned as `ln(1 + variance)` — a perceptually reasonable
 /// "activity" that compresses the huge dynamic range of raw variance. Operates
@@ -381,6 +414,115 @@ fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
     (base_q + delta.round() as i32).clamp(1, 255)
 }
 
+// ----------------------------------------------------------------------------
+// Variance Boost (variance-adaptive delta-Q) — the AV2 `av2/aq.rs` scheme ported
+// to the AV1 transport. Where the classic whole-SB AQ above uses a single 64x64
+// variance, Variance Boost splits each 64x64 superblock into 64 8x8 subblocks,
+// computes each subblock's variance, then picks ONE representative variance at a
+// configurable octile of the sorted set. Low picked variance => low local
+// contrast => the eye still resolves detail, so the quantizer is *lowered*
+// (quality boosted); high picked variance => texture masks artifacts, so it is
+// nudged coarser (rate-balanced mode) or left alone (boost-only mode). The octile
+// controls selectivity: a low octile boosts a SB if only a fraction of it is
+// low-variance (more bits), a high octile boosts only when (nearly) the whole SB
+// is low-variance. This is the same curve and defaults as `av2/aq.rs`; only the
+// luma plane type differs (`i32` fixed-point here, `f32` in the AV2 path).
+
+/// Per-8x8-subblock variances of a 64x64 superblock, written into `out` (length
+/// 64, row-major over the 8x8 grid). Subblocks outside the frame (partial edge SB)
+/// are filled with the mean of the in-frame subblocks so they don't bias the
+/// octile pick. Returns the count of in-frame subblocks (>=1 when the SB has any
+/// pixels). Mirrors `av2/aq.rs::sb_subblock_variances`.
+fn aq_sb_subblock_variances(
+    yp: &[i32],
+    pw: usize,
+    sb_y: usize,
+    sb_x: usize,
+    width: usize,
+    height: usize,
+    out: &mut [f32; 64],
+) -> usize {
+    let mut filled = 0usize;
+    let mut acc = 0f64;
+    for by in 0..8 {
+        for bx in 0..8 {
+            let y0 = sb_y + by * 8;
+            let x0 = sb_x + bx * 8;
+            let h = height.saturating_sub(y0).min(8);
+            let w = width.saturating_sub(x0).min(8);
+            let idx = by * 8 + bx;
+            if h == 0 || w == 0 {
+                out[idx] = f32::NAN; // out-of-frame, patched below
+                continue;
+            }
+            let mut sum = 0i64;
+            let mut sum2 = 0i64;
+            for r in 0..h {
+                let base = (y0 + r) * pw + x0;
+                for &v in &yp[base..base + w] {
+                    let v = v as i64;
+                    sum += v;
+                    sum2 += v * v;
+                }
+            }
+            let n = (h * w) as f64;
+            let mean = sum as f64 / n;
+            let var = (sum2 as f64 / n - mean * mean).max(0.0) as f32;
+            out[idx] = var;
+            acc += var as f64;
+            filled += 1;
+        }
+    }
+    if filled == 0 {
+        out.iter_mut().for_each(|v| *v = 0.0);
+        return 0;
+    }
+    let mean = (acc / filled as f64) as f32;
+    for v in out.iter_mut() {
+        if v.is_nan() {
+            *v = mean;
+        }
+    }
+    filled
+}
+
+/// Representative variance at the requested `octile` (1..=8) of the 64 sorted 8x8
+/// variances. Octile 1 = most low-variance-biased (boost readily), octile 8 = only
+/// the maximum. Mirrors `av2/aq.rs::sb_octile_variance`.
+fn aq_sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
+    subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let o = octile.clamp(1, 8) as usize;
+    let idx = (o * 8 - 1).min(63);
+    subvars[idx]
+}
+
+/// Variance Boost qindex delta for one superblock. `picked_var` is the octile
+/// variance; `ref_log` is the per-tile reference (mean whole-SB log-variance) used
+/// to keep the coarse side roughly zero-mean. Operates in log-variance space.
+/// Below `LOW_LOG` the SB is "low contrast": qindex is lowered up to `MAX_BOOST`.
+/// Above the reference it is nudged coarser (bounded by `MAX_CUT`) unless
+/// `boost_only`. `strength` scales the whole effect (1.0 = nominal). Mirrors
+/// `av2/aq.rs::variance_boost_delta` exactly.
+fn aq_variance_boost_delta(picked_var: f32, ref_log: f32, strength: f32, boost_only: bool) -> i32 {
+    let v_log = (1.0 + picked_var).ln();
+    const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
+    const MAX_BOOST: f32 = 18.0;
+    const MAX_CUT: f32 = 10.0;
+    const BOOST_SLOPE: f32 = 5.0;
+    const CUT_SLOPE: f32 = 3.0;
+
+    if v_log < LOW_LOG {
+        let d = ((LOW_LOG - v_log) * BOOST_SLOPE * strength).min(MAX_BOOST);
+        -(d.round() as i32)
+    } else if boost_only {
+        0
+    } else {
+        let over = (v_log - ref_log.max(LOW_LOG)).max(0.0);
+        let d = (over * CUT_SLOPE * strength).min(MAX_CUT);
+        d.round() as i32
+    }
+}
+
 /// Per-tile adaptive-quantization state held on the [`LossyTile`]. When
 /// `enabled` is false every method is a no-op and the tile quantizes at the
 /// fixed base, byte-identical to the pre-AQ encoder.
@@ -401,6 +543,17 @@ struct AqCtx {
     read_deltas: bool,
     /// `reducedDeltaQIndex` (pre-`<<res`) to emit at the first block of the SB.
     pending: i32,
+    /// When true, use the Variance Boost scheme (octile of 8x8 subblock variances)
+    /// instead of the classic whole-SB variance for the per-SB target. Gated behind
+    /// the `variance_boost` encoder option; off => classic AQ, byte-identical.
+    vb_enabled: bool,
+    /// Variance Boost selectivity octile (1..=8). Default 6 (SVT-AV1-PSY default).
+    vb_octile: u8,
+    /// Variance Boost strength multiplier (1.0 = nominal).
+    vb_strength: f32,
+    /// When true, only boost low-variance SBs (net-negative, spends bits). When
+    /// false, also coarsen high-variance SBs to keep the rate roughly matched.
+    vb_boost_only: bool,
 }
 
 impl AqCtx {
@@ -413,6 +566,10 @@ impl AqCtx {
             ref_act: 0.0,
             read_deltas: false,
             pending: 0,
+            vb_enabled: false,
+            vb_octile: 6,
+            vb_strength: 1.0,
+            vb_boost_only: false,
         }
     }
 }
@@ -841,7 +998,7 @@ impl<'a> LossyTile<'a> {
     /// the tile mean activity (see [`tile_ref_activity`]); the running
     /// `CurrentQIndex` starts at the frame base. Must be paired with a frame
     /// header that signals `delta_q_present = 1` and the matching `delta_q_res`.
-    fn enable_aq(&mut self, base_q: u8, ref_act: f32) {
+    fn enable_aq(&mut self, base_q: u8, ref_act: f32, vb: &VarianceBoost) {
         self.aq = AqCtx {
             enabled: true,
             base_q,
@@ -850,6 +1007,10 @@ impl<'a> LossyTile<'a> {
             ref_act,
             read_deltas: false,
             pending: 0,
+            vb_enabled: vb.enabled,
+            vb_octile: vb.octile.clamp(1, 8),
+            vb_strength: vb.strength.max(0.0),
+            vb_boost_only: vb.boost_only,
         };
     }
 
@@ -861,8 +1022,37 @@ impl<'a> LossyTile<'a> {
         if !self.aq.enabled {
             return;
         }
-        let act = sb_activity(&self.src[0], self.w, sb_y, sb_x, self.w, self.h);
-        let target = aq_target_qidx(self.aq.base_q as i32, act, self.aq.ref_act);
+        let target = if self.aq.vb_enabled {
+            // Variance Boost: pick the representative 8x8 variance at the configured
+            // octile and map it to a qindex delta off the frame base. ref_act (the
+            // tile mean whole-SB log-variance) anchors the coarse side, matching
+            // `av2/aq.rs::AqState::per_sb`.
+            let mut subvars = [0f32; 64];
+            let filled = aq_sb_subblock_variances(
+                &self.src[0],
+                self.w,
+                sb_y,
+                sb_x,
+                self.w,
+                self.h,
+                &mut subvars,
+            );
+            if filled == 0 {
+                self.aq.base_q as i32
+            } else {
+                let picked = aq_sb_octile_variance(&mut subvars, self.aq.vb_octile);
+                let delta = aq_variance_boost_delta(
+                    picked,
+                    self.aq.ref_act,
+                    self.aq.vb_strength,
+                    self.aq.vb_boost_only,
+                );
+                (self.aq.base_q as i32 + delta).clamp(1, 255)
+            }
+        } else {
+            let act = sb_activity(&self.src[0], self.w, sb_y, sb_x, self.w, self.h);
+            aq_target_qidx(self.aq.base_q as i32, act, self.aq.ref_act)
+        };
         let step = 1i32 << self.aq.res_log2;
         let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
             .round()
@@ -4434,6 +4624,7 @@ fn encode_one_tile(
     r: &TileRect,
     speed: Speed,
     aq: bool,
+    vb: &VarianceBoost,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -4462,7 +4653,7 @@ fn encode_one_tile(
         // Center the per-SB deltas on this tile's mean activity so the average
         // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
         let ref_act = tile_ref_activity(&tile.src[0], tile.w, tile.w, tile.h);
-        tile.enable_aq(base_q_idx, ref_act);
+        tile.enable_aq(base_q_idx, ref_act, vb);
     }
     for sb_y in (0..r.th).step_by(64) {
         for sb_x in (0..r.tw).step_by(64) {
@@ -4533,6 +4724,7 @@ fn encode_lossy_tilegroup(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: &VarianceBoost,
 ) -> (Vec<u8>, [Vec<i32>; 3], Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -4581,7 +4773,7 @@ fn encode_lossy_tilegroup(
             .iter()
             .map(|r| {
                 encode_one_tile(
-                    base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq,
+                    base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq, vb,
                 )
             })
             .collect()
@@ -4593,7 +4785,7 @@ fn encode_lossy_tilegroup(
                 scope.spawn(move || {
                     for (r, o) in rs.iter().zip(os.iter_mut()) {
                         *o = Some(encode_one_tile(
-                            base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq,
+                            base_q_idx, bd, w8, cw8, sub_x, sub_y, mono, src, r, speed, aq, vb,
                         ));
                     }
                 });
@@ -5079,9 +5271,12 @@ pub(crate) fn encode_av1_lossy_image_cs(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_cs_recon_dbg(base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq)
-        .0
+    encode_av1_lossy_image_cs_recon_dbg(
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, &vb,
+    )
+    .0
 }
 
 /// Debug variant of [`encode_av1_lossy_image_cs`] (4:4:4) returning the padded
@@ -5099,6 +5294,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: &VarianceBoost,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5109,7 +5305,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
         pad_to_mult8(v, w, h, w8, h8),
     ];
     let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq,
+        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq, vb,
     );
     let profile = if bd == 12 { 2 } else { 1 };
     let mut bytes = Vec::new();
@@ -5138,9 +5334,10 @@ pub(crate) fn encode_av1_lossy_image_422(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> Vec<u8> {
     encode_av1_lossy_image_422_recon_dbg(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq,
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb,
     )
     .0
 }
@@ -5158,6 +5355,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5170,7 +5368,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
     let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq,
+        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq, &vb,
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
@@ -5198,9 +5396,10 @@ pub(crate) fn encode_av1_lossy_image_420(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> Vec<u8> {
     encode_av1_lossy_image_420_recon_dbg(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq,
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb,
     )
     .0
 }
@@ -5221,6 +5420,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5233,7 +5433,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
     let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq,
+        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq, &vb,
     );
     let profile = if bd == 12 { 2 } else { 0 };
     let mut bytes = Vec::new();
@@ -5256,9 +5456,11 @@ pub(crate) fn encode_av1_mono_image(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> Vec<u8> {
-    let (bytes, _recon, _w8, _h8) =
-        encode_av1_mono_image_recon_dbg(base_q_idx, bd, w, h, luma, full_range, threads, speed, aq);
+    let (bytes, _recon, _w8, _h8) = encode_av1_mono_image_recon_dbg(
+        base_q_idx, bd, w, h, luma, full_range, threads, speed, aq, vb,
+    );
     bytes
 }
 
@@ -5274,13 +5476,15 @@ pub(crate) fn encode_av1_mono_image_recon_dbg(
     threads: usize,
     speed: Speed,
     aq: bool,
+    vb: VarianceBoost,
 ) -> (Vec<u8>, Vec<i32>, usize, usize) {
     assert_eq!(luma.len(), w * h, "luma plane must be w*h");
     assert!(w > 0 && h > 0, "width/height must be non-zero");
     let (w8, h8) = (align8(w), align8(h));
     let src = [pad_to_mult8(luma, w, h, w8, h8), Vec::new(), Vec::new()];
-    let (payload, recon, plan) =
-        encode_lossy_tilegroup(base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq);
+    let (payload, recon, plan) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq, &vb,
+    );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mono(

@@ -131,6 +131,11 @@ impl Av2Encoder {
             } else {
                 0.0
             },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
         );
 
         for row in 0..sb_rows {
@@ -186,8 +191,10 @@ impl Av2Encoder {
                                 svf[r * 32 + c] = vp[b + c];
                             }
                         }
-                        let dc_u_f = dc_pred_rect(&recu, pcw, cy, cx, 32, 64, neutral, bd);
-                        let dc_v_f = dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral, bd);
+                        let dc_u_f =
+                            dc_pred_rect_subsampled(&recu, pcw, cy, cx, 32, 64, neutral, bd);
+                        let dc_v_f =
+                            dc_pred_rect_subsampled(&recv, pcw, cy, cx, 32, 64, neutral, bd);
                         cfl::cfl_decide(
                             &recy,
                             pw,
@@ -434,8 +441,12 @@ impl Av2Encoder {
                                 cfl_partition_prediction::<32>(
                                     pcw, &up, &vp, cy, cx, &mut suf, &mut svf,
                                 );
-                                let dc_u_f = dc_pred_rect(&recu, pcw, cy, cx, 32, 64, neutral, bd);
-                                let dc_v_f = dc_pred_rect(&recv, pcw, cy, cx, 32, 64, neutral, bd);
+                                let dc_u_f = dc_pred_rect_subsampled(
+                                    &recu, pcw, cy, cx, 32, 64, neutral, bd,
+                                );
+                                let dc_v_f = dc_pred_rect_subsampled(
+                                    &recv, pcw, cy, cx, 32, 64, neutral, bd,
+                                );
                                 cfl::cfl_decide(
                                     &recy,
                                     pw,

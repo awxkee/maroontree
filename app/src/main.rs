@@ -97,13 +97,13 @@ fn main() {
     let encoded = av2_encoder
         .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
-    // for i in 0..10 {
-    //     let instant = Instant::now();
-    //     let encoded = av2_encoder
-    //         .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
-    //         .unwrap();
-    //     println!("Encoded in {}ms", instant.elapsed().as_millis());
-    // }
+    for i in 0..10 {
+        let instant = Instant::now();
+        let encoded = av2_encoder
+            .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
+            .unwrap();
+        println!("Encoded in {}ms", instant.elapsed().as_millis());
+    }
     // let out_obu = encoded.view();
     // let path = std::env::args()
     //     .nth(1)

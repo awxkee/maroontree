@@ -79,6 +79,24 @@ impl Av2Encoder {
         let mut cfl_above = vec![0i32; tmc as usize + 16];
         let mut cfl_left = vec![0i32; tmr as usize + 16];
         let bases = &self.bases;
+        // Variance Boost on the partition path: one AqState per tile, queried per 64x64 SB.
+        // When delta-Q is off (or base_q==0) `per_sb` returns `(qstep_i, 1.0)` and signals 0,
+        // so this path stays byte-identical to the pre-VB encoder.
+        let mut aqs = aq::AqState::new(
+            enc.delta_q_present,
+            self.base_q_idx as i32,
+            qstep_i,
+            if enc.delta_q_present {
+                aq::tile_ref_activity(yp, pw, sb_rows, sb_cols, width, height)
+            } else {
+                0.0
+            },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
+        );
         for row in 0..sb_rows {
             left_pctx.iter_mut().for_each(|p| *p = 0);
             for col in 0..sb_cols {
@@ -93,7 +111,12 @@ impl Av2Encoder {
                 // Arm this SB's delta-Q once; the first leaf's mode emitter consumes it
                 // (after its partition bit), so it is coded exactly once per SB. Edge
                 // SBs on the partition path stay quantization-neutral (signaled = 0).
-                enc.delta_q_signaled = 0;
+                // Variance Boost: derive this SB's quantizer (and signal its delta-Q) from
+                // the 8x8 subblock variances. `per_sb` sets `enc.delta_q_signaled` and returns
+                // the per-SB qstep + residual scale used by every leaf coder below. When AQ is
+                // off this is `(qstep_i, 1.0)` with signal 0 (byte-identical to before).
+                let (sb_qstep, sb_scale) =
+                    aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
                 enc.delta_q_pending = enc.delta_q_present;
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
@@ -135,8 +158,8 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
-                                1.0, // resid_scale: no AQ on this path
+                                sb_qstep,
+                                sb_scale, // resid_scale: Variance Boost
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -175,8 +198,8 @@ impl Av2Encoder {
                                     avg_l,
                                     bd,
                                     &bases.chroma420,
-                                    qstep_i,
-                                    leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                    sb_qstep,
+                                    leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
                                 )
                             } else {
                                 None
@@ -222,7 +245,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -240,7 +263,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -275,7 +298,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -293,7 +316,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &crate::av2::tables::SCAN,
                                 neutral,
                                 qc,
@@ -340,7 +363,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -358,7 +381,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -403,7 +426,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -425,7 +448,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x64.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
+                                    bases.luma16x64.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN16X32,
                             );
@@ -439,7 +465,7 @@ impl Av2Encoder {
                                 &crate::av2::itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN16X32,
                                     16,
                                     64,
@@ -475,7 +501,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -497,7 +523,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma64x16.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
+                                    bases.luma64x16.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN32X16,
                             );
@@ -511,7 +540,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN32X16,
                                     64,
                                     16,
@@ -547,7 +576,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -569,7 +598,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma8x32.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
+                                    bases.luma8x32.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN8X32,
                             );
@@ -583,7 +615,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN8X32,
                                     8,
                                     32,
@@ -619,7 +651,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -640,7 +672,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma32x8.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
+                                    bases.luma32x8.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN32X8,
                             );
@@ -654,7 +689,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN32X8,
                                     32,
                                     8,
@@ -690,7 +725,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -713,7 +748,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x32.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
+                                    bases.luma16x32.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN16X32,
                             );
@@ -727,7 +765,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN16X32,
                                     16,
                                     32,
@@ -763,7 +801,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -785,7 +823,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma32x16.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
+                                    bases.luma32x16.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN32X16,
                             );
@@ -799,7 +840,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN32X16,
                                     32,
                                     16,
@@ -835,7 +876,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -857,7 +898,10 @@ impl Av2Encoder {
                                 neutral,
                                 self.bit_depth as i32,
                             );
-                            let resid = get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred);
+                            let resid = crate::av2::aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
+                                bases.luma16x16.qstep as f32 / sb_qstep as f32,
+                            );
                             let pred_flat = [pred; 256];
                             let mut src16 = [0f32; 256];
                             for r in 0..16 {
@@ -879,12 +923,12 @@ impl Av2Encoder {
                                     })
                                     .sum()
                             };
-                            let lambda = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                            let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                             let rec_dct = itx422::reconstruct_luma16(
                                 &pred_flat,
                                 &lev_dct,
-                                qstep_i,
+                                sb_qstep,
                                 &SCAN16,
                                 self.bit_depth as i32,
                             );
@@ -893,7 +937,7 @@ impl Av2Encoder {
                             let rec_adst = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
                                 &lev_adst,
-                                qstep_i,
+                                sb_qstep,
                                 &SCAN16,
                                 true,
                                 true,
@@ -905,7 +949,7 @@ impl Av2Encoder {
                             let rec_ad = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
                                 &lev_ad,
-                                qstep_i,
+                                sb_qstep,
                                 &SCAN16,
                                 false,
                                 true,
@@ -917,7 +961,7 @@ impl Av2Encoder {
                             let rec_da = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
                                 &lev_da,
-                                qstep_i,
+                                sb_qstep,
                                 &SCAN16,
                                 true,
                                 false,
@@ -976,7 +1020,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -998,7 +1042,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.c8x8.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
+                                    bases.c8x8.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN8X8,
                             );
@@ -1012,7 +1059,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN8X8,
                                     8,
                                     8,
@@ -1040,7 +1087,10 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let predu = dc_pred_rect(recu, pcw, cy, cx, 4, 4, neutral, bd);
                             let levu = bases.c4x4.project_scan(
-                                &get_residual_rect(up, pcw, cy, cx, 4, 4, predu),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(up, pcw, cy, cx, 4, 4, predu),
+                                    bases.c4x4.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN4X4_LOSSY_PACKED,
                             );
@@ -1054,7 +1104,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     predu,
                                     &levu,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN4X4_LOSSY_PACKED,
                                     4,
                                     4,
@@ -1068,7 +1118,10 @@ impl Av2Encoder {
                             let u_nz = uc.iter().any(|&(_, l)| l != 0);
                             let predv = dc_pred_rect(recv, pcw, cy, cx, 4, 4, neutral, bd);
                             let levv = bases.c4x4.project_scan(
-                                &get_residual_rect(vp, pcw, cy, cx, 4, 4, predv),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(vp, pcw, cy, cx, 4, 4, predv),
+                                    bases.c4x4.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &SCAN4X4_LOSSY_PACKED,
                             );
@@ -1082,7 +1135,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     predv,
                                     &levv,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN4X4_LOSSY_PACKED,
                                     4,
                                     4,
@@ -1101,7 +1154,10 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
                             let lev = bases.c8x16.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
+                                    bases.c8x16.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &crate::av2::tables::SCAN8X16,
                             );
@@ -1115,7 +1171,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &crate::av2::tables::SCAN8X16,
                                     8,
                                     16,
@@ -1162,7 +1218,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1175,7 +1231,10 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
                             let lev = bases.c16x8.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
+                                &crate::av2::aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
+                                    bases.c16x8.qstep as f32 / sb_qstep as f32,
+                                ),
                                 0.0,
                                 &crate::av2::tables::SCAN16X8,
                             );
@@ -1189,7 +1248,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &crate::av2::tables::SCAN16X8,
                                     16,
                                     8,
@@ -1236,7 +1295,7 @@ impl Av2Encoder {
                                 QuantCtx {
                                     qc,
                                     neutral,
-                                    qstep: qstep_i,
+                                    qstep: sb_qstep,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1420,6 +1479,11 @@ impl Av2Encoder {
             } else {
                 0.0
             },
+        )
+        .with_variance_boost(
+            self.tune.vb_octile,
+            self.tune.vb_strength,
+            self.tune.vb_boost_only,
         );
         for row in 0..sb_rows {
             for col in 0..sb_cols {

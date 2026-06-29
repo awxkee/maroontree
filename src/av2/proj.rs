@@ -43,24 +43,8 @@ pub(crate) struct Basis {
 }
 
 /// RD end-of-block (EOB) truncation threshold, in unrounded-coefficient-magnitude units.
-///
-/// After plain `round()` quantisation, trailing nonzero coefficients (the high-frequency
-/// tail, in scan order) are the cheapest distortion to give up but still cost real rate:
-/// dropping them shrinks the coded run (EOB), which saves their level/sign bits *and* can
-/// drop the EOB signalling to a smaller class. This is the productive, decoder-safe slice
-/// of RDOQ — the encoder simply codes fewer coefficients, and reconstruction uses the same
-/// truncated levels, so it stays bit-exact with the decoder.
-///
-/// The RD rule "zero a trailing coefficient k when `lambda*rate_saved > dist_added`" reduces
-/// to a constant magnitude threshold here: `dist_added ∝ pr_k^2 * w` and `lambda ∝ qstep^2`
-/// with the per-coefficient pixel weight `w ∝ qstep^2`, so `lambda/w` — and thus the
-/// threshold — is QP-invariant. Measured optimum ≈ 0.9 (BD-rate ≈ −3% to −7.6% across
-/// flat/detailed/directional content). Crucially this only touches the *trailing* tail;
-/// thresholding interior coefficients the same way regresses badly. Overridable via
-/// `AV2_EOB_T` for retuning on other material.
 pub(crate) const RDOQ_EOB_T: f32 = 0.9;
-/// Default trellis-RDOQ strength (see [`crate::av2::Tuning::rdoq_lambda`]).
-pub(crate) const DEFAULT_RDOQ_LAMBDA: f64 = 0.09;
+pub(crate) const DEFAULT_RDOQ_LAMBDA: f64 = 0.07;
 
 /// Zero trailing coefficients (scan order) whose unrounded magnitude `prm[k]` is below the
 /// EOB threshold `t`, stopping at the first kept coefficient. `lev`/`prm` are in scan order.
@@ -86,18 +70,9 @@ pub(crate) struct Bases {
     pub(crate) luma: Basis,
     pub(crate) chroma420: Basis,
     /// 4:2:2 chroma: a 32-wide × 64-tall (TX_32X64) transform. avmdec codes its
-    /// coefficients exactly like the 64×64 chroma (adjusted size TX_32X32, scan
-    /// `default_scan_32x32`, EOB size class 6, txs entropy context TX_64X64), so only
-    /// the basis differs: the vertical axis is the 64-tap profile and the horizontal
-    /// axis the 32-tap profile. The overall amplitude (`dc_mix` below) carries avm's
-    /// rectangular-transform normalisation and is the one value to confirm on avmdec.
     pub(crate) chroma422: Basis,
     pub(crate) chroma444: Basis,
     /// 4:4:4 chroma for a bottom-edge 64×32 leaf: a 64-wide × 32-tall (TX_64X32)
-    /// transform = the transpose of `chroma422`. avmdec codes its coefficients
-    /// exactly like the 64×64 chroma (32×32 coeff region, scan default_scan_32x32,
-    /// EOB size class 6, txs entropy context TX_64X64); only the basis differs
-    /// (horizontal axis = 64-tap profile, vertical axis = 32-tap profile).
     pub(crate) chroma444_64x32: Basis,
     /// 16-tap-family luma bases (residue-4 leaves). `luma16x64` = 16 wide × 64 tall
     /// (TX_16X64, SCAN16X32 coeff grid); `luma64x16` = 64 wide × 16 tall (TX_64X16,

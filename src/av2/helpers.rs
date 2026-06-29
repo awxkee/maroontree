@@ -381,7 +381,48 @@ pub(crate) fn put_block(plane: &mut [f32], w: usize, y0: usize, x0: usize, bs: u
             .copy_from_slice(&rec[yy * bs..yy * bs + bs]);
     }
 }
-/// DC prediction for a `bw`-wide × `bh`-tall block (4:2:2 chroma is 32×64).
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dc_pred_rect_subsampled(
+    rec: &[f32],
+    w: usize,
+    y0: usize,
+    x0: usize,
+    bw: usize,
+    bh: usize,
+    neutral: f32,
+    bd: i32,
+) -> f32 {
+    let (ha, hl) = (y0 > 0, x0 > 0);
+    let ss_hor = if bw > 32 { 2 } else { 1 };
+    let ss_ver = if bh > 32 { 2 } else { 1 };
+    let mut sum: i64 = 0;
+    let mut count: i64 = 0;
+    if ha {
+        let mut i = 0;
+        while i < bw {
+            sum += rec[(y0 - 1) * w + x0 + i] as i64;
+            count += 1;
+            i += ss_hor;
+        }
+    }
+    if hl {
+        let mut i = 0;
+        while i < bh {
+            sum += rec[(y0 + i) * w + x0 - 1] as i64;
+            count += 1;
+            i += ss_ver;
+        }
+    }
+    if count == 0 {
+        return neutral;
+    }
+    let (scale, shift) = resolve_divisor_32(count as u32);
+    let rounding: i64 = (1i64 << shift) >> 1;
+    let p = ((sum * scale + rounding) >> shift).clamp(0, (1 << bd) - 1);
+    p as f32
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dc_pred_rect(
     rec: &[f32],
@@ -405,13 +446,6 @@ pub(crate) fn dc_pred_rect(
         0
     };
     // avm `highbd_dc_predictor` (reconintra.h) averages the `count` reference
-    // samples with a reciprocal-multiply, NOT plain integer division: it computes
-    // `(sum * scale + (1<<shift>>1)) >> shift` where `(scale, shift)` come from
-    // `resolve_divisor_32(count)`. For non-power-of-2 counts (96, 80, 72, 48, 36,
-    // 24 — every 1:2 / mixed rect chroma TX) plain `sum/count` rounds differently
-    // on many sums, and that ±1 difference accumulates through the chroma
-    // DC-prediction feedback loop into a top→bottom drift (the green cast). Using
-    // the exact reciprocal for ALL counts keeps every chroma TX bit-exact.
     let (count, sum) = match (ha, hl) {
         (true, true) => (bw + bh, sa + sl),
         (true, false) => (bw, sa),
@@ -491,15 +525,6 @@ pub(crate) fn levels_to_coeffs(lev: &[f32]) -> Vec<Coeff> {
         .collect()
 }
 
-/// Compute the four per-TU (skip_cdf, dc_sign_ctx) for one 64x64 SB at pixel
-/// origin (sb_y, sb_x), advancing the global cf-context arrays (4px granularity).
-/// Per-TU neighbour contexts for a lossless 64x64 superblock coded as a 16x16 grid of
-/// 4x4 transform units (raster order). Mirrors avm `get_txb_ctx` for luma with a 4x4 tx
-/// inside a larger block: each TU has one above and one left neighbour unit, so
-/// `txb_skip_ctx = (min(top,4)+min(left,4)+3)>>1` (== avm's `skip_contexts[top][left]`)
-/// and `dc_sign_ctx` from the neighbour DC signs. `above`/`left` pack cul-level in bits
-/// 0..5 and DC sign in bits 6..7 (0x40 = none/zero), exactly like [`sb_tu_contexts`].
-/// Returns the 256 `(txb_skip_ctx, dc_sign_ctx)` pairs; CDF lookup is the caller's job.
 pub(crate) fn sb_tu4_contexts(
     tus: &[Vec<Coeff>],
     sb_y: usize,
@@ -531,11 +556,11 @@ pub(crate) fn sb_tu4_contexts(
             let res = if nz.is_empty() {
                 0x40u8
             } else {
-                let cul = (nz
+                let cul = nz
                     .iter()
                     .map(|&(_, l)| l.unsigned_abs())
                     .sum::<u32>()
-                    .min(63)) as u8;
+                    .min(63) as u8;
                 let dc = nz
                     .iter()
                     .find(|&&(s, _)| s == 0)
