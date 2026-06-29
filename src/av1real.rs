@@ -379,26 +379,11 @@ fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
 /// `ref_act`. Below-average activity (flat) → finer quantizer (lower qindex);
 /// above-average (busy) → coarser. Clamped to a sane qindex range.
 ///
-/// `AQ_SLOPE` / `AQ_MAX_DELTA`, and an asymmetry factor applied to the coarsening
-/// (positive-delta) side, can be overridden at run time via the `AQ_SLOPE`,
-/// `AQ_MAX_DELTA` and `AQ_COARSEN_SCALE` environment variables — used only for
-/// offline calibration sweeps; unset they fall back to the compiled defaults.
+/// The slope, max delta, and the asymmetry factor applied to the coarsening
+/// (positive-delta) side are compile-time constants.
 fn aq_params() -> (f32, f32, f32) {
-    use std::sync::OnceLock;
-    static P: OnceLock<(f32, f32, f32)> = OnceLock::new();
-    *P.get_or_init(|| {
-        let get = |k: &str, d: f32| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(d)
-        };
-        (
-            get("AQ_SLOPE", AQ_SLOPE),
-            get("AQ_MAX_DELTA", AQ_MAX_DELTA),
-            get("AQ_COARSEN_SCALE", 1.0),
-        )
-    })
+    // (slope, max delta, coarsen scale). Coarsen scale 1.0 == pure variance.
+    (AQ_SLOPE, AQ_MAX_DELTA, 1.0)
 }
 
 fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
@@ -4366,61 +4351,35 @@ fn tx32_policy() -> u32 {
     2
 }
 
-/// Angle-delta intra refinement (env `ANGLE_DELTA`, default **off**). Set
-/// `ANGLE_DELTA=1` to enable the diagonal angle_delta winner-refinement search.
-/// Measured ~no-op on photographic content (diagonals rarely win the mode
-/// search), so it is held behind the toggle until intra edge-filter/upsampling
-/// make directional modes competitive enough for it to matter.
-/// Asymmetric-ADST tx-type search (env `ASYM_ADST`, default on; `=0` disables).
-/// A/B knob for the ADST_DCT/DCT_ADST trials.
+/// Asymmetric-ADST tx-type search. A/B knob for the ADST_DCT/DCT_ADST trials;
+/// enabled by default.
 fn asym_adst_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| !matches!(std::env::var("ASYM_ADST").ok().as_deref(), Some("0")))
+    true
 }
 
 fn angle_delta_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        matches!(
-            std::env::var("ANGLE_DELTA").ok().as_deref(),
-            Some("1") | Some("on") | Some("true")
-        )
-    })
+    // Diagonal angle_delta winner-refinement search. Measured ~no-op on
+    // photographic content (diagonals rarely win the mode search), so it is held
+    // off until intra edge-filter/upsampling make directional modes competitive.
+    false
 }
 
-/// Strength (and sign) of the variance-weighted "SSIM-style" RD adjustment
-/// (env `PRDO_K`). The per-block rate weight is scaled by
+/// Strength (and sign) of the variance-weighted "SSIM-style" RD adjustment.
+/// The per-block rate weight is scaled by
 /// `exp(K * (block_activity - tile_mean_activity))`, clamped to `[1/C, C]`:
 ///   K > 0  → busy blocks get a larger rate weight (fewer bits there — visual
 ///            masking hides the error), flat blocks more bits (aom `tune=ssim`);
 ///   K < 0  → the opposite (protect texture, spend more bits on busy blocks);
 ///   K = 0  → disabled (no change).
-/// Tune against a perceptual metric (SSIMULACRA2); the best sign depends on how
-/// much the existing variance AQ already shifts bits toward flats.
+/// Disabled by default.
 fn prdo_k() -> f64 {
-    use std::sync::OnceLock;
-    static K: OnceLock<f64> = OnceLock::new();
-    *K.get_or_init(|| {
-        std::env::var("PRDO_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0)
-    })
+    0.0
 }
 
-/// Clamp `C` for the perceptual RD scale (env `PRDO_CLAMP`, default 2.0): the
-/// per-block scale is limited to `[1/C, C]` so no block is starved or flooded.
+/// Clamp `C` for the perceptual RD scale: the per-block scale is limited to
+/// `[1/C, C]` so no block is starved or flooded.
 fn prdo_clamp() -> f64 {
-    use std::sync::OnceLock;
-    static C: OnceLock<f64> = OnceLock::new();
-    *C.get_or_init(|| {
-        std::env::var("PRDO_CLAMP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2.0)
-    })
+    2.0
 }
 
 #[inline]
@@ -4725,7 +4684,13 @@ fn encode_lossy_tilegroup(
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
-) -> (Vec<u8>, [Vec<i32>; 3], Tiling) {
+    cdef_on: bool,
+) -> (
+    Vec<u8>,
+    [Vec<i32>; 3],
+    Tiling,
+    Option<crate::obu::CdefParams>,
+) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
 
@@ -4870,8 +4835,319 @@ fn encode_lossy_tilegroup(
         &mut recon, w8, h8, cw8, ch8, &blk4f, nc4f, sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
     );
 
+    // Frame-level CDEF, applied after deblocking exactly as the decoder does.
+    // The encoder searches a global strength against the source (cheap SSE, not
+    // RD) and applies the matching filter so the reconstruction stays in sync
+    // with what the decoder will produce from the signalled cdef_params.
+    let cdef = if cdef_on && base_q_idx != 0 {
+        frame_cdef(
+            &mut recon, src, &skip8, sb8w, w8, h8, cw8, ch8, sub_x, sub_y, mono, base_q_idx, bd,
+        )
+    } else {
+        None
+    };
+
     let tilegroup = assemble_tilegroup(payloads);
-    (tilegroup, recon, plan)
+    (tilegroup, recon, plan, cdef)
+}
+
+/// CDEF damping derived from the base quantizer (spec range 3..=6); higher q ->
+/// stronger ringing -> a touch more damping. Kept simple and deterministic.
+fn cdef_damping(base_q_idx: u8) -> u8 {
+    3 + ((base_q_idx as u32) / 64).min(3) as u8
+}
+
+/// Search a single global CDEF strength (luma + chroma) by SSE against the
+/// source and apply it to the deblocked reconstruction in place. Returns the
+/// `CdefParams` to signal (`cdef_bits = 0`, one strength entry), or `None` when
+/// the best choice is "no filtering" (so the caller can leave CDEF effectively
+/// off while keeping the headers consistent). This is the cheap, not-RDO
+/// decision the brief asked for: a real distortion metric (SSE) over a small
+/// candidate set, not a one-tap proxy.
+#[allow(clippy::too_many_arguments)]
+fn frame_cdef(
+    recon: &mut [Vec<i32>; 3],
+    src: &[Vec<i32>; 3],
+    skip8: &[bool],
+    sb8w: usize,
+    w8: usize,
+    h8: usize,
+    cw8: usize,
+    ch8: usize,
+    sub_x: usize,
+    sub_y: usize,
+    mono: bool,
+    base_q_idx: u8,
+    bd: u8,
+) -> Option<crate::obu::CdefParams> {
+    use crate::cdef;
+    let damping = cdef_damping(base_q_idx) as i32;
+
+    // Precompute per-8x8 luma directions on the deblocked recon.
+    let nbx = w8.div_ceil(8);
+    let nby = h8.div_ceil(8);
+    let mut ldirs = vec![0usize; nbx * nby];
+    for by in 0..nby {
+        for bx in 0..nbx {
+            if bx * 8 < w8 && by * 8 < h8 {
+                let (d, _) = cdef::cdef_direction(&recon[0], w8, bx * 8, by * 8, bd);
+                ldirs[by * nbx + bx] = d;
+            }
+        }
+    }
+
+    // Per-8x8 luma skip map: CDEF is NOT applied to skip blocks (the decoder
+    // leaves them untouched), so the encoder must mirror that exactly. `skip8`
+    // is already a per-8x8 frame map.
+    let lskip: Vec<bool> = (0..nbx * nby)
+        .map(|i| {
+            let (bx, by) = (i % nbx, i / nbx);
+            skip8.get(by * sb8w + bx).copied().unwrap_or(true)
+        })
+        .collect();
+
+    // Per-8x8 chroma skip map: an 8x8 chroma block covers (1<<sub_x) x (1<<sub_y)
+    // 8x8 chroma-pixel area mapping back to luma 8x8 units. CDEF skips the chroma
+    // block when every covering luma 8x8 unit is skip.
+    let cnbx = cw8.div_ceil(8);
+    let cnby = ch8.div_ceil(8);
+    let cskip: Vec<bool> = (0..cnbx * cnby)
+        .map(|i| {
+            let (cbx, cby) = (i % cnbx, i / cnbx);
+            // chroma 8x8 -> luma pixel origin (cbx*8 << sub_x, cby*8 << sub_y),
+            // spanning (8<<sub_x) x (8<<sub_y) luma px = covering luma 8x8 units.
+            let lx0 = (cbx * 8) << sub_x;
+            let ly0 = (cby * 8) << sub_y;
+            let nlx = 1usize << sub_x;
+            let nly = 1usize << sub_y;
+            let mut all_skip = true;
+            for dy in 0..nly {
+                for dx in 0..nlx {
+                    let lbx = lx0 / 8 + dx;
+                    let lby = ly0 / 8 + dy;
+                    if lbx < sb8w {
+                        if let Some(&s) = skip8.get(lby * sb8w + lbx) {
+                            all_skip &= s;
+                        }
+                    }
+                }
+            }
+            all_skip
+        })
+        .collect();
+
+    let luma_margin: i64 = if base_q_idx >= 180 { 12 } else { 22 };
+    let (yp, ys) = cdef_search_plane(
+        &recon[0],
+        &src[0],
+        w8,
+        h8,
+        &ldirs,
+        &lskip,
+        nbx,
+        damping,
+        bd,
+        luma_margin,
+        1000,
+    );
+
+    // --- Chroma strength search (shared for U and V; uses U for the decision). ---
+    let (up, us) = if mono {
+        (0, 0)
+    } else {
+        let mut cdirs = vec![0usize; cnbx * cnby];
+        for by in 0..cnby {
+            for bx in 0..cnbx {
+                if bx * 8 < cw8 && by * 8 < ch8 {
+                    let (d, _) = cdef::cdef_direction(&recon[1], cw8, bx * 8, by * 8, bd);
+                    cdirs[by * cnbx + bx] = d;
+                }
+            }
+        }
+        cdef_search_plane(
+            &recon[1], &src[1], cw8, ch8, &cdirs, &cskip, cnbx, damping, bd, 0, 1000,
+        )
+    };
+
+    if yp == 0 && ys == 0 && up == 0 && us == 0 {
+        return None;
+    }
+
+    // Apply luma.
+    apply_cdef_plane(
+        &mut recon[0],
+        w8,
+        h8,
+        &ldirs,
+        &lskip,
+        nbx,
+        yp,
+        ys,
+        damping,
+        bd,
+    );
+    // Apply chroma (U, V) with the chroma direction maps.
+    if !mono && (up != 0 || us != 0) {
+        for plane in 1..3 {
+            let mut cdirs = vec![0usize; cnbx * cnby];
+            for by in 0..cnby {
+                for bx in 0..cnbx {
+                    if bx * 8 < cw8 && by * 8 < ch8 {
+                        let (d, _) = cdef::cdef_direction(&recon[plane], cw8, bx * 8, by * 8, bd);
+                        cdirs[by * cnbx + bx] = d;
+                    }
+                }
+            }
+            apply_cdef_plane(
+                &mut recon[plane],
+                cw8,
+                ch8,
+                &cdirs,
+                &cskip,
+                cnbx,
+                up,
+                us,
+                damping,
+                bd,
+            );
+        }
+    }
+
+    Some(crate::obu::CdefParams {
+        bits: 0,
+        damping: damping as u8,
+        strengths: vec![(yp as u8, ys as u8, up as u8, us as u8)],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cdef_search_plane(
+    recon: &[i32],
+    src: &[i32],
+    w: usize,
+    h: usize,
+    dirs: &[usize],
+    skip: &[bool],
+    nbx: usize,
+    damping: i32,
+    bd: u8,
+    margin_num: i64,
+    margin_den: i64,
+) -> (i32, i32) {
+    use crate::cdef;
+    // First measure the no-filter SSE baseline.
+    let mut off_sse = 0i64;
+    for y in (0..h).step_by(8) {
+        for x in (0..w).step_by(8) {
+            off_sse += plane_block_sse(recon, src, w, h, x, y);
+        }
+    }
+    let threshold = off_sse - (off_sse.saturating_mul(margin_num) / margin_den.max(1));
+    let mut best = (0i32, 0i32);
+    let mut best_sse = off_sse;
+    let mut tmp = recon.to_vec();
+    for &pri in &cdef::PRI_CANDIDATES {
+        for &sec in &cdef::SEC_CANDIDATES {
+            if pri == 0 && sec == 0 {
+                continue; // baseline already measured
+            }
+            let mut sse = 0i64;
+            for y in (0..h).step_by(8) {
+                for x in (0..w).step_by(8) {
+                    let bxi = x / 8;
+                    let byi = y / 8;
+                    if skip.get(byi * nbx + bxi).copied().unwrap_or(true) {
+                        sse += plane_block_sse(recon, src, w, h, x, y);
+                        continue;
+                    }
+                    let _ = dirs;
+                    let (dir, var) = cdef::cdef_direction(recon, w, x, y, bd);
+                    let apri = cdef::adjust_pri(pri, var);
+                    cdef::cdef_filter_8x8(
+                        &mut tmp,
+                        recon,
+                        w,
+                        x,
+                        y,
+                        apri << (bd - 8),
+                        sec << (bd - 8),
+                        dir,
+                        damping,
+                        bd,
+                    );
+                    sse += plane_block_sse(&tmp, src, w, h, x, y);
+                }
+            }
+            // Must beat the current best AND clear the improvement margin vs off.
+            if sse < best_sse && sse <= threshold {
+                best_sse = sse;
+                best = (pri, sec);
+            }
+        }
+    }
+    best
+}
+
+/// SSE over one (possibly edge-clipped) 8x8 block of a plane.
+fn plane_block_sse(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, y: usize) -> i64 {
+    let mut s = 0i64;
+    let yh = (y + 8).min(h);
+    let xw = (x + 8).min(w);
+    for yy in y..yh {
+        for xx in x..xw {
+            let d = (a[yy * w + xx] - b[yy * w + xx]) as i64;
+            s += d * d;
+        }
+    }
+    s
+}
+
+/// Apply a single global CDEF strength to a whole plane in place, reading from a
+/// pre-CDEF snapshot so every 8x8 filters the same source pixels (the decoder
+/// likewise reads the deblocked frame, not partially-CDEF'd pixels).
+#[allow(clippy::too_many_arguments)]
+fn apply_cdef_plane(
+    plane: &mut [i32],
+    w: usize,
+    h: usize,
+    dirs: &[usize],
+    skip: &[bool],
+    nbx: usize,
+    pri: i32,
+    sec: i32,
+    damping: i32,
+    bd: u8,
+) {
+    use crate::cdef;
+    let snapshot = plane.to_vec();
+    for y in (0..h).step_by(8) {
+        for x in (0..w).step_by(8) {
+            let bxi = x / 8;
+            let byi = y / 8;
+            // Skip blocks are left untouched, matching the decoder.
+            if skip.get(byi * nbx + bxi).copied().unwrap_or(true) {
+                continue;
+            }
+            // Recompute the direction and variance from the (pre-CDEF) snapshot
+            // so the primary strength can be scaled per block exactly as the
+            // decoder does. `dirs` is ignored here in favour of the fresh value.
+            let _ = dirs;
+            let (dir, var) = cdef::cdef_direction(&snapshot, w, x, y, bd);
+            let apri = cdef::adjust_pri(pri, var);
+            cdef::cdef_filter_8x8(
+                plane,
+                &snapshot,
+                w,
+                x,
+                y,
+                apri << (bd - 8),
+                sec << (bd - 8),
+                dir,
+                damping,
+                bd,
+            );
+        }
+    }
 }
 
 /// Frame-level deblocking filter on the stitched reconstruction. Mirrors the
@@ -4980,6 +5256,7 @@ fn assemble_frame_obus(
     tilegroup: &[u8],
     mono: bool,
     aq: bool,
+    cdef: Option<&crate::obu::CdefParams>,
 ) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = frame_header_lossy_multitile_th(
@@ -4990,6 +5267,7 @@ fn assemble_frame_obus(
             plan.trl,
             mono,
             aq,
+            cdef,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
@@ -5001,6 +5279,7 @@ fn assemble_frame_obus(
             0,
             mono,
             aq,
+            cdef,
         );
         wrap_obu_frame(&fh, tilegroup)
     }
@@ -5272,9 +5551,10 @@ pub(crate) fn encode_av1_lossy_image_cs(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_cs_recon_dbg(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, &vb,
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, &vb, cdef,
     )
     .0
 }
@@ -5295,6 +5575,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
+    cdef: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5304,8 +5585,8 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
         pad_to_mult8(u, w, h, w8, h8),
         pad_to_mult8(v, w, h, w8, h8),
     ];
-    let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq, vb,
+    let (payload, recon, plan, cdefp) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq, vb, cdef,
     );
     let profile = if bd == 12 { 2 } else { 1 };
     let mut bytes = Vec::new();
@@ -5313,7 +5594,14 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp(
         w as u32, h as u32, profile, bd, color,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        &plan,
+        &payload,
+        false,
+        aq,
+        cdefp.as_ref(),
+    ));
     (bytes, recon, (w8, h8))
 }
 
@@ -5335,9 +5623,10 @@ pub(crate) fn encode_av1_lossy_image_422(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_422_recon_dbg(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb,
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef,
     )
     .0
 }
@@ -5356,6 +5645,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5367,15 +5657,22 @@ pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq, &vb,
+    let (payload, recon, plan, cdefp) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq, &vb, cdef,
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, 2, bd, color, 1, 0,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        &plan,
+        &payload,
+        false,
+        aq,
+        cdefp.as_ref(),
+    ));
     (bytes, recon, (w8, h8, cw8))
 }
 
@@ -5397,9 +5694,10 @@ pub(crate) fn encode_av1_lossy_image_420(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_420_recon_dbg(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb,
+        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef,
     )
     .0
 }
@@ -5421,6 +5719,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> (Vec<u8>, [Vec<i32>; 3], (usize, usize, usize, usize)) {
     assert_eq!(luma.len(), w * h);
     assert!(w > 0 && h > 0, "width/height must be non-zero");
@@ -5432,8 +5731,8 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     let luma_p: Vec<i32> = pad_to_mult8(luma, w, h, w8, h8);
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
-    let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq, &vb,
+    let (payload, recon, plan, cdefp) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq, &vb, cdef,
     );
     let profile = if bd == 12 { 2 } else { 0 };
     let mut bytes = Vec::new();
@@ -5441,7 +5740,14 @@ pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
     bytes.extend_from_slice(&crate::obu::sequence_header_cicp_ss(
         w as u32, h as u32, profile, bd, color, 1, 1,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, false, aq));
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        &plan,
+        &payload,
+        false,
+        aq,
+        cdefp.as_ref(),
+    ));
     (bytes, recon, (w8, h8, cw8, ch8))
 }
 
@@ -5457,9 +5763,10 @@ pub(crate) fn encode_av1_mono_image(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     let (bytes, _recon, _w8, _h8) = encode_av1_mono_image_recon_dbg(
-        base_q_idx, bd, w, h, luma, full_range, threads, speed, aq, vb,
+        base_q_idx, bd, w, h, luma, full_range, threads, speed, aq, vb, cdef,
     );
     bytes
 }
@@ -5477,20 +5784,28 @@ pub(crate) fn encode_av1_mono_image_recon_dbg(
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
+    cdef: bool,
 ) -> (Vec<u8>, Vec<i32>, usize, usize) {
     assert_eq!(luma.len(), w * h, "luma plane must be w*h");
     assert!(w > 0 && h > 0, "width/height must be non-zero");
     let (w8, h8) = (align8(w), align8(h));
     let src = [pad_to_mult8(luma, w, h, w8, h8), Vec::new(), Vec::new()];
-    let (payload, recon, plan) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq, &vb,
+    let (payload, recon, plan, cdefp) = encode_lossy_tilegroup(
+        base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq, &vb, cdef,
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
     bytes.extend_from_slice(&crate::obu::sequence_header_mono(
         w as u32, h as u32, bd, full_range,
     ));
-    bytes.extend_from_slice(&assemble_frame_obus(base_q_idx, &plan, &payload, true, aq));
+    bytes.extend_from_slice(&assemble_frame_obus(
+        base_q_idx,
+        &plan,
+        &payload,
+        true,
+        aq,
+        cdefp.as_ref(),
+    ));
     let [luma_recon, _, _] = recon;
     (bytes, luma_recon, w8, h8)
 }

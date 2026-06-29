@@ -346,6 +346,7 @@ pub fn encode_still_lossy<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -386,6 +387,7 @@ pub fn encode_still_lossy<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     )
 }
 
@@ -404,6 +406,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -470,6 +473,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     )
 }
 
@@ -488,6 +492,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -554,6 +559,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     )
 }
 
@@ -567,6 +573,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
@@ -600,6 +607,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     );
     Ok(bytes)
 }
@@ -620,6 +628,7 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
         Speed::Slow,
         false,
         crate::av1real::VarianceBoost::off(),
+        false,
     )
 }
 
@@ -639,6 +648,7 @@ pub fn encode_lossless_gray<T: Pixel>(
         Speed::Slow,
         false,
         crate::av1real::VarianceBoost::off(),
+        false,
     )?;
     finalize_color(
         obu,
@@ -769,6 +779,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         Speed::Slow,
         false,
         crate::av1real::VarianceBoost::off(),
+        false,
     )?;
     finalize_with_alpha(
         obu,
@@ -792,9 +803,10 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
-    assert!(base_q_idx != 0, "use encode_still for lossless");
+    assert_ne!(base_q_idx, 0, "use encode_still for lossless");
     let maxv = (1i32 << bit_depth.bits()) - 1;
     let to_i = |p: &[T]| {
         p.iter()
@@ -814,6 +826,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     );
     Ok(bytes)
 }
@@ -829,6 +842,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
     assert!(base_q_idx != 0, "4:2:2 doesn't support lossless encoding");
@@ -851,6 +865,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     );
     Ok(bytes)
 }
@@ -866,6 +881,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     speed: Speed,
     aq: bool,
     vb: crate::av1real::VarianceBoost,
+    cdef: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
@@ -888,6 +904,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
         speed,
         aq,
         vb,
+        cdef,
     );
     Ok(bytes)
 }
@@ -913,7 +930,8 @@ mod tests {
                     0,
                     Speed::Slow,
                     false,
-                    VarianceBoost::off()
+                    VarianceBoost::off(),
+                    true
                 )
                 .is_empty()
             );

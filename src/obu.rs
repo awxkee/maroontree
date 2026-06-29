@@ -213,14 +213,7 @@ fn frame_header_lossless_impl(
     w.into_bytes()
 }
 
-/// Multi-tile lossy frame header. `cols_incr` / `rows_incr` are the
-/// `increment_tile_*_log2` bit sequences that walk the decoder from its derived
-/// minimum up to the chosen `TileColsLog2` / `TileRowsLog2` (computed by the
-/// encoder, which owns the tiling math). `tile_cols_log2` / `tile_rows_log2` are
-/// those chosen values; when their sum is > 0 the header additionally codes
-/// `context_update_tile_id` and `tile_size_bytes_minus_1` (here `TileSizeBytes =
-/// 4`). For a single tile both vectors hold the lone `0` stop-bit and the sum is
-/// 0, reproducing the previous single-tile header byte-for-byte.
+/// Multi-tile lossy frame header.
 pub(crate) fn frame_header_lossy_multitile(
     base_q_idx: u8,
     cols_incr: &[bool],
@@ -229,6 +222,7 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    cdef: Option<&CdefParams>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -240,14 +234,10 @@ pub(crate) fn frame_header_lossy_multitile(
         false,
         mono,
         aq,
+        cdef,
     )
 }
 
-/// Like [`frame_header_lossy_multitile`] but terminates with AV1 `trailing_bits()`
-/// (a `1` bit then zero pad) instead of plain zero `byte_alignment`. Use this
-/// when the header is carried in a standalone `OBU_FRAME_HEADER` (type 3): the
-/// spec requires trailing_bits there, and strict parsers (ffmpeg's cbs_av1)
-/// enforce it. (A combined `OBU_FRAME` uses zero byte_alignment instead.)
 pub(crate) fn frame_header_lossy_multitile_th(
     base_q_idx: u8,
     cols_incr: &[bool],
@@ -256,6 +246,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    cdef: Option<&CdefParams>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -267,6 +258,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         true,
         mono,
         aq,
+        cdef,
     )
 }
 
@@ -304,6 +296,33 @@ pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
     (lvl_y, lvl_uv)
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CdefParams {
+    pub bits: u8,
+    pub damping: u8,
+    pub strengths: Vec<(u8, u8, u8, u8)>,
+}
+
+fn write_cdef_params(w: &mut BitWriter, cdef: &CdefParams, mono: bool) {
+    w.f((cdef.damping as u32).saturating_sub(3), 2); // cdef_damping_minus_3
+    w.f(cdef.bits as u32, 2); // cdef_bits
+    let n = 1usize << cdef.bits;
+    let map_sec = |s: u8| -> u32 {
+        // spec: cdef_y_sec_strength; if it is 3 it becomes 4 (skip value 3).
+        let v = s as u32;
+        if v == 3 { 4 } else { v }
+    };
+    for i in 0..n {
+        let (yp, ys, up, us) = cdef.strengths.get(i).copied().unwrap_or((0, 0, 0, 0));
+        w.f(yp as u32, 4); // cdef_y_pri_strength
+        w.f(map_sec(ys), 2); // cdef_y_sec_strength (2 bits: 0,1,2,3->coded 4)
+        if !mono {
+            w.f(up as u32, 4); // cdef_uv_pri_strength
+            w.f(map_sec(us), 2); // cdef_uv_sec_strength
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn frame_header_lossy_impl(
     base_q_idx: u8,
@@ -315,6 +334,7 @@ fn frame_header_lossy_impl(
     trailing: bool,
     mono: bool,
     aq: bool,
+    cdef: Option<&CdefParams>,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -374,7 +394,14 @@ fn frame_header_lossy_impl(
     }
     w.f(0, 3); // loop_filter_sharpness = 0
     w.flag(false); // loop_filter_delta_enabled = 0
-    // cdef_params(): omitted — CDEF disabled at sequence level (enable_cdef = 0).
+
+    let noop_cdef = CdefParams {
+        bits: 0,
+        damping: 3,
+        strengths: vec![(0, 0, 0, 0)],
+    };
+    let cdef = cdef.unwrap_or(&noop_cdef);
+    write_cdef_params(&mut w, cdef, mono);
     // lr_params(): sequence enable_restoration = 0 => skipped
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
@@ -454,7 +481,7 @@ pub(crate) fn sequence_header_mono(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(false); // enable_cdef (CDEF removed)
+    w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
     w.flag(false); // enable_restoration
 
     // color_config() — monochrome branch.
@@ -513,7 +540,7 @@ fn seq_header_ss(
     w.flag(false); // enable_filter_intra
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
-    w.flag(false); // enable_cdef (CDEF removed)
+    w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
     w.flag(false); // enable_restoration
 
     // color_config()

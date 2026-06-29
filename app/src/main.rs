@@ -26,17 +26,13 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use criterion::{Criterion, Throughput};
 use image::imageops::FilterType;
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_gray8, encode_gray10, encode_rgb8, encode_rgb10,
+    Av2Encoder, BitDepth, Cicp, Orientation, PlanarImage, Speed, TxPart, av2_map_quality,
 };
-use std::fmt::format;
-use std::fs;
 use std::hint::black_box;
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn main() {
     // let (w, h) = (64usize, 64usize);
