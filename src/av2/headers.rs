@@ -22,14 +22,9 @@ pub(crate) struct Config {
     pub(crate) cdef: Option<(u8, u8, u8)>,
     /// Coded bit depth: 8, 10 or 12.
     pub(crate) bit_depth: u8,
-    /// When set, emit a `coded_lossless` frame: base_q forced to 0, in-loop filters and
-    /// the tx-mode bit omitted (avm forces `ONLY_4X4`). See [`frame_header`].
     pub(crate) lossless: bool,
-    /// Enable CfL chroma-from-luma signalling. Experimental, bitstream-affecting.
     pub(crate) cfl: bool,
-    /// Adaptive quantization: when set, `delta_q_present` is signalled in the
-    /// frame header and every superblock carries a per-SB quantizer delta.
-    /// `aq_res_log2` is the delta-Q resolution (qindex step = 1 << res_log2).
+    pub(crate) updating_cdf: bool,
     pub(crate) aq: bool,
     pub(crate) aq_res_log2: u8,
 }
@@ -164,7 +159,10 @@ pub(crate) fn frame_header(
     b.write_uvlc(0);
     b.write_bit(0);
     b.write_bit(0);
-    b.write_bit(1);
+    // This bit is read by the decoder as `disable_cdf_update` (decodeframe.c:9155),
+    // immediately before read_tile_info. The original encoder hard-coded it to 1
+    // (static CDFs). It now carries !updating_cdf: 1 = static, 0 = adaptive.
+    b.write_bit(!config.updating_cdf as u32); // disable_cdf_update
 
     let sb_cols = (width as usize).div_ceil(64);
     let sb_rows = (height as usize).div_ceil(64);

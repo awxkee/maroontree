@@ -701,7 +701,12 @@ pub(crate) fn inv_txfm_add(
             for col in 0..sh {
                 let trow = &tmp[col * sw..col * sw + sw];
                 let base = (col as isize * stride) as usize;
-                for (pair, &t) in dst[base..base + w].chunks_exact_mut(2).zip(trow) {
+                for (pair, &t) in dst[base..base + w]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(trow)
+                {
                     let v = cf(t);
                     pair[0] = (pair[0] + v).clamp(0, pmax);
                     pair[1] = (pair[1] + v).clamp(0, pmax);
@@ -724,7 +729,12 @@ pub(crate) fn inv_txfm_add(
                 let trow = &tmp[col * sw..col * sw + sw];
                 for dy in [2 * col, 2 * col + 1] {
                     let base = (dy as isize * stride) as usize;
-                    for (pair, &t) in dst[base..base + w].chunks_exact_mut(2).zip(trow) {
+                    for (pair, &t) in dst[base..base + w]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .zip(trow)
+                    {
                         let v = cf(t);
                         pair[0] = (pair[0] + v).clamp(0, pmax);
                         pair[1] = (pair[1] + v).clamp(0, pmax);
@@ -779,7 +789,7 @@ pub(crate) fn inv_txfm_add_wht4x4(dst: &mut [i32], stride: isize, coeff: &[i32],
             tmp[y * 4 + x] = v;
         }
     }
-    for (y, trow) in tmp.chunks_exact(4).enumerate() {
+    for (y, trow) in tmp.as_chunks::<4>().0.iter().enumerate() {
         let base = (y as isize * stride) as usize;
         for (d, &t) in dst[base..base + 4].iter_mut().zip(trow) {
             *d = (*d + t).clamp(0, pmax);

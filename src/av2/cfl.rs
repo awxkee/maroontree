@@ -91,10 +91,12 @@ pub(crate) fn subsample_luma_q3(
             for (y, orow) in out.chunks_exact_mut(cw).enumerate() {
                 let top = &luma[y * 2 * lstride..y * 2 * lstride + 2 * cw];
                 let bot = &luma[(y * 2 + 1) * lstride..(y * 2 + 1) * lstride + 2 * cw];
-                for (o, (t, b)) in orow
-                    .iter_mut()
-                    .zip(top.chunks_exact(2).zip(bot.chunks_exact(2)))
-                {
+                for (o, (t, b)) in orow.iter_mut().zip(
+                    top.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(bot.as_chunks::<2>().0.iter()),
+                ) {
                     *o = (t[0] + t[1] + b[0] + b[1]) << 1;
                 }
             }
@@ -102,7 +104,7 @@ pub(crate) fn subsample_luma_q3(
         (true, false) => {
             for (y, orow) in out.chunks_exact_mut(cw).enumerate() {
                 let row = &luma[y * lstride..y * lstride + 2 * cw];
-                for (o, p) in orow.iter_mut().zip(row.chunks_exact(2)) {
+                for (o, p) in orow.iter_mut().zip(row.as_chunks::<2>().0.iter()) {
                     *o = (p[0] + p[1]) << 2;
                 }
             }

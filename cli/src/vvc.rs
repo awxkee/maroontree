@@ -406,7 +406,13 @@ fn finish_monochrome(
         let y = &dec.planes;
         let a = &alpha.planes;
         let mut ya = vec![0u8; w as usize * h as usize * 2];
-        for ((dst, &yv), &av) in ya.chunks_exact_mut(2).zip(y.iter()).zip(a.iter()) {
+        for ((dst, &yv), &av) in ya
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(y.iter())
+            .zip(a.iter())
+        {
             dst[0] = yv;
             dst[1] = av;
         }

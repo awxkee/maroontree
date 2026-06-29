@@ -801,7 +801,7 @@ impl<'a> LossyTile<'a> {
         // one 16x16 (DC-pred from available recon above/left)
         let lpred = dc_pred_16x16(&self.recon[0], self.w, px, py, self.bd as i32);
         let mut r16 = [0i32; 256];
-        for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
+        for (ry, drow) in r16.as_chunks_mut::<16>().0.iter_mut().enumerate() {
             let srow = &self.src[0][(py + ry) * self.w + px..];
             for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                 *dv = s - lpred;
@@ -814,7 +814,7 @@ impl<'a> LossyTile<'a> {
         for (sx, sy) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
             let pred = dc_pred_8x8(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
             let mut r8 = [0i32; 64];
-            for (ry, drow) in r8.chunks_exact_mut(8).enumerate() {
+            for (ry, drow) in r8.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - pred;
@@ -1002,8 +1002,10 @@ impl<'a> LossyTile<'a> {
             }
             let mut resid = [0i32; 256];
             for (ry, (rrow, prow)) in resid
-                .chunks_exact_mut(16)
-                .zip(pred.chunks_exact(16))
+                .as_chunks_mut::<16>()
+                .0
+                .iter_mut()
+                .zip(pred.as_chunks::<16>().0.iter())
                 .enumerate()
             {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
@@ -1013,7 +1015,12 @@ impl<'a> LossyTile<'a> {
             }
             let blk_sse16 = |rr: &[i32; 256]| -> i64 {
                 let mut sse = 0i64;
-                for (ry, (prow, rrow)) in pred.chunks_exact(16).zip(rr.chunks_exact(16)).enumerate()
+                for (ry, (prow, rrow)) in pred
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .zip(rr.as_chunks::<16>().0.iter())
+                    .enumerate()
                 {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -1152,7 +1159,7 @@ impl<'a> LossyTile<'a> {
         // prunes the transform-type search to DCT_DCT (libaom-style).
         if self.speed.try_adst() {
             let mut resid = [0i32; 256];
-            for (ry, rrow) in resid.chunks_exact_mut(16).enumerate() {
+            for (ry, rrow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 16..ry * 16 + 16];
                 for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
@@ -1176,7 +1183,7 @@ impl<'a> LossyTile<'a> {
             );
             let rr = iadst_dequant_16x16(&acf, &self.quant);
             let mut asse = 0i64;
-            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 16..ry * 16 + 16];
                 for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -1209,7 +1216,7 @@ impl<'a> LossyTile<'a> {
                 // recompute the ADST_ADST winner cost as the bar to beat
                 let rr = iadst_dequant_16x16(&lcf, &self.quant);
                 let mut s = 0i64;
-                for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     let prow = &lpred_arr[ry * 16..ry * 16 + 16];
                     for ((&p, &rv), &sv) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -1223,7 +1230,7 @@ impl<'a> LossyTile<'a> {
             }
             for (fwd_dctadst, inv_dctadst) in [(false, false), (true, true)] {
                 let mut resid = [0i32; 256];
-                for (ry, rrow) in resid.chunks_exact_mut(16).enumerate() {
+                for (ry, rrow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     let prow = &lpred_arr[ry * 16..ry * 16 + 16];
                     for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
@@ -1255,7 +1262,7 @@ impl<'a> LossyTile<'a> {
                     iadstdct_dequant_16x16(&acf, &self.quant)
                 };
                 let mut asse = 0i64;
-                for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     let prow = &lpred_arr[ry * 16..ry * 16 + 16];
                     for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -1417,7 +1424,13 @@ impl<'a> LossyTile<'a> {
                 _ => idct_dequant_16x16(lcf, &self.quant),
             }
         };
-        for (ry, (prow, rrow)) in lpred.chunks_exact(16).zip(lrr.chunks_exact(16)).enumerate() {
+        for (ry, (prow, rrow)) in lpred
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(lrr.as_chunks::<16>().0.iter())
+            .enumerate()
+        {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
             for ((dv, &p), &rv) in drow.iter_mut().zip(prow.iter()).zip(rrow.iter()) {
                 *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -1446,7 +1459,7 @@ impl<'a> LossyTile<'a> {
             let pred = dc_pred_16x16(&self.recon[plane], self.w, px, py, self.bd as i32);
             cpred[ci] = pred;
             let mut resid = [0i32; 256];
-            for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+            for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(py + ry) * self.w + px..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - pred;
@@ -1497,7 +1510,7 @@ impl<'a> LossyTile<'a> {
                 let plane = ci + 1;
                 let dc = cpred[ci];
                 let mut src = [0i32; 256];
-                for (ry, drow) in src.chunks_exact_mut(16).enumerate() {
+                for (ry, drow) in src.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(py + ry) * self.w + px..][..16]);
                 }
                 let dcrr = idct_dequant_16x16(&ccf[ci], &self.cquant);
@@ -1591,7 +1604,7 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 256];
-                for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds16[ci][ry * 16..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
@@ -1660,7 +1673,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_16x16(&ccf[ci], &self.cquant)
             };
-            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                 if cfl_opt.is_some() || chosen_uv_16 == SMOOTH_V_PRED {
                     let prow = &cpred16[ci][ry * 16..];
@@ -1707,7 +1720,7 @@ impl<'a> LossyTile<'a> {
             let dc = dc_pred_8x8(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             dc_preds[ci] = dc;
             let mut resid = [0i32; 64];
-            for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
+            for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - dc;
@@ -1744,7 +1757,7 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 64];
-                for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds[ci][ry * 8..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
@@ -1771,8 +1784,10 @@ impl<'a> LossyTile<'a> {
             rr_sv[ci] = idct_dequant_8x8(&ccf_sv[ci], &self.cquant);
             let dc = dc_preds[ci];
             for (ry, (rd_row, rs_row)) in rr_dc[ci]
-                .chunks_exact(8)
-                .zip(rr_sv[ci].chunks_exact(8))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(rr_sv[ci].as_chunks::<8>().0.iter())
                 .enumerate()
             {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
@@ -1822,7 +1837,7 @@ impl<'a> LossyTile<'a> {
             self.a_coef[plane][bx4c..bx4c + 2].fill(res_ctx);
             self.l_coef[plane][by4c..by4c + 2].fill(res_ctx);
             let rr = if block_skip { [0i32; 64] } else { rr_cache[ci] };
-            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
                     let prow = &sv_preds[ci][ry * 8..];
@@ -1867,7 +1882,7 @@ impl<'a> LossyTile<'a> {
             let pred = dc_pred_8x16(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
             let mut resid = [0i32; 128];
-            for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
+            for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(py + ry) * self.cw + cx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - pred;
@@ -1915,7 +1930,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_8x16(&ccf[ci], &self.cquant)
             };
-            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
                 for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
                     *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
@@ -2192,8 +2207,10 @@ impl<'a> LossyTile<'a> {
             }
             let mut resid = [0i32; 64];
             for (ry, (rrow, prow)) in resid
-                .chunks_exact_mut(8)
-                .zip(pred.chunks_exact(8))
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(pred.as_chunks::<8>().0.iter())
                 .enumerate()
             {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
@@ -2205,7 +2222,13 @@ impl<'a> LossyTile<'a> {
             // choice is refined once for the winning mode after the loop.
             let blk_sse = |rr: &[i32; 64]| -> i64 {
                 let mut sse = 0i64;
-                for (ry, (prow, rrow)) in pred.chunks_exact(8).zip(rr.chunks_exact(8)).enumerate() {
+                for (ry, (prow, rrow)) in pred
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .zip(rr.as_chunks::<8>().0.iter())
+                    .enumerate()
+                {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
                         let r = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -2352,7 +2375,7 @@ impl<'a> LossyTile<'a> {
         // Full and Medium try ADST; only Fast prunes the transform type to DCT_DCT.
         if self.speed.try_adst() {
             let mut resid = [0i32; 64];
-            for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+            for (ry, rrow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                 for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
@@ -2376,7 +2399,7 @@ impl<'a> LossyTile<'a> {
             );
             let rr = iadst_dequant_8x8(&acf, &self.quant);
             let mut asse = 0i64;
-            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                 for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -2403,7 +2426,7 @@ impl<'a> LossyTile<'a> {
         if self.speed.try_adst() && asym_adst_enabled() {
             for (fwd_t, inv_is_dctadst) in [(false, false), (true, true)] {
                 let mut resid = [0i32; 64];
-                for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+                for (ry, rrow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                     for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
@@ -2435,7 +2458,7 @@ impl<'a> LossyTile<'a> {
                     iadstdct_dequant_8x8(&acf, &self.quant)
                 };
                 let mut asse = 0i64;
-                for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                     let srow = &self.src[0][(py + ry) * self.w + px..];
                     let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                     for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -2467,7 +2490,7 @@ impl<'a> LossyTile<'a> {
         // the IDTX symbol is 0 in the 7-type intra ext-tx set.
         if self.speed.try_adst() {
             let mut resid = [0i32; 64];
-            for (ry, rrow) in resid.chunks_exact_mut(8).enumerate() {
+            for (ry, rrow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                 for (r, (&p, &s)) in rrow.iter_mut().zip(prow.iter().zip(srow.iter())) {
@@ -2482,7 +2505,7 @@ impl<'a> LossyTile<'a> {
             // real-SSE win); bit-exactness is carried by the inverse regardless.
             let rr = iidentity_dequant_8x8(&icf, &self.quant);
             let mut isse = 0i64;
-            for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 let prow = &lpred_arr[ry * 8..ry * 8 + 8];
                 for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
@@ -2516,7 +2539,7 @@ impl<'a> LossyTile<'a> {
                 let pred = dc_pred_4x4(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
                 cpred[ci] = pred;
                 let mut resid = [0i32; 16];
-                for (ry, drow) in resid.chunks_exact_mut(4).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                         *dv = s - pred;
@@ -2529,7 +2552,7 @@ impl<'a> LossyTile<'a> {
                 let pred = dc_pred_4x8(&self.recon[plane], self.cw, cx, py, self.bd as i32);
                 cpred[ci] = pred;
                 let mut resid = [0i32; 32];
-                for (ry, drow) in resid.chunks_exact_mut(4).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.cw + cx..];
                     for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                         *dv = s - pred;
@@ -2542,7 +2565,7 @@ impl<'a> LossyTile<'a> {
                 let pred = dc_pred_8x8(&self.recon[plane], self.w, px, py, self.bd as i32);
                 cpred[ci] = pred;
                 let mut resid = [0i32; 64];
-                for (ry, drow) in resid.chunks_exact_mut(8).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                         *dv = s - pred;
@@ -2591,7 +2614,7 @@ impl<'a> LossyTile<'a> {
                 let plane = ci + 1;
                 let dc = cpred[ci];
                 let mut src = [0i32; 64];
-                for (ry, drow) in src.chunks_exact_mut(8).enumerate() {
+                for (ry, drow) in src.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(py + ry) * self.w + px..][..8]);
                 }
                 // DC option distortion/rate (from the coeffs already computed)
@@ -2716,7 +2739,7 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 16];
-                for (ry, drow) in resid.chunks_exact_mut(4).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds_420[ci][ry * 4..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
@@ -2778,7 +2801,7 @@ impl<'a> LossyTile<'a> {
                 let plane = ci + 1;
                 let dc = cpred[ci];
                 let mut src = [0i32; 16];
-                for (ry, drow) in src.chunks_exact_mut(4).enumerate() {
+                for (ry, drow) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(cy + ry) * self.cw + cx..][..4]);
                 }
                 let curr = idct_dequant_4x4(&ccf44[ci], &self.cquant);
@@ -2857,7 +2880,7 @@ impl<'a> LossyTile<'a> {
                 let plane = ci + 1;
                 let dc = cpred[ci];
                 let mut src = [0i32; 32];
-                for (ry, drow) in src.chunks_exact_mut(4).enumerate() {
+                for (ry, drow) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(py + ry) * self.cw + cx..][..4]);
                 }
                 let curr = idct_dequant_4x8(&ccf48[ci], &self.cquant);
@@ -2960,8 +2983,10 @@ impl<'a> LossyTile<'a> {
             idct_dequant_8x8(&lcf, &self.quant)
         };
         for (ry, (prow, rrow)) in lpred_arr
-            .chunks_exact(8)
-            .zip(lrr.chunks_exact(8))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(lrr.as_chunks::<8>().0.iter())
             .enumerate()
         {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
@@ -2990,7 +3015,7 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_4x4(&ccf44[ci], &self.cquant)
                 };
-                for (ry, rrow) in rr.chunks_exact(4).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                     if use_cfl {
                         let prow = &cpred420[ci][ry * 4..];
@@ -3030,7 +3055,7 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_4x8(&ccf48[ci], &self.cquant)
                 };
-                for (ry, rrow) in rr.chunks_exact(4).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
                     if use_cfl {
                         let prow = &cpred422[ci][ry * 4..];
@@ -3069,7 +3094,7 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_8x8(&ccf8[ci], &self.cquant)
                 };
-                for (ry, rrow) in rr.chunks_exact(8).enumerate() {
+                for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                     if use_cfl {
                         let prow = &cpred444[ci][ry * 8..];
@@ -3204,7 +3229,7 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (_x8 * 8, _y8 * 8);
         let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
         let mut r32 = [0i32; 1024];
-        for (ry, drow) in r32.chunks_exact_mut(32).enumerate() {
+        for (ry, drow) in r32.as_chunks_mut::<32>().0.iter_mut().enumerate() {
             let srow = &self.src[0][(py + ry) * self.w + px..];
             for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                 *dv = s - lpred;
@@ -3216,7 +3241,7 @@ impl<'a> LossyTile<'a> {
         for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
             let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
             let mut r16 = [0i32; 256];
-            for (ry, drow) in r16.chunks_exact_mut(16).enumerate() {
+            for (ry, drow) in r16.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let srow = &self.src[0][(py + sy + ry) * self.w + px + sx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - pred;
@@ -3281,8 +3306,10 @@ impl<'a> LossyTile<'a> {
             }
             let mut resid = [0i32; 1024];
             for (ry, (rrow, prow)) in resid
-                .chunks_exact_mut(32)
-                .zip(pred.chunks_exact(32))
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(pred.as_chunks::<32>().0.iter())
                 .enumerate()
             {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
@@ -3309,7 +3336,13 @@ impl<'a> LossyTile<'a> {
             }
             let rr = idct_dequant_32x32(&cf, &self.quant);
             let mut sse = 0i64;
-            for (ry, (prow, rrow)) in pred.chunks_exact(32).zip(rr.chunks_exact(32)).enumerate() {
+            for (ry, (prow, rrow)) in pred
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .zip(rr.as_chunks::<32>().0.iter())
+                .enumerate()
+            {
                 let srow = &self.src[0][(py + ry) * self.w + px..];
                 for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
                     let r = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -3495,7 +3528,13 @@ impl<'a> LossyTile<'a> {
         } else {
             idct_dequant_32x32(lcf, &self.quant)
         };
-        for (ry, (prow, rrow)) in lpred.chunks_exact(32).zip(lrr.chunks_exact(32)).enumerate() {
+        for (ry, (prow, rrow)) in lpred
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(lrr.as_chunks::<32>().0.iter())
+            .enumerate()
+        {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
             for ((dv, &p), &rv) in drow.iter_mut().zip(prow.iter()).zip(rrow.iter()) {
                 *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -3529,7 +3568,7 @@ impl<'a> LossyTile<'a> {
             let dc = dc_pred_32x32(&self.recon[plane], self.w, px, py, self.bd as i32);
             cdc[ci] = dc;
             let mut cresid = [0i32; 1024];
-            for (ry, drow) in cresid.chunks_exact_mut(32).enumerate() {
+            for (ry, drow) in cresid.as_chunks_mut::<32>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(py + ry) * self.w + px..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - dc;
@@ -3561,7 +3600,7 @@ impl<'a> LossyTile<'a> {
                 let plane = ci + 1;
                 let dc = cdc[ci];
                 let mut src = [0i32; 1024];
-                for (ry, drow) in src.chunks_exact_mut(32).enumerate() {
+                for (ry, drow) in src.as_chunks_mut::<32>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(py + ry) * self.w + px..][..32]);
                 }
                 let dcrr = idct_dequant_32x32(&ccf[ci], &self.cquant);
@@ -3592,7 +3631,7 @@ impl<'a> LossyTile<'a> {
                 cfl_cost[ci] = s2 as f64 + mlam * block_rate_bits(&q, &SCAN_32X32);
             }
         }
-        // CfL signalling costs extra (sign + per-plane alpha); only use it when
+        // CfL signaling costs extra (sign + per-plane alpha); only use it when
         // it beats plain DC on both planes' summed cost by that overhead.
         let cfl_sig =
             4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
@@ -3661,7 +3700,7 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 1024];
-                for (ry, drow) in resid.chunks_exact_mut(32).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<32>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &sv_preds32[ci][ry * 32..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
@@ -3720,7 +3759,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_32x32(&final_cf[ci], &self.cquant)
             };
-            for (ry, rrow) in crr.chunks_exact(32).enumerate() {
+            for (ry, rrow) in crr.as_chunks::<32>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                 if chosen_uv_32 == SMOOTH_V_PRED {
                     let prow = &sv_preds32[ci][ry * 32..];
@@ -3772,7 +3811,7 @@ impl<'a> LossyTile<'a> {
             let dc = dc_pred_16x16(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             dc_preds[ci] = dc;
             let mut resid = [0i32; 256];
-            for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+            for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - dc;
@@ -3808,7 +3847,7 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 256];
-                for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+                for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds[ci][ry * 16..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
@@ -3834,8 +3873,10 @@ impl<'a> LossyTile<'a> {
             rr_sv[ci] = idct_dequant_16x16(&ccf_sv[ci], &self.cquant);
             let dc = dc_preds[ci];
             for (ry, (rd_row, rs_row)) in rr_dc[ci]
-                .chunks_exact(16)
-                .zip(rr_sv[ci].chunks_exact(16))
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(rr_sv[ci].as_chunks::<16>().0.iter())
                 .enumerate()
             {
                 let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
@@ -3897,7 +3938,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 rr_cache[ci]
             };
-            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
                     let prow = &sv_preds[ci][ry * 16..];
@@ -3941,7 +3982,7 @@ impl<'a> LossyTile<'a> {
             let pred = dc_pred_16x32(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
             let mut resid = [0i32; 512];
-            for (ry, drow) in resid.chunks_exact_mut(16).enumerate() {
+            for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let srow = &self.src[plane][(py + ry) * self.cw + cx..];
                 for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
                     *dv = s - pred;
@@ -3987,7 +4028,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_16x32(&ccf[ci], &self.cquant)
             };
-            for (ry, rrow) in rr.chunks_exact(16).enumerate() {
+            for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
                 for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
                     *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
