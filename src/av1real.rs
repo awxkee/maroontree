@@ -6083,15 +6083,23 @@ fn frame_cdef(
     let signalled_damping = cdef_damping(base_q_idx) as i32;
     let damping = signalled_damping + (bd as i32 - 8);
 
-    // Precompute per-8x8 luma directions on the deblocked recon.
+    // Precompute per-8x8 luma directions AND variances on the deblocked recon,
+    // once. Both are functions of the pre-CDEF luma only (not of the candidate
+    // strength), so they are invariant across the entire strength search and the
+    // final apply. Computing them here removes a ~11x-redundant `cdef_direction`
+    // recompute that previously ran inside the candidate loop (the dominant cost
+    // of the whole still-image encode). `ldirs`/`lvars` are byte-for-byte the
+    // same values the old in-loop code produced, so the result is unchanged.
     let nbx = w8.div_ceil(8);
     let nby = h8.div_ceil(8);
     let mut ldirs = vec![0usize; nbx * nby];
+    let mut lvars = vec![0i32; nbx * nby];
     for by in 0..nby {
         for bx in 0..nbx {
             if bx * 8 < w8 && by * 8 < h8 {
-                let (d, _) = cdef::cdef_direction(&recon[0], w8, bx * 8, by * 8, bd);
+                let (d, v) = cdef::cdef_direction(&recon[0], w8, bx * 8, by * 8, bd);
                 ldirs[by * nbx + bx] = d;
+                lvars[by * nbx + bx] = v;
             }
         }
     }
@@ -6113,6 +6121,7 @@ fn frame_cdef(
         w8,
         h8,
         &ldirs,
+        &lvars,
         &lskip,
         nbx,
         damping,
@@ -6151,6 +6160,7 @@ fn frame_cdef(
         w8,
         h8,
         &ldirs,
+        &lvars,
         &lskip,
         nbx,
         yp,
@@ -6182,6 +6192,7 @@ fn cdef_search_plane(
     w: usize,
     h: usize,
     dirs: &[usize],
+    vars: &[i32],
     skip: &[bool],
     nbx: usize,
     damping: i32,
@@ -6198,50 +6209,83 @@ fn cdef_search_plane(
         }
     }
     let threshold = off_sse - (off_sse.saturating_mul(margin_num) / margin_den.max(1));
+
+    let candidates: Vec<(i32, i32)> = cdef::PRI_CANDIDATES
+        .iter()
+        .flat_map(|&pri| cdef::SEC_CANDIDATES.iter().map(move |&sec| (pri, sec)))
+        .filter(|&(pri, sec)| !(pri == 0 && sec == 0))
+        .collect();
+
+    // Evaluate one candidate: total frame SSE if this (pri, sec) were applied.
+    let eval = |pri: i32, sec: i32| -> i64 {
+        let mut tmp = recon.to_vec();
+        let mut sse = 0i64;
+        for y in (0..h).step_by(8) {
+            for x in (0..w).step_by(8) {
+                let bxi = x / 8;
+                let byi = y / 8;
+                let bi = byi * nbx + bxi;
+                if skip.get(bi).copied().unwrap_or(true) {
+                    sse += plane_block_sse(recon, src, w, h, x, y);
+                    continue;
+                }
+                let dir = dirs[bi];
+                let var = vars[bi];
+                // adjust_pri must be applied to the bit-depth-shifted strength
+                // (matches the decoders' adjust_strength, which scales the
+                // already-shifted level); scaling then shifting does not commute
+                // because of the `+8 >> 4` rounding.
+                let apri = cdef::adjust_pri(pri << (bd - 8), var);
+                cdef::cdef_filter_8x8(
+                    &mut tmp,
+                    recon,
+                    w,
+                    x,
+                    y,
+                    apri,
+                    sec << (bd - 8),
+                    dir,
+                    damping,
+                    bd,
+                );
+                sse += plane_block_sse(&tmp, src, w, h, x, y);
+            }
+        }
+        sse
+    };
+
+    // Spread candidates across worker threads. The candidate count is small
+    // (~11) so one thread per candidate is fine; scoped threads borrow `recon`,
+    // `src`, `dirs`, `vars`, `skip` immutably with no locks.
+    let want = resolve_threads(0).clamp(1, candidates.len().max(1));
+    let mut sses: Vec<i64> = vec![0; candidates.len()];
+    if want <= 1 || candidates.len() <= 1 {
+        for (slot, &(pri, sec)) in sses.iter_mut().zip(candidates.iter()) {
+            *slot = eval(pri, sec);
+        }
+    } else {
+        let chunk = candidates.len().div_ceil(want);
+        std::thread::scope(|scope| {
+            for (cs, os) in candidates.chunks(chunk).zip(sses.chunks_mut(chunk)) {
+                let eval = &eval;
+                scope.spawn(move || {
+                    for (&(pri, sec), o) in cs.iter().zip(os.iter_mut()) {
+                        *o = eval(pri, sec);
+                    }
+                });
+            }
+        });
+    }
+
+    // Reduce: pick the best candidate that beats baseline and clears the margin.
+    // Deterministic tie-break: iterate candidates in their fixed order, matching
+    // the previous sequential `<` comparison exactly.
     let mut best = (0i32, 0i32);
     let mut best_sse = off_sse;
-    let mut tmp = recon.to_vec();
-    for &pri in &cdef::PRI_CANDIDATES {
-        for &sec in &cdef::SEC_CANDIDATES {
-            if pri == 0 && sec == 0 {
-                continue; // baseline already measured
-            }
-            let mut sse = 0i64;
-            for y in (0..h).step_by(8) {
-                for x in (0..w).step_by(8) {
-                    let bxi = x / 8;
-                    let byi = y / 8;
-                    if skip.get(byi * nbx + bxi).copied().unwrap_or(true) {
-                        sse += plane_block_sse(recon, src, w, h, x, y);
-                        continue;
-                    }
-                    let _ = dirs;
-                    let (dir, var) = cdef::cdef_direction(recon, w, x, y, bd);
-                    // adjust_pri must be applied to the bit-depth-shifted strength
-                    // (matches the decoders' adjust_strength, which scales the
-                    // already-shifted level); scaling then shifting does not
-                    // commute because of the `+8 >> 4` rounding.
-                    let apri = cdef::adjust_pri(pri << (bd - 8), var);
-                    cdef::cdef_filter_8x8(
-                        &mut tmp,
-                        recon,
-                        w,
-                        x,
-                        y,
-                        apri,
-                        sec << (bd - 8),
-                        dir,
-                        damping,
-                        bd,
-                    );
-                    sse += plane_block_sse(&tmp, src, w, h, x, y);
-                }
-            }
-            // Must beat the current best AND clear the improvement margin vs off.
-            if sse < best_sse && sse <= threshold {
-                best_sse = sse;
-                best = (pri, sec);
-            }
+    for (&(pri, sec), &sse) in candidates.iter().zip(sses.iter()) {
+        if sse < best_sse && sse <= threshold {
+            best_sse = sse;
+            best = (pri, sec);
         }
     }
     best
@@ -6270,6 +6314,7 @@ fn apply_cdef_plane(
     w: usize,
     h: usize,
     dirs: &[usize],
+    vars: &[i32],
     skip: &[bool],
     nbx: usize,
     pri: i32,
@@ -6283,15 +6328,15 @@ fn apply_cdef_plane(
         for x in (0..w).step_by(8) {
             let bxi = x / 8;
             let byi = y / 8;
+            let bi = byi * nbx + bxi;
             // Skip blocks are left untouched, matching the decoder.
-            if skip.get(byi * nbx + bxi).copied().unwrap_or(true) {
+            if skip.get(bi).copied().unwrap_or(true) {
                 continue;
             }
-            // Recompute the direction and variance from the (pre-CDEF) snapshot
-            // so the primary strength can be scaled per block exactly as the
-            // decoder does. `dirs` is ignored here in favour of the fresh value.
-            let _ = dirs;
-            let (dir, var) = cdef::cdef_direction(&snapshot, w, x, y, bd);
+            // Use the precomputed direction/variance (same pre-CDEF snapshot the
+            // search used). Identical to the old in-loop recompute, but free.
+            let dir = dirs[bi];
+            let var = vars[bi];
             // adjust_pri on the bit-depth-shifted strength (see search above).
             let apri = cdef::adjust_pri(pri << (bd - 8), var);
             cdef::cdef_filter_8x8(
@@ -6399,55 +6444,80 @@ fn cdef_search_chroma(
             off_sse += plane_block_sse(recon, src, cw, ch, x, y);
         }
     }
+
+    let candidates: Vec<(i32, i32)> = cdef::PRI_CANDIDATES
+        .iter()
+        .flat_map(|&pri| cdef::SEC_CANDIDATES.iter().map(move |&sec| (pri, sec)))
+        .filter(|&(pri, sec)| !(pri == 0 && sec == 0))
+        .collect();
+
+    let eval = |pri: i32, sec: i32| -> i64 {
+        // Reset the scratch buffer to the unfiltered recon, filter all non-skip
+        // chroma sub-blocks, then measure SSE over the whole plane.
+        let mut tmp = recon.to_vec();
+        for lby in 0..nby {
+            for lbx in 0..nbx {
+                if skip8.get(lby * sb8w + lbx).copied().unwrap_or(true) {
+                    continue;
+                }
+                let cx = (lbx * 8) >> sub_x;
+                let cy = (lby * 8) >> sub_y;
+                if cx >= cw || cy >= ch {
+                    continue;
+                }
+                let ld = ldirs.get(lby * nbx + lbx).copied().unwrap_or(0);
+                let dir = uv_dir[ld];
+                cdef::cdef_filter_block(
+                    &mut tmp,
+                    recon,
+                    cw,
+                    cx,
+                    cy,
+                    cbw,
+                    cbh,
+                    pri << (bd - 8),
+                    sec << (bd - 8),
+                    dir,
+                    damping,
+                    bd,
+                );
+            }
+        }
+        let mut sse = 0i64;
+        for y in (0..ch).step_by(8) {
+            for x in (0..cw).step_by(8) {
+                sse += plane_block_sse(&tmp, src, cw, ch, x, y);
+            }
+        }
+        sse
+    };
+
+    let want = resolve_threads(0).clamp(1, candidates.len().max(1));
+    let mut sses: Vec<i64> = vec![0; candidates.len()];
+    if want <= 1 || candidates.len() <= 1 {
+        for (slot, &(pri, sec)) in sses.iter_mut().zip(candidates.iter()) {
+            *slot = eval(pri, sec);
+        }
+    } else {
+        let chunk = candidates.len().div_ceil(want);
+        std::thread::scope(|scope| {
+            for (cs, os) in candidates.chunks(chunk).zip(sses.chunks_mut(chunk)) {
+                let eval = &eval;
+                scope.spawn(move || {
+                    for (&(pri, sec), o) in cs.iter().zip(os.iter_mut()) {
+                        *o = eval(pri, sec);
+                    }
+                });
+            }
+        });
+    }
+
     let mut best = (0i32, 0i32);
     let mut best_sse = off_sse;
-    let mut tmp = recon.to_vec();
-    for &pri in &cdef::PRI_CANDIDATES {
-        for &sec in &cdef::SEC_CANDIDATES {
-            if pri == 0 && sec == 0 {
-                continue;
-            }
-            // Reset the scratch buffer to the unfiltered recon, filter all
-            // non-skip chroma sub-blocks, then measure SSE over the whole plane.
-            tmp.copy_from_slice(recon);
-            for lby in 0..nby {
-                for lbx in 0..nbx {
-                    if skip8.get(lby * sb8w + lbx).copied().unwrap_or(true) {
-                        continue;
-                    }
-                    let cx = (lbx * 8) >> sub_x;
-                    let cy = (lby * 8) >> sub_y;
-                    if cx >= cw || cy >= ch {
-                        continue;
-                    }
-                    let ld = ldirs.get(lby * nbx + lbx).copied().unwrap_or(0);
-                    let dir = uv_dir[ld];
-                    cdef::cdef_filter_block(
-                        &mut tmp,
-                        recon,
-                        cw,
-                        cx,
-                        cy,
-                        cbw,
-                        cbh,
-                        pri << (bd - 8),
-                        sec << (bd - 8),
-                        dir,
-                        damping,
-                        bd,
-                    );
-                }
-            }
-            let mut sse = 0i64;
-            for y in (0..ch).step_by(8) {
-                for x in (0..cw).step_by(8) {
-                    sse += plane_block_sse(&tmp, src, cw, ch, x, y);
-                }
-            }
-            if sse < best_sse {
-                best_sse = sse;
-                best = (pri, sec);
-            }
+    for (&(pri, sec), &sse) in candidates.iter().zip(sses.iter()) {
+        if sse < best_sse {
+            best_sse = sse;
+            best = (pri, sec);
         }
     }
     best

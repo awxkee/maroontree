@@ -59,7 +59,7 @@ fn main() {
         &img,
     )
     .unwrap();
-    for i in 0..10 {
+    for i in 0..5 {
         let instant = Instant::now();
         let out = encode_rgb8(
             &planar_rgb,
@@ -68,7 +68,8 @@ fn main() {
                 .with_cicp(Cicp::srgb_ycbcr())
                 .with_chroma(ChromaFormat::Yuv420)
                 .with_speed(Speed::Fast)
-                .with_threads(6),
+                .with_threads(10)
+                .with_variance_boost(true)
         )
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
