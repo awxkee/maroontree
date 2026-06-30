@@ -180,9 +180,10 @@ pub(crate) fn cdef_direction(
 /// doesn't over-smooth them. Secondary strength is never adjusted.
 pub(crate) fn adjust_pri(pri: i32, var: i32) -> i32 {
     if var == 0 {
-        return pri;
+        return 0;
     }
-    let l = log2_floor(var).min(12);
+    let vs = var >> 6;
+    let l = if vs != 0 { log2_floor(vs).min(12) } else { 0 };
     (pri * (4 + l) + 8) >> 4
 }
 
@@ -204,6 +205,28 @@ pub(crate) fn cdef_filter_8x8(
     damping: i32,
     bd: u8,
 ) {
+    cdef_filter_block(dst, src, stride, x, y, 8, 8, pri, sec, dir, damping, bd);
+}
+
+/// CDEF filter over a `bw` x `bh` block at (x, y). 8x8 for luma and 4:4:4
+/// chroma; 4x8 for 4:2:2 chroma; 4x4 for 4:2:0 chroma. The taps, constrain, and
+/// clamping are identical regardless of block size — only the iteration bounds
+/// change — so this exactly mirrors the decoders' per-sub-block chroma filtering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cdef_filter_block(
+    dst: &mut [i32],
+    src: &[i32],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bw: usize,
+    bh: usize,
+    pri: i32,
+    sec: i32,
+    dir: usize,
+    damping: i32,
+    bd: u8,
+) {
     let coeff_shift = (bd - 8) as i32;
     // Primary damping uses the frame damping; secondary uses damping-1 (>=1).
     // The spec further lowers primary damping by log2(pri) inside constrain via
@@ -216,8 +239,8 @@ pub(crate) fn cdef_filter_8x8(
     let pri_taps = CDEF_PRI_TAPS[((pri >> coeff_shift) & 1) as usize];
     let maxv = (1i32 << bd) - 1;
     let rows = src.len() / stride;
-    for i in 0..8 {
-        for j in 0..8 {
+    for i in 0..bh {
+        for j in 0..bw {
             let cx = x + j;
             let cy = y + i;
             if cx >= stride || cy >= rows {

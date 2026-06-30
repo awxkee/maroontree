@@ -56,6 +56,7 @@ impl Av2Encoder {
                     qc,
                     neutral,
                     qstep: qstep_i,
+                    rdoq_lambda: _rdoq_lambda,
                 },
             ..
         } = ctx;
@@ -559,6 +560,7 @@ impl Av2Encoder {
                         qc,
                         neutral,
                         qstep: qstep_i,
+                        rdoq_lambda: self.tune.chroma_rdoq_lambda,
                     },
                 },
                 PartitionNeighbors {

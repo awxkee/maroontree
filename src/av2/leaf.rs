@@ -244,10 +244,13 @@ pub(super) fn encode_luma_sb(
     } else {
         0.0
     };
+    // Residual scratch reused across every (mode, angle) candidate of this SB,
+    // instead of allocating a fresh 1024-element buffer per candidate.
+    let resid_buf = std::cell::RefCell::new(vec![0f32; 1024]);
     // Encode one (mode, angle_delta) into `recy`, returning its TU coeffs and RD cost.
     let encode_mode =
         |recy: &mut [f32], m: usize, adelta: i32, lambda: f64| -> ([Vec<Coeff>; 4], f64) {
-            let mut resid = vec![0f32; 1024];
+            let mut resid = resid_buf.borrow_mut();
             let mut cost = 0f64;
             let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
             for (i, &(ty, tx)) in POS.iter().enumerate() {
@@ -255,18 +258,21 @@ pub(super) fn encode_luma_sb(
                 let pblk = predict_luma(recy, pw, width, height, i, y0, x0, m, adelta, neutral);
                 for r in 0..32 {
                     let base = (y0 + r) * pw + x0;
-                    for c in 0..32 {
-                        resid[r * 32 + c] = (yp[base + c] - pblk[r * 32 + c]) * resid_scale;
+                    let src = &yp[base..base + 32];
+                    let pred = &pblk[r * 32..r * 32 + 32];
+                    let dst = &mut resid[r * 32..r * 32 + 32];
+                    for ((d, &s), &p) in dst.iter_mut().zip(src).zip(pred) {
+                        *d = (s - p) * resid_scale;
                     }
                 }
                 let lev = if lambda > 0.0 {
                     // Trellis RDOQ: pick coefficient levels by real rate-distortion
                     // (rate = true coded bits), then RD-trim the EOB.
-                    let (mut l, prm) = luma.project_with_prm(&resid);
+                    let (mut l, prm) = luma.project_with_prm(&resid[..]);
                     cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
                     l
                 } else {
-                    let l = luma.project(&resid, 0.0);
+                    let l = luma.project(&resid[..], 0.0);
                     cost += l
                         .iter()
                         .filter(|&&v| v != 0.0)

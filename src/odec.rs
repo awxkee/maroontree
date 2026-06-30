@@ -63,6 +63,41 @@ pub(crate) fn update_cdf(cdf: &mut [u16], val: usize) {
 // Encoder
 // ----------------------------------------------------------------------------
 
+/// Encode-side inverse of the spec's `inverse_recenter(r, v)`. Maps an absolute
+/// value `v` in `0..n` to its recentred code so that values near the reference
+/// `r` get small codes (spec 4.10.8). This is the exact inverse used by
+/// `decode_unsigned_subexp_with_ref`.
+pub(crate) fn recenter_finite(n: u32, r: u32, v: u32) -> u32 {
+    // Mirror libaom's recenter_finite_nonneg.
+    if (r << 1) <= n {
+        recenter_nonneg(r, v)
+    } else {
+        recenter_nonneg(n - 1 - r, n - 1 - v)
+    }
+}
+
+/// `recenter_nonneg(r, v)`: zig-zag the difference `v - r` around 0.
+fn recenter_nonneg(r: u32, v: u32) -> u32 {
+    if v > (r << 1) {
+        v
+    } else if v >= r {
+        (v - r) << 1
+    } else {
+        ((r - v) << 1) - 1
+    }
+}
+
+/// Spec `inverse_recenter(r, v)` — the decode-side inverse of `recenter_nonneg`.
+pub(crate) fn inverse_recenter(r: u32, v: u32) -> u32 {
+    if v > (r << 1) {
+        v
+    } else if (v & 1) != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
 pub(crate) struct OdEcEncoder {
     low: u32,
     rng: u16,
@@ -158,6 +193,78 @@ impl OdEcEncoder {
     pub(crate) fn encode_symbol(&mut self, s: usize, cdf: &mut [u16]) {
         self.encode_symbol_noupdate(s, cdf);
         update_cdf(cdf, s);
+    }
+
+    /// `ns(n)` — non-symmetric flat coding of a value in `0..n` (spec 4.10.7).
+    /// Uses `floor(log2(n))` or that+1 bits so the code is as short as possible.
+    pub(crate) fn encode_ns(&mut self, v: u32, n: u32) {
+        if n <= 1 {
+            return;
+        }
+        let w = (32 - (n - 1).leading_zeros()).max(1); // ceil(log2(n)) bits max
+        let m = (1u32 << w) - n;
+        if v < m {
+            // (w-1)-bit literal
+            self.encode_literal(v, w - 1);
+        } else {
+            // w-bit literal of (v + m), MSB first
+            let coded = v + m;
+            // emit high w-1 bits then the low bit (matches spec NS read order)
+            self.encode_literal(coded >> 1, w - 1);
+            self.encode_bool((coded & 1) == 1, 16384);
+        }
+    }
+
+    /// `decode_subexp(numSyms, k)` inverse: encode `v` in `0..num_syms` with the
+    /// sub-exponential scheme (spec 4.10.6). `k` is the initial exponent; Wiener
+    /// taps use per-tap `k` from `Wiener_Taps_K`, not a fixed 3.
+    pub(crate) fn encode_subexp(&mut self, v: u32, num_syms: u32, k: u32) {
+        let mut i = 0u32;
+        let mut mk = 0u32;
+        loop {
+            let b2 = if i != 0 { k + i - 1 } else { k };
+            let a = 1u32 << b2;
+            if num_syms <= mk + 3 * a {
+                // final: ns(numSyms - mk) of (v - mk)
+                self.encode_ns(v - mk, num_syms - mk);
+                return;
+            } else if v < mk + a {
+                // subexp_more_bits = 0, then b2-bit literal of (v - mk)
+                self.encode_bool(false, 16384);
+                self.encode_literal(v - mk, b2);
+                return;
+            } else {
+                // subexp_more_bits = 1, advance
+                self.encode_bool(true, 16384);
+                i += 1;
+                mk += a;
+            }
+        }
+    }
+
+    /// `decode_unsigned_subexp_with_ref(mx, k, r)` inverse. Encodes `v` in
+    /// `0..mx` relative to reference `r` (spec 4.10.8).
+    pub(crate) fn encode_unsigned_subexp_with_ref(&mut self, v: u32, mx: u32, k: u32, r: u32) {
+        // The spec recentres v around r so small deltas are cheap, then codes
+        // the recentred value with encode_subexp over `mx` symbols.
+        let recentered = recenter_finite(mx, r, v);
+        self.encode_subexp(recentered, mx, k);
+    }
+
+    /// `decode_signed_subexp_with_ref(low, high, k, r)` inverse. Encodes `v` in
+    /// `[low, high)` relative to reference `r`.
+    pub(crate) fn encode_signed_subexp_with_ref(
+        &mut self,
+        v: i32,
+        low: i32,
+        high: i32,
+        k: u32,
+        r: i32,
+    ) {
+        let x = (v - low) as u32;
+        let mx = (high - low) as u32;
+        let rr = (r - low) as u32;
+        self.encode_unsigned_subexp_with_ref(x, mx, k, rr);
     }
 
     /// Flush and return the coded bytes.
@@ -266,6 +373,60 @@ impl<'a> OdEcDecoder<'a> {
         v
     }
 
+    /// `ns(n)` decode (spec 4.10.7).
+    pub(crate) fn decode_ns(&mut self, n: u32) -> u32 {
+        if n <= 1 {
+            return 0;
+        }
+        let w = (32 - (n - 1).leading_zeros()).max(1);
+        let m = (1u32 << w) - n;
+        let v = self.decode_literal(w - 1);
+        if v < m {
+            v
+        } else {
+            let extra = self.decode_bool(16384) as u32;
+            (v << 1) - m + extra
+        }
+    }
+
+    /// `decode_subexp(numSyms, k)` (spec 4.10.6).
+    pub(crate) fn decode_subexp(&mut self, num_syms: u32, k: u32) -> u32 {
+        let mut i = 0u32;
+        let mut mk = 0u32;
+        loop {
+            let b2 = if i != 0 { k + i - 1 } else { k };
+            let a = 1u32 << b2;
+            if num_syms <= mk + 3 * a {
+                return self.decode_ns(num_syms - mk) + mk;
+            } else if self.decode_bool(16384) {
+                i += 1;
+                mk += a;
+            } else {
+                return self.decode_literal(b2) + mk;
+            }
+        }
+    }
+
+    pub(crate) fn decode_unsigned_subexp_with_ref(&mut self, mx: u32, k: u32, r: u32) -> u32 {
+        let v = self.decode_subexp(mx, k);
+        if (r << 1) <= mx {
+            inverse_recenter(r, v)
+        } else {
+            mx - 1 - inverse_recenter(mx - 1 - r, v)
+        }
+    }
+
+    pub(crate) fn decode_signed_subexp_with_ref(
+        &mut self,
+        low: i32,
+        high: i32,
+        k: u32,
+        r: i32,
+    ) -> i32 {
+        let x = self.decode_unsigned_subexp_with_ref((high - low) as u32, k, (r - low) as u32);
+        x as i32 + low
+    }
+
     pub(crate) fn decode_symbol_noupdate(&mut self, cdf: &[u16]) -> usize {
         let r = self.rng as u32;
         let n = cdf.len() as u32 - 1;
@@ -331,6 +492,33 @@ mod tests {
             (false, 3),
         ] {
             assert_eq!(r.decode_bool(f), v);
+        }
+    }
+
+    #[test]
+    fn subexp_with_ref_roundtrip() {
+        // Wiener tap ranges: (min, max, mid, k) per coded tap, both axes.
+        let ranges = [
+            (-5i32, 11i32, 3i32, 1u32),
+            (-23, 9, -7, 2),
+            (-17, 47, 15, 3),
+        ];
+        let mut rng = Rng(123);
+        let mut enc = OdEcEncoder::new();
+        let mut cases = Vec::new();
+        for _ in 0..20_000 {
+            let idx = (rng.next() % 3) as usize;
+            let (lo, hi, mid, k) = ranges[idx];
+            let span = (hi - lo) as u64;
+            let v = lo + (rng.next() % span) as i32;
+            let r = mid;
+            enc.encode_signed_subexp_with_ref(v, lo, hi, k, r);
+            cases.push((v, lo, hi, k, r));
+        }
+        let bytes = enc.done();
+        let mut dec = OdEcDecoder::new(&bytes);
+        for (v, lo, hi, k, r) in cases {
+            assert_eq!(dec.decode_signed_subexp_with_ref(lo, hi, k, r), v);
         }
     }
 

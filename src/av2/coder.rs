@@ -492,6 +492,174 @@ pub(crate) fn rdoq_luma(
     total_bits
 }
 
+/// Estimated bits to code a chroma coefficient of magnitude `level` at the given
+/// context, matching `encode_chroma_tokens_scan`. The chroma frequency split is
+/// simply DC (`is_dc`, scan position 0) vs. everything-else (high-frequency); the
+/// base-range tail always uses the chroma HF BR table. ~1-bit sign for nonzero
+/// levels.
+fn chroma_level_bits(
+    level: u32,
+    is_eob: bool,
+    is_dc: bool,
+    base_ctx: usize,
+    hi_range_ctx: usize,
+    qc: usize,
+) -> f64 {
+    let mut bits = if is_dc {
+        if is_eob {
+            // sym_chr_eob_lf (4 syms): mag-1 for mag<=4, else saturate at 4 + tail.
+            if level <= 4 {
+                tok_cost(&CHROMA_EOB_TOK_LF_QC[qc][0], (level - 1) as usize)
+            } else {
+                tok_cost(&CHROMA_EOB_TOK_LF_QC[qc][0], 4)
+                    + chroma_base_range_bits(level, hi_range_ctx, true, qc)
+            }
+        } else if level <= 4 {
+            tok_cost(&CHROMA_BASE_TOK_LF_QC[qc][base_ctx], level as usize)
+        } else {
+            tok_cost(&CHROMA_BASE_TOK_LF_QC[qc][base_ctx], 5)
+                + chroma_base_range_bits(level, hi_range_ctx, true, qc)
+        }
+    } else if is_eob {
+        // sym_chr_eob_hf (2 syms): mag-1 for mag<=2, else saturate at 2 + tail.
+        // The HF EOB context (1 + (eob>th1) + (eob>th2)) is folded into base_ctx
+        // by the caller.
+        if level <= 2 {
+            tok_cost(&CHROMA_EOB_TOK_HF_QC[qc][base_ctx], (level - 1) as usize)
+        } else {
+            tok_cost(&CHROMA_EOB_TOK_HF_QC[qc][base_ctx], 2)
+                + chroma_base_range_bits(level, hi_range_ctx, false, qc)
+        }
+    } else if level <= 2 {
+        tok_cost(&CHROMA_BASE_TOK_HF_QC[qc][base_ctx], level as usize)
+    } else {
+        tok_cost(&CHROMA_BASE_TOK_HF_QC[qc][base_ctx], 3)
+            + chroma_base_range_bits(level, hi_range_ctx, false, qc)
+    };
+    if level > 0 {
+        bits += 1.0;
+    }
+    bits
+}
+
+/// Chroma high-range residual bits: the chroma BR symbol (limit 3, HF BR table)
+/// plus the adaptive-Rice/Golomb tail for magnitudes beyond `max_base_range`
+/// (5 for DC, 6 for HF — the threshold the sign pass uses for `encode_high_range`).
+fn chroma_base_range_bits(level: u32, hi_range_ctx: usize, is_dc: bool, qc: usize) -> f64 {
+    let over = level - 3; // BR symbol residual (max_base_range for the BR symbol is 3)
+    let bits = if over <= 2 {
+        tok_cost(&CHROMA_BR_TOK_HF_QC[qc][hi_range_ctx], over as usize)
+    } else {
+        tok_cost(&CHROMA_BR_TOK_HF_QC[qc][hi_range_ctx], 3)
+    };
+    // Adaptive-Rice tail beyond the sign-pass threshold.
+    let max_base_range = if is_dc { 5u32 } else { 6u32 };
+    if level >= max_base_range {
+        bits + rice_tail_bits(level - max_base_range)
+    } else {
+        bits
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rdoq_chroma(
+    prm: &[f32],
+    lev: &mut [f32],
+    qc: usize,
+    scan: &[u16],
+    area: usize,
+    plane_offset: usize,
+    lambda: f64,
+) -> f64 {
+    let n = lev.len();
+    let mut eob = 0usize;
+    for (k, &l) in lev[..n].iter().enumerate() {
+        if l != 0.0 {
+            eob = k;
+        }
+    }
+    if lev[eob] == 0.0 {
+        return 0.0;
+    }
+    let (th1, th2) = (area / 8, area / 4);
+    let mut levels = vec![0i32; PLVL_BUF];
+
+    // Context for a coefficient at scan position `k`. For EOB the chroma model
+    // uses a fixed DC context (0) or the HF eob-position bucket; for non-EOB it
+    // uses the neighbour-level chroma context (with the U/V plane offset folded in
+    // by `chroma_coeff_context`).
+    let ctx_at = |levels: &[i32], k: usize, is_eob: bool, is_dc: bool| -> (usize, usize) {
+        if is_eob {
+            if is_dc {
+                (0, 0)
+            } else {
+                (1 + (k > th1) as usize + (k > th2) as usize, 0)
+            }
+        } else {
+            let rc = scan[k] as i32;
+            chroma_coeff_context(levels, rc, (rc >> 5) + (rc & 31), plane_offset)
+        }
+    };
+    let store = |levels: &mut [i32], k: usize, mag: i32| {
+        let rc = scan[k] as i32;
+        levels[plvl(rc) as usize] = mag.min(5);
+    };
+
+    // Phase A: per-coefficient magnitude RD (EOB fixed).
+    let mut total_bits = 0.0f64;
+    for k in (0..=eob).rev() {
+        let is_eob = k == eob;
+        let is_dc = k == 0;
+        let a = prm[k] as f64;
+        let q = lev[k].abs() as u32;
+        let (bc, hc) = ctx_at(&levels, k, is_eob, is_dc);
+        let lo = if is_eob { 1u32 } else { 0u32 };
+        let hi = q.max(lo);
+        let mut best_l = hi;
+        let mut best_cost = f64::INFINITY;
+        for l in lo..=hi {
+            let d = (a - l as f64) * (a - l as f64);
+            let r = chroma_level_bits(l, is_eob, is_dc, bc, hc, qc);
+            let cost = d + lambda * r;
+            if cost < best_cost {
+                best_cost = cost;
+                best_l = l;
+            }
+        }
+        lev[k] = best_l as f32 * lev[k].signum();
+        store(&mut levels, k, best_l as i32);
+        total_bits += chroma_level_bits(best_l, is_eob, is_dc, bc, hc, qc);
+    }
+
+    // Phase B: EOB RD-trim — drop trailing nonzero coefficients while the bit
+    // saving outweighs the distortion of zeroing them.
+    loop {
+        let mut last = None;
+        for (k, &l) in lev[..=eob].iter().enumerate() {
+            if l != 0.0 {
+                last = Some(k);
+            }
+        }
+        let Some(p) = last else { break };
+        if p == 0 {
+            break;
+        }
+        let is_dc = p == 0;
+        let (bc, hc) = ctx_at(&levels, p, true, is_dc);
+        let a = prm[p] as f64;
+        let drop_bits = chroma_level_bits(lev[p].abs() as u32, true, is_dc, bc, hc, qc);
+        if lambda * drop_bits > a * a {
+            lev[p] = 0.0;
+            let rc = scan[p] as i32;
+            levels[plvl(rc) as usize] = 0;
+            total_bits -= drop_bits;
+        } else {
+            break;
+        }
+    }
+    total_bits
+}
+
 fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
     coeffs
         .iter()
@@ -526,6 +694,69 @@ pub(crate) fn emit_delta_q(enc: &mut RangeEncoder, signaled: i32) {
 /// Consume a pending per-SB delta-Q: if the caller armed `delta_q_pending` and
 /// the frame enables delta-Q, emit the SB's symbol and disarm. Call immediately
 /// after the leaf's partition bit, before the luma mode.
+/// Consume a pending per-SB CCSO flag. Mirrors AVM `write_ccso` for the U plane:
+/// emitted after the partition bit and before delta-Q, once per SB. Phase 1 always
+/// filters (blk_idc = 1). The context is derived the way `av2_get_ccso_context`
+/// does for the SB's top-left block: `above`/`above-right` neighbours are excluded
+/// at the SB top boundary, so only the left/bottom-left neighbours (both in the SB
+/// to the left, hence same-SB) contribute. With every SB filtered this collapses to
+/// ctx = 0 in the first column (no left neighbour) and ctx = 2 elsewhere.
+pub(crate) fn maybe_emit_ccso(enc: &mut RangeEncoder) {
+    if enc.ccso_pending && (enc.ccso_u_enable || enc.ccso_v_enable) {
+        let (r, c) = enc.ccso_sb_rc;
+        let cols = enc.ccso_cols;
+        // Per-SB decision. When a decision grid is present (Phase 3 RD pass), read
+        // the chosen flag for this SB; otherwise filter every SB (Phase 2 all-on).
+        // The bitstream context depends only on the LEFT SB's decision: at the SB
+        // top boundary the above/above-right neighbours are excluded, leaving the
+        // left/bottom-left neighbours (both in the left SB). So col 0 => ctx 0;
+        // col > 0 => left_on ? 2 : 0. (U and V carry independent grids.)
+        let grid_u = &enc.ccso_grid;
+        let idx = r * cols + c;
+        let u_on = if enc.ccso_u_enable {
+            if grid_u.is_empty() {
+                1
+            } else {
+                grid_u[idx] as usize
+            }
+        } else {
+            0
+        };
+        let v_on = if enc.ccso_v_enable {
+            if enc.ccso_grid_v.is_empty() {
+                1
+            } else {
+                enc.ccso_grid_v[idx] as usize
+            }
+        } else {
+            0
+        };
+        if enc.ccso_u_enable {
+            let left = if c == 0 {
+                0
+            } else if grid_u.is_empty() {
+                1
+            } else {
+                grid_u[idx - 1] as usize
+            };
+            let ctx = if c == 0 { 0 } else if left != 0 { 2 } else { 0 };
+            enc.sym_ccso(1, ctx, u_on);
+        }
+        if enc.ccso_v_enable {
+            let left = if c == 0 {
+                0
+            } else if enc.ccso_grid_v.is_empty() {
+                1
+            } else {
+                enc.ccso_grid_v[idx - 1] as usize
+            };
+            let ctx = if c == 0 { 0 } else if left != 0 { 2 } else { 0 };
+            enc.sym_ccso(2, ctx, v_on);
+        }
+        enc.ccso_pending = false;
+    }
+}
+
 pub(crate) fn maybe_emit_delta_q(enc: &mut RangeEncoder) {
     if enc.delta_q_present && enc.delta_q_pending {
         emit_delta_q(enc, enc.delta_q_signaled);
@@ -621,6 +852,7 @@ pub(crate) fn encode_intra_modes_dir(
     if let Some(cdf) = partition_cdf {
         enc.bool_do_split(cdf, 0);
     }
+    maybe_emit_ccso(enc);
     maybe_emit_delta_q(enc);
     #[allow(clippy::needless_late_init)]
     let midx;
@@ -691,7 +923,10 @@ pub(crate) fn encode_intra_modes_dir(
         // DC chroma. uv_mode_ctx = (luma is directional); with ctx=1 the DC index
         // is shifted by one ("slot 0" encodes same-as-luma).
         let uv_ctx = (midx != NO_MIDX) as usize;
-        let uv_idx = uv_ctx; // DC = REORDERED_NONDIR[0]; idx = uv_ctx + 0
+        // Reordered chroma list: ctx==1 (directional luma) is
+        // [luma_mode, DC, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH, ...] so non-CfL chroma
+        // modes sit at index (uv_ctx + internal_mode): DC=uv_ctx, SMOOTH=uv_ctx+1, ...
+        let uv_idx = uv_ctx + enc.uv_mode;
         enc.sym_uv_mode(uv_ctx, uv_idx, 7);
     }
     midx
@@ -711,6 +946,7 @@ fn encode_intra_modes(
     if let Some(cdf) = partition_cdf {
         enc.bool_do_split(cdf, 0);
     }
+    maybe_emit_ccso(enc);
     maybe_emit_delta_q(enc);
     if lossless {
         // Lossless intra reads use_dpcm_y (dpcm_cdf, AVM_CDF2(16384)) before the luma
@@ -749,8 +985,12 @@ fn encode_intra_modes(
             }
             enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 0);
         }
-        // intra_uv_mode = 0 (DC chroma); uv_mode_cdf[context=0] (non-directional luma).
-        enc.sym_uv_mode(0, 0, 7);
+        // Chroma uv-mode. Co-located luma here is non-directional, so the
+        // reordered chroma list is [DC, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH, ...]
+        // and ctx = 0. The internal mode numbering (0=DC,1=SMOOTH,2=SMOOTH_V,
+        // 3=SMOOTH_H,4=PAETH) maps directly onto that list index.
+        let uv_idx = enc.uv_mode;
+        enc.sym_uv_mode(0, uv_idx, 7);
     }
 }
 

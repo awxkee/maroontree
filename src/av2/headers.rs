@@ -10,16 +10,45 @@ pub(crate) struct GuidedDeblock {
     pub(crate) scale_minus_one: u32,
 }
 
+/// CCSO (cross-component sample offset) frame parameters. Phase 2 supports U and V
+/// planes, in either band-offset-only or edge-classified mode.
+#[derive(Clone)]
+pub(crate) struct CcsoPlane {
+    /// false = edge-classified mode, true = band-offset-only.
+    pub(crate) bo_only: bool,
+    pub(crate) scale_idx: u8,
+    pub(crate) quant_idx: u8,
+    pub(crate) ext_filter_support: u8,
+    pub(crate) edge_clf: u8,
+    pub(crate) max_band_log2: u8,
+    /// Raw `ccso_offset` value per LUT entry. For bo_only, indexed by band
+    /// (`band << 4`); for edge mode, indexed `(band << 4) + (c0 << 2) + c1`.
+    pub(crate) offsets: Vec<i32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CcsoConfig {
+    /// Per-plane enable: index 0 = Y, 1 = U, 2 = V.
+    pub(crate) enable: [bool; 3],
+    /// Per-plane params (only meaningful where `enable[plane]`).
+    pub(crate) planes: [Option<CcsoPlane>; 3],
+}
+
 /// Top-level encoder configuration shared by the header builders.
+#[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) layout: Layout,
     pub(crate) base_q: u32,
     pub(crate) deblock: bool,
-    pub(crate) delta_q: i32,
+    pub(crate) db_apply: (bool, bool, bool, bool),
+    pub(crate) db_delta: (i32, i32, i32, i32),
     pub(crate) tx_switchable: bool,
     pub(crate) guided_deblock: Option<GuidedDeblock>,
     /// In-loop CDEF.
     pub(crate) cdef: Option<(u8, u8, u8)>,
+    /// CCSO (cross-component sample offset). `Some((plane_enables, blk_size_is_sb,
+    /// offsets))` when enabled. Phase 1: U plane only, band-offset-only mode.
+    pub(crate) ccso: Option<CcsoConfig>,
     /// Coded bit depth: 8, 10 or 12.
     pub(crate) bit_depth: u8,
     pub(crate) lossless: bool,
@@ -135,8 +164,13 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     } else {
         b.write_bit(0);
     }
-    b.write_bit(0);
-    b.write_bit(0); // restoration, ccso
+    b.write_bit(0); // enable_restoration
+    if config.ccso.is_some() {
+        b.write_bit(1); // enable_ccso
+        b.write_bit(1); // ccso_unit_matches_sb_size = 1 (CCSO unit == 64px SB)
+    } else {
+        b.write_bit(0); // enable_ccso
+    }
     b.write_bits(0, 2);
     b.write_bit(0);
     b.write_bit(0);
@@ -232,20 +266,38 @@ pub(crate) fn frame_header(
     }
 
     if config.deblock {
-        b.write_bit(1);
-        b.write_bit(1); // luma deblock levels (V, H)
+        // AV2 setup_loopfilter syntax. df_par_bits = df_par_bits_minus2 + 2 = 2
+        // (the sequence header writes df_par_bits_minus2 = 0), so df_par_offset = 2
+        // and each signaled delta is a 2-bit literal in [-2, 1].
+        let (av, ah, au, avv) = config.db_apply;
+        let (dy0, dy1, du, dv) = config.db_delta;
+        const DF_PAR_BITS: u32 = 2;
+        const DF_PAR_OFFSET: i32 = 1 << (DF_PAR_BITS - 1); // 2
+        let write_delta = |b: &mut ByteWriter, on: bool, delta: i32| {
+            if on {
+                if delta != 0 {
+                    b.write_bit(1);
+                    b.write_bits((delta + DF_PAR_OFFSET) as u32, DF_PAR_BITS);
+                } else {
+                    b.write_bit(0);
+                }
+            }
+        };
+        b.write_bit(av as u32); // apply_deblocking_filter[0] (vertical edges)
+        b.write_bit(ah as u32); // apply_deblocking_filter[1] (horizontal edges)
         if has_chroma {
-            b.write_bit(0);
-            b.write_bit(0); // chroma deblock levels (U, V)
+            if av || ah {
+                b.write_bit(au as u32); // apply_deblocking_filter_u
+                b.write_bit(avv as u32); // apply_deblocking_filter_v
+            }
         }
-        if config.delta_q != 0 {
-            b.write_bit(1);
-            b.write_bits(((config.delta_q + 2) as u32) & 3, 2);
-            b.write_bit(0); // reuse for the second luma level
-        } else {
-            b.write_bit(0);
-            b.write_bit(0);
-        }
+        // Per-direction luma deltas (delta_side mirrors delta_q). Direction 0's
+        // "no delta" means 0; direction 1's "no delta" means reuse direction 0.
+        write_delta(&mut b, av, dy0);
+        write_delta(&mut b, ah, dy1);
+        // Chroma deltas.
+        write_delta(&mut b, has_chroma && (av || ah) && au, du);
+        write_delta(&mut b, has_chroma && (av || ah) && avv, dv);
     } else {
         b.write_bit(0);
         b.write_bit(0);
@@ -274,6 +326,69 @@ pub(crate) fn frame_header(
         wstr(y_str);
         if has_chroma {
             wstr(uv_str);
+        }
+    }
+    // CCSO frame params (setup_ccso). single_picture_header_flag => ccso_frame_flag
+    // is implied 1 (no bit). Intra-only => no reuse bits. Each enabled plane writes
+    // bo_only (1b), scale_idx (2b), then either max_band_log2 (3b) for bo_only, or
+    // quant_idx (2b) + ext_filter_support (3b) + [edge_clf (1b) when quant_sz != 0] +
+    // max_band_log2 (2b) for edge mode; followed by the offset LUT (unary indices).
+    if let Some(cc) = &config.ccso {
+        const CCSO_OFFSET: [i32; 8] = [0, 1, -1, 3, -3, 7, -7, -10];
+        // quant_sz[scale][quant]: a zero entry means edge_clf is implied 0 (no bit).
+        const QUANT_SZ: [[u16; 4]; 4] = [
+            [16, 8, 32, 0],
+            [56, 40, 64, 128],
+            [48, 24, 96, 192],
+            [80, 112, 160, 256],
+        ];
+        const EDGE_INTERVAL: [usize; 2] = [3, 2];
+        let write_off = |b: &mut ByteWriter, raw: i32| {
+            let idx = CCSO_OFFSET.iter().position(|&v| v == raw).unwrap_or(0);
+            for i in 0..7 {
+                b.write_bit((idx != i) as u32);
+                if idx == i {
+                    break;
+                }
+            }
+        };
+        let num_planes = if has_chroma { 3 } else { 1 };
+        for plane in 0..num_planes {
+            b.write_bit(cc.enable[plane] as u32);
+            if !cc.enable[plane] {
+                continue;
+            }
+            let p = cc.planes[plane]
+                .as_ref()
+                .expect("enabled CCSO plane must carry params");
+            b.write_bit(p.bo_only as u32);
+            b.write_bits(p.scale_idx as u32, 2);
+            if p.bo_only {
+                b.write_bits(p.max_band_log2 as u32, 3);
+                let max_band = 1usize << p.max_band_log2;
+                for band in 0..max_band {
+                    let off = p.offsets.get(band << 4).copied().unwrap_or(0);
+                    write_off(&mut b, off);
+                }
+            } else {
+                b.write_bits(p.quant_idx as u32, 2);
+                b.write_bits(p.ext_filter_support as u32, 3);
+                if QUANT_SZ[p.scale_idx as usize][p.quant_idx as usize] != 0 {
+                    b.write_bit(p.edge_clf as u32);
+                }
+                b.write_bits(p.max_band_log2 as u32, 2);
+                let max_band = 1usize << p.max_band_log2;
+                let ni = EDGE_INTERVAL[p.edge_clf as usize];
+                for d0 in 0..ni {
+                    for d1 in 0..ni {
+                        for band in 0..max_band {
+                            let lut = (band << 4) + (d0 << 2) + d1;
+                            let off = p.offsets.get(lut).copied().unwrap_or(0);
+                            write_off(&mut b, off);
+                        }
+                    }
+                }
+            }
         }
     }
     b.write_bit(if config.tx_switchable { 1 } else { 0 }); // txfm_mode: 1=SWITCHABLE

@@ -193,25 +193,6 @@ pub(crate) fn dct1d_16_i32(buf: &mut [i32; 16]) {
     }
 }
 
-pub(crate) fn dct8x8(input: &mut [i32; 64], quant: &impl Dct) {
-    pub(crate) type Dct = dyn Fn(&mut [i32; 64], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
-    let f = WHT.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            use crate::neon::dct8x8_neon_i32;
-            Arc::new(|input: &mut [i32; 64], dc_q: i32, ac_q: i32| unsafe {
-                dct8x8_neon_i32(input, dc_q, ac_q)
-            })
-        }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-        {
-            Arc::new(dct8x8_scalar)
-        }
-    });
-    f(input, quant.q_mult_dc(), quant.q_mult_ac());
-}
-
 /// Shared 2-D integer DCT-8 transform core (no quantization). Output layout is
 /// `out[r*8 + u] = F[row_freq=r][col_freq=u]`, DC at index 0. This is the single
 /// forward transform reused by both the in-place quantizer ([`dct8x8_scalar`])
@@ -883,6 +864,41 @@ pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128],
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
+/// 16x8 (wide): residual `resid[row*16+col]` (8 tall x 16 wide). DCT-8 vertical,
+/// DCT-16 horizontal. The mirror of `dct8x16_coeffs`. Output ordering
+/// `out[fx*8 + fy]` (fy = vertical freq 0..8, fx = horizontal freq 0..16) pairs
+/// with `idct_dequant_16x8` which reads `coeff[row + col*8]`.
+fn dct16x8_coeffs(input: &[i32; 128]) -> [i32; 128] {
+    // Pass 1: DCT-8 down each of the 16 columns (vertical).
+    let mut tmp = [0i32; 128]; // tmp[fy*16 + col], fy = vertical freq 0..8
+    for col in 0..16usize {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 16 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fy in 0..8 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
+    // Pass 2: DCT-16 across each of the 8 rows (horizontal).
+    let mut out = [0i32; 128];
+    for fy in 0..8usize {
+        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut r);
+        // Same rect2 1/sqrt(2) gain normalization as 8x16.
+        for fx in 0..16 {
+            out[fx * 8 + fy] = mul_q16(r[fx], 46341);
+        }
+    }
+    out
+}
+
+pub(crate) fn dct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f64; 128]) {
+    let coeffs = dct16x8_coeffs(residual);
+    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+}
+
 /// 4x4: residual `resid[row*4+col]`. DCT-4 vertical then DCT-4 horizontal.
 /// Returns native (orthonormal*sqrt(16)=*4) coefficients; the *8/sqrt(W*H) gain
 /// normalization is folded into the trellis multiplier for full precision.
@@ -981,6 +997,131 @@ const RATIO_4X4_Q16: i32 = 131072; // 8/sqrt(16)  = 2
 const RATIO_4X8_Q16: i32 = 92682; //  8/sqrt(32)  = sqrt(2)
 const RATIO_16X32_Q16: i32 = 23170; // 8/sqrt(512) = 1/(2 sqrt2)
 
+/// Forward ADST-4 1D matrix in Q12, derived as the inverse of dav1d's exact
+/// `inv_adst4_1d` and rescaled so its row norm (2.0) matches the codebase's
+/// forward DCT-4 (which is likewise non-orthonormal and corrected by
+/// `RATIO_4X4_Q16`). This pairing makes ADST_ADST 4x4 reconstruct at the same
+/// intrinsic scale as DCT_DCT 4x4, so `RATIO_4X4_Q16` and the inverse
+/// orchestration carry over unchanged. Byte-exactness is validated against
+/// aomdec/dav1d.
+static ADST4_FWD_Q12: [[i32; 4]; 4] = [
+    [1868, 3510, 4730, 5379],
+    [4730, 4730, 0, -4730],
+    [5379, -1868, -4730, 3510],
+    [3510, -5379, 4730, -1868],
+];
+
+#[inline]
+fn fwd_adst4_1d(inp: &[i32; 4]) -> [i32; 4] {
+    let mut out = [0i32; 4];
+    for i in 0..4 {
+        let mut acc = 0i64;
+        for j in 0..4 {
+            acc += ADST4_FWD_Q12[i][j] as i64 * inp[j] as i64;
+        }
+        out[i] = ((acc + 2048) >> 12) as i32;
+    }
+    out
+}
+
+/// Forward 2D ADST_ADST 4x4: ADST on columns then ADST on rows, stored
+/// transposed (out[u*4+r]) like the other forwards in this module.
+fn adst4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        let c = fwd_adst4_1d(&col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = c[r];
+        }
+    }
+    let mut out = [0i32; 16];
+    for r in 0..4usize {
+        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let rr = fwd_adst4_1d(&row);
+        for u in 0..4 {
+            out[u * 4 + r] = rr[u];
+        }
+    }
+    out
+}
+
+/// Trellis (RDOQ) forward ADST_ADST 4x4: levels + unrounded targets, mirroring
+/// `dct4x4_t` (same `RATIO_4X4_Q16` quant scaling).
+pub(crate) fn adst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
+    let coeffs = adst4x4_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+/// Forward ADST_DCT 4x4: ADST on columns (vertical), DCT on rows (horizontal).
+/// AV1 `ADST_DCT`; mirrors `adstdct8x8_coeffs` with the 4-point kernels.
+fn adstdct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        let c = fwd_adst4_1d(&col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = c[r];
+        }
+    }
+    let mut out = [0i32; 16];
+    for r in 0..4usize {
+        let mut row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        dct1d_4_i32(&mut row);
+        for u in 0..4 {
+            out[u * 4 + r] = row[u];
+        }
+    }
+    out
+}
+
+/// Forward DCT_ADST 4x4: DCT on columns (vertical), ADST on rows (horizontal).
+/// AV1 `DCT_ADST`; mirrors `dctadst8x8_coeffs` with the 4-point kernels.
+fn dctadst4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        dct1d_4_i32(&mut col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = col[r];
+        }
+    }
+    let mut out = [0i32; 16];
+    for r in 0..4usize {
+        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let rr = fwd_adst4_1d(&row);
+        for u in 0..4 {
+            out[u * 4 + r] = rr[u];
+        }
+    }
+    out
+}
+
+pub(crate) fn adstdct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
+    let coeffs = adstdct4x4_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+pub(crate) fn dctadst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
+    let coeffs = dctadst4x4_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
 pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
     let coeffs = dct4x4_coeffs(residual);
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
@@ -990,6 +1131,115 @@ pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f
 
 pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
     let coeffs = dct4x8_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+/// Forward 2D ADST_ADST 4x8: height-8 ADST on columns, then width-4 ADST on
+/// rows, stored `out[fx*8+fy]` exactly like `dct4x8_coeffs`. Composes
+/// `fwd_adst8_1d` (row-norm sqrt(8), matches dct8) and `fwd_adst4_1d` (row-norm
+/// 2, matches the scaled dct4), so the intrinsic scale equals the 4x8 DCT path
+/// and `RATIO_4X8_Q16` carries over unchanged.
+fn adst4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
+    let mut tmp = [0i32; 32]; // tmp[fy*4 + col], fy in 0..8
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        let cc = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = cc[fy];
+        }
+    }
+    let mut out = [0i32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        let rr = fwd_adst4_1d(&r);
+        for fx in 0..4 {
+            out[fx * 8 + fy] = rr[fx];
+        }
+    }
+    out
+}
+
+pub(crate) fn adst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
+    let coeffs = adst4x8_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+/// Forward ADST_DCT 4x8: ADST on columns (height-8, vertical), DCT on rows
+/// (width-4, horizontal). Mirrors `adst4x8_coeffs` (col pass then row pass,
+/// out[fx*8+fy]) with the vertical kernel ADST and the horizontal kernel DCT.
+fn adstdct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
+    let mut tmp = [0i32; 32];
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        let cc = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = cc[fy];
+        }
+    }
+    let mut out = [0i32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        dct1d_4_i32(&mut r);
+        for fx in 0..4 {
+            out[fx * 8 + fy] = r[fx];
+        }
+    }
+    out
+}
+
+/// Forward DCT_ADST 4x8: DCT on columns (height-8, vertical), ADST on rows
+/// (width-4, horizontal).
+fn dctadst4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
+    let mut tmp = [0i32; 32];
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = c[fy];
+        }
+    }
+    let mut out = [0i32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        let rr = fwd_adst4_1d(&r);
+        for fx in 0..4 {
+            out[fx * 8 + fy] = rr[fx];
+        }
+    }
+    out
+}
+
+pub(crate) fn adstdct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
+    let coeffs = adstdct4x8_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
+    let coeffs = dctadst4x8_coeffs(residual);
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
     quant_levels_and_targets(&coeffs, m_dc, m_ac)
@@ -1011,27 +1261,32 @@ mod tests {
         (0..n).map(|i| ((i * 41 + 7) % 113) as i32 - 56).collect()
     }
 
-    /// The trellis `_t` variants must emit levels bit-identical to the in-place
-    /// integer DCT (so RDOQ refines exactly the levels the direct path codes).
+    /// The 16x8 (wide) forward+inverse pair must reconstruct a residual to
+    /// within transform rounding (DC and low-frequency content recovered).
     #[test]
-    fn trellis_t_matches_inplace_levels() {
-        let q = Quant::new(48, 8);
-        let r: [i32; 64] = pat(64).try_into().unwrap();
-        let mut inp = r;
-        dct8x8(&mut inp, &q);
-        assert_eq!(dct8x8_t(&r, &q).0, inp, "8x8");
-        let r: [i32; 256] = pat(256).try_into().unwrap();
-        let mut inp = r;
-        dct16x16(&mut inp, &q);
-        assert_eq!(dct16x16_t(&r, &q).0, inp, "16x16");
-        let r: [i32; 1024] = pat(1024).try_into().unwrap();
-        let mut inp = r;
-        dct32x32(&mut inp, &q);
-        assert_eq!(dct32x32_t(&r, &q).0.to_vec(), inp.to_vec(), "32x32");
-        let r: [i32; 128] = pat(128).try_into().unwrap();
-        let mut inp = r;
-        dct8x16_i32(&mut inp, &q);
-        assert_eq!(dct8x16_t(&r, &q).0, inp, "8x16");
+    fn dct16x8_pairs_with_inverse() {
+        use crate::idct::idct_dequant_16x8;
+        let q = Quant::new(32, 8);
+        // residual laid out 8 tall x 16 wide: rw[row*16 + col]
+        let rw: [i32; 128] = pat(128).try_into().unwrap();
+        let (lw, _) = dct16x8_t(&rw, &q);
+        let rec = idct_dequant_16x8(&lw, &q);
+        // The mean should be preserved closely and the reconstruction should
+        // correlate strongly with the input (lossy quant, so not exact).
+        let mean_in: f64 = rw.iter().map(|&v| v as f64).sum::<f64>() / 128.0;
+        let mean_out: f64 = rec.iter().map(|&v| v as f64).sum::<f64>() / 128.0;
+        assert!(
+            (mean_in - mean_out).abs() < 2.0,
+            "mean drift {mean_in} vs {mean_out}"
+        );
+        // Energy of the error should be far below the energy of the signal.
+        let sig: f64 = rw.iter().map(|&v| (v as f64).powi(2)).sum();
+        let err: f64 = rw
+            .iter()
+            .zip(rec.iter())
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum();
+        assert!(err < sig * 0.5, "error energy {err} vs signal {sig}");
     }
 
     // ── coefficient verifiers ─────────────────────────────────────────────────

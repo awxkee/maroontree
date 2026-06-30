@@ -133,12 +133,7 @@ pub(crate) struct RangeEncoder {
     /// CDF band avmdec loads (0:q<=90, 1:91..140, 2:141..190, 3:>=191).
     /// Defaults to 1 so legacy q120 paths are unchanged.
     pub(crate) qc: usize,
-    /// Per-superblock adaptive-quantization (delta-Q) signalling. When
-    /// `delta_q_present` is set, every SB emits a delta-Q symbol right after its
-    /// partition bit; `delta_q_signaled` is the value to emit for the current SB
-    /// (signaled units = qindex-delta / 2^res_log2, magnitude <= 6, sign carried
-    /// by a bypass bit). Matches the decoder's `have_delta_q` (always true for
-    /// intra luma, where skip_txfm == 0).
+    /// Per-superblock adaptive-quantization (delta-Q).
     pub(crate) delta_q_present: bool,
     pub(crate) delta_q_signaled: i32,
     /// Set by the caller just before emitting the SB's first leaf; the mode
@@ -146,6 +141,30 @@ pub(crate) struct RangeEncoder {
     /// clears the flag), so delta-Q is coded exactly once per SB regardless of
     /// how the SB partitions.
     pub(crate) delta_q_pending: bool,
+    /// CCSO per-superblock flag state. `ccso_u_enable` mirrors the frame header's
+    /// U-plane CCSO enable; when set the mode emitter writes one `blk_idc` symbol
+    /// per SB (after the partition bit, before delta-Q), using the neighbour-based
+    /// context. Phase 1 always filters (blk_idc = 1). `ccso_pending` is armed by the
+    /// caller per SB and consumed exactly once. `ccso_grid`/`ccso_cols` track the
+    /// per-SB decisions for the above/left context lookup; `ccso_sb_rc` is the
+    /// current SB's (row, col).
+    pub(crate) ccso_u_enable: bool,
+    pub(crate) ccso_v_enable: bool,
+    pub(crate) ccso_pending: bool,
+    pub(crate) ccso_grid: Vec<u8>,
+    pub(crate) ccso_grid_v: Vec<u8>,
+    pub(crate) ccso_cols: usize,
+    pub(crate) ccso_sb_rc: (usize, usize),
+    /// Derived CCSO U-plane band offsets (raw `ccso_offset` values) + params,
+    /// produced by the post-reconstruction search and consumed when the frame
+    /// header is built. `None` when CCSO is off.
+    pub(crate) ccso_u_result: Option<crate::av2::ccso::PlaneResult>,
+    pub(crate) ccso_v_result: Option<crate::av2::ccso::PlaneResult>,
+    /// Decision-pass outputs (Phase 3): the chosen edge filter + per-SB grid for
+    /// each plane, and the SB column count, handed to the emit pass.
+    pub(crate) ccso_decided_u: Option<(crate::av2::ccso::CcsoEdgeResult, Vec<u8>)>,
+    pub(crate) ccso_decided_v: Option<(crate::av2::ccso::CcsoEdgeResult, Vec<u8>)>,
+    pub(crate) ccso_sb_cols_out: usize,
     /// Emit CfL (chroma-from-luma) signalling for chroma-ref blocks. Set per encode
     /// from the tuning flag; false keeps the bitstream byte-identical.
     pub(crate) cfl: bool,
@@ -160,10 +179,11 @@ pub(crate) struct RangeEncoder {
     pub(crate) cfl_mag_v: u8,
     pub(crate) cfl_ctx_u: usize,
     pub(crate) cfl_ctx_v: usize,
-    /// Per-tile mutable CDF working copies.  `Some` when `updating_cdf = true`
-    /// (i.e. `disable_cdf_update = 0` in the frame header).  When `None` the
-    /// encoder uses the static pre-loaded tables and the decoder runs with
-    /// `disable_cdf_update = 1` — CDFs stay fixed at their q-context defaults.
+    /// Chroma intra prediction mode for the current block, in the internal
+    /// numbering used by the luma dispatch: 0 = DC (default), 1 = SMOOTH,
+    /// 2 = SMOOTH_V, 3 = SMOOTH_H, 4 = PAETH.
+    pub(crate) uv_mode: usize,
+    /// Per-tile mutable CDF working copies.
     pub(crate) cdf_state: Option<Box<CdfState>>,
 }
 
@@ -178,6 +198,18 @@ impl RangeEncoder {
             delta_q_present: false,
             delta_q_signaled: 0,
             delta_q_pending: false,
+            ccso_u_enable: false,
+            ccso_v_enable: false,
+            ccso_pending: false,
+            ccso_grid: Vec::new(),
+            ccso_grid_v: Vec::new(),
+            ccso_cols: 0,
+            ccso_sb_rc: (0, 0),
+            ccso_u_result: None,
+            ccso_v_result: None,
+            ccso_decided_u: None,
+            ccso_decided_v: None,
+            ccso_sb_cols_out: 0,
             cfl: false,
             cfl_ctx: 0,
             cfl_use: false,
@@ -186,6 +218,7 @@ impl RangeEncoder {
             cfl_mag_v: 0,
             cfl_ctx_u: 0,
             cfl_ctx_v: 0,
+            uv_mode: 0,
             cdf_state: None,
         }
     }
@@ -1244,8 +1277,27 @@ impl RangeEncoder {
             self.sym_static(&TX_PART_32X64_INIT, s, nsyms);
         }
     }
-    pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {
+    /// CCSO per-superblock on/off flag (adaptive 2-symbol CDF, `ccso[plane][ctx]`).
+    /// Only emitted when CCSO is enabled for `plane`; mirrors AVM `write_ccso`.
+    pub(crate) fn sym_ccso(&mut self, plane: usize, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.ccso[plane][ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                1,
+            );
+        } else {
+            // CCSO requires adaptive CDFs (always enabled for lossy frames).
+            unreachable!("CCSO flag emitted without adaptive CDF state");
+        }
+    }
+
+    pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {        if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.tx_short_side[ctx];
             Self::sym_mut_inner(
                 &mut self.low,

@@ -1,27 +1,31 @@
 /*
- * Directional intra predictors for the AV2 encoder (conformant to the decoder).
+ * Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
  *
- * Adds V, H, D45, D67, D113, D135, D157, D203 on top of the existing
- * DC / SMOOTH(+V/H) / PAETH set in `intrapred.rs`.
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
  *
- * IMPORTANT (validated against the user's decoder `ipred.rs`):
- *   - V and H at angle_delta = 0 are *pure copies* (the decoder routes angle
- *     exactly 90/180 to VertPred/HorPred, not the z-path) -> no edge filter.
- *   - The six diagonals are the decoder's z1/z2/z3 directional prediction.
- *     For LUMA these are NORMATIVE: a 4-tap sub-pixel filter plus intra-edge
- *     reference filtering. A 2-tap "simple" predictor does NOT reconstruct the
- *     same pixels the decoder produces, so it is not conformant for luma.
- *     CHROMA uses the same edge filtering but a 2-tap interpolation.
+ * 1.  Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
  *
- * This is a faithful port of the decoder's z1/z2/z3 stripped to the case the
- * encoder needs: 8-bit, mrl_idx = 0, no IBP, no multi-reference-line, no
- * upsampling, non-smooth edge (is_sm = false). It is much shorter than the
- * decoder's generic versions but produces bit-identical output for that case.
+ * 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
  *
- * Reference convention matches `intrapred::build_refs`:
- *   above[0..2*bs], left[0..2*bs] (tail-repeated), corner = top-left sample.
+ * 3.  Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 #[rustfmt::skip]
 static DR: [i32; 90] = [
     0,4096,2048,1365,1024,819,682,585,512,455,409,409,409,372,341,292,273,256,

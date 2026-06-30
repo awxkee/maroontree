@@ -29,6 +29,26 @@
 use super::*;
 use crate::av2::cfl::{cfl_partition_prediction, cfl_prediction};
 
+/// Phase 3 precomputed CCSO state: per-plane edge-filter result and the per-SB
+/// on/off decision grid, derived in a first pass over the completed recon.
+pub(crate) struct CcsoPrecomp {
+    pub(crate) u: Option<(crate::av2::ccso::CcsoEdgeResult, Vec<u8>)>,
+    pub(crate) v: Option<(crate::av2::ccso::CcsoEdgeResult, Vec<u8>)>,
+    pub(crate) sb_cols: usize,
+}
+
+/// Convert a CcsoEdgeResult into the header PlaneResult (always edge mode here).
+pub(crate) fn edge_to_plane(r: &crate::av2::ccso::CcsoEdgeResult) -> crate::av2::ccso::PlaneResult {
+    crate::av2::ccso::PlaneResult::Edge {
+        scale_idx: r.scale_idx,
+        quant_idx: r.quant_idx,
+        ext_filter_support: r.ext_filter_support,
+        edge_clf: r.edge_clf,
+        max_band_log2: r.max_band_log2,
+        offsets: r.offsets.clone(),
+    }
+}
+
 impl Av2Encoder {
     #[allow(clippy::too_many_arguments)]
     fn encode_yuv420_partition(
@@ -61,6 +81,7 @@ impl Av2Encoder {
                     qc,
                     neutral,
                     qstep: qstep_i,
+                    rdoq_lambda: _rdoq_lambda,
                 },
         } = ctx;
         let PartitionNeighbors {
@@ -246,6 +267,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -299,6 +321,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -364,6 +387,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -427,6 +451,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -502,6 +527,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -577,6 +603,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -652,6 +679,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -726,6 +754,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -802,6 +831,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -877,6 +907,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1021,6 +1052,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1219,6 +1251,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1296,6 +1329,7 @@ impl Av2Encoder {
                                     qc,
                                     neutral,
                                     qstep: sb_qstep,
+                                    rdoq_lambda: self.tune.chroma_rdoq_lambda,
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
@@ -1354,7 +1388,28 @@ impl Av2Encoder {
                 self.threads,
             ));
         }
-        let enc = self.encode_420_core(&yf, &cbf, &crf, width, height);
+        // CCSO with per-SB RD (Phase 3): a first pass builds the recon, searches
+        // the filter, and decides per-SB on/off; a second pass re-emits with those
+        // decisions (gated filter + correct flags). When CCSO is off, or the
+        // decision pass turned both planes off, the single pass is used directly.
+        let mut enc = self.encode_420_core(&yf, &cbf, &crf, width, height, None);
+        // Pass 1 emits a complete, valid CCSO-off bitstream and, as a side
+        // computation, derives the CCSO filter + per-SB on/off decisions from its
+        // reconstruction. Only when at least one superblock is chosen do we pay for a
+        // second pass that re-emits with the gated filter and the per-SB flags; when
+        // CCSO is off for the frame (common at high quality / flat content) pass 1's
+        // bitstream is final and there is no second pass.
+        if self.tune.ccso
+            && self.base_q_idx != 0
+            && (enc.ccso_decided_u.is_some() || enc.ccso_decided_v.is_some())
+        {
+            let pre = CcsoPrecomp {
+                u: enc.ccso_decided_u.take(),
+                v: enc.ccso_decided_v.take(),
+                sb_cols: enc.ccso_sb_cols_out,
+            };
+            enc = self.encode_420_core(&yf, &cbf, &crf, width, height, Some(&pre));
+        }
         Ok(self.finish(enc, &config, pw, ph, width, height, color))
     }
 
@@ -1368,6 +1423,11 @@ impl Av2Encoder {
         crf: &[f32],
         width: usize,
         height: usize,
+        // Phase 3: precomputed CCSO state from a prior decision pass. When `Some`,
+        // the per-SB flags are emitted from the decision grids and the filter is
+        // applied gated by them (no search). When `None`, the pass searches all-on
+        // and records the result+grids on the returned encoder for a second pass.
+        ccso_pre: Option<&CcsoPrecomp>,
     ) -> RangeEncoder {
         let bases = &self.bases;
         let (pw, ph) = (sb_align(width), sb_align(height));
@@ -1386,6 +1446,41 @@ impl Av2Encoder {
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
         enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
+        // CCSO (U plane): enable the per-SB flag emission. Phase 1 filters every SB.
+        // NOTE: the decoder classifies CCSO bands from the *post-deblock* luma (the
+        // ext_rec_y snapshot is taken after av2_loop_filter_frame). Our recon is
+        // pre-deblock, so band classification matches avmdec byte-exactly only when
+        // luma deblocking is off. A future phase can apply the luma deblock filter to
+        // recy before CCSO to lift this restriction.
+        enc.ccso_u_enable = self.tune.ccso && self.base_q_idx != 0;
+        enc.ccso_v_enable = self.tune.ccso && self.base_q_idx != 0;
+        enc.ccso_cols = pw / 64;
+        // Phase 3: the decision pass (ccso_pre == None) is a throwaway recon pass —
+        // it searches the filter and decides per-SB on/off but must NOT emit any
+        // ccso flags into its (discarded) bitstream. Only the emit pass, which has
+        // the decision grids, emits flags and applies the gated filter. So flag
+        // emission is gated on `ccso_pre.is_some()`; the search itself still needs
+        // the enable booleans, tracked separately below.
+        let ccso_search_u = enc.ccso_u_enable;
+        let ccso_search_v = enc.ccso_v_enable;
+        if ccso_pre.is_none() {
+            enc.ccso_u_enable = false;
+            enc.ccso_v_enable = false;
+        }
+        // Phase 3: in the emit pass, install the per-SB decision grids so the flag
+        // emission and filter application are gated by the RD decisions. A plane that
+        // the decision pass turned off entirely is disabled here (no flags, no header).
+        if let Some(pre) = ccso_pre {
+            enc.ccso_cols = pre.sb_cols;
+            match &pre.u {
+                Some((_, grid)) => enc.ccso_grid = grid.clone(),
+                None => enc.ccso_u_enable = false,
+            }
+            match &pre.v {
+                Some((_, grid)) => enc.ccso_grid_v = grid.clone(),
+                None => enc.ccso_v_enable = false,
+            }
+        }
         let qc = enc.qc;
         let neutral = self.dc_neutral();
         let qstep_i = quant::qstep(self.base_q_idx as u32) as i32;
@@ -1447,6 +1542,7 @@ impl Av2Encoder {
                         qc,
                         neutral,
                         qstep: qstep_i,
+                        rdoq_lambda: self.tune.chroma_rdoq_lambda,
                     },
                 },
                 PartitionNeighbors {
@@ -1575,9 +1671,135 @@ impl Av2Encoder {
                     enc.cfl_mag_v = ch.mag_v;
                     enc.cfl_ctx_u = ch.ctx_u;
                     enc.cfl_ctx_v = ch.ctx_v;
+                    enc.uv_mode = 0;
                 } else {
                     enc.cfl_use = false;
+                    enc.uv_mode = 0;
                 }
+                // Chroma intra-mode search (non-CfL). Runs BEFORE the luma/uv mode
+                // emitter (encode_luma_block_split_dir) so `enc.uv_mode` is set when
+                // the uv-mode symbol is written. AV2 shares one uv-mode across U+V;
+                // at TX_32X32 the ext-tx set is DCT/IDTX so every candidate still
+                // reconstructs with DCT_DCT — the search improves prediction only.
+                // The chosen levels + reconstruction are cached and reused below.
+                let bd = self.bit_depth as i32;
+                let chroma_search: Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = if cfl_choice
+                    .is_none()
+                {
+                    let dcu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
+                    let dcv = dc_pred(&recv, pcw, cy, cx, 32, neutral);
+                    let cand_modes: &[usize] = if !self.tune.chroma_mode_search {
+                        &[0] // search disabled: DC only (byte-identical to baseline)
+                    } else if self.speed.reduced_modes() {
+                        &[0, 1, 4]
+                    } else {
+                        &[0, 1, 2, 3, 4]
+                    };
+                    let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                    let mut best_mode = 0usize;
+                    let mut best_cost = f64::INFINITY;
+                    let mut best = None;
+                    for &m in cand_modes {
+                        let (pu, pv): (Vec<f32>, Vec<f32>) = if m == 0 {
+                            (vec![dcu; 32 * 32], vec![dcv; 32 * 32])
+                        } else {
+                            (
+                                chroma422::predict_chroma_mode_dims(
+                                    &recu,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    32,
+                                    m,
+                                    neutral,
+                                    width / 2,
+                                    height / 2,
+                                ),
+                                chroma422::predict_chroma_mode_dims(
+                                    &recv,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    32,
+                                    m,
+                                    neutral,
+                                    width / 2,
+                                    height / 2,
+                                ),
+                            )
+                        };
+                        let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                        let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                        let mut ru = vec![0f32; 32 * 32];
+                        let mut rv = vec![0f32; 32 * 32];
+                        for r in 0..32 {
+                            let b = (cy + r) * pcw + cx;
+                            for c in 0..32 {
+                                ru[r * 32 + c] = up[b + c] - pu[r * 32 + c];
+                                rv[r * 32 + c] = vp[b + c] - pv[r * 32 + c];
+                            }
+                        }
+                        let lu = chroma422::project_chroma_rdoq(
+                            &bases.chroma420,
+                            &aq::scale_resid(&ru, sb_resid_scale),
+                            &tables::SCAN,
+                            qc,
+                            1024,
+                            0,
+                            self.tune.chroma_rdoq_lambda,
+                        );
+                        let lv = chroma422::project_chroma_rdoq(
+                            &bases.chroma420,
+                            &aq::scale_resid(&rv, sb_resid_scale),
+                            &tables::SCAN,
+                            qc,
+                            1024,
+                            4,
+                            self.tune.chroma_rdoq_lambda,
+                        );
+                        let recu_b = itx422::reconstruct_chroma_cfl(
+                            &pu_i,
+                            &lu,
+                            sb_qstep,
+                            &tables::SCAN,
+                            32,
+                            32,
+                            bd,
+                        );
+                        let recv_b = itx422::reconstruct_chroma_cfl(
+                            &pv_i,
+                            &lv,
+                            sb_qstep,
+                            &tables::SCAN,
+                            32,
+                            32,
+                            bd,
+                        );
+                        let mut sse = 0f64;
+                        for r in 0..32 {
+                            let b = (cy + r) * pcw + cx;
+                            for c in 0..32 {
+                                let du = up[b + c] - recu_b[r * 32 + c];
+                                let dv = vp[b + c] - recv_b[r * 32 + c];
+                                sse += (du * du + dv * dv) as f64;
+                            }
+                        }
+                        let rate: f64 = lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+                        // Small bias toward DC to avoid spending uv-mode bits for a
+                        // marginal SSE gain.
+                        let mode_bits = if m == 0 { 0.0 } else { 2.0 };
+                        let cost = sse + lambda * (rate + mode_bits);
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_mode = m;
+                            best = Some((lu, lv, recu_b, recv_b));
+                        }
+                    }
+                    enc.uv_mode = best_mode;
+                    best
+                } else {
+                    None
+                };
                 let lmidx = if col > 0 {
                     midx_grid[row * sb_cols + col - 1]
                 } else {
@@ -1591,6 +1813,10 @@ impl Av2Encoder {
                 // Arm this SB's delta-Q (value already set above); the mode emitter
                 // consumes it after the partition bit, exactly once per SB.
                 enc.delta_q_pending = enc.delta_q_present;
+                // Arm this SB's CCSO flag (consumed before delta-Q). (row, col) feed
+                // the neighbour-based context.
+                enc.ccso_pending = enc.ccso_u_enable || enc.ccso_v_enable;
+                enc.ccso_sb_rc = (row, col);
                 let (_cul, sb_midx) = encode_luma_block_split_dir(
                     &mut enc,
                     &tus,
@@ -1605,17 +1831,28 @@ impl Av2Encoder {
                 );
                 midx_grid[row * sb_cols + col] = sb_midx;
 
-                let bd = self.bit_depth as i32;
                 let (levu, levv) = if let Some(ref ch) = cfl_choice {
                     let mut ru = [0f32; 32 * 32];
                     let mut rv = [0f32; 32 * 32];
                     cfl_prediction::<32>(pcw, &up, &vp, cy, cx, &ch, &mut ru, &mut rv);
-                    let levu = bases
-                        .chroma420
-                        .project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
-                    let levv = bases
-                        .chroma420
-                        .project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
+                    let levu = chroma422::project_chroma_rdoq(
+                        &bases.chroma420,
+                        &aq::scale_resid(&ru, sb_resid_scale),
+                        &tables::SCAN,
+                        qc,
+                        1024,
+                        0,
+                        self.tune.chroma_rdoq_lambda,
+                    );
+                    let levv = chroma422::project_chroma_rdoq(
+                        &bases.chroma420,
+                        &aq::scale_resid(&rv, sb_resid_scale),
+                        &tables::SCAN,
+                        qc,
+                        1024,
+                        4,
+                        self.tune.chroma_rdoq_lambda,
+                    );
                     put_block(
                         &mut recu,
                         pcw,
@@ -1650,54 +1887,12 @@ impl Av2Encoder {
                     );
                     (levu, levv)
                 } else {
-                    let predu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
-                    let levu = bases.chroma420.project(
-                        &aq::scale_resid(
-                            &get_residual(&up, pcw, cy, cx, 32, predu),
-                            sb_resid_scale,
-                        ),
-                        0.0,
-                    );
-                    put_block(
-                        &mut recu,
-                        pcw,
-                        cy,
-                        cx,
-                        32,
-                        &itx422::reconstruct_chroma(
-                            predu,
-                            &levu,
-                            sb_qstep,
-                            &tables::SCAN,
-                            32,
-                            32,
-                            bd,
-                        ),
-                    );
-                    let predv = dc_pred(&recv, pcw, cy, cx, 32, neutral);
-                    let levv = bases.chroma420.project(
-                        &aq::scale_resid(
-                            &get_residual(&vp, pcw, cy, cx, 32, predv),
-                            sb_resid_scale,
-                        ),
-                        0.0,
-                    );
-                    put_block(
-                        &mut recv,
-                        pcw,
-                        cy,
-                        cx,
-                        32,
-                        &itx422::reconstruct_chroma(
-                            predv,
-                            &levv,
-                            sb_qstep,
-                            &tables::SCAN,
-                            32,
-                            32,
-                            bd,
-                        ),
-                    );
+                    // Reuse the chroma intra-mode search already performed (and
+                    // signaled via enc.uv_mode) before the luma/uv-mode emitter.
+                    let (levu, levv, recu_b, recv_b) =
+                        chroma_search.expect("non-CfL chroma path must have a cached mode search");
+                    put_block(&mut recu, pcw, cy, cx, 32, &recu_b);
+                    put_block(&mut recv, pcw, cy, cx, 32, &recv_b);
                     (levu, levv)
                 };
                 let ucoeffs = levels_to_coeffs(&levu);
@@ -1717,6 +1912,97 @@ impl Av2Encoder {
                 u_has[row * sb_cols + col] = u_present as i32;
                 v_has[row * sb_cols + col] = vcoeffs.iter().any(|&(_, l)| l != 0) as i32;
                 cfl_has[row * sb_cols + col] = cfl_choice.is_some() as i32;
+            }
+        }
+        // CCSO (U and V planes, edge-classified). The per-SB flags were already
+        // emitted (all on). Build the border-extended luma once, search the best
+        // filter LUT per plane against source, apply it to recon so the encoder
+        // output matches the decoder's post-filter result. 4:2:0 => hscale=vscale=1.
+        if ccso_search_u || ccso_search_v || ccso_pre.is_some() {
+            let (ext, estride) = crate::av2::ccso::extend_luma(&recy, pw, ph);
+            let bd = self.bit_depth as u32;
+            let sb_cols = pw / 64;
+            let sb_rows = ph / 64;
+            // Approximate RD multiplier from the frame qstep: rate (bits) weighs
+            // ~rd_mult against SSE. Tuned so the per-SB flag cost is comparable to a
+            // meaningful SSE change. rd_scale lets the threshold be retuned.
+            let qstep = quant::qstep(self.base_q_idx as u32) as f64;
+            let rd_scale: f64 = std::env::var("CCSO_RD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(std::env::var("CCSO_RD").ok().and_then(|s| s.parse().ok()).unwrap_or(self.tune.ccso_rd_scale));
+            // RD multiplier matching AVM's RDCOST scaling. AVM compares
+            // `(ssd << 7) + (rate*rdmult >> 9)`; dividing through by 128 gives
+            // `ssd + rate * rdmult/65536`, so our per-SB rd_mult (weight on the
+            // flag's bit cost vs SSE) is `rdmult / 65536`, with `rdmult ~ c*qstep^2`.
+            // rd_scale folds the AVM constant (~0.85) and a tuning factor together.
+            let rd_mult = rd_scale * qstep * qstep / 1048576.0;
+            if let Some(pre) = ccso_pre {
+                // Emit pass: apply the precomputed result gated by the grid.
+                if let Some((r, grid)) = &pre.u {
+                    crate::av2::ccso::apply_edge_gated(
+                        &ext, estride, &mut recu, pcw, pch, 1, 1, bd, r, grid, pre.sb_cols,
+                    );
+                    enc.ccso_u_result = Some(edge_to_plane(r));
+                }
+                if let Some((r, grid)) = &pre.v {
+                    crate::av2::ccso::apply_edge_gated(
+                        &ext, estride, &mut recv, pcw, pch, 1, 1, bd, r, grid, pre.sb_cols,
+                    );
+                    enc.ccso_v_result = Some(edge_to_plane(r));
+                }
+            } else {
+                // Decision pass: search all-on, decide per-SB, store result + grid on
+                // the encoder for the second pass. Filter is NOT applied here (the
+                // emit pass applies it gated); recon stays unfiltered.
+                // Optional SSIMULACRA2-inspired proxy: weight the per-SB decision SSE
+                // by inverse source activity so flat-region errors dominate the on/off
+                // choice. When proxy is on, rd_mult is rescaled (the weighting shrinks
+                // SSE magnitudes) so the flag-rate threshold stays comparable.
+                // The per-SB decision uses raw-SSE rate-distortion by default. An
+                // optional SSIMULACRA2-inspired proxy (`CCSO_PROXY`) instead weights
+                // the decision SSE by inverse source activity, which turns off
+                // superblocks where chroma filtering helps SSE but not perceptual
+                // quality — safer on flat/structured content, but it also suppresses
+                // the genuine gains on heavily textured chroma, so it is opt-in.
+                let proxy = std::env::var("CCSO_PROXY").is_ok();
+                let kc = 128.0 * (1u32 << (2 * (bd - 8))) as f64;
+                let (act_u, act_v, dec_rd) = if proxy {
+                    (
+                        Some(crate::av2::ccso::inv_activity_map(&up, pcw, pch, kc)),
+                        Some(crate::av2::ccso::inv_activity_map(&vp, pcw, pch, kc)),
+                        rd_mult / kc, // weighting divides SSE by ~kc; match the threshold
+                    )
+                } else {
+                    (None, None, rd_mult)
+                };
+                if ccso_search_u {
+                    if let Some(r) = crate::av2::ccso::search_edge(
+                        &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, None,
+                    ) {
+                        let (grid, any) = crate::av2::ccso::decide_blk_md(
+                            &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, &r, sb_cols,
+                            sb_rows, dec_rd, act_u.as_deref(), 1,
+                        );
+                        if any {
+                            enc.ccso_decided_u = Some((r, grid));
+                        }
+                    }
+                }
+                if ccso_search_v {
+                    if let Some(r) = crate::av2::ccso::search_edge(
+                        &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None,
+                    ) {
+                        let (grid, any) = crate::av2::ccso::decide_blk_md(
+                            &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, &r, sb_cols,
+                            sb_rows, dec_rd, act_v.as_deref(), 2,
+                        );
+                        if any {
+                            enc.ccso_decided_v = Some((r, grid));
+                        }
+                    }
+                }
+                enc.ccso_sb_cols_out = sb_cols;
             }
         }
         enc
@@ -1781,7 +2067,7 @@ impl Av2Encoder {
                 let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
                 let tu = extract_subplane(cbf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
                 let tv = extract_subplane(crf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
-                *slot = self.encode_420_core(&ty, &tu, &tv, tw, th).finish();
+                *slot = self.encode_420_core(&ty, &tu, &tv, tw, th, None).finish();
             }
         } else {
             let chunk = n.div_ceil(nthreads);
@@ -1810,7 +2096,7 @@ impl Av2Encoder {
                                 tw.div_ceil(2),
                                 th.div_ceil(2),
                             );
-                            *slot = me.encode_420_core(&ty, &tu, &tv, tw, th).finish();
+                            *slot = me.encode_420_core(&ty, &tu, &tv, tw, th, None).finish();
                         }
                     });
                 }

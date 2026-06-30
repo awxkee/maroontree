@@ -33,6 +33,15 @@ mod av1_tables;
 mod av1_tile;
 mod av1_wht;
 mod av1real;
+
+/// Enable or disable the experimental rectangular (PARTITION_H, 16x8) partition
+/// candidate in the AV1 intra encoder. Off by default. When enabled, the encoder
+/// offers a horizontal split for 4:4:4 16x16 luma blocks where a libaom-style
+/// variance test and a quality gate predict it will win the rate-distortion
+/// comparison; the result is byte-exact against aomdec and dav1d. Process-global.
+pub fn set_rect_partitions(enabled: bool) {
+    av1real::HORZ_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
 mod av2;
 mod avif;
 mod bitwriter;
@@ -63,6 +72,7 @@ mod tables;
 mod transform;
 mod trellis;
 mod util;
+mod wiener;
 
 pub mod av2_image {
     pub use crate::av2::simple::*;
@@ -72,7 +82,8 @@ pub use avif::{
     ChromaFormat, EncodeConfig, Speed, encode_gray_alpha8, encode_gray_alpha10,
     encode_gray_alpha12, encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10,
     encode_rgb12, encode_rgba8, encode_rgba8_with_alpha, encode_rgba10, encode_rgba10_with_alpha,
-    encode_rgba12, encode_rgba12_with_alpha, encode_yuv8, encode_yuv10, encode_yuv12,
+    encode_rgba12, encode_rgba12_with_alpha, encode_yuv_obu_recon_bd, encode_yuv8, encode_yuv10,
+    encode_yuv12, encode_yuv420_obu_recon, encode_yuv422_obu_recon, encode_yuv444_obu_recon,
     encode_yuva8_with_alpha, encode_yuva10_with_alpha, encode_yuva12_with_alpha,
 };
 pub use color::{
