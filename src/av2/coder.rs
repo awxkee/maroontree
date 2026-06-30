@@ -739,7 +739,13 @@ pub(crate) fn maybe_emit_ccso(enc: &mut RangeEncoder) {
             } else {
                 grid_u[idx - 1] as usize
             };
-            let ctx = if c == 0 { 0 } else if left != 0 { 2 } else { 0 };
+            let ctx = if c == 0 {
+                0
+            } else if left != 0 {
+                2
+            } else {
+                0
+            };
             enc.sym_ccso(1, ctx, u_on);
         }
         if enc.ccso_v_enable {
@@ -750,7 +756,13 @@ pub(crate) fn maybe_emit_ccso(enc: &mut RangeEncoder) {
             } else {
                 enc.ccso_grid_v[idx - 1] as usize
             };
-            let ctx = if c == 0 { 0 } else if left != 0 { 2 } else { 0 };
+            let ctx = if c == 0 {
+                0
+            } else if left != 0 {
+                2
+            } else {
+                0
+            };
             enc.sym_ccso(2, ctx, v_on);
         }
         enc.ccso_pending = false;

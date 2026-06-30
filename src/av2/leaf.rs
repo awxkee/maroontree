@@ -30,13 +30,6 @@
 use super::*;
 use crate::Speed;
 
-/// Build a 32x32 luma predictor for candidate mode `m` from prepared edges.
-///   0=DC (handled by callers), 1=SMOOTH, 2=SMOOTH_V, 3=SMOOTH_H, 4=PAETH,
-///   5=V, 6=H, 7=D45, 8=D135, 9=D113, 10=D157, 11=D203, 12=D67.
-/// Directional modes are conformant to the decoder (4-tap luma + intra-edge
-/// filter); `have_top`/`have_left` and the available-extension bounds gate the
-/// normative edge filter. `edge_filter` should track the sequence header flag
-/// (true on AVM main profile).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_intra_pred(
     m: usize,
@@ -64,12 +57,6 @@ fn dispatch_intra_pred(
         11 => D203,
         _ => D67,
     };
-    // seq_intra_edge_filter is not enabled in our bitstream header, so the
-    // decoder never filters the reference edge. The encoder must match: passing
-    // edge_filter=false keeps the references unfiltered for every directional
-    // mode (z1/z2/z3). Applying it here (the old hardcoded `true`) corrupted
-    // every edge-filtered diagonal/delta block — V/H copies were immune, which
-    // is why only diagonals diverged.
     directional::directional(
         dir, adelta, 32, ab, lf, corner, true, have_top, have_left, false, max_w, max_h,
     )
@@ -95,14 +82,6 @@ pub(super) fn predict_luma(
     }
     let have_above = y0 > 0;
     let have_left = x0 > 0;
-    // Exact avm reference-sample availability for TX_32X32 in a 64x64
-    // PARTITION_NONE luma block (has_top_right / has_bottom_left specialised;
-    // mi_cols/mi_rows = round_up(dim,8)>>2; single tile). `i` is raster TX index.
-    // avm tile bounds are superblock-aligned: tile.mi_col_end =
-    // sb_cols<<mib_size_log2 = ((dim+63)&~63)>>2, NOT the 8-pixel-aligned
-    // mi_params value. Using the SB-aligned bound is what makes a transform
-    // block's top-right / bottom-left correctly resolve to already-decoded
-    // samples in the same superblock (e.g. TX(32,0) reads TX(0,32)'s edge).
     let mi_col_end = (((width + 63) & !63) >> 2) as i64;
     let mi_row_end = (((height + 63) & !63) >> 2) as i64;
     let sb_y0 = (y0 / 64) * 64;
@@ -141,15 +120,6 @@ pub(super) fn predict_luma(
     )
 }
 
-/// Encode one 64x64 luma superblock as a single PARTITION_NONE block with a
-/// per-SB intra mode chosen from {DC, SMOOTH, PAETH}. Each candidate is fully
-/// trialled (4x TX_32X32 with intra-SB reconstruction feedback); the mode with
-/// the smallest total coefficient magnitude (rate proxy) wins. Mutates `recy`
-/// (leaving the winner's reconstruction) and returns the four TX coefficient
-/// lists plus the chosen `mode_idx` (0=DC, 1=SMOOTH, 4=PAETH).
-/// RD lambda for the per-SB luma tx-partition choice (pixel-SSE vs coded bits).
-/// Scales ~qstep^2 like a standard mode-decision lambda; `c` is the multiplier in
-/// lambda = c*qstep^2 (see [`crate::av2::Tuning::part_lambda_c`]).
 pub(crate) fn part_lambda(qstep: i32, c: f64) -> f64 {
     c * (qstep as f64) * (qstep as f64)
 }
@@ -188,11 +158,6 @@ pub(super) fn encode_luma_sb(
     sb_x: usize,
     luma: &Basis,
     qstep: i32,
-    // Per-superblock residual pre-scale for adaptive quantization. The luma
-    // `Basis` projects at the frame base qstep; scaling the residual by
-    // qstep_base / qstep_sb before projection yields levels quantized at the
-    // SB's qstep (projection is linear), which reconstruct_luma(qstep_sb) then
-    // dequantizes consistently. 1.0 reproduces the base-qstep behaviour.
     resid_scale: f32,
     scan: &[u16],
     neutral: f32,
@@ -322,11 +287,6 @@ pub(super) fn encode_luma_sb(
     (best_tus, best_mode, best_delta as i8)
 }
 
-/// Intra prediction for one TX_32X32 of a bottom-edge 64x32 luma leaf. `ti` is the
-/// sub-TU index (0=left, 1=right) within the SB-wide leaf at (`sb_y`,`sb_x`).
-/// Unlike `predict_luma`, availability uses the NATIVE mi grid (`mi_cols`,`mi_rows`)
-/// and bottom-left is always off: the leaf is the bottom partition, so everything
-/// below it is out of frame / not yet decoded.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predict_luma_leaf32(
     recy: &[f32],
@@ -374,11 +334,6 @@ pub(super) fn predict_luma_leaf32(
     )
 }
 
-/// Project + trial-code a bottom-edge 64x32 luma leaf as two side-by-side TX_32X32.
-/// Mirrors `encode_luma_sb` (mode trial over {DC,SMOOTH,PAETH} with intra-leaf
-/// reconstruction feedback) but only the top two TUs and with leaf-aware prediction.
-/// Mutates `recy` (top 64x32 of the SB) and returns the two TU coefficient lists
-/// plus the chosen mode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_luma_leaf32(
     recy: &mut [f32],
@@ -459,10 +414,6 @@ pub(super) fn encode_luma_leaf32(
     (best_tus, best_mode)
 }
 
-/// General intra prediction for one TX_32X32 sub-block of a partition leaf, using
-/// the NATIVE mi grid for reference availability. `(ty,tx)` is the TU's pixel offset
-/// within the SB; `i` is the equivalent 64x64-raster index that selects avm's
-/// top-right (i∈{0,1,2}) / bottom-left (i==0) eligibility rules.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predict_luma_leaf_tu(
     recy: &[f32],

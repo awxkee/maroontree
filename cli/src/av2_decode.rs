@@ -32,8 +32,8 @@ use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
 use tealdust::{
-    AvifImage, ColorInfo, ColorPrimaries, MatrixCoefficients, Orientation, PixelLayout,
-    TransferCharacteristics,
+    AvifImage, AvifSettings, ColorInfo, ColorPrimaries, MatrixCoefficients, Orientation,
+    PixelLayout, TransferCharacteristics,
 };
 use thiserror::Error;
 
@@ -120,7 +120,9 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
     };
 
     let data_vec = fs::read(file).map_err(|x| AvifError::Io(x.to_string()))?;
-    let mut decoder = tealdust::AvifDecoder::new(&data_vec)
+    let mut settings = AvifSettings::default();
+    settings.decoder_settings.frame_size_limit = 8096 * 8096;
+    let mut decoder = tealdust::AvifDecoder::with_settings(&data_vec, settings)
         .map_err(|e| AvifError::Format(format!("garnetash: {e}")))?;
 
     let image_info = decoder

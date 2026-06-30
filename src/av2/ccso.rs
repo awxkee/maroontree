@@ -422,7 +422,11 @@ pub(crate) fn decide_blk_md(
                         + (lx as isize + taps[1].0) as usize];
                     let c0 = classify(t0 - c, q, res.edge_clf);
                     let c1 = classify(t1 - c, q, res.edge_clf);
-                    let band = if single_band { 0 } else { (c >> shift_bits) as usize };
+                    let band = if single_band {
+                        0
+                    } else {
+                        (c >> shift_bits) as usize
+                    };
                     let lut = (band << 4) + (c0 << 2) + c1;
                     let off = res.offsets[lut] * scale;
                     let f = (r + off).clamp(0, max_val) as f64;
@@ -504,7 +508,11 @@ pub(crate) fn apply_edge_gated(
                 [(ly as isize + taps[1].1) as usize * stride + (lx as isize + taps[1].0) as usize];
             let c0 = classify(t0 - c, q, res.edge_clf);
             let c1 = classify(t1 - c, q, res.edge_clf);
-            let band = if single_band { 0 } else { (c >> shift_bits) as usize };
+            let band = if single_band {
+                0
+            } else {
+                (c >> shift_bits) as usize
+            };
             let lut = (band << 4) + (c0 << 2) + c1;
             let off = res.offsets[lut] * scale;
             let v = (rec_c[y * cw + x] as i32 + off).clamp(0, max_val);

@@ -1930,7 +1930,12 @@ impl Av2Encoder {
             let rd_scale: f64 = std::env::var("CCSO_RD")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(std::env::var("CCSO_RD").ok().and_then(|s| s.parse().ok()).unwrap_or(self.tune.ccso_rd_scale));
+                .unwrap_or(
+                    std::env::var("CCSO_RD")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(self.tune.ccso_rd_scale),
+                );
             // RD multiplier matching AVM's RDCOST scaling. AVM compares
             // `(ssd << 7) + (rate*rdmult >> 9)`; dividing through by 128 gives
             // `ssd + rate * rdmult/65536`, so our per-SB rd_mult (weight on the
@@ -1941,13 +1946,33 @@ impl Av2Encoder {
                 // Emit pass: apply the precomputed result gated by the grid.
                 if let Some((r, grid)) = &pre.u {
                     crate::av2::ccso::apply_edge_gated(
-                        &ext, estride, &mut recu, pcw, pch, 1, 1, bd, r, grid, pre.sb_cols,
+                        &ext,
+                        estride,
+                        &mut recu,
+                        pcw,
+                        pch,
+                        1,
+                        1,
+                        bd,
+                        r,
+                        grid,
+                        pre.sb_cols,
                     );
                     enc.ccso_u_result = Some(edge_to_plane(r));
                 }
                 if let Some((r, grid)) = &pre.v {
                     crate::av2::ccso::apply_edge_gated(
-                        &ext, estride, &mut recv, pcw, pch, 1, 1, bd, r, grid, pre.sb_cols,
+                        &ext,
+                        estride,
+                        &mut recv,
+                        pcw,
+                        pch,
+                        1,
+                        1,
+                        bd,
+                        r,
+                        grid,
+                        pre.sb_cols,
                     );
                     enc.ccso_v_result = Some(edge_to_plane(r));
                 }
@@ -1981,8 +2006,21 @@ impl Av2Encoder {
                         &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, None,
                     ) {
                         let (grid, any) = crate::av2::ccso::decide_blk_md(
-                            &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, &r, sb_cols,
-                            sb_rows, dec_rd, act_u.as_deref(), 1,
+                            &ext,
+                            estride,
+                            &up,
+                            &recu,
+                            pcw,
+                            pch,
+                            1,
+                            1,
+                            bd,
+                            &r,
+                            sb_cols,
+                            sb_rows,
+                            dec_rd,
+                            act_u.as_deref(),
+                            1,
                         );
                         if any {
                             enc.ccso_decided_u = Some((r, grid));
@@ -1994,8 +2032,21 @@ impl Av2Encoder {
                         &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None,
                     ) {
                         let (grid, any) = crate::av2::ccso::decide_blk_md(
-                            &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, &r, sb_cols,
-                            sb_rows, dec_rd, act_v.as_deref(), 2,
+                            &ext,
+                            estride,
+                            &vp,
+                            &recv,
+                            pcw,
+                            pch,
+                            1,
+                            1,
+                            bd,
+                            &r,
+                            sb_cols,
+                            sb_rows,
+                            dec_rd,
+                            act_v.as_deref(),
+                            2,
                         );
                         if any {
                             enc.ccso_decided_v = Some((r, grid));

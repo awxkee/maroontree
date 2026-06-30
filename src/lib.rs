@@ -34,14 +34,6 @@ mod av1_tile;
 mod av1_wht;
 mod av1real;
 
-/// Enable or disable the experimental rectangular (PARTITION_H, 16x8) partition
-/// candidate in the AV1 intra encoder. Off by default. When enabled, the encoder
-/// offers a horizontal split for 4:4:4 16x16 luma blocks where a libaom-style
-/// variance test and a quality gate predict it will win the rate-distortion
-/// comparison; the result is byte-exact against aomdec and dav1d. Process-global.
-pub fn set_rect_partitions(enabled: bool) {
-    av1real::HORZ_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
 mod av2;
 mod avif;
 mod bitwriter;

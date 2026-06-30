@@ -26,12 +26,12 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use std::fs;
 use image::imageops::FilterType;
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
     TxPart, av2_map_quality, encode_rgb8,
 };
+use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
@@ -51,7 +51,9 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    let img = image::open("./assets/biddhabrot3_small.png")
+        .unwrap()
+        .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -66,18 +68,20 @@ fn main() {
             &EncodeConfig::new()
                 .with_quality(60)
                 .with_cicp(Cicp::srgb_ycbcr())
-                .with_chroma(ChromaFormat::Yuv420)
+                .with_chroma(ChromaFormat::Yuv444)
                 .with_speed(Speed::Fast)
                 .with_threads(10)
                 .with_variance_boost(true)
+                .with_cdef(false),
         )
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
         fs::write("./out.avif", out).unwrap();
     }
-    let img = image::open("./assets/manhattan.png")
+    img.save("./out_rav1e.avif").unwrap();
+    let img = image::open("./assets/DSC00116.png")
         .unwrap()
-        .resize_exact(1600, 900, FilterType::Nearest)
+        // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
     let pimg = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
@@ -91,14 +95,14 @@ fn main() {
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
-        .with_threads(12)
+        .with_threads(1)
         .with_cfl(true)
         .with_updating_cdf(true)
         .with_chroma_mode_search(true)
         .with_chroma_rdoq_lambda(0.05)
         .with_ccso(false);
     let encoded = av2_encoder
-        .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
+        .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
     // for i in 0..10 {
     //     let instant = Instant::now();

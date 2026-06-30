@@ -1297,7 +1297,8 @@ impl RangeEncoder {
         }
     }
 
-    pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {        if let Some(ref mut cs) = self.cdf_state {
+    pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.tx_short_side[ctx];
             Self::sym_mut_inner(
                 &mut self.low,

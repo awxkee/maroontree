@@ -51,19 +51,18 @@ pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
 #[cfg(not(test))]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// Runtime enable for the RD-selected 4x4 luma split (off by default; the path
-/// is bit-exact but its quality benefit is still being measured).
+
 pub(crate) static SPLIT4_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Test/debug gate: force every eligible 16x16 luma block to PARTITION_H (two
-/// 16x8 sub-blocks). Used to validate the rectangular-partition path to
-/// byte-exactness in isolation, exactly as FORCE_SPLIT4 did for the 4x4 split.
+    std::sync::atomic::AtomicBool::new(true);
+
 pub(crate) static FORCE_HORZ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// Runtime enable for the RD-selected PARTITION_H (16x8) candidate. Off by
-/// default; the path is byte-exact but its quality benefit is being measured.
+
 pub(crate) static HORZ_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) static TUNE_SSIMULACRA2: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,10 +80,7 @@ use crate::intrapred::*;
 use crate::quant::*;
 use crate::tables::*;
 
-/// AV1 chroma transform type derived from the intra mode (`Mode_To_Txfm`),
-/// restricted to the kinds reachable from the directional chroma modes this
-/// encoder offers. The decoder derives this from the signalled `uv_mode`, so the
-/// encoder must use the matching forward/inverse pair for byte-exactness.
+/// AV1 chroma transform type derived from the intra mode (`Mode_To_Txfm`)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChromaTx {
     DctDct,
@@ -163,13 +159,6 @@ fn inv_chroma_4x8(tx: ChromaTx, levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     }
 }
 
-/// Per-frame adaptive CDF state. dav1d adapts every symbol's CDF as it decodes
-/// (when `disable_cdf_update = 0`); to stay bit-exact we hold the same mutable
-/// CDFs (initialised from the qcat defaults, in `icdf` form with a trailing
-/// adaptation count) and adapt them identically after each coded symbol via
-/// `OdEcEncoder::encode_symbol`. Coef class index: 0 = `TX_4X4` (4:2:0 chroma),
-/// 1 = `TX_8X8`/`RTX_4X8` (luma, 4:4:4 and 4:2:2 chroma). Plane index: 0 = luma,
-/// 1 = chroma.
 pub(crate) struct Cdfs {
     pub(crate) skip: Vec<Vec<u16>>,               // block skip [3 ctx]
     pub(crate) part_bl8: Vec<Vec<u16>>,           // PARTITION_NONE @ 8x8 [4 ctx]
@@ -466,9 +455,6 @@ fn sb_activity(
     (1.0 + var).ln() as f32
 }
 
-/// Mean activity over every superblock of the tile — the reference the per-SB
-/// deltas are centred on, so the deltas are (approximately) zero-mean and the
-/// average quantizer tracks the base.
 fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
     let mut sum = 0f32;
     let mut cnt = 0f32;
@@ -481,12 +467,6 @@ fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
     if cnt > 0.0 { sum / cnt } else { 5.0 }
 }
 
-/// Map a superblock's `activity` to a target qindex, centred on the tile mean
-/// `ref_act`. Below-average activity (flat) → finer quantizer (lower qindex);
-/// above-average (busy) → coarser. Clamped to a sane qindex range.
-///
-/// The slope, max delta, and the asymmetry factor applied to the coarsening
-/// (positive-delta) side are compile-time constants.
 fn aq_params() -> (f32, f32, f32) {
     // (slope, max delta, coarsen scale). Coarsen scale 1.0 == pure variance.
     (AQ_SLOPE, AQ_MAX_DELTA, 1.0)
@@ -505,25 +485,6 @@ fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
     (base_q + delta.round() as i32).clamp(1, 255)
 }
 
-// ----------------------------------------------------------------------------
-// Variance Boost (variance-adaptive delta-Q) — the AV2 `av2/aq.rs` scheme ported
-// to the AV1 transport. Where the classic whole-SB AQ above uses a single 64x64
-// variance, Variance Boost splits each 64x64 superblock into 64 8x8 subblocks,
-// computes each subblock's variance, then picks ONE representative variance at a
-// configurable octile of the sorted set. Low picked variance => low local
-// contrast => the eye still resolves detail, so the quantizer is *lowered*
-// (quality boosted); high picked variance => texture masks artifacts, so it is
-// nudged coarser (rate-balanced mode) or left alone (boost-only mode). The octile
-// controls selectivity: a low octile boosts a SB if only a fraction of it is
-// low-variance (more bits), a high octile boosts only when (nearly) the whole SB
-// is low-variance. This is the same curve and defaults as `av2/aq.rs`; only the
-// luma plane type differs (`i32` fixed-point here, `f32` in the AV2 path).
-
-/// Per-8x8-subblock variances of a 64x64 superblock, written into `out` (length
-/// 64, row-major over the 8x8 grid). Subblocks outside the frame (partial edge SB)
-/// are filled with the mean of the in-frame subblocks so they don't bias the
-/// octile pick. Returns the count of in-frame subblocks (>=1 when the SB has any
-/// pixels). Mirrors `av2/aq.rs::sb_subblock_variances`.
 fn aq_sb_subblock_variances(
     yp: &[i32],
     pw: usize,
@@ -577,9 +538,6 @@ fn aq_sb_subblock_variances(
     filled
 }
 
-/// Representative variance at the requested `octile` (1..=8) of the 64 sorted 8x8
-/// variances. Octile 1 = most low-variance-biased (boost readily), octile 8 = only
-/// the maximum. Mirrors `av2/aq.rs::sb_octile_variance`.
 fn aq_sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
     subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let o = octile.clamp(1, 8) as usize;
@@ -587,13 +545,7 @@ fn aq_sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
     subvars[idx]
 }
 
-/// Variance Boost qindex delta for one superblock. `picked_var` is the octile
-/// variance; `ref_log` is the per-tile reference (mean whole-SB log-variance) used
-/// to keep the coarse side roughly zero-mean. Operates in log-variance space.
-/// Below `LOW_LOG` the SB is "low contrast": qindex is lowered up to `MAX_BOOST`.
-/// Above the reference it is nudged coarser (bounded by `MAX_CUT`) unless
-/// `boost_only`. `strength` scales the whole effect (1.0 = nominal). Mirrors
-/// `av2/aq.rs::variance_boost_delta` exactly.
+/// Variance Boost qindex delta for one superblock.
 fn aq_variance_boost_delta(picked_var: f32, ref_log: f32, strength: f32, boost_only: bool) -> i32 {
     let v_log = (1.0 + picked_var).ln();
     const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
@@ -665,10 +617,7 @@ impl AqCtx {
     }
 }
 
-/// Whole-frame lossy encoder state. Context arrays are indexed by absolute frame
-/// coordinates: the above arrays persist down the superblock rows, and the left
-/// arrays are naturally fresh per SB row (each row occupies a distinct
-/// coordinate range), mirroring dav1d's per-SB-row left reset.
+/// Whole-frame lossy encoder state.
 struct LossyTile<'a> {
     bd: u8,
     quant: Quant,
@@ -716,6 +665,10 @@ struct LossyTile<'a> {
     frame_y0: usize,
     frame_w: usize,
     frame_h: usize,
+    /// Base quant index this tile was built with. Stored so the R-D search can
+    /// apply libaom's SSIMULACRA2 rdmult weight (see `cost::mode_lambda_aom` /
+    /// `aom_ssimulacra2_rdmult_weight`), which is a function of qindex.
+    base_q_idx: u8,
 }
 
 impl<'a> LossyTile<'a> {
@@ -754,6 +707,7 @@ impl<'a> LossyTile<'a> {
             frame_y0: 0,
             frame_w: w,
             frame_h: h,
+            base_q_idx: q,
         }
     }
 
@@ -796,6 +750,7 @@ impl<'a> LossyTile<'a> {
             frame_y0: 0,
             frame_w: w,
             frame_h: h,
+            base_q_idx: q,
         }
     }
 
@@ -837,6 +792,7 @@ impl<'a> LossyTile<'a> {
             frame_y0: 0,
             frame_w: w,
             frame_h: h,
+            base_q_idx: q,
         }
     }
 
@@ -878,6 +834,7 @@ impl<'a> LossyTile<'a> {
             frame_y0: 0,
             frame_w: w,
             frame_h: h,
+            base_q_idx: q,
         }
     }
 
@@ -928,8 +885,6 @@ impl<'a> LossyTile<'a> {
     }
 
     /// txb_skip context for a luma RTX_16X8 block coded as a single transform.
-    /// dav1d `get_skip_ctx` returns 0 when the block size equals the transform
-    /// size (which it does here: BS_16x8 == one RTX_16X8), same as square luma.
     fn skip_ctx_16x8_luma(&self) -> usize {
         0
     }
@@ -1155,7 +1110,6 @@ impl<'a> LossyTile<'a> {
         }
         let (px, py) = (x8 * 8, y8 * 8);
         let acq = self.quant.ac_q() as f64;
-        let part_lam = mode_lambda() * acq * acq * self.perceptual_rd_scale(px, py, 16);
 
         let horz_on = !self.ss420
             && !self.ss422
@@ -1188,15 +1142,28 @@ impl<'a> LossyTile<'a> {
         }
 
         // --- R-D on the surviving candidates ---
-        let rd_none = self.rd_cost_square(px, py, 16, false, false);
+        // Anchor the perceptual R-D scale ONCE at the parent 16x16 region and use
+        // it for every candidate (NONE, the four SPLIT children, HORZ, and the
+        // partition-signal term). This guarantees all costs share one lambda axis
+        // so the min-selection is a valid R-D decision. (Previously each candidate
+        // recomputed its own scale on its own sub-region, mixing axes.)
+        let prdo = self.perceptual_rd_scale(px, py, 16);
+        // libaom SSIMULACRA2 rdmult weight (qindex-dependent, 1.0 when the tune
+        // is off). Folded into the shared per-decision scale so it applies
+        // uniformly to NONE/SPLIT/HORZ and the partition-signal term — keeping
+        // every candidate on one lambda axis (see note above).
+        let tune = TUNE_SSIMULACRA2.load(std::sync::atomic::Ordering::Relaxed);
+        let prdo = prdo * crate::cost::mode_lambda_weight(self.base_q_idx, tune);
+        let part_lam = mode_lambda() * acq * acq * prdo;
+        let rd_none = self.rd_cost_square(px, py, 16, false, false, prdo);
         let mut rd_split = part_lam * SPLIT_SIGNAL_BITS;
         for (sx, sy) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
-            rd_split += self.rd_cost_square(px + sx, py + sy, 8, false, false);
+            rd_split += self.rd_cost_square(px + sx, py + sy, 8, false, false, prdo);
         }
         let rd_horz = if prune_horz {
             f64::INFINITY
         } else {
-            self.rd_cost_horz(px, py)
+            self.rd_cost_horz(px, py, prdo)
         };
 
         // Pick the minimum of whatever survived pruning.
@@ -1446,12 +1413,26 @@ impl<'a> LossyTile<'a> {
     /// call speculatively while deciding a partition. Chroma is excluded — the
     /// luma residual dominates the partition choice and including chroma would
     /// double the cost of the search for little decision benefit.
-    fn rd_cost_square(&self, px: usize, py: usize, dim: usize, have_tr: bool, have_bl: bool) -> f64 {
+    fn rd_cost_square(
+        &self,
+        px: usize,
+        py: usize,
+        dim: usize,
+        have_tr: bool,
+        have_bl: bool,
+        prdo: f64,
+    ) -> f64 {
         let acq = self.quant.ac_q() as f64;
         let dcq = self.quant.dc_q() as f64;
         let lam = trellis_lambda();
         let mlam = mode_lambda() * acq * acq;
-        let prdo = self.perceptual_rd_scale(px, py, dim);
+        // `prdo` is the perceptual R-D scale of the PARENT partition decision,
+        // passed in so every candidate (PARTITION_NONE, the four SPLIT children,
+        // HORZ) is measured on ONE lambda axis. Previously each call recomputed
+        // its own scale for its own sub-region, so the four 8x8 split costs, the
+        // 16x16 none cost, and the partition-signal term were each weighted by a
+        // different perceptual factor and the resulting comparison was not a
+        // valid R-D ordering (the source of the "random" partition decisions).
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         // Compact candidate set: DC plus the two non-directional modes that win
         // most often on photographic content. (The full 13-mode search is what
@@ -1469,8 +1450,19 @@ impl<'a> LossyTile<'a> {
                         pred = [d; 64];
                     } else {
                         intra_predict_nd(
-                            m, &self.recon[0], self.w, px, py, 8, 8, have_tr, have_bl, self.w,
-                            self.h, &mut pred, self.bd,
+                            m,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            8,
+                            8,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            &mut pred,
+                            self.bd,
                         );
                     }
                     let mut resid = [0i32; 64];
@@ -1506,8 +1498,19 @@ impl<'a> LossyTile<'a> {
                         pred = [d; 256];
                     } else {
                         intra_predict_nd(
-                            m, &self.recon[0], self.w, px, py, 16, 16, have_tr, have_bl, self.w,
-                            self.h, &mut pred, self.bd,
+                            m,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            16,
+                            16,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            &mut pred,
+                            self.bd,
                         );
                     }
                     let mut resid = [0i32; 256];
@@ -1544,8 +1547,19 @@ impl<'a> LossyTile<'a> {
                         pred = [d; 1024];
                     } else {
                         intra_predict_nd(
-                            m, &self.recon[0], self.w, px, py, 32, 32, have_tr, have_bl, self.w,
-                            self.h, &mut pred, self.bd,
+                            m,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            32,
+                            32,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            &mut pred,
+                            self.bd,
                         );
                     }
                     let mut resid = [0i32; 1024];
@@ -1582,11 +1596,13 @@ impl<'a> LossyTile<'a> {
     /// 16x8 sub-blocks, each DC-predicted + DCT and trellis-quantized through the
     /// exact inverse (matching what `code_block16_horz_444` emits). Returns
     /// SSE + mlam*bits summed over both halves plus the HORZ partition signal.
-    fn rd_cost_horz(&self, px: usize, py: usize) -> f64 {
+    fn rd_cost_horz(&self, px: usize, py: usize, prdo: f64) -> f64 {
         let acq = self.quant.ac_q() as f64;
         let dcq = self.quant.dc_q() as f64;
         let lam = trellis_lambda();
-        let prdo = self.perceptual_rd_scale(px, py, 16);
+        // Parent-anchored perceptual scale (see `rd_cost_square`): the HORZ
+        // candidate must share the same lambda as NONE/SPLIT for the comparison
+        // to be a valid R-D ordering.
         let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
         let maxv = (1 << self.bd) - 1;
         let mut total = mlam * SPLIT_SIGNAL_BITS; // HORZ costs a partition symbol like SPLIT
@@ -2409,7 +2425,7 @@ impl<'a> LossyTile<'a> {
                         *dv = s - p;
                     }
                 }
-                // SMOOTH_V chroma derives ADST_DCT (dav1d_txtp_from_uvmode), so
+                // SMOOTH_V chroma derives ADST_DCT, so
                 // the encoder must forward/inverse with ADST_DCT to match the
                 // decoder. Using plain DCT desyncs at >8-bit.
                 let (q, qt) = adstdct16x16_t(&resid, &self.cquant);
@@ -2762,14 +2778,28 @@ impl<'a> LossyTile<'a> {
                 self.blk4h[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = 1;
             }
         }
-        // chroma origin (4:2:0): one 4x4 chroma block for the whole 8x8 region
-        let (cx, cy) = (px / 2, py / 2);
+        // Chroma layout differs by subsampling:
+        //   4:2:0 -> the four 4x4 luma units share ONE 4x4 chroma block, coded on
+        //            the bottom-right sub-block (origin px/2, py/2).
+        //   4:4:4 -> chroma is full resolution: EVERY 4x4 luma sub-block carries a
+        //            co-located 4x4 chroma block (dav1d has_chroma is true for each
+        //            BLOCK_4X4 in I444). Each sub-block emits its own uv_mode and
+        //            U/V residual at the same (bx, by) with stride w.
+        // (4:2:2 is excluded upstream via `split_eligible`.)
+        let ss420 = self.ss420;
+        let (cx420, cy420) = (px / 2, py / 2);
         // z-order: TL, TR, BL, BR
         let sub = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)];
         for (si, &(sx, sy)) in sub.iter().enumerate() {
             let (bx, by) = (px + sx * 4, py + sy * 4);
             let (bx4, by4) = (bx / 4, by / 4);
-            let has_chroma = si == 3;
+            // In 4:2:0 chroma is coded only on the bottom-right unit; in 4:4:4
+            // every unit carries chroma.
+            let has_chroma = !self.mono && (!ss420 || si == 3);
+            // Chroma origin / stride for this unit: full-res co-located for 4:4:4,
+            // half-res shared block for 4:2:0.
+            let (chx, chy) = if ss420 { (cx420, cy420) } else { (bx, by) };
+            let cstride = self.cw;
 
             // --- luma 4x4: search the non-directional intra modes DC, SMOOTH
             // and PAETH. SMOOTH_V/SMOOTH_H are intentionally excluded: at the
@@ -2836,28 +2866,124 @@ impl<'a> LossyTile<'a> {
             }
             let luma_zero = lcf.iter().all(|&c| c == 0);
 
-            // --- chroma (BR only): DC prediction + forward transform ---
+            // --- chroma: DC (and, for 4:4:4, CfL) prediction + forward transform.
+            // Per-unit chroma in 4:4:4; BR-only shared block in 4:2:0. ---
             let mut ccf = [[0i32; 16]; 2];
-            let mut cpred = [0i32; 2];
+            let mut cpred = [0i32; 2]; // chroma DC value per plane
+            // Per-pixel chroma prediction (DC fills flat; CfL fills dc + alpha*ac).
+            let mut cpred_px = [[0i32; 16]; 2];
             let mut chroma_zero = true;
-            if has_chroma && !self.mono {
+            let mut use_cfl = false;
+            let mut cfl_alpha_uv = [0i32; 2];
+            if has_chroma {
                 let (cdcq, cacq) = (self.cquant.dc_q() as f64, self.cquant.ac_q() as f64);
+                // DC option (always computed; the per-pixel prediction is the DC
+                // value broadcast across the block).
+                let mut dc_ccf = [[0i32; 16]; 2];
+                let mut dc_sse = [0i64; 2];
+                let mut dc_bits = [0f64; 2];
+                let mut src_planes = [[0i32; 16]; 2];
                 for ci in 0..2 {
                     let plane = ci + 1;
-                    let dc = dc_pred_4x4(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
+                    let dc = dc_pred_4x4(&self.recon[plane], cstride, chx, chy, self.bd as i32);
                     cpred[ci] = dc;
-                    let mut cres = [0i32; 16];
+                    let mut src = [0i32; 16];
                     for ry in 0..4 {
-                        let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                        let srow = &self.src[plane][(chy + ry) * cstride + chx..];
                         for rx in 0..4 {
-                            cres[ry * 4 + rx] = srow[rx] - dc;
+                            src[ry * 4 + rx] = srow[rx];
                         }
+                    }
+                    src_planes[ci] = src;
+                    let mut cres = [0i32; 16];
+                    for i in 0..16 {
+                        cres[i] = src[i] - dc;
                     }
                     let (mut q, qt) = forward_dct_quant_4x4_t(&cres, &self.cquant);
                     trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
-                    ccf[ci] = q;
-                    if !q.iter().all(|&c| c == 0) {
-                        chroma_zero = false;
+                    let rr = idct_dequant_4x4(&q, &self.cquant);
+                    let mut sse = 0i64;
+                    for i in 0..16 {
+                        let r = (dc + rr[i]).clamp(0, maxv);
+                        let d = src[i] - r;
+                        sse += (d * d) as i64;
+                    }
+                    dc_ccf[ci] = q;
+                    dc_sse[ci] = sse;
+                    dc_bits[ci] = block_rate_bits(&q, &SCAN_4X4);
+                }
+
+                // CfL option (4:4:4 only; 4:2:0 chroma here is the shared half-res
+                // block and is left DC-only). The AC reference is this 4x4 luma
+                // unit's reconstruction (luma is always DCT_DCT in SPLIT4).
+                let cfl_eligible = !ss420;
+                let mut cfl_ccf = [[0i32; 16]; 2];
+                let mut cfl_a = [0i32; 2];
+                let mut cfl_px = [[0i32; 16]; 2];
+                let mut cfl_sse = [0i64; 2];
+                let mut cfl_bits = [0f64; 2];
+                if cfl_eligible {
+                    let lrr_cfl = idct_dequant_4x4(&lcf, &self.quant);
+                    let mut luma_rec = [0i32; 16];
+                    for i in 0..16 {
+                        luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, maxv);
+                    }
+                    let mut ac = [0i32; 16];
+                    cfl_ac_444(&luma_rec, 4, 4, &mut ac);
+                    for ci in 0..2 {
+                        let dc = cpred[ci];
+                        let src = src_planes[ci];
+                        let a = cfl_best_alpha(&ac, &src, dc, 16, self.bd);
+                        cfl_a[ci] = a;
+                        let mut cpr = [0i32; 16];
+                        let mut resid = [0i32; 16];
+                        for i in 0..16 {
+                            cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
+                            resid[i] = src[i] - cpr[i];
+                        }
+                        let (mut q, qt) = forward_dct_quant_4x4_t(&resid, &self.cquant);
+                        trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
+                        let rr = idct_dequant_4x4(&q, &self.cquant);
+                        let mut sse = 0i64;
+                        for i in 0..16 {
+                            let r = (cpr[i] + rr[i]).clamp(0, maxv);
+                            let d = src[i] - r;
+                            sse += (d * d) as i64;
+                        }
+                        cfl_ccf[ci] = q;
+                        cfl_a[ci] = a;
+                        cfl_px[ci] = cpr;
+                        cfl_sse[ci] = sse;
+                        cfl_bits[ci] = block_rate_bits(&q, &SCAN_4X4);
+                    }
+                }
+
+                // RD: pick CfL over DC only when it has a non-zero alpha and wins
+                // including the joint signalling cost (sign symbol + a magnitude
+                // per non-zero plane), mirroring the 8x8 4:4:4 path.
+                let sig = 4.0
+                    + if cfl_a[0] != 0 { 4.0 } else { 0.0 }
+                    + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
+                let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
+                let cfl_total =
+                    (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+                if cfl_eligible && cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
+                    use_cfl = true;
+                    cfl_alpha_uv = cfl_a;
+                    for ci in 0..2 {
+                        ccf[ci] = cfl_ccf[ci];
+                        cpred_px[ci] = cfl_px[ci];
+                        if !cfl_ccf[ci].iter().all(|&c| c == 0) {
+                            chroma_zero = false;
+                        }
+                    }
+                } else {
+                    for ci in 0..2 {
+                        ccf[ci] = dc_ccf[ci];
+                        cpred_px[ci] = [cpred[ci]; 16];
+                        if !dc_ccf[ci].iter().all(|&c| c == 0) {
+                            chroma_zero = false;
+                        }
                     }
                 }
             }
@@ -2879,12 +3005,16 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(best_mode, &mut self.cdfs.kf_y[yctx]);
             if has_chroma {
-                // chroma stays DC (CfL/SMOOTH_V layered later); uv context uses
-                // the luma mode of the chroma-bearing (bottom-right) sub-block.
-                self.emit_uv_mode(best_mode, DC_PRED, None);
+                // uv context uses the luma mode of this unit. CfL signals the
+                // joint sign + per-plane alpha; otherwise plain DC.
+                if use_cfl {
+                    self.emit_uv_mode(best_mode, CFL_PRED, Some(cfl_alpha_uv));
+                } else {
+                    self.emit_uv_mode(best_mode, DC_PRED, None);
+                }
             }
 
-            // --- residual: luma 4x4, then (BR) chroma U/V 4x4 ---
+            // --- residual: luma 4x4, then chroma U/V 4x4 (if has_chroma) ---
             let lres_ctx = if block_skip {
                 0x40
             } else {
@@ -2915,9 +3045,9 @@ impl<'a> LossyTile<'a> {
                 }
             }
 
-            // chroma residual + reconstruction (BR only)
-            if has_chroma && !self.mono {
-                let (bx4c, by4c) = (cx / 4, cy / 4);
+            // chroma residual + reconstruction
+            if has_chroma {
+                let (bx4c, by4c) = (chx / 4, chy / 4);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let res_ctx = if block_skip {
@@ -2935,9 +3065,12 @@ impl<'a> LossyTile<'a> {
                         idct_dequant_4x4(&ccf[ci], &self.cquant)
                     };
                     for ry in 0..4 {
-                        let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
+                        let drow = &mut self.recon[plane][(chy + ry) * cstride + chx..];
                         for rx in 0..4 {
-                            drow[rx] = (cpred[ci] + rr[ry * 4 + rx]).clamp(0, maxv);
+                            // When the block is skipped (no residual) the prediction
+                            // is exactly the chroma reconstruction. For a skipped CfL
+                            // block, cpred_px already holds the CfL prediction.
+                            drow[rx] = (cpred_px[ci][ry * 4 + rx] + rr[ry * 4 + rx]).clamp(0, maxv);
                         }
                     }
                 }
@@ -6145,8 +6278,20 @@ fn frame_cdef(
         (0, 0)
     } else {
         cdef_search_chroma(
-            &recon[1], &src[1], cw8, ch8, &ldirs, &uv_dir, skip8, sb8w, nbx, nby, sub_x, sub_y,
-            chroma_damping, bd,
+            &recon[1],
+            &src[1],
+            cw8,
+            ch8,
+            &ldirs,
+            &uv_dir,
+            skip8,
+            sb8w,
+            nbx,
+            nby,
+            sub_x,
+            sub_y,
+            chroma_damping,
+            bd,
         )
     };
 
@@ -6172,8 +6317,21 @@ fn frame_cdef(
     if !mono && (up != 0 || us != 0) {
         for plane in 1..3 {
             apply_cdef_chroma(
-                &mut recon[plane], cw8, ch8, &ldirs, &uv_dir, skip8, sb8w, nbx, nby, sub_x, sub_y,
-                up, us, chroma_damping, bd,
+                &mut recon[plane],
+                cw8,
+                ch8,
+                &ldirs,
+                &uv_dir,
+                skip8,
+                sb8w,
+                nbx,
+                nby,
+                sub_x,
+                sub_y,
+                up,
+                us,
+                chroma_damping,
+                bd,
             );
         }
     }
@@ -6523,7 +6681,6 @@ fn cdef_search_chroma(
     best
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn frame_deblock(
     recon: &mut [Vec<i32>; 3],
@@ -6533,7 +6690,7 @@ fn frame_deblock(
     ch8: usize,
     blk4: &[u8],  // luma block width map (vertical edges)
     blk4h: &[u8], // luma block height map (horizontal edges)
-    nc4: usize, // luma 4-col count == w8/4
+    nc4: usize,   // luma 4-col count == w8/4
     sub_x: usize,
     sub_y: usize,
     mono: bool,

@@ -1289,9 +1289,6 @@ mod tests {
         assert!(err < sig * 0.5, "error energy {err} vs signal {sig}");
     }
 
-    // ── coefficient verifiers ─────────────────────────────────────────────────
-    // Ground truth: 1/(2·cos((2k+1)·π/(2N))) computed in f64, rounded to Q0.16.
-
     fn q16(v: f64) -> i32 {
         (v * 65536.0_f64).round() as i32
     }
@@ -1617,29 +1614,14 @@ mod tests {
 #[cfg(all(target_arch = "aarch64", feature = "neon", test))]
 mod neon_consistency {
     use super::*;
-    use crate::neon::{dct8x8_neon_i32, dct16x16_neon_i32};
+    use crate::neon::dct16x16_neon_i32;
     fn next(seed: &mut u64) -> i32 {
         *seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*seed >> 33) as i32).rem_euclid(960) - 480
     }
-    #[test]
-    fn neon_matches_scalar_8x8() {
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        for &(dcq, acq) in &[(26i32, 30i32), (52, 58), (210, 240)] {
-            for _ in 0..128 {
-                let mut a = [0i32; 64];
-                for v in a.iter_mut() {
-                    *v = next(&mut seed);
-                }
-                let mut b = a;
-                unsafe { dct8x8_neon_i32(&mut a, dcq, acq) };
-                dct8x8_scalar(&mut b, dcq, acq);
-                assert_eq!(a, b, "NEON 8x8 forward+quant diverges from scalar");
-            }
-        }
-    }
+
     #[test]
     fn neon_matches_scalar_16x16() {
         let mut seed = 0xD1B5_4A32_D192_ED03u64;

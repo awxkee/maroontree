@@ -65,7 +65,77 @@ pub(crate) fn trellis_lambda() -> f64 {
     TRELLIS_LAMBDA0
 }
 
-/// Probability -> bit-cost table. `COST_Q[p]` holds `-log2(p / 32768)` in
+// ---------------------------------------------------------------------------
+// libaom rdmult port (av1/encoder/rd.c, BSD-2-Clause — same license family as
+// this crate). Reimplemented in Rust from the reference algorithm, not copied
+// verbatim. For an all-intra still (AVIF key frame) the relevant path is the
+// KF_UPDATE branch of `av1_compute_rd_mult_based_on_qindex`.
+//
+//   q       = av1_dc_quant_QTX(qindex, 0, bit_depth)   // == our dc_q()
+//   rdmult  = q * q
+//   rdmult *= def_kf_rd_multiplier(q) = 3.3 + 0.0015*q  // KF branch
+//   // SSIMULACRA2 / IQ tuning weight (good-quality, non-realtime):
+//   weight  = clamp(((255 - qindex) * 3) / 4, 0, 72) + 128   // 128..200
+//   rdmult *= weight / 128
+//   // bit-depth normalisation: 8-bit none, 10-bit >>4, 12-bit >>8
+//
+// libaom's integer RDCOST is
+//   RDCOST(rdmult, R, D) = ((rdmult * R + (1<<9)) >> 10) + (D << 4)
+// with R in *real* entropy-coded bits (Q9, 1 bit = 512) and D = integer SSE.
+// This crate keeps a *proxy* bit estimate and float SSE, so the integer rdmult
+// cannot be used as-is. We expose the libaom rdmult shape (the q-dependence and
+// the SSIMULACRA2 weight — the parts that fix decision *consistency* across q)
+// and fold the fixed-point/units difference into one calibration constant so
+// `cost = SSE + mode_lambda_aom(...) * proxy_bits` stays on the same scale the
+// existing thresholds were tuned against.
+
+/// libaom's DC-quant-domain KF rd multiplier: `3.3 + 0.0015*q`.
+#[allow(dead_code)]
+#[inline]
+fn def_kf_rd_multiplier(q: f64) -> f64 {
+    3.3 + 0.0015 * q
+}
+
+/// libaom's SSIMULACRA2 / IQ tuning weight for good-quality (non-realtime)
+/// all-intra: `clamp(((255-qindex)*3)/4, 0, 72) + 128`, range 128..=200, applied
+/// as `weight/128`. Biases toward larger transforms at low/mid qindex and ramps
+/// to neutral by qindex 159 — libaom tuned this directly on SSIMULACRA2.
+#[inline]
+pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f64 {
+    let w = (((255i32 - qindex as i32) * 3) / 4).clamp(0, 72) + 128;
+    w as f64 / 128.0
+}
+
+#[allow(dead_code)]
+pub(crate) const AOM_RDMULT_CALIB: f64 = 1.0 / (1 << 4) as f64; // undo libaom's D<<4
+
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn mode_lambda_aom(dc_q: f64, qindex: u8, bd: u8, tune_ssimulacra2: bool) -> f64 {
+    let mut rdmult = dc_q * dc_q * def_kf_rd_multiplier(dc_q);
+    if tune_ssimulacra2 {
+        rdmult *= aom_ssimulacra2_rdmult_weight(qindex);
+    }
+    // Bit-depth normalisation (libaom: 10-bit >>4, 12-bit >>8).
+    rdmult *= match bd {
+        10 => 1.0 / (1 << 4) as f64,
+        12 => 1.0 / (1 << 8) as f64,
+        _ => 1.0,
+    };
+    // libaom RDCOST weights rate as rdmult/1024 against D<<4 distortion; our cost
+    // compares against raw SSE, so divide by 1024 and by the D<<4 factor.
+    rdmult * (1.0 / 1024.0) * AOM_RDMULT_CALIB
+}
+
+#[inline]
+pub(crate) fn mode_lambda_weight(qindex: u8, tune: bool) -> f64 {
+    if tune {
+        aom_ssimulacra2_rdmult_weight(qindex)
+    } else {
+        1.0
+    }
+}
+
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in
 /// `[1, 32768]`. Built once; replaces a per-call `log2()` (a libm transcendental
 /// that dominated the trellis) with a single array load. Q22 keeps the rounding
@@ -128,11 +198,6 @@ pub(crate) fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f64 {
 
 /// Candidate non-directional luma modes evaluated by the mode search, in CDF
 /// symbol order (DC first).
-/// Estimated coded bits for a quantized block, for the intra mode search. Unlike
-/// `est_block_bits` (a partition-time proxy whose EOB term wrongly penalises the
-/// many-small-coefficient residuals that good prediction produces), this sums
-/// the calibrated per-level token cost over the coded prefix, so it tracks the
-/// real entropy cost and ranks predictors correctly.
 pub(crate) fn block_rate_bits(cf: &[i32], scan: &[usize]) -> f64 {
     let mut eob: i32 = -1;
     for (i, &rc) in scan.iter().enumerate() {

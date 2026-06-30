@@ -28,8 +28,7 @@
  */
 
 use crate::dct::{
-    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32,
-    dct32x32_t,
+    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32, dct32x32_t,
 };
 
 /// DC dequant value `dav1d_dq_tbl[bd][q][0]` for bit_depth 8/10/12.
