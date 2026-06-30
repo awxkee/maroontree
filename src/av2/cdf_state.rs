@@ -460,10 +460,7 @@ impl CdfState {
         // Luma TX_16X16 skip (avm txb_skip txs_ctx=2) — distinct adaptation slot from
         // the TX_32X32 table reused for `txb_skip`. Checked last because its ctx0 seed
         // can otherwise be confused with a chroma value at some q-contexts.
-        if let Some(i) = SKIP_TX16_QC[self.qc]
-            .iter()
-            .position(|&v| v == val)
-        {
+        if let Some(i) = SKIP_TX16_QC[self.qc].iter().position(|&v| v == val) {
             return (3, i);
         }
         // TX_8X8 skip (avm txb_skip txs_ctx=1) — its own adaptation slot.
@@ -486,14 +483,14 @@ impl CdfState {
             .position(|&v| v as u16 == val)
             .unwrap_or(0)
     }
-    
+
     pub(crate) fn rect_type_ctx_of(&self, val: u16) -> usize {
         crate::av2::partition::RECT_TYPE_CDF0
             .iter()
             .position(|&v| v as u16 == val)
             .unwrap_or(0)
     }
-    
+
     pub(crate) fn txfm_bool(&mut self, val: u16) -> &mut Vec<u16> {
         self.txfm_bools.entry(val).or_insert_with(|| {
             let para = cdf_para::BOOL_PARA_LUT

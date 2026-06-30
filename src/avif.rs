@@ -190,7 +190,7 @@ impl Default for EncodeConfig {
             speed: Speed::Slow,
             adaptive_quant: true,
             variance_boost: true,
-            cdef: true,
+            cdef: false,
             wiener: false,
         }
     }

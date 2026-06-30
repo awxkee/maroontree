@@ -368,12 +368,6 @@ pub(crate) fn dct8x8_neon_coeffs(input: &[i32; 64]) -> [i32; 64] {
 }
 
 #[target_feature(enable = "neon")]
-pub(crate) fn dct8x8_neon_i32(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
-    let coeffs = dct8x8_neon_coeffs(input);
-    quant_flat(&coeffs, dc_q, ac_q, input);
-}
-
-#[target_feature(enable = "neon")]
 pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
     unsafe {
         let mut c_l = load16_i32(input, 16);
@@ -600,9 +594,8 @@ pub(crate) fn dct8x16_neon_i32(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
 
 #[cfg(test)]
 mod neon_vs_scalar {
-
-    use crate::dct::{dct8x8_scalar, dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
-    use crate::neon::{dct8x8_neon_i32, dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
+    use crate::dct::{dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
+    use crate::neon::{dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
 
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
@@ -640,77 +633,6 @@ mod neon_vs_scalar {
         (65536, 46341), // DC full-scale, AC √2/2
         (32768, 32768), // both halved
     ];
-
-    fn run_8x8(input: [i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [i32; 64]) {
-        let mut scalar = input;
-        dct8x8_scalar(&mut scalar, dc_q, ac_q);
-        let mut neon = input;
-        // SAFETY: aarch64 target guarantees NEON availability at runtime.
-        unsafe { dct8x8_neon_i32(&mut neon, dc_q, ac_q) };
-        (scalar, neon)
-    }
-
-    #[test]
-    fn test_8x8_zeros() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8([0i32; 64], dc_q, ac_q);
-            assert_eq!(s, n, "8x8 zeros dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_8x8_constant() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8([64i32; 64], dc_q, ac_q);
-            assert_eq!(s, n, "8x8 constant dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_8x8_ramp() {
-        let mut input = [0i32; 64];
-        fill_ramp(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8(input, dc_q, ac_q);
-            assert_eq!(s, n, "8x8 ramp dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_8x8_alternating() {
-        let mut input = [0i32; 64];
-        fill_alt(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8(input, dc_q, ac_q);
-            assert_eq!(s, n, "8x8 alternating dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_8x8_random_seed0() {
-        let mut input = [0i32; 64];
-        fill_lcg(&mut input, 0xDEAD_BEEF);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8(input, dc_q, ac_q);
-            let first = s.iter().zip(n.iter()).position(|(a, b)| a != b);
-            assert_eq!(
-                s, n,
-                "8x8 rand(DEADBEEF) dc_q={dc_q} ac_q={ac_q}: mismatch at {first:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_8x8_random_seed1() {
-        let mut input = [0i32; 64];
-        fill_lcg(&mut input, 0x1234_5678);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_8x8(input, dc_q, ac_q);
-            assert_eq!(s, n, "8x8 rand(12345678) dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    // ── dct16x16 ──────────────────────────────────────────────────────────
 
     fn run_16x16(input: [i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [i32; 256]) {
         let mut scalar = input;

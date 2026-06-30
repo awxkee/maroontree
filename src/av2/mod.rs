@@ -29,6 +29,7 @@
 mod aq;
 mod av2_itx;
 mod avif;
+mod ccso;
 mod cdf_para;
 mod cdf_state;
 mod cdfs_qctx;
@@ -36,7 +37,6 @@ mod cdfx_4tx;
 #[allow(dead_code)]
 mod cfl;
 mod chroma422;
-mod ccso;
 mod coder;
 mod csc;
 #[allow(dead_code)]

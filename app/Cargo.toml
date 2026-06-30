@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 maroontree = {path = "../", default-features = false}
-image = {version = "0.25.10", default-features = false, features = ["jpeg", "png"]}
+image = {version = "0.25.10", default-features = false, features = ["jpeg", "png", "avif"]}
 criterion = "0.8.2"
