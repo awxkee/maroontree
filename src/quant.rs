@@ -28,7 +28,7 @@
  */
 
 use crate::dct::{
-    dct4x4_t, dct4x8_t, dct8x8, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32,
+    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32,
     dct32x32_t,
 };
 
@@ -129,7 +129,18 @@ impl Quant {
     }
 
     pub(crate) fn new_chroma(base_q_idx: u8, bd: u8) -> Self {
-        let dc_idx = (base_q_idx as i32 + chroma_dc_delta(base_q_idx)).clamp(0, 255) as u8;
+        Self::new_chroma_with_delta(base_q_idx, chroma_dc_delta(base_q_idx), bd)
+    }
+
+    /// As [`Self::new_chroma`] but with an explicit chroma-DC qindex delta. Under
+    /// adaptive quantization the per-superblock qindex (`CurrentQIndex`) changes,
+    /// but the chroma-DC delta is a frame-level constant signalled once in the
+    /// header (`DeltaQUDc`, derived from the frame `base_q_idx`). The decoder
+    /// forms the chroma-DC qindex as `CurrentQIndex + DeltaQUDc`, so the encoder
+    /// must apply that same frame-level delta to the AQ-adjusted qindex rather
+    /// than recomputing it from the local qindex.
+    pub(crate) fn new_chroma_with_delta(base_q_idx: u8, dc_delta: i32, bd: u8) -> Self {
+        let dc_idx = (base_q_idx as i32 + dc_delta).clamp(0, 255) as u8;
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
         let dc = dc_q(dc_idx, bd) as i32;
         let ac = ac_q(base_q_idx, bd) as i32;
@@ -168,15 +179,6 @@ impl Dct for Quant {
     fn q_mult_ac(&self) -> i32 {
         self.q_mult_ac
     }
-}
-
-/// Forward-DCT + quantize an 8x8 residual block into AV1 quantized coefficient
-/// levels (raster order, for `encode_tx8_luma_coeffs`). The dav1d 8x8 inverse
-/// DCT equals (1/8) x orthonormal DCT, so forward `cf = 8 * orthonormalDCT2(R)`,
-/// quantized by dc_q (DC) / ac_q (AC), transposed (`rc = u*8 + v`) to dav1d's
-/// coefficient layout. (Calibrated against dav1d: round-trip max error ~1 at q=16.)
-pub(crate) fn forward_dct_quant_8x8(residual: &mut [i32; 64], q: &impl Dct) {
-    dct8x8(residual, q)
 }
 
 /// Trellis (RDOQ) forward 8x8: the integer DCT levels plus the unrounded

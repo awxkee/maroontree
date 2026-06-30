@@ -36,6 +36,7 @@ mod cdfx_4tx;
 #[allow(dead_code)]
 mod cfl;
 mod chroma422;
+mod ccso;
 mod coder;
 mod csc;
 #[allow(dead_code)]
@@ -160,10 +161,27 @@ pub struct Tuning {
     /// Trellis-RDOQ strength (level^2 per bit). `0.0` disables RDOQ (round-to-nearest
     /// + EOB truncation baseline).
     pub rdoq_lambda: f64,
+    /// Trellis-RDOQ strength for chroma planes (level^2 per bit). `0.0` disables the
+    /// chroma trellis (round-to-nearest + EOB truncation baseline), which is the
+    /// default — chroma RDOQ is bitstream-affecting and opt-in.
+    pub chroma_rdoq_lambda: f64,
     /// Multiplier `c` in the tx-partition RD lambda `lambda = c * qstep^2`.
     pub part_lambda_c: f64,
     /// Enable the in-loop deblocking filter
     pub deblock: bool,
+    /// Enable deblocking of the chroma (U/V) planes.
+    pub chroma_deblock: bool,
+    /// Enable CCSO (cross-component sample offset) on the U plane. Phase 1:
+    /// band-offset-only, every superblock filtered, offsets derived by a per-band
+    /// SSE search. Off by default while under development.
+    pub ccso: bool,
+    /// CCSO per-superblock RD on/off threshold scale (higher = more conservative,
+    /// fewer superblocks filtered). Default 16.0.
+    pub ccso_rd_scale: f64,
+    /// Deblock threshold quantizer-index offset for luma / chroma (range -2..=1
+    /// with df_par_bits=2). 0 = thresholds derived purely from the frame qindex.
+    pub db_delta_y: i32,
+    pub db_delta_uv: i32,
     /// Enable the in-loop CDEF (directional de-ring).
     pub cdef: bool,
     /// Enable AV2 chroma-from-luma (CfL) intra prediction. Experimental; bitstream-affecting.
@@ -183,6 +201,8 @@ pub struct Tuning {
     /// extra bits for quality). When false (default), it also coarsens high-variance
     /// SBs so the average quantizer tracks the frame base (rate-balanced).
     pub vb_boost_only: bool,
+    /// Enable the non-CfL chroma intra-mode search
+    pub chroma_mode_search: bool,
     pub updating_cdf: bool,
 }
 
@@ -193,14 +213,21 @@ impl Default for Tuning {
             tile_rows: 1,
             txpart: TxPart::ThreeWay,
             rdoq_lambda: proj::DEFAULT_RDOQ_LAMBDA,
+            chroma_rdoq_lambda: proj::DEFAULT_RDOQ_LAMBDA,
             part_lambda_c: 0.0001,
             deblock: true,
+            chroma_deblock: true,
+            ccso: false,
+            ccso_rd_scale: 1.0,
+            db_delta_y: i32::MIN,
+            db_delta_uv: 0,
             cdef: false,
             cfl: true,
             aq: true,
             vb_octile: 6,
             vb_strength: 0.6,
             vb_boost_only: true,
+            chroma_mode_search: true,
             updating_cdf: true,
         }
     }
@@ -281,6 +308,8 @@ struct QuantCtx {
     qc: usize,
     neutral: f32,
     qstep: i32,
+    /// Chroma trellis-RDOQ strength; 0.0 = round-to-nearest (no trellis).
+    rdoq_lambda: f64,
 }
 
 /// Immutable per-pass geometry + quant parameters for a native edge-partition walk.
@@ -392,6 +421,12 @@ impl Av2Encoder {
         self
     }
 
+    /// Set the chroma trellis-RDOQ strength (0.0 disables it; default 0.0).
+    pub fn with_chroma_rdoq_lambda(mut self, lambda: f64) -> Self {
+        self.tune.chroma_rdoq_lambda = lambda.max(0.0);
+        self
+    }
+
     /// Set the RDO effort level (see [`Speed`]). [`Speed::Slow`]
     /// (the default) does per-candidate RDOQ; faster tiers run RDOQ once on the
     /// winning luma mode, and [`Speed::Fast`] also reduces the intra set.
@@ -435,6 +470,18 @@ impl Av2Encoder {
         self
     }
 
+    /// Enable the non-CfL chroma intra-mode search
+    pub fn with_chroma_mode_search(mut self, on: bool) -> Self {
+        self.tune.chroma_mode_search = on;
+        self
+    }
+
+    pub fn with_ccso(mut self, on: bool) -> Self {
+        self.tune.ccso = on;
+        self
+    }
+
+    /// Enable adaptive CDF updating during tile decode
     pub fn with_updating_cdf(mut self, on: bool) -> Self {
         self.tune.updating_cdf = on;
         self
@@ -451,11 +498,29 @@ impl Av2Encoder {
     }
 
     fn config(&self, layout: Layout) -> Config {
+        // Quality-adaptive luma deblock delta. A +1 quantiser-index offset strengthens
+        // the luma filter, which helps at low/mid quality (large gains: man1024 +0.29,
+        // bship +1.60, buddha +0.99 BD-SSIM at low q) and is neutral at high quality.
+        // Applied automatically when `db_delta_y` is left at its `i32::MIN` "auto"
+        // default; any explicit value (including 0) overrides. Chroma deblock is left off by default (it over-smooths chroma:
+        // -0.77 BD-SSIM), so `db_delta_uv` is only used when chroma_deblock is set.
+        let adaptive_dy = if self.base_q_idx >= 48 { 1 } else { 0 };
+        let eff_dy = if self.tune.db_delta_y == i32::MIN {
+            adaptive_dy
+        } else {
+            self.tune.db_delta_y
+        };
         Config {
             layout,
             base_q: self.base_q_idx as u32,
             deblock: self.tune.deblock,
-            delta_q: 0,
+            db_apply: (
+                self.tune.deblock,
+                self.tune.deblock,
+                self.tune.deblock && self.tune.chroma_deblock,
+                self.tune.deblock && self.tune.chroma_deblock,
+            ),
+            db_delta: (eff_dy, eff_dy, self.tune.db_delta_uv, self.tune.db_delta_uv),
             tx_switchable: true,
             guided_deblock: None,
             cdef: if self.tune.cdef {
@@ -466,6 +531,10 @@ impl Av2Encoder {
             } else {
                 None
             },
+            // CCSO is computed as a post-reconstruction search pass (it needs the
+            // final recon to derive offsets), so the Config carries None here and the
+            // encoder fills it in just before writing the frame header.
+            ccso: None,
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
             cfl: self.tune.cfl && self.base_q_idx != 0,
@@ -510,6 +579,8 @@ impl Av2Encoder {
         height: usize,
         color: &Cicp,
     ) -> Av2Frame {
+        let ccso_u_result = enc.ccso_u_result.clone();
+        let ccso_v_result = enc.ccso_v_result.clone();
         let tile = enc.finish();
         // AV2 derives its mode-info grid by rounding the frame to 4px
         // (ALIGN_POWER_OF_TWO(dim, MI_SIZE_LOG2)); superblocks are 64px (16 mi).
@@ -525,7 +596,7 @@ impl Av2Encoder {
         // Lossless now codes every boundary geometry via the recursive forced-split
         // partition coder, so it always signals the real size (decoder crops to W x H).
         // Lossy doesn't clip its tx blocks at boundaries, so it pads unless SB-aligned.
-        let aligned = mi_cols.is_multiple_of(MIB) && mi_rows.is_multiple_of(MIB);
+        let aligned = ((mi_cols) % (MIB) == 0) && ((mi_rows) % (MIB) == 0);
         // Boundary-safe lossy 4:4:4 can also signal real W×H natively (the partial-edge
         // superblock decodes correctly with the edge-clamped entropy contexts).
         let lossy_native = !config.lossless
@@ -537,6 +608,40 @@ impl Av2Encoder {
         let exact = config.lossless || aligned || lossy_native;
         // Signaled dimensions: real size when boundary-safe, else the padded size.
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
+        // Fold the derived CCSO U/V results into the config for the frame header.
+        let mut config = (*config).clone();
+        let to_plane = |r: &ccso::PlaneResult| -> headers::CcsoPlane {
+            use crate::av2::ccso::PlaneResult::*;
+            match r {
+                Edge {
+                    scale_idx,
+                    quant_idx,
+                    ext_filter_support,
+                    edge_clf,
+                    max_band_log2,
+                    offsets,
+                } => crate::av2::headers::CcsoPlane {
+                    bo_only: false,
+                    scale_idx: *scale_idx,
+                    quant_idx: *quant_idx,
+                    ext_filter_support: *ext_filter_support,
+                    edge_clf: *edge_clf,
+                    max_band_log2: *max_band_log2,
+                    offsets: offsets.clone(),
+                },
+            }
+        };
+        if ccso_u_result.is_some() || ccso_v_result.is_some() {
+            config.ccso = Some(headers::CcsoConfig {
+                enable: [false, ccso_u_result.is_some(), ccso_v_result.is_some()],
+                planes: [
+                    None,
+                    ccso_u_result.as_ref().map(&to_plane),
+                    ccso_v_result.as_ref().map(&to_plane),
+                ],
+            });
+        }
+        let config = &config;
         let mut frame = frame_header(config, sw as u32, sh as u32, (0, 0, 1));
         frame.extend(&tile);
         let mut data = vec![];

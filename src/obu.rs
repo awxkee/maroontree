@@ -223,6 +223,7 @@ pub(crate) fn frame_header_lossy_multitile(
     mono: bool,
     aq: bool,
     cdef: Option<&CdefParams>,
+    lr: Option<&LrParams>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -235,6 +236,7 @@ pub(crate) fn frame_header_lossy_multitile(
         mono,
         aq,
         cdef,
+        lr,
     )
 }
 
@@ -247,6 +249,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     mono: bool,
     aq: bool,
     cdef: Option<&CdefParams>,
+    lr: Option<&LrParams>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -259,6 +262,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         mono,
         aq,
         cdef,
+        lr,
     )
 }
 
@@ -323,6 +327,40 @@ fn write_cdef_params(w: &mut BitWriter, cdef: &CdefParams, mono: bool) {
     }
 }
 
+/// Loop-restoration parameters for the frame header. This encoder only enables
+/// **luma Wiener** restoration with the smallest restoration-unit size (64x64,
+/// `lr_unit_shift = 0`, one unit per superblock); chroma is always
+/// `RESTORE_NONE`. `enabled = false` writes the all-`RESTORE_NONE` form (the
+/// no-op the decoder also runs when restoration is off).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LrParams {
+    /// True when luma uses RESTORE_WIENER; false => all planes RESTORE_NONE.
+    pub luma_wiener: bool,
+}
+
+/// Write `lr_params()` (spec 5.9.20). `num_planes` is 1 for monochrome else 3.
+fn write_lr_params(w: &mut BitWriter, lr: &LrParams, num_planes: usize) {
+    // Remap_Lr_Type maps coded lr_type -> restoration type; coded value 2 yields
+    // RESTORE_WIENER. Luma uses Wiener when enabled, chroma always NONE.
+    // Plane 0:
+    if lr.luma_wiener {
+        w.f(2, 2); // lr_type = 2 => RESTORE_WIENER
+    } else {
+        w.f(0, 2); // RESTORE_NONE
+    }
+    // Planes 1,2 (if present): RESTORE_NONE.
+    for _ in 1..num_planes {
+        w.f(0, 2);
+    }
+    if lr.luma_wiener {
+        // UsesLr = 1. Not 128x128 superblocks => lr_unit_shift read as: 1 bit;
+        // if 1, +1 more bit. We want shift = 0 (size 64), so a single 0 bit.
+        w.f(0, 1); // lr_unit_shift = 0 -> LoopRestorationSize = 256 >> 2 = 64
+        // usesChromaLr = 0 (chroma is NONE), so no lr_uv_shift is read even in
+        // subsampled formats.
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn frame_header_lossy_impl(
     base_q_idx: u8,
@@ -335,6 +373,7 @@ fn frame_header_lossy_impl(
     mono: bool,
     aq: bool,
     cdef: Option<&CdefParams>,
+    lr: Option<&LrParams>,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -402,7 +441,12 @@ fn frame_header_lossy_impl(
     };
     let cdef = cdef.unwrap_or(&noop_cdef);
     write_cdef_params(&mut w, cdef, mono);
-    // lr_params(): sequence enable_restoration = 0 => skipped
+    // lr_params(): sequence enable_restoration = 1, so always coded. Defaults to
+    // all RESTORE_NONE (no-op) unless luma Wiener is enabled for this frame.
+    let noop_lr = LrParams::default();
+    let lr = lr.unwrap_or(&noop_lr);
+    let num_planes = if mono { 1 } else { 3 };
+    write_lr_params(&mut w, lr, num_planes);
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
     // FrameIsIntra => reference/skip-mode/global-motion skipped
@@ -482,7 +526,7 @@ pub(crate) fn sequence_header_mono(
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
-    w.flag(false); // enable_restoration
+    w.flag(true); // enable_restoration (loop restoration: luma Wiener)
 
     // color_config() — monochrome branch.
     let high_bitdepth = bit_depth > 8;
@@ -541,7 +585,7 @@ fn seq_header_ss(
     w.flag(false); // enable_intra_edge_filter
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
-    w.flag(false); // enable_restoration
+    w.flag(true); // enable_restoration (loop restoration: luma Wiener)
 
     // color_config()
     let high_bitdepth = bit_depth > 8;

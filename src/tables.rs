@@ -276,10 +276,8 @@ pub(crate) const COEFF_BASE_RANGE: i32 = 12;
 pub(crate) static SCAN_16X16: [usize; 256] = crate::coef_q::SCAN_16X16;
 pub(crate) static SCAN_32X32: [usize; 1024] = crate::coef_q::SCAN_32X32;
 pub(crate) static SCAN_8X16: [usize; 128] = crate::coef_q::SCAN_8X16;
+pub(crate) static SCAN_16X8: [usize; 128] = crate::coef_q::SCAN_16X8;
 pub(crate) static SCAN_16X32: [usize; 512] = crate::coef_q::SCAN_16X32;
-/// R-D proxy per-block overhead (level-sum units) for the 16x16-vs-4x8x8
-/// partition decision in `prefer_16x16`. Tuned so smooth regions pick 16x16.
-pub(crate) const OVERHEAD_8: u32 = 8;
 pub(crate) const OVERHEAD_16: u32 = 8;
 pub(crate) static SCAN_8X8: [usize; 64] = [
     0, 8, 1, 2, 9, 16, 24, 17, 10, 3, 4, 11, 18, 25, 32, 40, 33, 26, 19, 12, 5, 6, 13, 20, 27, 34,
@@ -377,4 +375,14 @@ pub(crate) static LO_CTX_OFF_WLH: [[u32; 5]; 5] = [
     [6, 6, 21, 21, 21],
     [6, 21, 21, 21, 21],
     [21, 21, 21, 21, 21],
+];
+
+/// 2D coeff-base context offsets for non-square transforms with width > height
+/// (e.g. RTX_16X8). dav1d `dav1d_lo_ctx_offsets[1]`, indexed `[y][x]`.
+pub(crate) static LO_CTX_OFF_WGH: [[u32; 5]; 5] = [
+    [0, 16, 6, 6, 21],
+    [16, 16, 6, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
 ];

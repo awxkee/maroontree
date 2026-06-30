@@ -844,6 +844,40 @@ pub(crate) fn dc_pred_8x16(recon: &[i32], stride: usize, ox: usize, oy: usize, b
     }
 }
 
+/// DC prediction for a 16x8 (wide) block: above 16 samples, left 8 samples.
+pub(crate) fn dc_pred_16x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
+    let above = oy > 0;
+    let left = ox > 0;
+    match (above, left) {
+        (true, true) => {
+            let mut s = 12i32; // (16+8)>>1
+            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(8)
+                .sum::<i32>();
+            s >>= 3; // ctz(16+8) = ctz(24) = 3
+            (((s as u32) * 0x5556) >> 16) as i32
+        }
+        (true, false) => {
+            let mut s = 8i32; // 16>>1
+            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
+            s >> 4 // ctz(16)
+        }
+        (false, true) => {
+            let mut s = 4i32; // 8>>1
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(8)
+                .sum::<i32>();
+            s >> 3 // ctz(8)
+        }
+        (false, false) => 1 << (bd - 1),
+    }
+}
+
 /// DC prediction for a 16x16 block (mirror of `dc_pred_8x8`).
 pub(crate) fn dc_pred_16x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
     let above = oy > 0;

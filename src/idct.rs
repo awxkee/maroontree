@@ -68,6 +68,49 @@ pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512
     tmp
 }
 
+/// 16x8 (wide) inverse: width 16, height 8. The mirror of `idct_dequant_8x16`,
+/// for luma PARTITION_H sub-blocks. `levels` are in 16(w)x8(h) raster
+/// (rc = row*16 + col). Returns 128 reconstructed residuals in the same raster.
+pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    // rect2 prescale + transpose: dav1d reads coeff[y + x*sh] with sh=h=8.
+    // tmp is laid out row-major width-16: tmp[row*16 + col].
+    let mut tmp = [0i32; 128];
+    for row in 0..8 {
+        for col in 0..16 {
+            tmp[row * 16 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    // row transform: width-16 inv_dct16 (stride 1) over each of the 8 rows.
+    for row in 0..8 {
+        inv_dct16_1d(&mut tmp[row * 16..], 1, rmin, rmax);
+    }
+    // mid shift = 1: (t + 1) >> 1, clipped to int16.
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    // column transform: height-8 inv_dct8 (stride 16) over each of the 16 columns.
+    for col in 0..16 {
+        inv_dct8_1d(&mut tmp[col..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
@@ -1066,6 +1109,334 @@ pub(crate) fn idct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     // column transform: inv_dct4 (stride 4) over each of the 4 columns
     for col in 0..4 {
         inv_dct4_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// dav1d-exact integer inverse ADST-4 (`inv_adst4_1d_internal_c`, in-place),
+/// over a stride-`s` lane. Transcribed verbatim from dav1d `src/itx_1d.c`.
+/// Note: unlike ADST8, the 4-point kernel performs NO min/max clipping inside
+/// the pass (the params are accepted for signature parity but unused), matching
+/// dav1d. The `(C - 4096)` constant form with the trailing `+ inX` terms is the
+/// decoder's exact arithmetic and is required for byte-exact reconstruction.
+pub(crate) fn inv_adst4_1d(c: &mut [i32], s: usize, _min: i32, _max: i32) {
+    let in0 = c[0];
+    let in1 = c[s];
+    let in2 = c[2 * s];
+    let in3 = c[3 * s];
+    let o0 =
+        ((1321 * in0 + (3803 - 4096) * in2 + (2482 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+            >> 12)
+            + in2
+            + in3
+            + in1;
+    let o1 =
+        (((2482 - 4096) * in0 - 1321 * in2 - (3803 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+            >> 12)
+            + in0
+            - in3
+            + in1;
+    let o2 = (209 * (in0 - in2 + in3) + 128) >> 8;
+    let o3 = (((3803 - 4096) * in0 + (2482 - 4096) * in2 - 1321 * in3 - (3344 - 4096) * in1
+        + 2048)
+        >> 12)
+        + in0
+        + in2
+        - in1;
+    c[0] = o0;
+    c[s] = o1;
+    c[2 * s] = o2;
+    c[3 * s] = o3;
+}
+
+/// Reconstruct a 4x4 residual from quantized levels using the AV1 inverse
+/// ADST_ADST (used for directional chroma modes whose `Mode_To_Txfm` is
+/// ADST_ADST). Same per-size orchestration as `idct_dequant_4x4`: dequant +
+/// transpose, row ADST pass (shift 0), clamp to col range, column ADST pass,
+/// `(t+8)>>4`. For TX_4X4 dav1d uses shift=0 (no inter-pass `(t+1)>>1`).
+pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for row in 0..4 {
+        inv_adst4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_adst4_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse ADST_DCT 4x4 (AV1 `ADST_DCT`): the decoder applies inv_dct on rows
+/// (first) and inv_adst on columns (second), mirroring `iadstdct_dequant_8x8`
+/// with 4-point kernels and the 4x4 orchestration (shift=0, no inter-pass
+/// `(t+1)>>1`). Pairs with the `adstdct4x4` forward.
+pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for row in 0..4 {
+        inv_dct4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_adst4_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse DCT_ADST 4x4 (AV1 `DCT_ADST`): inv_adst on rows (first), inv_dct on
+/// columns (second). Pairs with the `dctadst4x4` forward.
+pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for row in 0..4 {
+        inv_adst4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_dct4_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse ADST_DCT 4x8 (AV1 `ADST_DCT`): inv_dct on rows (width-4, first),
+/// inv_adst on columns (height-8, second). Mirrors `iadst_dequant_4x8` with the
+/// row kernel swapped to DCT. Pairs with the `adstdct4x8` forward.
+pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 32];
+    for rc in 0..32 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 32];
+    for row in 0..8 {
+        for col in 0..4 {
+            tmp[row * 4 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..8 {
+        inv_dct4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_adst8_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// Inverse DCT_ADST 4x8 (AV1 `DCT_ADST`): inv_adst on rows (width-4, first),
+/// inv_dct on columns (height-8, second). Pairs with the `dctadst4x8` forward.
+pub(crate) fn idctadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 32];
+    for rc in 0..32 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 32];
+    for row in 0..8 {
+        for col in 0..4 {
+            tmp[row * 4 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..8 {
+        inv_adst4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_dct8_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+#[cfg(test)]
+mod adst4_tests {
+    use super::*;
+    use crate::dct::adst4x4_t;
+    use crate::quant::Quant;
+
+    // Forward ADST4 then inverse ADST4 must reconstruct a residual closely
+    // (exactly at high quality where quant is near-lossless), confirming the
+    // dav1d-sourced inverse and the derived forward are a consistent,
+    // correctly-scaled pair.
+    #[test]
+    fn adst4_roundtrip_highq() {
+        // High quality (low base_q_idx) -> small quant step -> near-lossless.
+        let q = Quant::new_chroma(8, 8);
+        let residuals: [[i32; 16]; 3] = [
+            [
+                40, -32, 20, -12, 28, -24, 16, -8, 36, -28, 24, -4, 32, -20, 12, -16,
+            ],
+            [
+                80, 70, -40, 30, -60, 50, 20, -10, 44, -36, 24, -16, 32, -28, 12, -4,
+            ],
+            [
+                -50, 48, -46, 44, 42, -40, 38, -36, 34, 32, -30, 28, 26, -24, 22, -20,
+            ],
+        ];
+        for res in &residuals {
+            let (levels, _t) = adst4x4_t(res, &q);
+            let rec = iadst_dequant_4x4(&levels, &q);
+            // Energy-preserving check: reconstruction must track the input
+            // (mean-abs error small relative to signal magnitude).
+            let mut err = 0i64;
+            let mut sig = 0i64;
+            for i in 0..16 {
+                err += (rec[i] - res[i]).unsigned_abs() as i64;
+                sig += res[i].unsigned_abs() as i64;
+            }
+            assert!(
+                err * 4 <= sig + 16,
+                "ADST4 round-trip error too large: err={err} sig={sig} rec={rec:?} res={res:?}"
+            );
+        }
+    }
+
+    // The inverse must be deterministic and stride-correct: applying it on a
+    // single nonzero DC coefficient yields a flat-ish block (no NaNs/overflow).
+    #[test]
+    fn adst4_dc_only_is_finite() {
+        let q = Quant::new_chroma(40, 8);
+        let mut levels = [0i32; 16];
+        levels[0] = 12;
+        let rec = iadst_dequant_4x4(&levels, &q);
+        // all values within a sane residual range
+        for &v in &rec {
+            assert!(v.abs() < 4096, "ADST4 DC inverse out of range: {v}");
+        }
+    }
+
+    // ADST_DCT and DCT_ADST 4x4 must also round-trip (forward then inverse
+    // tracks the input), confirming the mixed-kernel pairs are scale-consistent.
+    #[test]
+    fn adstdct_dctadst_4x4_roundtrip() {
+        use crate::dct::{adstdct4x4_t, dctadst4x4_t};
+        let q = Quant::new_chroma(8, 8);
+        let res: [i32; 16] = [
+            40, -32, 20, -12, 28, -24, 16, -8, 36, -28, 24, -4, 32, -20, 12, -16,
+        ];
+        let check = |rec: [i32; 16], tag: &str| {
+            let mut err = 0i64;
+            let mut sig = 0i64;
+            for i in 0..16 {
+                err += (rec[i] - res[i]).unsigned_abs() as i64;
+                sig += res[i].unsigned_abs() as i64;
+            }
+            assert!(
+                err * 4 <= sig + 16,
+                "{tag} 4x4 round-trip error too large: err={err} sig={sig}"
+            );
+        };
+        let (l1, _) = adstdct4x4_t(&res, &q);
+        check(iadstdct_dequant_4x4(&l1, &q), "ADST_DCT");
+        let (l2, _) = dctadst4x4_t(&res, &q);
+        check(idctadst_dequant_4x4(&l2, &q), "DCT_ADST");
+    }
+}
+
+/// Reconstruct a 4x8 residual from quantized levels using the AV1 inverse
+/// ADST_ADST (4:2:2 directional chroma; `Mode_To_Txfm` ADST_ADST). Mirrors
+/// `idct_dequant_4x8` exactly (rect2 `(c*181+128)>>8` prescale, width-4 row
+/// pass, clamp, height-8 col pass, `(t+8)>>4`) with ADST kernels in both
+/// dimensions. For TX_4X8 dav1d uses shift=0.
+pub(crate) fn iadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 32];
+    for rc in 0..32 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 32];
+    for row in 0..8 {
+        for col in 0..4 {
+            tmp[row * 4 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..8 {
+        inv_adst4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_adst8_1d(&mut tmp[col..], 4, cmin, cmax);
     }
     for t in tmp.iter_mut() {
         *t = (*t + 8) >> 4;

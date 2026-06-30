@@ -221,6 +221,10 @@ pub(crate) struct CdfState {
     pub(crate) do_split: Vec<Vec<u16>>, // [64 partition_ctx]
     pub(crate) rect_type: Vec<Vec<u16>>, // [64 partition_ctx]
     pub(crate) txfm_bools: std::collections::HashMap<u16, Vec<u16>>,
+    /// CCSO per-superblock on/off flag, adaptive 2-symbol CDF. Indexed
+    /// [plane][ctx] with CCSO_PLANES=3, CCSO_CONTEXT=4. Phase 1 only uses
+    /// plane 1 (U), but all three planes are initialised to the AVM defaults.
+    pub(crate) ccso: Vec<Vec<Vec<u16>>>,
 }
 
 impl CdfState {
@@ -393,6 +397,39 @@ impl CdfState {
                 })
                 .collect(),
             txfm_bools: std::collections::HashMap::new(),
+            // CCSO blk on/off flag CDFs. AVM default_ccso_cdf[plane][ctx]:
+            // CDF2 value a0 -> icdf0 = 32768 - a0; PARA2(a,b,c) = (a+2,b+3,c+4).
+            ccso: {
+                // [plane][ctx] = (a0, (para0, para1, para2))
+                let defs: [[(u16, (u8, u8, u8)); 4]; 3] = [
+                    [
+                        (18469, (0, 1, 2)),
+                        (16384, (2, 3, 4)),
+                        (4949, (1, 1, 2)),
+                        (16384, (2, 3, 4)),
+                    ],
+                    [
+                        (23470, (1, 1, 2)),
+                        (16384, (2, 3, 4)),
+                        (6666, (1, 1, 2)),
+                        (16384, (2, 3, 4)),
+                    ],
+                    [
+                        (22914, (1, 1, 2)),
+                        (16384, (2, 3, 4)),
+                        (6993, (1, 1, 2)),
+                        (16384, (2, 3, 4)),
+                    ],
+                ];
+                defs.iter()
+                    .map(|plane| {
+                        plane
+                            .iter()
+                            .map(|&(a0, para)| bool_wc(32768 - a0, para))
+                            .collect()
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -423,7 +460,10 @@ impl CdfState {
         // Luma TX_16X16 skip (avm txb_skip txs_ctx=2) — distinct adaptation slot from
         // the TX_32X32 table reused for `txb_skip`. Checked last because its ctx0 seed
         // can otherwise be confused with a chroma value at some q-contexts.
-        if let Some(i) = SKIP_TX16_QC[self.qc].iter().position(|&v| v == val) {
+        if let Some(i) = SKIP_TX16_QC[self.qc]
+            .iter()
+            .position(|&v| v == val)
+        {
             return (3, i);
         }
         // TX_8X8 skip (avm txb_skip txs_ctx=1) — its own adaptation slot.
@@ -446,14 +486,14 @@ impl CdfState {
             .position(|&v| v as u16 == val)
             .unwrap_or(0)
     }
-
+    
     pub(crate) fn rect_type_ctx_of(&self, val: u16) -> usize {
         crate::av2::partition::RECT_TYPE_CDF0
             .iter()
             .position(|&v| v as u16 == val)
             .unwrap_or(0)
     }
-
+    
     pub(crate) fn txfm_bool(&mut self, val: u16) -> &mut Vec<u16> {
         self.txfm_bools.entry(val).or_insert_with(|| {
             let para = cdf_para::BOOL_PARA_LUT

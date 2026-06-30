@@ -31,6 +31,25 @@ use super::*;
 use crate::av2::coder::EobCdf;
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn project_chroma_rdoq(
+    basis: &Basis,
+    resid: &[f32],
+    scan: &[u16],
+    qc: usize,
+    area: usize,
+    plane_offset: usize,
+    lambda: f64,
+) -> Vec<f32> {
+    if lambda > 0.0 {
+        let (mut l, prm) = basis.project_scan_with_prm(resid, scan);
+        coder::rdoq_chroma(&prm, &mut l, qc, scan, area, plane_offset, lambda);
+        l
+    } else {
+        basis.project_scan(resid, 0.0, scan)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recon_422_chroma(
     pred: f32,
     lev: &[f32],
@@ -107,7 +126,12 @@ pub(super) fn code_422_chroma_tu(
         area,
         u_skip_row,
     } = spec;
-    let QuantCtx { qc, neutral, qstep } = quant;
+    let QuantCtx {
+        qc,
+        neutral,
+        qstep,
+        rdoq_lambda,
+    } = quant;
     // Variance Boost: when the SB quantizer differs from the basis (frame) qstep, scale the
     // residual so the projection (which quantizes at `basis.qstep`) effectively quantizes at
     // `qstep`, matching the reconstruction that dequantizes at `qstep`. Identity when equal.
@@ -138,8 +162,24 @@ pub(super) fn code_422_chroma_tu(
                 *rv = vp - pred_vs as f32;
             }
         }
-        let levu = basis.project_scan(&aq::scale_resid(&ru, cscale), 0.0, scan);
-        let levv = basis.project_scan(&aq::scale_resid(&rv, cscale), 0.0, scan);
+        let levu = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&ru, cscale),
+            scan,
+            qc,
+            cw * ch,
+            0,
+            rdoq_lambda,
+        );
+        let levv = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&rv, cscale),
+            scan,
+            qc,
+            cw * ch,
+            4,
+            rdoq_lambda,
+        );
         put_block_rect(
             recu,
             pcw,
@@ -161,13 +201,17 @@ pub(super) fn code_422_chroma_tu(
         (levu, levv)
     } else {
         let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
-        let levu = basis.project_scan(
+        let levu = project_chroma_rdoq(
+            basis,
             &crate::av2::aq::scale_resid(
                 &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
                 cscale,
             ),
-            0.0,
             scan,
+            qc,
+            cw * ch,
+            0,
+            rdoq_lambda,
         );
         put_block_rect(
             recu,
@@ -179,13 +223,17 @@ pub(super) fn code_422_chroma_tu(
             &recon_422_chroma(predu, &levu, qstep, scan, cw, ch, basis, bd),
         );
         let predv = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
-        let levv = basis.project_scan(
+        let levv = project_chroma_rdoq(
+            basis,
             &crate::av2::aq::scale_resid(
                 &get_residual_rect(vp, pcw, cy, cx, cw, ch, predv),
                 cscale,
             ),
-            0.0,
             scan,
+            qc,
+            cw * ch,
+            4,
+            rdoq_lambda,
         );
         put_block_rect(
             recv,
@@ -205,4 +253,59 @@ pub(super) fn code_422_chroma_tu(
     let v_skip = CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
     encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area);
     (up_, vc.iter().any(|&(_, l)| l != 0))
+}
+
+/// As [`predict_chroma_mode`] but with explicit chroma-plane dimensions so the
+/// top-right / bottom-left reference availability can be resolved the way avmdec
+/// does. `cw_px`/`ch_px` are the chroma plane's coded width/height in pixels.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_chroma_mode_dims(
+    rec: &[f32],
+    pcw: usize,
+    cy: usize,
+    cx: usize,
+    bs: usize,
+    m: usize,
+    neutral: f32,
+    cw_px: usize,
+    ch_px: usize,
+) -> Vec<f32> {
+    use crate::av2::intrapred;
+    let have_above = cy > 0;
+    let have_left = cx > 0;
+    // Top-right / bottom-left availability for the chroma 32x32 block, mirroring
+    // the luma TX-index-0 calc in `predict_luma` (the chroma block fills one 32x32
+    // chroma SB region, analogous to a single TX_32X32 at the SB origin). avmdec
+    // resolves these against SB-aligned plane bounds; getting them wrong replaces
+    // the top-right/bottom-left anchor with an extended edge sample and diverges.
+    // The chroma plane's mi grid is the luma grid >> 1 (4:2:0). One chroma "mi"
+    // unit here is 4 chroma px; the chroma SB is 32 px = 8 mi units.
+    let mi_col_end = (((cw_px + 31) & !31) >> 2) as i64; // chroma SB-aligned, /4
+    let mi_row_end = (((ch_px + 31) & !31) >> 2) as i64;
+    let mi_row = (cy >> 2) as i64;
+    let mi_col = (cx >> 2) as i64;
+    // px to the right / below this 32-px block within the SB-aligned plane.
+    let xr = ((mi_col_end - mi_col - 8) << 2) + 32 - (cx as i64 - ((cx / 32) * 32) as i64);
+    let yd = ((mi_row_end - mi_row - 8) << 2) + 32 - (cy as i64 - ((cy / 32) * 32) as i64);
+    let right_available = (mi_col + 8) < mi_col_end;
+    let bottom_available = (yd > 0) && ((mi_row + 8) < mi_row_end);
+    let tr_px = if have_above && right_available && xr > 0 {
+        xr.min(bs as i64).max(0) as usize
+    } else {
+        0
+    };
+    // Bottom-left for a full-SB chroma block resolves to the SB below-left, which
+    // is later in raster order and therefore not yet reconstructed — so it is never
+    // available here and the reference is extended from left[bs-1].
+    let _ = (bottom_available, yd);
+    let bl_px = 0usize;
+    let (ab, lf, corner) = intrapred::build_refs(
+        rec, pcw, cy, cx, bs, have_above, have_left, tr_px, bl_px, neutral,
+    );
+    match m {
+        1 => intrapred::smooth(bs, &ab, &lf),
+        2 => intrapred::smooth_v(bs, &ab, &lf),
+        3 => intrapred::smooth_h(bs, &ab, &lf),
+        _ => intrapred::paeth(bs, &ab, &lf, corner),
+    }
 }
