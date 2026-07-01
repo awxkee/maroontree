@@ -69,7 +69,7 @@ fn main() {
                 .with_quality(60)
                 .with_cicp(Cicp::srgb_ycbcr())
                 .with_chroma(ChromaFormat::Yuv444)
-                .with_speed(Speed::Fast)
+                .with_speed(Speed::Medium)
                 .with_threads(10)
                 .with_variance_boost(true)
                 .with_cdef(false),

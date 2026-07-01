@@ -393,13 +393,7 @@ pub fn encode_still_lossy<T: Pixel>(
     )
 }
 
-/// Encode a **lossy 4:2:2** still (profile 2). Like [`encode_still_lossy`] but
-/// the chroma planes are horizontally subsampled by 2 (BT.601 full-range YCbCr,
-/// `RTX_4X8` chroma transforms). The decoder reconstructs full-resolution RGB.
-/// Bit-exact reconstruction was verified against dav1d 1.4.1. On the PSNR
-/// metric this is roughly neutral-to-slightly-better on colorful content and
-/// slightly worse on very smooth content (where 4:4:4 chroma is already
-/// skip-dominated and nearly free), so 4:4:4 remains the default.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_still_lossy_422<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
@@ -481,13 +475,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     )
 }
 
-/// Encode a **lossy 4:2:0** still (profile 0). Like [`encode_still_lossy`] but
-/// chroma is subsampled by 2 both horizontally and vertically (2x2 box average,
-/// BT.601 full-range YCbCr, `TX_4X4` chroma transforms — quarter-resolution
-/// chroma, same as JPEG/`yuv420p`). Bit-exact reconstruction verified vs dav1d
-/// 1.4.1. As with 4:2:2 this does *not* improve RGB-PSNR R-D over the default
-/// 4:4:4 path (slimav's chroma skip already makes smooth chroma nearly free), so
-/// it exists mainly for pipeline compatibility; **4:4:4 remains the default.**
+#[allow(clippy::too_many_arguments)]
 pub fn encode_still_lossy_420<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
