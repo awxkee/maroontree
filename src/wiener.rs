@@ -173,7 +173,7 @@ pub(crate) fn wiener_filter_plane(
         // Stripe height: 56 for the first stripe, 64 thereafter.
         let stripe_h = if ytop == 0 { 56 } else { 64 };
         let ybot = (ytop + stripe_h).min(h);
-        // AV1 makes 2 rows of the neighbouring stripe available to the vertical
+        // AV1 makes 2 rows of the neighboring stripe available to the vertical
         // filter (the saved boundary lines); the 3rd tap row is replicated.
         let ctop = ytop.saturating_sub(2);
         let cbot = (ybot + 2).min(h) - 1;

@@ -42,16 +42,16 @@ fn floor_log2(x: u32) -> u32 {
     31 - x.leading_zeros()
 }
 
-/// Luma low/high-frequency token context from already-coded neighbour levels.
+/// Luma low/high-frequency token context from already-coded neighbor levels.
 /// Returns `(base_context, hi_range_context)`.
 /// Padded levels-buffer stride/index. avm lays the coeff levels in a buffer whose
-/// row stride exceeds the coeff width and with top/bottom pad rows, so neighbour
+/// row stride exceeds the coeff width and with top/bottom pad rows, so neighbor
 /// reads past the coeff region return 0. slimav stores frequency positions as
 /// rc = a*32 + c (a = horiz freq, c = vert freq). A flat rc index has no gap between
-/// columns, so a vertical-neighbour read at c=31 (rc+1 / rc+2) would wrap into the
+/// columns, so a vertical-neighbor read at c=31 (rc+1 / rc+2) would wrap into the
 /// next column's low-frequency coeffs instead of zero. `plvl` remaps rc into a padded
 /// buffer (column stride 36 > 32+2) so c+1/c+2 at the c=31 boundary land in the gap
-/// (always zero), and a-direction neighbours past the region hit unwritten (zero)
+/// (always zero), and a-direction neighbors past the region hit unwritten (zero)
 /// rows. This matches avm's get_padded_idx zero-padding for all tx sizes.
 const PLVL_STRIDE: i32 = 36;
 const PLVL_BUF: usize = (PLVL_STRIDE as usize) * 40;
@@ -64,15 +64,15 @@ fn luma_coeff_context(levels: &[i32], rc: i32, xy: i32) -> (usize, usize) {
     let low_freq = xy < 4;
     let mut limit: i32 = if low_freq { 5 } else { 3 };
     let p = plvl(rc);
-    let neighbour = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
+    let neighbor = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
     let mut low_mag = 0i32;
     let mut hi_mag = 0i32;
     for (dy, dx) in [(0, 1), (1, 0), (1, 1)] {
-        let v = neighbour(dy, dx);
+        let v = neighbor(dy, dx);
         low_mag += v.min(limit);
         hi_mag += v.min(5);
     }
-    low_mag += neighbour(0, 2).min(limit) + neighbour(2, 0).min(limit);
+    low_mag += neighbor(0, 2).min(limit) + neighbor(2, 0).min(limit);
 
     let offset;
     if low_freq {
@@ -110,8 +110,8 @@ fn luma_coeff_context(levels: &[i32], rc: i32, xy: i32) -> (usize, usize) {
 fn chroma_coeff_context(levels: &[i32], rc: i32, xy: i32, plane_offset: usize) -> (usize, usize) {
     let add_limit: i32 = if xy < 1 { 5 } else { 3 };
     let p = plvl(rc);
-    let neighbour = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
-    let (right, below, below_right) = (neighbour(0, 1), neighbour(1, 0), neighbour(1, 1));
+    let neighbor = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
+    let (right, below, below_right) = (neighbor(0, 1), neighbor(1, 0), neighbor(1, 1));
     let low_mag = right.min(add_limit) + below.min(add_limit) + below_right.min(add_limit);
     let hi_mag = right.min(5) + below.min(5) + below_right.min(5);
     let base_ctx = plane_offset + (((low_mag + 1) >> 1).min(3)) as usize;
@@ -586,7 +586,7 @@ pub(crate) fn rdoq_chroma(
 
     // Context for a coefficient at scan position `k`. For EOB the chroma model
     // uses a fixed DC context (0) or the HF eob-position bucket; for non-EOB it
-    // uses the neighbour-level chroma context (with the U/V plane offset folded in
+    // uses the neighbor-level chroma context (with the U/V plane offset folded in
     // by `chroma_coeff_context`).
     let ctx_at = |levels: &[i32], k: usize, is_eob: bool, is_dc: bool| -> (usize, usize) {
         if is_eob {
@@ -697,10 +697,10 @@ pub(crate) fn emit_delta_q(enc: &mut RangeEncoder, signaled: i32) {
 /// Consume a pending per-SB CCSO flag. Mirrors AVM `write_ccso` for the U plane:
 /// emitted after the partition bit and before delta-Q, once per SB. Phase 1 always
 /// filters (blk_idc = 1). The context is derived the way `av2_get_ccso_context`
-/// does for the SB's top-left block: `above`/`above-right` neighbours are excluded
-/// at the SB top boundary, so only the left/bottom-left neighbours (both in the SB
+/// does for the SB's top-left block: `above`/`above-right` neighbors are excluded
+/// at the SB top boundary, so only the left/bottom-left neighbors (both in the SB
 /// to the left, hence same-SB) contribute. With every SB filtered this collapses to
-/// ctx = 0 in the first column (no left neighbour) and ctx = 2 elsewhere.
+/// ctx = 0 in the first column (no left neighbor) and ctx = 2 elsewhere.
 pub(crate) fn maybe_emit_ccso(enc: &mut RangeEncoder) {
     if enc.ccso_pending && (enc.ccso_u_enable || enc.ccso_v_enable) {
         let (r, c) = enc.ccso_sb_rc;
@@ -708,8 +708,8 @@ pub(crate) fn maybe_emit_ccso(enc: &mut RangeEncoder) {
         // Per-SB decision. When a decision grid is present (Phase 3 RD pass), read
         // the chosen flag for this SB; otherwise filter every SB (Phase 2 all-on).
         // The bitstream context depends only on the LEFT SB's decision: at the SB
-        // top boundary the above/above-right neighbours are excluded, leaving the
-        // left/bottom-left neighbours (both in the left SB). So col 0 => ctx 0;
+        // top boundary the above/above-right neighbors are excluded, leaving the
+        // left/bottom-left neighbors (both in the left SB). So col 0 => ctx 0;
         // col > 0 => left_on ? 2 : 0. (U and V carry independent grids.)
         let grid_u = &enc.ccso_grid;
         let idx = r * cols + c;
@@ -798,7 +798,7 @@ fn nominal_midx(y_mode: u8) -> u8 {
     (p * 7 + 3) as u8
 }
 
-/// Build the neighbour-adaptive directional mode list (decode.rs:4736-4790).
+/// Build the neighbor-adaptive directional mode list (decode.rs:4736-4790).
 /// `lmidx`/`amidx` = left/above block midx (NO_MIDX if absent/non-directional).
 /// Built in full (prefix-stable), so the position of a target midx is its dir_idx.
 fn build_dir_list_y(bw4: usize, bh4: usize, lmidx: u8, amidx: u8) -> Vec<u8> {
@@ -848,7 +848,7 @@ fn build_dir_list_y(bw4: usize, bh4: usize, lmidx: u8, amidx: u8) -> Vec<u8> {
 
 /// Emit the luma y_mode (and DC chroma) for a 64x64 PARTITION_NONE block,
 /// supporting the directional modes. Returns the block's `midx` (NO_MIDX for
-/// non-directional) so the caller can store it for neighbour context.
+/// non-directional) so the caller can store it for neighbor context.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_intra_modes_dir(
     enc: &mut RangeEncoder,
@@ -870,7 +870,7 @@ pub(crate) fn encode_intra_modes_dir(
     let midx;
     if mode_idx < 5 {
         // non-directional: set 0, idx0[ctx], symbol = mode_idx (0..4). The idx0
-        // context counts directional neighbours and must match the decoder even
+        // context counts directional neighbors and must match the decoder even
         // for non-directional blocks adjacent to directional ones.
         let y_ctx = (lmidx != NO_MIDX) as usize + (amidx != NO_MIDX) as usize;
         enc.sym_y_set(0);
@@ -978,7 +978,7 @@ fn encode_intra_modes(
         // avm_read_symbol(.,2). When CfL is chosen (enc.cfl_use): emit is_cfl=1, then
         // cfl_index=0 (CFL_EXPLICIT), then the joint sign + per-plane magnitudes, and
         // skip the uv-mode symbol entirely (decoder sets uv_mode = UV_CFL_PRED & returns).
-        // Otherwise emit is_cfl=0 with the neighbour context and fall through to uv-mode.
+        // Otherwise emit is_cfl=0 with the neighbor context and fall through to uv-mode.
         if enc.cfl {
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
@@ -1038,7 +1038,7 @@ fn encode_luma_signs(
 /// Stored per-coefficient data for chroma: `(rc, mag, is_dc)`.
 type ChromaStored = (i32, u32, bool);
 
-/// Reverse-scan token pass for chroma; fills the neighbour-level grid.
+/// Reverse-scan token pass for chroma; fills the neighbor-level grid.
 /// DC is low-frequency; all AC is high-frequency.
 fn encode_chroma_tokens(
     enc: &mut RangeEncoder,
@@ -1171,7 +1171,7 @@ fn encode_chroma_signs(enc: &mut RangeEncoder, coeffs: &[Coeff], stored: &[Chrom
     }
 }
 
-/// Encode one chroma plane block. `skip_cdf` is the layout/neighbour-dependent
+/// Encode one chroma plane block. `skip_cdf` is the layout/neighbor-dependent
 /// all-zero CDF and `is_u_plane` selects the U (offset 0) or V (offset 4) context.
 pub(crate) fn encode_chroma_block(
     enc: &mut RangeEncoder,
@@ -1546,7 +1546,7 @@ pub(crate) fn encode_luma_leaf_rect128(
 /// Generalised luma coeff-token coder. `scan` is the coefficient scan in slimav
 /// column-major convention (rc = a*32 + c); `area` = coeff-region width*height,
 /// which sets the EOB-token base-context thresholds (avm get_lower_levels_ctx_eob:
-/// area/8, area/4). Everything else (PLVL_STRIDE, LF split at scan pos 10, neighbour
+/// area/8, area/4). Everything else (PLVL_STRIDE, LF split at scan pos 10, neighbor
 /// template, TX_32X32-class cdfs) is size-independent in this convention.
 fn encode_luma_tokens_scan(
     enc: &mut RangeEncoder,
@@ -1692,7 +1692,7 @@ pub(crate) fn encode_luma_block_split(
 /// Directional-aware 64x64 PARTITION_NONE emit. Identical to
 /// `encode_luma_block_split` but routes the y_mode through the directional
 /// coder (so internal modes 5..=12 emit conformantly) and returns the block's
-/// `midx` for neighbour context. `lmidx`/`amidx` are the left/above SB midx
+/// `midx` for neighbor context. `lmidx`/`amidx` are the left/above SB midx
 /// (NO_MIDX if absent or non-directional); bw4=bh4=16 for a 64x64 block.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_luma_block_split_dir(
@@ -2392,7 +2392,7 @@ pub(crate) fn encode_luma_tu4(
 // avm chroma: LF_2D_LIM_UV=1 so only the DC is lf (base_lf_uv, no br); every other
 // position is hf (base_uv + br_uv). Signs are all bypass (no dc_sign cdf). Golomb
 // threshold is 5 for lf (LF_NUM_BASE_LEVELS+1), 6 for hf. plane ctx for eob = 2.
-// Context fns use 3 neighbours; U uses ctx 0..3, V adds +4.
+// Context fns use 3 neighbors; U uses ctx 0..3, V adds +4.
 
 fn ctx_lf_2d_chroma(levels: &[u8], rc: usize, voff: usize) -> usize {
     let b = pidx(rc);

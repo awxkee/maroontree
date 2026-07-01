@@ -231,7 +231,7 @@ pub(crate) fn sb_tu_contexts_pos(
 /// Context for a single rectangular luma TU (16-tap family: TX_16X64 4×16 mi,
 /// TX_64X16 16×4 mi, TX_16X16 4×4 mi). `wu`/`hu` are the tx width/height in mi units
 /// (tx_size_wide_unit/high_unit). Skip ctx is 0 when `block_eq_tx` (block == tx, which
-/// holds for all single-TX 16-family leaves); dc_sign ctx sums neighbour sign bits over
+/// holds for all single-TX 16-family leaves); dc_sign ctx sums neighbor sign bits over
 /// the tx units. Updates `wu` above + `hu` left entries with this TU's cul/DC byte.
 /// Returns `(skip_cdf, dc_sign_ctx)`.
 #[allow(clippy::too_many_arguments)]
@@ -584,7 +584,7 @@ pub(crate) fn sb_tu4_contexts(
 
 /// Compute one superblock's 256 4x4 lossless TUs for a single plane: per 4x4 block,
 /// DC-predict from the reconstruction, forward-WHT the residual, reconstruct (so later
-/// blocks predict from exact neighbours), and emit the coded levels as a coeff list.
+/// blocks predict from exact neighbors), and emit the coded levels as a coeff list.
 pub(crate) fn lossless_sb_tus(
     src: &[f32],
     pw: usize,

@@ -353,7 +353,7 @@ pub(crate) fn cfl_avg_l(
 
 /// General CfL decision for a whole-64 chroma block (any format). The caller extracts the
 /// `cw*ch` chroma source blocks (`src_u`/`src_v`), the DC intra predictions (`dc_u_f`/
-/// `dc_v_f`) and the neighbour luma DC (`avg_l` from `cfl_avg_l`). Builds the AC from the
+/// `dc_v_f`) and the neighbor luma DC (`avg_l` from `cfl_avg_l`). Builds the AC from the
 /// block luma (subsampled per `ssx`/`ssy`) minus `avg_l`, forms the best-alpha candidate,
 /// then does real rate-distortion: transform/quantise/reconstruct both DC and CfL per plane
 /// and pick CfL only when it lowers J = SSE + lambda*bits. `chroma` is the format's basis.

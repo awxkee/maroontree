@@ -278,11 +278,11 @@ impl EncodeConfig {
         self
     }
 
-    pub(crate) fn vb(&self) -> crate::av1real::VarianceBoost {
+    pub(crate) fn vb(&self) -> crate::av1_coder::VarianceBoost {
         if self.variance_boost {
-            crate::av1real::VarianceBoost::on()
+            crate::av1_coder::VarianceBoost::on()
         } else {
-            crate::av1real::VarianceBoost::off()
+            crate::av1_coder::VarianceBoost::off()
         }
     }
 
@@ -447,7 +447,7 @@ fn dispatch_lossy<T: crate::Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
@@ -1215,7 +1215,7 @@ fn dispatch_yuv_u8(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -1270,7 +1270,7 @@ fn dispatch_yuv_u16(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {

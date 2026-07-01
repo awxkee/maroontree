@@ -143,7 +143,7 @@ pub(crate) struct RangeEncoder {
     pub(crate) delta_q_pending: bool,
     /// CCSO per-superblock flag state. `ccso_u_enable` mirrors the frame header's
     /// U-plane CCSO enable; when set the mode emitter writes one `blk_idc` symbol
-    /// per SB (after the partition bit, before delta-Q), using the neighbour-based
+    /// per SB (after the partition bit, before delta-Q), using the neighbor-based
     /// context. Phase 1 always filters (blk_idc = 1). `ccso_pending` is armed by the
     /// caller per SB and consumed exactly once. `ccso_grid`/`ccso_cols` track the
     /// per-SB decisions for the above/left context lookup; `ccso_sb_rc` is the
@@ -169,7 +169,7 @@ pub(crate) struct RangeEncoder {
     /// from the tuning flag; false keeps the bitstream byte-identical.
     pub(crate) cfl: bool,
     /// Per-block CfL state, set just before the block's mode encode. `cfl_ctx` is the
-    /// is_cfl neighbour context (0..2). `cfl_use` selects CfL (uv_mode = UV_CFL_PRED);
+    /// is_cfl neighbor context (0..2). `cfl_use` selects CfL (uv_mode = UV_CFL_PRED);
     /// when true, `cfl_js`/`cfl_mag_u`/`cfl_mag_v` + `cfl_ctx_u`/`cfl_ctx_v` carry the
     /// resolved joint-sign, per-plane magnitude indices and alpha-cdf contexts.
     pub(crate) cfl_ctx: usize,

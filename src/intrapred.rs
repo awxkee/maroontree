@@ -55,7 +55,7 @@ pub(crate) const VERT_LEFT_PRED: usize = 8;
 /// Z1 diagonals (up-right): `D45` (45 deg) and `D67` (= `VERT_LEFT_PRED`, 67 deg).
 /// They read the top row extended to the right (top-right samples). Z3 diagonal
 /// (down-left): `D203` (203 deg), reading the left column extended downward
-/// (bottom-left samples). These need the neighbour-availability derivation
+/// (bottom-left samples). These need the neighbor-availability derivation
 /// (dav1d's intra-edge tree) and the extended reference arrays.
 pub(crate) const D45_PRED: usize = 3;
 pub(crate) const D203_PRED: usize = 7;
@@ -103,7 +103,7 @@ pub(crate) static DR_INTRA_DERIVATIVE: [i32; 44] = [
 ];
 
 /// `dav1d_intra_mode_context` — maps an intra mode to its keyframe y-mode CDF
-/// context (0..=4), used for both the above and left neighbours.
+/// context (0..=4), used for both the above and left neighbors.
 pub(crate) static INTRA_MODE_CTX: [usize; 13] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
 
 /// `dav1d_sm_weights` slice for a given block dimension (SMOOTH predictors).
@@ -205,7 +205,7 @@ pub(crate) fn cfl_pred_pixel(dc: i32, ac: i32, alpha: i32, bd: u8) -> i32 {
 
 /// Energy-minimising CfL alpha for one plane, in dav1d alpha units (the predictor
 /// applies `alpha/64` after the <<3 AC scaling). Returns the best of the analytic
-/// optimum and its +/-1 neighbours by pre-quantisation residual energy, clamped to
+/// optimum and its +/-1 neighbors by pre-quantisation residual energy, clamped to
 /// the signalled range [-16, 16] (0 means "CfL useless for this plane").
 pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8) -> i32 {
     let mut num: i64 = 0;
@@ -328,7 +328,7 @@ pub(crate) fn intra_predict_nd_ad(
     // Top-right extension (top[bw..2bw]) for Z1, and bottom-left extension
     // (left[bh..2bh]) for Z3, following dav1d_prepare_intra_edges: copy the
     // available samples (clamped to the frame edge) then replicate, or — when
-    // the neighbour is unavailable — replicate the last edge sample.
+    // the neighbor is unavailable — replicate the last edge sample.
     if have_tr {
         let px_have = bw.min(fw - (ox + bw));
         for i in 0..px_have {
@@ -808,7 +808,7 @@ pub(crate) fn dc_pred_4x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd
 }
 
 /// DC predictor for an 8-wide x 16-tall chroma block (4:2:2 `RTX_8X16`). Mirrors
-/// dav1d/AV1 DC_PRED: average of the 8 above + 16 left reconstructed neighbours
+/// dav1d/AV1 DC_PRED: average of the 8 above + 16 left reconstructed neighbors
 /// (w+h = 24 = 8*3, so `>>3` then the `*0x5556>>16` divide-by-3); single-edge
 /// and no-edge cases fall back to the available average or 128.
 pub(crate) fn dc_pred_8x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {

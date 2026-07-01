@@ -285,11 +285,9 @@ pub(crate) fn frame_header(
         };
         b.write_bit(av as u32); // apply_deblocking_filter[0] (vertical edges)
         b.write_bit(ah as u32); // apply_deblocking_filter[1] (horizontal edges)
-        if has_chroma {
-            if av || ah {
-                b.write_bit(au as u32); // apply_deblocking_filter_u
-                b.write_bit(avv as u32); // apply_deblocking_filter_v
-            }
+        if has_chroma && (av || ah) {
+            b.write_bit(au as u32); // apply_deblocking_filter_u
+            b.write_bit(avv as u32); // apply_deblocking_filter_v
         }
         // Per-direction luma deltas (delta_side mirrors delta_q). Direction 0's
         // "no delta" means 0; direction 1's "no delta" means reuse direction 0.

@@ -286,7 +286,7 @@ impl Av2Encoder {
         // `*_above[mi_col]` / `*_left[mi_row]` hold whether the most recent TU covering
         // that column/row had U/V coeffs. Per-mi (not per-SB) so that multiple chroma
         // TUs within one SB — e.g. the two vertically stacked 8×32 residue-2 leaves —
-        // see each other as neighbours.
+        // see each other as neighbors.
         let mut u_above = vec![0i32; tmc as usize + 16];
         let mut v_above = vec![0i32; tmc as usize + 16];
         let mut u_left = vec![0i32; tmr as usize + 16];
@@ -537,8 +537,8 @@ impl Av2Encoder {
                     // ---- commit winner ----
                     restore(&mut recy, &snap_best);
                     // CfL decision (4:4:4 whole-64 fast path). recy is final here; recu/
-                    // recv hold the neighbour reconstructions for the DC prediction. The
-                    // is_cfl context comes from CfL-usage neighbours. This sets the
+                    // recv hold the neighbor reconstructions for the DC prediction. The
+                    // is_cfl context comes from CfL-usage neighbors. This sets the
                     // per-block CfL state consumed by encode_intra_modes during the
                     // luma-block encode below (which emits is_cfl + alphas).
                     let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
@@ -2514,7 +2514,7 @@ impl Av2Encoder {
                         }
                         other => unreachable!("unsupported lossy leaf {:?}", other),
                     };
-                    // CfL-usage neighbour update: enc.cfl_use holds this leaf's decision
+                    // CfL-usage neighbor update: enc.cfl_use holds this leaf's decision
                     // (true only for a (16,16) leaf that picked CfL; false otherwise).
                     let cfl_used = enc.cfl_use as i32;
                     for c in lmc..lmc + bw_mi {

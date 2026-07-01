@@ -596,7 +596,7 @@ impl Av2Encoder {
         // Lossless now codes every boundary geometry via the recursive forced-split
         // partition coder, so it always signals the real size (decoder crops to W x H).
         // Lossy doesn't clip its tx blocks at boundaries, so it pads unless SB-aligned.
-        let aligned = ((mi_cols) % (MIB) == 0) && ((mi_rows) % (MIB) == 0);
+        let aligned = mi_cols.is_multiple_of(MIB) && mi_rows.is_multiple_of(MIB);
         // Boundary-safe lossy 4:4:4 can also signal real W×H natively (the partial-edge
         // superblock decodes correctly with the edge-clamped entropy contexts).
         let lossy_native = !config.lossless
