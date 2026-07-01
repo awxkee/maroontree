@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av1real::*;
+use crate::av1_coder::*;
 use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
 use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
@@ -306,7 +306,7 @@ pub(crate) fn trellis_optimize_ctx(
     pre.resize(n + 1, 0.0);
     irate.resize(n, 0.0);
     let mut acc = 0.0f64; // pre[1]: empty prefix
-    // Interior positions [1, eob]: priced with neighbour context.
+    // Interior positions [1, eob]: priced with neighbor context.
     for ((&rc, ir), p) in scan[1..eu + 1]
         .iter()
         .zip(irate[1..eu + 1].iter_mut())

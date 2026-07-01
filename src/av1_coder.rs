@@ -1210,7 +1210,7 @@ impl<'a> LossyTile<'a> {
     /// Code a 16x16 region (4:4:4 only) as a single TX_16X16 block: luma +
     /// chroma DC prediction, forward DCT16 + quant, the TX_16X16 coefficient
     /// coder, and reconstruction via the exact integer inverse. Updates the
-    /// 4-unit (16-sample) skip / coef neighbour-context footprint.
+    /// 4-unit (16-sample) skip / coef neighbor-context footprint.
     /// Set the RDO effort level (0 = full, >= 1 = fast). Returns `self` for
     /// builder-style chaining at tile construction.
     fn with_speed(mut self, speed: Speed) -> Self {
@@ -1254,9 +1254,9 @@ impl<'a> LossyTile<'a> {
     /// small partial edge superblocks merge into the previous unit (the unit
     /// count uses `(frame+unit/2)/unit`) and emit zero units. Because units are
     /// >= the 64x64 superblock size and aligned to the frame grid, each unit's
-    /// top-left superblock lies in exactly one tile, so every unit is signalled
-    /// exactly once across all tiles — no tile-boundary special-casing needed.
-    /// Emits nothing when `self.wiener` is `None`.
+    /// > top-left superblock lies in exactly one tile, so every unit is signalled
+    /// > exactly once across all tiles — no tile-boundary special-casing needed.
+    /// > Emits nothing when `self.wiener` is `None`.
     fn emit_lr_sb(&mut self, sb_x: usize, sb_y: usize) {
         let Some(unit) = self.wiener else {
             return;
@@ -1270,10 +1270,10 @@ impl<'a> LossyTile<'a> {
         let r = (self.frame_y0 + sb_y) / MI;
         let c = (self.frame_x0 + sb_x) / MI;
         let sb_mi = UNIT / MI; // 16
-        let urs = (r * MI + UNIT - 1) / UNIT;
-        let ure = unit_rows.min(((r + sb_mi) * MI + UNIT - 1) / UNIT);
-        let ucs = (c * MI + UNIT - 1) / UNIT;
-        let uce = unit_cols.min(((c + sb_mi) * MI + UNIT - 1) / UNIT);
+        let urs = (r * MI).div_ceil(UNIT);
+        let ure = unit_rows.min(((r + sb_mi) * MI).div_ceil(UNIT));
+        let ucs = (c * MI).div_ceil(UNIT);
+        let uce = unit_cols.min(((c + sb_mi) * MI).div_ceil(UNIT));
         for _ur in urs..ure {
             for _uc in ucs..uce {
                 self.emit_lr_unit(&unit);
@@ -2418,9 +2418,8 @@ impl<'a> LossyTile<'a> {
             // Reconstructed R-D of the CURRENT chroma choice (DC or CfL), using the
             // coeffs/prediction already selected above.
             let mut cur_total = 0f64;
-            if cfl_opt.is_some() {
+            if let Some(a) = cfl_opt {
                 // CfL signals a non-DC uv_mode plus per-plane alpha (~4 bits each).
-                let a = cfl_opt.unwrap();
                 cur_total += mlam
                     * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
             }
@@ -3285,7 +3284,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
 
-            // --- neighbour context updates for this 4x4 ---
+            // --- neighbor context updates for this 4x4 ---
             self.a_skip[bx4] = block_skip as u8;
             self.l_skip[by4] = block_skip as u8;
             self.a_mode[bx4] = best_mode as u8;
@@ -4774,7 +4773,7 @@ impl<'a> LossyTile<'a> {
     /// Code a 32x32 region (4:4:4 only) as a single TX_32X32 block: DC-pred luma
     /// and both chroma planes, forward DCT32 + quant + trellis, the TX_32X32
     /// coefficient coder, and reconstruction via the exact integer inverse.
-    /// Updates the 8-unit (32-sample) skip / mode / coef neighbour footprint.
+    /// Updates the 8-unit (32-sample) skip / mode / coef neighbor footprint.
     /// (DC-only for now; SMOOTH/PAETH/directional and CfL at 32x32 come next.)
     fn code_block32(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) {
         self.record_blk(x8, y8, 8);
@@ -6158,14 +6157,7 @@ struct Tiling {
     rows_incr: Vec<bool>,
 }
 
-/// Pick a tiling for a frame of `sb_cols` x `sb_rows` superblocks. It is always
-/// at least the spec **minimum** the decoder derives (so large frames stay
-/// valid), and is subdivided further toward `target_tiles` so tile-level threads
-/// have independent work. `target_tiles == 1` yields exactly the spec minimum —
-/// a single tile for small frames, byte-identical to the untiled path. Extra
-/// tiles trade a little compression (each tile resets entropy contexts and can't
-/// predict across its edges) for parallelism, splitting the longer side first so
-/// tiles stay roughly square.
+/// Pick a tiling for a frame of `sb_cols` x `sb_rows` superblocks.
 fn plan_tiling(sb_cols: u32, sb_rows: u32, target_tiles: usize) -> Tiling {
     const MAX_TILE_WIDTH_SB: u32 = 4096 / 64; // 64
     const MAX_TILE_AREA_SB: u32 = (4096 * 2304) / (64 * 64); // 2304
@@ -6375,26 +6367,7 @@ fn resolve_threads(threads: usize) -> usize {
     }
 }
 
-/// Encode `src` (already padded to `w8` x `h8`, chroma subsampled by
-/// `sub_x`/`sub_y`) as one or more AV1 tiles and return the **tile-group
-/// payload** (everything that follows the frame header inside `OBU_FRAME`), the
-/// stitched full-frame reconstruction, and the chosen `(TileColsLog2,
-/// TileRowsLog2)`.
-///
-/// Each tile is encoded as an independent sub-frame: the source is cropped to
-/// the tile's pixel rectangle and handed to a fresh [`LossyTile`] whose origin
-/// is the tile's top-left, so tile boundaries become frame boundaries and all
-/// the existing prediction/availability/context logic applies unchanged (intra
-/// prediction and entropy contexts never cross a tile edge, as the spec
-/// requires). For a single tile the payload is just that tile's bytes —
-/// byte-identical to the previous single-tile path.
-///
-/// `threads` controls tile-level parallelism (AV1's natural parallel unit, since
-/// tiles share no state): `1` runs serially (no threads spawned), `0` uses all
-/// available cores, `N` uses up to `N`; the effective count is capped at the
-/// number of tiles. The output is byte-identical regardless of `threads` — the
-/// thread count only decides which core encodes which tile.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn encode_lossy_tilegroup(
     base_q_idx: u8,
     bd: u8,
@@ -6596,10 +6569,7 @@ fn encode_lossy_tilegroup(
         &mut recon, w8, h8, cw8, ch8, &blk4f, &blk4hf, nc4f, sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
     );
 
-    // Frame-level CDEF, applied after deblocking exactly as the decoder does.
-    // The encoder searches a global strength against the source (cheap SSE, not
-    // RD) and applies the matching filter so the reconstruction stays in sync
-    // with what the decoder will produce from the signalled cdef_params.
+    // Frame-level CDEF
     let cdef = if cdef_on && base_q_idx != 0 {
         frame_cdef(
             &mut recon, src, &skip8, sb8w, w8, h8, cw8, ch8, sub_x, sub_y, mono, base_q_idx, bd,
@@ -6608,15 +6578,7 @@ fn encode_lossy_tilegroup(
         None
     };
 
-    // Frame-level luma Wiener loop restoration, applied after CDEF (the last
-    // in-loop filter). Works with any tiling: `read_lr` is signalled in frame
-    // coordinates so each restoration unit is emitted exactly once by whichever
-    // tile contains its top-left superblock. The encoder searches one global
-    // Wiener filter against the source over the CDEF'd luma; if it helps, it
-    // re-encodes the tiles so each superblock emits the `read_lr` syntax (the
-    // reconstruction is unchanged because LR is a post-filter — only the payload
-    // gains the symbols), then applies the same filter to the reconstruction so
-    // it stays in sync with the decoder.
+    // Frame-level luma Wiener loop restoration
     let lr = if wiener_on && base_q_idx != 0 {
         if let Some(unit) = frame_wiener_search(&recon[0], &src[0], w8, h8, bd) {
             // Re-encode tiles emitting the LR syntax (recon is unchanged because
@@ -6661,11 +6623,6 @@ fn apply_frame_wiener(
     wiener_filter_plane(plane, &src, w, h, &hk, &vk, bd);
 }
 
-/// Search a single global luma Wiener filter by SSE against the source over the
-/// CDEF'd reconstruction. Returns the chosen `WienerUnit`, or `None` when no
-/// candidate beats "no restoration" (so the caller signals RESTORE_NONE). This
-/// is the cheap, not-RDO decision the project uses elsewhere: a real distortion
-/// metric over a small, sane candidate set rather than a full Wiener solve.
 fn frame_wiener_search(
     recon: &[i32],
     src: &[i32],
@@ -6695,7 +6652,7 @@ fn frame_wiener_search(
             let vk = WienerKernel::from_coded(v_taps);
             wiener_filter_plane(&mut tmp, recon, w, h, &hk, &vk, bd);
             let s = sse(&tmp);
-            if s < base && best.as_ref().map_or(true, |b| s < b.0) {
+            if s < base && best.as_ref().is_none_or(|b| s < b.0) {
                 best = Some((
                     s,
                     crate::wiener::WienerUnit {
@@ -6709,13 +6666,7 @@ fn frame_wiener_search(
     best.map(|b| b.1)
 }
 
-/// Search a single global CDEF strength (luma + chroma) by SSE against the
-/// source and apply it to the deblocked reconstruction in place. Returns the
-/// `CdefParams` to signal (`cdef_bits = 0`, one strength entry), or `None` when
-/// the best choice is "no filtering" (so the caller can leave CDEF effectively
-/// off while keeping the headers consistent). This is the cheap, not-RDO
-/// decision the brief asked for: a real distortion metric (SSE) over a small
-/// candidate set, not a one-tap proxy.
+/// Search a single global CDEF strength (luma + chroma) by SSE
 #[allow(clippy::too_many_arguments)]
 fn frame_cdef(
     recon: &mut [Vec<i32>; 3],
@@ -6733,20 +6684,9 @@ fn frame_cdef(
     bd: u8,
 ) -> Option<crate::obu::CdefParams> {
     use crate::cdef;
-    // The signalled cdef_damping is `damping - 3` (obu.rs); the decoder
-    // reconstructs it and adds `bitdepth_min_8` (= bd - 8) before filtering, so
-    // the encoder filters with `signalled + (bd - 8)`. Chroma further uses
-    // `damping - 1`.
     let signalled_damping = cdef_damping(base_q_idx) as i32;
     let damping = signalled_damping + (bd as i32 - 8);
 
-    // Precompute per-8x8 luma directions AND variances on the deblocked recon,
-    // once. Both are functions of the pre-CDEF luma only (not of the candidate
-    // strength), so they are invariant across the entire strength search and the
-    // final apply. Computing them here removes a ~11x-redundant `cdef_direction`
-    // recompute that previously ran inside the candidate loop (the dominant cost
-    // of the whole still-image encode). `ldirs`/`lvars` are byte-for-byte the
-    // same values the old in-loop code produced, so the result is unchanged.
     let nbx = w8.div_ceil(8);
     let nby = h8.div_ceil(8);
     let mut ldirs = vec![0usize; nbx * nby];
@@ -6787,7 +6727,6 @@ fn frame_cdef(
         1000,
     );
 
-    // --- Chroma strength search. ---
     // Chroma reuses the LUMA direction (remapped via uv_dir) and damping-1, and
     // is filtered at chroma sub-block granularity tied to the covering luma 8x8:
     // 8x8 for 4:4:4, 4x8 for 4:2:2, 4x4 for 4:2:0 — exactly as the decoders do
@@ -6839,6 +6778,7 @@ fn frame_cdef(
     );
     // Apply chroma (U, V) at sub-block granularity with remapped luma directions.
     if !mono && (up != 0 || us != 0) {
+        #[allow(clippy::needless_range_loop)]
         for plane in 1..3 {
             apply_cdef_chroma(
                 &mut recon[plane],
@@ -7378,15 +7318,6 @@ fn encode_one_lossless_tile(
     crate::av1_tile::encode_tile_lossless(tw, th, bd, [&p0, &p1, &p2])
 }
 
-/// Encode a **lossless** 4:4:4 frame as a (possibly multi-tile) tile group,
-/// mirroring the lossy tiling path. The frame is split into at least the spec
-/// minimum tiling — so frames wider than 4096px or larger than the max tile area
-/// stay valid (the previous single-tile lossless path mis-signalled these) — and
-/// further toward `threads` tiles for parallelism. Each tile is encoded
-/// independently; `threads` parallelises across tiles with scoped threads (no
-/// shared mutable state, no locks). `threads == 1` yields the spec minimum: a
-/// single tile for small frames, byte-identical to the untiled path. The output
-/// is byte-identical regardless of thread count for a fixed tiling.
 fn encode_lossless_tilegroup(
     bd: u8,
     w8: usize,

@@ -328,16 +328,7 @@ impl<T: Pixel> PlanarImage<T> {
     }
 }
 
-/// Encode a **lossy** 8-bit 4:4:4 still to a conformant AV1 OBU stream. Width
-/// and height must be multiples of 64.
-///
-/// The frame is tiled into 64x64 superblocks (raster order, single tile), each
-/// split uniformly into 8x8 blocks coded `DC_PRED` + `TX_8X8` (`DCT_DCT`) and
-/// quantized by `base_q_idx` (keep `<= 20` to stay in coefficient qctx 0). A
-/// reconstruction loop runs inside the encoder so each block's DC prediction
-/// matches the decoder's, including across superblock boundaries. Verified to
-/// decode in dav1d 1.4.1 and ffmpeg/libdav1d from 64x64 to 256x192 (gradient
-/// PSNR ~49-57 dB at q=16; flat color is exact).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_still_lossy<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
@@ -345,7 +336,7 @@ pub fn encode_still_lossy<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
@@ -375,7 +366,7 @@ pub fn encode_still_lossy<T: Pixel>(
         *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
         *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
     }
-    crate::av1real::encode_av1_lossy_image_cs(
+    crate::av1_coder::encode_av1_lossy_image_cs(
         base_q_idx,
         bd.bits(),
         img.width,
@@ -401,7 +392,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
@@ -457,7 +448,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
             cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
         }
     }
-    crate::av1real::encode_av1_lossy_image_422(
+    crate::av1_coder::encode_av1_lossy_image_422(
         base_q_idx,
         bd.bits(),
         w,
@@ -483,7 +474,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
@@ -539,7 +530,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
             *cr = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
         }
     }
-    crate::av1real::encode_av1_lossy_image_420(
+    crate::av1_coder::encode_av1_lossy_image_420(
         base_q_idx,
         bd.bits(),
         w,
@@ -566,7 +557,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -578,7 +569,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
             .iter()
             .map(|v| v.to_i32().clamp(0, maxv) as i16)
             .collect();
-        return Ok(crate::av1real::encode_av1_mono_lossless_image(
+        return Ok(crate::av1_coder::encode_av1_mono_lossless_image(
             bit_depth.bits(),
             img.width,
             img.height,
@@ -591,7 +582,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
         .iter()
         .map(|v| v.to_i32().clamp(0, maxv))
         .collect();
-    let bytes = crate::av1real::encode_av1_mono_image(
+    let bytes = crate::av1_coder::encode_av1_mono_image(
         base_q_idx,
         bit_depth.bits(),
         img.width,
@@ -623,7 +614,7 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
         threads,
         Speed::Slow,
         false,
-        crate::av1real::VarianceBoost::off(),
+        crate::av1_coder::VarianceBoost::off(),
         false,
         false,
     )
@@ -644,7 +635,7 @@ pub fn encode_lossless_gray<T: Pixel>(
         cfg.threads,
         Speed::Slow,
         false,
-        crate::av1real::VarianceBoost::off(),
+        crate::av1_coder::VarianceBoost::off(),
         false,
         false,
     )?;
@@ -695,12 +686,12 @@ pub fn encode_lossless_obu<T: Pixel>(
         1
     };
     let (w, h) = (img.width, img.height);
-    let (w8, h8) = (crate::av1real::align8(w), crate::av1real::align8(h));
+    let (w8, h8) = (crate::av1_coder::align8(w), crate::av1_coder::align8(h));
     let to_i16 = |p: &[T]| p.iter().map(|p| p.to_i32() as i16).collect::<Vec<i16>>();
     let planes_i16: [Vec<i16>; 3] = [
-        crate::av1real::pad_to_mult8(&to_i16(&img.planes[0]), w, h, w8, h8),
-        crate::av1real::pad_to_mult8(&to_i16(&img.planes[1]), w, h, w8, h8),
-        crate::av1real::pad_to_mult8(&to_i16(&img.planes[2]), w, h, w8, h8),
+        crate::av1_coder::pad_to_mult8(&to_i16(&img.planes[0]), w, h, w8, h8),
+        crate::av1_coder::pad_to_mult8(&to_i16(&img.planes[1]), w, h, w8, h8),
+        crate::av1_coder::pad_to_mult8(&to_i16(&img.planes[2]), w, h, w8, h8),
     ];
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
@@ -711,7 +702,7 @@ pub fn encode_lossless_obu<T: Pixel>(
         img.bit_depth.bits(),
         color,
     ));
-    bytes.extend_from_slice(&crate::av1real::encode_lossless_frame_obus(
+    bytes.extend_from_slice(&crate::av1_coder::encode_lossless_frame_obus(
         img.bit_depth.bits(),
         w8,
         h8,
@@ -776,7 +767,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         cfg.threads,
         Speed::Slow,
         false,
-        crate::av1real::VarianceBoost::off(),
+        crate::av1_coder::VarianceBoost::off(),
         false,
         false,
     )?;
@@ -801,7 +792,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -813,7 +804,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
-    let bytes = crate::av1real::encode_av1_lossy_image_cs(
+    let bytes = crate::av1_coder::encode_av1_lossy_image_cs(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
@@ -842,7 +833,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -854,7 +845,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
-    let bytes = crate::av1real::encode_av1_lossy_image_422(
+    let bytes = crate::av1_coder::encode_av1_lossy_image_422(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
@@ -883,7 +874,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1real::VarianceBoost,
+    vb: crate::av1_coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -895,7 +886,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
-    let bytes = crate::av1real::encode_av1_lossy_image_420(
+    let bytes = crate::av1_coder::encode_av1_lossy_image_420(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
@@ -917,7 +908,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1real::VarianceBoost;
+    use crate::av1_coder::VarianceBoost;
 
     /// Non-multiple-of-8 sizes must not panic and must produce a non-empty
     /// stream for both very small and odd dimensions.

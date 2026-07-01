@@ -96,7 +96,7 @@ impl Av2Encoder {
             u_left,
             v_left,
         } = cnb;
-        // Per-mi CfL-usage neighbours for get_cfl_ctx (one bit per chroma block).
+        // Per-mi CfL-usage neighbors for get_cfl_ctx (one bit per chroma block).
         let mut cfl_above = vec![0i32; tmc as usize + 16];
         let mut cfl_left = vec![0i32; tmr as usize + 16];
         let bases = &self.bases;
@@ -1683,9 +1683,13 @@ impl Av2Encoder {
                 // reconstructs with DCT_DCT — the search improves prediction only.
                 // The chosen levels + reconstruction are cached and reused below.
                 let bd = self.bit_depth as i32;
-                let chroma_search: Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = if cfl_choice
-                    .is_none()
-                {
+                #[allow(clippy::type_complexity)]
+                let chroma_search: Option<(
+                    Vec<f32>,
+                    Vec<f32>,
+                    Vec<f32>,
+                    Vec<f32>,
+                )> = if cfl_choice.is_none() {
                     let dcu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
                     let dcv = dc_pred(&recv, pcw, cy, cx, 32, neutral);
                     let cand_modes: &[usize] = if !self.tune.chroma_mode_search {
@@ -1814,7 +1818,7 @@ impl Av2Encoder {
                 // consumes it after the partition bit, exactly once per SB.
                 enc.delta_q_pending = enc.delta_q_present;
                 // Arm this SB's CCSO flag (consumed before delta-Q). (row, col) feed
-                // the neighbour-based context.
+                // the neighbor-based context.
                 enc.ccso_pending = enc.ccso_u_enable || enc.ccso_v_enable;
                 enc.ccso_sb_rc = (row, col);
                 let (_cul, sb_midx) = encode_luma_block_split_dir(
@@ -2001,56 +2005,56 @@ impl Av2Encoder {
                 } else {
                     (None, None, rd_mult)
                 };
-                if ccso_search_u {
-                    if let Some(r) = crate::av2::ccso::search_edge(
+                if ccso_search_u
+                    && let Some(r) = crate::av2::ccso::search_edge(
                         &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, None,
-                    ) {
-                        let (grid, any) = crate::av2::ccso::decide_blk_md(
-                            &ext,
-                            estride,
-                            &up,
-                            &recu,
-                            pcw,
-                            pch,
-                            1,
-                            1,
-                            bd,
-                            &r,
-                            sb_cols,
-                            sb_rows,
-                            dec_rd,
-                            act_u.as_deref(),
-                            1,
-                        );
-                        if any {
-                            enc.ccso_decided_u = Some((r, grid));
-                        }
+                    )
+                {
+                    let (grid, any) = crate::av2::ccso::decide_blk_md(
+                        &ext,
+                        estride,
+                        &up,
+                        &recu,
+                        pcw,
+                        pch,
+                        1,
+                        1,
+                        bd,
+                        &r,
+                        sb_cols,
+                        sb_rows,
+                        dec_rd,
+                        act_u.as_deref(),
+                        1,
+                    );
+                    if any {
+                        enc.ccso_decided_u = Some((r, grid));
                     }
                 }
-                if ccso_search_v {
-                    if let Some(r) = crate::av2::ccso::search_edge(
+                if ccso_search_v
+                    && let Some(r) = crate::av2::ccso::search_edge(
                         &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None,
-                    ) {
-                        let (grid, any) = crate::av2::ccso::decide_blk_md(
-                            &ext,
-                            estride,
-                            &vp,
-                            &recv,
-                            pcw,
-                            pch,
-                            1,
-                            1,
-                            bd,
-                            &r,
-                            sb_cols,
-                            sb_rows,
-                            dec_rd,
-                            act_v.as_deref(),
-                            2,
-                        );
-                        if any {
-                            enc.ccso_decided_v = Some((r, grid));
-                        }
+                    )
+                {
+                    let (grid, any) = crate::av2::ccso::decide_blk_md(
+                        &ext,
+                        estride,
+                        &vp,
+                        &recv,
+                        pcw,
+                        pch,
+                        1,
+                        1,
+                        bd,
+                        &r,
+                        sb_cols,
+                        sb_rows,
+                        dec_rd,
+                        act_v.as_deref(),
+                        2,
+                    );
+                    if any {
+                        enc.ccso_decided_v = Some((r, grid));
                     }
                 }
                 enc.ccso_sb_cols_out = sb_cols;

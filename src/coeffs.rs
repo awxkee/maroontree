@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av1real::*;
+use crate::av1_coder::*;
 use crate::odec::OdEcEncoder;
 use crate::tables::*;
 
@@ -306,7 +306,7 @@ pub(crate) fn encode_tx16_coeffs_adapt(
             enc.encode_bool((eob >> b) & 1 == 1, 16384);
         }
     }
-    let mut levels = [0u8; 320]; // stride 16, neighbour reads up to (x+2)*16+(y+2)=289
+    let mut levels = [0u8; 320]; // stride 16, neighbor reads up to (x+2)*16+(y+2)=289
     let ctx_e = 1 + (eob > 32) as usize + (eob > 64) as usize;
     let rc = SCAN_16X16[eob];
     let (ex, ey) = (rc >> 4, rc & 15);
@@ -436,7 +436,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
             enc.encode_bool((eob >> b) & 1 == 1, 16384);
         }
     }
-    let mut levels = [0u8; 1156]; // stride 32, neighbour reads up to (x+2)*32+(y+2)
+    let mut levels = [0u8; 1156]; // stride 32, neighbor reads up to (x+2)*32+(y+2)
     let ctx_e = 1 + (eob > 128) as usize + (eob > 256) as usize;
     let rc = SCAN_32X32[eob];
     let (ex, ey) = (rc >> 5, rc & 31);
@@ -493,7 +493,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
 /// coeffs, `cf[fx*8+fy]`). `RTX_4X8` shares coef-CDF class ctx=1 with `TX_8X8`,
 /// so the base/br/eob-base/eob-hi/dc-sign/skip CDFs are reused; only the eob_pt
 /// CDF (`eob_bin_32`), the scan, the lo-ctx offsets (w<h) and the eob-ctx
-/// thresholds differ. Returns the dav1d coef neighbour-context byte.
+/// thresholds differ. Returns the dav1d coef neighbor-context byte.
 pub(crate) fn encode_4x8_chroma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,
@@ -612,7 +612,7 @@ pub(crate) fn encode_4x8_chroma_coeffs(
 /// table at stride 8, eob-ctx thresholds N>>3 / N>>2 = 16 / 32, and — being luma —
 /// SIGNALS the transform type (txtp_intra1 set, `min = TX_8X8`, the same CDF the
 /// 8x8 luma path uses). Level position decomposition: x = rc>>3 (0..16),
-/// y = rc&7 (0..8); levels[x*8 + y]. Returns the coef neighbour byte.
+/// y = rc&7 (0..8); levels[x*8 + y]. Returns the coef neighbor byte.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_16x8_luma_coeffs(
     enc: &mut OdEcEncoder,
@@ -838,7 +838,7 @@ pub(crate) fn encode_16x8_chroma_coeffs(
 /// the coef-CDF class ctx=2 (the same base/br/eob/skip CDFs as luma TX_16X16),
 /// the chroma `eob_multi128` bins, the `w<h` level-offset table at stride 16,
 /// and eob-ctx thresholds N>>3 / N>>2 = 16 / 32. Chroma infers the transform
-/// type (no txtp symbol). Returns the coef neighbour byte.
+/// type (no txtp symbol). Returns the coef neighbor byte.
 pub(crate) fn encode_8x16_chroma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,

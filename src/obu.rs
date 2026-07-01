@@ -418,7 +418,7 @@ fn frame_header_lossy_impl(
     // delta_lf_present flag is coded and we leave loop-filter deltas off).
     if aq {
         w.flag(true); // delta_q_present = 1
-        w.f(crate::av1real::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
+        w.f(crate::av1_coder::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
         w.flag(false); // delta_lf_present = 0
     } else {
         w.flag(false); // delta_q_present = 0  (=> delta_lf absent)

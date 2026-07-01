@@ -38,7 +38,7 @@ pub(crate) static SKIP_CDF: [u16; 3] = [31671, 16515, 4576];
 
 /// `default_kf_y_mode_cdf[KF_MODE_CONTEXTS][KF_MODE_CONTEXTS]` (libaom), the
 /// keyframe luma intra-mode CDFs indexed by `[above_ctx][left_ctx]` (each ctx is
-/// `INTRA_MODE_CTX[neighbour_mode]`). `[0][0]` equals the former single
+/// `INTRA_MODE_CTX[neighbor_mode]`). `[0][0]` equals the former single
 /// `kf_y_mode_dc_dc()` CDF, so all-DC output is unchanged.
 pub(crate) static KF_Y_MODE_CDF: [[[u16; 12]; 5]; 5] = [
     [
@@ -294,7 +294,7 @@ pub(crate) static LO_CTX_OFF: [[u32; 5]; 5] = [
 ];
 
 /// The byte dav1d stores in its `levels` map for a coefficient of magnitude `m`,
-/// used by the neighbour-context model: `m*0x41` for m<=2, else `min(m,15)+0xC0`.
+/// used by the neighbor-context model: `m*0x41` for m<=2, else `min(m,15)+0xC0`.
 #[inline]
 pub(crate) fn level_byte(m: u32) -> u8 {
     if m == 0 {

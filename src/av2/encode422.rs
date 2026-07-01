@@ -110,13 +110,13 @@ impl Av2Encoder {
         // Native (no-pad) 4:2:2 luma extents for the 32-family; else pad to whole SBs.
         let native_mi = native_422_mi(width, height);
         let (tmc, tmr) = native_mi.unwrap_or(((pw / 4) as i64, (ph / 4) as i64));
-        // Per-mi chroma neighbour presence, indexed in luma-mi space (the shared tree
-        // drives both planes, so neighbour relations match the luma footprint).
+        // Per-mi chroma neighbor presence, indexed in luma-mi space (the shared tree
+        // drives both planes, so neighbor relations match the luma footprint).
         let mut u_above = vec![0i32; tmc as usize + 16];
         let mut v_above = vec![0i32; tmc as usize + 16];
         let mut u_left = vec![0i32; tmr as usize + 16];
         let mut v_left = vec![0i32; tmr as usize + 16];
-        // Per-mi CfL-usage neighbours for get_cfl_ctx.
+        // Per-mi CfL-usage neighbors for get_cfl_ctx.
         let mut cfl_above = vec![0i32; tmc as usize + 16];
         let mut cfl_left = vec![0i32; tmr as usize + 16];
         let needs_partition = native_mi.is_some() && lossy_needs_partition(width, height);
@@ -176,7 +176,7 @@ impl Av2Encoder {
                     let (cy, cx) = (sb_y, sb_x / 2);
                     let bd = self.bit_depth as i32;
                     // CfL decision (4:2:2 whole-64 fast path). 32x64 chroma; luma subsampled
-                    // horizontally (<<2); neighbour DC via cfl_avg_l(ssx=true, ssy=false).
+                    // horizontally (<<2); neighbor DC via cfl_avg_l(ssx=true, ssy=false).
                     let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
                     let cfl_l = if fmc > 0 { cfl_left[fmr] } else { 0 };
                     enc.cfl_ctx = (cfl_a + cfl_l) as usize;
@@ -1635,7 +1635,7 @@ impl Av2Encoder {
         };
         let mut ya = vec![0x40u8; pw / 4 + 16];
         let mut yl = vec![0x40u8; ph / 4 + 16];
-        // Chroma neighbour grids live in chroma-pixel space (half-width above grid).
+        // Chroma neighbor grids live in chroma-pixel space (half-width above grid).
         let mut ua = vec![0u8; pcw / 4 + 16];
         let mut ul = vec![0u8; ph / 4 + 16];
         let mut va = vec![0u8; pcw / 4 + 16];

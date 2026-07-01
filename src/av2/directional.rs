@@ -425,7 +425,7 @@ impl Dir {
 /// Directional predictor for a square `bs`x`bs` block, conformant to the
 /// decoder. `is_luma` selects 4-tap vs 2-tap interpolation; `have_top`/
 /// `have_left`/`edge_filter` gate the normative intra-edge reference filter
-/// (it applies only when both neighbours exist, mrl==0 and the seq flag is on).
+/// (it applies only when both neighbors exist, mrl==0 and the seq flag is on).
 /// `max_width`/`max_height` are the available real-sample bounds for the edge
 /// filter (pass `bs` for a fully-available interior block).
 #[allow(clippy::too_many_arguments)]

@@ -401,6 +401,7 @@ impl CdfState {
             // CDF2 value a0 -> icdf0 = 32768 - a0; PARA2(a,b,c) = (a+2,b+3,c+4).
             ccso: {
                 // [plane][ctx] = (a0, (para0, para1, para2))
+                #[allow(clippy::type_complexity)]
                 let defs: [[(u16, (u8, u8, u8)); 4]; 3] = [
                     [
                         (18469, (0, 1, 2)),

@@ -28,11 +28,11 @@
  */
 #![allow(clippy::manual_clamp)]
 
+mod av1_coder;
 mod av1_coefs;
 mod av1_tables;
 mod av1_tile;
-mod av1_wht;
-mod av1real;
+mod wht;
 
 mod av2;
 mod avif;

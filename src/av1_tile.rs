@@ -29,12 +29,12 @@
 
 use crate::av1_coefs::encode_coefs;
 use crate::av1_tables::SKIP_CTX;
-use crate::av1_wht::levels_from_resid;
 use crate::cdf_tables as C;
 use crate::cost::coef_rate_bits;
 use crate::intrapred::INTRA_MODE_CTX;
 use crate::msac_enc::Writer;
 use crate::tables::*;
+use crate::wht::levels_from_resid;
 
 /// DC prediction for a 4×4 block at pixel origin (ox, oy).
 /// Reads from the source plane directly (lossless: recon == src).
@@ -85,7 +85,7 @@ static SM4: [i32; 4] = [255, 149, 85, 64];
 static LL_MODES: [usize; 7] = [0, 1, 2, 9, 10, 11, 12];
 
 /// Build the 4x4 intra reference edges (top[4], left[4], corner) from the
-/// source plane, matching dav1d's neighbour construction (recon == src in
+/// source plane, matching dav1d's neighbor construction (recon == src in
 /// lossless). Non-directional modes need no top-right / bottom-left extension.
 #[inline]
 fn edges_4x4(
