@@ -296,11 +296,7 @@ pub(crate) fn search_edge(
             }
         }
     }
-    // Return the best filter whenever it reduces (weighted) SSE at all. The per-SB
-    // RD decision (decide_blk_md) does the real gating — it turns off superblocks
-    // where filtering doesn't pay for its flag, so the whole-plane gate here is just
-    // "is there any benefit anywhere". (Phase 2 used a stricter 3% gate because it
-    // had no per-SB control; Phase 3 replaces that with the RD decision.)
+    // Return the best filter whenever it reduces (weighted) SSE at all
     match best {
         Some((total, res)) if total + 1e-6 < base_sse => Some(res),
         _ => None,
@@ -320,13 +316,6 @@ pub(crate) enum PlaneResult {
         offsets: Vec<i32>,
     },
 }
-
-// ===========================================================================
-// SSIMULACRA2-inspired distortion proxy (P0): variance-normalized SSE.
-// inv_activity = 1 / (local_var + k); errors in flat regions weigh more.
-// Computed from the SOURCE plane (the reconstruction's variance is itself
-// distorted, which would create a feedback loop).
-// ===========================================================================
 
 /// Per-pixel inverse-activity weight from a 3×3 local variance of `src`
 /// (cw×ch). `k` is the activity floor (8-bit ~128 for chroma; scale by
@@ -434,13 +423,7 @@ pub(crate) fn decide_blk_md(
                     sse_on += df * df;
                 }
             }
-            // RD decision with the real adaptive-CDF flag cost. The context is the
-            // left-neighbour decision (col 0 => ctx 0; else left_on ? 2 : 0), matching
-            // the bitstream context. The per-context cost is -log2(P(symbol)) from the
-            // running CDF, and the CDF is updated with the chosen symbol as we walk —
-            // exactly as AVM's derive_blk_md does. This makes "on" expensive in
-            // isolation (ctx 0) but cheap once a neighbour filters (ctx 2), so the
-            // decision favours spatially contiguous filtering instead of speckle.
+            // RD decision with the real adaptive-CDF flag cost.
             let idx = sr * sb_cols + sc;
             let left_on = if sc == 0 { false } else { grid[idx - 1] != 0 };
             let ctx = if sc == 0 {

@@ -95,10 +95,21 @@ enum ChromaTx {
 /// emit a chroma `angle_delta` symbol (delta 0), and are only offered where the
 /// chroma block is >= 8x8 (4:4:4), matching AV1's `use_angle_delta`.
 fn chroma_tx_for_mode(mode: usize) -> ChromaTx {
+    // Mirrors dav1d_txtp_from_uvmode: the decoder derives the chroma transform
+    // type from the uv_mode. (At tx sizes whose square is >= TX_32X32 the spec
+    // forces DCT_DCT regardless; callers at those sizes ignore this and use DCT.)
     match mode {
-        m if m == PAETH_PRED || m == SMOOTH_PRED => ChromaTx::AdstAdst,
-        m if m == SMOOTH_V_PRED || m == V_PRED => ChromaTx::AdstDct,
-        m if m == SMOOTH_H_PRED || m == H_PRED => ChromaTx::DctAdst,
+        // ADST_ADST: SMOOTH, PAETH, D135 (DIAG_DOWN_RIGHT)
+        m if m == PAETH_PRED || m == SMOOTH_PRED || m == D135_PRED => ChromaTx::AdstAdst,
+        // ADST_DCT: SMOOTH_V, V, D113 (VERT_RIGHT), D67 (VERT_LEFT)
+        m if m == SMOOTH_V_PRED || m == V_PRED || m == D113_PRED || m == VERT_LEFT_PRED => {
+            ChromaTx::AdstDct
+        }
+        // DCT_ADST: SMOOTH_H, H, D157 (HOR_DOWN), D203 (HOR_UP)
+        m if m == SMOOTH_H_PRED || m == H_PRED || m == D157_PRED || m == D203_PRED => {
+            ChromaTx::DctAdst
+        }
+        // DCT_DCT: DC, D45 (DIAG_DOWN_LEFT), and anything else.
         _ => ChromaTx::DctDct,
     }
 }
@@ -120,6 +131,26 @@ fn inv_chroma_8x8(tx: ChromaTx, levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
         ChromaTx::AdstAdst => iadst_dequant_8x8(levels, q),
         ChromaTx::AdstDct => iadstdct_dequant_8x8(levels, q),
         ChromaTx::DctAdst => idctadst_dequant_8x8(levels, q),
+    }
+}
+
+/// Forward transform + trellis quant for a 16x16 chroma block under the given
+/// chroma tx kind (mirrors `fwd_chroma_8x8` at TX_16X16).
+fn fwd_chroma_16x16(tx: ChromaTx, resid: &[i32; 256], q: &impl Dct) -> ([i32; 256], [f64; 256]) {
+    match tx {
+        ChromaTx::DctDct => forward_dct_quant_16x16_t(resid, q),
+        ChromaTx::AdstAdst => adst16x16_t(resid, q),
+        ChromaTx::AdstDct => adstdct16x16_t(resid, q),
+        ChromaTx::DctAdst => dctadst16x16_t(resid, q),
+    }
+}
+
+fn inv_chroma_16x16(tx: ChromaTx, levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
+    match tx {
+        ChromaTx::DctDct => idct_dequant_16x16(levels, q),
+        ChromaTx::AdstAdst => iadst_dequant_16x16(levels, q),
+        ChromaTx::AdstDct => iadstdct_dequant_16x16(levels, q),
+        ChromaTx::DctAdst => idctadst_dequant_16x16(levels, q),
     }
 }
 
@@ -2157,7 +2188,7 @@ impl<'a> LossyTile<'a> {
                 // Directional chroma modes (here only V_PRED/H_PRED, used at 8x8
                 // 4:4:4 chroma where `use_angle_delta` holds) emit a chroma
                 // angle_delta symbol. The encoder only offers delta 0, so emit the
-                // centre bucket (delta + 3 == 3).
+                // center bucket (delta + 3 == 3).
                 if (V_PRED..=VERT_LEFT_PRED).contains(&uv_mode) {
                     self.enc
                         .encode_symbol(3, &mut self.cdfs.angle_delta[uv_mode - V_PRED]);
@@ -2375,82 +2406,135 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        // SMOOTH_V check: on smooth vertical gradients DC prediction rings at block
-        // boundaries; SMOOTH_V interpolates from the top edge to the bottom-left corner,
-        // giving near-zero residual on gradients and eliminating the green-lane stripes.
         let mut chosen_uv_16 = DC_PRED;
-        // SMOOTH_V is only beneficial at low quality (ac_q > 300 ≈ quality ≤ 35).
-        // At higher quality DC/CfL suffice and SMOOTH_V's <= tie-break causes
-        // block-boundary colour mismatches across the whole image.
-        if self.quant.ac_q() > 300 {
+        {
             let (dcq, acq, lam) = (
                 self.cquant.dc_q() as f64,
                 self.cquant.ac_q() as f64,
                 trellis_lambda(),
             );
-            let mut sv_ccf16 = [[0i32; 256]; 2];
-            let mut sv_preds16 = [[0i32; 256]; 2];
-            let mut sse_cur = 0i64;
-            let mut sse_sv = 0i64;
+            let mlam = mode_lambda() * acq * acq;
+            let maxv = (1 << self.bd) - 1;
+            // Reconstructed R-D of the CURRENT chroma choice (DC or CfL), using the
+            // coeffs/prediction already selected above.
+            let mut cur_total = 0f64;
+            if cfl_opt.is_some() {
+                // CfL signals a non-DC uv_mode plus per-plane alpha (~4 bits each).
+                let a = cfl_opt.unwrap();
+                cur_total += mlam
+                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+            }
             for ci in 0..2 {
                 let plane = ci + 1;
-                for ry in 0..16 {
+                let rr = idct_dequant_16x16(&ccf[ci], &self.cquant);
+                let mut sse = 0i64;
+                for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
                     let prow = &cpred16[ci][ry * 16..];
-                    for (&srow, &prow) in srow[..16].iter().zip(prow[..16].iter()) {
-                        let d = srow - prow;
-                        sse_cur += (d * d) as i64;
+                    for ((&s, &p), &r) in srow[..16].iter().zip(prow.iter()).zip(rrow.iter()) {
+                        let d = s - (p + r).clamp(0, maxv);
+                        sse += (d * d) as i64;
                     }
                 }
-                intra_predict_nd(
-                    SMOOTH_V_PRED,
-                    &self.recon[plane],
-                    self.w,
-                    px,
-                    py,
-                    16,
-                    16,
-                    false,
-                    false,
-                    self.w,
-                    self.h,
-                    &mut sv_preds16[ci],
-                    self.bd,
-                );
-                let mut resid = [0i32; 256];
-                for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    let prow = &sv_preds16[ci][ry * 16..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
-                        *dv = s - p;
-                    }
+                cur_total += sse as f64 + mlam * block_rate_bits(&ccf[ci], &SCAN_16X16);
+            }
+
+            // Directional / smooth chroma modes, each with its decoder-derived
+            // chroma tx (PAETH/SMOOTH -> ADST_ADST, SMOOTH_V -> ADST_DCT,
+            // SMOOTH_H -> DCT_ADST). PAETH is empirically the strongest non-DC
+            // chroma mode, so it is searched alongside the SMOOTH family. The
+            // winner must beat the current DC/CfL choice on the libaom-style
+            // R-D cost computed in `cur_total`.
+            let mut best_total = cur_total;
+            let mut best_mode_uv = DC_PRED;
+            let mut best_ccf16 = [[0i32; 256]; 2];
+            let mut best_pred16 = [[0i32; 256]; 2];
+            for &cand in &[
+                SMOOTH_V_PRED,
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
                 }
-                // SMOOTH_V chroma derives ADST_DCT, so
-                // the encoder must forward/inverse with ADST_DCT to match the
-                // decoder. Using plain DCT desyncs at >8-bit.
-                let (q, qt) = adstdct16x16_t(&resid, &self.cquant);
-                sv_ccf16[ci] = q;
-                trellis_optimize(&mut sv_ccf16[ci], &qt, dcq, acq, &SCAN_16X16, lam);
-                let mean_resid_sv = resid.iter().sum::<i32>() / 256;
-                if sv_ccf16[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                    sv_ccf16[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
-                }
-                for ry in 0..16 {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    let prow = &sv_preds16[ci][ry * 16..];
-                    for (&srow, &prow) in srow[..16].iter().zip(prow[..16].iter()) {
-                        let d = srow - prow;
-                        sse_sv += (d * d) as i64;
+                let tx = chroma_tx_for_mode(cand);
+                let mut cand_ccf = [[0i32; 256]; 2];
+                let mut cand_pred = [[0i32; 256]; 2];
+                // V/H and the Z2 angular modes (D135/D113/D157) all emit a chroma
+                // angle_delta symbol (~3 bits); they sit in the 1..=8 directional range.
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    7.0
+                } else {
+                    4.0
+                };
+                let mut cand_total = mlam * sig_bits;
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    intra_predict_nd(
+                        cand,
+                        &self.recon[plane],
+                        self.w,
+                        px,
+                        py,
+                        16,
+                        16,
+                        false,
+                        false,
+                        self.w,
+                        self.h,
+                        &mut cand_pred[ci],
+                        self.bd,
+                    );
+                    let mut resid = [0i32; 256];
+                    for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                        let srow = &self.src[plane][(py + ry) * self.w + px..];
+                        let prow = &cand_pred[ci][ry * 16..];
+                        for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                            *dv = s - p;
+                        }
                     }
+                    let (mut q, qt) = fwd_chroma_16x16(tx, &resid, &self.cquant);
+                    trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X16, lam);
+                    let mean_resid = resid.iter().sum::<i32>() / 256;
+                    if q[0] == 0 && mean_resid.abs() >= 8 {
+                        q[0] = if mean_resid > 0 { 1 } else { -1 };
+                    }
+                    cand_ccf[ci] = q;
+                    let rr = inv_chroma_16x16(tx, &q, &self.cquant);
+                    let mut sse = 0i64;
+                    for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
+                        let srow = &self.src[plane][(py + ry) * self.w + px..];
+                        let prow = &cand_pred[ci][ry * 16..];
+                        for ((&s, &p), &r) in srow[..16].iter().zip(prow.iter()).zip(rrow.iter()) {
+                            let d = s - (p + r).clamp(0, maxv);
+                            sse += (d * d) as i64;
+                        }
+                    }
+                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X16);
+                }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    best_mode_uv = cand;
+                    best_ccf16 = cand_ccf;
+                    best_pred16 = cand_pred;
                 }
             }
-            if sse_sv <= sse_cur {
-                ccf[..2].copy_from_slice(&sv_ccf16[..2]);
-                cpred16[..2].copy_from_slice(&sv_preds16[..2]);
-                cfl_opt = None; // SMOOTH_V overrides CfL if it wins
-                chosen_uv_16 = SMOOTH_V_PRED;
+            if best_mode_uv != DC_PRED {
+                ccf[..2].copy_from_slice(&best_ccf16[..2]);
+                cpred16[..2].copy_from_slice(&best_pred16[..2]);
+                cfl_opt = None; // a non-DC chroma mode overrides CfL if it wins
+                chosen_uv_16 = best_mode_uv;
             }
-        } // end if ac_q > 300 (SMOOTH_V)
+        } // end directional/smooth chroma (4:4:4 16x16)
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma16(
@@ -2487,15 +2571,19 @@ impl<'a> LossyTile<'a> {
             self.l_coef[plane][by4..by4 + 4].fill(res_ctx);
             let rr = if block_skip {
                 [0i32; 256]
-            } else if chosen_uv_16 == SMOOTH_V_PRED {
-                // ADST_DCT inverse to match the decoder's derived chroma txtp.
-                iadstdct_dequant_16x16(&ccf[ci], &self.cquant)
+            } else if chosen_uv_16 != DC_PRED {
+                // A directional/smooth chroma mode: invert with its decoder-derived
+                // chroma tx (PAETH/SMOOTH -> ADST_ADST, SMOOTH_V -> ADST_DCT,
+                // SMOOTH_H -> DCT_ADST).
+                inv_chroma_16x16(chroma_tx_for_mode(chosen_uv_16), &ccf[ci], &self.cquant)
             } else {
                 idct_dequant_16x16(&ccf[ci], &self.cquant)
             };
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
-                if cfl_opt.is_some() || chosen_uv_16 == SMOOTH_V_PRED {
+                if cfl_opt.is_some() || chosen_uv_16 != DC_PRED {
+                    // CfL and every non-DC mode store their per-pixel prediction in
+                    // `cpred16`.
                     let prow = &cpred16[ci][ry * 16..];
                     for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
                         *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
@@ -2554,15 +2642,62 @@ impl<'a> LossyTile<'a> {
                 ccf_dc[ci][0] = if mean_resid_dc > 0 { 1 } else { -1 };
             }
         }
-        // SMOOTH_V: only at low quality (ac_q > 300 ≈ quality ≤ 35)
-        let smooth_v_active = false; // chroma SMOOTH_V needs ADST_DCT (mode-derived tx for chroma); encoder only has DCT_DCT, so offering it desyncs dav1d. Disabled until ADST_DCT chroma is implemented.
-        let mut ccf_sv = [[0i32; 64]; 2];
-        let mut sv_preds = [[0i32; 64]; 2];
-        if smooth_v_active {
+        // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits, summed over U+V).
+        let mlam = mode_lambda() * acq * acq;
+        let mut rr_dc = [[0i32; 64]; 2];
+        let mut dc_total = 0f64;
+        for ci in 0..2 {
+            let plane = ci + 1;
+            rr_dc[ci] = idct_dequant_8x8(&ccf_dc[ci], &self.cquant);
+            let dc = dc_preds[ci];
+            let mut sse = 0i64;
+            for (ry, rrow) in rr_dc[ci].as_chunks::<8>().0.iter().enumerate() {
+                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                for (&s, &r) in srow[..8].iter().zip(rrow.iter()) {
+                    let d = s - (dc + r).clamp(0, maxval);
+                    sse += (d * d) as i64;
+                }
+            }
+            dc_total += sse as f64 + mlam * block_rate_bits(&ccf_dc[ci], &SCAN_8X8);
+        }
+        // Directional / smooth chroma modes, each with its decoder-derived chroma tx.
+        // PAETH is empirically the strongest non-DC chroma mode, searched alongside
+        // the SMOOTH family. Winner must beat DC on the same R-D metric.
+        let mut best_total = dc_total;
+        let mut chosen_uv = DC_PRED;
+        let mut best_ccf = ccf_dc;
+        let mut best_rr = rr_dc;
+        let mut best_pred = [[0i32; 64]; 2];
+        for &cand in &[
+            SMOOTH_V_PRED,
+            PAETH_PRED,
+            SMOOTH_PRED,
+            SMOOTH_H_PRED,
+            V_PRED,
+            H_PRED,
+            D135_PRED,
+            D113_PRED,
+            D157_PRED,
+        ] {
+            // Directional predictors (V/H + angular D135/D113/D157) run only at
+            // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+            if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional() {
+                continue;
+            }
+            let tx = chroma_tx_for_mode(cand);
+            let mut cand_ccf = [[0i32; 64]; 2];
+            let mut cand_rr = [[0i32; 64]; 2];
+            let mut cand_pred = [[0i32; 64]; 2];
+            let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                7.0
+            } else {
+                4.0
+            };
+            let mut cand_total = mlam * sig_bits;
             for ci in 0..2 {
                 let plane = ci + 1;
                 intra_predict_nd(
-                    SMOOTH_V_PRED,
+                    cand,
                     &self.recon[plane],
                     self.cw,
                     cx,
@@ -2573,64 +2708,47 @@ impl<'a> LossyTile<'a> {
                     false,
                     self.cw,
                     self.h,
-                    &mut sv_preds[ci],
+                    &mut cand_pred[ci],
                     self.bd,
                 );
                 let mut resid = [0i32; 64];
                 for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    let prow = &sv_preds[ci][ry * 8..];
+                    let prow = &cand_pred[ci][ry * 8..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
                         *dv = s - p;
                     }
                 }
-                let (q, qt) = forward_dct_quant_8x8_t(&resid, &self.cquant);
-                ccf_sv[ci] = q;
-                trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_8X8, lam);
-                let mean_resid_sv = resid.iter().sum::<i32>() / 64;
-                if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                    ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
+                let (mut q, qt) = fwd_chroma_8x8(tx, &resid, &self.cquant);
+                trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X8, lam);
+                let mean_resid = resid.iter().sum::<i32>() / 64;
+                if q[0] == 0 && mean_resid.abs() >= 8 {
+                    q[0] = if mean_resid > 0 { 1 } else { -1 };
                 }
+                cand_ccf[ci] = q;
+                cand_rr[ci] = inv_chroma_8x8(tx, &q, &self.cquant);
+                let mut sse = 0i64;
+                for (ry, rrow) in cand_rr[ci].as_chunks::<8>().0.iter().enumerate() {
+                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                    let prow = &cand_pred[ci][ry * 8..];
+                    for ((&s, &p), &r) in srow[..8].iter().zip(prow.iter()).zip(rrow.iter()) {
+                        let d = s - (p + r).clamp(0, maxval);
+                        sse += (d * d) as i64;
+                    }
+                }
+                cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_8X8);
             }
-        } // end if smooth_v_active
-        // RD: reconstruct both and compare SSE; cache inverse-transform for winner reuse
-        let mut rr_dc = [[0i32; 64]; 2];
-        let mut rr_sv = [[0i32; 64]; 2];
-        let mut sse_dc = 0i64;
-        let mut sse_sv = 0i64;
-        for ci in 0..2 {
-            let plane = ci + 1;
-            rr_dc[ci] = idct_dequant_8x8(&ccf_dc[ci], &self.cquant);
-            rr_sv[ci] = idct_dequant_8x8(&ccf_sv[ci], &self.cquant);
-            let dc = dc_preds[ci];
-            for (ry, (rd_row, rs_row)) in rr_dc[ci]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .zip(rr_sv[ci].as_chunks::<8>().0.iter())
-                .enumerate()
-            {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                let prow = &sv_preds[ci][ry * 8..];
-                for (((&s, &prow), &rd), &rs) in srow[..8]
-                    .iter()
-                    .zip(prow[..8].iter())
-                    .zip(rd_row[..8].iter())
-                    .zip(rs_row[..8].iter())
-                {
-                    let d = s - (dc + rd).clamp(0, maxval);
-                    let v = s - (prow + rs).clamp(0, maxval);
-                    sse_dc += (d * d) as i64;
-                    sse_sv += (v * v) as i64;
-                }
+            if cand_total < best_total {
+                best_total = cand_total;
+                chosen_uv = cand;
+                best_ccf = cand_ccf;
+                best_rr = cand_rr;
+                best_pred = cand_pred;
             }
         }
-        let use_sv = smooth_v_active && sse_sv <= sse_dc;
-        let (chosen_uv, ccf, rr_cache) = if use_sv {
-            (SMOOTH_V_PRED, ccf_sv, rr_sv)
-        } else {
-            (DC_PRED, ccf_dc, rr_dc)
-        };
+        let (ccf, rr_cache) = (best_ccf, best_rr);
+        let sv_preds = best_pred;
+        let use_nondc = chosen_uv != DC_PRED;
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma16(
@@ -2659,7 +2777,7 @@ impl<'a> LossyTile<'a> {
             let rr = if block_skip { [0i32; 64] } else { rr_cache[ci] };
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                if use_sv {
+                if use_nondc {
                     let prow = &sv_preds[ci][ry * 8..];
                     for ((dv, &rv), &prow) in
                         drow[..8].iter_mut().zip(rrow.iter()).zip(prow[..8].iter())
@@ -2695,29 +2813,119 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         let cx = px / 2;
         let (bx4c, by4c) = (cx / 4, py / 4);
+        let maxv = (1 << self.bd) - 1;
+        let (dcq, acq, lam) = (
+            self.cquant.dc_q() as f64,
+            self.cquant.ac_q() as f64,
+            trellis_lambda(),
+        );
+        let mlam = mode_lambda() * acq * acq;
         let mut ccf = [[0i32; 128]; 2];
         let mut cpred = [0i32; 2];
+        // Per-pixel chroma prediction (DC broadcast, or CfL dc+alpha*ac).
+        let mut cpred_px = [[0i32; 128]; 2];
+        let mut src_planes = [[0i32; 128]; 2];
+        // DC option (always computed).
+        let mut dc_ccf = [[0i32; 128]; 2];
+        let mut dc_sse = [0i64; 2];
+        let mut dc_bits = [0f64; 2];
         for ci in 0..2 {
             let plane = ci + 1;
             let pred = dc_pred_8x16(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
+            let mut src = [0i32; 128];
             let mut resid = [0i32; 128];
-            for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            for (ry, (drow, srow_dst)) in resid
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks_mut::<8>().0.iter_mut())
+                .enumerate()
+            {
                 let srow = &self.src[plane][(py + ry) * self.cw + cx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                for ((dv, sd), &s) in drow.iter_mut().zip(srow_dst.iter_mut()).zip(srow.iter()) {
                     *dv = s - pred;
+                    *sd = s;
                 }
             }
-            let (q, qt) = forward_dct_quant_8x16_t(&resid, &self.cquant);
-            ccf[ci] = q;
-            trellis_optimize(
-                &mut ccf[ci],
-                &qt,
-                self.cquant.dc_q() as f64,
-                self.cquant.ac_q() as f64,
-                &SCAN_8X16,
-                trellis_lambda(),
-            );
+            src_planes[ci] = src;
+            let (mut q, qt) = forward_dct_quant_8x16_t(&resid, &self.cquant);
+            trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X16, lam);
+            let rr = idct_dequant_8x16(&q, &self.cquant);
+            let mut sse = 0i64;
+            for i in 0..128 {
+                let r = (pred + rr[i]).clamp(0, maxv);
+                let d = src[i] - r;
+                sse += (d * d) as i64;
+            }
+            dc_ccf[ci] = q;
+            dc_sse[ci] = sse;
+            dc_bits[ci] = block_rate_bits(&q, &SCAN_8X16);
+        }
+
+        // CfL option: predict 8x16 U/V from the horizontally-subsampled 16x16
+        // reconstructed luma (dav1d cfl_ac, ss_hor=1, ss_ver=0). Mirrors the
+        // 4:2:2 4x8 CfL in `code_block` at the larger 8x16 chroma size.
+        let mut use_cfl = false;
+        let mut cfl_alpha_uv = [0i32; 2];
+        {
+            let lrr_cfl = match txtp16 {
+                1 => iadst_dequant_16x16(lcf, &self.quant),
+                2 => iadstdct_dequant_16x16(lcf, &self.quant),
+                3 => idctadst_dequant_16x16(lcf, &self.quant),
+                _ => idct_dequant_16x16(lcf, &self.quant),
+            };
+            let mut luma_rec = [0i32; 256];
+            for i in 0..256 {
+                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, maxv);
+            }
+            let mut ac = [0i32; 128];
+            cfl_ac_sub(&luma_rec, 16, 8, 16, true, false, &mut ac);
+            let mut cfl_ccf = [[0i32; 128]; 2];
+            let mut cfl_a = [0i32; 2];
+            let mut cfl_sse = [0i64; 2];
+            let mut cfl_bits = [0f64; 2];
+            for ci in 0..2 {
+                let dc = cpred[ci];
+                let src = src_planes[ci];
+                let a = cfl_best_alpha(&ac, &src, dc, 128, self.bd);
+                cfl_a[ci] = a;
+                let mut cpr = [0i32; 128];
+                let mut resid = [0i32; 128];
+                for i in 0..128 {
+                    cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
+                    resid[i] = src[i] - cpr[i];
+                }
+                let (mut q, qt) = forward_dct_quant_8x16_t(&resid, &self.cquant);
+                trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X16, lam);
+                let rr = idct_dequant_8x16(&q, &self.cquant);
+                let mut sse = 0i64;
+                for i in 0..128 {
+                    let r = (cpr[i] + rr[i]).clamp(0, maxv);
+                    let d = src[i] - r;
+                    sse += (d * d) as i64;
+                }
+                cfl_ccf[ci] = q;
+                cfl_sse[ci] = sse;
+                cfl_bits[ci] = block_rate_bits(&q, &SCAN_8X16);
+                cpred_px[ci] = cpr;
+            }
+            let sig =
+                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
+            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
+            let cfl_total =
+                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            if cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
+                use_cfl = true;
+                cfl_alpha_uv = cfl_a;
+                ccf[..2].copy_from_slice(&cfl_ccf[..2]);
+            }
+        }
+        if !use_cfl {
+            for ci in 0..2 {
+                ccf[ci] = dc_ccf[ci];
+                cpred_px[ci] = [cpred[ci]; 128];
+            }
         }
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
@@ -2728,8 +2936,8 @@ impl<'a> LossyTile<'a> {
             lpred,
             y_mode,
             block_skip,
-            DC_PRED,
-            None,
+            if use_cfl { CFL_PRED } else { DC_PRED },
+            if use_cfl { Some(cfl_alpha_uv) } else { None },
             txtp16,
             angle_delta,
         );
@@ -2752,8 +2960,9 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
-                for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                    *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
+                let prow = &cpred_px[ci][ry * 8..];
+                for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
+                    *dv = (p + rv).clamp(0, maxv);
                 }
             }
         }
@@ -3301,16 +3510,8 @@ impl<'a> LossyTile<'a> {
                 dc_sgn,
             );
         }
-        // Current best transform-type cost (starts at the DCT winner); the ADST
-        // refinement updates it so the IDTX refinement compares against whichever
-        // of DCT/ADST is currently winning.
         let mut best_txtp_sse = best_dct_sse;
         let mut best_txtp_bits = best_dct_bits;
-        // Per-block transform refinement: try ADST_ADST on the winning
-        // prediction only and keep it if cheaper than that mode's DCT. This is
-        // one extra transform+trellis per block instead of one per candidate
-        // mode, which is where the encode-time regression came from.
-        // Full and Medium try ADST; only Fast prunes the transform type to DCT_DCT.
         if self.speed.try_adst() {
             let mut resid = [0i32; 64];
             for (ry, rrow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
@@ -3659,10 +3860,20 @@ impl<'a> LossyTile<'a> {
                 SMOOTH_H_PRED,
                 V_PRED,
                 H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
             ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
+                }
                 let tx = chroma_tx_for_mode(cand);
-                // mode symbol (~4 bits) + angle_delta symbol (~3 bits) for V/H
-                let sig_bits = if cand == V_PRED || cand == H_PRED {
+                // mode symbol (~4 bits) + angle_delta symbol (~3 bits) for the
+                // directional modes (V/H and the Z2 angulars D135/D113/D157).
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
                     7.0
                 } else {
                     4.0
@@ -3930,11 +4141,32 @@ impl<'a> LossyTile<'a> {
             let mut best_mode_uv = DC_PRED;
             let mut best_ccf = ccf44;
             let mut best_pred = [[0i32; 16]; 2];
-            for &cand in &[PAETH_PRED, SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED] {
+            for &cand in &[
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_V_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
+                }
                 let tx = chroma_tx_for_mode(cand);
                 let mut cand_ccf = [[0i32; 16]; 2];
                 let mut cand_pred = [[0i32; 16]; 2];
-                let mut cand_total = mlam * 4.0; // non-DC uv_mode signalling
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    7.0
+                } else {
+                    4.0
+                };
+                let mut cand_total = mlam * sig_bits; // non-DC uv_mode (+angle_delta for V/H)
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let mut pp = [0i32; 16];
@@ -4084,11 +4316,32 @@ impl<'a> LossyTile<'a> {
             let mut best_mode_uv = DC_PRED;
             let mut best_ccf = ccf48;
             let mut best_pred = [[0i32; 32]; 2];
-            for &cand in &[PAETH_PRED, SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED] {
+            for &cand in &[
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_V_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
+                }
                 let tx = chroma_tx_for_mode(cand);
                 let mut cand_ccf = [[0i32; 32]; 2];
                 let mut cand_pred = [[0i32; 32]; 2];
-                let mut cand_total = mlam * 4.0;
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    7.0
+                } else {
+                    4.0
+                };
+                let mut cand_total = mlam * sig_bits;
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let mut pp = [0i32; 32];
@@ -4915,83 +5168,135 @@ impl<'a> LossyTile<'a> {
         } else {
             (&ccf, cdc, None)
         };
-        // SMOOTH_V check on 32x32 chroma (same principle as 16x16 path).
+        // Directional / smooth chroma on the 32x32 chroma block. Per the AV1 spec
+        // (compute_tx_type), intra blocks whose square transform size is >= TX_32X32
+        // always use DCT_DCT, so every non-DC uv_mode here codes its residual with
+        // the plain 32x32 DCT — only the prediction differs. PAETH/SMOOTH/SMOOTH_V/
+        // SMOOTH_H are searched against the current DC/CfL winner on the libaom-style
+        // R-D cost (SSE + mlam*(coeff_bits + mode_signal_bits)).
         #[allow(unused_mut)] // assigned via break in 'sv labeled block
         let mut cf_use_owned: [[i32; 1024]; 2];
         let mut sv_preds32 = [[0i32; 1024]; 2];
         let (final_cf, chosen_uv_32) = 'sv: {
-            // Gate SMOOTH_V on low quality only
-            if self.quant.ac_q() <= 300 {
-                break 'sv (cf_use, DC_PRED);
-            }
-            let mut sv_ccf32 = [[0i32; 1024]; 2];
-            let mut sse_cur = 0i64;
-            let mut sse_sv = 0i64;
             let dcq2 = self.cquant.dc_q() as f64;
             let acq2 = self.cquant.ac_q() as f64;
             let lam2 = trellis_lambda();
+            let mlam = mode_lambda() * acq2 * acq2;
+            let maxv = (1 << self.bd) - 1;
+            // R-D of the current winner (DC or CfL), residual already in `cf_use`.
+            let mut cur_total = 0f64;
+            if use_cfl {
+                let a = cfl_a;
+                cur_total += mlam
+                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+            }
             for ci in 0..2 {
                 let plane = ci + 1;
-                // sse_cur: raw source vs current winner prediction (DC scalar or CfL pixels)
-                for ry in 0..32 {
+                let rr = idct_dequant_32x32(&cf_use[ci], &self.cquant);
+                let mut sse = 0i64;
+                for (ry, rrow) in rr.as_chunks::<32>().0.iter().enumerate() {
                     let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    if use_cfl {
-                        let prow = &cfl_pred[ci][ry * 32..];
-                        for (&sr, &pr) in srow[..32].iter().zip(prow[..32].iter()) {
-                            let d = sr - pr;
-                            sse_cur += (d * d) as i64;
+                    for (j, (&s, &r)) in srow[..32].iter().zip(rrow.iter()).enumerate() {
+                        let p = if use_cfl {
+                            cfl_pred[ci][ry * 32 + j]
+                        } else {
+                            pred_dc[ci]
+                        };
+                        let d = s - (p + r).clamp(0, maxv);
+                        sse += (d * d) as i64;
+                    }
+                }
+                cur_total += sse as f64 + mlam * block_rate_bits(&cf_use[ci], &SCAN_32X32);
+            }
+
+            let mut best_total = cur_total;
+            let mut best_mode = DC_PRED;
+            let mut best_ccf = [[0i32; 1024]; 2];
+            let mut best_pred = [[0i32; 1024]; 2];
+            for &cand in &[
+                SMOOTH_V_PRED,
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
+                }
+                let mut cand_ccf = [[0i32; 1024]; 2];
+                let mut cand_pred = [[0i32; 1024]; 2];
+                // V/H also emit a chroma angle_delta symbol (~3 bits); transform stays
+                // DCT_DCT here (spec forces it at Tx_Size_Sqr >= TX_32X32).
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    7.0
+                } else {
+                    4.0
+                };
+                let mut cand_total = mlam * sig_bits;
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    intra_predict_nd(
+                        cand,
+                        &self.recon[plane],
+                        self.w,
+                        px,
+                        py,
+                        32,
+                        32,
+                        false,
+                        false,
+                        self.w,
+                        self.h,
+                        &mut cand_pred[ci],
+                        self.bd,
+                    );
+                    let mut resid = [0i32; 1024];
+                    for (ry, drow) in resid.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+                        let srow = &self.src[plane][(py + ry) * self.w + px..];
+                        let prow = &cand_pred[ci][ry * 32..];
+                        for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
+                            *dv = s - p;
                         }
-                    } else {
-                        let dc = pred_dc[ci];
-                        for &s in srow[..32].iter() {
-                            let d = s - dc;
-                            sse_cur += (d * d) as i64;
+                    }
+                    // Forced DCT_DCT at 32x32 (spec), regardless of uv_mode.
+                    let (mut q, qt) = forward_dct_quant_32x32_t(&resid, &self.cquant);
+                    trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_32X32, lam2);
+                    let mean_resid = resid.iter().sum::<i32>() / 1024;
+                    if q[0] == 0 && mean_resid.abs() >= 8 {
+                        q[0] = if mean_resid > 0 { 1 } else { -1 };
+                    }
+                    cand_ccf[ci] = q;
+                    let rr = idct_dequant_32x32(&q, &self.cquant);
+                    let mut sse = 0i64;
+                    for (ry, rrow) in rr.as_chunks::<32>().0.iter().enumerate() {
+                        let srow = &self.src[plane][(py + ry) * self.w + px..];
+                        let prow = &cand_pred[ci][ry * 32..];
+                        for ((&s, &p), &r) in srow[..32].iter().zip(prow.iter()).zip(rrow.iter()) {
+                            let d = s - (p + r).clamp(0, maxv);
+                            sse += (d * d) as i64;
                         }
                     }
+                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_32X32);
                 }
-                intra_predict_nd(
-                    SMOOTH_V_PRED,
-                    &self.recon[plane],
-                    self.w,
-                    px,
-                    py,
-                    32,
-                    32,
-                    false,
-                    false,
-                    self.w,
-                    self.h,
-                    &mut sv_preds32[ci],
-                    self.bd,
-                );
-                let mut resid = [0i32; 1024];
-                for (ry, drow) in resid.as_chunks_mut::<32>().0.iter_mut().enumerate() {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    let prow = &sv_preds32[ci][ry * 32..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
-                        *dv = s - p;
-                    }
-                }
-                let (q, qt) = forward_dct_quant_32x32_t(&resid, &self.cquant);
-                sv_ccf32[ci] = q;
-                trellis_optimize(&mut sv_ccf32[ci], &qt, dcq2, acq2, &SCAN_32X32, lam2);
-                let mean_resid_sv = resid.iter().sum::<i32>() / 1024;
-                if sv_ccf32[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                    sv_ccf32[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
-                }
-                for ry in 0..32 {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    let prow = &sv_preds32[ci][ry * 32..];
-                    for (&srow, &prow) in srow[..32].iter().zip(prow[..32].iter()) {
-                        let d = srow - prow;
-                        sse_sv += (d * d) as i64;
-                    }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    best_mode = cand;
+                    best_ccf = cand_ccf;
+                    best_pred = cand_pred;
                 }
             }
-            if sse_sv < sse_cur {
-                cfl_opt = None; // SMOOTH_V overrides CfL if it wins
-                cf_use_owned = sv_ccf32;
-                break 'sv (&cf_use_owned, SMOOTH_V_PRED);
+            if best_mode != DC_PRED {
+                cfl_opt = None; // a non-DC chroma mode overrides CfL if it wins
+                cf_use_owned = best_ccf;
+                sv_preds32 = best_pred;
+                break 'sv (&cf_use_owned, best_mode);
             }
             (cf_use, DC_PRED)
         };
@@ -5026,7 +5331,7 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in crr.as_chunks::<32>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
-                if chosen_uv_32 == SMOOTH_V_PRED {
+                if chosen_uv_32 != DC_PRED {
                     let prow = &sv_preds32[ci][ry * 32..];
                     for (j, (dv, &rv)) in drow[..32].iter_mut().zip(rrow.iter()).enumerate() {
                         *dv = (prow[j] + rv).clamp(0, (1 << self.bd) - 1);
@@ -5090,14 +5395,66 @@ impl<'a> LossyTile<'a> {
                 ccf_dc[ci][0] = if mean_resid_dc > 0 { 1 } else { -1 };
             }
         }
-        let smooth_v_active_32 = false; // see note: chroma SMOOTH_V -> ADST_DCT not implemented; would desync decoder
-        let mut ccf_sv = [[0i32; 256]; 2];
+        // SMOOTH_V chroma derives ADST_DCT (a 2D tx -> default scan and coef
+        // contexts identical to DCT_DCT; only the transform differs). Forward with
+        // adstdct16x16_t and reconstruct with iadstdct_dequant_16x16 to match the
+        // decoder's derived chroma txtp. Offered at every quality; the Lagrangian
+        // R-D decision below selects it only when it truly wins.
+        // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits over U+V).
+        let mlam = mode_lambda() * acq * acq;
+        let mut rr_dc = [[0i32; 256]; 2];
+        let mut dc_total = 0f64;
+        for ci in 0..2 {
+            let plane = ci + 1;
+            rr_dc[ci] = idct_dequant_16x16(&ccf_dc[ci], &self.cquant);
+            let dc = dc_preds[ci];
+            let mut sse = 0i64;
+            for (ry, rrow) in rr_dc[ci].as_chunks::<16>().0.iter().enumerate() {
+                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                for (&s, &r) in srow[..16].iter().zip(rrow.iter()) {
+                    let d = s - (dc + r).clamp(0, maxval);
+                    sse += (d * d) as i64;
+                }
+            }
+            dc_total += sse as f64 + mlam * block_rate_bits(&ccf_dc[ci], &SCAN_16X16);
+        }
+        // Directional / smooth chroma modes (PAETH/SMOOTH/SMOOTH_V/SMOOTH_H), each
+        // with its decoder-derived chroma tx. Winner must beat DC on the R-D metric.
+        let mut best_total = dc_total;
+        let mut chosen_uv = DC_PRED;
+        let mut best_ccf = ccf_dc;
+        let mut best_rr = rr_dc;
         let mut sv_preds = [[0i32; 256]; 2];
-        if smooth_v_active_32 {
+        for &cand in &[
+            SMOOTH_V_PRED,
+            PAETH_PRED,
+            SMOOTH_PRED,
+            SMOOTH_H_PRED,
+            V_PRED,
+            H_PRED,
+            D135_PRED,
+            D113_PRED,
+            D157_PRED,
+        ] {
+            // Directional predictors (V/H + angular D135/D113/D157) run only at
+            // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+            if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional() {
+                continue;
+            }
+            let tx = chroma_tx_for_mode(cand);
+            let mut cand_ccf = [[0i32; 256]; 2];
+            let mut cand_rr = [[0i32; 256]; 2];
+            let mut cand_pred = [[0i32; 256]; 2];
+            let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                7.0
+            } else {
+                4.0
+            };
+            let mut cand_total = mlam * sig_bits;
             for ci in 0..2 {
                 let plane = ci + 1;
                 intra_predict_nd(
-                    SMOOTH_V_PRED,
+                    cand,
                     &self.recon[plane],
                     self.cw,
                     cx,
@@ -5108,63 +5465,46 @@ impl<'a> LossyTile<'a> {
                     false,
                     self.cw,
                     self.h,
-                    &mut sv_preds[ci],
+                    &mut cand_pred[ci],
                     self.bd,
                 );
                 let mut resid = [0i32; 256];
                 for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    let prow = &sv_preds[ci][ry * 16..];
+                    let prow = &cand_pred[ci][ry * 16..];
                     for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
                         *dv = s - p;
                     }
                 }
-                let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.cquant);
-                ccf_sv[ci] = q;
-                trellis_optimize(&mut ccf_sv[ci], &qt, dcq, acq, &SCAN_16X16, lam);
-                let mean_resid_sv = resid.iter().sum::<i32>() / 256;
-                if ccf_sv[ci][0] == 0 && mean_resid_sv.abs() >= 8 {
-                    ccf_sv[ci][0] = if mean_resid_sv > 0 { 1 } else { -1 };
+                let (mut q, qt) = fwd_chroma_16x16(tx, &resid, &self.cquant);
+                trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X16, lam);
+                let mean_resid = resid.iter().sum::<i32>() / 256;
+                if q[0] == 0 && mean_resid.abs() >= 8 {
+                    q[0] = if mean_resid > 0 { 1 } else { -1 };
                 }
+                cand_ccf[ci] = q;
+                cand_rr[ci] = inv_chroma_16x16(tx, &q, &self.cquant);
+                let mut sse = 0i64;
+                for (ry, rrow) in cand_rr[ci].as_chunks::<16>().0.iter().enumerate() {
+                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
+                    let prow = &cand_pred[ci][ry * 16..];
+                    for ((&s, &p), &r) in srow[..16].iter().zip(prow.iter()).zip(rrow.iter()) {
+                        let d = s - (p + r).clamp(0, maxval);
+                        sse += (d * d) as i64;
+                    }
+                }
+                cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X16);
             }
-        } // end if smooth_v_active_32
-        let mut rr_dc = [[0i32; 256]; 2];
-        let mut rr_sv = [[0i32; 256]; 2];
-        let mut sse_dc = 0i64;
-        let mut sse_sv = 0i64;
-        for ci in 0..2 {
-            let plane = ci + 1;
-            rr_dc[ci] = idct_dequant_16x16(&ccf_dc[ci], &self.cquant);
-            rr_sv[ci] = idct_dequant_16x16(&ccf_sv[ci], &self.cquant);
-            let dc = dc_preds[ci];
-            for (ry, (rd_row, rs_row)) in rr_dc[ci]
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .zip(rr_sv[ci].as_chunks::<16>().0.iter())
-                .enumerate()
-            {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                let prow = &sv_preds[ci][ry * 16..];
-                for (((&s, &prow), &rd), &rs) in srow[..16]
-                    .iter()
-                    .zip(prow[..16].iter())
-                    .zip(rd_row[..16].iter())
-                    .zip(rs_row[..16].iter())
-                {
-                    let d = s - (dc + rd).clamp(0, maxval);
-                    let v = s - (prow + rs).clamp(0, maxval);
-                    sse_dc += (d * d) as i64;
-                    sse_sv += (v * v) as i64;
-                }
+            if cand_total < best_total {
+                best_total = cand_total;
+                chosen_uv = cand;
+                best_ccf = cand_ccf;
+                best_rr = cand_rr;
+                sv_preds = cand_pred;
             }
         }
-        let use_sv = smooth_v_active_32 && sse_sv <= sse_dc;
-        let (chosen_uv, ccf, rr_cache) = if use_sv {
-            (SMOOTH_V_PRED, ccf_sv, rr_sv)
-        } else {
-            (DC_PRED, ccf_dc, rr_dc)
-        };
+        let use_sv = chosen_uv != DC_PRED;
+        let (ccf, rr_cache) = (best_ccf, best_rr);
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma32(
@@ -5240,29 +5580,212 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         let cx = px / 2;
         let (bx4c, by4c) = (cx / 4, py / 4);
+        let maxv = (1 << self.bd) - 1;
+        let (dcq, acq, lam) = (
+            self.cquant.dc_q() as f64,
+            self.cquant.ac_q() as f64,
+            trellis_lambda(),
+        );
+        let mlam = mode_lambda() * acq * acq;
         let mut ccf = [[0i32; 512]; 2];
         let mut cpred = [0i32; 2];
+        let mut cpred_px = [[0i32; 512]; 2];
+        let mut src_planes = [[0i32; 512]; 2];
+        let mut dc_ccf = [[0i32; 512]; 2];
+        let mut dc_sse = [0i64; 2];
+        let mut dc_bits = [0f64; 2];
         for ci in 0..2 {
             let plane = ci + 1;
             let pred = dc_pred_16x32(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
+            let mut src = [0i32; 512];
             let mut resid = [0i32; 512];
-            for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            for (ry, (drow, srow_dst)) in resid
+                .as_chunks_mut::<16>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks_mut::<16>().0.iter_mut())
+                .enumerate()
+            {
                 let srow = &self.src[plane][(py + ry) * self.cw + cx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
+                for ((dv, sd), &s) in drow.iter_mut().zip(srow_dst.iter_mut()).zip(srow.iter()) {
                     *dv = s - pred;
+                    *sd = s;
                 }
             }
-            let (q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
-            ccf[ci] = q;
-            trellis_optimize(
-                &mut ccf[ci],
-                &qt,
-                self.cquant.dc_q() as f64,
-                self.cquant.ac_q() as f64,
-                &SCAN_16X32,
-                trellis_lambda(),
-            );
+            src_planes[ci] = src;
+            let (mut q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
+            trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X32, lam);
+            let rr = idct_dequant_16x32(&q, &self.cquant);
+            let mut sse = 0i64;
+            for i in 0..512 {
+                let r = (pred + rr[i]).clamp(0, maxv);
+                let d = src[i] - r;
+                sse += (d * d) as i64;
+            }
+            dc_ccf[ci] = q;
+            dc_sse[ci] = sse;
+            dc_bits[ci] = block_rate_bits(&q, &SCAN_16X32);
+        }
+
+        // CfL: predict the 16x32 U/V from the horizontally-subsampled 32x32
+        // reconstructed luma (dav1d cfl_ac, ss_hor=1, ss_ver=0). 32x32 luma is
+        // always DCT_DCT here, so the AC reference inverts with idct_dequant_32x32.
+        let mut use_cfl = false;
+        let mut cfl_alpha_uv = [0i32; 2];
+        {
+            let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
+            let mut luma_rec = [0i32; 1024];
+            for i in 0..1024 {
+                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, maxv);
+            }
+            let mut ac = [0i32; 512];
+            cfl_ac_sub(&luma_rec, 32, 16, 32, true, false, &mut ac);
+            let mut cfl_ccf = [[0i32; 512]; 2];
+            let mut cfl_a = [0i32; 2];
+            let mut cfl_sse = [0i64; 2];
+            let mut cfl_bits = [0f64; 2];
+            for ci in 0..2 {
+                let dc = cpred[ci];
+                let src = src_planes[ci];
+                let a = cfl_best_alpha(&ac, &src, dc, 512, self.bd);
+                cfl_a[ci] = a;
+                let mut cpr = [0i32; 512];
+                let mut resid = [0i32; 512];
+                for i in 0..512 {
+                    cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
+                    resid[i] = src[i] - cpr[i];
+                }
+                let (mut q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
+                trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X32, lam);
+                let rr = idct_dequant_16x32(&q, &self.cquant);
+                let mut sse = 0i64;
+                for i in 0..512 {
+                    let r = (cpr[i] + rr[i]).clamp(0, maxv);
+                    let d = src[i] - r;
+                    sse += (d * d) as i64;
+                }
+                cfl_ccf[ci] = q;
+                cfl_sse[ci] = sse;
+                cfl_bits[ci] = block_rate_bits(&q, &SCAN_16X32);
+                cpred_px[ci] = cpr;
+            }
+            let sig =
+                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
+            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
+            let cfl_total =
+                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            if cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
+                use_cfl = true;
+                cfl_alpha_uv = cfl_a;
+                ccf[..2].copy_from_slice(&cfl_ccf[..2]);
+            }
+        }
+        // Directional / smooth chroma on the 16x32 block. The AV1 spec forces
+        // DCT_DCT for any intra block whose square transform size is >= TX_32X32,
+        // and 16x32 (Tx_Size_Sqr = TX_32X32) hits that rule -- so the residual is
+        // always the plain 16x32 DCT and only the prediction changes (PAETH/SMOOTH/
+        // SMOOTH_V/SMOOTH_H). Searched against the DC/CfL winner on the R-D metric.
+        let mut chosen_uv = if use_cfl { CFL_PRED } else { DC_PRED };
+        {
+            // R-D of the current winner (DC or CfL), from the committed ccf/cpred.
+            let mut best_total = 0f64;
+            if use_cfl {
+                let a = cfl_alpha_uv;
+                best_total += mlam
+                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+            }
+            for ci in 0..2 {
+                let cur_ccf = if use_cfl { ccf[ci] } else { dc_ccf[ci] };
+                let rr = idct_dequant_16x32(&cur_ccf, &self.cquant);
+                let mut sse = 0i64;
+                for i in 0..512 {
+                    let p = if use_cfl { cpred_px[ci][i] } else { cpred[ci] };
+                    let d = src_planes[ci][i] - (p + rr[i]).clamp(0, maxv);
+                    sse += (d * d) as i64;
+                }
+                best_total += sse as f64 + mlam * block_rate_bits(&cur_ccf, &SCAN_16X32);
+            }
+            for &cand in &[
+                SMOOTH_V_PRED,
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ] {
+                // Directional predictors (V/H + angular D135/D113/D157) run only at
+                // >= Medium speed; Fast keeps the cheaper DC/CfL/SMOOTH/PAETH set.
+                if (V_PRED..=VERT_LEFT_PRED).contains(&cand) && !self.speed.try_chroma_directional()
+                {
+                    continue;
+                }
+                let mut cand_ccf = [[0i32; 512]; 2];
+                let mut cand_pred = [[0i32; 512]; 2];
+                // V/H also emit a chroma angle_delta symbol (~3 bits); transform stays
+                // DCT_DCT here (spec forces it at Tx_Size_Sqr >= TX_32X32).
+                let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    7.0
+                } else {
+                    4.0
+                };
+                let mut cand_total = mlam * sig_bits;
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    intra_predict_nd(
+                        cand,
+                        &self.recon[plane],
+                        self.cw,
+                        cx,
+                        py,
+                        16,
+                        32,
+                        false,
+                        false,
+                        self.cw,
+                        self.h,
+                        &mut cand_pred[ci],
+                        self.bd,
+                    );
+                    let src = src_planes[ci];
+                    let mut resid = [0i32; 512];
+                    for i in 0..512 {
+                        resid[i] = src[i] - cand_pred[ci][i];
+                    }
+                    // Forced DCT_DCT at 16x32 (spec), regardless of uv_mode.
+                    let (mut q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
+                    trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X32, lam);
+                    let mean_resid = resid.iter().sum::<i32>() / 512;
+                    if q[0] == 0 && mean_resid.abs() >= 8 {
+                        q[0] = if mean_resid > 0 { 1 } else { -1 };
+                    }
+                    cand_ccf[ci] = q;
+                    let rr = idct_dequant_16x32(&q, &self.cquant);
+                    let mut sse = 0i64;
+                    for i in 0..512 {
+                        let r = (cand_pred[ci][i] + rr[i]).clamp(0, maxv);
+                        let d = src[i] - r;
+                        sse += (d * d) as i64;
+                    }
+                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X32);
+                }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    chosen_uv = cand;
+                    use_cfl = false;
+                    ccf[..2].copy_from_slice(&cand_ccf[..2]);
+                    cpred_px[..2].copy_from_slice(&cand_pred[..2]);
+                }
+            }
+        }
+        if chosen_uv == DC_PRED {
+            for ci in 0..2 {
+                ccf[ci] = dc_ccf[ci];
+                cpred_px[ci] = [cpred[ci]; 512];
+            }
         }
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
@@ -5273,8 +5796,8 @@ impl<'a> LossyTile<'a> {
             lpred,
             y_mode,
             block_skip,
-            DC_PRED,
-            None,
+            chosen_uv,
+            if use_cfl { Some(cfl_alpha_uv) } else { None },
             angle_delta,
         );
         for ci in 0..2 {
@@ -5295,8 +5818,9 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
-                for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                    *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
+                let prow = &cpred_px[ci][ry * 16..];
+                for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
+                    *dv = (p + rv).clamp(0, maxv);
                 }
             }
         }
