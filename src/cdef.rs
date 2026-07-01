@@ -133,6 +133,7 @@ pub(crate) fn cdef_direction(
             partial[7][i / 2 + j] += p;
         }
     }
+    #[allow(clippy::too_many_arguments)]
     for i in 0..8 {
         cost[2] += (partial[2][i] as i64) * (partial[2][i] as i64);
         cost[6] += (partial[6][i] as i64) * (partial[6][i] as i64);

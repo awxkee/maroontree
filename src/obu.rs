@@ -213,7 +213,7 @@ fn frame_header_lossless_impl(
     w.into_bytes()
 }
 
-/// Multi-tile lossy frame header.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn frame_header_lossy_multitile(
     base_q_idx: u8,
     cols_incr: &[bool],
@@ -240,6 +240,7 @@ pub(crate) fn frame_header_lossy_multitile(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn frame_header_lossy_multitile_th(
     base_q_idx: u8,
     cols_incr: &[bool],
