@@ -7315,7 +7315,7 @@ fn encode_one_lossless_tile(
     let p0 = crop_plane(&src[0], full_w, x0, y0, tw, th);
     let p1 = crop_plane(&src[1], full_w, x0, y0, tw, th);
     let p2 = crop_plane(&src[2], full_w, x0, y0, tw, th);
-    crate::av1_tile::encode_tile_lossless(tw, th, bd, [&p0, &p1, &p2])
+    crate::tile::encode_tile_lossless(tw, th, bd, [&p0, &p1, &p2])
 }
 
 fn encode_lossless_tilegroup(
@@ -7400,7 +7400,7 @@ fn encode_one_lossless_tile_mono(
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
-    crate::av1_tile::encode_tile_lossless_mono(tw, th, bd, &p0)
+    crate::tile::encode_tile_lossless_mono(tw, th, bd, &p0)
 }
 
 /// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res

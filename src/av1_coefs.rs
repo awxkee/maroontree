@@ -27,9 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::av1_tables::{LO_CTX_2D, SCAN_4X4};
 use crate::cdf_tables as C;
 use crate::msac_enc::Writer;
+use crate::skip_tables::{LO_CTX_2D, SCAN_4X4};
 
 const STRIDE: usize = 4;
 

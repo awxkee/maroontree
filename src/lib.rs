@@ -30,8 +30,8 @@
 
 mod av1_coder;
 mod av1_coefs;
-mod av1_tables;
-mod av1_tile;
+mod skip_tables;
+mod tile;
 mod wht;
 
 mod av2;
