@@ -27,24 +27,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! AV1 Constrained Directional Enhancement Filter (CDEF), spec §7.15.
-//!
-//! CDEF is an in-loop post-filter applied after deblocking. It runs over each
-//! 8x8 luma block: first a direction is estimated (`cdef_direction`), then a
-//! primary filter follows that direction with strength `pri` and a secondary
-//! filter runs at 45° offsets with strength `sec`, both attenuated by a
-//! `damping` parameter so large differences from the centre pixel are ignored
-//! (that is the "constrained" part — it preserves true edges while removing
-//! ringing).
-//!
-//! This module implements the exact integer filter the decoder runs, so the
-//! encoder can apply it to its own reconstruction and stay bit-synchronised. It
-//! also provides a cheap per-64x64 strength search (`pick_strength_sse`) that
-//! evaluates a small candidate set by SSE against the source — not a one-tap
-//! proxy, but far cheaper than full RD.
-//!
-//! Pixels are `i32` samples in `0..=(1<<bd)-1`, matching the encoder's planes.
-
 /// CDEF can be skipped per-8x8 when the block is flagged (largest-value sentinel).
 pub(crate) const CDEF_VERY_LARGE: i32 = 0x4000;
 
@@ -102,7 +84,7 @@ fn constrain_spec(diff: i32, strength: i32, damping: i32) -> i32 {
 /// Estimate the dominant direction (0..=7) of an 8x8 block and the strength of
 /// that direction's correlation (`var`, used by callers if needed). Mirrors the
 /// spec `cdef_direction` process: it correlates the 8x8 luma block against the 8
-/// directional patterns and returns the best. `bd_shift = bd - 8` normalises
+/// directional patterns and returns the best. `bd_shift = bd - 8` normalizes
 /// high-bit-depth samples to 8-bit before the variance comparison.
 pub(crate) fn cdef_direction(
     plane: &[i32],
@@ -170,7 +152,7 @@ pub(crate) fn cdef_direction(
         }
     }
     // Directional variance per spec 7.15.2: difference between the best cost and
-    // the cost of the opposite direction, normalised by >>10. Used to scale the
+    // the cost of the opposite direction, normalized by >>10. Used to scale the
     // primary strength per block (see `adjust_pri`).
     let var = ((best - cost[(best_dir + 4) & 7]) >> 10) as i32;
     (best_dir, var)
