@@ -214,6 +214,8 @@ pub(crate) struct CdfState {
     pub(crate) skip_tx4: Vec<Vec<u16>>,      // [10] TX4 skip (avm txb_skip tx0)
     pub(crate) cfl_is: Vec<Vec<u16>>,        // [3] cfl_is/use flag (avm cfl_cdf)
     pub(crate) cfl_index: Vec<u16>,          // cfl_index flag (avm cfl_index_cdf)
+    pub(crate) cfl_mhccp: Vec<u16>,          // cfl_mhccp_switch flag (avm cfl_mhccp_switch_cdf)
+    pub(crate) filter_dir: Vec<Vec<u16>>,    // [4 ctx] mh_dir (avm filter_dir_cdf), nsyms=3
     pub(crate) skip_tx64: Vec<Vec<u16>>,     // [10] TX64 skip (avm txb_skip tx4)
     pub(crate) skip_v: Vec<Vec<u16>>, // [12] V skip (avm v_txb_skip — shared by all V blocks incl 4x4)
     pub(crate) dc_sign: Vec<Vec<u16>>, // [3 dc_sign_ctx]
@@ -365,16 +367,25 @@ impl CdfState {
                 .map(|c| bool_wc(cfl::CFL_IS_CDF[c], cdf_para::PARA_CFL_IS[c]))
                 .collect(),
             cfl_index: bool_wc(cfl::CFL_INDEX_CDF, cdf_para::PARA_CFL_INDEX),
+            cfl_mhccp: bool_wc(cfl::CFL_MHCCP_SWITCH_CDF, cdf_para::PARA_CFL_INDEX),
+            filter_dir: (0..4)
+                .map(|c| {
+                    expand_para(
+                        &cfl::FILTER_DIR_CDF[c],
+                        3,
+                        (
+                            cfl::FILTER_DIR_PARA[c].0,
+                            cfl::FILTER_DIR_PARA[c].1,
+                            cfl::FILTER_DIR_PARA[c].2,
+                        ),
+                    )
+                })
+                .collect(),
             skip_tx64: (0..10)
                 .map(|c| bool_wc(CHROMA_SKIP_TX64_QC[qc][c], cdf_para::PARA_SKIP_TX64[qc][c]))
                 .collect(),
             skip_v: (0..12)
-                .map(|c| {
-                    bool_wc(
-                        crate::av2::cdfs_qctx::V_SKIP_TX4_QC[qc][c],
-                        cdf_para::PARA_V_SKIP_TX4[qc][c],
-                    )
-                })
+                .map(|c| bool_wc(V_SKIP_TX4_QC[qc][c], cdf_para::PARA_V_SKIP_TX4[qc][c]))
                 .collect(),
             dc_sign: (0..3)
                 .map(|c| bool_wc(DC_SIGN_QC[qc][c], cdf_para::PARA_DC_SIGN[qc][c]))

@@ -5,19 +5,6 @@
  * under the BSD 2-Clause License.
  */
 
-//! AV2 inverse transforms, a faithful port of the dav2d scalar pipeline.
-//!
-//! Validated bit-exact against dav2d's own C reference: the 1-D transforms over
-//! 38,000 random vectors, and the 2-D driver / DC-only / WHT / cctx paths across
-//! every transform size & type at bit depths 8, 10 and 12.
-//!
-//! All arithmetic is integer and bit-depth parameterized by `bd` (8/10/12):
-//! intermediate row clip is `±2^(bd+7)`, the final pixel clip is `[0, 2^bd-1]`,
-//! and `cctx` clips to `±2^(bd+7)` — matching dav2d's HIGHBD build exactly.
-//!
-//! `txtp` packs the transform as `hor | (class << 3) | (ver << 5)`, where the
-//! 1-D type ids are [`Tx1d`] and the class is [`TxClass`]; build one with [`txtp`].
-
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) enum Tx1d {
@@ -47,31 +34,31 @@ pub(crate) const fn txtp(hor: Tx1d, ver: Tx1d, class: TxClass) -> usize {
 /// RectTxfmSize indices (dav2d order). Pass one as `tx` to [`inv_txfm_add`].
 #[allow(dead_code)]
 pub(crate) mod tx_size {
-    pub const TX_4X4: usize = 0;
-    pub const TX_8X8: usize = 1;
-    pub const TX_16X16: usize = 2;
-    pub const TX_32X32: usize = 3;
-    pub const TX_64X64: usize = 4;
-    pub const RTX_4X8: usize = 5;
-    pub const RTX_8X4: usize = 6;
-    pub const RTX_8X16: usize = 7;
-    pub const RTX_16X8: usize = 8;
-    pub const RTX_16X32: usize = 9;
-    pub const RTX_32X16: usize = 10;
-    pub const RTX_32X64: usize = 11;
-    pub const RTX_64X32: usize = 12;
-    pub const RTX_4X16: usize = 13;
-    pub const RTX_16X4: usize = 14;
-    pub const RTX_8X32: usize = 15;
-    pub const RTX_32X8: usize = 16;
-    pub const RTX_16X64: usize = 17;
-    pub const RTX_64X16: usize = 18;
-    pub const RTX_4X32: usize = 19;
-    pub const RTX_32X4: usize = 20;
-    pub const RTX_8X64: usize = 21;
-    pub const RTX_64X8: usize = 22;
-    pub const RTX_4X64: usize = 23;
-    pub const RTX_64X4: usize = 24;
+    pub(crate) const TX_4X4: usize = 0;
+    pub(crate) const TX_8X8: usize = 1;
+    pub(crate) const TX_16X16: usize = 2;
+    pub(crate) const TX_32X32: usize = 3;
+    pub(crate) const TX_64X64: usize = 4;
+    pub(crate) const RTX_4X8: usize = 5;
+    pub(crate) const RTX_8X4: usize = 6;
+    pub(crate) const RTX_8X16: usize = 7;
+    pub(crate) const RTX_16X8: usize = 8;
+    pub(crate) const RTX_16X32: usize = 9;
+    pub(crate) const RTX_32X16: usize = 10;
+    pub(crate) const RTX_32X64: usize = 11;
+    pub(crate) const RTX_64X32: usize = 12;
+    pub(crate) const RTX_4X16: usize = 13;
+    pub(crate) const RTX_16X4: usize = 14;
+    pub(crate) const RTX_8X32: usize = 15;
+    pub(crate) const RTX_32X8: usize = 16;
+    pub(crate) const RTX_16X64: usize = 17;
+    pub(crate) const RTX_64X16: usize = 18;
+    pub(crate) const RTX_4X32: usize = 19;
+    pub(crate) const RTX_32X4: usize = 20;
+    pub(crate) const RTX_8X64: usize = 21;
+    pub(crate) const RTX_64X8: usize = 22;
+    pub(crate) const RTX_4X64: usize = 23;
+    pub(crate) const RTX_64X4: usize = 24;
 }
 
 static DCT8_KERNEL: [i8; 16] = [

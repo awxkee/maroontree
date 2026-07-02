@@ -99,6 +99,9 @@ impl Av2Encoder {
             enc.enable_adaptive_cdf(enc.qc);
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.mhccp = self.tune.mhccp && self.base_q_idx != 0;
+        enc.mhccp_ssx = true;
+        enc.mhccp_ssy = false;
         enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         let qc = enc.qc;
         let neutral = self.dc_neutral();
@@ -212,7 +215,7 @@ impl Av2Encoder {
                             bd,
                             &bases.chroma422,
                             qstep_i,
-                            crate::av2::leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                            leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
                         )
                     } else {
                         None
@@ -407,6 +410,7 @@ impl Av2Encoder {
                     let cfl_l = if lmc > 0 { cfl_left[lmr] } else { 0 };
                     enc.cfl_ctx = (cfl_a + cfl_l) as usize;
                     enc.cfl_use = false;
+                    enc.mhccp_use = false;
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
                             let (tus, mode_idx, _) = encode_luma_sb(
@@ -539,6 +543,32 @@ impl Av2Encoder {
                             let (skip2, dcs2) = sb_tu_contexts_64x32(
                                 &tus2, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                32,
+                                32,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.chroma420,
+                                &tables::SCAN,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_64x32(
                                 &mut enc, &tus2, &skip2, &dcs2, mode_idx, true, pc,
                             );
@@ -571,7 +601,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 16) => {
@@ -669,6 +699,32 @@ impl Av2Encoder {
                                 tmr,
                                 true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                32,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c16x32,
+                                &SCAN16X32,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_32x32(
                                 &mut enc, &tu, skip2[0], dcs2[0], mode_idx, true, pc,
                             );
@@ -701,7 +757,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 16) => {
@@ -815,6 +871,32 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 16, 4, true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                32,
+                                16,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c32x16,
+                                &SCAN32X16,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_64x16(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
                                 &mut enc,
@@ -845,7 +927,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 4) => {
@@ -963,6 +1045,32 @@ impl Av2Encoder {
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 4, true,
                             );
                             let skip = SKIP_TX16_QC[qc][0] as u32;
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                16,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c8x16,
+                                &tables::SCAN8X16,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_16x16_full(
                                 &mut enc, &tu, skip, dcs, 0, true, pc, 11074, tx_idx,
                             );
@@ -995,7 +1103,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (2, 8) => {
@@ -1037,6 +1145,32 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 2, 8, true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                4,
+                                32,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c4x32,
+                                &tables::SCAN4X32,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_8x32(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
                                 &mut enc,
@@ -1067,7 +1201,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 2) => {
@@ -1109,6 +1243,32 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 8, 2, true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                8,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c16x8,
+                                &tables::SCAN16X8,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_32x8(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
                                 &mut enc,
@@ -1139,7 +1299,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (2, 2) => {
@@ -1172,6 +1332,32 @@ impl Av2Encoder {
                             let tu: Vec<Coeff> = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 2, 2, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                4,
+                                8,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c4x8,
+                                &tables::SCAN4X8,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_8x8(
                                 &mut enc,
@@ -1213,7 +1399,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (2, 4) => {
@@ -1391,6 +1577,32 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 8, true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                32,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.luma8x32,
+                                &SCAN8X32,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_16x32(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
                                 &mut enc,
@@ -1421,7 +1633,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 4) => {
@@ -1448,6 +1660,32 @@ impl Av2Encoder {
                             let tu: Vec<Coeff> = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 8, 4, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                &mut enc,
+                                &recy,
+                                &recu,
+                                &recv,
+                                &up,
+                                &vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                16,
+                                true,
+                                false,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.luma16x16,
+                                &tables::SCAN16,
+                                qstep_i,
+                                leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_32x16(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -1479,7 +1717,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         other => unreachable!("unsupported native 4:2:2 leaf {:?}", other),
@@ -1626,6 +1864,9 @@ impl Av2Encoder {
             enc.enable_adaptive_cdf(enc.qc);
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.mhccp = self.tune.mhccp && self.base_q_idx != 0;
+        enc.mhccp_ssx = true;
+        enc.mhccp_ssy = false;
         let neutral = self.dc_neutral();
         let (sb_cols, sb_rows) = (pw / 64, ph / 64);
         let code_mc = ((width + 7) & !7) / 4;

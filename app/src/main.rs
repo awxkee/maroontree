@@ -95,12 +95,13 @@ fn main() {
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
         .with_speed(Speed::Fast)
-        .with_threads(1)
+        .with_threads(12)
         .with_cfl(true)
         .with_updating_cdf(true)
         .with_chroma_mode_search(true)
         .with_chroma_rdoq_lambda(0.05)
-        .with_ccso(false);
+        .with_ccso(false)
+        .with_mhccp(true);
     let encoded = av2_encoder
         .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();

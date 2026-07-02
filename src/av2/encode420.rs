@@ -233,6 +233,10 @@ impl Av2Encoder {
                                 enc.cfl_ctx_u = ch.ctx_u;
                                 enc.cfl_ctx_v = ch.ctx_v;
                             }
+                            // Partition path does not evaluate MHCCP; ensure the
+                            // per-block flag is clear so no switch symbol is emitted.
+                            enc.mhccp_allowed = false;
+                            enc.mhccp_use = false;
                             encode_luma_block_split(
                                 enc,
                                 &tus,
@@ -295,6 +299,32 @@ impl Av2Encoder {
                             );
                             let (skip2, dcs2) =
                                 sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                32,
+                                16,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c32x16,
+                                &SCAN32X16,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_64x32(enc, &tus2, &skip2, &dcs2, mode_idx, true, pc);
                             code_422_chroma_tu(
                                 enc,
@@ -325,7 +355,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 16) => {
@@ -340,7 +370,7 @@ impl Av2Encoder {
                                 sb_x,
                                 &bases.luma,
                                 sb_qstep,
-                                &crate::av2::tables::SCAN,
+                                &tables::SCAN,
                                 neutral,
                                 qc,
                                 self.tune.rdoq_lambda,
@@ -361,6 +391,32 @@ impl Av2Encoder {
                             );
                             let s2 = [skip2[0], skip2[1]];
                             let d2 = [dcs2[0], dcs2[1]];
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                32,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c16x32,
+                                &SCAN16X32,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_32x64(enc, &tus2, &s2, &d2, mode_idx, true, pc);
                             code_422_chroma_tu(
                                 enc,
@@ -377,7 +433,7 @@ impl Av2Encoder {
                                     cw: 16,
                                     ch: 32,
                                     basis: &bases.c16x32,
-                                    scan: &crate::av2::tables::SCAN16X32,
+                                    scan: &SCAN16X32,
                                     eob_cdf: EobCdf::ChrEob512,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 512,
@@ -391,7 +447,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 8) => {
@@ -425,6 +481,32 @@ impl Av2Encoder {
                                 tmr,
                                 true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                16,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.luma16x16,
+                                &SCAN16,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_32x32(enc, &tu, skip2[0], dcs2[0], mode_idx, true, pc);
                             code_422_chroma_tu(
                                 enc,
@@ -455,7 +537,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 16) => {
@@ -473,7 +555,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x64.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
                                     bases.luma16x64.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -500,6 +582,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 16, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                32,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.luma8x32,
+                                &SCAN8X32,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_16x64(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -531,7 +639,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (16, 4) => {
@@ -549,7 +657,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma64x16.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
                                     bases.luma64x16.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -576,6 +684,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 16, 4, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                32,
+                                8,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.luma32x8,
+                                &SCAN32X8,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_64x16(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -607,7 +741,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (2, 8) => {
@@ -625,7 +759,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma8x32.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
                                     bases.luma8x32.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -652,6 +786,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 2, 8, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                4,
+                                16,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c4x16,
+                                &tables::SCAN4X16,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_8x32(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -683,7 +843,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 2) => {
@@ -700,7 +860,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma32x8.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
                                     bases.luma32x8.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -727,6 +887,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 8, 2, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                4,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c16x4,
+                                &tables::SCAN16X4,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -758,7 +944,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 8) => {
@@ -777,7 +963,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x32.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
                                     bases.luma16x32.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -804,6 +990,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 8, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                16,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c8x16,
+                                &tables::SCAN8X16,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_16x32(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -835,7 +1047,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (8, 4) => {
@@ -853,7 +1065,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma32x16.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
                                     bases.luma32x16.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -880,6 +1092,32 @@ impl Av2Encoder {
                             let tu = levels_to_coeffs(&lev);
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 8, 4, true,
+                            );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                16,
+                                8,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c16x8,
+                                &tables::SCAN16X8,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
                             );
                             encode_luma_leaf_32x16(enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
@@ -911,7 +1149,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 4) => {
@@ -929,7 +1167,7 @@ impl Av2Encoder {
                                 neutral,
                                 self.bit_depth as i32,
                             );
-                            let resid = crate::av2::aq::scale_resid(
+                            let resid = aq::scale_resid(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
                                 bases.luma16x16.qstep as f32 / sb_qstep as f32,
                             );
@@ -1024,6 +1262,32 @@ impl Av2Encoder {
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 4, true,
                             );
                             let skip = SKIP_TX16_QC[qc][0] as u32;
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                8,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c8x8,
+                                &SCAN8X8,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             encode_luma_leaf_16x16_full(
                                 enc, &tu, skip, dcs, 0, true, pc, 11074, tx_idx,
                             );
@@ -1056,7 +1320,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (2, 2) => {
@@ -1074,7 +1338,7 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.c8x8.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
                                     bases.c8x8.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -1111,7 +1375,7 @@ impl Av2Encoder {
                                 true,
                                 pc,
                                 3148,
-                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                                Some((&coder::TXTP_EXT8, 0, 6)),
                             );
                             use crate::av2::coder::{
                                 SCAN4X4_LOSSY, SCAN4X4_LOSSY_PACKED, encode_chroma_tu4_scan,
@@ -1119,7 +1383,7 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let predu = dc_pred_rect(recu, pcw, cy, cx, 4, 4, neutral, bd);
                             let levu = bases.c4x4.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(up, pcw, cy, cx, 4, 4, predu),
                                     bases.c4x4.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -1145,12 +1409,12 @@ impl Av2Encoder {
                             );
                             let uc = levels_to_coeffs(&levu);
                             let u_ctx = (6 + ua + ul) as usize;
-                            let u_skip = crate::av2::cdfs_qctx::SKIP_TX4_QC[enc.qc][u_ctx] as u32;
+                            let u_skip = cdfs_qctx::SKIP_TX4_QC[enc.qc][u_ctx] as u32;
                             encode_chroma_tu4_scan(enc, &uc, u_skip, false, &SCAN4X4_LOSSY, u_ctx);
                             let u_nz = uc.iter().any(|&(_, l)| l != 0);
                             let predv = dc_pred_rect(recv, pcw, cy, cx, 4, 4, neutral, bd);
                             let levv = bases.c4x4.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(vp, pcw, cy, cx, 4, 4, predv),
                                     bases.c4x4.qstep as f32 / sb_qstep as f32,
                                 ),
@@ -1176,7 +1440,7 @@ impl Av2Encoder {
                             );
                             let vc = levels_to_coeffs(&levv);
                             let v_ctx = (6 * (u_nz as i32) + va + vl) as usize;
-                            let v_skip = crate::av2::cdfs_qctx::V_SKIP_TX4_QC[enc.qc][v_ctx] as u32;
+                            let v_skip = cdfs_qctx::V_SKIP_TX4_QC[enc.qc][v_ctx] as u32;
                             encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
                             (u_nz, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1186,12 +1450,12 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
                             let lev = bases.c8x16.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
                                     bases.c8x16.qstep as f32 / sb_qstep as f32,
                                 ),
                                 0.0,
-                                &crate::av2::tables::SCAN8X16,
+                                &tables::SCAN8X16,
                             );
                             put_block_rect(
                                 recy,
@@ -1204,7 +1468,7 @@ impl Av2Encoder {
                                     pred,
                                     &lev,
                                     sb_qstep,
-                                    &crate::av2::tables::SCAN8X16,
+                                    &tables::SCAN8X16,
                                     8,
                                     16,
                                     bd,
@@ -1214,7 +1478,33 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 2, 4, true,
                             );
-                            crate::av2::coder::encode_luma_leaf_rect128(
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                4,
+                                8,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c4x8,
+                                &tables::SCAN4X8,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
+                            coder::encode_luma_leaf_rect128(
                                 enc,
                                 &tu,
                                 skip,
@@ -1223,8 +1513,8 @@ impl Av2Encoder {
                                 true,
                                 pc,
                                 12348,
-                                &crate::av2::tables::SCAN8X16,
-                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                                &tables::SCAN8X16,
+                                Some((&coder::TXTP_EXT8, 0, 6)),
                             );
                             code_422_chroma_tu(
                                 enc,
@@ -1255,7 +1545,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                             )
                         }
                         (4, 2) => {
@@ -1264,12 +1554,12 @@ impl Av2Encoder {
                             let bd = self.bit_depth as i32;
                             let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
                             let lev = bases.c16x8.project_scan(
-                                &crate::av2::aq::scale_resid(
+                                &aq::scale_resid(
                                     &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
                                     bases.c16x8.qstep as f32 / sb_qstep as f32,
                                 ),
                                 0.0,
-                                &crate::av2::tables::SCAN16X8,
+                                &tables::SCAN16X8,
                             );
                             put_block_rect(
                                 recy,
@@ -1282,7 +1572,7 @@ impl Av2Encoder {
                                     pred,
                                     &lev,
                                     sb_qstep,
-                                    &crate::av2::tables::SCAN16X8,
+                                    &tables::SCAN16X8,
                                     16,
                                     8,
                                     bd,
@@ -1292,7 +1582,7 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 2, true,
                             );
-                            crate::av2::coder::encode_luma_leaf_rect128(
+                            coder::encode_luma_leaf_rect128(
                                 enc,
                                 &tu,
                                 skip,
@@ -1301,8 +1591,8 @@ impl Av2Encoder {
                                 true,
                                 pc,
                                 12348,
-                                &crate::av2::tables::SCAN16X8,
-                                Some((&crate::av2::coder::TXTP_EXT8, 0, 6)),
+                                &tables::SCAN16X8,
+                                Some((&coder::TXTP_EXT8, 0, 6)),
                             );
                             code_422_chroma_tu(
                                 enc,
@@ -1445,6 +1735,9 @@ impl Av2Encoder {
             enc.enable_adaptive_cdf(enc.qc);
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.mhccp = self.tune.mhccp && self.base_q_idx != 0;
+        enc.mhccp_ssx = true;
+        enc.mhccp_ssy = true;
         enc.delta_q_present = self.tune.aq && self.base_q_idx != 0;
         // CCSO (U plane): enable the per-SB flag emission. Phase 1 filters every SB.
         // NOTE: the decoder classifies CCSO bands from the *post-deblock* luma (the
@@ -1676,6 +1969,108 @@ impl Av2Encoder {
                     enc.cfl_use = false;
                     enc.uv_mode = 0;
                 }
+                // MHCCP: multi-parameter cross-component predictor competing with
+                // the incumbent (DC or classic CfL) on J = SSE + lambda*bits.
+                let mhccp_choice = if enc.mhccp {
+                    let bd = self.bit_depth as i32;
+                    let lam = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                    let dc_u_f = dc_pred(&recu, pcw, cy, cx, 32, neutral);
+                    let dc_v_f = dc_pred(&recv, pcw, cy, cx, 32, neutral);
+                    // Chroma source blocks (same extraction cfl_decide uses).
+                    let mut suf_m = [0f32; 32 * 32];
+                    let mut svf_m = [0f32; 32 * 32];
+                    cfl_partition_prediction::<32>(pcw, &up, &vp, cy, cx, &mut suf_m, &mut svf_m);
+                    let baseline_j = if let Some(ref ch) = cfl_choice {
+                        let alpha_bits = 2.0
+                            + 3.0
+                            + if ch.sign_u != 0 { 3.0 } else { 0.0 }
+                            + if ch.sign_v != 0 { 3.0 } else { 0.0 };
+                        cfl::score_predictor(
+                            suf_m.as_slice(),
+                            svf_m.as_slice(),
+                            &ch.pred_u,
+                            &ch.pred_v,
+                            32,
+                            32,
+                            bd,
+                            &bases.chroma420,
+                            qstep_i,
+                            lam,
+                            alpha_bits,
+                        )
+                    } else {
+                        let dc_u_pred = [dc_u_f.round() as i32; 32 * 32];
+                        let dc_v_pred = [dc_v_f.round() as i32; 32 * 32];
+                        cfl::score_predictor(
+                            suf_m.as_slice(),
+                            svf_m.as_slice(),
+                            &dc_u_pred,
+                            &dc_v_pred,
+                            32,
+                            32,
+                            bd,
+                            &bases.chroma420,
+                            qstep_i,
+                            lam,
+                            0.0,
+                        )
+                    };
+                    let mctx = cfl::MhccpCtx {
+                        recy: &recy,
+                        pw,
+                        recu: &recu,
+                        recv: &recv,
+                        pcw,
+                        ly: sb_y,
+                        lx: sb_x,
+                        cy,
+                        cx,
+                        ssx: true,
+                        ssy: true,
+                        have_top: row > 0,
+                        have_left: col > 0,
+                        // Whole-superblock chroma block: its top edge is the SB
+                        // boundary, so one padding line above (avm is_top_sb_boundary).
+                        is_top_sb_boundary: true,
+                        size_group: cfl::mhccp_size_group_32(),
+                    };
+                    cfl::mhccp_decide(
+                        &mctx,
+                        suf_m.as_slice(),
+                        svf_m.as_slice(),
+                        32,
+                        32,
+                        bd,
+                        &bases.chroma420,
+                        qstep_i,
+                        lam,
+                        &tables::SCAN,
+                        baseline_j,
+                    )
+                } else {
+                    None
+                };
+                // This 32x32-partition leaf is MHCCP-eligible (block size in
+                // [8x8,64x64], not 4x4). Mark it so the switch symbol is emitted
+                // on this CfL block, matching the decoder's is_mhccp_allowed gate.
+                enc.mhccp_allowed = enc.mhccp;
+                if let Some(mh) = mhccp_choice.as_ref().and_then(|c| c.mhccp) {
+                    enc.cfl_use = true;
+                    enc.mhccp_use = true;
+                    enc.mhccp_dir = mh.mh_dir;
+                    enc.mhccp_size_group = mh.size_group;
+                    enc.uv_mode = 0;
+                } else {
+                    enc.mhccp_use = false;
+                }
+                // When MHCCP wins, its CflChoice (carrying the MHCCP predictor in
+                // pred_u/pred_v) replaces the incumbent so the shared cfl_choice
+                // reconstruction path below uses the MHCCP prediction.
+                let cfl_choice = if enc.mhccp_use {
+                    mhccp_choice
+                } else {
+                    cfl_choice
+                };
                 // Chroma intra-mode search (non-CfL). Runs BEFORE the luma/uv mode
                 // emitter (encode_luma_block_split_dir) so `enc.uv_mode` is set when
                 // the uv-mode symbol is written. AV2 shares one uv-mode across U+V;
@@ -2032,11 +2427,10 @@ impl Av2Encoder {
                     }
                 }
                 if ccso_search_v
-                    && let Some(r) = crate::av2::ccso::search_edge(
-                        &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None,
-                    )
+                    && let Some(r) =
+                        ccso::search_edge(&ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None)
                 {
-                    let (grid, any) = crate::av2::ccso::decide_blk_md(
+                    let (grid, any) = ccso::decide_blk_md(
                         &ext,
                         estride,
                         &vp,

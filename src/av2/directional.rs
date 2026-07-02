@@ -148,7 +148,7 @@ fn z1(
     let (w, h) = (bs, bs);
     let dx = DR[angle as usize];
     let max_base_x = (w + h) as i32 - 1;
-    let mut filt = vec![0i32; 141];
+    let mut filt = [0i32; 141];
     let top_off = 2usize;
     let sz = 1 + w + h;
     let str = if edge {
@@ -302,7 +302,7 @@ fn z2(
     let dx = DR[(180 - angle) as usize];
 
     // top edge buffer
-    let mut filt = vec![0i32; 72];
+    let mut filt = [0i32; 72];
     let top_off = 0usize;
     let sz_t = 1 + w;
     let str_t = if edge {
@@ -328,7 +328,7 @@ fn z2(
     filt[sz_t + 1] = filt[sz_t];
 
     // left edge buffer
-    let mut filt2 = vec![0i32; 72];
+    let mut filt2 = [0i32; 72];
     let left_off = h + 2;
     let sz_l = 1 + h;
     let str_l = if edge {

@@ -346,7 +346,7 @@ impl Av2Encoder {
                                 sb_x,
                                 8,
                                 32,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,
@@ -446,7 +446,7 @@ impl Av2Encoder {
                                 sb_x,
                                 16,
                                 16,
-                                &crate::av2::itx422::reconstruct_chroma(
+                                &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
                                     qstep_i,

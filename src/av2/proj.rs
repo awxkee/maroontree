@@ -32,11 +32,11 @@ use crate::util::FastRound;
 use std::cell::RefCell;
 
 pub(crate) struct Basis {
-    /// Quantiser rescale factor (qstep_target / qstep_measured), applied at run time.
+    /// quantizer rescale factor (qstep_target / qstep_measured), applied at run time.
     pub(crate) scale: f32,
     /// Max reconstructed sample value = (1 << bit_depth) - 1. Defaults to 8-bit (255).
     pub(crate) max_val: f32,
-    /// Dequantiser step for the forward-DCT path (set in [`Bases::rescaled_to_q`]).
+    /// Dequantizer step for the forward-DCT path (set in [`Bases::rescaled_to_q`]).
     pub(crate) qstep: i32,
     /// Which avm forward transform this basis uses (DCT size, or 16×16 ADST mix).
     pub(crate) fwd: crate::av2::fdct::FwdKind,
@@ -131,7 +131,7 @@ pub(crate) struct Bases {
 }
 
 /// Thread-local forward-DCT input/output scratch: the i32 residual fed to the
-/// transform and the coded coefficients fed to the quantiser. Reused across blocks.
+/// transform and the coded coefficients fed to the quantizer. Reused across blocks.
 struct FwdScratch {
     resid: Box<[i32; 4096]>,
     out: Box<[i32; 1024]>,
@@ -142,9 +142,9 @@ thread_local! {
 }
 
 impl Basis {
-    /// Rescale to a different quantiser. The bases are the decoder's level-1
+    /// Rescale to a different quantizer. The bases are the decoder's level-1
     /// reconstruction `qstep · T(k)` with a q-independent transform `T`, so the target
-    /// quantiser is just a multiply by `f = qstep_target/qstep_measured`. We record it
+    /// quantizer is just a multiply by `f = qstep_target/qstep_measured`. We record it
     /// as a factor (applied in project/reconstruct) rather than touching the profiles.
     pub(crate) fn scale(&mut self, f: f32) {
         self.scale *= f;

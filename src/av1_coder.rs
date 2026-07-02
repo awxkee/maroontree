@@ -1148,7 +1148,7 @@ impl<'a> LossyTile<'a> {
             // Q-adaptive gate (libaom strategy): rectangular partitions deliver
             // their gain at lower bitrates. At high quality the DC-only 16x8
             // sub-blocks lose to the square path's full mode search, so only
-            // offer HORZ once the quantiser is coarse enough (ac_q ~> q60).
+            // offer HORZ once the quantizer is coarse enough (ac_q ~> q60).
             && self.quant.ac_q() >= AC_Q_HORZ_MIN;
 
         // --- libaom-style variance features ---
@@ -6093,7 +6093,7 @@ const LF_BAND_SMOOTH_RANGE: i32 = 32;
 /// syntax. Tuned conservatively — too low over-splits (bloats rate), too high
 /// under-splits (blurs detail).
 const SPLIT_SIGNAL_BITS: f64 = 24.0;
-/// Minimum ac quantiser for the rectangular PARTITION_H candidate. Below this
+/// Minimum ac quantizer for the rectangular PARTITION_H candidate. Below this
 /// (high quality) the DC-only 16x8 sub-blocks lose to the square path's full
 /// mode search, so HORZ is gated off — libaom's Q-adaptive partition strategy.
 const AC_Q_HORZ_MIN: i32 = 100;

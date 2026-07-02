@@ -74,6 +74,77 @@ pub(super) struct ChromaPlanes<'a> {
     pub(super) stride: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mhccp_decide_leaf(
+    enc: &mut RangeEncoder,
+    recy: &[f32],
+    recu: &[f32],
+    recv: &[f32],
+    up: &[f32],
+    vp: &[f32],
+    pw: usize,
+    pcw: usize,
+    ly: usize,
+    lx: usize,
+    cy: usize,
+    cx: usize,
+    cw: usize,
+    ch: usize,
+    ssx: bool,
+    ssy: bool,
+    have_top: bool,
+    have_left: bool,
+    neutral: f32,
+    basis: &Basis,
+    scan: &[u16],
+    qstep: i32,
+    lambda: f64,
+    bd: i32,
+) -> Option<cfl::CflChoice> {
+    if !enc.mhccp
+        || !cfl::is_mhccp_allowed(
+            (cw << (ssx as usize)) / 4,
+            (ch << (ssy as usize)) / 4,
+            ssx,
+            ssy,
+        )
+    {
+        return None;
+    }
+    let mut suf = vec![0f32; cw * ch];
+    let mut svf = vec![0f32; cw * ch];
+
+    let up_rows = up[cy * pcw + cx..].chunks(pcw);
+    let vp_rows = vp[cy * pcw + cx..].chunks(pcw);
+
+    for ((suf_row, svf_row), (up_row, vp_row)) in suf
+        .chunks_exact_mut(cw)
+        .zip(svf.chunks_exact_mut(cw))
+        .zip(up_rows.zip(vp_rows))
+        .take(ch)
+    {
+        suf_row.copy_from_slice(&up_row[..cw]);
+        svf_row.copy_from_slice(&vp_row[..cw]);
+    }
+
+    let dc_u = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
+    let dc_v = dc_pred_rect(recv, pcw, cy, cx, cw, ch, neutral, bd);
+    let choice = cfl::mhccp_eval_leaf(
+        recy, pw, recu, recv, pcw, ly, lx, cy, cx, cw, ch, ssx, ssy, have_top, have_left, &suf,
+        &svf, dc_u, dc_v, basis, qstep, lambda, scan, bd,
+    );
+    if let Some(ref ch_choice) = choice
+        && let Some(ref mh) = ch_choice.mhccp
+    {
+        enc.cfl_use = true;
+        enc.mhccp_use = true;
+        enc.mhccp_dir = mh.mh_dir;
+        enc.mhccp_size_group = mh.size_group;
+        enc.uv_mode = 0;
+    }
+    choice
+}
+
 /// Shape-constant transform parameters for one chroma TU geometry; identical for every
 /// TU of a given leaf shape, so it can be built once per match arm instead of spelled
 /// out as eight positional args at every call.
@@ -107,7 +178,7 @@ pub(super) fn code_422_chroma_tu(
     quant: QuantCtx,
     nb: ChromaNeighbors,
     bd: i32,
-    cfl: Option<&crate::av2::cfl::CflChoice>,
+    cfl: Option<&cfl::CflChoice>,
 ) -> (bool, bool) {
     let ChromaPlanes {
         rec_u: recu,
@@ -132,6 +203,8 @@ pub(super) fn code_422_chroma_tu(
         qstep,
         rdoq_lambda,
     } = quant;
+    // MHCCP (if any) is decided BEFORE the luma mode is emitted and handed in via
+    // `cfl` (its pred_u/pred_v carry the MHCCP predictor). See `mhccp_decide_leaf`.
     // Variance Boost: when the SB quantizer differs from the basis (frame) qstep, scale the
     // residual so the projection (which quantizes at `basis.qstep`) effectively quantizes at
     // `qstep`, matching the reconstruction that dequantizes at `qstep`. Identity when equal.
@@ -203,10 +276,7 @@ pub(super) fn code_422_chroma_tu(
         let predu = dc_pred_rect(recu, pcw, cy, cx, cw, ch, neutral, bd);
         let levu = project_chroma_rdoq(
             basis,
-            &crate::av2::aq::scale_resid(
-                &get_residual_rect(up, pcw, cy, cx, cw, ch, predu),
-                cscale,
-            ),
+            &aq::scale_resid(&get_residual_rect(up, pcw, cy, cx, cw, ch, predu), cscale),
             scan,
             qc,
             cw * ch,
@@ -270,7 +340,6 @@ pub(super) fn predict_chroma_mode_dims(
     cw_px: usize,
     ch_px: usize,
 ) -> Vec<f32> {
-    use crate::av2::intrapred;
     let have_above = cy > 0;
     let have_left = cx > 0;
     // Top-right / bottom-left availability for the chroma 32x32 block, mirroring

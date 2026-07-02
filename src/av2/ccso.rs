@@ -26,15 +26,13 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/// The AVM `ccso_offset` table: candidate raw offset values (a band offset is one
-/// of these, multiplied by the scale at apply time).
-pub(crate) const CCSO_OFFSET: [i32; 8] = [0, 1, -1, 3, -3, 7, -7, -10];
-/// The AVM `ccso_scale` table indexed by `scale_idx`.
-pub(crate) const CCSO_SCALE: [i32; 4] = [1, 2, 3, 4];
 
-/// `quant_sz[scale_idx][quant_idx]` — the quantiser step that thresholds the
+pub(crate) static CCSO_OFFSET: [i32; 8] = [0, 1, -1, 3, -3, 7, -7, -10];
+pub(crate) static CCSO_SCALE: [i32; 4] = [1, 2, 3, 4];
+
+/// `quant_sz[scale_idx][quant_idx]` — the quantizer step that thresholds the
 /// luma-difference classification.
-pub(crate) const QUANT_SZ: [[u16; 4]; 4] = [
+pub(crate) static QUANT_SZ: [[u16; 4]; 4] = [
     [16, 8, 32, 0],
     [56, 40, 64, 128],
     [48, 24, 96, 192],
@@ -42,7 +40,7 @@ pub(crate) const QUANT_SZ: [[u16; 4]; 4] = [
 ];
 
 /// Number of edge intervals per `edge_clf` (3 for clf 0, 2 for clf 1).
-const EDGE_INTERVAL: [usize; 2] = [3, 2];
+static EDGE_INTERVAL: [usize; 2] = [3, 2];
 
 /// `CCSO_PADDING_SIZE`: luma border extension for the edge taps.
 pub(crate) const PAD: usize = 5;

@@ -54,6 +54,7 @@ pub mod itx422;
 mod layout;
 mod leaf;
 mod lossless;
+mod mhccp;
 mod partition;
 mod proj;
 mod quant;
@@ -182,10 +183,12 @@ pub struct Tuning {
     /// with df_par_bits=2). 0 = thresholds derived purely from the frame qindex.
     pub db_delta_y: i32,
     pub db_delta_uv: i32,
-    /// Enable the in-loop CDEF (directional de-ring).
+    /// Enable the in-loop CDEF (directional de-ring)
     pub cdef: bool,
-    /// Enable AV2 chroma-from-luma (CfL) intra prediction. Experimental; bitstream-affecting.
+    /// AV2 chroma-from-luma (CfL) intra prediction
     pub cfl: bool,
+    /// AV2 multi-hypothesis cross-component prediction (MHCCP)
+    pub mhccp: bool,
     /// Enable per-superblock adaptive quantization (variance-driven delta-Q).
     /// Bitstream-affecting; spends fewer bits on busy SBs and more on flat ones.
     pub aq: bool,
@@ -223,6 +226,7 @@ impl Default for Tuning {
             db_delta_uv: 0,
             cdef: false,
             cfl: true,
+            mhccp: true,
             aq: true,
             vb_octile: 6,
             vb_strength: 0.6,
@@ -365,7 +369,7 @@ impl Av2Encoder {
     }
 
     /// Build an encoder for `base_q_idx` at a given coded bit depth (8, 10 or 12).
-    /// The avm quantiser step is bit-depth-independent, so only the sample range,
+    /// The avm quantizer step is bit-depth-independent, so only the sample range,
     /// reconstruction clamp, DC-prediction neutral and the sequence-header signalling
     /// differ; the bases are unchanged.
     pub fn with_bit_depth(base_q_idx: u8, bit_depth: u8) -> Self {
@@ -481,6 +485,11 @@ impl Av2Encoder {
         self
     }
 
+    pub fn with_mhccp(mut self, on: bool) -> Self {
+        self.tune.mhccp = on;
+        self
+    }
+
     /// Enable adaptive CDF updating during tile decode
     pub fn with_updating_cdf(mut self, on: bool) -> Self {
         self.tune.updating_cdf = on;
@@ -498,7 +507,7 @@ impl Av2Encoder {
     }
 
     fn config(&self, layout: Layout) -> Config {
-        // Quality-adaptive luma deblock delta. A +1 quantiser-index offset strengthens
+        // Quality-adaptive luma deblock delta. A +1 quantizer-index offset strengthens
         // the luma filter, which helps at low/mid quality (large gains: man1024 +0.29,
         // bship +1.60, buddha +0.99 BD-SSIM at low q) and is neutral at high quality.
         // Applied automatically when `db_delta_y` is left at its `i32::MIN` "auto"
@@ -538,6 +547,9 @@ impl Av2Encoder {
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
             cfl: self.tune.cfl && self.base_q_idx != 0,
+            // MHCCP only makes sense with chroma and lossy coding; gated further
+            // per-block by is_mhccp_allowed (not 4x4, block <= 64x64).
+            mhccp: self.tune.mhccp && self.base_q_idx != 0 && layout.has_chroma(),
             // Adaptive quantization: on for lossy frames when tuned on. res_log2=2
             // (qindex step 4) keeps |signaled| <= 6 covering a +/-24 qindex span.
             aq: self.tune.aq && self.base_q_idx != 0,

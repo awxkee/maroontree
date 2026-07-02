@@ -179,6 +179,20 @@ pub(crate) struct RangeEncoder {
     pub(crate) cfl_mag_v: u8,
     pub(crate) cfl_ctx_u: usize,
     pub(crate) cfl_ctx_v: usize,
+    /// MHCCP block state.
+    pub(crate) mhccp: bool,
+    /// Chroma subsampling of the current stream, for the per-block
+    pub(crate) mhccp_ssx: bool,
+    /// Current coded block dimensions in 4-sample units
+    pub(crate) cur_bw4: usize,
+    pub(crate) cur_bh4: usize,
+    pub(crate) mhccp_ssy: bool,
+    /// Per-block: does this block satisfy avm `is_mhccp_allowed` (block size in
+    /// [8x8, 64x64], not 4x4, within max UV tx)?
+    pub(crate) mhccp_allowed: bool,
+    pub(crate) mhccp_use: bool,
+    pub(crate) mhccp_dir: u8,
+    pub(crate) mhccp_size_group: u8,
     /// Chroma intra prediction mode for the current block, in the internal
     /// numbering used by the luma dispatch: 0 = DC (default), 1 = SMOOTH,
     /// 2 = SMOOTH_V, 3 = SMOOTH_H, 4 = PAETH.
@@ -218,6 +232,15 @@ impl RangeEncoder {
             cfl_mag_v: 0,
             cfl_ctx_u: 0,
             cfl_ctx_v: 0,
+            mhccp: false,
+            mhccp_ssx: false,
+            mhccp_ssy: false,
+            cur_bw4: 16,
+            cur_bh4: 16,
+            mhccp_allowed: false,
+            mhccp_use: false,
+            mhccp_dir: 0,
+            mhccp_size_group: 0,
             uv_mode: 0,
             cdf_state: None,
         }
@@ -376,13 +399,20 @@ impl RangeEncoder {
     ) {
         let range = *range_ref;
         let scaled_range = range >> 8;
-        let min_prob = &MIN_PROB[nsyms_mt - 1];
         // Detect whether the original table already carried a trailing-0 sentinel
         // (cdf_state::expand uses the same rule). If so this is an nsyms_mt-symbol
         // no-escape alphabet (nsyms_avm = nsyms_mt); otherwise the escape adds the
         // implicit sentinel (nsyms_avm = nsyms_mt + 1).
         let has_sentinel = cdf[nsyms_mt - 1] == 0;
         let nsyms_avm = if has_sentinel { nsyms_mt } else { nsyms_mt + 1 };
+        // AVM's probability scaling (`od_ec_prob_scale`) selects the increment row
+        // by the *coded alphabet size* `nsym` (= nsyms_avm), via
+        // `av2_prob_inc_tbl[nsym - 2]`. The MIN_PROB table mirrors that table, so it
+        // must also be indexed by `nsyms_avm - 2`, NOT `nsyms_mt - 1`. These agree
+        // for bools and escape-coded alphabets but differ for no-escape multi-symbol
+        // alphabets (e.g. the 3-ary MHCCP `mh_dir`, which carries a trailing-0
+        // sentinel so nsyms_avm = nsyms_mt = 3 -> row 1, not row 2).
+        let min_prob = &MIN_PROB[nsyms_avm - 2];
         // Encode against [icdf_0 .. sentinel]; boundary(k) needs index up to nsyms_mt
         // (the sentinel) for the escape symbol of an escape-coded table.
         let icdf = &cdf[..=nsyms_mt];
@@ -625,7 +655,7 @@ impl RangeEncoder {
             self.sym_static(&LUMA32_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
         }
     }
-    // ---- chroma -----------------------------------------------------------
+
     pub(crate) fn sym_chr_hf(&mut self, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.chr_hf[ctx];
@@ -643,6 +673,7 @@ impl RangeEncoder {
             self.sym_static(&CHROMA_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
         }
     }
+
     pub(crate) fn sym_chr_lf(&mut self, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.chr_lf[ctx];
@@ -1329,6 +1360,41 @@ impl RangeEncoder {
             );
         } else {
             self.encode_bool(static_cdf, bit);
+        }
+    }
+    pub(crate) fn bool_cfl_mhccp(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cfl_mhccp;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+    /// mh_dir (MHCCP filter direction), 3-ary symbol. `ctx` is the
+    /// size_group_lookup context (0..4). Static fallback uses the default CDF.
+    pub(crate) fn sym_mh_dir(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.filter_dir[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                3,
+            );
+        } else {
+            use crate::av2::cfl::FILTER_DIR_CDF;
+            self.sym_static(&FILTER_DIR_CDF[ctx], s, 3);
         }
     }
     pub(crate) fn bool_cfl_index(&mut self, static_cdf: u32, bit: u32) {

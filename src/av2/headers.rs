@@ -53,6 +53,9 @@ pub(crate) struct Config {
     pub(crate) bit_depth: u8,
     pub(crate) lossless: bool,
     pub(crate) cfl: bool,
+    /// Enable MHCCP (multi-hypothesis cross-component prediction), avm
+    /// `enable_mhccp` sequence-header flag. Requires chroma.
+    pub(crate) mhccp: bool,
     pub(crate) updating_cdf: bool,
     pub(crate) aq: bool,
     pub(crate) aq_res_log2: u8,
@@ -128,8 +131,8 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     if has_chroma {
         b.write_bits(0, 2); // cfl downsample filter index
     }
-    b.write_bit(0);
-    b.write_bit(0); // mhccp, ibp
+    b.write_bit(config.mhccp as u32); // enable_mhccp
+    b.write_bit(0); // enable_ibp
     b.write_bit(0);
     b.write_bit(1); // reference config
     b.write_uniform(0, 3);

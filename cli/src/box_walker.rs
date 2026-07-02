@@ -179,7 +179,7 @@ fn detect_container(bytes: &[u8]) -> ImageContainer {
                     return ImageContainer::Heic;
                 }
                 if brand_matches(chunk, AV1_MAJOR_BRANDS) {
-                    return ImageContainer::Avif;
+                    return walk_boxes(bytes, 0);
                 }
             }
             // VVC has no dedicated major/compatible brand of its own: VVC stills

@@ -313,11 +313,7 @@ pub(super) fn predict_luma_leaf32(
     let xr = ((mi_cols - mi_col - 16) << 2) + 32 - lx;
     let right_available = (mi_col + col_off + 8) < mi_cols;
     let tr_ok = have_above && right_available && xr > 0;
-    let tr_px = if tr_ok {
-        (xr.min(32)).max(0) as usize
-    } else {
-        0
-    };
+    let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, 0, neutral,
     );

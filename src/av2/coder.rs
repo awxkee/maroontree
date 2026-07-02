@@ -44,15 +44,6 @@ fn floor_log2(x: u32) -> u32 {
 
 /// Luma low/high-frequency token context from already-coded neighbor levels.
 /// Returns `(base_context, hi_range_context)`.
-/// Padded levels-buffer stride/index. avm lays the coeff levels in a buffer whose
-/// row stride exceeds the coeff width and with top/bottom pad rows, so neighbor
-/// reads past the coeff region return 0. slimav stores frequency positions as
-/// rc = a*32 + c (a = horiz freq, c = vert freq). A flat rc index has no gap between
-/// columns, so a vertical-neighbor read at c=31 (rc+1 / rc+2) would wrap into the
-/// next column's low-frequency coeffs instead of zero. `plvl` remaps rc into a padded
-/// buffer (column stride 36 > 32+2) so c+1/c+2 at the c=31 boundary land in the gap
-/// (always zero), and a-direction neighbors past the region hit unwritten (zero)
-/// rows. This matches avm's get_padded_idx zero-padding for all tx sizes.
 const PLVL_STRIDE: i32 = 36;
 const PLVL_BUF: usize = (PLVL_STRIDE as usize) * 40;
 #[inline]
@@ -864,6 +855,24 @@ pub(crate) fn encode_intra_modes_dir(
     if let Some(cdf) = partition_cdf {
         enc.bool_do_split(cdf, 0);
     }
+    // MHCCP: the decoder reads the cfl_mhccp_switch on every CfL block where its
+    // own is_mhccp_allowed() is true, so the encoder must mirror that exactly
+    // (emitting switch=0 when we are not doing MHCCP). The switch/mh_dir CDF
+    // context uses the actual coded block size via bw4/bh4. The whole-64 CfL fast
+    // path only produced a valid MHCCP predictor for genuine 64x64 luma blocks;
+    // for any other allowed size we still emit the (switch=0) symbol.
+    if enc.mhccp {
+        let allowed = crate::av2::cfl::is_mhccp_allowed(bw4, bh4, enc.mhccp_ssx, enc.mhccp_ssy);
+        enc.mhccp_allowed = allowed;
+        if allowed {
+            enc.mhccp_size_group = crate::av2::cfl::mhccp_size_group_wh4(bw4, bh4);
+            if !(bw4 == 16 && bh4 == 16) {
+                enc.mhccp_use = false; // predictor only valid for 64x64 fast path
+            }
+        } else {
+            enc.mhccp_use = false;
+        }
+    }
     maybe_emit_ccso(enc);
     maybe_emit_delta_q(enc);
     #[allow(clippy::needless_late_init)]
@@ -918,7 +927,23 @@ pub(crate) fn encode_intra_modes_dir(
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
                 enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
-                enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                // avm: when MHCCP is enabled at seq level, emit the switch first.
+                if enc.mhccp && enc.mhccp_allowed {
+                    enc.bool_cfl_mhccp(
+                        crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
+                        enc.mhccp_use as u32,
+                    );
+                    if !enc.mhccp_use {
+                        enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                    }
+                } else {
+                    enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                }
+                if enc.mhccp && enc.mhccp_allowed && enc.mhccp_use {
+                    // MHCCP (CFL_MULTI_PARAM): emit filter direction, no alpha.
+                    enc.sym_mh_dir(enc.mhccp_size_group as usize, enc.mhccp_dir as usize);
+                    return midx;
+                }
                 enc.sym_cfl_sign(enc.cfl_js as usize);
                 let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
                 let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
@@ -955,6 +980,30 @@ fn encode_intra_modes(
     // do_split bool (=0, PARTITION_NONE) with the leaf's per-bsize/context cdf.
     // None for non-partition-point leaves (4x4 / narrow ext blocks), which read
     // no partition bit at all.
+    // The decoder reads the cfl_mhccp_switch on every CfL block where its own
+    // is_mhccp_allowed() is true, regardless of which encoder leaf emitted the
+    // block, so the switch MUST be emitted (=0 if not doing MHCCP) whenever the
+    // block size is MHCCP-allowed. Block dims come from enc.cur_bw4/cur_bh4.
+    // If the caller already selected MHCCP for this block (enc.mhccp_use == true,
+    // set just before this call), preserve its dir/size_group; otherwise this is
+    // a non-MHCCP leaf and we emit switch=0.
+    if enc.mhccp {
+        enc.mhccp_allowed = crate::av2::cfl::is_mhccp_allowed(
+            enc.cur_bw4,
+            enc.cur_bh4,
+            enc.mhccp_ssx,
+            enc.mhccp_ssy,
+        );
+        if enc.mhccp_allowed && !enc.mhccp_use {
+            enc.mhccp_size_group = crate::av2::cfl::mhccp_size_group_wh4(enc.cur_bw4, enc.cur_bh4);
+        }
+        if !enc.mhccp_allowed {
+            enc.mhccp_use = false;
+        }
+    } else {
+        enc.mhccp_allowed = false;
+        enc.mhccp_use = false;
+    }
     if let Some(cdf) = partition_cdf {
         enc.bool_do_split(cdf, 0);
     }
@@ -983,7 +1032,21 @@ fn encode_intra_modes(
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
                 enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
-                enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                if enc.mhccp && enc.mhccp_allowed {
+                    enc.bool_cfl_mhccp(
+                        crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
+                        enc.mhccp_use as u32,
+                    );
+                    if !enc.mhccp_use {
+                        enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                    }
+                } else {
+                    enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                }
+                if enc.mhccp && enc.mhccp_allowed && enc.mhccp_use {
+                    enc.sym_mh_dir(enc.mhccp_size_group as usize, enc.mhccp_dir as usize);
+                    return;
+                }
                 enc.sym_cfl_sign(enc.cfl_js as usize);
                 let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
                 let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
@@ -1353,6 +1416,8 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     do_part_cdf: u32,
     tx_type_idx: usize,
 ) -> u32 {
+    enc.cur_bw4 = 4;
+    enc.cur_bh4 = 4;
     // intra_ext_tx_cdf[eset=1][TX_16X16] = AVM_CDF7(13759,26108,27688,29793,30265,
     // 31576); icdf = 32768 - cumulative. reduced_tx_set=0, FSC/IST off (headers).
     // `tx_type_idx` indexes the EXT_NEW_TX_SET (av2_md_idx2type[size_class=2][mode]):
@@ -1482,6 +1547,8 @@ pub(crate) fn encode_luma_leaf_8x8(
     do_part_cdf: u32,
     tx_type_cdf: Option<(&'static [u16], usize, usize)>, // (cdf, idx, nsym)
 ) -> u32 {
+    enc.cur_bw4 = 2;
+    enc.cur_bh4 = 2;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single TX_8X8
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
@@ -1495,7 +1562,7 @@ pub(crate) fn encode_luma_leaf_8x8(
     if eob >= 1
         && let Some((cdf, idx, nsym)) = tx_type_cdf
     {
-        enc.encode_symbol(cdf, idx, nsym); // tx-type: static (non-adaptive)
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1519,6 +1586,8 @@ pub(crate) fn encode_luma_leaf_rect128(
     scan: &'static [u16],
     tx_type_cdf: Option<(&'static [u16], usize, usize)>,
 ) -> u32 {
+    enc.cur_bw4 = 32;
+    enc.cur_bh4 = 32;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single rect TX
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
@@ -1532,7 +1601,7 @@ pub(crate) fn encode_luma_leaf_rect128(
     if eob >= 1
         && let Some((cdf, idx, nsym)) = tx_type_cdf
     {
-        enc.encode_symbol(cdf, idx, nsym); // tx-type: static (non-adaptive)
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1679,6 +1748,8 @@ pub(crate) fn encode_luma_block_split(
     has_chroma: bool,
     part_cdf: u32,
 ) -> [u32; 4] {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 16;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(TX_SPLIT_64 as u32, 1); // tx_split = 1
     enc.sym_tx_part_64(0, 6); // tx_part symbol 0 = SPLIT
@@ -1742,6 +1813,8 @@ pub(crate) fn encode_luma_block_vert4(
     has_chroma: bool,
     part_cdf: u32,
 ) -> [u32; 4] {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 16;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(TX_SPLIT_64 as u32, 1); // do_partition = 1
     enc.sym_tx_part_64(4, 6); // type symbol 4 = VERT4
@@ -1809,6 +1882,8 @@ pub(crate) fn encode_luma_leaf_64x32(
     has_chroma: bool,
     part_cdf: u32,
 ) -> [u32; 2] {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(TX_DO_PART_64X32, 1); // do_partition = 1
     enc.sym_tx_part_64x32(2, 6); // type = VERT-1 = 2
@@ -1835,6 +1910,8 @@ pub(crate) fn encode_luma_leaf_32x64(
     has_chroma: bool,
     part_cdf: u32,
 ) -> [u32; 2] {
+    enc.cur_bw4 = 8;
+    enc.cur_bh4 = 16;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(TX_DO_PART_64X32, 1); // do_partition = 1 (group 6 cdf == 16816)
     enc.sym_tx_part_32x64(1, 6); // type = HORZ-1 = 1
@@ -1870,6 +1947,8 @@ pub(crate) fn encode_luma_leaf_dc_class2(
     part_cdf: u32,
     do_part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 32;
+    enc.cur_bh4 = 32;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE → single transform
     if dc_level == 0 {
@@ -1907,6 +1986,8 @@ pub(crate) fn encode_luma_leaf_16x64(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 4;
+    enc.cur_bh4 = 16;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx do_partition = NONE → single TX_16X64
     encode_luma_tu_rect(
@@ -1933,6 +2014,8 @@ pub(crate) fn encode_luma_leaf_64x16(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 4;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx do_partition = NONE → single TX_64X16
     encode_luma_tu_rect(
@@ -2019,6 +2102,8 @@ pub(crate) fn encode_luma_leaf_16x32(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 4;
+    enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(19451, 0); // tx_split (szctx 4) = NONE → single TX_16X32
     encode_luma_tu_rect_long32(
@@ -2046,6 +2131,8 @@ pub(crate) fn encode_luma_leaf_32x16(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 8;
+    enc.cur_bh4 = 4;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(19451, 0); // tx_split (szctx 4) = NONE → single TX_32X16
     encode_luma_tu_rect_long32(
@@ -2075,6 +2162,8 @@ pub(crate) fn encode_luma_leaf_8x32(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 2;
+    enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx_split (szctx 8) = NONE → single TX_8X32
     encode_luma_tu_rect_long32(
@@ -2102,6 +2191,8 @@ pub(crate) fn encode_luma_leaf_32x8(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 8;
+    enc.cur_bh4 = 2;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx_split (szctx 8) = NONE → single TX_32X8
     encode_luma_tu_rect_long32(
@@ -2128,6 +2219,8 @@ pub(crate) fn encode_luma_leaf_32x32(
     has_chroma: bool,
     part_cdf: u32,
 ) -> u32 {
+    enc.cur_bw4 = 8;
+    enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(TX_DO_PART_32X32, 0); // do_partition = 0 → single TX_32X32
     encode_luma_tu32(enc, tu, skip_cdf, dc_sign_ctx)
