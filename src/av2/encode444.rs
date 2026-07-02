@@ -727,6 +727,99 @@ impl Av2Encoder {
                     } else {
                         enc.cfl_use = false;
                     }
+                    // Chroma intra mode search MUST run before the luma-block encode
+                    // below, because that encode emits the uv_mode symbol. Decide the
+                    // winning predictor now (when not CfL), set enc.uv_mode, and reuse
+                    // the predictor when coding the chroma residual further down.
+                    let uv444_pred: Option<(Vec<f32>, Vec<f32>)> =
+                        if cfl_choice.is_none() && self.tune.chroma_mode_search {
+                            let cand_modes: &[usize] = if self.speed.reduced_modes() {
+                                &[0, 1, 4, 5, 6]
+                            } else if self.speed.chroma_angle_directional() {
+                                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                            } else {
+                                &[0, 1, 2, 3, 4, 5, 6]
+                            };
+                            let mode_lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                            let dcu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
+                            let dcv = dc_pred(&recv, pw, sb_y, sb_x, 64, neutral);
+                            let mut best_mode = 0usize;
+                            let mut best_cost = f64::INFINITY;
+                            let mut best_pred: Option<(Vec<f32>, Vec<f32>)> = None;
+                            for &m in cand_modes {
+                                let (pu, pv): (Vec<f32>, Vec<f32>) = if m == 0 {
+                                    (vec![dcu; 64 * 64], vec![dcv; 64 * 64])
+                                } else {
+                                    (
+                                        chroma422::predict_chroma444_whole64(
+                                            &recu, pw, sb_y, sb_x, m, neutral, width, height,
+                                        ),
+                                        chroma422::predict_chroma444_whole64(
+                                            &recv, pw, sb_y, sb_x, m, neutral, width, height,
+                                        ),
+                                    )
+                                };
+                                let pu_i: Vec<i32> =
+                                    pu.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                                let pv_i: Vec<i32> =
+                                    pv.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                                let mut ru = vec![0f32; 64 * 64];
+                                let mut rv = vec![0f32; 64 * 64];
+                                for r in 0..64 {
+                                    let b = (sb_y + r) * pw + sb_x;
+                                    for c in 0..64 {
+                                        ru[r * 64 + c] = up[b + c] - pu[r * 64 + c];
+                                        rv[r * 64 + c] = vp[b + c] - pv[r * 64 + c];
+                                    }
+                                }
+                                let lu = bases
+                                    .chroma444
+                                    .project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
+                                let lv = bases
+                                    .chroma444
+                                    .project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
+                                let recu_b = itx422::reconstruct_chroma_cfl(
+                                    &pu_i,
+                                    &lu,
+                                    sb_qstep,
+                                    &tables::SCAN,
+                                    64,
+                                    64,
+                                    self.bit_depth as i32,
+                                );
+                                let recv_b = itx422::reconstruct_chroma_cfl(
+                                    &pv_i,
+                                    &lv,
+                                    sb_qstep,
+                                    &tables::SCAN,
+                                    64,
+                                    64,
+                                    self.bit_depth as i32,
+                                );
+                                let mut sse = 0f64;
+                                for r in 0..64 {
+                                    let b = (sb_y + r) * pw + sb_x;
+                                    for c in 0..64 {
+                                        let du = up[b + c] - recu_b[r * 64 + c];
+                                        let dv = vp[b + c] - recv_b[r * 64 + c];
+                                        sse += (du * du + dv * dv) as f64;
+                                    }
+                                }
+                                let rate: f64 =
+                                    lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+                                let mode_bits = if m == 0 { 0.0 } else { 2.0 };
+                                let cost = sse + mode_lambda * (rate + mode_bits);
+                                if cost < best_cost {
+                                    best_cost = cost;
+                                    best_mode = m;
+                                    best_pred = if m == 0 { None } else { Some((pu, pv)) };
+                                }
+                            }
+                            enc.uv_mode = best_mode;
+                            best_pred
+                        } else {
+                            None
+                        };
                     enc.delta_q_pending = enc.delta_q_present;
                     match best {
                         Part::Vert4 => {
@@ -850,7 +943,62 @@ impl Av2Encoder {
                             ),
                         );
                         (levu, levv)
+                    } else if let Some((pu, pv)) = uv444_pred.as_ref() {
+                        // Non-DC chroma intra mode chosen above (enc.uv_mode already
+                        // set and emitted by the luma-block encode). Code the residual
+                        // against the per-pixel predictor, reconstruct with it as base.
+                        let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                        let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+                        let mut ru = vec![0f32; 64 * 64];
+                        let mut rv = vec![0f32; 64 * 64];
+                        for r in 0..64 {
+                            let b = (sb_y + r) * pw + sb_x;
+                            for c in 0..64 {
+                                ru[r * 64 + c] = up[b + c] - pu[r * 64 + c];
+                                rv[r * 64 + c] = vp[b + c] - pv[r * 64 + c];
+                            }
+                        }
+                        let levu = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&ru, sb_resid_scale), 0.0);
+                        let levv = bases
+                            .chroma444
+                            .project(&aq::scale_resid(&rv, sb_resid_scale), 0.0);
+                        put_block(
+                            &mut recu,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            64,
+                            &itx422::reconstruct_chroma_cfl(
+                                &pu_i,
+                                &levu,
+                                sb_qstep,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        put_block(
+                            &mut recv,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            64,
+                            &itx422::reconstruct_chroma_cfl(
+                                &pv_i,
+                                &levv,
+                                sb_qstep,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            ),
+                        );
+                        (levu, levv)
                     } else {
+                        // DC (either search disabled, or DC won the search above).
                         let predu = dc_pred(&recu, pw, sb_y, sb_x, 64, neutral);
                         let levu = bases.chroma444.project(
                             &aq::scale_resid(

@@ -964,9 +964,18 @@ pub(crate) fn encode_intra_modes_dir(
         // [luma_mode, DC, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH, ...] so non-CfL chroma
         // modes sit at index (uv_ctx + internal_mode): DC=uv_ctx, SMOOTH=uv_ctx+1, ...
         let uv_idx = uv_ctx + enc.uv_mode;
-        enc.sym_uv_mode(uv_ctx, uv_idx, 7);
+        emit_uv_mode_idx(enc, uv_ctx, uv_idx);
     }
     midx
+}
+
+fn emit_uv_mode_idx(enc: &mut RangeEncoder, uv_ctx: usize, uv_idx: usize) {
+    if uv_idx < 7 {
+        enc.sym_uv_mode(uv_ctx, uv_idx, 7);
+    } else {
+        enc.sym_uv_mode(uv_ctx, 7, 7);
+        enc.encode_bypass((uv_idx - 7) as u32, 3);
+    }
 }
 
 fn encode_intra_modes(
@@ -1065,7 +1074,7 @@ fn encode_intra_modes(
         // and ctx = 0. The internal mode numbering (0=DC,1=SMOOTH,2=SMOOTH_V,
         // 3=SMOOTH_H,4=PAETH) maps directly onto that list index.
         let uv_idx = enc.uv_mode;
-        enc.sym_uv_mode(0, uv_idx, 7);
+        emit_uv_mode_idx(enc, 0, uv_idx);
     }
 }
 
@@ -1559,10 +1568,10 @@ pub(crate) fn encode_luma_leaf_8x8(
     enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
-    if eob >= 1
-        && let Some((cdf, idx, nsym)) = tx_type_cdf
-    {
-        enc.encode_symbol(cdf, idx, nsym);
+    if eob >= 1 {
+        if let Some((cdf, idx, nsym)) = tx_type_cdf {
+            enc.encode_symbol(cdf, idx, nsym);
+        }
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1598,10 +1607,10 @@ pub(crate) fn encode_luma_leaf_rect128(
     enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob128Luma, EOB_HI_BIT_QC[enc.qc], 0, 7);
-    if eob >= 1
-        && let Some((cdf, idx, nsym)) = tx_type_cdf
-    {
-        enc.encode_symbol(cdf, idx, nsym);
+    if eob >= 1 {
+        if let Some((cdf, idx, nsym)) = tx_type_cdf {
+            enc.encode_symbol(cdf, idx, nsym);
+        }
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);

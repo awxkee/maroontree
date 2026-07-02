@@ -145,7 +145,181 @@ pub(super) fn mhccp_decide_leaf(
     choice
 }
 
-/// Shape-constant transform parameters for one chroma TU geometry; identical for every
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chroma_mode_decide_leaf(
+    enc: &mut RangeEncoder,
+    recu: &[f32],
+    recv: &[f32],
+    up: &[f32],
+    vp: &[f32],
+    pcw: usize,
+    cy: usize,
+    cx: usize,
+    bs: usize,
+    neutral: f32,
+    basis: &Basis,
+    scan: &[u16],
+    qc: usize,
+    qstep: i32,
+    sb_qstep: i32,
+    resid_scale: f32,
+    rdoq_lambda: f64,
+    lambda: f64,
+    cw_px: usize,
+    ch_px: usize,
+    reduced: bool,
+    angle_dir: bool,
+    bd: i32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    // Candidate set. DC + SMOOTH family + PAETH is the base. V/H (nominal
+    // directional) are searched in every speed tier. The diagonal directionals
+    // (D45..D203) are searched only when `angle_dir` (Medium speed and above).
+    // Fast (`reduced`) keeps the cheapest non-directional subset plus V/H.
+    let cand_modes: &[usize] = match (reduced, angle_dir) {
+        (true, _) => &[0, 1, 4, 5, 6],
+        (false, false) => &[0, 1, 2, 3, 4, 5, 6],
+        (false, true) => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    };
+    let dcu = dc_pred_rect(recu, pcw, cy, cx, bs, bs, neutral, bd);
+    let dcv = dc_pred_rect(recv, pcw, cy, cx, bs, bs, neutral, bd);
+    let cscale = basis.qstep as f32 / qstep as f32;
+    let mut best_mode = 0usize;
+    let mut best_cost = f64::INFINITY;
+    let mut best_pred: Option<(Vec<f32>, Vec<f32>)> = None;
+    for &m in cand_modes {
+        let (pu, pv): (Vec<f32>, Vec<f32>) = if m == 0 {
+            (vec![dcu; bs * bs], vec![dcv; bs * bs])
+        } else {
+            (
+                predict_chroma_sq(recu, pcw, cy, cx, bs, m, neutral, cw_px, ch_px),
+                predict_chroma_sq(recv, pcw, cy, cx, bs, m, neutral, cw_px, ch_px),
+            )
+        };
+        let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+        let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+        let mut ru = vec![0f32; bs * bs];
+        let mut rv = vec![0f32; bs * bs];
+        for r in 0..bs {
+            let b = (cy + r) * pcw + cx;
+            for c in 0..bs {
+                ru[r * bs + c] = up[b + c] - pu[r * bs + c];
+                rv[r * bs + c] = vp[b + c] - pv[r * bs + c];
+            }
+        }
+        let lu = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&ru, cscale * resid_scale),
+            scan,
+            qc,
+            bs * bs,
+            0,
+            rdoq_lambda,
+        );
+        let lv = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&rv, cscale * resid_scale),
+            scan,
+            qc,
+            bs * bs,
+            4,
+            rdoq_lambda,
+        );
+        let recu_b = itx422::reconstruct_chroma_cfl(&pu_i, &lu, sb_qstep, scan, bs, bs, bd);
+        let recv_b = itx422::reconstruct_chroma_cfl(&pv_i, &lv, sb_qstep, scan, bs, bs, bd);
+        let mut sse = 0f64;
+        for r in 0..bs {
+            let b = (cy + r) * pcw + cx;
+            for c in 0..bs {
+                let du = up[b + c] - recu_b[r * bs + c];
+                let dv = vp[b + c] - recv_b[r * bs + c];
+                sse += (du * du + dv * dv) as f64;
+            }
+        }
+        let rate: f64 = lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+        let mode_bits = if m == 0 { 0.0 } else { 2.0 };
+        let cost = sse + lambda * (rate + mode_bits);
+        if cost < best_cost {
+            best_cost = cost;
+            best_mode = m;
+            best_pred = if m == 0 { None } else { Some((pu, pv)) };
+        }
+    }
+    enc.uv_mode = best_mode;
+    best_pred
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_chroma_sq(
+    rec: &[f32],
+    pcw: usize,
+    cy: usize,
+    cx: usize,
+    bs: usize,
+    m: usize,
+    neutral: f32,
+    cw_px: usize,
+    ch_px: usize,
+) -> Vec<f32> {
+    let have_above = cy > 0;
+    let have_left = cx > 0;
+    // Chroma mi grid (4 chroma px per mi). SB-aligned plane bounds.
+    let mi_col_end = (((cw_px + 31) & !31) >> 2) as i64;
+    let mi_row_end = (((ch_px + 31) & !31) >> 2) as i64;
+    let mi_col = (cx >> 2) as i64;
+    let mi_row = (cy >> 2) as i64;
+    let bs_mi = (bs >> 2) as i64;
+    // px to the right / below this block within the SB-aligned plane.
+    let xr = ((mi_col_end - mi_col - bs_mi) << 2) + bs as i64;
+    let right_available = (mi_col + bs_mi) < mi_col_end;
+    let _ = mi_row_end;
+    let _ = mi_row;
+    let tr_px = if have_above && right_available && xr > 0 {
+        xr.min(bs as i64).max(0) as usize
+    } else {
+        0
+    };
+    let bl_px = 0usize;
+    let (ab, lf, corner) = intrapred::build_refs(
+        rec, pcw, cy, cx, bs, have_above, have_left, tr_px, bl_px, neutral,
+    );
+    match m {
+        1 => intrapred::smooth(bs, &ab, &lf),
+        2 => intrapred::smooth_v(bs, &ab, &lf),
+        3 => intrapred::smooth_h(bs, &ab, &lf),
+        4 => intrapred::paeth(bs, &ab, &lf, corner),
+        // Directional (nominal angle; UV angle_delta is 0 when the co-located luma
+        // mode is non-directional, which is the case for these leaves). The mode
+        // order after PAETH follows AVM's `default_mode_list_uv`:
+        // 5=V, 6=H, 7=D45, 8=D135, 9=D67, 10=D113, 11=D157, 12=D203.
+        _ => {
+            use crate::av2::directional::Dir;
+            let dir = match m {
+                5 => Dir::V,
+                6 => Dir::H,
+                7 => Dir::D45,
+                8 => Dir::D135,
+                9 => Dir::D67,
+                10 => Dir::D113,
+                11 => Dir::D157,
+                _ => Dir::D203,
+            };
+            directional::directional(
+                dir,
+                0,
+                bs,
+                &ab,
+                &lf,
+                corner,
+                false,
+                have_above,
+                have_left,
+                false,
+                bs as i32 + tr_px as i32,
+                bs as i32 + bl_px as i32,
+            )
+        }
+    }
+}
 /// TU of a given leaf shape, so it can be built once per match arm instead of spelled
 /// out as eight positional args at every call.
 pub(super) struct ChromaTxSpec<'a> {
@@ -179,6 +353,7 @@ pub(super) fn code_422_chroma_tu(
     nb: ChromaNeighbors,
     bd: i32,
     cfl: Option<&cfl::CflChoice>,
+    uvmode_pred: Option<(&[f32], &[f32])>,
 ) -> (bool, bool) {
     let ChromaPlanes {
         rec_u: recu,
@@ -270,6 +445,58 @@ pub(super) fn code_422_chroma_tu(
             cw,
             ch,
             &itx422::reconstruct_chroma_cfl(&cflc.pred_v, &levv, qstep, scan, cw, ch, bd),
+        );
+        (levu, levv)
+    } else if let Some((pu, pv)) = uvmode_pred {
+        // Chroma intra mode (SMOOTH family / PAETH): per-pixel predictor decided
+        // before the luma emit (see chroma_mode_decide_leaf); reconstruct with that
+        // base, exactly like the CfL per-pixel path.
+        let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+        let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5).floor() as i32).collect();
+        let mut ru = vec![0f32; cw * ch];
+        let mut rv = vec![0f32; cw * ch];
+        for r in 0..ch {
+            let b = (cy + r) * pcw + cx;
+            for c in 0..cw {
+                ru[r * cw + c] = up[b + c] - pu[r * cw + c];
+                rv[r * cw + c] = vp[b + c] - pv[r * cw + c];
+            }
+        }
+        let levu = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&ru, cscale),
+            scan,
+            qc,
+            cw * ch,
+            0,
+            rdoq_lambda,
+        );
+        let levv = project_chroma_rdoq(
+            basis,
+            &aq::scale_resid(&rv, cscale),
+            scan,
+            qc,
+            cw * ch,
+            4,
+            rdoq_lambda,
+        );
+        put_block_rect(
+            recu,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &itx422::reconstruct_chroma_cfl(&pu_i, &levu, qstep, scan, cw, ch, bd),
+        );
+        put_block_rect(
+            recv,
+            pcw,
+            cy,
+            cx,
+            cw,
+            ch,
+            &itx422::reconstruct_chroma_cfl(&pv_i, &levv, qstep, scan, cw, ch, bd),
         );
         (levu, levv)
     } else {
@@ -376,5 +603,71 @@ pub(super) fn predict_chroma_mode_dims(
         2 => intrapred::smooth_v(bs, &ab, &lf),
         3 => intrapred::smooth_h(bs, &ab, &lf),
         _ => intrapred::paeth(bs, &ab, &lf, corner),
+    }
+}
+
+pub(super) fn predict_chroma444_whole64(
+    rec: &[f32],
+    pw: usize,
+    sb_y: usize,
+    sb_x: usize,
+    m: usize,
+    neutral: f32,
+    cw_px: usize,
+    ch_px: usize,
+) -> Vec<f32> {
+    let have_above = sb_y > 0;
+    let have_left = sb_x > 0;
+    // Luma-grid mi units (4 px each). The block is one 64x64 SB = 16 mi.
+    let mi_col_end = (((cw_px + 63) & !63) >> 2) as i64;
+    let mi_row_end = (((ch_px + 63) & !63) >> 2) as i64;
+    let mi_col = (sb_x >> 2) as i64;
+    let mi_row = (sb_y >> 2) as i64;
+    // px available to the right of / below this 64-px block within the SB-aligned
+    // plane, mirroring `predict_luma`'s xr/yd for a block at TX offset 0.
+    let xr = ((mi_col_end - mi_col - 16) << 2) + 64;
+    let yd = ((mi_row_end - mi_row - 16) << 2) + 64;
+    let right_available = (mi_col + 16) < mi_col_end;
+    // The bottom-left SB is later in raster order (not yet reconstructed), so the
+    // whole-SB block never has a real bottom-left; the reference extends left[bs-1].
+    let tr_ok = have_above && right_available && xr > 0;
+    let tr_px = if tr_ok { xr.min(64).max(0) as usize } else { 0 };
+    let _ = yd;
+    let bl_px = 0usize;
+    let (ab, lf, corner) = intrapred::build_refs(
+        rec, pw, sb_y, sb_x, 64, have_above, have_left, tr_px, bl_px, neutral,
+    );
+    match m {
+        1 => intrapred::smooth(64, &ab, &lf),
+        2 => intrapred::smooth_v(64, &ab, &lf),
+        3 => intrapred::smooth_h(64, &ab, &lf),
+        4 => intrapred::paeth(64, &ab, &lf, corner),
+        _ => {
+            use crate::av2::directional::Dir;
+            let dir = match m {
+                5 => Dir::V,
+                6 => Dir::H,
+                7 => Dir::D45,
+                8 => Dir::D135,
+                9 => Dir::D67,
+                10 => Dir::D113,
+                11 => Dir::D157,
+                _ => Dir::D203,
+            };
+            directional::directional(
+                dir,
+                0,
+                64,
+                &ab,
+                &lf,
+                corner,
+                false,
+                have_above,
+                have_left,
+                false,
+                64 + tr_px as i32,
+                64 + bl_px as i32,
+            )
+        }
     }
 }

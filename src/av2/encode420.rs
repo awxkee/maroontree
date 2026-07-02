@@ -276,6 +276,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 cfl_choice.as_ref(),
+                                None,
                             )
                         }
                         (16, 8) => {
@@ -356,6 +357,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 16) => {
@@ -448,6 +450,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 8) => {
@@ -538,6 +541,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 16) => {
@@ -640,6 +644,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (16, 4) => {
@@ -742,6 +747,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (2, 8) => {
@@ -844,6 +850,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 2) => {
@@ -945,6 +952,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 8) => {
@@ -1048,6 +1056,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 4) => {
@@ -1150,6 +1159,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 4) => {
@@ -1321,6 +1331,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (2, 2) => {
@@ -1546,6 +1557,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 2) => {
@@ -1623,6 +1635,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
+                                None,
                                 None,
                             )
                         }

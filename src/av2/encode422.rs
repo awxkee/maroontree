@@ -520,6 +520,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 cfl_choice.as_ref(),
+                                None,
                             )
                         }
                         (16, 8) => {
@@ -569,6 +570,35 @@ impl Av2Encoder {
                                 leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
                                 self.bit_depth as i32,
                             );
+                            let uv_pred = if mh_choice.is_none() && self.tune.chroma_mode_search {
+                                chroma422::chroma_mode_decide_leaf(
+                                    &mut enc,
+                                    &recu,
+                                    &recv,
+                                    &up,
+                                    &vp,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    32,
+                                    neutral,
+                                    &bases.chroma420,
+                                    &tables::SCAN,
+                                    qc,
+                                    qstep_i,
+                                    qstep_i,
+                                    1.0,
+                                    self.tune.chroma_rdoq_lambda,
+                                    leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                    width / 2,
+                                    height,
+                                    self.speed.reduced_modes(),
+                                    self.speed.chroma_angle_directional(),
+                                    self.bit_depth as i32,
+                                )
+                            } else {
+                                None
+                            };
                             encode_luma_leaf_64x32(
                                 &mut enc, &tus2, &skip2, &dcs2, mode_idx, true, pc,
                             );
@@ -602,6 +632,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                uv_pred.as_ref().map(|(u, v)| (u.as_slice(), v.as_slice())),
                             )
                         }
                         (8, 16) => {
@@ -666,6 +697,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
+                                None,
                                 None,
                             )
                         }
@@ -758,6 +790,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 16) => {
@@ -829,6 +862,7 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
+                                None,
                                 None,
                             )
                         }
@@ -928,6 +962,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (4, 4) => {
@@ -1104,6 +1139,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (2, 8) => {
@@ -1202,6 +1238,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 2) => {
@@ -1300,6 +1337,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (2, 2) => {
@@ -1400,6 +1438,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (2, 4) => {
@@ -1475,6 +1514,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 None,
+                                None,
                             )
                         }
                         (4, 2) => {
@@ -1508,6 +1548,35 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 2, true,
                             );
+                            let uv_pred = if self.tune.chroma_mode_search {
+                                chroma422::chroma_mode_decide_leaf(
+                                    &mut enc,
+                                    &recu,
+                                    &recv,
+                                    &up,
+                                    &vp,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    8,
+                                    neutral,
+                                    &bases.c8x8,
+                                    &tables::SCAN8X8,
+                                    qc,
+                                    qstep_i,
+                                    qstep_i,
+                                    1.0,
+                                    self.tune.chroma_rdoq_lambda,
+                                    leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                    width / 2,
+                                    height,
+                                    self.speed.reduced_modes(),
+                                    self.speed.chroma_angle_directional(),
+                                    self.bit_depth as i32,
+                                )
+                            } else {
+                                None
+                            };
                             crate::av2::coder::encode_luma_leaf_rect128(
                                 &mut enc,
                                 &tu,
@@ -1550,6 +1619,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 None,
+                                uv_pred.as_ref().map(|(u, v)| (u.as_slice(), v.as_slice())),
                             )
                         }
                         (4, 8) => {
@@ -1619,7 +1689,7 @@ impl Av2Encoder {
                                     cw: 8,
                                     ch: 32,
                                     basis: &bases.luma8x32,
-                                    scan: &tables::SCAN8X32,
+                                    scan: &SCAN8X32,
                                     eob_cdf: EobCdf::ChrEob256,
                                     eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
                                     area: 256,
@@ -1634,6 +1704,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                None,
                             )
                         }
                         (8, 4) => {
@@ -1687,6 +1758,35 @@ impl Av2Encoder {
                                 leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
                                 self.bit_depth as i32,
                             );
+                            let uv_pred = if mh_choice.is_none() && self.tune.chroma_mode_search {
+                                chroma422::chroma_mode_decide_leaf(
+                                    &mut enc,
+                                    &recu,
+                                    &recv,
+                                    &up,
+                                    &vp,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    16,
+                                    neutral,
+                                    &bases.luma16x16,
+                                    &tables::SCAN16,
+                                    qc,
+                                    qstep_i,
+                                    qstep_i,
+                                    1.0,
+                                    self.tune.chroma_rdoq_lambda,
+                                    leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                    width / 2,
+                                    height,
+                                    self.speed.reduced_modes(),
+                                    self.speed.chroma_angle_directional(),
+                                    self.bit_depth as i32,
+                                )
+                            } else {
+                                None
+                            };
                             encode_luma_leaf_32x16(&mut enc, &tu, skip, dcs, 0, true, pc);
                             code_422_chroma_tu(
                                 &mut enc,
@@ -1718,6 +1818,7 @@ impl Av2Encoder {
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
                                 mh_choice.as_ref(),
+                                uv_pred.as_ref().map(|(u, v)| (u.as_slice(), v.as_slice())),
                             )
                         }
                         other => unreachable!("unsupported native 4:2:2 leaf {:?}", other),

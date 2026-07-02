@@ -54,7 +54,6 @@
 //! let avif = encode_yuv8(&y, &cb, &cr, width, height, &cfg)?;
 //! // cb/cr must be ceil(w/2)×ceil(h/2) samples when cfg.chroma == Yuv420
 //! ```
-
 use crate::color::Cicp;
 use crate::encoder::{
     encode_lossy_gray_obu, encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422,
@@ -132,6 +131,13 @@ impl Speed {
     }
 
     pub(crate) fn try_chroma_directional(self) -> bool {
+        !matches!(self, Speed::Fast)
+    }
+
+    /// Whether the diagonal (angle) chroma directional modes (D45..D203) are
+    /// searched. Only Medium speed and above (i.e. not [`Speed::Fast`]); nominal
+    /// V/H are searched in every tier.
+    pub(crate) fn chroma_angle_directional(self) -> bool {
         !matches!(self, Speed::Fast)
     }
 }
