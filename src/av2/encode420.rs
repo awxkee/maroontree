@@ -1748,7 +1748,6 @@ impl Av2Encoder {
         let yp = pad_plane(yf, width, height, pw, ph);
         let up = pad_plane(cbf, width.div_ceil(2), height.div_ceil(2), pcw, pch);
         let vp = pad_plane(crf, width.div_ceil(2), height.div_ceil(2), pcw, pch);
-        let layout = Layout::I420;
         let mut recy = vec![0f32; pw * ph];
         let mut recu = vec![0f32; pcw * pch + 1];
         let mut recv = vec![0f32; pcw * pch + 1];
@@ -2325,11 +2324,10 @@ impl Av2Encoder {
                 let ul = if col > 0 { at(&u_has, 0, 1) } else { 0 };
                 let va = if row > 0 { at(&v_has, 1, 0) } else { 0 };
                 let vl = if col > 0 { at(&v_has, 0, 1) } else { 0 };
-                let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
-                encode_chroma_block(&mut enc, &ucoeffs, u_skip, true);
+                let u_skip = (6 + ua + ul) as u32;
+                encode_chroma_block_ex(&mut enc, &ucoeffs, u_skip, true, false);
                 let u_present = ucoeffs.iter().any(|&(_, l)| l != 0);
-                let v_skip =
-                    CHROMA_SKIP_V_QC[qc][(6 * (u_present as i32) + va + vl) as usize] as u32;
+                let v_skip = (6 * (u_present as i32) + va + vl) as u32;
                 encode_chroma_block(&mut enc, &vcoeffs, v_skip, false);
                 u_has[row * sb_cols + col] = u_present as i32;
                 v_has[row * sb_cols + col] = vcoeffs.iter().any(|&(_, l)| l != 0) as i32;

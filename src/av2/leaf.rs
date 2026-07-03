@@ -430,17 +430,25 @@ pub(super) fn predict_luma_leaf_tu(
     }
     let have_above = y0 > 0;
     let have_left = x0 > 0;
+    let sb_x0 = (x0 / 64) * 64;
+    let sb_y0 = (y0 / 64) * 64;
+    let is_right = (x0 - sb_x0) >= 32;
+    let is_bottom = (y0 - sb_y0) >= 32;
     let mi_col = (sb_x >> 2) as i64;
     let mi_row = (sb_y >> 2) as i64;
     let (lx, ly) = (tx as i64, ty as i64);
     let (col_off, row_off) = (lx / 4, ly / 4);
     let xr = ((mc - mi_col - 16) << 2) + 32 - lx;
     let yd = ((mr - mi_row - 16) << 2) + 32 - ly;
-    let right_available = (mi_col + col_off + 8) < mc;
-    let bottom_available = (yd > 0) && ((mi_row + row_off + 8) < mr);
-    let tr_ok = matches!(i, 0..=2) && have_above && right_available && xr > 0;
+    // top-right unavailable for the bottom-right leaf; bottom-left only for the top-left leaf.
+    let tr_avail = !(is_right && is_bottom) && !is_bottom && (mi_col + col_off + 8) < mc;
+    let bl_avail = !is_right && !is_bottom && !is_right && (mi_row + row_off + 8) < mr;
+    // SMOOTH/SMOOTH_H/D45/D67 need above-right; SMOOTH/SMOOTH_V/D203 need bottom-left.
+    let need_tr = matches!(m, 1 | 3 | 7) || m >= 12;
+    let need_bl = matches!(m, 1 | 2 | 11);
+    let tr_ok = need_tr && matches!(i, 0..=2) && have_above && tr_avail && xr > 0;
     let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
-    let bl_ok = i == 0 && have_left && bottom_available && yd > 0;
+    let bl_ok = need_bl && i == 0 && have_left && bl_avail && yd > 0;
     let bl_px = if bl_ok { yd.min(32).max(0) as usize } else { 0 };
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,

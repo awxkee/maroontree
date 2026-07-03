@@ -88,20 +88,25 @@ fn smooth_scale(bs: usize) -> usize {
 }
 
 fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    let log2 = blk_size_log2(bs);
-    let rnd = (bs as i32) >> 1;
-    let w = &SM_WEIGHTS[smooth_scale(bs)];
-    let (right, bottom) = (above[bs], left[bs]);
+    // AV2 highbd_smooth_predictor (avm_dsp/intrapred.c).
+    let bl = left[bs];
+    let tr = above[bs];
+    let lg = blk_size_log2(bs);
+    let scale = ((lg - 2) + (lg - 2) + 2) >> 2;
+    let blend_max_log2 = blk_size_log2(32);
+    let dr = |v: i32, bits: i32| (v + (1 << (bits - 1))) >> bits;
     let mut out = vec![0f32; bs * bs];
-    for (y, &l) in left[..bs].iter().enumerate() {
-        let (diff_hor, off_ver, w_ver) = (l - right, bs as i32 - 1 - y as i32, w[y]);
-        let row = &mut out[y * bs..y * bs + bs];
-        for (x, (dst, &above_x)) in row.iter_mut().zip(&above[..bs]).enumerate() {
-            let mut pred_ver = bottom + (((above_x - bottom) * off_ver + rnd) >> log2);
-            let mut pred_hor = right + ((diff_hor * (bs as i32 - 1 - x as i32) + rnd) >> log2);
-            pred_ver += ((above_x - pred_ver) * w_ver + 32) >> 6;
-            pred_hor += ((l - pred_hor) * w[x] + 32) >> 6;
-            *dst = ((pred_ver + pred_hor + 1) >> 1) as f32;
+    for r in 0..bs {
+        let s_top = 32 >> blk_size_log2(64).min(((r as i32) << 1) >> scale);
+        let l = left[r];
+        for c in 0..bs {
+            let s_left = 32 >> blk_size_log2(64).min(((c as i32) << 1) >> scale);
+            let top = above[c];
+            let mut predv = bl + dr((top - bl) * (bs as i32 - 1 - r as i32), lg);
+            let mut predh = tr + dr((l - tr) * (bs as i32 - 1 - c as i32), lg);
+            predv += dr((top - predv) * s_top, blend_max_log2 + 1);
+            predh += dr((l - predh) * s_left, blend_max_log2 + 1);
+            out[r * bs + c] = dr(predv + predh, 1) as f32;
         }
     }
     out
@@ -148,12 +153,6 @@ fn smooth_h_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
 /// Public SMOOTH dispatch: NEON (4-lane, MAC) on aarch64, scalar elsewhere. The
 /// NEON kernel is bit-exact to [`smooth_scalar`] (validated lane-for-lane).
 pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        if bs.is_multiple_of(4) {
-            return unsafe { neon::smooth(bs, above, left) };
-        }
-    }
     smooth_scalar(bs, above, left)
 }
 
@@ -209,50 +208,6 @@ mod neon {
     fn xcoef(base: i32) -> int32x4_t {
         static IDX: [i32; 4] = [0, 1, 2, 3];
         unsafe { vsubq_s32(vdupq_n_s32(base), vld1q_s32(IDX.as_ptr())) }
-    }
-
-    #[inline]
-    #[target_feature(enable = "neon")]
-    pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-        let log2 = 31 - (bs as u32).leading_zeros() as i32;
-        let rnd = bs as i32 >> 1;
-        let w = &SM_WEIGHTS[smooth_scale(bs)];
-        let (right, bottom) = (above[bs], left[bs]);
-        let mut out = vec![0f32; bs * bs];
-        let (rb, bb, r32, rndb) = (
-            vdupq_n_s32(right),
-            vdupq_n_s32(bottom),
-            vdupq_n_s32(32),
-            vdupq_n_s32(rnd),
-        );
-        for (y, &l) in left[..bs].iter().enumerate() {
-            let (diff_hor, off_ver, w_ver) = (l - right, bs as i32 - 1 - y as i32, w[y]);
-            let lb = vdupq_n_s32(l);
-            let row = &mut out[y * bs..y * bs + bs];
-            let mut x = 0;
-            while x < bs {
-                unsafe {
-                    let av = vld1q_s32(above[x..].as_ptr());
-                    let wx = vld1q_s32(w[x..].as_ptr());
-                    let xc = xcoef(bs as i32 - 1 - x as i32);
-                    // pred_ver = bottom + ((av - bottom) * off_ver + rnd) >> log2
-                    let mut pv = vaddq_s32(bb, shr(mla_n(rndb, vsubq_s32(av, bb), off_ver), log2));
-                    // pred_ver += ((av - pred_ver) * w_ver + 32) >> 6
-                    pv = vaddq_s32(pv, shr(mla_n(r32, vsubq_s32(av, pv), w_ver), 6));
-                    // pred_hor = right + (diff_hor * xc + rnd) >> log2
-                    let mut ph = vaddq_s32(rb, shr(mla_n(rndb, xc, diff_hor), log2));
-                    // pred_hor += ((l - pred_hor) * w[x] + 32) >> 6   (per-column weights)
-                    ph = vaddq_s32(ph, shr(vmlaq_s32(r32, vsubq_s32(lb, ph), wx), 6));
-                    // out = (pred_ver + pred_hor + 1) >> 1
-                    store(
-                        shr(vaddq_s32(vaddq_s32(pv, ph), vdupq_n_s32(1)), 1),
-                        &mut row[x..],
-                    );
-                }
-                x += 4;
-            }
-        }
-        out
     }
 
     #[target_feature(enable = "neon")]

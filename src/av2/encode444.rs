@@ -608,7 +608,6 @@ impl Av2Encoder {
                 let split_q_safe = self.base_q_idx <= 97;
                 let sb_use_split = !needs_partition
                     && self.tune.chroma_split
-                    && false // disabled: V-plane coeff-context desync in split leaves on complex 444
                     && split_q_safe
                     && sb_x + 64 <= width
                     && sb_y + 64 <= height
@@ -616,8 +615,18 @@ impl Av2Encoder {
                         let (sb_qstep, sb_resid_scale) =
                             aqs.per_sb_probe(&yp, pw, sb_y, sb_x, width, height);
                         self.chroma_split_wins_444(
-                            &recu, &recv, &up, &vp, pw, sb_y, sb_x, bases, sb_qstep,
-                            sb_resid_scale, neutral, qc,
+                            &recu,
+                            &recv,
+                            &up,
+                            &vp,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            bases,
+                            sb_qstep,
+                            sb_resid_scale,
+                            neutral,
+                            qc,
                         )
                     };
                 if !needs_partition && !sb_use_split {
@@ -1221,8 +1230,13 @@ impl Av2Encoder {
                         &mut left_pctx,
                     )
                 };
-                // Edge SBs: quantization-neutral, but emit delta_q (0) once per SB.
-                enc.delta_q_signaled = 0;
+                // Split path: commit per-SB AQ delta-q and reconstruct at that qstep.
+                let (split_qstep, _split_resid_scale) = if sb_use_split {
+                    aqs.per_sb(&mut enc, &yp, pw, sb_y, sb_x, width, height)
+                } else {
+                    enc.delta_q_signaled = 0;
+                    (qstep_i, 1.0f32)
+                };
                 enc.delta_q_pending = enc.delta_q_present;
                 enc.in_interior_split = sb_use_split;
                 for op in &ops {
@@ -1645,7 +1659,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                split_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,

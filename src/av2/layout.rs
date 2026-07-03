@@ -26,7 +26,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av2::cdfs_qctx::{CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC};
 
 /// YUV chroma sampling layout.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,15 +65,6 @@ impl Layout {
             Layout::Monochrome | Layout::I420 => 0, // MAIN_420_10_IP0
             Layout::I422 => 3,                      // MAIN_422_10_IP1
             Layout::I444 => 4,                      // MAIN_444_10_IP1
-        }
-    }
-
-    /// Chroma-U all-zero CDF for this layout's chroma transform size, in the
-    /// quality context `qc` = get_q_ctx(base_q_idx).
-    pub(crate) fn chroma_u_skip(self, qc: usize) -> &'static [u16; 10] {
-        match self {
-            Layout::I420 => &CHROMA_SKIP_TX32_QC[qc],
-            _ => &CHROMA_SKIP_TX64_QC[qc],
         }
     }
 }

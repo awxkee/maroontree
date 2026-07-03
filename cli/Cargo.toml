@@ -14,7 +14,7 @@ hpvcd = { version = "0.2.1", optional = true }
 fast_transpose = { version = "0.2.7", optional = true }
 thiserror = "2.0.18"
 hpvca = { version = "0.1.9", optional = true }
-jixel = "0.2.3"
+jixel = "0.2.4"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
 garnetash = "0.1.0"
