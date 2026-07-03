@@ -1723,6 +1723,17 @@ pub(crate) static BOOL_PARA_LUT: [(u16, (u8, u8, u8)); 497] = [
 ];
 /// Per-context PARA for the rect_type partition bool (avm default_rect_type_cdf
 /// structure 0). Unused contexts (encoder seed 16384) carry neutral PARA.
+pub(crate) static PARA_DO_SQUARE_SPLIT: [(u8, u8, u8); 8] = [
+    (2, 2, 2),
+    (1, 1, 2),
+    (0, 1, 2),
+    (1, 2, 2),
+    (3, 1, 4),
+    (0, 2, 4),
+    (1, 1, 3),
+    (1, 2, 2),
+];
+
 pub(crate) static PARA_RECT_TYPE: [(u8, u8, u8); 64] = [
     (2, 3, 4),
     (3, 3, 4),

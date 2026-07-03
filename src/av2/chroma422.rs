@@ -547,7 +547,7 @@ pub(super) fn code_422_chroma_tu(
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
     encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area);
     let up_ = uc.iter().any(|&(_, l)| l != 0);
-    let v_skip = CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+    let v_skip = (6 * (up_ as i32) + va + vl) as u32;
     encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area);
     (up_, vc.iter().any(|&(_, l)| l != 0))
 }
@@ -606,7 +606,8 @@ pub(super) fn predict_chroma_mode_dims(
     }
 }
 
-pub(super) fn predict_chroma444_whole64(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_chroma444_whole64(
     rec: &[f32],
     pw: usize,
     sb_y: usize,
@@ -630,8 +631,14 @@ pub(super) fn predict_chroma444_whole64(
     let right_available = (mi_col + 16) < mi_col_end;
     // The bottom-left SB is later in raster order (not yet reconstructed), so the
     // whole-SB block never has a real bottom-left; the reference extends left[bs-1].
+    // AVM `has_top_right` (av2/common/reconintra.c): for chroma planes, a
+    // transform wider than 32 px is never allowed top-right reference samples
+    // ("Do not allow more than 64 top reference samples"). The whole-SB chroma
+    // block is a single TX_64X64, so top-right is unavailable regardless of the
+    // neighbour reconstruction — the reference extends the top edge instead.
     let tr_ok = have_above && right_available && xr > 0;
-    let tr_px = if tr_ok { xr.min(64).max(0) as usize } else { 0 };
+    let tr_px = 0usize;
+    let _ = tr_ok;
     let _ = yd;
     let bl_px = 0usize;
     let (ab, lf, corner) = intrapred::build_refs(

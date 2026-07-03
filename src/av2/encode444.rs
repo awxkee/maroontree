@@ -145,7 +145,7 @@ fn code_444_chroma_leaf(
     eob_hi: u16,
     area: usize,
     u_skip_row: &[u16],
-    qc: usize,
+    _qc: usize,
     neutral: f32,
     qstep: i32,
     ua: i32,
@@ -269,7 +269,7 @@ fn code_444_chroma_leaf(
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
     encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area);
     let up_ = uc.iter().any(|&(_, l)| l != 0);
-    let v_skip = CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+    let v_skip = (6 * (up_ as i32) + va + vl) as u32;
     encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area);
     (up_, vc.iter().any(|&(_, l)| l != 0))
 }
@@ -349,6 +349,94 @@ pub(super) fn assemble_multitile(
 }
 
 impl Av2Encoder {
+    /// RD decision (mirrors AVM `rd_pick_partition` NONE-vs-SPLIT on the chroma cost):
+    /// returns true when coding the 64x64 chroma as 4x TX_32X32 has lower RD than one
+    /// TX_64X64. The 64x64 transform zeros the high-frequency 3/4 of coefficients, so on
+    /// detailed chroma the split reconstructs far more accurately; the split pays the
+    /// partition-signal bits plus per-leaf overhead. Distortion is real reconstructed SSE
+    /// and rate is the (lambda-weighted) coefficient + signal bit estimate, matching the
+    /// `RDCOST(rate,dist)` comparison AVM performs. DC prediction is used on both sides as
+    /// the common baseline (CfL/MHCCP only shift both costs together).
+    #[allow(clippy::too_many_arguments)]
+    fn chroma_split_wins_444(
+        &self,
+        recu: &[f32],
+        recv: &[f32],
+        up: &[f32],
+        vp: &[f32],
+        pw: usize,
+        sb_y: usize,
+        sb_x: usize,
+        bases: &crate::av2::proj::Bases,
+        sb_qstep: i32,
+        sb_resid_scale: f32,
+        neutral: f32,
+        _qc: usize,
+    ) -> bool {
+        use crate::av2::helpers::{dc_pred, get_residual};
+        let bd = self.bit_depth as i32;
+        let scan = &tables::SCAN;
+        let lambda = crate::av2::leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+        // Cost of one plane coded as a single 64x64 transform (DC pred).
+        let whole_plane = |rec: &[f32], src: &[f32]| -> (f64, f64) {
+            let pred = dc_pred(rec, pw, sb_y, sb_x, 64, neutral);
+            let lev = bases.chroma444.project(
+                &crate::av2::aq::scale_resid(
+                    &get_residual(src, pw, sb_y, sb_x, 64, pred),
+                    sb_resid_scale,
+                ),
+                0.0,
+            );
+            let recon =
+                crate::av2::itx422::reconstruct_chroma(pred, &lev, sb_qstep, scan, 64, 64, bd);
+            let mut sse = 0f64;
+            for r in 0..64 {
+                let b = (sb_y + r) * pw + sb_x;
+                for c in 0..64 {
+                    let d = (src[b + c] - recon[r * 64 + c]) as f64;
+                    sse += d * d;
+                }
+            }
+            let bits: f64 = lev.iter().filter(|&&l| l != 0.0).count() as f64 * 4.0;
+            (sse, bits)
+        };
+        // Cost of one plane coded as 4x 32x32 transforms (DC pred per sub-block).
+        let split_plane = |rec: &[f32], src: &[f32]| -> (f64, f64) {
+            let mut sse = 0f64;
+            let mut bits = 0f64;
+            for (dr, dc) in [(0usize, 0usize), (0, 32), (32, 0), (32, 32)] {
+                let (by, bx) = (sb_y + dr, sb_x + dc);
+                let pred = dc_pred(rec, pw, by, bx, 32, neutral);
+                let lev = bases
+                    .chroma420
+                    .project(&get_residual(src, pw, by, bx, 32, pred), 0.0);
+                let recon =
+                    crate::av2::itx422::reconstruct_chroma(pred, &lev, sb_qstep, scan, 32, 32, bd);
+                for r in 0..32 {
+                    let b = (by + r) * pw + bx;
+                    for c in 0..32 {
+                        let d = (src[b + c] - recon[r * 32 + c]) as f64;
+                        sse += d * d;
+                    }
+                }
+                bits += lev.iter().filter(|&&l| l != 0.0).count() as f64 * 4.0;
+            }
+            (sse, bits)
+        };
+        let (whu_sse, whu_bits) = whole_plane(recu, up);
+        let (whv_sse, whv_bits) = whole_plane(recv, vp);
+        let (spu_sse, spu_bits) = split_plane(recu, up);
+        let (spv_sse, spv_bits) = split_plane(recv, vp);
+        // Partition signal: do_split(1) + do_square_split(1) at 64x64, and each of the
+        // four 32x32 children codes do_split(0). ~1 bit each is a conservative estimate.
+        let split_signal_bits = 6.0;
+        // Luma is coded identically (4x TX_32X32) in both the whole-64 fast path and the
+        // split, so it cancels and is excluded from this chroma-only comparison.
+        let j_whole = (whu_sse + whv_sse) + lambda * (whu_bits + whv_bits);
+        let j_split = (spu_sse + spv_sse) + lambda * (spu_bits + spv_bits + split_signal_bits);
+        j_split < j_whole
+    }
+
     /// Encode a 4:4:4 YCbCr still. `y`, `cb`, `cr` are full-resolution
     /// (`width × height`). Luma is four 32x32 transform units per 64x64 superblock;
     /// each chroma plane is one 64x64 transform per superblock.
@@ -416,7 +504,7 @@ impl Av2Encoder {
         let up = pad_plane(cb, width, height, pw, ph);
         let vp = pad_plane(cr, width, height, pw, ph);
 
-        let layout = Layout::I444;
+        let _layout = Layout::I444;
         let mut recy = vec![0f32; pw * ph];
         let mut recu = vec![0f32; pw * ph];
         let mut recv = vec![0f32; pw * ph];
@@ -485,18 +573,62 @@ impl Av2Encoder {
                 let sb_x = col * 64;
                 // Fast-path SB chroma context at the SB-origin mi (col*16, row*16).
                 let (fmr, fmc) = (row * 16, col * 16);
-                let ua = if fmr > 0 { u_above[fmc] } else { 0 };
-                let ul = if fmc > 0 { u_left[fmr] } else { 0 };
-                let va = if fmr > 0 { v_above[fmc] } else { 0 };
-                let vl = if fmc > 0 { v_left[fmr] } else { 0 };
+                let ua = if fmr > 0 {
+                    u_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
+                } else {
+                    0
+                };
+                let ul = if fmc > 0 {
+                    u_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
+                } else {
+                    0
+                };
+                let va = if fmr > 0 {
+                    v_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
+                } else {
+                    0
+                };
+                let vl = if fmc > 0 {
+                    v_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
+                } else {
+                    0
+                };
 
                 // Helper closures capture nothing mutable; chroma coeff encode is inlined
                 // per leaf because basis/size/skip-table differ.
-                if !needs_partition {
+                // Per-SB: decide whether to code this full interior 64x64 as a 4x32x32
+                // square split (chroma-motivated, see chroma_split_wins_444). Edge SBs and
+                // dimension-forced splits keep their existing behaviour.
+                // The split relies on the 32x32 intra-leaf coder, which is bit-exact against
+                // the reference decoder for base_q_idx <= 97 (quality >= ~62). Below that a
+                // pre-existing leaf-coder desync appears (also present in edge-SB leaf paths,
+                // independent of this feature), so the split is restricted to the verified
+                // range. The chroma-detail plateau this fixes only matters at higher quality,
+                // which is exactly the bit-exact range, so no useful gain is lost.
+                let split_q_safe = self.base_q_idx <= 97;
+                let sb_use_split = !needs_partition
+                    && self.tune.chroma_split
+                    && false // disabled: V-plane coeff-context desync in split leaves on complex 444
+                    && split_q_safe
+                    && sb_x + 64 <= width
+                    && sb_y + 64 <= height
+                    && {
+                        let (sb_qstep, sb_resid_scale) =
+                            aqs.per_sb_probe(&yp, pw, sb_y, sb_x, width, height);
+                        self.chroma_split_wins_444(
+                            &recu, &recv, &up, &vp, pw, sb_y, sb_x, bases, sb_qstep,
+                            sb_resid_scale, neutral, qc,
+                        )
+                    };
+                if !needs_partition && !sb_use_split {
                     // Fast path: whole 64X64 SB. RD-choose luma tx-partition between
                     // SPLIT (4×TX_32X32) and VERT4 (4×TX_16X64), cheap SSE + rate proxy.
                     let (sb_qstep, sb_resid_scale) =
                         aqs.per_sb(&mut enc, &yp, pw, sb_y, sb_x, width, height);
+                    // do_split cdf for this whole-64 PARTITION_NONE, from the real partition
+                    // context (12276 in an all-whole-64 frame; differs next to a split SB).
+                    let none_do_split_cdf =
+                        partition::sb_none_do_split_cdf(row, col, &above_pctx, &left_pctx);
                     let sse_region = |rec: &[f32]| -> f64 {
                         let mut s = 0f64;
                         for r in 0..64 {
@@ -568,7 +700,7 @@ impl Av2Encoder {
                             recy[b..b + 64].copy_from_slice(&snap[r * 64..r * 64 + 64]);
                         }
                     };
-                    #[derive(PartialEq)]
+                    #[derive(PartialEq, Debug)]
                     enum Part {
                         Split,
                         Vert4,
@@ -849,7 +981,7 @@ impl Av2Encoder {
                                 &dc_sign_ctxs,
                                 0,
                                 true,
-                                12276,
+                                none_do_split_cdf,
                             );
                         }
                         Part::Horz4 => {
@@ -879,7 +1011,7 @@ impl Av2Encoder {
                                 &dc_sign_ctxs,
                                 0,
                                 true,
-                                12276,
+                                none_do_split_cdf,
                             );
                         }
                         Part::Split => {
@@ -893,7 +1025,7 @@ impl Av2Encoder {
                                 &dc_sign_ctxs,
                                 mode_idx,
                                 true,
-                                12276,
+                                none_do_split_cdf,
                             );
                         }
                     }
@@ -1051,11 +1183,10 @@ impl Av2Encoder {
                     };
                     let ucoeffs = levels_to_coeffs(&levu);
                     let vcoeffs = levels_to_coeffs(&levv);
-                    let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
+                    let u_skip = (6 + ua + ul) as u32;
                     encode_chroma_block(&mut enc, &ucoeffs, u_skip, true);
                     let u_present = ucoeffs.iter().any(|&(_, l)| l != 0);
-                    let v_skip =
-                        CHROMA_SKIP_V_QC[qc][(6 * (u_present as i32) + va + vl) as usize] as u32;
+                    let v_skip = (6 * (u_present as i32) + va + vl) as u32;
                     encode_chroma_block(&mut enc, &vcoeffs, v_skip, false);
                     let v_present = vcoeffs.iter().any(|&(_, l)| l != 0);
                     let cfl_used = cfl_choice.is_some() as i32;
@@ -1069,26 +1200,45 @@ impl Av2Encoder {
                         v_left[r] = v_present as i32;
                         cfl_left[r] = cfl_used;
                     }
+                    // Maintain partition contexts for this whole-64 PARTITION_NONE so that
+                    // SBs neighbouring a chroma-motivated split observe correct contexts.
+                    partition::sb_none_pctx(row, col, &mut above_pctx, &mut left_pctx);
                     continue;
                 }
 
                 // Walk + dispatch. For residues {6,8} each SB yields exactly one Leaf and
                 // no RectType ops; RectType is handled generically for forward-compat.
-                let ops = partition::sb_partition_ops(
-                    row,
-                    col,
-                    tmr as usize,
-                    tmc as usize,
-                    &mut above_pctx,
-                    &mut left_pctx,
-                );
+                // A chroma-motivated interior split emits a 4x32x32 PARTITION_SPLIT instead.
+                let ops = if sb_use_split {
+                    partition::sb_square_split_ops(row, col, &mut above_pctx, &mut left_pctx)
+                } else {
+                    partition::sb_partition_ops(
+                        row,
+                        col,
+                        tmr as usize,
+                        tmc as usize,
+                        &mut above_pctx,
+                        &mut left_pctx,
+                    )
+                };
                 // Edge SBs: quantization-neutral, but emit delta_q (0) once per SB.
                 enc.delta_q_signaled = 0;
                 enc.delta_q_pending = enc.delta_q_present;
+                enc.in_interior_split = sb_use_split;
                 for op in &ops {
                     let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
                         partition::Op::RectType { cdf, val } => {
                             enc.bool_rect_type(*cdf, *val);
+                            continue;
+                        }
+                        partition::Op::Split {
+                            do_split_cdf,
+                            square_cdf,
+                        } => {
+                            enc.bool_do_split(*do_split_cdf, 1);
+                            if *square_cdf != 0 {
+                                enc.bool_do_square_split(*square_cdf, 1);
+                            }
                             continue;
                         }
                         partition::Op::Leaf {
@@ -1104,10 +1254,26 @@ impl Av2Encoder {
                     // address the leaf, not the SB origin.
                     let sb_y = lmr * 4;
                     let sb_x = lmc * 4;
-                    let ua = if lmr > 0 { u_above[lmc] } else { 0 };
-                    let ul = if lmc > 0 { u_left[lmr] } else { 0 };
-                    let va = if lmr > 0 { v_above[lmc] } else { 0 };
-                    let vl = if lmc > 0 { v_left[lmr] } else { 0 };
+                    let ua = if lmr > 0 {
+                        u_above[lmc..lmc + bw_mi].iter().any(|&x| x != 0) as i32
+                    } else {
+                        0
+                    };
+                    let ul = if lmc > 0 {
+                        u_left[lmr..lmr + bh_mi].iter().any(|&x| x != 0) as i32
+                    } else {
+                        0
+                    };
+                    let va = if lmr > 0 {
+                        v_above[lmc..lmc + bw_mi].iter().any(|&x| x != 0) as i32
+                    } else {
+                        0
+                    };
+                    let vl = if lmc > 0 {
+                        v_left[lmr..lmr + bh_mi].iter().any(|&x| x != 0) as i32
+                    } else {
+                        0
+                    };
                     {
                         let cfl_a = if lmr > 0 { cfl_above[lmc] } else { 0 };
                         let cfl_l = if lmc > 0 { cfl_left[lmr] } else { 0 };
@@ -1264,11 +1430,10 @@ impl Av2Encoder {
                                 (levu, levv)
                             };
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-                            let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
+                            let u_skip = (6 + ua + ul) as u32;
                             encode_chroma_block(&mut enc, &uc, u_skip, true);
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block(&mut enc, &vc, v_skip, false);
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1359,11 +1524,10 @@ impl Av2Encoder {
                                 ),
                             );
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-                            let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
+                            let u_skip = (6 + ua + ul) as u32;
                             encode_chroma_block(&mut enc, &uc, u_skip, true);
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block(&mut enc, &vc, v_skip, false);
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1464,11 +1628,10 @@ impl Av2Encoder {
                                 ),
                             );
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-                            let u_skip = layout.chroma_u_skip(qc)[(6 + ua + ul) as usize] as u32;
+                            let u_skip = (6 + ua + ul) as u32;
                             encode_chroma_block(&mut enc, &uc, u_skip, true);
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block(&mut enc, &vc, v_skip, false);
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1508,7 +1671,7 @@ impl Av2Encoder {
                             // the MHCCP predictor and signal it (is_cfl + switch=1 +
                             // mh_dir). ssx=ssy=false for 4:4:4.
                             let bd444 = self.bit_depth as i32;
-                            let mh444 = if enc.mhccp {
+                            let mh444 = if enc.mhccp && !enc.in_interior_split {
                                 let dcu = dc_pred(&recu, pw, sb_y, sb_x, 32, neutral);
                                 let dcv = dc_pred(&recv, pw, sb_y, sb_x, 32, neutral);
                                 let baseline_j = {
@@ -1561,6 +1724,10 @@ impl Av2Encoder {
                                 None
                             };
                             let mh_win = mh444.as_ref().and_then(|c| c.mhccp.as_ref()).is_some();
+                            // This 32x32 leaf codes chroma as DC or MHCCP, both of which use
+                            // uv_mode = 0 (UV_DC_PRED). Set it explicitly so a stale uv_mode
+                            // from a prior leaf can't leak into the emitted symbol.
+                            enc.uv_mode = 0;
                             if let Some(ref ch) = mh444
                                 && mh_win
                             {
@@ -1663,11 +1830,10 @@ impl Av2Encoder {
                                 (levu, levv)
                             };
                             let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-                            let u_skip = CHROMA_SKIP_TX32_QC[qc][(6 + ua + ul) as usize] as u32;
-                            encode_chroma_block(&mut enc, &uc, u_skip, true);
+                            let u_skip = (6 + ua + ul) as u32;
+                            encode_chroma_block_ex(&mut enc, &uc, u_skip, true, false);
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block(&mut enc, &vc, v_skip, false);
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1790,8 +1956,7 @@ impl Av2Encoder {
                                 512,
                             );
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block_rect(
                                 &mut enc,
                                 &vc,
@@ -1921,8 +2086,7 @@ impl Av2Encoder {
                                 512,
                             );
                             let up_ = uc.iter().any(|&(_, l)| l != 0);
-                            let v_skip =
-                                CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                             encode_chroma_block_rect(
                                 &mut enc,
                                 &vc,
@@ -2608,6 +2772,7 @@ impl Av2Encoder {
                         cfl_left[r] = cfl_used;
                     }
                 }
+                enc.in_interior_split = false;
             }
         }
         enc
@@ -2829,6 +2994,15 @@ impl Av2Encoder {
                     match *op {
                         partition::Op::RectType { cdf, val } => {
                             enc.bool_rect_type(cdf, val);
+                        }
+                        partition::Op::Split {
+                            do_split_cdf,
+                            square_cdf,
+                        } => {
+                            enc.bool_do_split(do_split_cdf, 1);
+                            if square_cdf != 0 {
+                                enc.bool_do_square_split(square_cdf, 1);
+                            }
                         }
                         partition::Op::Leaf {
                             mi_row,

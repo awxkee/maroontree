@@ -419,11 +419,12 @@ pub(crate) fn trellis_optimize(
     }
     let n = scan.len();
     let lambda = lambda0 * ac_q * ac_q * trellis_lambda_scale();
-    let dqf = |rc: usize| if rc == 0 { dc_q } else { ac_q };
+    let (dc_q2, ac_q2) = (dc_q * dc_q, ac_q * ac_q);
+    // Distortion of coding coeff `rc` at magnitude `lev`: dq^2*(|tf|-lev)^2.
     let d = |rc: usize, lev: i32| {
-        let dq = dqf(rc);
-        let t = tf[rc].abs();
-        dq * dq * (t - lev.unsigned_abs() as f64).powi(2)
+        let dq2 = if rc == 0 { dc_q2 } else { ac_q2 };
+        let e = tf[rc].abs() - lev.unsigned_abs() as f64;
+        dq2 * e * e
     };
 
     let mut eob_idx: i32 = -1;
@@ -438,15 +439,18 @@ pub(crate) fn trellis_optimize(
 
     // Step A: per-coefficient round-down (toward zero) by local R-D.
     for &rc in scan[..=eob_idx as usize].iter() {
-        let l = cf[rc].unsigned_abs();
-        if l == 0 {
+        let c = cf[rc];
+        if c == 0 {
             continue;
         }
-        let cost_l = d(rc, l as i32) + lambda * coef_rate_bits(l);
-        let cost_dn = d(rc, (l - 1) as i32) + lambda * coef_rate_bits(l - 1);
+        let l = c.unsigned_abs();
+        let dq2 = if rc == 0 { dc_q2 } else { ac_q2 };
+        let at = tf[rc].abs();
+        let (e_l, e_dn) = (at - l as f64, at - (l - 1) as f64);
+        let cost_l = dq2 * e_l * e_l + lambda * coef_rate_bits(l);
+        let cost_dn = dq2 * e_dn * e_dn + lambda * coef_rate_bits(l - 1);
         if cost_dn < cost_l {
-            let s = if cf[rc] < 0 { -1 } else { 1 };
-            cf[rc] = s * (l as i32 - 1);
+            cf[rc] = if c < 0 { -(l as i32 - 1) } else { l as i32 - 1 };
         }
     }
 

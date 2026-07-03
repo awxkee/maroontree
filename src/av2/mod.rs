@@ -26,8 +26,9 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#[allow(unused_imports)]
 mod aq;
-mod av2_itx;
+pub(crate) mod av2_itx;
 mod avif;
 mod ccso;
 mod cdf_para;
@@ -59,7 +60,7 @@ mod partition;
 mod proj;
 mod quant;
 pub mod simple;
-mod tables;
+pub(crate) mod tables;
 mod tables_tx32;
 mod wht;
 
@@ -73,8 +74,8 @@ use crate::av2::chroma422::{
     ChromaNeighbors, ChromaPlanes, ChromaTxSpec, code_422_chroma_tu, recon_422_chroma,
 };
 use crate::av2::coder::{
-    Coeff, EobCdf, encode_chroma_block, encode_chroma_block_rect, encode_chroma_tu4,
-    encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
+    Coeff, EobCdf, encode_chroma_block, encode_chroma_block_ex, encode_chroma_block_rect,
+    encode_chroma_tu4, encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
     encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_8x8,
     encode_luma_leaf_8x32, encode_luma_leaf_16x16_full, encode_luma_leaf_16x32,
     encode_luma_leaf_16x64, encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32,
@@ -206,6 +207,10 @@ pub struct Tuning {
     pub vb_boost_only: bool,
     /// Enable the non-CfL chroma intra-mode search
     pub chroma_mode_search: bool,
+    /// Enable RD-driven 64x64->4x32x32 chroma-motivated square split (4:4:4/4:2:2).
+    /// A 64x64 chroma transform zeros the high-frequency 3/4 of coefficients; splitting
+    /// into 32x32 transforms codes all frequencies, a large win on detailed chroma.
+    pub chroma_split: bool,
     pub updating_cdf: bool,
 }
 
@@ -232,6 +237,7 @@ impl Default for Tuning {
             vb_strength: 0.6,
             vb_boost_only: true,
             chroma_mode_search: true,
+            chroma_split: true,
             updating_cdf: true,
         }
     }

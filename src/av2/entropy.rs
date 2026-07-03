@@ -191,6 +191,11 @@ pub(crate) struct RangeEncoder {
     /// [8x8, 64x64], not 4x4, within max UV tx)?
     pub(crate) mhccp_allowed: bool,
     pub(crate) mhccp_use: bool,
+    /// True while coding leaves of an interior chroma-motivated square split. MHCCP in
+    /// these 32x32 leaves is not yet bit-exact against the reference decoder (the implicit
+    /// luma-neighbour fetch differs for an interior split node), so it is suppressed there;
+    /// the split's quality gain comes from the 32x32 transform, not from MHCCP.
+    pub(crate) in_interior_split: bool,
     pub(crate) mhccp_dir: u8,
     pub(crate) mhccp_size_group: u8,
     /// Chroma intra prediction mode for the current block, in the internal
@@ -239,6 +244,7 @@ impl RangeEncoder {
             cur_bh4: 16,
             mhccp_allowed: false,
             mhccp_use: false,
+            in_interior_split: false,
             mhccp_dir: 0,
             mhccp_size_group: 0,
             uv_mode: 0,
@@ -1505,6 +1511,63 @@ impl RangeEncoder {
     /// Adaptive skip with an explicit table id (0=TX32, 1=TX64, 2=V). Used where
     /// the caller knows the table, avoiding value-collision ambiguity for the
     /// neutral 16384 probability that appears in multiple skip tables.
+    pub(crate) fn bool_u_skip32(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.txb_skip[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(
+                crate::av2::cdfs_qctx::CHROMA_SKIP_TX32_QC[self.qc][ctx] as u32,
+                bit,
+            );
+        }
+    }
+    pub(crate) fn bool_u_skip64(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.skip_tx64[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(
+                crate::av2::cdfs_qctx::CHROMA_SKIP_TX64_QC[self.qc][ctx] as u32,
+                bit,
+            );
+        }
+    }
+    pub(crate) fn bool_v_skip(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.skip_v[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(
+                crate::av2::cdfs_qctx::V_SKIP_TX4_QC[self.qc][ctx] as u32,
+                bit,
+            );
+        }
+    }
     pub(crate) fn bool_skip_tbl(&mut self, static_cdf: u32, bit: u32, table: u8) {
         if let Some(ref mut cs) = self.cdf_state {
             // Auto-detect the skip table (TX32 / TX64 / V) from the resolved static CDF
@@ -1575,6 +1638,27 @@ impl RangeEncoder {
         if let Some(ref mut cs) = self.cdf_state {
             let ctx = cs.do_split_ctx_of(static_cdf as u16);
             let cdf = &mut cs.do_split[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(static_cdf, bit);
+        }
+    }
+
+    /// Adaptive `do_square_split` bool (PARTITION_SPLIT selection). Static mode is
+    /// byte-identical to `encode_bool`; adaptive mode adapts the per-context working
+    /// copy, matching avmdec which adapts this symbol on plane 0.
+    pub(crate) fn bool_do_square_split(&mut self, static_cdf: u32, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let ctx = cs.do_square_split_ctx_of(static_cdf as u16);
+            let cdf = &mut cs.do_square_split[ctx];
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,

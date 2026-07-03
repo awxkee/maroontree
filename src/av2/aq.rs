@@ -246,6 +246,38 @@ impl AqState {
     /// and reconstruct at `qstep_sb`). When AQ is off this is `(qstep_base, 1.0)`
     /// and signals 0. The caller still arms `enc.delta_q_pending` before the mode.
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn per_sb_probe(
+        &self,
+        yp: &[f32],
+        pw: usize,
+        sb_y: usize,
+        sb_x: usize,
+        width: usize,
+        height: usize,
+    ) -> (i32, f32) {
+        if !self.present {
+            return (self.qstep_base, 1.0);
+        }
+        let mut subvars = [0f32; 64];
+        let filled = sb_subblock_variances(yp, pw, sb_y, sb_x, width, height, &mut subvars);
+        let target = if filled == 0 {
+            self.base_q
+        } else {
+            let picked = sb_octile_variance(&mut subvars, self.vb_octile);
+            let delta =
+                variance_boost_delta(picked, self.ref_act, self.vb_strength, self.vb_boost_only);
+            (self.base_q + delta).clamp(1, 255)
+        };
+        let step = 1i32 << AQ_RES_LOG2;
+        let sig = (((target - self.last_qidx) as f32) / step as f32)
+            .fast_round()
+            .clamp(-(AQ_MAX_SIGNALED as f32), AQ_MAX_SIGNALED as f32) as i32;
+        let newq = (self.last_qidx + sig * step).clamp(1, 255);
+        let qs = qstep(newq as u32) as i32;
+        (qs, self.qstep_base as f32 / qs as f32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn per_sb(
         &mut self,
         enc: &mut RangeEncoder,

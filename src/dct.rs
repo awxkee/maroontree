@@ -1129,6 +1129,40 @@ pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f
     quant_levels_and_targets(&coeffs, m_dc, m_ac)
 }
 
+/// 8x4 forward: residual `resid[row*8+col]` (4 tall x 8 wide). Transpose of 4x8.
+fn dct8x4_coeffs(input: &[i32; 32]) -> [i32; 32] {
+    let mut tmp = [0i32; 32]; // tmp[fx*4 + row]
+    for row in 0..4 {
+        let mut c = [0i32; 8];
+        for col in 0..8 {
+            c[col] = input[row * 8 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fx in 0..8 {
+            tmp[fx * 4 + row] = c[fx];
+        }
+    }
+    let mut out = [0i32; 32];
+    for fx in 0..8 {
+        let mut r = [0i32; 4];
+        for row in 0..4 {
+            r[row] = tmp[fx * 4 + row];
+        }
+        dct1d_4_i32(&mut r);
+        for fy in 0..4 {
+            out[fx * 4 + fy] = r[fy];
+        }
+    }
+    out
+}
+
+pub(crate) fn dct8x4_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
+    let coeffs = dct8x4_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
 pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
     let coeffs = dct4x8_coeffs(residual);
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
@@ -1242,6 +1276,40 @@ pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32]
     let coeffs = dctadst4x8_coeffs(residual);
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+}
+
+fn dct32x16_coeffs(input: &[i32; 512]) -> [i32; 512] {
+    const B: i32 = 6;
+    let mut tmp = [0i32; 512]; // tmp[fx*16 + row], fx in 0..32
+    for row in 0..16 {
+        let mut c = [0i32; 32];
+        for col in 0..32 {
+            c[col] = input[row * 32 + col] << B;
+        }
+        dct1d_32_i32(&mut c);
+        for fx in 0..32 {
+            tmp[fx * 16 + row] = c[fx];
+        }
+    }
+    let mut out = [0i32; 512];
+    for fx in 0..32 {
+        let mut r = [0i32; 16];
+        for row in 0..16 {
+            r[row] = tmp[fx * 16 + row];
+        }
+        dct1d_16_i32(&mut r);
+        for fy in 0..16 {
+            out[fx * 16 + fy] = (r[fy] + (1 << (B - 1))) >> B;
+        }
+    }
+    out
+}
+
+pub(crate) fn dct32x16_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f64; 512]) {
+    let coeffs = dct32x16_coeffs(residual);
+    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
+    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
     quant_levels_and_targets(&coeffs, m_dc, m_ac)
 }
 

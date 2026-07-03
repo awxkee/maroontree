@@ -774,6 +774,40 @@ pub(crate) fn dc_pred_4x4(recon: &[i32], stride: usize, ox: usize, oy: usize, bd
 /// DC prediction for a 4-wide x 8-tall chroma block (dav1d `dc_gen`, 8-bit).
 /// w+h = 12 is not a power of two, so the both-edges case uses the reciprocal
 /// multiply (ctz(12)=2 shift, then *0x5556>>16 since 8 is not > 2*4).
+/// DC predictor for an 8-wide x 4-tall block (transpose of 4x8): 8 above + 4 left.
+pub(crate) fn dc_pred_8x4(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
+    let above = oy > 0;
+    let left = ox > 0;
+    match (above, left) {
+        (true, true) => {
+            let mut s = 6i32; // (8+4)>>1
+            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(4)
+                .sum::<i32>();
+            s >>= 2; // ctz(12)
+            (((s as u32) * 0x5556) >> 16) as i32
+        }
+        (true, false) => {
+            let mut s = 4i32; // 8>>1
+            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
+            s >> 3
+        }
+        (false, true) => {
+            let mut s = 2i32; // 4>>1
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(4)
+                .sum::<i32>();
+            s >> 2
+        }
+        (false, false) => 1 << (bd - 1),
+    }
+}
+
 pub(crate) fn dc_pred_4x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
     let above = oy > 0;
     let left = ox > 0;
@@ -946,6 +980,40 @@ pub(crate) fn dc_pred_32x32(recon: &[i32], stride: usize, ox: usize, oy: usize, 
 
 /// DC predictor for a 16-wide x 32-tall chroma block (4:2:2 `RTX_16X32`).
 /// Mirrors `dc_pred_8x16`: sum 16 above + 32 left = 48 = 16*3 samples.
+/// DC predictor for 32-wide x 16-tall (transpose of 16x32): 32 above + 16 left.
+pub(crate) fn dc_pred_32x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
+    let above = oy > 0;
+    let left = ox > 0;
+    match (above, left) {
+        (true, true) => {
+            let mut s = 24i32; // (32+16)>>1
+            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>();
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(16)
+                .sum::<i32>();
+            s >>= 4; // ctz(48)
+            (((s as u32) * 0x5556) >> 16) as i32
+        }
+        (true, false) => {
+            let mut s = 16i32;
+            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>();
+            s >> 5
+        }
+        (false, true) => {
+            let mut s = 8i32;
+            s += recon[oy * stride + ox - 1..]
+                .iter()
+                .step_by(stride)
+                .take(16)
+                .sum::<i32>();
+            s >> 4
+        }
+        (false, false) => 1 << (bd - 1),
+    }
+}
+
 pub(crate) fn dc_pred_16x32(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
     let above = oy > 0;
     let left = ox > 0;

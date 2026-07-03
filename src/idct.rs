@@ -29,6 +29,41 @@
 use crate::quant::Dct;
 use std::sync::OnceLock;
 
+pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 512];
+    for rc in 0..512 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = (((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) >> 1) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 512];
+    for row in 0..16 {
+        for col in 0..32 {
+            tmp[row * 32 + col] = (coeff[row + col * 16] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..16 {
+        inv_dct32_1d(&mut tmp[row * 32..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..32 {
+        inv_dct16_1d(&mut tmp[col..], 32, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
@@ -143,6 +178,45 @@ pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
     // column transform: height-16 inv_dct16 (stride 8) over each of the 8 columns
     for col in 0..8 {
         inv_dct16_1d(&mut tmp[col..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// 8x4 inverse: coeff layout `[fx*4+fy]` (8 wide x 4 tall). Transpose of 4x8.
+pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 32];
+    for rc in 0..32 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    // tmp[row*8+col] = (coeff[col*4 + row] * 181 + 128) >> 8   (is_rect2 prescale)
+    let mut tmp = [0i32; 32];
+    for row in 0..4 {
+        for col in 0..8 {
+            tmp[row * 8 + col] = (coeff[col * 4 + row] * 181 + 128) >> 8;
+        }
+    }
+    // row transform: width-8 inv_dct8 (stride 1) over each of the 4 rows
+    for row in 0..4 {
+        inv_dct8_1d(&mut tmp[row * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    // column transform: height-4 inv_dct4 (stride 8) over each of the 8 columns
+    for col in 0..8 {
+        inv_dct4_1d(&mut tmp[col..], 8, cmin, cmax);
     }
     for t in tmp.iter_mut() {
         *t = (*t + 8) >> 4;

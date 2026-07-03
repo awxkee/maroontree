@@ -10,7 +10,7 @@ img-parts = "0.4.0"
 yuv = "0.8.15"
 anyhow = "1.0.102"
 moxcms = { version = "0.8.1" }
-hpvcd = { version = "0.1.4", optional = true }
+hpvcd = { version = "0.2.1", optional = true }
 fast_transpose = { version = "0.2.7", optional = true }
 thiserror = "2.0.18"
 hpvca = { version = "0.1.9", optional = true }
@@ -18,7 +18,7 @@ jixel = "0.2.3"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
 garnetash = "0.1.0"
-tealdust = { version = "0.1.0" }
+tealdust = { version = "0.1.1" }
 
 [features]
 default = ["heic", "vvc"]

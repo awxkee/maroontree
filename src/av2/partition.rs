@@ -84,6 +84,12 @@ pub(crate) static DO_SPLIT_CDF0: [u32; 64] = [
     9241, 11778, 6041, 11581, 7444, 14930, 6632, 16177, 12930, 22163, 9854, 20159, 21427, 28212,
     8550, 19709, 17390, 26910, 11124, 25001, 24459, 31081,
 ];
+// do_square_split cdf0 (my encode_bool form = 32768 - AVM_CDF2), plane 0 (LUMA_PART),
+// 8 square-split contexts. AVM default_do_square_split_cdf[0][ctx] values are
+// {18000,10521,11395,4419,12996,8185,10979,5010}. Context is `left*2 + above`
+// (from the split partition context bits), with no bsize offset for < 256x256.
+pub(crate) static DO_SQUARE_SPLIT_CDF0: [u32; 8] =
+    [14768, 22247, 21373, 28349, 19772, 24583, 21789, 27758];
 // rect_type cdf0 (HORZ vs VERT), plane 0, 64 contexts.
 pub(crate) static RECT_TYPE_CDF0: [u32; 64] = [
     18124, 22595, 14239, 16697, 12505, 19955, 6156, 9491, 22174, 25768, 12766, 19879, 18914, 22018,
@@ -184,6 +190,12 @@ pub(crate) enum Op {
     RectType {
         cdf: u32,
         val: u32,
+    },
+    /// Emit `do_split` bool (1 = split) with the given static cdf, then, when
+    /// `square_cdf` is `Some`, emit `do_square_split = 1` selecting PARTITION_SPLIT.
+    Split {
+        do_split_cdf: u32,
+        square_cdf: u32,
     },
     Leaf {
         mi_row: usize,
@@ -420,5 +432,100 @@ pub(crate) fn sb_partition_ops(
         left_pctx,
         &mut out,
     );
+    out
+}
+
+/// Update the partition contexts for a whole 64x64 SB coded as PARTITION_NONE, exactly
+/// as the decoder does (`update_pctx` for BLOCK_64X64). The whole-64 fast path must call
+/// this so that neighbours of a chroma-motivated split SB (which set pctx=56 on their
+/// 32x32 leaves) observe the correct do_split / rect_type contexts. Without it, a NONE SB
+/// following a split leaves stale context and the decoder mis-parses the next partition.
+pub(crate) fn sb_none_pctx(
+    sb_row: usize,
+    sb_col: usize,
+    above_pctx: &mut [u8],
+    left_pctx: &mut [u8],
+) {
+    update_pctx(above_pctx, left_pctx, sb_row * 16, sb_col * 16, 12);
+}
+
+/// The `do_split` cdf a whole-64 PARTITION_NONE SB must use, given the current
+/// partition contexts. In an all-whole-64 frame every SB has raw_ctx 0 and this
+/// returns `DO_SPLIT_CDF0[12]` (== 12276), preserving the legacy fast path; once a
+/// neighbouring SB has been square-split (setting pctx=56 on its 32x32 leaves) the
+/// context becomes non-zero and the correct cdf is selected, matching the decoder.
+pub(crate) fn sb_none_do_split_cdf(
+    sb_row: usize,
+    sb_col: usize,
+    above_pctx: &[u8],
+    left_pctx: &[u8],
+) -> u32 {
+    let ctx = raw_ctx(above_pctx, left_pctx, sb_row * 16, sb_col * 16, 12) + BSIZE_MAP[12] * 4;
+    DO_SPLIT_CDF0[ctx]
+}
+
+/// Ops for a full interior 64x64 SB that we choose to split down to 32x32 leaves.
+/// A 64x64 is NOT square-split-eligible in this configuration (square split only
+/// applies to 128/256 SBs), so we reach 32x32 via two levels of rectangular
+/// partition: 64x64 --VERT--> two 32x64, each --HORZ--> two 32x32. Extended
+/// partitions are disabled in the sequence header, so `do_ext_partition` is implied
+/// (no bit); each rect node emits only `do_split=1` + `rect_type`. Each 32x32 leaf
+/// then carries its own `do_split=0`. Contexts are updated exactly as the decoder does.
+/// Valid only for a full interior SB (all children in-frame) so no boundary-implied
+/// partitions apply.
+pub(crate) fn sb_square_split_ops(
+    sb_row: usize,
+    sb_col: usize,
+    above_pctx: &mut [u8],
+    left_pctx: &mut [u8],
+) -> Vec<Op> {
+    let mut out = Vec::new();
+    let mi_row = sb_row * 16;
+    let mi_col = sb_col * 16;
+    const B64: usize = 12; // BLOCK_64X64
+    const B32X64: usize = 10; // BLOCK_32X64
+    const B32: usize = 9; // BLOCK_32X32
+    // 64x64 -> VERT: do_split=1 (implied by NONE-not-forced? no: NONE is allowed for a
+    // full interior block, so do_split is signalled), rect_type=VERT. do_ext implied off.
+    out.push(Op::Split {
+        do_split_cdf: DO_SPLIT_CDF0
+            [raw_ctx(above_pctx, left_pctx, mi_row, mi_col, B64) + BSIZE_MAP[B64] * 4],
+        square_cdf: 0, // sentinel: no square-split symbol for 64x64 (not eligible)
+    });
+    let rt_ctx = raw_ctx(above_pctx, left_pctx, mi_row, mi_col, B64) + BSIZE_RECT_MAP[B64] * 4;
+    out.push(Op::RectType {
+        cdf: RECT_TYPE_CDF0[rt_ctx],
+        val: VERT as u32,
+    });
+    // Two 32x64 children (left, right). Each does HORZ -> two 32x32.
+    for dc in [0usize, 8usize] {
+        let cr = mi_row;
+        let cc = mi_col + dc;
+        // 32x64 -> HORZ: do_split=1 + rect_type=HORZ.
+        out.push(Op::Split {
+            do_split_cdf: DO_SPLIT_CDF0
+                [raw_ctx(above_pctx, left_pctx, cr, cc, B32X64) + BSIZE_MAP[B32X64] * 4],
+            square_cdf: 0,
+        });
+        let rt2 = raw_ctx(above_pctx, left_pctx, cr, cc, B32X64) + BSIZE_RECT_MAP[B32X64] * 4;
+        out.push(Op::RectType {
+            cdf: RECT_TYPE_CDF0[rt2],
+            val: HORZ as u32,
+        });
+        // Two 32x32 leaves (top, bottom).
+        for dr in [0usize, 8usize] {
+            let lr = cr + dr;
+            let lc = cc;
+            let ctx = raw_ctx(above_pctx, left_pctx, lr, lc, B32) + BSIZE_MAP[B32] * 4;
+            out.push(Op::Leaf {
+                mi_row: lr,
+                mi_col: lc,
+                bw_mi: 8,
+                bh_mi: 8,
+                part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+            });
+            update_pctx(above_pctx, left_pctx, lr, lc, B32);
+        }
+    }
     out
 }

@@ -278,6 +278,7 @@ pub(crate) static SCAN_32X32: [usize; 1024] = crate::coef_q::SCAN_32X32;
 pub(crate) static SCAN_8X16: [usize; 128] = crate::coef_q::SCAN_8X16;
 pub(crate) static SCAN_16X8: [usize; 128] = crate::coef_q::SCAN_16X8;
 pub(crate) static SCAN_16X32: [usize; 512] = crate::coef_q::SCAN_16X32;
+pub(crate) static SCAN_32X16: [usize; 512] = crate::coef_q::SCAN_32X16;
 pub(crate) const OVERHEAD_16: u32 = 8;
 pub(crate) static SCAN_8X8: [usize; 64] = [
     0, 8, 1, 2, 9, 16, 24, 17, 10, 3, 4, 11, 18, 25, 32, 40, 33, 26, 19, 12, 5, 6, 13, 20, 27, 34,
@@ -366,6 +367,10 @@ pub(crate) static SCAN_4X4: [usize; 16] = [0, 4, 1, 2, 5, 8, 12, 9, 6, 3, 7, 10,
 pub(crate) static SCAN_4X8: [usize; 32] = [
     0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
     29, 22, 15, 30, 23, 31,
+];
+pub(crate) static SCAN_8X4: [usize; 32] = [
+    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
+    23, 26, 29, 27, 30, 31,
 ];
 
 /// `dav1d_lo_ctx_offsets[2]` (w < h) — coeff_base position offset for RTX_4X8.

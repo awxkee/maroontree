@@ -145,6 +145,16 @@ impl Av2Encoder {
                             enc.bool_rect_type(*cdf, *val);
                             continue;
                         }
+                        partition::Op::Split {
+                            do_split_cdf,
+                            square_cdf,
+                        } => {
+                            enc.bool_do_split(*do_split_cdf, 1);
+                            if *square_cdf != 0 {
+                                enc.bool_do_square_split(*square_cdf, 1);
+                            }
+                            continue;
+                        }
                         partition::Op::Leaf {
                             bw_mi,
                             bh_mi,

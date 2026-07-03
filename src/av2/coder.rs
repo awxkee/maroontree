@@ -1251,15 +1251,35 @@ pub(crate) fn encode_chroma_block(
     skip_cdf: u32,
     is_u_plane: bool,
 ) {
+    encode_chroma_block_ex(enc, coeffs, skip_cdf, is_u_plane, true)
+}
+
+/// `skip_cdf` carries the skip context index. `u_tx64` selects the TX64 vs TX32 U slot.
+pub(crate) fn encode_chroma_block_ex(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    skip_cdf: u32,
+    is_u_plane: bool,
+    u_tx64: bool,
+) {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
-    // U plane -> chroma skip table (id 1, TX64 for 444); V plane -> v_txb_skip (id 2).
-    let skip_tbl: u8 = if is_u_plane { 1 } else { 2 };
+    let emit = |enc: &mut RangeEncoder, bit: u32| {
+        let ctx = skip_cdf as usize;
+        if !is_u_plane {
+            enc.bool_v_skip(ctx, bit);
+        } else if u_tx64 {
+            enc.bool_u_skip64(ctx, bit);
+        } else {
+            enc.bool_u_skip32(ctx, bit);
+        }
+    };
     if nonzero.is_empty() {
-        enc.bool_skip_tbl(skip_cdf, 1, skip_tbl);
+        emit(enc, 1);
         return;
     }
-    enc.bool_skip_tbl(skip_cdf, 0, skip_tbl);
+    emit(enc, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
+
     encode_eob(
         enc,
         eob,
@@ -1568,10 +1588,10 @@ pub(crate) fn encode_luma_leaf_8x8(
     enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
-    if eob >= 1 {
-        if let Some((cdf, idx, nsym)) = tx_type_cdf {
-            enc.encode_symbol(cdf, idx, nsym);
-        }
+    if eob >= 1
+        && let Some((cdf, idx, nsym)) = tx_type_cdf
+    {
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
@@ -1607,10 +1627,10 @@ pub(crate) fn encode_luma_leaf_rect128(
     enc.bool_txb_skip(skip_cdf, 0);
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob128Luma, EOB_HI_BIT_QC[enc.qc], 0, 7);
-    if eob >= 1 {
-        if let Some((cdf, idx, nsym)) = tx_type_cdf {
-            enc.encode_symbol(cdf, idx, nsym);
-        }
+    if eob >= 1
+        && let Some((cdf, idx, nsym)) = tx_type_cdf
+    {
+        enc.encode_symbol(cdf, idx, nsym);
     }
     let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);

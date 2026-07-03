@@ -221,6 +221,7 @@ pub(crate) struct CdfState {
     pub(crate) dc_sign: Vec<Vec<u16>>, // [3 dc_sign_ctx]
     pub(crate) eob_extra: Vec<u16>,   // [1]
     pub(crate) do_split: Vec<Vec<u16>>, // [64 partition_ctx]
+    pub(crate) do_square_split: Vec<Vec<u16>>, // [8 square_split_ctx]
     pub(crate) rect_type: Vec<Vec<u16>>, // [64 partition_ctx]
     pub(crate) txfm_bools: std::collections::HashMap<u16, Vec<u16>>,
     /// CCSO per-superblock on/off flag, adaptive 2-symbol CDF. Indexed
@@ -399,6 +400,14 @@ impl CdfState {
                     )
                 })
                 .collect(),
+            do_square_split: (0..8)
+                .map(|c| {
+                    bool_wc(
+                        crate::av2::partition::DO_SQUARE_SPLIT_CDF0[c] as u16,
+                        cdf_para::PARA_DO_SQUARE_SPLIT[c],
+                    )
+                })
+                .collect(),
             rect_type: (0..64)
                 .map(|c| {
                     bool_wc(
@@ -491,6 +500,13 @@ impl CdfState {
 
     pub(crate) fn do_split_ctx_of(&self, val: u16) -> usize {
         crate::av2::partition::DO_SPLIT_CDF0
+            .iter()
+            .position(|&v| v as u16 == val)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn do_square_split_ctx_of(&self, val: u16) -> usize {
+        crate::av2::partition::DO_SQUARE_SPLIT_CDF0
             .iter()
             .position(|&v| v as u16 == val)
             .unwrap_or(0)

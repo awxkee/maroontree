@@ -471,9 +471,11 @@ fn build_luma_ref(
     height: usize,
     above: usize,
     left: usize,
+    tr_ext: usize,
+    bl_ext: usize,
 ) -> mhccp::MhccpRefBuf {
-    let ref_width = left + width;
-    let ref_height = above + height;
+    let ref_width = left + width + tr_ext;
+    let ref_height = above + height + bl_ext;
     let mut buf = mhccp::MhccpRefBuf::new(
         ref_width,
         ref_height,
@@ -496,17 +498,35 @@ fn build_luma_ref(
         let xx = x.clamp(0, pw - 1);
         ctx.recy[(yy * pw + xx) as usize].fast_round() as i32
     };
+    // AVM `av2_mhccp_implicit_fetch_neighbor_luma_420`: near the superblock top
+    // boundary, only one line above is available, so the padding rows in the above
+    // region offset which luma lines are actually sampled. In luma domain the
+    // reference has `above << sy` lines; the offset fires while the luma row
+    // `h = j<<sy` is inside that above region.
+    let above_luma = (above as i32) << sy;
+    let line1_luma = ((mhccp::LINE_NUM as i32) + 1) << (sy as i32);
     for j in 0..ref_height {
         for i in 0..ref_width {
             // luma top-left sample for this chroma ref position
             let ly = ly0 + ((j as i32) << sy);
             let lx = lx0 + ((i as i32) << sx);
+            let h = (j as i32) << sy; // luma row within the reference region
+            let (cent_off, bot_off) =
+                if above_luma == line1_luma && ctx.is_top_sb_boundary && h < above_luma {
+                    (line1_luma - (h + 1), line1_luma - (h + 2))
+                } else {
+                    (0, 0)
+                };
             let q3 = match (ctx.ssx, ctx.ssy) {
                 (true, true) => {
-                    (lp(ly, lx) + lp(ly, lx + 1) + lp(ly + 1, lx) + lp(ly + 1, lx + 1)) << 1
+                    (lp(ly + cent_off, lx)
+                        + lp(ly + cent_off, lx + 1)
+                        + lp(ly + 1 + bot_off, lx)
+                        + lp(ly + 1 + bot_off, lx + 1))
+                        << 1
                 }
-                (true, false) => (lp(ly, lx) + lp(ly, lx + 1)) << 2,
-                (false, false) => lp(ly, lx) << 3,
+                (true, false) => (lp(ly + cent_off, lx) + lp(ly + cent_off, lx + 1)) << 2,
+                (false, false) => lp(ly + cent_off, lx) << 3,
                 _ => unreachable!(),
             };
             buf.set(i, j, q3);
@@ -525,10 +545,12 @@ fn build_chroma_ref(
     height: usize,
     above: usize,
     left: usize,
+    tr_ext: usize,
+    bl_ext: usize,
     is_top_sb: bool,
 ) -> mhccp::MhccpRefBuf {
-    let ref_width = left + width;
-    let ref_height = above + height;
+    let ref_width = left + width + tr_ext;
+    let ref_height = above + height + bl_ext;
     let mut buf =
         mhccp::MhccpRefBuf::new(ref_width, ref_height, above, left, width, height, is_top_sb);
     let pw = pcw as i32;
@@ -840,7 +862,21 @@ pub(crate) fn mhccp_decide(
         return None; // no causal support -> MHCCP degenerates
     }
 
-    let luma_ref = build_luma_ref(ctx, cw, ch, above, left);
+    let pch = ctx.recu.len() / ctx.pcw;
+    let sx = ctx.ssx as usize;
+    let sy = ctx.ssy as usize;
+    // AVM caps the reference region at 128 luma samples (64 chroma for 4:2:0)
+    // before subsampling; `ref_width = min(128, left+width+top_right) >> sub_x`.
+    let tr_avail = ctx.have_top && cw > 4 && ctx.cx + 2 * cw <= ctx.pcw;
+    let tr_ext = if tr_avail {
+        let cap_c = 128usize >> sx;
+        cap_c.saturating_sub(left + cw)
+    } else {
+        0
+    };
+    let _ = (pch, sy);
+    let bl_ext = 0usize; // bottom-left block is not yet coded in raster order
+    let luma_ref = build_luma_ref(ctx, cw, ch, above, left, tr_ext, bl_ext);
     let cref_u = build_chroma_ref(
         ctx.recu,
         ctx.pcw,
@@ -850,6 +886,8 @@ pub(crate) fn mhccp_decide(
         ch,
         above,
         left,
+        tr_ext,
+        bl_ext,
         ctx.is_top_sb_boundary,
     );
     let cref_v = build_chroma_ref(
@@ -861,6 +899,8 @@ pub(crate) fn mhccp_decide(
         ch,
         above,
         left,
+        tr_ext,
+        bl_ext,
         ctx.is_top_sb_boundary,
     );
 
@@ -936,18 +976,15 @@ pub(crate) fn mhccp_decide(
 
     match best {
         Some((j, choice)) => {
-            // SSIMULACRA2-calibrated acceptance margin. MSE-optimal MHCCP over-
-            // selects at high quality where it gives no perceptual benefit, so we
-            // require the J-improvement to exceed a quality-dependent threshold
-            // T(qstep) = MHCCP_MARGIN_A + MHCCP_MARGIN_B / qstep, normalized by the
-            // block energy scale (qstep^2 * N). Derived from SSIMULACRA2 agreement
-            // analysis over correlated-chroma content (see calibration notes):
-            // strict at low qstep (high quality), permissive at high qstep.
-            let n_f = (cw * ch) as f64;
-            let q = qstep.max(1) as f64;
-            let t = MHCCP_MARGIN_A + MHCCP_MARGIN_B / q;
-            let norm_gain = (baseline_j - j) / (q * q * n_f);
-            if norm_gain > t { Some(choice) } else { None }
+            // AVM selects MHCCP purely by RD cost (`av2_txfm_uvrd` + mode-signal
+            // rate, compared via `RDCOST`); it wins only when its full rate-distortion
+            // cost `j` beats the incumbent (DC / classic-alpha CfL). `j` already folds
+            // in the reconstructed SSE plus lambda-weighted coefficient, switch and
+            // filter_dir bits, so the decision is a direct `j < baseline_j`. An earlier
+            // MSE-margin heuristic over-selected MHCCP (spending chroma bits for no
+            // SSIMULACRA2 benefit); the pure-RD rule matches AVM and is never RD-negative
+            // across correlated / semi-correlated / decorrelated calibration content.
+            if j < baseline_j { Some(choice) } else { None }
         }
         _ => None,
     }
@@ -1012,11 +1049,6 @@ pub(crate) fn mhccp_eval_leaf(
         &ctx, src_u, src_v, cw, ch, bd, chroma, qstep, lambda, scan, sse,
     )
 }
-/// `T(qstep) = MHCCP_MARGIN_A + MHCCP_MARGIN_B / qstep`; MHCCP is accepted only
-/// when the normalized J improvement `(J_incumbent - J_mhccp)/(qstep^2 * N)`
-/// exceeds `T`. Fit against SSIMULACRA2 on correlated-chroma blocks.
-pub(crate) const MHCCP_MARGIN_A: f64 = -0.0039;
-pub(crate) const MHCCP_MARGIN_B: f64 = 0.097;
 
 /// Approximate bits to code `mh_dir` under the default `filter_dir` CDF for the
 /// given size-group context. Uses -log2(p_symbol) from the cumulative table.

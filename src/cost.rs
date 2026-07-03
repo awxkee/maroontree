@@ -23,22 +23,40 @@ pub(crate) fn est_block_bits(cf: &[i32], scan: &[usize]) -> u32 {
 /// >= 15, plus one sign bit for any nonzero). Used only by the encoder's trellis
 /// > quantizer to compare candidate levels — it need not be exact, since only the
 /// > *relative* costs drive the decision.
-pub(crate) fn coef_rate_bits(level: u32) -> f64 {
+fn coef_rate_bits_slow(level: u32) -> f64 {
     match level {
-        0 => 0.9, // a "0" base token coded in the interior run
+        0 => 0.9,
         1 => 1.7 + 1.0,
         2 => 2.6 + 1.0,
         _ => {
-            let mut b = 3.0 + 1.0; // base token == 3 (escape) + sign
-            let total_br = ((level as i32) - 3).min(COEFF_BASE_RANGE); // 0..12
-            let steps = (total_br / 3 + 1) as f64; // base-range symbols actually coded
+            let mut b = 3.0 + 1.0;
+            let total_br = ((level as i32) - 3).min(COEFF_BASE_RANGE);
+            let steps = (total_br / 3 + 1) as f64;
             b += steps * 1.3;
             if level >= 15 {
                 let v = level - 15;
-                b += 2.0 * ((32 - (v + 1).leading_zeros()) as f64) - 1.0; // ~exp-golomb
+                b += 2.0 * ((32 - (v + 1).leading_zeros()) as f64) - 1.0;
             }
             b
         }
+    }
+}
+
+// Rate LUT for the hot low-magnitude range (bit-identical to coef_rate_bits_slow);
+// ≥64 falls back to the closed form.
+static COEF_RATE_LUT: [f64; 64] = [
+    0.9, 2.7, 3.6, 5.3, 5.3, 5.3, 6.6, 6.6, 6.6, 7.9, 7.9, 7.9, 9.2, 9.2, 9.2, 11.5, 13.5, 13.5,
+    15.5, 15.5, 15.5, 15.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 19.5, 19.5, 19.5, 19.5,
+    19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 21.5, 21.5, 21.5, 21.5,
+    21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5, 21.5,
+];
+
+#[inline]
+pub(crate) fn coef_rate_bits(level: u32) -> f64 {
+    if (level as usize) < 64 {
+        COEF_RATE_LUT[level as usize]
+    } else {
+        coef_rate_bits_slow(level)
     }
 }
 
