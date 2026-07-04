@@ -234,7 +234,7 @@ pub(super) fn encode_luma_sb(
                     // Trellis RDOQ: pick coefficient levels by real rate-distortion
                     // (rate = true coded bits), then RD-trim the EOB.
                     let (mut l, prm) = luma.project_with_prm(&resid[..]);
-                    cost += crate::av2::coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+                    cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
                     l
                 } else {
                     let l = luma.project(&resid[..], 0.0);
@@ -245,7 +245,7 @@ pub(super) fn encode_luma_sb(
                         .sum::<f64>();
                     l
                 };
-                let rb = crate::av2::itx422::reconstruct_luma(&pblk, &lev, qstep, scan, bd);
+                let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);
                 put_block(recy, pw, y0, x0, 32, &rb);
                 tus[i] = levels_to_coeffs(&lev);
             }
@@ -444,7 +444,9 @@ pub(crate) fn predict_luma_leaf_tu(
     // top-right unavailable for the bottom-right leaf; bottom-left only for the top-left leaf.
     // avm has_top_right: top-row leaves (tr_mask_row<0) read above-right from the
     // coded SB row above, so TL and TR both qualify; only bottom-row leaves don't.
+    #[allow(clippy::overly_complex_bool_expr)]
     let tr_avail = !(is_right && is_bottom) && !is_bottom && (mi_col + col_off + 8) < mc;
+    #[allow(clippy::overly_complex_bool_expr)]
     let bl_avail = !is_right && !is_bottom && (mi_row + row_off + 8) < mr;
     // SMOOTH/SMOOTH_H/D45/D67 need above-right; SMOOTH/SMOOTH_V/D203 need bottom-left.
     let need_tr = matches!(m, 1 | 3 | 7) || m >= 12;
