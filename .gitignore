@@ -4,3 +4,10 @@ Cargo.lock
 *.obu
 *.gz
 *.zip
+*.avif
+*.png
+*.jpg
+*.jpeg
+*.jxl
+*.heic
+*.heif
