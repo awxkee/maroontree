@@ -1903,45 +1903,117 @@ impl Av2Encoder {
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
                         (4, 16) => {
-                            // Right-edge 16×64 luma leaf (residue 4), DC pred (mode 0),
-                            // single TX_16X64, coeff region 16×32 (SCAN16X32, eob 512).
-                            let pred = dc_pred_rect(
-                                &recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                16,
-                                64,
-                                neutral,
-                                self.bit_depth as i32,
-                            );
-                            let lev = bases.luma16x64.project_scan(
+                            // Right-edge 16×64 luma leaf: RD single TX_16X64 vs tx-partition
+                            // HORZ (2×TX_16X32, per-TU sequential prediction).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 16, 64, neutral, bd);
+                            let resid = aq::scale_resid(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 64, pred),
-                                0.0,
-                                &SCAN16X32,
+                                split_resid_scale,
                             );
-                            put_block_rect(
-                                &mut recy,
-                                pw,
-                                sb_y,
-                                sb_x,
+                            let rate = |lev: &[f32]| -> f64 {
+                                lev.iter()
+                                    .filter(|&&v| v != 0.0)
+                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                                    .sum::<f64>()
+                            };
+                            let sse_vs = |rec: &[f32], h2: usize, yoff: usize| -> f64 {
+                                let mut s = 0f64;
+                                for r in 0..h2 {
+                                    for c in 0..16 {
+                                        let d = yp[(sb_y + yoff + r) * pw + sb_x + c] as f64
+                                            - rec[r * 16 + c] as f64;
+                                        s += d * d;
+                                    }
+                                }
+                                s
+                            };
+                            let lambda = leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
+                            let lev = bases.luma16x64.project_scan(&resid, 0.0, &SCAN16X32);
+                            let rec_a = itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                split_qstep,
+                                &SCAN16X32,
                                 16,
                                 64,
-                                &itx422::reconstruct_chroma(
-                                    pred,
-                                    &lev,
-                                    split_qstep,
-                                    &SCAN16X32,
-                                    16,
-                                    64,
-                                    self.bit_depth as i32,
-                                ),
+                                bd,
                             );
-                            let tu = levels_to_coeffs(&lev);
-                            let (skip, dcs) = sb_tu_contexts_rect(
-                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 16, true,
-                            );
-                            encode_luma_leaf_16x64(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            let j_a = sse_vs(&rec_a, 64, 0) + lambda * rate(&lev);
+                            let mut levs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                            let mut recs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                            let mut j_b = lambda * 4.0;
+                            {
+                                let mut scratch = recy.clone();
+                                for half in 0..2 {
+                                    let tuy = sb_y + half * 32;
+                                    let p =
+                                        dc_pred_rect(&scratch, pw, tuy, sb_x, 16, 32, neutral, bd);
+                                    let r = aq::scale_resid(
+                                        &get_residual_rect(&yp, pw, tuy, sb_x, 16, 32, p),
+                                        split_resid_scale,
+                                    );
+                                    let l = bases.luma16x32.project_scan(&r, 0.0, &SCAN16X32);
+                                    let rec = itx422::reconstruct_chroma(
+                                        p,
+                                        &l,
+                                        split_qstep,
+                                        &SCAN16X32,
+                                        16,
+                                        32,
+                                        bd,
+                                    );
+                                    put_block_rect(&mut scratch, pw, tuy, sb_x, 16, 32, &rec);
+                                    j_b += sse_vs(&rec, 32, half * 32) + lambda * rate(&l);
+                                    levs_b[half] = l;
+                                    recs_b[half] = rec;
+                                }
+                            }
+                            if j_b < j_a {
+                                for (half, src) in recs_b.iter().enumerate() {
+                                    put_block_rect(
+                                        &mut recy,
+                                        pw,
+                                        sb_y + half * 32,
+                                        sb_x,
+                                        16,
+                                        32,
+                                        src,
+                                    );
+                                }
+                                let tus: [Vec<Coeff>; 2] =
+                                    [levels_to_coeffs(&levs_b[0]), levels_to_coeffs(&levs_b[1])];
+                                let mut skips = [0u32; 2];
+                                let mut dcss = [0usize; 2];
+                                for half in 0..2 {
+                                    let (sk, dc) = sb_tu_contexts_rect(
+                                        &tus[half],
+                                        sb_y + half * 32,
+                                        sb_x,
+                                        &mut above,
+                                        &mut left,
+                                        qc,
+                                        tmc,
+                                        tmr,
+                                        4,
+                                        8,
+                                        false,
+                                    );
+                                    skips[half] = sk;
+                                    dcss[half] = dc;
+                                }
+                                coder::encode_luma_leaf_16x64_horz(
+                                    &mut enc, &tus, &skips, &dcss, 0, true, pc,
+                                );
+                            } else {
+                                put_block_rect(&mut recy, pw, sb_y, sb_x, 16, 64, &rec_a);
+                                let tu = levels_to_coeffs(&lev);
+                                let (skip, dcs) = sb_tu_contexts_rect(
+                                    &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 4, 16,
+                                    true,
+                                );
+                                encode_luma_leaf_16x64(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            }
                             // chroma 16×64 (TX_16X64): reuse luma16x64 basis for projection
                             // (validity-only); chroma eob class 512, TX_32X32 skip ctx.
                             let predu = dc_pred_rect(
@@ -2037,45 +2109,119 @@ impl Av2Encoder {
                             (up_, vc.iter().any(|&(_, l)| l != 0))
                         }
                         (16, 4) => {
-                            // Bottom-edge 64×16 luma leaf (residue 4), DC pred, single
-                            // TX_64X16, coeff region 32×16 (SCAN32X16, eob 512).
-                            let pred = dc_pred_rect(
-                                &recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                64,
-                                16,
-                                neutral,
-                                self.bit_depth as i32,
-                            );
-                            let lev = bases.luma64x16.project_scan(
+                            // Bottom-edge 64×16 luma leaf: RD between single TX_64X16 and
+                            // tx-partition VERT (2×TX_32X16, no >32 zero-out).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(&recy, pw, sb_y, sb_x, 64, 16, neutral, bd);
+                            let resid = aq::scale_resid(
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 64, 16, pred),
-                                0.0,
-                                &SCAN32X16,
+                                split_resid_scale,
                             );
-                            put_block_rect(
-                                &mut recy,
-                                pw,
-                                sb_y,
-                                sb_x,
+                            let rate = |lev: &[f32]| -> f64 {
+                                lev.iter()
+                                    .filter(|&&v| v != 0.0)
+                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                                    .sum::<f64>()
+                            };
+                            let sse_vs = |rec: &[f32], w: usize, xoff: usize| -> f64 {
+                                let mut s = 0f64;
+                                for r in 0..16 {
+                                    for c in 0..w {
+                                        let d = yp[(sb_y + r) * pw + sb_x + xoff + c] as f64
+                                            - rec[r * w + c] as f64;
+                                        s += d * d;
+                                    }
+                                }
+                                s
+                            };
+                            let lambda = leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
+                            let lev = bases.luma64x16.project_scan(&resid, 0.0, &SCAN32X16);
+                            let rec_a = itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                split_qstep,
+                                &SCAN32X16,
                                 64,
                                 16,
-                                &itx422::reconstruct_chroma(
-                                    pred,
-                                    &lev,
-                                    split_qstep,
-                                    &SCAN32X16,
-                                    64,
-                                    16,
-                                    self.bit_depth as i32,
-                                ),
+                                bd,
                             );
-                            let tu = levels_to_coeffs(&lev);
-                            let (skip, dcs) = sb_tu_contexts_rect(
-                                &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 16, 4, true,
-                            );
-                            encode_luma_leaf_64x16(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            let j_a = sse_vs(&rec_a, 64, 0) + lambda * rate(&lev);
+                            // Per-TU prediction (decoder predicts each sub-TU from prior
+                            // recon), simulated on a scratch copy so cand A stays clean.
+                            let mut levs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                            let mut recs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                            let mut j_b = lambda * 4.0;
+                            {
+                                let mut scratch = recy.clone();
+                                for half in 0..2 {
+                                    let tux = sb_x + half * 32;
+                                    let p =
+                                        dc_pred_rect(&scratch, pw, sb_y, tux, 32, 16, neutral, bd);
+                                    let r = aq::scale_resid(
+                                        &get_residual_rect(&yp, pw, sb_y, tux, 32, 16, p),
+                                        split_resid_scale,
+                                    );
+                                    let l = bases.luma32x16.project_scan(&r, 0.0, &SCAN32X16);
+                                    let rec = itx422::reconstruct_chroma(
+                                        p,
+                                        &l,
+                                        split_qstep,
+                                        &SCAN32X16,
+                                        32,
+                                        16,
+                                        bd,
+                                    );
+                                    put_block_rect(&mut scratch, pw, sb_y, tux, 32, 16, &rec);
+                                    j_b += sse_vs(&rec, 32, half * 32) + lambda * rate(&l);
+                                    levs_b[half] = l;
+                                    recs_b[half] = rec;
+                                }
+                            }
+                            if j_b < j_a {
+                                for (half, src) in recs_b.iter().enumerate() {
+                                    put_block_rect(
+                                        &mut recy,
+                                        pw,
+                                        sb_y,
+                                        sb_x + half * 32,
+                                        32,
+                                        16,
+                                        src,
+                                    );
+                                }
+                                let tus: [Vec<Coeff>; 2] =
+                                    [levels_to_coeffs(&levs_b[0]), levels_to_coeffs(&levs_b[1])];
+                                let mut skips = [0u32; 2];
+                                let mut dcss = [0usize; 2];
+                                for half in 0..2 {
+                                    let (sk, dc) = sb_tu_contexts_rect(
+                                        &tus[half],
+                                        sb_y,
+                                        sb_x + half * 32,
+                                        &mut above,
+                                        &mut left,
+                                        qc,
+                                        tmc,
+                                        tmr,
+                                        8,
+                                        4,
+                                        false,
+                                    );
+                                    skips[half] = sk;
+                                    dcss[half] = dc;
+                                }
+                                coder::encode_luma_leaf_64x16_vert(
+                                    &mut enc, &tus, &skips, &dcss, 0, true, pc,
+                                );
+                            } else {
+                                put_block_rect(&mut recy, pw, sb_y, sb_x, 64, 16, &rec_a);
+                                let tu = levels_to_coeffs(&lev);
+                                let (skip, dcs) = sb_tu_contexts_rect(
+                                    &tu, sb_y, sb_x, &mut above, &mut left, qc, tmc, tmr, 16, 4,
+                                    true,
+                                );
+                                encode_luma_leaf_64x16(&mut enc, &tu, skip, dcs, 0, true, pc);
+                            }
                             let predu = dc_pred_rect(
                                 &recu,
                                 pw,

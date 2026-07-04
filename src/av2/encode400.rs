@@ -100,7 +100,7 @@ impl Av2Encoder {
                     aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height)
                 } else {
                     enc.delta_q_signaled = 0;
-                    (qstep_i, 1.0f32)
+                    aqs.current()
                 };
                 enc.delta_q_pending = enc.delta_q_present;
                 for op in &ops {
@@ -172,7 +172,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -194,7 +194,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -228,7 +228,7 @@ impl Av2Encoder {
                                 sb_y,
                                 sb_x,
                                 &bases.luma,
-                                qstep_i,
+                                sb_qstep,
                                 &tables::SCAN,
                                 neutral,
                                 qc,
@@ -264,7 +264,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma16x64.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN16X32,
                             );
@@ -278,7 +281,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN16X32,
                                     16,
                                     64,
@@ -303,7 +306,10 @@ impl Av2Encoder {
                                 self.bit_depth as i32,
                             );
                             let lev = bases.luma64x16.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN32X16,
                             );
@@ -317,7 +323,7 @@ impl Av2Encoder {
                                 &itx422::reconstruct_chroma(
                                     pred,
                                     &lev,
-                                    qstep_i,
+                                    sb_qstep,
                                     &SCAN32X16,
                                     64,
                                     16,
@@ -331,24 +337,17 @@ impl Av2Encoder {
                             encode_luma_leaf_64x16(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (2, 8) => {
-                            let pred = dc_pred_rect(
-                                recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                8,
-                                32,
-                                neutral,
-                                self.bit_depth as i32,
-                            );
-                            let mut lev = bases.luma8x32.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
+                            // 8x32 luma leaf, full AC (ported from 4:4:4).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 32, neutral, bd);
+                            let lev = bases.luma8x32.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN8X32,
                             );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0;
-                            }
                             put_block_rect(
                                 recy,
                                 pw,
@@ -357,48 +356,27 @@ impl Av2Encoder {
                                 8,
                                 32,
                                 &itx422::reconstruct_chroma(
-                                    pred,
-                                    &lev,
-                                    qstep_i,
-                                    &SCAN8X32,
-                                    8,
-                                    32,
-                                    self.bit_depth as i32,
+                                    pred, &lev, sb_qstep, &SCAN8X32, 8, 32, bd,
                                 ),
                             );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
-                            };
-                            let (_s, dcs) = sb_tu_contexts_rect(
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 2, 8, true,
                             );
-                            let skip = SKIP_TX16_QC[qc][0] as u32;
-                            encode_luma_leaf_dc_class2(
-                                enc, dc_level, skip, dcs, 0, false, pc, 18958,
-                            );
+                            coder::encode_luma_leaf_8x32(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (8, 2) => {
-                            let pred = dc_pred_rect(
-                                recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                32,
-                                8,
-                                neutral,
-                                self.bit_depth as i32,
-                            );
-                            let mut lev = bases.luma32x8.project_scan(
-                                &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
+                            // 32x8 luma leaf, full AC (ported from 4:4:4).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 32, 8, neutral, bd);
+                            let lev = bases.luma32x8.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
+                                    sb_resid_scale,
+                                ),
                                 0.0,
                                 &SCAN32X8,
                             );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0;
-                            }
                             put_block_rect(
                                 recy,
                                 pw,
@@ -407,83 +385,322 @@ impl Av2Encoder {
                                 32,
                                 8,
                                 &itx422::reconstruct_chroma(
-                                    pred,
-                                    &lev,
-                                    qstep_i,
-                                    &SCAN32X8,
-                                    32,
-                                    8,
-                                    self.bit_depth as i32,
+                                    pred, &lev, sb_qstep, &SCAN32X8, 32, 8, bd,
                                 ),
                             );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
-                            };
-                            let (_s, dcs) = sb_tu_contexts_rect(
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 8, 2, true,
                             );
-                            let skip = SKIP_TX16_QC[qc][0] as u32;
-                            encode_luma_leaf_dc_class2(
-                                enc, dc_level, skip, dcs, 0, false, pc, 18958,
-                            );
+                            coder::encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (4, 4) => {
-                            let pred = dc_pred_rect(
-                                recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                16,
-                                16,
-                                neutral,
-                                self.bit_depth as i32,
-                            );
-                            let mut lev = bases.luma16x16.project_scan(
+                            // 16x16 corner leaf: tx_type RD over DCT/ADST mixes (ported from 4:4:4).
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 16, neutral, bd);
+                            let resid = aq::scale_resid(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
-                                0.0,
-                                &SCAN16,
+                                sb_resid_scale,
                             );
-                            for v in lev[1..].iter_mut() {
-                                *v = 0.0;
+                            let pred_flat = [pred; 256];
+                            let mut src16 = [0f32; 256];
+                            for r in 0..16 {
+                                for c in 0..16 {
+                                    src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
+                                }
                             }
-                            put_block_rect(
-                                recy,
-                                pw,
-                                sb_y,
-                                sb_x,
-                                16,
-                                16,
-                                &itx422::reconstruct_chroma(
-                                    pred,
-                                    &lev,
-                                    qstep_i,
-                                    &SCAN16,
-                                    16,
-                                    16,
-                                    self.bit_depth as i32,
-                                ),
-                            );
-                            let dc_level = lev[0] as i32;
-                            let tu: Vec<Coeff> = if dc_level != 0 {
-                                vec![(0, dc_level)]
-                            } else {
-                                vec![]
+                            let rate = |lev: &[f32]| -> f64 {
+                                lev.iter()
+                                    .filter(|&&v| v != 0.0)
+                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
+                                    .sum::<f64>()
                             };
+                            let sse = |rec: &[f32]| -> f64 {
+                                (0..256)
+                                    .map(|i| {
+                                        let d = src16[i] as f64 - rec[i] as f64;
+                                        d * d
+                                    })
+                                    .sum()
+                            };
+                            let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                            let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_dct = itx422::reconstruct_luma16(
+                                &pred_flat, &lev_dct, sb_qstep, &SCAN16, bd,
+                            );
+                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_adst = itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_adst, sb_qstep, &SCAN16, true, true, bd,
+                            );
+                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let lev_ad =
+                                bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_ad = itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_ad, sb_qstep, &SCAN16, false, true, bd,
+                            );
+                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let lev_da =
+                                bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
+                            let rec_da = itx422::reconstruct_luma16_adst(
+                                &pred_flat, &lev_da, sb_qstep, &SCAN16, true, false, bd,
+                            );
+                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let mut best = cost_dct;
+                            let mut choice = 0usize;
+                            if cost_adst < best {
+                                best = cost_adst;
+                                choice = 1;
+                            }
+                            if cost_ad < best {
+                                best = cost_ad;
+                                choice = 2;
+                            }
+                            if cost_da < best {
+                                choice = 3;
+                            }
+                            let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice {
+                                1 => (&lev_adst, &rec_adst, 1),
+                                2 => (&lev_ad, &rec_ad, 2),
+                                3 => (&lev_da, &rec_da, 3),
+                                _ => (&lev_dct, &rec_dct, 0),
+                            };
+                            put_block_rect(recy, pw, sb_y, sb_x, 16, 16, rec);
+                            let tu: Vec<Coeff> = levels_to_coeffs(lev);
                             let (_s, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 4, true,
                             );
                             let skip = SKIP_TX16_QC[qc][0] as u32;
-                            encode_luma_leaf_dc_class2(
-                                enc, dc_level, skip, dcs, 0, false, pc, 11074,
+                            coder::encode_luma_leaf_16x16_full(
+                                enc, &tu, skip, dcs, 0, false, pc, 11074, tx_idx,
+                            );
+                        }
+                        (8, 4) => {
+                            // 32x16 luma leaf (TX_32X16), ported from the 4:4:4 arm.
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 32, 16, neutral, bd);
+                            let lev = bases.luma32x16.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
+                                    sb_resid_scale,
+                                ),
+                                0.0,
+                                &tables::SCAN32X16,
+                            );
+                            put_block_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                32,
+                                16,
+                                &itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN32X16,
+                                    32,
+                                    16,
+                                    bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 8, 4, true,
+                            );
+                            coder::encode_luma_leaf_32x16(enc, &tu, skip, dcs, 0, false, pc);
+                        }
+                        (4, 8) => {
+                            // 16x32 luma leaf (TX_16X32), ported from the 4:4:4 arm.
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 32, neutral, bd);
+                            let lev = bases.luma16x32.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
+                                    sb_resid_scale,
+                                ),
+                                0.0,
+                                &tables::SCAN16X32,
+                            );
+                            put_block_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                32,
+                                &itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN16X32,
+                                    16,
+                                    32,
+                                    bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 8, true,
+                            );
+                            coder::encode_luma_leaf_16x32(enc, &tu, skip, dcs, 0, false, pc);
+                        }
+                        (4, 2) => {
+                            // 16x8 luma leaf (TX_16X8, rect128), ported from the 4:4:4 arm.
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
+                            let lev = bases.c16x8.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
+                                    sb_resid_scale,
+                                ),
+                                0.0,
+                                &tables::SCAN16X8,
+                            );
+                            put_block_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                16,
+                                8,
+                                &itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN16X8,
+                                    16,
+                                    8,
+                                    bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 2, true,
+                            );
+                            coder::encode_luma_leaf_rect128(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                0,
+                                false,
+                                4,
+                                2,
+                                pc,
+                                12348,
+                                &tables::SCAN16X8,
+                                Some((&coder::TXTP_EXT8, 0, 6)),
+                            );
+                        }
+                        (2, 4) => {
+                            // 8x16 luma leaf (TX_8X16, rect128), ported from the 4:4:4 arm.
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
+                            let lev = bases.c8x16.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
+                                    sb_resid_scale,
+                                ),
+                                0.0,
+                                &tables::SCAN8X16,
+                            );
+                            put_block_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                8,
+                                16,
+                                &itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN8X16,
+                                    8,
+                                    16,
+                                    bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 2, 4, true,
+                            );
+                            coder::encode_luma_leaf_rect128(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                0,
+                                false,
+                                2,
+                                4,
+                                pc,
+                                12348,
+                                &tables::SCAN8X16,
+                                Some((&coder::TXTP_EXT8, 0, 6)),
+                            );
+                        }
+                        (2, 2) => {
+                            // 8x8 luma leaf (TX_8X8), ported from the 4:4:4 arm.
+                            let bd = self.bit_depth as i32;
+                            let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 8, neutral, bd);
+                            let lev = bases.c8x8.project_scan(
+                                &aq::scale_resid(
+                                    &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
+                                    sb_resid_scale,
+                                ),
+                                0.0,
+                                &tables::SCAN8X8,
+                            );
+                            put_block_rect(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                8,
+                                8,
+                                &itx422::reconstruct_chroma(
+                                    pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN8X8,
+                                    8,
+                                    8,
+                                    bd,
+                                ),
+                            );
+                            let tu: Vec<Coeff> = levels_to_coeffs(&lev);
+                            let (skip, dcs) = sb_tu_contexts_rect(
+                                &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 2, 2, true,
+                            );
+                            coder::encode_luma_leaf_8x8(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                0,
+                                false,
+                                pc,
+                                3148,
+                                Some((&coder::TXTP_EXT8, 0, 6)),
                             );
                         }
                         other => unreachable!("unsupported native 4:0:0 leaf {:?}", other),
                     }
                 }
             }
+        }
+        if let Ok(p) = std::env::var("DUMP_REC") {
+            let mut o = Vec::with_capacity(width * height);
+            for r in 0..height {
+                o.extend(
+                    recy[r * pw..r * pw + width]
+                        .iter()
+                        .map(|&v| v.clamp(0.0, 255.0) as u8),
+                );
+            }
+            std::fs::write(p, o).unwrap();
         }
     }
 

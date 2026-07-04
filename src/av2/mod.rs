@@ -81,7 +81,7 @@ use crate::av2::coder::{
     encode_luma_block_vert4, encode_luma_leaf_8x8, encode_luma_leaf_8x32,
     encode_luma_leaf_16x16_full, encode_luma_leaf_16x32, encode_luma_leaf_16x64,
     encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32, encode_luma_leaf_32x64,
-    encode_luma_leaf_64x16, encode_luma_leaf_64x32, encode_luma_leaf_dc_class2,
+    encode_luma_leaf_64x16, encode_luma_leaf_64x32,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,

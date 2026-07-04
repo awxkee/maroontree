@@ -1196,6 +1196,40 @@ impl RangeEncoder {
             self.sym_static(&TX_PART_2D_64, s, nsyms);
         }
     }
+    pub(crate) fn sym_tx_part_64x16(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_64x16;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::TX_PART_64X16_INIT;
+            self.sym_static(&TX_PART_64X16_INIT, s, nsyms);
+        }
+    }
+    pub(crate) fn sym_tx_part_16x64(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_16x64;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::TX_PART_16X64_INIT;
+            self.sym_static(&TX_PART_16X64_INIT, s, nsyms);
+        }
+    }
     pub(crate) fn sym_tx_part_64x32(&mut self, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.tx_part_64x32;

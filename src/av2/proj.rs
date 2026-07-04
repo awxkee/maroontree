@@ -195,6 +195,8 @@ impl Bases {
             self.luma16x16_dct_adst.scale(f);
             self.luma8x32.scale(f);
             self.luma32x8.scale(f);
+            self.luma16x32.scale(f);
+            self.luma32x16.scale(f);
             self.c16x32.scale(f);
             self.c8x64.scale(f);
             self.c32x16.scale(f);
@@ -217,6 +219,8 @@ impl Bases {
         self.luma16x16_dct_adst.qstep = qs;
         self.luma8x32.qstep = qs;
         self.luma32x8.qstep = qs;
+        self.luma16x32.qstep = qs;
+        self.luma32x16.qstep = qs;
         self.luma16x64.qstep = qs;
         self.luma64x16.qstep = qs;
         self.c16x32.qstep = qs;

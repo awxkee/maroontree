@@ -143,6 +143,8 @@ pub(crate) static UV_MODE_INIT: [[u16; 7]; 2] = [
 pub(crate) static DELTA_Q_INIT: [u16; 7] = [16174, 9443, 6344, 4543, 3410, 2669, 2155];
 pub(crate) static TX_PART_64X32_INIT: [u16; 6] = [28067, 19266, 7810, 6355, 4602, 2639];
 pub(crate) static TX_PART_32X64_INIT: [u16; 6] = [30413, 15167, 11065, 6718, 4887, 1371];
+pub(crate) static TX_PART_64X16_INIT: [u16; 6] = [30452, 28054, 10037, 8971, 3254, 2691];
+pub(crate) static TX_PART_16X64_INIT: [u16; 6] = [31215, 16608, 14089, 4785, 3176, 629];
 pub(crate) static INTRA_EXT_TX16_INIT: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
 pub(crate) static TX_SHORT_SIDE_INIT: [[u16; 3]; 2] = [
     [6068, 608, 20], // ctx 0: intra_ext_tx_short_side_cdf index 1 (8x32 / 32x8 leaves)
@@ -200,6 +202,8 @@ pub(crate) struct CdfState {
     pub(crate) tx_part_64: Vec<u16>,            // nsyms=5
     pub(crate) tx_part_64x32: Vec<u16>,
     pub(crate) tx_part_32x64: Vec<u16>,
+    pub(crate) tx_part_64x16: Vec<u16>,
+    pub(crate) tx_part_16x64: Vec<u16>,
     pub(crate) tx_short_side: Vec<Vec<u16>>, // [2 ctx] nsyms=2
     pub(crate) cfl_sign: Vec<u16>,           // nsyms=7
     pub(crate) cfl_alpha: Vec<Vec<u16>>,     // [6] × nsyms=7
@@ -320,6 +324,8 @@ impl CdfState {
             tx_part_64: expand_para(&TX_PART_2D_64, 6, (2, 3, 3)),
             tx_part_64x32: expand_para(&TX_PART_64X32_INIT, 6, (2, 3, 3)),
             tx_part_32x64: expand_para(&TX_PART_32X64_INIT, 6, (2, 3, 3)),
+            tx_part_64x16: expand_para(&TX_PART_64X16_INIT, 6, (2, 2, 3)),
+            tx_part_16x64: expand_para(&TX_PART_16X64_INIT, 6, (2, 3, 3)),
             tx_short_side: (0..2)
                 .map(|c| expand_para(&TX_SHORT_SIDE_INIT[c], 3, cdf_para::PARA_TX_SHORT_SIDE))
                 .collect(),

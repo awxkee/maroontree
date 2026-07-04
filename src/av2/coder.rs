@@ -2041,58 +2041,6 @@ pub(crate) fn encode_luma_leaf_32x64(
     cul
 }
 
-/// Encode a bottom-right 16×16 intra luma corner leaf (residue 4 in both dims).
-/// BLOCK_16X16 is tx-part group 3 (cdf 11074); NONE → single TX_16X16 (entropy class
-/// 2, eob class 256). Luma is coded DC-only: keeping eob count == 1 makes the decoder
-/// skip the (otherwise complex) EXT_NEW_TX_SET tx_type read entirely (dc_skip). A
-/// `dc_level` of 0 emits a skip. `tx_type` is luma-only, so chroma 16×16 still codes
-/// full AC separately. The DC is the LF eob coeff at raster pos 0, so its base-range
-/// context is 0 (get_br_ctx_lf_eob).
-/// Encode a DC-only intra luma leaf in entropy class 2: the 16×16 corner (TX_16X16,
-/// do_part group 3 → cdf 11074) and the residue-2 edges 8×32 / 32×8 (TX_8X32 / TX_32X8,
-/// do_part group 7 → cdf 18032). Keeping eob count == 1 makes the decoder skip the
-/// tx_type read (dc_skip), avoiding the EXT_NEW_TX_SET / LONG_SIDE_32 sets these sizes
-/// would otherwise use. All three are entropy class 2 (LUMA16 LF eob cdf) with eob
-/// class 256. `dc_level` 0 → skip. `tx_type` is luma-only so chroma still codes full
-/// AC. The DC is the LF eob coeff at raster pos 0, base-range context 0.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_luma_leaf_dc_class2(
-    enc: &mut RangeEncoder,
-    dc_level: i32,
-    skip_cdf: u32,
-    dc_sign_ctx: usize,
-    mode_idx: usize,
-    has_chroma: bool,
-    part_cdf: u32,
-    do_part_cdf: u32,
-) -> u32 {
-    enc.cur_bw4 = 32;
-    enc.cur_bh4 = 32;
-    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
-    enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE → single transform
-    if dc_level == 0 {
-        enc.bool_txb_skip(skip_cdf, 1);
-        return 0;
-    }
-    enc.bool_txb_skip(skip_cdf, 0);
-    // eob count 1 (position 0): decoder's dc_skip path skips tx_type + sec_tx_type.
-    encode_eob(enc, 0, EobCdf::Eob256, EOB_HI_BIT_QC[enc.qc], 1, 7);
-    let mag = dc_level.unsigned_abs();
-    if mag <= 4 {
-        enc.sym_luma16_eob_lf(0, (mag - 1) as usize, 4);
-    } else {
-        enc.sym_luma16_eob_lf(0, 4, 4);
-        encode_luma_base_range(enc, mag, 0, false);
-    }
-    enc.bool_dc_sign(
-        DC_SIGN_QC[enc.qc][dc_sign_ctx] as u32,
-        (dc_level < 0) as u32,
-    );
-    if mag >= 8 {
-        encode_high_range(enc, mag - 8, 0);
-    }
-    mag.min(63)
-}
 /// do_partition (both splits allowed) → emit NONE (group-8 cdf 18958 = 32768 -
 /// AVM_CDF2(13810)) for a single TX_16X64. Coeff region 16×32, scan SCAN16X32, eob
 /// class 512. block==tx dimensionally (16×64) so the caller passes a ctx-0 skip cdf.
@@ -2125,6 +2073,74 @@ pub(crate) fn encode_luma_leaf_16x64(
 /// Encode a bottom-edge 64×16 intra luma leaf (residue 4). BLOCK_64X16 is also
 /// tx-part group 8 (cdf 18958); NONE → single TX_64X16, coeff region 32×16, scan
 /// SCAN32X16, eob class 512.
+/// 64x16 leaf with tx-partition VERT: two side-by-side TX_32X16 TUs.
+/// avm read_tx_partition: do_partition=1, 4way symbol VERT-1=2 (group 13).
+pub(crate) fn encode_luma_leaf_64x16_vert(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 2],
+    skip_cdfs: &[u32; 2],
+    dc_sign_ctxs: &[usize; 2],
+    mode_idx: usize,
+    has_chroma: bool,
+    part_cdf: u32,
+) -> [u32; 2] {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 4;
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
+    enc.bool_txfm_part(18958, 1);
+    enc.sym_tx_part_64x16(2, 6);
+    let mut cul = [0u32; 2];
+    for i in 0..2 {
+        cul[i] = encode_luma_tu_rect_long32(
+            enc,
+            &tus[i],
+            skip_cdfs[i],
+            dc_sign_ctxs[i],
+            &SCAN32X16,
+            EobCdf::Eob512,
+            EOB_HI_BIT_QC[enc.qc],
+            512,
+            &[5853, 357, 20],
+            false,
+        );
+    }
+    cul
+}
+
+/// 16x64 leaf with tx-partition HORZ: two stacked TX_16X32 TUs (symbol HORZ-1=1).
+pub(crate) fn encode_luma_leaf_16x64_horz(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 2],
+    skip_cdfs: &[u32; 2],
+    dc_sign_ctxs: &[usize; 2],
+    mode_idx: usize,
+    has_chroma: bool,
+    part_cdf: u32,
+) -> [u32; 2] {
+    enc.cur_bw4 = 4;
+    enc.cur_bh4 = 16;
+    encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
+    enc.bool_txfm_part(18958, 1);
+    enc.sym_tx_part_16x64(1, 6);
+    let mut cul = [0u32; 2];
+    for i in 0..2 {
+        cul[i] = encode_luma_tu_rect_long32_w(
+            enc,
+            &tus[i],
+            skip_cdfs[i],
+            dc_sign_ctxs[i],
+            &SCAN16X32,
+            EobCdf::Eob512,
+            EOB_HI_BIT_QC[enc.qc],
+            512,
+            &[5853, 357, 20],
+            false,
+            4,
+        );
+    }
+    cul
+}
+
 pub(crate) fn encode_luma_leaf_64x16(
     enc: &mut RangeEncoder,
     tu: &[Coeff],
