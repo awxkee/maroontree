@@ -280,9 +280,13 @@ pub(crate) fn quantize_to_levels(
     let th = thresh;
     let mut lev = vec![0f32; scan.len()];
     let mut prm = vec![0f32; scan.len()];
+    // Width-w AVM scans (rc=row*cw+col) index the row-major fdct out directly;
+    // legacy stride-32 scans (rc=col*32+row) use the old decode.
+    let wscan = !scan.is_empty() && scan.get(1).is_some_and(|&v| v as usize == n);
     for ((&rc, prm), lev) in scan.iter().zip(prm.iter_mut()).zip(lev.iter_mut()) {
         let rc = rc as usize;
-        let pr = coeff[(rc & 31) * n + (rc >> 5)] as f32 * inv_q;
+        let idx = if wscan { rc } else { (rc & 31) * n + (rc >> 5) };
+        let pr = coeff[idx] as f32 * inv_q;
         let a = pr.abs();
         *prm = a;
         if a >= th {

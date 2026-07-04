@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
 #[allow(unused_imports)]
 mod aq;
 pub(crate) mod av2_itx;
@@ -34,6 +35,7 @@ mod ccso;
 mod cdf_para;
 mod cdf_state;
 mod cdfs_qctx;
+pub(crate) mod cdfs_uv_qcx;
 mod cdfx_4tx;
 #[allow(dead_code)]
 mod cfl;
@@ -66,8 +68,7 @@ mod wht;
 
 use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::{
-    CHROMA_EOB_HI_BIT_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, CHROMA_SKIP_V_QC, SKIP_TX8_QC,
-    SKIP_TX16_QC,
+    CHROMA_EOB_HI_BIT_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, SKIP_TX8_QC, SKIP_TX16_QC,
 };
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::chroma422::{
@@ -75,12 +76,12 @@ use crate::av2::chroma422::{
 };
 use crate::av2::coder::{
     Coeff, EobCdf, encode_chroma_block, encode_chroma_block_ex, encode_chroma_block_rect,
-    encode_chroma_tu4, encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
-    encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_8x8,
-    encode_luma_leaf_8x32, encode_luma_leaf_16x16_full, encode_luma_leaf_16x32,
-    encode_luma_leaf_16x64, encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32,
-    encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
-    encode_luma_leaf_dc_class2,
+    encode_chroma_block_rect_w, encode_chroma_tu4, encode_lossless_luma_sb,
+    encode_luma_block_horz4, encode_luma_block_split, encode_luma_block_split_dir,
+    encode_luma_block_vert4, encode_luma_leaf_8x8, encode_luma_leaf_8x32,
+    encode_luma_leaf_16x16_full, encode_luma_leaf_16x32, encode_luma_leaf_16x64,
+    encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32, encode_luma_leaf_32x64,
+    encode_luma_leaf_64x16, encode_luma_leaf_64x32, encode_luma_leaf_dc_class2,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,

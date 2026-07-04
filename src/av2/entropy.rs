@@ -174,6 +174,7 @@ pub(crate) struct RangeEncoder {
     /// resolved joint-sign, per-plane magnitude indices and alpha-cdf contexts.
     pub(crate) cfl_ctx: usize,
     pub(crate) cfl_use: bool,
+    pub(crate) cfl_signaled: bool,
     pub(crate) cfl_js: u8,
     pub(crate) cfl_mag_u: u8,
     pub(crate) cfl_mag_v: u8,
@@ -232,6 +233,7 @@ impl RangeEncoder {
             cfl: false,
             cfl_ctx: 0,
             cfl_use: false,
+            cfl_signaled: false,
             cfl_js: 0,
             cfl_mag_u: 0,
             cfl_mag_v: 0,
@@ -662,76 +664,6 @@ impl RangeEncoder {
         }
     }
 
-    pub(crate) fn sym_chr_hf(&mut self, ctx: usize, s: usize) {
-        if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.chr_hf[ctx];
-            Self::sym_mut_inner(
-                &mut self.low,
-                &mut self.range,
-                &mut self.count,
-                &mut self.output,
-                cdf,
-                s,
-                3,
-            );
-        } else {
-            use crate::av2::cdfs_qctx::CHROMA_BASE_TOK_HF_QC;
-            self.sym_static(&CHROMA_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
-        }
-    }
-
-    pub(crate) fn sym_chr_lf(&mut self, ctx: usize, s: usize) {
-        if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.chr_lf[ctx];
-            Self::sym_mut_inner(
-                &mut self.low,
-                &mut self.range,
-                &mut self.count,
-                &mut self.output,
-                cdf,
-                s,
-                5,
-            );
-        } else {
-            use crate::av2::cdfs_qctx::CHROMA_BASE_TOK_LF_QC;
-            self.sym_static(&CHROMA_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
-        }
-    }
-    pub(crate) fn sym_chr_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
-        if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.chr_eob_hf[ctx];
-            Self::sym_mut_inner(
-                &mut self.low,
-                &mut self.range,
-                &mut self.count,
-                &mut self.output,
-                cdf,
-                s,
-                nsyms,
-            );
-        } else {
-            use crate::av2::cdfs_qctx::CHROMA_EOB_TOK_HF_QC;
-            self.sym_static(&CHROMA_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
-        }
-    }
-    pub(crate) fn sym_chr_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
-        if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.chr_eob_lf[ctx];
-            Self::sym_mut_inner(
-                &mut self.low,
-                &mut self.range,
-                &mut self.count,
-                &mut self.output,
-                cdf,
-                s,
-                nsyms,
-            );
-        } else {
-            use crate::av2::cdfs_qctx::CHROMA_EOB_TOK_LF_QC;
-            self.sym_static(&CHROMA_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
-        }
-    }
-    // ---- base-range carry -------------------------------------------------
     pub(crate) fn sym_br_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.br_hf[ctx];
@@ -766,23 +698,7 @@ impl RangeEncoder {
             self.sym_static(&BR_TOK_QC[self.qc][ctx], s, nsyms);
         }
     }
-    pub(crate) fn sym_chr_br(&mut self, ctx: usize, s: usize, nsyms: usize) {
-        if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.chr_br[ctx];
-            Self::sym_mut_inner(
-                &mut self.low,
-                &mut self.range,
-                &mut self.count,
-                &mut self.output,
-                cdf,
-                s,
-                nsyms,
-            );
-        } else {
-            use crate::av2::cdfs_qctx::CHROMA_BR_TOK_HF_QC;
-            self.sym_static(&CHROMA_BR_TOK_HF_QC[self.qc][ctx], s, nsyms);
-        }
-    }
+
     // ---- EOB bin (7-symbol, used via encode_eob) --------------------------
     pub(crate) fn sym_eob_bin(&mut self, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
@@ -1353,6 +1269,7 @@ impl RangeEncoder {
     }
     // ---- CfL -------------------------------------------------------------
     pub(crate) fn bool_cfl_is(&mut self, ctx: usize, static_cdf: u32, bit: u32) {
+        self.cfl_signaled = bit != 0; // what the stream actually says
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.cfl_is[ctx];
             Self::sym_mut_inner(
@@ -1576,7 +1493,7 @@ impl RangeEncoder {
             // value and must adapt the TX32 slot (avm txs_ctx=3), not the TX64 slot. The
             // V plane is unambiguous and is selected explicitly.
             let (slot, ctx) = if table == 2 {
-                (2u8, cs.skip_ctx_in(static_cdf as u16, 2))
+                (2u8, static_cdf as usize)
             } else {
                 cs.skip_slot_of(static_cdf as u16)
             };
@@ -1597,6 +1514,9 @@ impl RangeEncoder {
                 bit as usize,
                 1,
             );
+        } else if table == 2 {
+            use crate::av2::cdfs_qctx::V_SKIP_TX4_QC;
+            self.encode_bool(V_SKIP_TX4_QC[self.qc][static_cdf as usize] as u32, bit);
         } else {
             self.encode_bool(static_cdf, bit);
         }

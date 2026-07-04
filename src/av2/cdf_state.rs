@@ -29,6 +29,7 @@
 
 use crate::av2::cdf_para;
 use crate::av2::cdfs_qctx::*;
+use crate::av2::cdfs_uv_qcx as uvq;
 use crate::av2::cdfx_4tx::*;
 use crate::av2::cfl;
 use crate::av2::tables_tx32::TX_PART_2D_64;
@@ -166,13 +167,8 @@ pub(crate) struct CdfState {
     pub(crate) luma32_lf: Vec<Vec<u16>>,
     pub(crate) luma32_eob_hf: Vec<Vec<u16>>,
     pub(crate) luma32_eob_lf: Vec<Vec<u16>>,
-    pub(crate) chr_hf: Vec<Vec<u16>>,     // [12]
-    pub(crate) chr_lf: Vec<Vec<u16>>,     // [12]
-    pub(crate) chr_eob_hf: Vec<Vec<u16>>, // [4]
-    pub(crate) chr_eob_lf: Vec<Vec<u16>>, // [4]
-    pub(crate) br_hf: Vec<Vec<u16>>,      // [7]
-    pub(crate) br: Vec<Vec<u16>>,         // [14]
-    pub(crate) chr_br: Vec<Vec<u16>>,     // [4]
+    pub(crate) br_hf: Vec<Vec<u16>>, // [7]
+    pub(crate) br: Vec<Vec<u16>>,    // [14]
     pub(crate) eob_bin: Vec<u16>,
     pub(crate) eob64_luma: Vec<u16>,
     pub(crate) eob128_luma: Vec<u16>,
@@ -282,28 +278,8 @@ impl CdfState {
                 &LUMA32_EOB_TOK_LF_QC[qc],
                 &cdf_para::PARA_LUMA32_EOB_TOK_LF[qc],
             ),
-            chr_hf: e1d_para(
-                &CHROMA_BASE_TOK_HF_QC[qc],
-                &cdf_para::PARA_CHROMA_BASE_TOK_HF[qc],
-            ),
-            chr_lf: e1d_para(
-                &CHROMA_BASE_TOK_LF_QC[qc],
-                &cdf_para::PARA_CHROMA_BASE_TOK_LF[qc],
-            ),
-            chr_eob_hf: e1d_para(
-                &CHROMA_EOB_TOK_HF_QC[qc],
-                &cdf_para::PARA_CHROMA_EOB_TOK_HF[qc],
-            ),
-            chr_eob_lf: e1d_para(
-                &CHROMA_EOB_TOK_LF_QC[qc],
-                &cdf_para::PARA_CHROMA_EOB_TOK_LF[qc],
-            ),
             br_hf: e1d_para(&BR_TOK_HF_QC[qc], &cdf_para::PARA_BR_TOK_HF[qc]),
             br: e1d_para(&BR_TOK_QC[qc], &cdf_para::PARA_BR_TOK[qc]),
-            chr_br: e1d_para(
-                &CHROMA_BR_TOK_HF_QC[qc],
-                &cdf_para::PARA_CHROMA_BR_TOK_HF[qc],
-            ),
             eob_bin: expand_para(&EOB_BIN_QC[qc], 7, cdf_para::PARA_EOB_BIN[qc]),
             eob64_luma: expand_para(&EOB64_LUMA_QC[qc], 6, cdf_para::PARA_EOB64_LUMA[qc]),
             eob128_luma: expand_para(&EOB128_LUMA_QC[qc], 7, cdf_para::PARA_EOB128_LUMA[qc]),
@@ -328,11 +304,14 @@ impl CdfState {
             base_eob_tx4: e1d(&BASE_EOB_TX4_Q0),
             br_lf_q0: e1d(&BR_LF_Q0),
             br_q0: e1d(&BR_Q0),
-            base_lf_uv: e1d_para(&BASE_LF_UV_Q0, &cdf_para::PARA_BASE_LF_UV),
-            base_uv: e1d_para(&BASE_UV_Q0, &cdf_para::PARA_BASE_UV),
-            br_uv: e1d_para(&BR_UV_Q0, &cdf_para::PARA_BR_UV),
-            base_lf_eob_uv: e1d_para(&BASE_LF_EOB_UV_Q0, &cdf_para::PARA_BASE_LF_EOB_UV),
-            base_eob_uv: e1d_para(&BASE_EOB_UV_Q0, &cdf_para::PARA_BASE_EOB_UV),
+            base_lf_uv: e1d_para(&uvq::BASE_LF_UV_QCX[qc], &uvq::PARA_BASE_LF_UV_QCX[qc]),
+            base_uv: e1d_para(&uvq::BASE_UV_QCX[qc], &uvq::PARA_BASE_UV_QCX[qc]),
+            br_uv: e1d_para(&uvq::BR_UV_QCX[qc], &uvq::PARA_BR_UV_QCX[qc]),
+            base_lf_eob_uv: e1d_para(
+                &uvq::BASE_LF_EOB_UV_QCX[qc],
+                &uvq::PARA_BASE_LF_EOB_UV_QCX[qc],
+            ),
+            base_eob_uv: e1d_para(&uvq::BASE_EOB_UV_QCX[qc], &uvq::PARA_BASE_EOB_UV_QCX[qc]),
             y_set: expand_para(&Y_SET_INIT, 3, cdf_para::PARA_Y_SET),
             y_idx0: e1d_para(&Y_IDX0_INIT, &cdf_para::PARA_Y_IDX0),
             y_idx1: e1d_para(&Y_IDX1_INIT, &cdf_para::PARA_Y_IDX1),
@@ -454,20 +433,6 @@ impl CdfState {
         }
     }
 
-    /// Locate the adaptive working copy for a resolved skip CDF value, searching
-    /// the three skip tables (TX32, TX64, V) in turn. Returns which table and the
-    /// context index. Values within each (table, qc) are unique; the only cross-
-    /// table collision is the neutral 16384, which adapts equivalently anywhere.
-    /// Find the context index for a skip value within a specific table id
-    /// (0=TX32, 1=TX64, 2=V). Avoids cross-table collisions (e.g. neutral 16384).
-    pub(crate) fn skip_ctx_in(&self, val: u16, table: u8) -> usize {
-        let tbl: &[u16] = match table {
-            0 => &CHROMA_SKIP_TX32_QC[self.qc],
-            1 => &CHROMA_SKIP_TX64_QC[self.qc],
-            _ => &V_SKIP_TX4_QC[self.qc],
-        };
-        tbl.iter().position(|&v| v == val).unwrap_or(0)
-    }
     pub(crate) fn skip_slot_of(&self, val: u16) -> (u8, usize) {
         if let Some(i) = CHROMA_SKIP_TX32_QC[self.qc].iter().position(|&v| v == val) {
             return (0, i);

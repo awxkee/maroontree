@@ -235,7 +235,9 @@ impl AqState {
         boost_only: bool,
     ) -> Self {
         self.vb_octile = octile.clamp(1, 8);
-        self.vb_strength = strength.max(0.0);
+        // SS2-calibrated taper: boost pays at coarse q, is net-negative near-lossless.
+        let taper = ((self.base_q as f32 - 30.0) / 40.0).clamp(0.0, 1.0);
+        self.vb_strength = strength.max(0.0) * taper;
         self.vb_boost_only = boost_only;
         self
     }
@@ -274,6 +276,16 @@ impl AqState {
             .clamp(-(AQ_MAX_SIGNALED as f32), AQ_MAX_SIGNALED as f32) as i32;
         let newq = (self.last_qidx + sig * step).clamp(1, 255);
         let qs = qstep(newq as u32) as i32;
+        (qs, self.qstep_base as f32 / qs as f32)
+    }
+
+    /// Current accumulated (qstep, resid_scale) without signaling — for SBs that
+    /// emit delta 0 but must code at the decoder's accumulated qindex.
+    pub(crate) fn current(&self) -> (i32, f32) {
+        if !self.present {
+            return (self.qstep_base, 1.0);
+        }
+        let qs = qstep(self.last_qidx as u32) as i32;
         (qs, self.qstep_base as f32 / qs as f32)
     }
 

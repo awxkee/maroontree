@@ -229,6 +229,7 @@ impl Av2Encoder {
                         enc.cfl_ctx_v = ch.ctx_v;
                     } else {
                         enc.cfl_use = false;
+                        enc.cfl_signaled = false;
                     }
                     enc.delta_q_pending = enc.delta_q_present;
                     encode_luma_block_split(
@@ -348,7 +349,7 @@ impl Av2Encoder {
                         1024,
                     );
                     let up_ = uc.iter().any(|&(_, l)| l != 0);
-                    let v_skip = CHROMA_SKIP_V_QC[qc][(6 * (up_ as i32) + va + vl) as usize] as u32;
+                    let v_skip = (6 * (up_ as i32) + va + vl) as u32;
                     encode_chroma_block_rect(
                         &mut enc,
                         &vc,
@@ -420,6 +421,7 @@ impl Av2Encoder {
                     let cfl_l = if lmc > 0 { cfl_left[lmr] } else { 0 };
                     enc.cfl_ctx = (cfl_a + cfl_l) as usize;
                     enc.cfl_use = false;
+                    enc.cfl_signaled = false;
                     enc.mhccp_use = false;
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
@@ -1489,6 +1491,8 @@ impl Av2Encoder {
                                 dcs,
                                 0,
                                 true,
+                                2,
+                                4,
                                 pc,
                                 12348,
                                 &crate::av2::tables::SCAN8X16,
@@ -1594,6 +1598,8 @@ impl Av2Encoder {
                                 dcs,
                                 0,
                                 true,
+                                4,
+                                2,
                                 pc,
                                 12348,
                                 &crate::av2::tables::SCAN16X8,
@@ -1833,7 +1839,7 @@ impl Av2Encoder {
                         }
                         other => unreachable!("unsupported native 4:2:2 leaf {:?}", other),
                     };
-                    let cfl_used = enc.cfl_use as i32;
+                    let cfl_used = enc.cfl_signaled as i32;
                     for c in lmc..lmc + bw_mi {
                         u_above[c] = u_present as i32;
                         v_above[c] = v_present as i32;

@@ -50,11 +50,17 @@ const PLVL_BUF: usize = (PLVL_STRIDE as usize) * 40;
 fn plvl(rc: i32) -> i32 {
     (rc >> 5) * PLVL_STRIDE + (rc & 31)
 }
+fn plvl_w(rc: i32, bwl: i32) -> i32 {
+    (rc >> bwl) * PLVL_STRIDE + (rc & ((1 << bwl) - 1))
+}
 
 fn luma_coeff_context(levels: &[i32], rc: i32, xy: i32) -> (usize, usize) {
+    luma_coeff_context_w(levels, rc, xy, 5)
+}
+fn luma_coeff_context_w(levels: &[i32], rc: i32, xy: i32, bwl: i32) -> (usize, usize) {
     let low_freq = xy < 4;
     let mut limit: i32 = if low_freq { 5 } else { 3 };
-    let p = plvl(rc);
+    let p = plvl_w(rc, bwl);
     let neighbor = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
     let mut low_mag = 0i32;
     let mut hi_mag = 0i32;
@@ -99,8 +105,17 @@ fn luma_coeff_context(levels: &[i32], rc: i32, xy: i32) -> (usize, usize) {
 /// Chroma (2D DCT) token context. `plane_offset` is 0 for U and 4 for V.
 /// Returns `(base_context, hi_range_context)`.
 fn chroma_coeff_context(levels: &[i32], rc: i32, xy: i32, plane_offset: usize) -> (usize, usize) {
+    chroma_coeff_context_w(levels, rc, xy, plane_offset, 5)
+}
+fn chroma_coeff_context_w(
+    levels: &[i32],
+    rc: i32,
+    xy: i32,
+    plane_offset: usize,
+    bwl: i32,
+) -> (usize, usize) {
     let add_limit: i32 = if xy < 1 { 5 } else { 3 };
-    let p = plvl(rc);
+    let p = plvl_w(rc, bwl);
     let neighbor = |dy: i32, dx: i32| -> i32 { levels[(p + dy * PLVL_STRIDE + dx) as usize] };
     let (right, below, below_right) = (neighbor(0, 1), neighbor(1, 0), neighbor(1, 1));
     let low_mag = right.min(add_limit) + below.min(add_limit) + below_right.min(add_limit);
@@ -190,16 +205,6 @@ fn encode_luma_base_range(
         } else {
             enc.sym_br(hi_range_ctx, 3, 3);
         }
-    }
-}
-
-/// Chroma high-frequency base-range symbol (limit 3; golomb handles the tail).
-fn encode_chroma_base_range(enc: &mut RangeEncoder, magnitude: u32, hi_range_ctx: usize) {
-    let over = magnitude - 3;
-    if over <= 2 {
-        enc.sym_chr_br(hi_range_ctx, over as usize, 3);
-    } else {
-        enc.sym_chr_br(hi_range_ctx, 3, 3);
     }
 }
 
@@ -923,16 +928,19 @@ pub(crate) fn encode_intra_modes_dir(
         midx = target;
     }
     if has_chroma {
-        if enc.cfl {
+        // Same read condition as encode_intra_modes: is_cfl is read whenever
+        // cfl OR (mhccp && block-allowed); switch only coded when cfl is on.
+        if enc.cfl || (enc.mhccp && enc.mhccp_allowed) {
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
                 enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
-                // avm: when MHCCP is enabled at seq level, emit the switch first.
                 if enc.mhccp && enc.mhccp_allowed {
-                    enc.bool_cfl_mhccp(
-                        crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
-                        enc.mhccp_use as u32,
-                    );
+                    if enc.cfl {
+                        enc.bool_cfl_mhccp(
+                            crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
+                            enc.mhccp_use as u32,
+                        );
+                    }
                     if !enc.mhccp_use {
                         enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
                     }
@@ -1037,15 +1045,19 @@ fn encode_intra_modes(
         // cfl_index=0 (CFL_EXPLICIT), then the joint sign + per-plane magnitudes, and
         // skip the uv-mode symbol entirely (decoder sets uv_mode = UV_CFL_PRED & returns).
         // Otherwise emit is_cfl=0 with the neighbor context and fall through to uv-mode.
-        if enc.cfl {
+        // Decoder reads is_cfl iff is_cfl_allowed(enable_cfl_intra) || is_mhccp_allowed;
+        // with cfl off but mhccp on, the switch is inferred =1 (not coded).
+        if enc.cfl || (enc.mhccp && enc.mhccp_allowed) {
             let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
             if enc.cfl_use {
                 enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
                 if enc.mhccp && enc.mhccp_allowed {
-                    enc.bool_cfl_mhccp(
-                        crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
-                        enc.mhccp_use as u32,
-                    );
+                    if enc.cfl {
+                        enc.bool_cfl_mhccp(
+                            crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
+                            enc.mhccp_use as u32,
+                        );
+                    }
                     if !enc.mhccp_use {
                         enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
                     }
@@ -1108,7 +1120,7 @@ fn encode_luma_signs(
 }
 
 /// Stored per-coefficient data for chroma: `(rc, mag, is_dc)`.
-type ChromaStored = (i32, u32, bool);
+type ChromaStored = (i32, bool);
 
 /// Reverse-scan token pass for chroma; fills the neighbor-level grid.
 /// DC is low-frequency; all AC is high-frequency.
@@ -1132,49 +1144,59 @@ fn encode_chroma_tokens_scan(
     scan: &[u16],
     area: usize,
 ) -> Vec<ChromaStored> {
-    let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
+    encode_chroma_tokens_scan_w(enc, coeffs, eob, plane_offset, scan, area, 5)
+}
+fn encode_chroma_tokens_scan_w(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    eob: usize,
+    plane_offset: usize,
+    scan: &[u16],
+    area: usize,
+    bwl: i32,
+) -> Vec<ChromaStored> {
+    // height = area / width = area >> bwl
+    let height = area >> bwl;
+    let t1 = (height << bwl) / 8;
+    let t2 = (height << bwl) / 4;
+    let mut levels = vec![0u8; PLVL_BUF];
     let mut stored: Vec<ChromaStored> = vec![];
+    let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
         let level = level_at(coeffs, scan_pos);
-        let rc = scan[scan_pos] as i32;
-        let x = rc >> 5;
-        let y = rc & 31;
+        let rc = scan[scan_pos] as usize;
+        let row = rc >> bwl;
+        let col = rc & mask;
         let mag = level.unsigned_abs();
         let is_eob = scan_pos == eob;
-        let is_dc = scan_pos == 0;
-        if is_eob && is_dc {
-            if mag <= 4 {
-                enc.sym_chr_eob_lf(0, (mag - 1) as usize, 4);
+        let lf = (row + col) < 1;
+        let (base_ctx, hi_ctx) = if is_eob {
+            // get_lower_levels_ctx_eob(bwl, height, scan_idx)
+            let c = scan_pos;
+            let e = if c == 0 {
+                0
+            } else if c <= t1 {
+                1
+            } else if c <= t2 {
+                2
             } else {
-                enc.sym_chr_eob_lf(0, 4, 4);
-            }
-        } else if is_eob {
-            let eob_ctx = 1 + (eob > th1) as usize + (eob > th2) as usize;
-            if mag <= 2 {
-                enc.sym_chr_eob_hf(eob_ctx, (mag - 1) as usize, 2);
-            } else {
-                enc.sym_chr_eob_hf(eob_ctx, 2, 2);
-                encode_chroma_base_range(enc, mag, 0);
-            }
-        } else if is_dc {
-            let (base_ctx, _) = chroma_coeff_context(&levels, rc, 0, plane_offset);
-            if mag <= 4 {
-                enc.sym_chr_lf(base_ctx, mag as usize);
-            } else {
-                enc.sym_chr_lf(base_ctx, 5);
-            }
+                3
+            };
+            (e, 0)
+        } else if lf {
+            (ctx_lf_2d_chroma_w(&levels, rc, plane_offset, bwl), 0)
         } else {
-            let (base_ctx, hi_range_ctx) = chroma_coeff_context(&levels, rc, x + y, plane_offset);
-            if mag <= 2 {
-                enc.sym_chr_hf(base_ctx, mag as usize);
-            } else {
-                enc.sym_chr_hf(base_ctx, 3);
-                encode_chroma_base_range(enc, mag, hi_range_ctx);
-            }
+            (
+                ctx_2d_chroma_w(&levels, rc, plane_offset, bwl),
+                br_ctx_2d_chroma_w(&levels, rc, bwl),
+            )
+        };
+        if std::env::var("CBE").is_ok() && bwl == 4 && plane_offset == 0 && !is_eob && !lf {
+            eprintln!("CBE pos={} ctx={} mag={}", rc, base_ctx, mag);
         }
-        levels[plvl(rc) as usize] = (mag as i32).min(5);
-        stored.push((rc, mag, is_dc));
+        let sl = encode_chroma4_token(enc, mag, is_eob, base_ctx, hi_ctx, lf);
+        levels[pidx_w(rc, bwl)] = sl as u8;
+        stored.push((level, !lf));
     }
     stored
 }
@@ -1192,6 +1214,22 @@ pub(crate) fn encode_chroma_block_rect(
     eob_cdf: EobCdf,
     eob_hi: u16,
     area: usize,
+) {
+    encode_chroma_block_rect_w(
+        enc, coeffs, skip_cdf, is_u_plane, scan, eob_cdf, eob_hi, area, 5,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_chroma_block_rect_w(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    skip_cdf: u32,
+    is_u_plane: bool,
+    scan: &[u16],
+    eob_cdf: EobCdf,
+    eob_hi: u16,
+    area: usize,
+    bwl: i32,
 ) {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     let skip_tbl: u8 = if is_u_plane { 1 } else { 2 };
@@ -1222,21 +1260,29 @@ pub(crate) fn encode_chroma_block_rect(
         },
     );
     let plane_offset = if is_u_plane { 0 } else { 4 };
-    let stored = encode_chroma_tokens_scan(enc, &nonzero, eob, plane_offset, scan, area);
-    encode_chroma_signs(enc, &nonzero, &stored);
+    let stored = encode_chroma_tokens_scan_w(enc, &nonzero, eob, plane_offset, scan, area, bwl);
+    encode_chroma_signs(enc, &stored);
 }
 
 /// Sign + golomb residual pass for chroma (all signs are bypass).
-fn encode_chroma_signs(enc: &mut RangeEncoder, coeffs: &[Coeff], stored: &[ChromaStored]) {
+fn encode_chroma_signs(enc: &mut RangeEncoder, stored: &[ChromaStored]) {
     let mut running_avg = 0i32;
-    for &(rc, mag, is_dc) in stored {
-        if mag == 0 {
+    for &(level, high_freq) in stored {
+        if level == 0 {
             continue;
         }
-        let scan_pos = SCAN.iter().position(|&s| s as i32 == rc).unwrap();
-        let level = level_at(coeffs, scan_pos);
+        let mag = level.unsigned_abs();
         enc.encode_bypass(if level < 0 { 1 } else { 0 }, 1);
-        let max_base_range = if is_dc { 5u32 } else { 6u32 };
+        let max_base_range = if high_freq { 6u32 } else { 5u32 };
+        if std::env::var("SGE").is_ok() {
+            eprintln!(
+                "SGE mag={} hf={} maxbr={} hr={}",
+                mag,
+                high_freq,
+                max_base_range,
+                mag.saturating_sub(max_base_range)
+            );
+        }
         if mag >= max_base_range {
             running_avg = encode_high_range(enc, mag - max_base_range, running_avg);
         }
@@ -1290,7 +1336,7 @@ pub(crate) fn encode_chroma_block_ex(
     );
     let plane_offset = if is_u_plane { 0 } else { 4 };
     let stored = encode_chroma_tokens(enc, &nonzero, eob, plane_offset);
-    encode_chroma_signs(enc, &nonzero, &stored);
+    encode_chroma_signs(enc, &stored);
 }
 
 // ----- TX_32X32 luma split path -------------------------------------------------
@@ -1387,42 +1433,45 @@ fn encode_luma16_token(
         limit + (level as i32 - limit).min(3)
     }
 }
-
-fn encode_luma16_tokens_scan(
+// Width-aware (bwl = log2 block width) variant for non-32-wide rect leaves.
+fn encode_luma16_tokens_scan_w(
     enc: &mut RangeEncoder,
     coeffs: &[Coeff],
     eob: usize,
     scan: &[u16],
     area: usize,
+    bwl: i32,
 ) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
     let mut levels = vec![0i32; PLVL_BUF];
     let mut stored: Vec<LumaStored> = vec![];
+    let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
         let level = level_at(coeffs, scan_pos);
         let rc = scan[scan_pos] as i32;
-        let x = rc >> 5;
-        let y = rc & 31;
+        let x = rc >> bwl;
+        let y = rc & mask;
         let mag = level.unsigned_abs();
         let is_eob = scan_pos == eob;
-        let high_freq = scan_pos >= LUMA_HI_TO_LOW;
+        let high_freq = if bwl >= 5 {
+            scan_pos >= LUMA_HI_TO_LOW
+        } else {
+            (x + y) >= 4
+        };
         let (base_ctx, hi_range_ctx) = if is_eob {
             if eob == 0 {
                 (0usize, 0usize)
             } else {
                 (
                     1 + (eob > th1) as usize + (eob > th2) as usize,
-                    // get_br_ctx_lf_eob: the eob coeff's br ctx is 0 at the DC (raster
-                    // pos 0, i.e. eob position 0) and 7 elsewhere in the LF region; HF
-                    // eob uses 0.
                     if high_freq || eob == 0 { 0 } else { 7 },
                 )
             }
         } else {
-            luma_coeff_context(&levels, rc, x + y)
+            luma_coeff_context_w(&levels, rc, x + y, bwl)
         };
         let stored_level = encode_luma16_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
-        levels[plvl(rc) as usize] = stored_level;
+        levels[plvl_w(rc, bwl) as usize] = stored_level;
         stored.push((rc, x, y, level, high_freq));
     }
     stored
@@ -1466,7 +1515,7 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     if eob >= 1 {
         enc.sym_intra_ext_tx16(tx_type_idx, 6); // tx_type index
     }
-    let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, &SCAN16, 256);
+    let stored = encode_luma16_tokens_scan_w(enc, &nonzero, eob, &SCAN16, 256, 4);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
         .iter()
@@ -1523,24 +1572,30 @@ fn encode_luma8_token(
     }
 }
 
-fn encode_luma8_tokens_scan(
+fn encode_luma8_tokens_scan_w(
     enc: &mut RangeEncoder,
     coeffs: &[Coeff],
     eob: usize,
     scan: &[u16],
     area: usize,
+    bwl: i32,
 ) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
     let mut levels = vec![0i32; PLVL_BUF];
     let mut stored: Vec<LumaStored> = vec![];
+    let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
         let level = level_at(coeffs, scan_pos);
         let rc = scan[scan_pos] as i32;
-        let x = rc >> 5;
-        let y = rc & 31;
+        let x = rc >> bwl;
+        let y = rc & mask;
         let mag = level.unsigned_abs();
         let is_eob = scan_pos == eob;
-        let high_freq = scan_pos >= LUMA_HI_TO_LOW;
+        let high_freq = if bwl >= 5 {
+            scan_pos >= LUMA_HI_TO_LOW
+        } else {
+            (x + y) >= 4
+        };
         let (base_ctx, hi_range_ctx) = if is_eob {
             if eob == 0 {
                 (0usize, 0usize)
@@ -1551,10 +1606,10 @@ fn encode_luma8_tokens_scan(
                 )
             }
         } else {
-            luma_coeff_context(&levels, rc, x + y)
+            luma_coeff_context_w(&levels, rc, x + y, bwl)
         };
         let stored_level = encode_luma8_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
-        levels[plvl(rc) as usize] = stored_level;
+        levels[plvl_w(rc, bwl) as usize] = stored_level;
         stored.push((rc, x, y, level, high_freq));
     }
     stored
@@ -1593,7 +1648,7 @@ pub(crate) fn encode_luma_leaf_8x8(
     {
         enc.encode_symbol(cdf, idx, nsym);
     }
-    let stored = encode_luma8_tokens_scan(enc, &nonzero, eob, &SCAN8X8, 64);
+    let stored = encode_luma8_tokens_scan_w(enc, &nonzero, eob, &SCAN8X8, 64, 3);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
         .iter()
@@ -1610,13 +1665,15 @@ pub(crate) fn encode_luma_leaf_rect128(
     dc_sign_ctx: usize,
     mode_idx: usize,
     has_chroma: bool,
+    bw4: usize,
+    bh4: usize,
     part_cdf: u32,
     do_part_cdf: u32,
     scan: &'static [u16],
     tx_type_cdf: Option<(&'static [u16], usize, usize)>,
 ) -> u32 {
-    enc.cur_bw4 = 32;
-    enc.cur_bh4 = 32;
+    enc.cur_bw4 = bw4;
+    enc.cur_bh4 = bh4;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single rect TX
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
@@ -1632,7 +1689,9 @@ pub(crate) fn encode_luma_leaf_rect128(
     {
         enc.encode_symbol(cdf, idx, nsym);
     }
-    let stored = encode_luma16_tokens_scan(enc, &nonzero, eob, scan, 128);
+    // bwl = log2(tx width) = log2(bw4*4)
+    let bwl = (bw4 * 4).trailing_zeros() as i32;
+    let stored = encode_luma16_tokens_scan_w(enc, &nonzero, eob, scan, 128, bwl);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
         .iter()
@@ -1653,34 +1712,46 @@ fn encode_luma_tokens_scan(
     scan: &[u16],
     area: usize,
 ) -> Vec<LumaStored> {
+    encode_luma_tokens_scan_w(enc, coeffs, eob, scan, area, 5)
+}
+fn encode_luma_tokens_scan_w(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    eob: usize,
+    scan: &[u16],
+    area: usize,
+    bwl: i32,
+) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
     let mut levels = vec![0i32; PLVL_BUF];
     let mut stored: Vec<LumaStored> = vec![];
+    let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
         let level = level_at(coeffs, scan_pos);
         let rc = scan[scan_pos] as i32;
-        let x = rc >> 5;
-        let y = rc & 31;
+        let x = rc >> bwl;
+        let y = rc & mask;
         let mag = level.unsigned_abs();
         let is_eob = scan_pos == eob;
-        let high_freq = scan_pos >= LUMA_HI_TO_LOW;
+        let high_freq = if bwl >= 5 {
+            scan_pos >= LUMA_HI_TO_LOW
+        } else {
+            (x + y) >= 4
+        };
         let (base_ctx, hi_range_ctx) = if is_eob {
             if eob == 0 {
                 (0usize, 0usize)
             } else {
                 (
                     1 + (eob > th1) as usize + (eob > th2) as usize,
-                    // get_br_ctx_lf_eob: the eob coeff's br ctx is 0 at the DC (raster
-                    // pos 0, i.e. eob position 0) and 7 elsewhere in the LF region; HF
-                    // eob uses 0.
                     if high_freq || eob == 0 { 0 } else { 7 },
                 )
             }
         } else {
-            luma_coeff_context(&levels, rc, x + y)
+            luma_coeff_context_w(&levels, rc, x + y, bwl)
         };
         let stored_level = encode_luma32_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
-        levels[plvl(rc) as usize] = stored_level;
+        levels[plvl_w(rc, bwl) as usize] = stored_level;
         stored.push((rc, x, y, level, high_freq));
     }
     stored
@@ -1727,6 +1798,30 @@ pub(crate) fn encode_luma_tu_rect(
     eob_hi: u16,
     area: usize,
 ) -> u32 {
+    encode_luma_tu_rect_w(
+        enc,
+        coeffs,
+        skip_cdf,
+        dc_sign_ctx,
+        scan,
+        eob_cdf,
+        eob_hi,
+        area,
+        5,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_tu_rect_w(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    scan: &[u16],
+    eob_cdf: EobCdf,
+    eob_hi: u16,
+    area: usize,
+    bwl: i32,
+) -> u32 {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
         enc.bool_txb_skip(skip_cdf, 1);
@@ -1748,16 +1843,10 @@ pub(crate) fn encode_luma_tu_rect(
         },
         if area == 64 { 6 } else { 7 },
     );
-    // TX_16X64/TX_64X16 are intra EXT_TX_SET_LONG_SIDE_64 (7 types), so the decoder
-    // reads a 4-symbol short_side tx_type when eob count > 1 (i.e. not DC-only). The
-    // long side is implicitly DCT (tx_size_sqr_up = TX_64X64 ≠ TX_32X32, no flag), and
-    // short_side_idx 0 maps to DCT_DCT for both orientations. cdf = 32768 -
-    // intra_ext_tx_short_side_cdf[TX_16X16] (AVM_CDF4(26915, 32411, 32748)).
     if eob >= 1 {
-        // intra_ext_tx_short_side_cdf[TX_16X16] = index 2 → working-copy ctx 1.
         enc.sym_tx_short_side(1, 0);
     }
-    let stored = encode_luma_tokens_scan(enc, &nonzero, eob, scan, area);
+    let stored = encode_luma_tokens_scan_w(enc, &nonzero, eob, scan, area, bwl);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
         .iter()
@@ -1849,7 +1938,7 @@ pub(crate) fn encode_luma_block_vert4(
     enc.sym_tx_part_64(4, 6); // type symbol 4 = VERT4
     let mut cul = [0u32; 4];
     for i in 0..4 {
-        cul[i] = encode_luma_tu_rect(
+        cul[i] = encode_luma_tu_rect_w(
             enc,
             &tus[i],
             skip_cdfs[i],
@@ -1858,6 +1947,7 @@ pub(crate) fn encode_luma_block_vert4(
             EobCdf::Eob512,
             EOB_HI_BIT_QC[enc.qc],
             512,
+            4,
         );
     }
     cul
@@ -2019,7 +2109,7 @@ pub(crate) fn encode_luma_leaf_16x64(
     enc.cur_bh4 = 16;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx do_partition = NONE → single TX_16X64
-    encode_luma_tu_rect(
+    encode_luma_tu_rect_w(
         enc,
         tu,
         skip_cdf,
@@ -2028,6 +2118,7 @@ pub(crate) fn encode_luma_leaf_16x64(
         EobCdf::Eob512,
         EOB_HI_BIT_QC[enc.qc],
         512,
+        4,
     )
 }
 
@@ -2072,6 +2163,34 @@ pub(crate) fn encode_luma_tu_rect_long32(
     short_cdf: &[u16; 3],
     ctx2: bool,
 ) -> u32 {
+    encode_luma_tu_rect_long32_w(
+        enc,
+        coeffs,
+        skip_cdf,
+        dc_sign_ctx,
+        scan,
+        eob_cdf,
+        eob_hi,
+        area,
+        short_cdf,
+        ctx2,
+        5,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_tu_rect_long32_w(
+    enc: &mut RangeEncoder,
+    coeffs: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    scan: &[u16],
+    eob_cdf: EobCdf,
+    eob_hi: u16,
+    area: usize,
+    short_cdf: &[u16; 3],
+    ctx2: bool,
+    bwl: i32,
+) -> u32 {
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
         enc.bool_txb_skip(skip_cdf, 1);
@@ -2107,9 +2226,9 @@ pub(crate) fn encode_luma_tu_rect_long32(
     // used by the 16-family (TX_16X32 / TX_32X16). The decoder selects these via
     // `452 + t_dim.ctx*160` (HF) / `1440 + t_dim.ctx*528` (LF) and eob_base_y_tok_*.
     let stored = if ctx2 {
-        encode_luma16_tokens_scan(enc, &nonzero, eob, scan, area)
+        encode_luma16_tokens_scan_w(enc, &nonzero, eob, scan, area, bwl)
     } else {
-        encode_luma_tokens_scan(enc, &nonzero, eob, scan, area)
+        encode_luma_tokens_scan_w(enc, &nonzero, eob, scan, area, bwl)
     };
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
     nonzero
@@ -2135,7 +2254,7 @@ pub(crate) fn encode_luma_leaf_16x32(
     enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(19451, 0); // tx_split (szctx 4) = NONE → single TX_16X32
-    encode_luma_tu_rect_long32(
+    encode_luma_tu_rect_long32_w(
         enc,
         tu,
         skip_cdf,
@@ -2146,6 +2265,7 @@ pub(crate) fn encode_luma_leaf_16x32(
         512,
         &[5853, 357, 20], // txtp_intra_short_1d(min=2)
         false,
+        4,
     )
 }
 
@@ -2195,7 +2315,7 @@ pub(crate) fn encode_luma_leaf_8x32(
     enc.cur_bh4 = 8;
     encode_intra_modes(enc, mode_idx, has_chroma, false, Some(part_cdf), false);
     enc.bool_txfm_part(18958, 0); // tx_split (szctx 8) = NONE → single TX_8X32
-    encode_luma_tu_rect_long32(
+    encode_luma_tu_rect_long32_w(
         enc,
         tu,
         skip_cdf,
@@ -2206,6 +2326,7 @@ pub(crate) fn encode_luma_leaf_8x32(
         256,
         &[6068, 608, 20], // txtp_intra_short_1d(min=1)
         true,
+        3, // bwl = log2(8)
     )
 }
 
@@ -2259,6 +2380,32 @@ pub(crate) fn encode_luma_leaf_32x32(
 #[inline]
 fn pidx(rc: usize) -> usize {
     rc + (rc >> 2) * 4
+}
+fn pidx_w(rc: usize, bwl: i32) -> usize {
+    let row = rc >> bwl;
+    let col = rc & ((1 << bwl) - 1);
+    row * ((1 << bwl) + 4) + col
+}
+fn ctx_lf_2d_chroma_w(levels: &[u8], rc: usize, voff: usize, bwl: i32) -> usize {
+    let b = pidx_w(rc, bwl);
+    let s = (1 << bwl) + 4;
+    let mag =
+        levels[b + 1].min(5) as i32 + levels[b + s].min(5) as i32 + levels[b + s + 1].min(5) as i32;
+    ((mag + 1) >> 1).min(3) as usize + voff
+}
+fn ctx_2d_chroma_w(levels: &[u8], rc: usize, voff: usize, bwl: i32) -> usize {
+    let b = pidx_w(rc, bwl);
+    let s = (1 << bwl) + 4;
+    let mag =
+        levels[b + 1].min(3) as i32 + levels[b + s].min(3) as i32 + levels[b + s + 1].min(3) as i32;
+    ((mag + 1) >> 1).min(3) as usize + voff
+}
+fn br_ctx_2d_chroma_w(levels: &[u8], rc: usize, bwl: i32) -> usize {
+    let b = pidx_w(rc, bwl);
+    let s = (1 << bwl) + 4;
+    let mag =
+        levels[b + 1].min(5) as i32 + levels[b + s].min(5) as i32 + levels[b + s + 1].min(5) as i32;
+    ((mag + 1) >> 1).min(3) as usize
 }
 
 // get_lower_levels_ctx_eob(bwl=2, height=4, scan_idx): height<<bwl = 16 -> /8=2, /4=4.

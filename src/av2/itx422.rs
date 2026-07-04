@@ -82,9 +82,18 @@ pub(crate) fn reconstruct_chroma(
     // Dequantize scan-ordered levels directly into dav2d's transposed coeff
     // layout (`coeff[col*ch + row]`), skipping the intermediate grid + transpose.
     let mut coeff = vec![0i32; cw * ch];
+    // Width-w scans: rc=row*cw+col; legacy stride-32: rc=col*32+row.
+    let wscan = scan.get(1).is_some_and(|&v| v as usize == cw);
+    let sh = (cw as u32).trailing_zeros();
+    let smask = cw - 1;
     for (&l, &rc) in lev.iter().zip(scan.iter()) {
         if l != 0.0 {
-            let (col, row) = (rc as usize >> 5, rc as usize & 31);
+            let rc = rc as usize;
+            let (row, col) = if wscan {
+                (rc >> sh, rc & smask)
+            } else {
+                (rc & 31, rc >> 5)
+            };
             let li = l as i64;
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
@@ -98,9 +107,6 @@ pub(crate) fn reconstruct_chroma(
     out
 }
 
-/// As `reconstruct_chroma`, but the prediction base is a per-pixel block (`pred[i]`)
-/// rather than a flat DC scalar — used for CfL, whose predictor is dc + alpha*luma_ac.
-/// `pred` must be `w*h` in raster order and already clipped to bit depth.
 pub(crate) fn reconstruct_chroma_cfl(
     pred: &[i32],
     lev: &[f32],
@@ -248,7 +254,8 @@ pub(crate) fn reconstruct_luma_16x64(
     let mut coeff = [0i32; 512];
     for (&l, &rc) in lev[..512].iter().zip(scan[..512].iter()) {
         if l != 0.0 {
-            let (col, row) = (rc as usize >> 5, rc as usize & 31);
+            // SCAN16X32 is the AVM width-16 scan: rc = row*16 + col.
+            let (row, col) = (rc as usize >> 4, rc as usize & 15);
             let li = l as i64;
             let mag = (li.abs() * qstep as i64) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;

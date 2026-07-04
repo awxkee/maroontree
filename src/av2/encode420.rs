@@ -177,6 +177,7 @@ impl Av2Encoder {
                     let cfl_l = if lmc > 0 { cfl_left[lmr] } else { 0 };
                     enc.cfl_ctx = (cfl_a + cfl_l) as usize;
                     enc.cfl_use = false;
+                    enc.cfl_signaled = false;
                     let (u_present, v_present) = match (bw_mi, bh_mi) {
                         (16, 16) => {
                             // 64x64 luma → 32x32 chroma (TX_32X32, eob 1024, skip TX32).
@@ -1461,7 +1462,7 @@ impl Av2Encoder {
                             );
                             let vc = levels_to_coeffs(&levv);
                             let v_ctx = (6 * (u_nz as i32) + va + vl) as usize;
-                            let v_skip = cdfs_qctx::V_SKIP_TX4_QC[enc.qc][v_ctx] as u32;
+                            let v_skip = v_ctx as u32;
                             encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
                             (u_nz, vc.iter().any(|&(_, l)| l != 0))
                         }
@@ -1532,6 +1533,8 @@ impl Av2Encoder {
                                 dcs,
                                 0,
                                 true,
+                                2,
+                                4,
                                 pc,
                                 12348,
                                 &tables::SCAN8X16,
@@ -1604,6 +1607,32 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 4, 2, true,
                             );
+                            let mh_choice = chroma422::mhccp_decide_leaf(
+                                enc,
+                                &*recy,
+                                &*recu,
+                                &*recv,
+                                up,
+                                vp,
+                                pw,
+                                pcw,
+                                sb_y,
+                                sb_x,
+                                cy,
+                                cx,
+                                8,
+                                4,
+                                true,
+                                true,
+                                lmr > 0,
+                                lmc > 0,
+                                neutral,
+                                &bases.c8x4,
+                                &tables::SCAN8X4,
+                                sb_qstep,
+                                leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
+                                self.bit_depth as i32,
+                            );
                             coder::encode_luma_leaf_rect128(
                                 enc,
                                 &tu,
@@ -1611,6 +1640,8 @@ impl Av2Encoder {
                                 dcs,
                                 0,
                                 true,
+                                4,
+                                2,
                                 pc,
                                 12348,
                                 &tables::SCAN16X8,
@@ -1645,13 +1676,13 @@ impl Av2Encoder {
                                 },
                                 ChromaNeighbors { ua, ul, va, vl },
                                 self.bit_depth as i32,
-                                None,
+                                mh_choice.as_ref(),
                                 None,
                             )
                         }
                         other => unreachable!("unsupported native 4:2:0 leaf {:?}", other),
                     };
-                    let cfl_used = enc.cfl_use as i32;
+                    let cfl_used = enc.cfl_signaled as i32;
                     for c in lmc..lmc + bw_mi {
                         u_above[c] = u_present as i32;
                         v_above[c] = v_present as i32;
@@ -1767,8 +1798,10 @@ impl Av2Encoder {
         // pre-deblock, so band classification matches avmdec byte-exactly only when
         // luma deblocking is off. A future phase can apply the luma deblock filter to
         // recy before CCSO to lift this restriction.
-        enc.ccso_u_enable = self.tune.ccso && self.base_q_idx != 0;
-        enc.ccso_v_enable = self.tune.ccso && self.base_q_idx != 0;
+        // CCSO disabled for 4:2:0: AVM classifies bands from post-deblock CurrFrame
+        // luma; our recon is pre-deblock, so deltas land in the wrong places.
+        enc.ccso_u_enable = false;
+        enc.ccso_v_enable = false;
         enc.ccso_cols = pw / 64;
         // Phase 3: the decision pass (ccso_pre == None) is a throwaway recon pass —
         // it searches the filter and decides per-SB on/off but must NOT emit any
@@ -1989,6 +2022,7 @@ impl Av2Encoder {
                     enc.uv_mode = 0;
                 } else {
                     enc.cfl_use = false;
+                    enc.cfl_signaled = false;
                     enc.uv_mode = 0;
                 }
                 // MHCCP: multi-parameter cross-component predictor competing with

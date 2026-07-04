@@ -411,7 +411,7 @@ pub(super) fn encode_luma_leaf32(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn predict_luma_leaf_tu(
+pub(crate) fn predict_luma_leaf_tu(
     recy: &[f32],
     pw: usize,
     mc: i64,
@@ -423,6 +423,7 @@ pub(super) fn predict_luma_leaf_tu(
     i: usize,
     m: usize,
     neutral: f32,
+    split_leaf: bool,
 ) -> Vec<f32> {
     let (y0, x0) = (sb_y + ty, sb_x + tx);
     if m == 0 {
@@ -448,7 +449,11 @@ pub(super) fn predict_luma_leaf_tu(
     let need_bl = matches!(m, 1 | 2 | 11);
     let tr_ok = need_tr && matches!(i, 0..=2) && have_above && tr_avail && xr > 0;
     let tr_px = if tr_ok { xr.min(32).max(0) as usize } else { 0 };
-    let bl_ok = need_bl && i == 0 && have_left && bl_avail && yd > 0;
+    let bl_ok = need_bl
+        && i == 0
+        && have_left
+        && (bl_avail || (split_leaf && is_right && !is_bottom))
+        && yd > 0;
     let bl_px = if bl_ok { yd.min(32).max(0) as usize } else { 0 };
     let (ab, lf, corner) = intrapred::build_refs(
         recy, pw, y0, x0, 32, have_above, have_left, tr_px, bl_px, neutral,
@@ -507,7 +512,8 @@ pub(super) fn encode_luma_leaf_v32x64(
         let mut tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
         for (k, &(ty, i)) in tu_i.iter().enumerate() {
             let (y0, x0) = (sb_y + ty, sb_x);
-            let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, ty, 0, i, m, neutral);
+            let pblk =
+                predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, ty, 0, i, m, neutral, false);
             for r in 0..32 {
                 let base = (y0 + r) * pw + x0;
                 for c in 0..32 {
@@ -581,7 +587,7 @@ pub(super) fn encode_luma_leaf_s32x32(
     // Single TU: no intra-leaf feedback, so a mode is fully described by its
     // (recon, coeffs, cost) and the winner can simply be re-projected with RDOQ.
     let encode_mode = |recy: &[f32], m: usize, lambda: f64| -> ([f32; 1024], Vec<Coeff>, f64) {
-        let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, 0, 0, 0, m, neutral);
+        let pblk = predict_luma_leaf_tu(recy, pw, mc, mr, sb_y, sb_x, 0, 0, 0, m, neutral, true);
         let mut resid = [0f32; 1024];
         for r in 0..32 {
             let base = (sb_y + r) * pw + sb_x;

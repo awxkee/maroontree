@@ -544,11 +544,12 @@ pub(super) fn code_422_chroma_tu(
         (levu, levv)
     };
     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
+    let cbwl = (cw.min(32) as f32).log2() as i32;
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
-    encode_chroma_block_rect(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area);
+    encode_chroma_block_rect_w(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area, cbwl);
     let up_ = uc.iter().any(|&(_, l)| l != 0);
     let v_skip = (6 * (up_ as i32) + va + vl) as u32;
-    encode_chroma_block_rect(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area);
+    encode_chroma_block_rect_w(enc, &vc, v_skip, false, scan, eob_cdf, eob_hi, area, cbwl);
     (up_, vc.iter().any(|&(_, l)| l != 0))
 }
 
