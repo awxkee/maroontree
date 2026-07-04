@@ -442,8 +442,8 @@ pub(crate) fn predict_luma_leaf_tu(
     let xr = ((mc - mi_col - 16) << 2) + 32 - lx;
     let yd = ((mr - mi_row - 16) << 2) + 32 - ly;
     // top-right unavailable for the bottom-right leaf; bottom-left only for the top-left leaf.
-    let tr_avail = !(is_right && is_bottom) && !is_bottom && (mi_col + col_off + 8) < mc;
-    let bl_avail = !is_right && !is_bottom && !is_right && (mi_row + row_off + 8) < mr;
+    let tr_avail = !is_right && !is_bottom && (mi_col + col_off + 8) < mc;
+    let bl_avail = !is_right && !is_bottom && (mi_row + row_off + 8) < mr;
     // SMOOTH/SMOOTH_H/D45/D67 need above-right; SMOOTH/SMOOTH_V/D203 need bottom-left.
     let need_tr = matches!(m, 1 | 3 | 7) || m >= 12;
     let need_bl = matches!(m, 1 | 2 | 11);
