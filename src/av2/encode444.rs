@@ -3337,20 +3337,28 @@ impl Av2Encoder {
         let off_q = (1i32 << (bd.bits() - 1)) << Q;
         let mx_i = maxv;
         let n = img.planes[0].len();
-        let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
-        for (((((yv, cbv), crv), &rr), &gg), &bb) in y
-            .iter_mut()
-            .zip(cb.iter_mut())
-            .zip(cr.iter_mut())
-            .zip(img.planes[2].iter())
-            .zip(img.planes[0].iter())
-            .zip(img.planes[1].iter())
-        {
-            let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-            *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
-            *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
-            *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
-        }
+        let (y, cb, cr) = if self.base_q_idx == 0 {
+            let y = img.planes[0].iter().map(|x| x.to_i32()).collect::<Vec<_>>();
+            let cb = img.planes[1].iter().map(|x| x.to_i32()).collect::<Vec<_>>();
+            let cr = img.planes[2].iter().map(|x| x.to_i32()).collect::<Vec<_>>();
+            (y, cb, cr)
+        } else {
+            let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            for (((((yv, cbv), crv), &rr), &gg), &bb) in y
+                .iter_mut()
+                .zip(cb.iter_mut())
+                .zip(cr.iter_mut())
+                .zip(img.planes[2].iter())
+                .zip(img.planes[0].iter())
+                .zip(img.planes[1].iter())
+            {
+                let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
+                *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
+                *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
+                *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
+            }
+            (y, cb, cr)
+        };
         self.encode_yuv444(
             &PlanarImage {
                 width: img.width,
