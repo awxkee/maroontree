@@ -794,6 +794,49 @@ pub(crate) fn sb_tu4_chroma_skip(
     skip
 }
 
+/// Work-stealing parallel map (same scheme as the AV1 coder): workers atomically
+/// claim the next index, so no thread idles on a static chunk while work remains.
+pub(crate) fn par_map_indexed<T, F>(nthreads: usize, n: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if nthreads <= 1 || n <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        let mut got: Vec<(usize, T)> = Vec::new();
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= n {
+                break got;
+            }
+            got.push((i, f(i)));
+        }
+    };
+    let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+        // Caller thread participates too, so spawn one fewer worker.
+        let spawned = nthreads.min(n) - 1;
+        let handles: Vec<_> = (0..spawned).map(|_| scope.spawn(work)).collect();
+        std::iter::once(work())
+            .chain(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("worker panicked")),
+            )
+            .collect()
+    });
+    let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(n).collect();
+    for (i, v) in parts.into_iter().flatten() {
+        slots[i] = Some(v);
+    }
+    slots
+        .into_iter()
+        .map(|s| s.expect("index produced"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

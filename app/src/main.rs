@@ -28,7 +28,7 @@
  */
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_rgb8,
+    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
 };
 use std::fs;
 use std::hint::black_box;
@@ -60,9 +60,9 @@ fn main() {
         &img,
     )
     .unwrap();
-    for i in 0..10 {
+    for i in 0..5 {
         let instant = Instant::now();
-        let out = encode_rgb8(
+        let out = encode_lossless(
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(60)
@@ -75,7 +75,7 @@ fn main() {
         )
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
-        // fs::write("./out.avif", out).unwrap();
+        fs::write("./out.avif", out).unwrap();
     }
     /* let img = image::open("./assets/manhattan.png")
          .unwrap()

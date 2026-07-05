@@ -876,31 +876,17 @@ impl Av2Encoder {
         // Phase A: per-SB TU generation is independent in lossless (recon == source),
         // so generate the clipped SB TU grids in parallel across `threads`.
         let nsb = sb_rows * sb_cols;
-        let mut sbtus: Vec<Vec<Vec<Coeff>>> = (0..nsb).map(|_| Vec::new()).collect();
-        let nthreads = Self::resolve_threads(threads);
-        if nthreads <= 1 || nsb < 8 {
-            for (idx, slot) in sbtus.iter_mut().enumerate() {
-                let (row, col) = (idx / sb_cols, idx % sb_cols);
-                let (rr, rc) = ((code_mr - row * 16).min(16), (code_mc - col * 16).min(16));
-                *slot = lossless_sb_tus(yp, pw, row * 64, col * 64, neutral, rr, rc);
-            }
+        // Work-stealing across SBs; tiny frames stay serial.
+        let nthreads = if nsb < 8 {
+            1
         } else {
-            let chunk = nsb.div_ceil(nthreads);
-            let (code_mc, code_mr) = (code_mc, code_mr);
-            std::thread::scope(|sc| {
-                for (ci, slice) in sbtus.chunks_mut(chunk).enumerate() {
-                    let base = ci * chunk;
-                    sc.spawn(move || {
-                        for (k, slot) in slice.iter_mut().enumerate() {
-                            let (row, col) = ((base + k) / sb_cols, (base + k) % sb_cols);
-                            let rr = (code_mr - row * 16).min(16);
-                            let rc = (code_mc - col * 16).min(16);
-                            *slot = lossless_sb_tus(yp, pw, row * 64, col * 64, neutral, rr, rc);
-                        }
-                    });
-                }
-            });
-        }
+            Self::resolve_threads(threads)
+        };
+        let sbtus: Vec<Vec<Vec<Coeff>>> = par_map_indexed(nthreads, nsb, |idx| {
+            let (row, col) = (idx / sb_cols, idx % sb_cols);
+            let (rr, rc) = ((code_mr - row * 16).min(16), (code_mc - col * 16).min(16));
+            lossless_sb_tus(yp, pw, row * 64, col * 64, neutral, rr, rc)
+        });
 
         let mut above_pctx = vec![0u8; code_mc + 16];
 

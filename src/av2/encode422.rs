@@ -1898,34 +1898,15 @@ impl Av2Encoder {
         let (yf, cbf, crf) = (&planes.0, &planes.1, &planes.2);
         let cw = cstride; // chroma plane stride (4:2:2)
         let n = specs.len();
-        let mut tiles_bytes: Vec<Vec<u8>> = vec![Vec::new(); n];
+        // Independent per-tile encodes on a work-stealing map (no idle static chunks).
         let nthreads = Self::resolve_threads(threads).min(n.max(1));
-        if nthreads <= 1 || n <= 1 {
-            for (slot, &(x0, y0, tw, th)) in tiles_bytes.iter_mut().zip(&specs) {
-                let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
-                let tu = extract_subplane(cbf, cw, x0 / 2, y0, tw.div_ceil(2), th);
-                let tv = extract_subplane(crf, cw, x0 / 2, y0, tw.div_ceil(2), th);
-                *slot = self.encode_422_core(&ty, &tu, &tv, tw, th).finish();
-            }
-        } else {
-            let chunk = n.div_ceil(nthreads);
-            let me = self;
-            let (yf, cbf, crf) = (&yf, &cbf, &crf);
-            std::thread::scope(|sc| {
-                for (out_chunk, spec_chunk) in
-                    tiles_bytes.chunks_mut(chunk).zip(specs.chunks(chunk))
-                {
-                    sc.spawn(move || {
-                        for (slot, &(x0, y0, tw, th)) in out_chunk.iter_mut().zip(spec_chunk) {
-                            let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
-                            let tu = extract_subplane(cbf, cw, x0 / 2, y0, tw.div_ceil(2), th);
-                            let tv = extract_subplane(crf, cw, x0 / 2, y0, tw.div_ceil(2), th);
-                            *slot = me.encode_422_core(&ty, &tu, &tv, tw, th).finish();
-                        }
-                    });
-                }
-            });
-        }
+        let tiles_bytes: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+            let (x0, y0, tw, th) = specs[i];
+            let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
+            let tu = extract_subplane(cbf, cw, x0 / 2, y0, tw.div_ceil(2), th);
+            let tv = extract_subplane(crf, cw, x0 / 2, y0, tw.div_ceil(2), th);
+            self.encode_422_core(&ty, &tu, &tv, tw, th).finish()
+        });
         assemble_multitile(
             config,
             sig_w,
@@ -1994,47 +1975,23 @@ impl Av2Encoder {
         type PackedCoeff = Vec<Coeff>;
         // Phase A: per-SB 4×4 WHT TUs. Luma over the full SB (rr×rc), chroma over the
         // half-width SB (rr × rc/2) at chroma origin sb_x/2.
-        let mut sbtus: Vec<(Vec<PackedCoeff>, Vec<PackedCoeff>, Vec<PackedCoeff>)> = (0..nsb)
-            .map(|_| (Vec::new(), Vec::new(), Vec::new()))
-            .collect();
-        let gen_block =
-            |idx: usize, slot: &mut (Vec<PackedCoeff>, Vec<PackedCoeff>, Vec<PackedCoeff>)| {
+        // Work-stealing across SBs; tiny frames stay serial.
+        let nthreads = if nsb < 8 {
+            1
+        } else {
+            Self::resolve_threads(threads)
+        };
+        let sbtus: Vec<(Vec<PackedCoeff>, Vec<PackedCoeff>, Vec<PackedCoeff>)> =
+            par_map_indexed(nthreads, nsb, |idx| {
                 let (row, col) = (idx / sb_cols, idx % sb_cols);
                 let (sb_y, sb_x) = (row * 64, col * 64);
                 let (rr, rc) = rem(row, col);
-                *slot = (
+                (
                     lossless_sb_tus(&yp, pw, sb_y, sb_x, neutral, rr, rc),
                     lossless_sb_tus(&up, pcw, sb_y, sb_x / 2, neutral, rr, rc / 2),
                     lossless_sb_tus(&vp, pcw, sb_y, sb_x / 2, neutral, rr, rc / 2),
-                );
-            };
-        let nthreads = Self::resolve_threads(threads);
-        if nthreads <= 1 || nsb < 8 {
-            for (idx, slot) in sbtus.iter_mut().enumerate() {
-                gen_block(idx, slot);
-            }
-        } else {
-            let chunk = nsb.div_ceil(nthreads);
-            let (yp, up, vp) = (&yp, &up, &vp);
-            std::thread::scope(|sc| {
-                for (ci, slice) in sbtus.chunks_mut(chunk).enumerate() {
-                    let base = ci * chunk;
-                    sc.spawn(move || {
-                        for (k, slot) in slice.iter_mut().enumerate() {
-                            let (row, col) = ((base + k) / sb_cols, (base + k) % sb_cols);
-                            let (sb_y, sb_x) = (row * 64, col * 64);
-                            let rr = (code_mr - row * 16).min(16);
-                            let rc = (code_mc - col * 16).min(16);
-                            *slot = (
-                                lossless_sb_tus(yp, pw, sb_y, sb_x, neutral, rr, rc),
-                                lossless_sb_tus(up, pcw, sb_y, sb_x / 2, neutral, rr, rc / 2),
-                                lossless_sb_tus(vp, pcw, sb_y, sb_x / 2, neutral, rr, rc / 2),
-                            );
-                        }
-                    });
-                }
+                )
             });
-        }
         // Phase B: serial partition + entropy walk (shared luma tree drives both planes).
         let mut above_pctx = vec![0u8; code_mc + 16];
         for row in 0..sb_rows {

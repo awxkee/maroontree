@@ -2490,48 +2490,15 @@ impl Av2Encoder {
         let (yf, cbf, crf) = (&planes.0, &planes.1, &planes.2);
         let cw = cstride; // chroma plane stride (4:2:0)
         let n = specs.len();
-        let mut tiles_bytes: Vec<Vec<u8>> = vec![Vec::new(); n];
+        // Independent per-tile encodes on a work-stealing map (no idle static chunks).
         let nthreads = Self::resolve_threads(threads).min(n.max(1));
-        if nthreads <= 1 || n <= 1 {
-            for (slot, &(x0, y0, tw, th)) in tiles_bytes.iter_mut().zip(&specs) {
-                let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
-                let tu = extract_subplane(cbf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
-                let tv = extract_subplane(crf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
-                *slot = self.encode_420_core(&ty, &tu, &tv, tw, th, None).finish();
-            }
-        } else {
-            let chunk = n.div_ceil(nthreads);
-            let me = self;
-            let (yf, cbf, crf) = (&yf, &cbf, &crf);
-            std::thread::scope(|sc| {
-                for (out_chunk, spec_chunk) in
-                    tiles_bytes.chunks_mut(chunk).zip(specs.chunks(chunk))
-                {
-                    sc.spawn(move || {
-                        for (slot, &(x0, y0, tw, th)) in out_chunk.iter_mut().zip(spec_chunk) {
-                            let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
-                            let tu = extract_subplane(
-                                cbf,
-                                cw,
-                                x0 / 2,
-                                y0 / 2,
-                                tw.div_ceil(2),
-                                th.div_ceil(2),
-                            );
-                            let tv = extract_subplane(
-                                crf,
-                                cw,
-                                x0 / 2,
-                                y0 / 2,
-                                tw.div_ceil(2),
-                                th.div_ceil(2),
-                            );
-                            *slot = me.encode_420_core(&ty, &tu, &tv, tw, th, None).finish();
-                        }
-                    });
-                }
-            });
-        }
+        let tiles_bytes: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+            let (x0, y0, tw, th) = specs[i];
+            let ty = extract_subplane(yf, lstride, x0, y0, tw, th);
+            let tu = extract_subplane(cbf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
+            let tv = extract_subplane(crf, cw, x0 / 2, y0 / 2, tw.div_ceil(2), th.div_ceil(2));
+            self.encode_420_core(&ty, &tu, &tv, tw, th, None).finish()
+        });
         assemble_multitile(
             config,
             sig_w,
