@@ -305,7 +305,7 @@ pub(crate) fn validate_dims(width: u32, height: u32) -> Result<(), EncodeError> 
 }
 
 fn validate_quality(quality: u8) -> Result<(), EncodeError> {
-    if quality == 0 || quality > 100 {
+    if quality > 100 {
         return Err(EncodeError::InvalidQuality);
     }
     Ok(())

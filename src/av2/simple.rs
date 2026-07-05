@@ -70,7 +70,7 @@ fn encode_yuv_color<T: Pixel>(
 }
 
 /// Encode the alpha plane (already a standalone monochrome image) as a
-/// **lossless** AV2 mono frame, matching the AV1 behaviour of coding alpha
+/// **lossless** AV2 mono frame, matching the AV1 behavior of coding alpha
 /// without loss.
 fn encode_alpha<T: Pixel>(
     alpha_mono: &PlanarImage<T>,
@@ -85,7 +85,7 @@ fn encode_alpha<T: Pixel>(
 }
 
 /// Common preamble: enforce the expected bit depth, validate dims + config, and
-/// build a colour encoder at the mapped quality.
+/// build a color encoder at the mapped quality.
 fn prepare(
     bit_depth: BitDepth,
     want: BitDepth,
@@ -98,15 +98,20 @@ fn prepare(
     }
     validate_dims(width as u32, height as u32)?;
     cfg.validate()?;
-    Ok(
-        Av2Encoder::with_bit_depth(av2_map_quality(cfg.quality), bit_depth.bits())
-            .with_tiles(8, 8)
-            .with_txpart(TxPart::ThreeWay)
-            .with_speed(cfg.speed)
-            .with_threads(cfg.threads)
-            .with_cfl(true)
-            .with_aq(cfg.adaptive_quant),
+    Ok(Av2Encoder::with_bit_depth(
+        if cfg.quality == 0 {
+            0
+        } else {
+            av2_map_quality(cfg.quality)
+        },
+        bit_depth.bits(),
     )
+    .with_tiles(8, 8)
+    .with_txpart(TxPart::ThreeWay)
+    .with_speed(cfg.speed)
+    .with_threads(cfg.threads)
+    .with_cfl(true)
+    .with_aq(cfg.adaptive_quant))
 }
 
 fn prepare_lossless_capable(
