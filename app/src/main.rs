@@ -26,7 +26,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use image::imageops::FilterType;
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
     TxPart, av2_map_quality, encode_rgb8,
@@ -78,8 +77,7 @@ fn main() {
         println!("encoding time {:?}", instant.elapsed());
         fs::write("./out.avif", out).unwrap();
     }
-    img.save("./out_rav1e.avif").unwrap();
-    let img = image::open("./assets/DSC00116.png")
+    let img = image::open("./assets/manhattan.png")
         .unwrap()
         // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
@@ -105,13 +103,13 @@ fn main() {
     let encoded = av2_encoder
         .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
         .unwrap();
-    // for i in 0..10 {
-    //     let instant = Instant::now();
-    //     let encoded = av2_encoder
-    //         .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
-    //         .unwrap();
-    //     println!("Encoded in {}ms", instant.elapsed().as_millis());
-    // }
+    for i in 0..10 {
+        let instant = Instant::now();
+        let encoded = av2_encoder
+            .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
+            .unwrap();
+        println!("Av2 Encoded in {}ms", instant.elapsed().as_millis());
+    }
     // let out_obu = encoded.view();
     // let path = std::env::args()
     //     .nth(1)

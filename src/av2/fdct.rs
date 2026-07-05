@@ -29,6 +29,7 @@
 
 use crate::util::FastRound;
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 #[rustfmt::skip]
 pub(crate) static DCT32_FWD_KERNEL: [i8; 1024] = [
@@ -529,7 +530,11 @@ thread_local! {
         RefCell::new(PassScratch { buf: Box::new([0; 4096]), coeff: Box::new([0; 4096]) });
 }
 
-pub(crate) fn fdct_rect(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> usize {
+pub(crate) type FdctRectFn = unsafe fn(&[i32], usize, usize, &mut [i32]) -> usize;
+
+static FDCT_RECT: OnceLock<FdctRectFn> = OnceLock::new();
+
+unsafe fn fdct_rect_scalar(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> usize {
     let (s1, s2) = fwd_shifts(w, h);
     let zh = if h > 32 { 32 } else { 0 };
     let zw = if w > 32 { 32 } else { 0 };
@@ -550,4 +555,116 @@ pub(crate) fn fdct_rect(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> u
         }
     }
     cw * ch
+}
+
+#[inline]
+fn resolve_fdct_rect() -> FdctRectFn {
+    *FDCT_RECT.get_or_init(|| {
+        let mut _f = fdct_rect_scalar as FdctRectFn;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = crate::av2::neon::fdct_rect_neon as FdctRectFn;
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::av2::avx::fdct_rect_avx2 as FdctRectFn;
+            }
+        }
+        _f
+    })
+}
+
+pub(crate) fn fdct_rect(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> usize {
+    let f = resolve_fdct_rect();
+    unsafe { f(resid, w, h, out) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TX_SIZES: &[(usize, usize)] = &[
+        (4, 4),
+        (8, 8),
+        (16, 16),
+        (32, 32),
+        (64, 64),
+        (4, 8),
+        (8, 4),
+        (8, 16),
+        (16, 8),
+        (16, 32),
+        (32, 16),
+        (32, 64),
+        (64, 32),
+        (4, 16),
+        (16, 4),
+        (8, 32),
+        (32, 8),
+        (16, 64),
+        (64, 16),
+        (4, 32),
+        (32, 4),
+        (8, 64),
+        (64, 8),
+        (4, 64),
+        (64, 4),
+    ];
+
+    fn residual_case(w: usize, h: usize, seed: u32) -> Vec<i32> {
+        let mut state = seed
+            .wrapping_mul(747_796_405)
+            .wrapping_add((w as u32) << 16)
+            .wrapping_add(h as u32);
+        let mut out = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 21) as i32) - 1024;
+                let gradient = (x as i32 * 11) - (y as i32 * 7) + ((x ^ y) as i32 * 3);
+                out[y * w + x] = (noise + gradient).clamp(-2048, 2047);
+            }
+        }
+        out
+    }
+
+    unsafe fn assert_fdct_impl_matches_scalar(name: &str, simd: FdctRectFn) {
+        // Run a few sequences in intentionally mixed order so TLS scratch reuse is exercised.
+        for seed in 0..8u32 {
+            for &(w, h) in TX_SIZES.iter().rev().chain(TX_SIZES.iter()) {
+                let resid = residual_case(w, h, seed);
+                let mut expected = [0i32; 1024];
+                let mut actual = [0i32; 1024];
+
+                let expected_n = unsafe { fdct_rect_scalar(&resid, w, h, &mut expected) };
+                let actual_n = unsafe { simd(&resid, w, h, &mut actual) };
+
+                assert_eq!(
+                    actual_n, expected_n,
+                    "{name} size mismatch for {w}x{h} seed {seed}"
+                );
+                assert_eq!(
+                    &actual[..actual_n],
+                    &expected[..expected_n],
+                    "{name} coeff mismatch for {w}x{h} seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn fdct_neon_matches_scalar() {
+        unsafe { assert_fdct_impl_matches_scalar("neon", crate::av2::neon::fdct_rect_neon) };
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[test]
+    fn fdct_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe { assert_fdct_impl_matches_scalar("avx2", crate::av2::avx::fdct_rect_avx2) };
+    }
 }

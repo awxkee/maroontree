@@ -20,8 +20,9 @@ rust-version = "1.93.0"
 [dependencies]
 
 [features]
-default = ["neon"]
+default = ["neon", "avx"]
 neon = []
+avx = []
 
 [profile.release]
 debug = "full"

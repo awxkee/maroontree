@@ -29,8 +29,9 @@
 
 #[allow(unused_imports)]
 mod aq;
-pub(crate) mod av2_itx;
 mod avif;
+#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+mod avx;
 mod ccso;
 mod cdf_para;
 mod cdf_state;
@@ -53,11 +54,14 @@ mod fdct;
 mod headers;
 mod helpers;
 mod intrapred;
+pub(crate) mod itx;
 pub mod itx422;
 mod layout;
 mod leaf;
 mod lossless;
 mod mhccp;
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+mod neon;
 mod partition;
 mod proj;
 mod quant;

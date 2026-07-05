@@ -30,10 +30,6 @@
 use super::*;
 
 impl Av2Encoder {
-    /// Native 4:0:0 (monochrome) edge-partition walk. Luma-only — the 4:4:4 luma walk
-    /// with all chroma coding stripped and `has_chroma = false`. Because there is no
-    /// chroma, every luma leaf geometry the encoders support is available with no
-    /// corner restrictions, so this covers the full `lossy_native_mi` residue set.
     #[allow(clippy::too_many_arguments)]
     fn encode_yuv400_partition(
         &self,
@@ -392,7 +388,7 @@ impl Av2Encoder {
                             let (skip, dcs) = sb_tu_contexts_rect(
                                 &tu, sb_y, sb_x, above, left, qc, tmc, tmr, 8, 2, true,
                             );
-                            coder::encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, false, pc);
+                            encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, false, pc);
                         }
                         (4, 4) => {
                             // 16x16 corner leaf: tx_type RD over DCT/ADST mixes (ported from 4:4:4).

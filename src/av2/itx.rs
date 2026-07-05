@@ -5,6 +5,8 @@
  * under the BSD 2-Clause License.
  */
 
+use std::sync::OnceLock;
+
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) enum Tx1d {
@@ -61,7 +63,7 @@ pub(crate) mod tx_size {
     pub(crate) const RTX_64X4: usize = 24;
 }
 
-static DCT8_KERNEL: [i8; 16] = [
+pub(in crate::av2) static DCT8_KERNEL: [i8; 16] = [
     89, 75, 50, 18, 75, -18, -89, -50, 50, -89, 18, 75, 18, -50, 75, -89,
 ];
 static DCT16_KERNEL: [i8; 64] = [
@@ -74,7 +76,7 @@ static DCT16_KERNEL: [i8; 64] = [
 /// dense DCT-32 matrix, avm `tx_kernel_dct2_size32`). Used by the flat
 /// hand-unrolled [`inv_dct32`] butterfly (~2.3x faster than recursing).
 #[rustfmt::skip]
-static DCT32_DENSE_KERNEL: [i8; 1024] = [
+pub(in crate::av2) static DCT32_DENSE_KERNEL: [i8; 1024] = [
       64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,
       90,  90,  88,  85,  82,  78,  73,  67,  61,  54,  47,  39,  30,  22,  13,   4,  -4, -13, -22, -30, -39, -47, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90,
       90,  87,  80,  70,  57,  43,  26,   9,  -9, -26, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -26,  -9,   9,  26,  43,  57,  70,  80,  87,  90,
@@ -111,7 +113,7 @@ static DCT32_DENSE_KERNEL: [i8; 1024] = [
 
 /// Full size-16 inverse DCT-II kernel `K16[in*16 + out]` for the flat [`inv_dct16`].
 #[rustfmt::skip]
-static DCT16_DENSE_KERNEL: [i8; 256] = [
+pub(in crate::av2) static DCT16_DENSE_KERNEL: [i8; 256] = [
       64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,  64,
       90,  87,  80,  70,  57,  43,  26,   9,  -9, -26, -43, -57, -70, -80, -87, -90,
       89,  75,  50,  18, -18, -50, -75, -89, -89, -75, -50, -18,  18,  50,  75,  89,
@@ -129,15 +131,15 @@ static DCT16_DENSE_KERNEL: [i8; 256] = [
       18, -50,  75, -89,  89, -75,  50, -18, -18,  50, -75,  89, -89,  75, -50,  18,
        9, -26,  43, -57,  70, -80,  87, -90,  90, -87,  80, -70,  57, -43,  26,  -9,
 ];
-static ADST4_KERNEL: [i8; 16] = [
+pub(in crate::av2) static ADST4_KERNEL: [i8; 16] = [
     18, 50, 75, 89, 50, 89, 18, -75, 75, 18, -89, 50, 89, -75, 50, -18,
 ];
-static ADST8_KERNEL: [i8; 64] = [
+pub(in crate::av2) static ADST8_KERNEL: [i8; 64] = [
     11, 34, 54, 71, 84, 88, 79, 50, 28, 74, 89, 68, 17, -44, -83, -69, 44, 89, 48, -41, -89, -44,
     50, 81, 58, 76, -34, -86, 10, 88, 6, -84, 70, 39, -87, 1, 86, -44, -59, 78, 79, -12, -66, 87,
     -35, -44, 86, -62, 86, -58, 12, 38, -75, 88, -74, 40, 89, -86, 79, -70, 58, -44, 29, -14,
 ];
-static ADST16_KERNEL: [i8; 256] = [
+pub(in crate::av2) static ADST16_KERNEL: [i8; 256] = [
     8, 25, 41, 55, 67, 77, 84, 88, 89, 87, 81, 73, 62, 48, 33, 17, 17, 48, 73, 87, 88, 77, 55, 25,
     -8, -41, -67, -84, -89, -81, -62, -33, 25, 67, 88, 81, 48, 0, -48, -81, -88, -67, -25, 25, 67,
     88, 81, 48, 33, 81, 84, 41, -25, -77, -87, -48, 17, 73, 88, 55, -8, -67, -89, -62, 41, 88, 62,
@@ -151,10 +153,10 @@ static ADST16_KERNEL: [i8; 256] = [
     17, 25, -62, 84, -88, 73, -41, 88, -81, 67, -48, 25, 0, -25, 48, -67, 81, -88, 88, -81, 67,
     -48, 25, 89, -88, 87, -84, 81, -77, 73, -67, 62, -55, 48, -41, 33, -25, 17, -8,
 ];
-static FLIPADST4_KERNEL: [i8; 16] = [
+pub(in crate::av2) static FLIPADST4_KERNEL: [i8; 16] = [
     89, 75, 50, 18, 75, -18, -89, -50, 50, -89, 18, 75, 18, -50, 75, -89,
 ];
-static FLIPADST16_KERNEL: [i8; 256] = [
+pub(in crate::av2) static FLIPADST16_KERNEL: [i8; 256] = [
     89, 88, 87, 84, 81, 77, 73, 67, 62, 55, 48, 41, 33, 25, 17, 8, 88, 81, 67, 48, 25, 0, -25, -48,
     -67, -81, -88, -88, -81, -67, -48, -25, 87, 67, 33, -8, -48, -77, -89, -81, -55, -17, 25, 62,
     84, 88, 73, 41, 84, 48, -8, -62, -88, -77, -33, 25, 73, 89, 67, 17, -41, -81, -87, -55, 81, 25,
@@ -168,12 +170,12 @@ static FLIPADST16_KERNEL: [i8; 256] = [
     -48, 81, -88, 67, -25, -25, 67, -88, 81, -48, 17, -48, 73, -87, 88, -77, 55, -25, -8, 41, -67,
     84, -89, 81, -62, 33, 8, -25, 41, -55, 67, -77, 84, -88, 89, -87, 81, -73, 62, -48, 33, -17,
 ];
-static DDT8_KERNEL: [i8; 64] = [
+pub(in crate::av2) static DDT8_KERNEL: [i8; 64] = [
     4, 6, 22, 57, 96, 103, 78, 56, 7, 14, 48, 94, 73, -17, -79, -96, 15, 36, 85, 76, -43, -80, 7,
     98, 33, 77, 88, -26, -69, 56, 56, -77, 65, 100, 0, -73, 55, 15, -82, 54, 98, 45, -86, 34, 20,
     -66, 79, -33, 106, -57, -23, 54, -71, 75, -56, 19, 80, -98, 82, -66, 53, -41, 26, -6,
 ];
-static DDT16_KERNEL: [i8; 256] = [
+pub(in crate::av2) static DDT16_KERNEL: [i8; 256] = [
     12, 17, 37, 45, 47, 60, 64, 82, 89, 100, 92, 84, 69, 50, 51, 44, 15, 23, 49, 60, 60, 74, 70,
     73, 48, 9, -35, -71, -83, -79, -89, -95, 19, 30, 60, 69, 61, 64, 40, 3, -53, -99, -91, -46, 2,
     47, 73, 124, 23, 38, 69, 73, 49, 28, -19, -80, -96, -45, 42, 88, 75, 14, -17, -126, 30, 48, 75,
@@ -441,19 +443,6 @@ fn inv_identity32(c: &mut [i32]) {
     }
 }
 
-fn inv_wht4(c: &mut [i32; 4]) {
-    let (in0, in1, in2, in3) = (c[0], c[1], c[2], c[3]);
-    let t0 = in0 + in1;
-    let t2 = in2 - in3;
-    let t4 = (t0 - t2) >> 1;
-    let t3 = t4 - in3;
-    let t1 = t4 - in1;
-    c[0] = t0 - t3;
-    c[1] = t3;
-    c[2] = t1;
-    c[3] = t2 + t1;
-}
-
 type Fn1d = fn(&mut [i32]);
 static TX1D: [[Option<Fn1d>; 6]; 5] = [
     [
@@ -490,7 +479,7 @@ static TX1D: [[Option<Fn1d>; 6]; 5] = [
     ],
     [Some(inv_dct32), None, None, None, None, None],
 ];
-static DIM: [(usize, usize, usize, usize); 25] = [
+pub(in crate::av2) static DIM: [(usize, usize, usize, usize); 25] = [
     (1, 1, 0, 0),
     (2, 2, 1, 1),
     (4, 4, 2, 2),
@@ -517,7 +506,7 @@ static DIM: [(usize, usize, usize, usize); 25] = [
     (1, 16, 0, 4),
     (16, 1, 4, 0),
 ];
-static TXSH: [(i32, i32); 25] = [
+pub(in crate::av2) static TXSH: [(i32, i32); 25] = [
     (7, 10),
     (7, 11),
     (6, 13),
@@ -605,10 +594,43 @@ fn inv_txfm_passes(
 /// prediction at output index `i`. The residual add, pixel clip and i32→f32 cast
 /// all happen in this single output pass, so callers need no separate prediction
 /// pre-fill, transpose, or cast pass (mirrors the old fused reconstruct path).
-/// Run the inverse-transform row + column passes, dispatching to the NEON lane
-/// implementation on aarch64 (bit-exact to the scalar passes). Shared by
-/// [`inv_txfm_add`] and [`inv_txfm_recon_f32`] so both get SIMD on the costly
-/// transform while their cheap output stages stay scalar.
+/// Run the inverse-transform row + column passes, dispatching through a
+/// OnceLock-resolved SIMD backend when available (NEON on aarch64, AVX2 on x86).
+/// Shared by [`inv_txfm_add`] and [`inv_txfm_recon_f32`] so both get SIMD on the
+/// costly transform while their cheap output stages stay scalar.
+pub(crate) type ItxPassesFn =
+    unsafe fn(&mut [i32; 32 * 32], &[i32], usize, usize, i32) -> (usize, usize, usize, usize, i32);
+
+static ITX_PASSES: OnceLock<ItxPassesFn> = OnceLock::new();
+
+unsafe fn inv_txfm_passes_scalar_dispatch(
+    tmp: &mut [i32; 32 * 32],
+    coeff: &[i32],
+    txtp: usize,
+    tx: usize,
+    bd: i32,
+) -> (usize, usize, usize, usize, i32) {
+    inv_txfm_passes(tmp, coeff, txtp, tx, bd)
+}
+
+#[inline]
+fn resolve_txfm_passes() -> ItxPassesFn {
+    *ITX_PASSES.get_or_init(|| {
+        let mut _f = inv_txfm_passes_scalar_dispatch as ItxPassesFn;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = neon_lane::passes_neon as ItxPassesFn;
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::av2::avx::inv_txfm_passes_avx2 as ItxPassesFn;
+            }
+        }
+        _f
+    })
+}
+
 #[inline]
 fn txfm_passes(
     tmp: &mut [i32; 32 * 32],
@@ -617,14 +639,8 @@ fn txfm_passes(
     tx: usize,
     bd: i32,
 ) -> (usize, usize, usize, usize, i32) {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: neon feature detected at runtime.
-            return unsafe { neon_lane::passes_neon(tmp, coeff, txtp, tx, bd) };
-        }
-    }
-    inv_txfm_passes(tmp, coeff, txtp, tx, bd)
+    let f = resolve_txfm_passes();
+    unsafe { f(tmp, coeff, txtp, tx, bd) }
 }
 
 pub(crate) fn inv_txfm_recon_f32<F: Fn(usize) -> i32>(
@@ -728,58 +744,6 @@ pub(crate) fn inv_txfm_add(
                     }
                 }
             }
-        }
-    }
-}
-
-/// DC-only DCT_DCT fast path (dav2d's fused rounding) — used when only the DC
-/// coefficient is non-zero. `dc_in` is `coeff[0]`.
-#[allow(dead_code)]
-pub(crate) fn inv_txfm_add_dc(dst: &mut [i32], stride: isize, dc_in: i32, tx: usize, bd: i32) {
-    let (tw, th, lw, lh) = DIM[tx];
-    let (sp1, s1) = TXSH[tx];
-    let shift = sp1 + s1 - 12;
-    let rnd = (1 << (shift - 1)) + sp1 - 6;
-    let (w, h) = (4 * tw, 4 * th);
-    let pmax = (1 << bd) - 1;
-    let mut dc = dc_in;
-    if (lw + lh) & 1 != 0 {
-        dc = (dc * 181 + 128) >> 8;
-    }
-    dc = (dc + rnd) >> shift;
-    for y in 0..h {
-        let base = (y as isize * stride) as usize;
-        for d in dst[base..base + w].iter_mut() {
-            *d = (*d + dc).clamp(0, pmax);
-        }
-    }
-}
-
-/// 4x4 Walsh-Hadamard inverse add (lossless path). `coeff` in `coeff[y + x*4]` layout.
-#[allow(dead_code)]
-pub(crate) fn inv_txfm_add_wht4x4(dst: &mut [i32], stride: isize, coeff: &[i32], bd: i32) {
-    let mut tmp = [0i32; 16];
-    let pmax = (1 << bd) - 1;
-    for (y, row) in tmp.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        for (x, slot) in row.iter_mut().enumerate() {
-            *slot = coeff[y + x * 4] >> 3;
-        }
-        inv_wht4(row);
-    }
-    let mut colbuf = [0i32; 4];
-    for x in 0..4 {
-        for (y, slot) in colbuf.iter_mut().enumerate() {
-            *slot = tmp[y * 4 + x];
-        }
-        inv_wht4(&mut colbuf);
-        for (y, &v) in colbuf.iter().enumerate() {
-            tmp[y * 4 + x] = v;
-        }
-    }
-    for (y, trow) in tmp.as_chunks::<4>().0.iter().enumerate() {
-        let base = (y as isize * stride) as usize;
-        for (d, &t) in dst[base..base + 4].iter_mut().zip(trow) {
-            *d = (*d + t).clamp(0, pmax);
         }
     }
 }
@@ -1171,7 +1135,7 @@ mod neon_lane {
     /// # Safety
     /// Requires the `neon` feature (baseline on aarch64).
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn passes_neon(
+    pub(super) fn passes_neon(
         tmp: &mut [i32; 32 * 32],
         coeff: &[i32],
         txtp: usize,
@@ -1179,5 +1143,91 @@ mod neon_lane {
         bd: i32,
     ) -> (usize, usize, usize, usize, i32) {
         inv_txfm_passes_lanes::<N4>(tmp, coeff, txtp, tx, bd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_1d_types(sz: usize) -> &'static [usize] {
+        match sz {
+            0 => &[0, 1, 2, 3],
+            1 | 2 => &[0, 1, 2, 3, 4, 5],
+            3 => &[0, 1],
+            4 => &[0],
+            _ => &[],
+        }
+    }
+
+    fn coeff_case(sw: usize, sh: usize, tx: usize, hor: usize, ver: usize, seed: u32) -> Vec<i32> {
+        let mut state = seed
+            .wrapping_mul(747_796_405)
+            .wrapping_add((tx as u32) << 24)
+            .wrapping_add((hor as u32) << 12)
+            .wrapping_add(ver as u32);
+        let mut coeff = vec![0i32; sw * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 21) as i32) - 1024;
+                let trend = (x as i32 * 17) - (y as i32 * 13) + ((x ^ y) as i32 * 5);
+                coeff[y * sw + x] = (noise + trend).clamp(-2048, 2047);
+            }
+        }
+        coeff
+    }
+
+    unsafe fn assert_itx_impl_matches_scalar(name: &str, simd: ItxPassesFn) {
+        for tx in 0..DIM.len() {
+            let (tw, th, lw, lh) = DIM[tx];
+            let sw = (4 * tw).min(32);
+            let sh = (4 * th).min(32);
+            for &hor in valid_1d_types(lw) {
+                for &ver in valid_1d_types(lh) {
+                    let txtp = hor | (ver << 5);
+                    for &bd in &[8, 10, 12] {
+                        for seed in 0..3u32 {
+                            let coeff = coeff_case(sw, sh, tx, hor, ver, seed);
+                            let mut expected = [0x5555_5555i32; 32 * 32];
+                            let mut actual = [0x3333_3333i32; 32 * 32];
+
+                            let expected_ret = inv_txfm_passes(&mut expected, &coeff, txtp, tx, bd);
+                            let actual_ret = unsafe { simd(&mut actual, &coeff, txtp, tx, bd) };
+                            assert_eq!(
+                                actual_ret, expected_ret,
+                                "{name} return mismatch tx={tx} hor={hor} ver={ver} bd={bd} seed={seed}"
+                            );
+                            let area = expected_ret.0 * expected_ret.1;
+                            assert_eq!(
+                                &actual[..area],
+                                &expected[..area],
+                                "{name} coeff mismatch tx={tx} hor={hor} ver={ver} bd={bd} seed={seed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn itx_neon_passes_match_scalar() {
+        unsafe { assert_itx_impl_matches_scalar("neon", neon_lane::passes_neon as ItxPassesFn) };
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[test]
+    fn itx_avx2_passes_match_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            assert_itx_impl_matches_scalar(
+                "avx2",
+                crate::av2::avx::inv_txfm_passes_avx2 as ItxPassesFn,
+            )
+        };
     }
 }

@@ -36,7 +36,7 @@ fn dc_tx_scale(w: usize, h: usize) -> i32 {
 }
 
 fn dc_tx_index(w: usize, h: usize) -> usize {
-    use crate::av2::av2_itx::tx_size::*;
+    use crate::av2::itx::tx_size::*;
     match (w, h) {
         (4, 4) => TX_4X4,
         (8, 8) => TX_8X8,
@@ -103,7 +103,7 @@ pub(crate) fn reconstruct_chroma(
     }
     let p = pred.fast_round() as i32;
     let mut out = vec![0f32; w * h];
-    crate::av2::av2_itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| p);
+    crate::av2::itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| p);
     out
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn reconstruct_chroma_cfl(
         }
     }
     let mut out = vec![0f32; w * h];
-    crate::av2::av2_itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |i| pred[i]);
+    crate::av2::itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |i| pred[i]);
     out
 }
 
@@ -159,11 +159,11 @@ pub(crate) fn reconstruct_luma16_adst(
     // txtp = hor | (ver << 5); hor = row transform, ver = col transform. ADST=2, DCT=0.
     let txtp = (if row_adst { 2 } else { 0 }) | ((if col_adst { 2 } else { 0 }) << 5);
     let mut out = [0f32; 256];
-    crate::av2::av2_itx::inv_txfm_recon_f32(
+    crate::av2::itx::inv_txfm_recon_f32(
         &mut out,
         &coeff,
         txtp,
-        crate::av2::av2_itx::tx_size::TX_16X16,
+        crate::av2::itx::tx_size::TX_16X16,
         bd,
         |i| (pred[i] + 0.5) as i32,
     );
@@ -191,11 +191,11 @@ pub(crate) fn reconstruct_luma16(
     }
     // DCT_DCT (txtp 0), TX_16X16 — fused reconstruct (add pred + clip + cast in one pass).
     let mut out = [0f32; 256];
-    crate::av2::av2_itx::inv_txfm_recon_f32(
+    crate::av2::itx::inv_txfm_recon_f32(
         &mut out,
         &coeff,
         0,
-        crate::av2::av2_itx::tx_size::TX_16X16,
+        crate::av2::itx::tx_size::TX_16X16,
         bd,
         |i| (pred[i] + 0.5) as i32,
     );
@@ -230,11 +230,11 @@ pub(crate) fn reconstruct_luma_64x16(
         }
     }
     let mut out = [0f32; 1024];
-    crate::av2::av2_itx::inv_txfm_recon_f32(
+    crate::av2::itx::inv_txfm_recon_f32(
         &mut out,
         &coeff,
         0,
-        crate::av2::av2_itx::tx_size::RTX_64X16,
+        crate::av2::itx::tx_size::RTX_64X16,
         bd,
         |i| (pred[i] + 0.5) as i32,
     );
@@ -264,11 +264,11 @@ pub(crate) fn reconstruct_luma_16x64(
         }
     }
     let mut out = [0f32; 1024];
-    crate::av2::av2_itx::inv_txfm_recon_f32(
+    crate::av2::itx::inv_txfm_recon_f32(
         &mut out,
         &coeff,
         0,
-        crate::av2::av2_itx::tx_size::RTX_16X64,
+        crate::av2::itx::tx_size::RTX_16X64,
         bd,
         |i| (pred[i] + 0.5) as i32,
     );
@@ -296,11 +296,11 @@ pub(crate) fn reconstruct_luma(
         }
     }
     let mut out = [0f32; 1024];
-    crate::av2::av2_itx::inv_txfm_recon_f32(
+    crate::av2::itx::inv_txfm_recon_f32(
         &mut out,
         &coeff,
         0,
-        crate::av2::av2_itx::tx_size::TX_32X32,
+        crate::av2::itx::tx_size::TX_32X32,
         bd,
         |i| (pred[i] + 0.5) as i32,
     );
