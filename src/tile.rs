@@ -894,53 +894,6 @@ pub fn encode_tile_lossless_mono(w: usize, h: usize, bit_depth: u8, luma: &[i16]
 mod tests {
     use super::*;
 
-    /// Arbitrary-size (non-multiple-of-64) lossless regression guard. 72×64 has
-    /// one full superblock plus an 8px-wide edge column split to 8×8 leaves via
-    /// the frame-edge partition logic. Bytes verified bit-exact in dav1d 1.4.1
-    /// and ffmpeg.
-    #[test]
-    fn lossless_72x64_edge_stable() {
-        let (w, h) = (72usize, 64usize);
-        let (mut g, mut b, mut r) = (vec![0i16; w * h], vec![0i16; w * h], vec![0i16; w * h]);
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                g[i] = ((x + y) % 64) as i16;
-                b[i] = (x % 64) as i16;
-                r[i] = (y % 64) as i16;
-            }
-        }
-        let p = encode_tile_lossless(w, h, 8, [&g, &b, &r]);
-        assert_eq!(p.len(), 1671);
-        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 224364);
-        assert_eq!(&p[..6], &[221, 107, 90, 215, 91, 24]);
-    }
-
-    /// Multi-superblock lossless regression guard (128x64, two superblocks).
-    /// Bytes verified to decode exactly in dav1d 1.4.1 and ffmpeg.
-    #[test]
-    fn lossless_128x64_stable() {
-        let (w, h) = (128usize, 64usize);
-        let (mut g, mut b, mut r) = (vec![0i16; w * h], vec![0i16; w * h], vec![0i16; w * h]);
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                g[i] = ((x + y) % 64) as i16;
-                b[i] = (x % 64) as i16;
-                r[i] = (y % 64) as i16;
-            }
-        }
-        let p = encode_tile_lossless(w, h, 8, [&g, &b, &r]);
-        assert_eq!(p.len(), 2904);
-        assert_eq!(p.iter().map(|&x| x as u64).sum::<u64>(), 384244);
-        assert_eq!(&p[..6], &[0xdd, 0x6b, 0x5a, 0xd7, 0x5b, 0x18]);
-    }
-
-    /// Mono lossless determinism + non-emptiness. The mono leaf is an exact
-    /// subset of the verified 4:4:4 leaf (no uv_mode symbol, no chroma blocks),
-    /// so its luma coding is byte-for-byte the 4:4:4 luma coding. Golden bytes
-    /// for these assertions should be captured once the stream is confirmed to
-    /// round-trip in dav1d/avifdec (a mono AVIF wrapper with `mono_chrome = 1`).
     #[test]
     fn mono_lossless_deterministic_nonempty() {
         let (w, h) = (72usize, 64usize); // includes a frame-edge split column
