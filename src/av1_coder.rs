@@ -7604,6 +7604,46 @@ fn resolve_threads(threads: usize) -> usize {
     }
 }
 
+fn par_map_indexed<T, F>(nthreads: usize, n: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if nthreads <= 1 || n <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        let mut got: Vec<(usize, T)> = Vec::new();
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= n {
+                break got;
+            }
+            got.push((i, f(i)));
+        }
+    };
+    let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+        let spawned = nthreads.min(n) - 1;
+        let handles: Vec<_> = (0..spawned).map(|_| scope.spawn(work)).collect();
+        std::iter::once(work())
+            .chain(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("worker panicked")),
+            )
+            .collect()
+    });
+    let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(n).collect();
+    for (i, v) in parts.into_iter().flatten() {
+        slots[i] = Some(v);
+    }
+    slots
+        .into_iter()
+        .map(|s| s.expect("index produced"))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn encode_lossy_tilegroup(
     base_q_idx: u8,
@@ -7666,65 +7706,25 @@ fn encode_lossy_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
 
-    // Encode every tile. Serial when a single thread (or single tile) is asked
-    // for; otherwise split the tiles into disjoint chunks, one scoped thread per
-    // chunk (no shared mutable state, so no locks and no `unsafe`).
-    // `wiener_unit` controls whether each SB emits `read_lr` Wiener syntax; it is
-    // `None` on the first pass (coefficients not yet known) and the chosen global
-    // filter on the optional second pass. Because LR is a post-filter, the
-    // reconstruction is identical regardless, so only the payloads differ.
     let encode_all = |wiener_unit: Option<crate::wiener::WienerUnit>| -> Vec<TileOut> {
-        if nthreads <= 1 || n <= 1 {
-            rects
-                .iter()
-                .map(|r| {
-                    encode_one_tile(
-                        base_q_idx,
-                        bd,
-                        w8,
-                        h8,
-                        cw8,
-                        sub_x,
-                        sub_y,
-                        mono,
-                        src,
-                        r,
-                        speed,
-                        aq,
-                        vb,
-                        wiener_unit,
-                    )
-                })
-                .collect()
-        } else {
-            let mut slots: Vec<Option<TileOut>> = (0..n).map(|_| None).collect();
-            let chunk = n.div_ceil(nthreads);
-            std::thread::scope(|scope| {
-                for (rs, os) in rects.chunks(chunk).zip(slots.chunks_mut(chunk)) {
-                    scope.spawn(move || {
-                        for (r, o) in rs.iter().zip(os.iter_mut()) {
-                            *o = Some(encode_one_tile(
-                                base_q_idx,
-                                bd,
-                                w8,
-                                h8,
-                                cw8,
-                                sub_x,
-                                sub_y,
-                                mono,
-                                src,
-                                r,
-                                speed,
-                                aq,
-                                vb,
-                                wiener_unit,
-                            ));
-                        }
-                    });
-                }
-            });
-            slots.into_iter().map(|o| o.unwrap()).collect()
-        }
+        par_map_indexed(nthreads, n, |i| {
+            encode_one_tile(
+                base_q_idx,
+                bd,
+                w8,
+                h8,
+                cw8,
+                sub_x,
+                sub_y,
+                mono,
+                src,
+                &rects[i],
+                speed,
+                aq,
+                vb,
+                wiener_unit,
+            )
+        })
     };
     let outs: Vec<TileOut> = encode_all(None);
 
@@ -8113,28 +8113,13 @@ fn cdef_search_plane(
         sse
     };
 
-    // Spread candidates across worker threads. The candidate count is small
-    // (~11) so one thread per candidate is fine; scoped threads borrow `recon`,
-    // `src`, `dirs`, `vars`, `skip` immutably with no locks.
+    // Spread candidates across workers (caller included) with work stealing;
+    // closures borrow `recon`, `src`, `dirs`, `vars`, `skip` immutably, no locks.
     let want = resolve_threads(0).clamp(1, candidates.len().max(1));
-    let mut sses: Vec<i64> = vec![0; candidates.len()];
-    if want <= 1 || candidates.len() <= 1 {
-        for (slot, &(pri, sec)) in sses.iter_mut().zip(candidates.iter()) {
-            *slot = eval(pri, sec);
-        }
-    } else {
-        let chunk = candidates.len().div_ceil(want);
-        std::thread::scope(|scope| {
-            for (cs, os) in candidates.chunks(chunk).zip(sses.chunks_mut(chunk)) {
-                let eval = &eval;
-                scope.spawn(move || {
-                    for (&(pri, sec), o) in cs.iter().zip(os.iter_mut()) {
-                        *o = eval(pri, sec);
-                    }
-                });
-            }
-        });
-    }
+    let sses: Vec<i64> = par_map_indexed(want, candidates.len(), |i| {
+        let (pri, sec) = candidates[i];
+        eval(pri, sec)
+    });
 
     // Reduce: pick the best candidate that beats baseline and clears the margin.
     // Deterministic tie-break: iterate candidates in their fixed order, matching
@@ -8352,24 +8337,10 @@ fn cdef_search_chroma(
     };
 
     let want = resolve_threads(0).clamp(1, candidates.len().max(1));
-    let mut sses: Vec<i64> = vec![0; candidates.len()];
-    if want <= 1 || candidates.len() <= 1 {
-        for (slot, &(pri, sec)) in sses.iter_mut().zip(candidates.iter()) {
-            *slot = eval(pri, sec);
-        }
-    } else {
-        let chunk = candidates.len().div_ceil(want);
-        std::thread::scope(|scope| {
-            for (cs, os) in candidates.chunks(chunk).zip(sses.chunks_mut(chunk)) {
-                let eval = &eval;
-                scope.spawn(move || {
-                    for (&(pri, sec), o) in cs.iter().zip(os.iter_mut()) {
-                        *o = eval(pri, sec);
-                    }
-                });
-            }
-        });
-    }
+    let sses: Vec<i64> = par_map_indexed(want, candidates.len(), |i| {
+        let (pri, sec) = candidates[i];
+        eval(pri, sec)
+    });
 
     let mut best = (0i32, 0i32);
     let mut best_sse = off_sse;
@@ -8584,25 +8555,9 @@ fn encode_lossless_tilegroup(
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
-    let payloads: Vec<Vec<u8>> = if nthreads <= 1 || n <= 1 {
-        rects
-            .iter()
-            .map(|r| encode_one_lossless_tile(bd, w8, src, r))
-            .collect()
-    } else {
-        let mut slots: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
-        let chunk = n.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            for (rs, os) in rects.chunks(chunk).zip(slots.chunks_mut(chunk)) {
-                scope.spawn(move || {
-                    for (r, o) in rs.iter().zip(os.iter_mut()) {
-                        *o = Some(encode_one_lossless_tile(bd, w8, src, r));
-                    }
-                });
-            }
-        });
-        slots.into_iter().map(|o| o.unwrap()).collect()
-    };
+    let payloads: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+        encode_one_lossless_tile(bd, w8, src, &rects[i])
+    });
 
     (assemble_tilegroup(payloads), plan)
 }
@@ -8672,25 +8627,9 @@ fn encode_lossless_mono_tilegroup(
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
-    let payloads: Vec<Vec<u8>> = if nthreads <= 1 || n <= 1 {
-        rects
-            .iter()
-            .map(|r| encode_one_lossless_tile_mono(bd, w8, luma, r))
-            .collect()
-    } else {
-        let mut slots: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
-        let chunk = n.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            for (rs, os) in rects.chunks(chunk).zip(slots.chunks_mut(chunk)) {
-                scope.spawn(move || {
-                    for (r, o) in rs.iter().zip(os.iter_mut()) {
-                        *o = Some(encode_one_lossless_tile_mono(bd, w8, luma, r));
-                    }
-                });
-            }
-        });
-        slots.into_iter().map(|o| o.unwrap()).collect()
-    };
+    let payloads: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+        encode_one_lossless_tile_mono(bd, w8, luma, &rects[i])
+    });
 
     (assemble_tilegroup(payloads), plan)
 }
@@ -8731,10 +8670,6 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     assemble_lossless_mono_frame_obus(&plan, &tilegroup)
 }
 
-/// Encode a full monochrome **lossless** AV1 still image: temporal delimiter +
-/// monochrome sequence header (`mono_chrome = 1`) + lossless frame. `luma` is
-/// `w*h` samples; it is padded to a multiple of 8 internally. Profile 0 for
-/// 8/10-bit, profile 2 for 12-bit.
 pub(crate) fn encode_av1_mono_lossless_image(
     bd: u8,
     w: usize,
@@ -8778,7 +8713,7 @@ pub(crate) fn encode_av1_lossy_image_cs(
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_cs_recon_dbg(
+    encode_av1_lossy_image_cs_recon(
         base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, &vb, cdef, wiener,
     )
     .0
@@ -8787,7 +8722,7 @@ pub(crate) fn encode_av1_lossy_image_cs(
 /// Debug variant of [`encode_av1_lossy_image_cs`] (4:4:4) returning the padded
 /// reconstruction and dims, for bit-exactness verification.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
+pub(crate) fn encode_av1_lossy_image_cs_recon(
     base_q_idx: u8,
     bd: u8,
     w: usize,
@@ -8832,10 +8767,6 @@ pub(crate) fn encode_av1_lossy_image_cs_recon_dbg(
     (bytes, recon, (w8, h8))
 }
 
-/// Encode a **lossy 4:2:2** YCbCr still (profile 2). `luma` is `w*h`; `u`/`v`
-/// are the horizontally-subsampled chroma planes, each `cw*h` with
-/// `cw = (w+1)/2`. The decoder reconstructs full-resolution RGB via the
-/// signalled BT.601 matrix and 4:2:2 upsampling.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_av1_lossy_image_422(
     base_q_idx: u8,
@@ -8853,14 +8784,14 @@ pub(crate) fn encode_av1_lossy_image_422(
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_422_recon_dbg(
+    encode_av1_lossy_image_422_recon(
         base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef, wiener,
     )
     .0
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn encode_av1_lossy_image_422_recon_dbg(
+pub(crate) fn encode_av1_lossy_image_422_recon(
     base_q_idx: u8,
     bd: u8,
     w: usize,
@@ -8927,17 +8858,14 @@ pub(crate) fn encode_av1_lossy_image_420(
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
-    encode_av1_lossy_image_420_recon_dbg(
+    encode_av1_lossy_image_420_recon(
         base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef, wiener,
     )
     .0
 }
 
-/// Debug variant of [`encode_av1_lossy_image_420`] also returning the encoder's
-/// padded reconstruction `[Y, U, V]` and the padded dims `(w8, h8, cw8, ch8)`,
-/// for bit-exactness verification against the decoder.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn encode_av1_lossy_image_420_recon_dbg(
+pub(crate) fn encode_av1_lossy_image_420_recon(
     base_q_idx: u8,
     bd: u8,
     w: usize,
@@ -8999,7 +8927,7 @@ pub(crate) fn encode_av1_mono_image(
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
-    let (bytes, _recon, _w8, _h8) = encode_av1_mono_image_recon_dbg(
+    let (bytes, _recon, _w8, _h8) = encode_av1_mono_image_recon(
         base_q_idx, bd, w, h, luma, full_range, threads, speed, aq, vb, cdef, wiener,
     );
     bytes
@@ -9007,7 +8935,7 @@ pub(crate) fn encode_av1_mono_image(
 
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_av1_mono_image_recon_dbg(
+pub(crate) fn encode_av1_mono_image_recon(
     base_q_idx: u8,
     bd: u8,
     w: usize,
