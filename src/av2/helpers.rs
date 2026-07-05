@@ -544,6 +544,7 @@ pub(crate) fn pixel_sse_rounded(a: &[f32], b: &[f32]) -> u64 {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pixel_sse_rounded_block(
     src: &[f32],
     src_stride: usize,
@@ -610,7 +611,7 @@ fn resolve_coeff_rate_f32() -> CoeffRateF32Fn {
         {
             _f = crate::av2::neon::coeff_rate_f32_neon as CoeffRateF32Fn;
         }
-        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
                 _f = crate::av2::avx::coeff_rate_f32_avx2 as CoeffRateF32Fn;
@@ -635,7 +636,7 @@ fn resolve_coeff_abs_rate_f32() -> CoeffAbsRateF32Fn {
         {
             _f = crate::av2::neon::coeff_abs_rate_f32_neon as CoeffAbsRateF32Fn;
         }
-        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::av2::avx::coeff_abs_rate_f32_avx2 as CoeffAbsRateF32Fn;
@@ -877,7 +878,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn coeff_rate_avx2_matches_scalar() {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
@@ -886,7 +887,7 @@ mod tests {
         assert_coeff_rate_impl_matches_scalar("avx2", crate::av2::avx::coeff_rate_f32_avx2);
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn coeff_abs_rate_avx2_matches_scalar() {
         if !std::is_x86_feature_detected!("avx2") {

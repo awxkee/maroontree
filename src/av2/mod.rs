@@ -30,7 +30,7 @@
 #[allow(unused_imports)]
 mod aq;
 mod avif;
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod ccso;
 mod cdf_para;

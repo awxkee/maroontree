@@ -314,8 +314,8 @@ fn plane_leaf_bits(
     by: usize,
     n_tx: usize,
     base: i32,
-) -> f64 {
-    let mut bits = 0f64;
+) -> f32 {
+    let mut bits = 0f32;
     let mut pred = [0i32; 16];
     let mut resid = [0i32; 16];
 
@@ -359,9 +359,9 @@ fn best_leaf(
     py: usize,
     n_tx: usize,
     base: i32,
-) -> (f64, usize, usize) {
+) -> (f32, usize, usize) {
     let mut y_mode = 0usize;
-    let mut yb = f64::INFINITY;
+    let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
         let b = plane_leaf_bits(m, planes[0], stride, px, py, n_tx, base);
         if b < yb {
@@ -370,7 +370,7 @@ fn best_leaf(
         }
     }
     let mut uv_mode = 0usize;
-    let mut ub = f64::INFINITY;
+    let mut ub = f32::INFINITY;
     for &m in LL_MODES.iter() {
         let b = plane_leaf_bits(m, planes[1], stride, px, py, n_tx, base)
             + plane_leaf_bits(m, planes[2], stride, px, py, n_tx, base);
@@ -379,7 +379,7 @@ fn best_leaf(
             uv_mode = m;
         }
     }
-    let ang = |m: usize| if (1..=8).contains(&m) { 1.5 } else { 0.0 };
+    let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     let ovh = 7.0 + ang(y_mode) + ang(uv_mode); // skip + y_mode + uv_mode (+ angle_deltas)
     (yb + ub + ovh, y_mode, uv_mode)
 }
@@ -390,8 +390,8 @@ enum Plan {
     Split(Box<[Plan; 4]>),
 }
 
-const PART_NONE_BITS: f64 = 1.0;
-const PART_SPLIT_BITS: f64 = 1.5;
+const PART_NONE_BITS: f32 = 1.0;
+const PART_SPLIT_BITS: f32 = 1.5;
 
 /// Decide none-vs-split by estimated bits; returns the plan and its cost. Min
 /// leaf is 8x8 (sz8 == 1).
@@ -402,7 +402,7 @@ fn plan_full(
     py: usize,
     sz8: usize,
     base: i32,
-) -> (f64, Plan) {
+) -> (f32, Plan) {
     let (bits_leaf, ym, uv) = best_leaf(planes, stride, px, py, sz8 * 2, base);
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {
@@ -683,9 +683,9 @@ fn best_leaf_mono(
     py: usize,
     n_tx: usize,
     base: i32,
-) -> (f64, usize) {
+) -> (f32, usize) {
     let mut y_mode = 0usize;
-    let mut yb = f64::INFINITY;
+    let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
         let b = plane_leaf_bits(m, luma, stride, px, py, n_tx, base);
         if b < yb {
@@ -693,7 +693,7 @@ fn best_leaf_mono(
             y_mode = m;
         }
     }
-    let ang = |m: usize| if (1..=8).contains(&m) { 1.5 } else { 0.0 };
+    let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
     let ovh = 4.0 + ang(y_mode);
     (yb + ovh, y_mode)
@@ -707,7 +707,7 @@ fn plan_full_mono(
     py: usize,
     sz8: usize,
     base: i32,
-) -> (f64, Plan) {
+) -> (f32, Plan) {
     let (bits_leaf, ym) = best_leaf_mono(luma, stride, px, py, sz8 * 2, base);
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {

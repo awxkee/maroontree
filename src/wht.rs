@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 #[allow(unused)]
 fn fwht_raw(input: &mut [i32; 16]) {
@@ -81,19 +81,37 @@ fn wht_scalar(resid: &mut [i32; 16]) {
     resid.copy_from_slice(&t)
 }
 
-pub(crate) fn levels_from_resid(resid: &mut [i32; 16]) {
-    type Wht = dyn Fn(&mut [i32; 16]) + Send + Sync;
-    static WHT: OnceLock<Arc<Wht>> = OnceLock::new();
-    let f = WHT.get_or_init(|| {
+type WhtFn = fn(&mut [i32; 16]);
+static WHT: OnceLock<WhtFn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn fwht_raw_neon_wrap(input: &mut [i32; 16]) {
+    crate::neon::fwht_raw_neon(input);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn fwht_raw_avx2_wrap(input: &mut [i32; 16]) {
+    unsafe { crate::avx::fwht_raw_avx2(input) }
+}
+
+#[inline]
+fn resolve_wht() -> WhtFn {
+    *WHT.get_or_init(|| {
+        let mut _f: WhtFn = wht_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            use crate::neon::fwht_raw_neon;
-            Arc::new(fwht_raw_neon)
+            _f = fwht_raw_neon_wrap;
         }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
-            Arc::new(wht_scalar)
+            if std::is_x86_feature_detected!("avx2") {
+                _f = fwht_raw_avx2_wrap;
+            }
         }
-    });
-    f(resid);
+        _f
+    })
+}
+
+pub(crate) fn levels_from_resid(resid: &mut [i32; 16]) {
+    resolve_wht()(resid);
 }

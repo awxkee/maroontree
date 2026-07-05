@@ -361,6 +361,13 @@ pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
                 return idct_dequant_8x8_neon;
             }
         }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                use crate::avx::idct_dequant_8x8_avx2;
+                return idct_dequant_8x8_avx2;
+            }
+        }
         idct_dequant_8x8_scalar
     });
     let dequant = IdctDequant {
@@ -666,6 +673,13 @@ pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256
             if std::arch::is_aarch64_feature_detected!("neon") {
                 use crate::neon::idct_dequant_16x16_neon;
                 return idct_dequant_16x16_neon;
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                use crate::avx::idct_dequant_16x16_avx2;
+                return idct_dequant_16x16_avx2;
             }
         }
         idct_dequant_16x16_scalar
@@ -1101,6 +1115,13 @@ pub(crate) fn idct_dequant_32x32(levels: &[i32; 1024], q: &impl Dct) -> [i32; 10
                 return idct_dequant_32x32_neon;
             }
         }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                use crate::avx::idct_dequant_32x32_avx2;
+                return idct_dequant_32x32_avx2;
+            }
+        }
         idct_dequant_32x32_scalar
     });
     let dequant = IdctDequant {
@@ -1516,4 +1537,138 @@ pub(crate) fn iadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
         *t = (*t + 8) >> 4;
     }
     tmp
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "avx"
+))]
+mod avx2_itx_tests {
+    use super::*;
+
+    fn dequant() -> IdctDequant {
+        IdctDequant {
+            dc_q: 77,
+            ac_q: 91,
+            rmin: -(1 << 19),
+            rmax: (1 << 19) - 1,
+            cmin: -(1 << 15),
+            cmax: (1 << 15) - 1,
+            cf_max: (1 << 22) - 1,
+        }
+    }
+
+    fn fill_levels<const N: usize>() -> [i32; N] {
+        let mut out = [0i32; N];
+        let mut s = 0x1234_5678u32 ^ N as u32;
+        for (i, v) in out.iter_mut().enumerate() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let level = ((s >> 24) as i32 % 63) - 31;
+            *v = if i % 11 == 0 { 0 } else { level };
+        }
+        out[0] = 23;
+        out
+    }
+
+    #[test]
+    fn idct_8x8_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<64>();
+        let scalar = idct_dequant_8x8_scalar(&levels, &dq);
+        let avx2 = unsafe { crate::avx::idct_dequant_8x8_avx2(&levels, &dq) };
+        assert_eq!(scalar, avx2);
+    }
+
+    #[test]
+    fn idct_16x16_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<256>();
+        let scalar = idct_dequant_16x16_scalar(&levels, &dq);
+        let avx2 = unsafe { crate::avx::idct_dequant_16x16_avx2(&levels, &dq) };
+        assert_eq!(scalar, avx2);
+    }
+
+    #[test]
+    fn idct_32x32_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<1024>();
+        let scalar = idct_dequant_32x32_scalar(&levels, &dq);
+        let avx2 = unsafe { crate::avx::idct_dequant_32x32_avx2(&levels, &dq) };
+        assert_eq!(scalar, avx2);
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", feature = "neon"))]
+mod neon_itx_tests {
+    use super::*;
+
+    fn dequant() -> IdctDequant {
+        IdctDequant {
+            dc_q: 77,
+            ac_q: 91,
+            rmin: -(1 << 19),
+            rmax: (1 << 19) - 1,
+            cmin: -(1 << 15),
+            cmax: (1 << 15) - 1,
+            cf_max: (1 << 22) - 1,
+        }
+    }
+
+    fn fill_levels<const N: usize>() -> [i32; N] {
+        let mut out = [0i32; N];
+        let mut s = 0x8765_4321u32 ^ N as u32;
+        for (i, v) in out.iter_mut().enumerate() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let level = ((s >> 24) as i32 % 63) - 31;
+            *v = if i % 13 == 0 { 0 } else { level };
+        }
+        out[0] = -19;
+        out
+    }
+
+    #[test]
+    fn idct_8x8_neon_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<64>();
+        let scalar = idct_dequant_8x8_scalar(&levels, &dq);
+        let neon = unsafe { crate::neon::idct_dequant_8x8_neon(&levels, &dq) };
+        assert_eq!(scalar, neon);
+    }
+
+    #[test]
+    fn idct_16x16_neon_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<256>();
+        let scalar = idct_dequant_16x16_scalar(&levels, &dq);
+        let neon = unsafe { crate::neon::idct_dequant_16x16_neon(&levels, &dq) };
+        assert_eq!(scalar, neon);
+    }
+
+    #[test]
+    fn idct_32x32_neon_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let dq = dequant();
+        let levels = fill_levels::<1024>();
+        let scalar = idct_dequant_32x32_scalar(&levels, &dq);
+        let neon = unsafe { crate::neon::idct_dequant_32x32_neon(&levels, &dq) };
+        assert_eq!(scalar, neon);
+    }
 }

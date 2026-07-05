@@ -37,7 +37,7 @@
 // SQRT_2  = 1.4142136  -> 92682
 
 use crate::quant::Dct;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 pub(crate) const WC4_0: i32 = 35468; // 0.541196  * 65536
 pub(crate) const WC4_1: i32 = 85627; // 1.306563  * 65536
@@ -198,7 +198,7 @@ pub(crate) fn dct1d_16_i32(buf: &mut [i32; 16]) {
 /// forward transform reused by both the in-place quantizer ([`dct8x8_scalar`])
 /// and the trellis/RDOQ variant ([`dct8x8_t`]).
 #[inline]
-fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
+pub(crate) fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
     let mut tmp = [0i32; 64];
     // Pass 1: column-wise DCT-8.
     for x in 0..8usize {
@@ -524,31 +524,47 @@ pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
     }
 }
 
+type Dct16x16Fn = fn(&mut [i32; 256], i32, i32);
+static DCT16X16: OnceLock<Dct16x16Fn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct16x16_neon_i32_wrap(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+    unsafe { crate::neon::dct16x16_neon_i32(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct16x16_avx2_i32_wrap(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
+    unsafe { crate::avx::dct16x16_avx2_i32(input, dc_q, ac_q) }
+}
+
 #[inline]
-pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
-    pub(crate) type Dct = dyn Fn(&mut [i32; 256], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
-    let f = WHT.get_or_init(|| {
+fn resolve_dct16x16() -> Dct16x16Fn {
+    *DCT16X16.get_or_init(|| {
+        let mut _f: Dct16x16Fn = dct16x16_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            use crate::neon::dct16x16_neon_i32;
-            Arc::new(|input: &mut [i32; 256], dc_q: i32, ac_q: i32| unsafe {
-                dct16x16_neon_i32(input, dc_q, ac_q)
-            })
+            _f = dct16x16_neon_i32_wrap;
         }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
-            Arc::new(dct16x16_scalar)
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct16x16_avx2_i32_wrap;
+            }
         }
-    });
-    f(input, quant.q_mult_dc(), quant.q_mult_ac());
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
+    resolve_dct16x16()(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
 /// Shared 2-D integer DCT-16 transform core (no quantization). Output layout
 /// `out[u*16 + v]`, DC at index 0. Reused by [`dct16x16_scalar`] and [`dct16x16_t`].
 #[inline]
 #[allow(unused)]
-fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
+pub(crate) fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     let mut tmp = [0i32; 256];
     // Column-wise 1D DCT
     for u in 0..16 {
@@ -631,31 +647,47 @@ pub(crate) fn dct1d_32_i32(buf: &mut [i32; 32]) {
     }
 }
 
+type Dct32x32Fn = fn(&mut [i32; 1024], i32, i32);
+static DCT32X32: OnceLock<Dct32x32Fn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct32x32_neon_i32_wrap(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+    unsafe { crate::neon::dct32x32_neon_i32(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct32x32_avx2_i32_wrap(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
+    unsafe { crate::avx::dct32x32_avx2_i32(input, dc_q, ac_q) }
+}
+
+#[inline]
+fn resolve_dct32x32() -> Dct32x32Fn {
+    *DCT32X32.get_or_init(|| {
+        let mut _f: Dct32x32Fn = dct32x32_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct32x32_neon_i32_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct32x32_avx2_i32_wrap;
+            }
+        }
+        _f
+    })
+}
+
 #[inline]
 #[allow(unused)]
 pub(crate) fn dct32x32(input: &mut [i32; 1024], quant: &impl Dct) {
-    pub(crate) type Dct = dyn Fn(&mut [i32; 1024], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
-    let f = WHT.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            use crate::neon::dct32x32_neon_i32;
-            Arc::new(|input: &mut [i32; 1024], dc_q: i32, ac_q: i32| unsafe {
-                dct32x32_neon_i32(input, dc_q, ac_q)
-            })
-        }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-        {
-            Arc::new(dct32x32_scalar)
-        }
-    });
-    f(input, quant.q_mult_dc(), quant.q_mult_ac());
+    resolve_dct32x32()(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
 /// Shared 2-D integer DCT-32 transform core (no quantization). Output layout
 /// `out[u*32 + v]`, DC at index 0. Reused by [`dct32x32_scalar`] and [`dct32x32_t`].
 #[inline]
-fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
+pub(crate) fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     const B: i32 = 6;
     let mut tmp = [0i32; 1024];
     // Column-wise 1D DCT (on the B-bit-headroom residual)
@@ -690,24 +722,40 @@ pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     }
 }
 
-#[allow(unused)]
-pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
-    pub(crate) type Dct = dyn Fn(&mut [i32; 128], i32, i32) + Send + Sync;
-    static WHT: OnceLock<Arc<Dct>> = OnceLock::new();
-    let f = WHT.get_or_init(|| {
+type Dct8x16Fn = fn(&mut [i32; 128], i32, i32);
+static DCT8X16: OnceLock<Dct8x16Fn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct8x16_neon_i32_wrap(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
+    unsafe { crate::neon::dct8x16_neon_i32(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct8x16_avx2_i32_wrap(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
+    unsafe { crate::avx::dct8x16_avx2_i32(input, dc_q, ac_q) }
+}
+
+#[inline]
+fn resolve_dct8x16() -> Dct8x16Fn {
+    *DCT8X16.get_or_init(|| {
+        let mut _f: Dct8x16Fn = dct8x16_i32_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            use crate::neon::dct8x16_neon_i32;
-            Arc::new(|input: &mut [i32; 128], dc_q: i32, ac_q: i32| unsafe {
-                dct8x16_neon_i32(input, dc_q, ac_q)
-            })
+            _f = dct8x16_neon_i32_wrap;
         }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
-            Arc::new(crate::dct::dct8x16_i32_scalar)
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct8x16_avx2_i32_wrap;
+            }
         }
-    });
-    f(input, quant.q_mult_dc(), quant.q_mult_ac());
+        _f
+    })
+}
+
+#[allow(unused)]
+pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
+    resolve_dct8x16()(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
 /// Shared 2-D integer 8x16 transform core (8 wide x 16 tall; residual read as
@@ -716,7 +764,7 @@ pub(crate) fn dct8x16_i32(input: &mut [i32; 128], quant: &impl Dct) {
 /// index 0 — matching the float reference, the scan order and the inverse.
 /// Reused by [`dct8x16_i32_scalar`] and [`dct8x16_t`].
 #[inline]
-fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
+pub(crate) fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     // Pass 1: DCT-16 down each of the 8 columns (vertical).
     let mut tmp = [0i32; 128]; // tmp[fy*8 + col], fy = vertical freq
     for col in 0..8usize {
@@ -767,52 +815,146 @@ fn quant_levels_and_targets<const N: usize>(
     (cf, tf)
 }
 
+type Dct8x8CoeffsFn = fn(&[i32; 64]) -> [i32; 64];
+type Dct16x16CoeffsFn = fn(&[i32; 256]) -> [i32; 256];
+type Dct32x32CoeffsFn = fn(&[i32; 1024]) -> [i32; 1024];
+type Dct8x16CoeffsFn = fn(&[i32; 128]) -> [i32; 128];
+
+static DCT8X8_COEFFS: OnceLock<Dct8x8CoeffsFn> = OnceLock::new();
+static DCT16X16_COEFFS: OnceLock<Dct16x16CoeffsFn> = OnceLock::new();
+static DCT32X32_COEFFS: OnceLock<Dct32x32CoeffsFn> = OnceLock::new();
+static DCT8X16_COEFFS: OnceLock<Dct8x16CoeffsFn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct8x8_neon_coeffs_wrap(input: &[i32; 64]) -> [i32; 64] {
+    unsafe { crate::neon::dct8x8_neon_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct16x16_neon_coeffs_wrap(input: &[i32; 256]) -> [i32; 256] {
+    unsafe { crate::neon::dct16x16_neon_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct32x32_neon_coeffs_wrap(input: &[i32; 1024]) -> [i32; 1024] {
+    unsafe { crate::neon::dct32x32_neon_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct8x16_neon_coeffs_wrap(input: &[i32; 128]) -> [i32; 128] {
+    unsafe { crate::neon::dct8x16_neon_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct8x8_avx2_coeffs_wrap(input: &[i32; 64]) -> [i32; 64] {
+    unsafe { crate::avx::dct8x8_avx2_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct16x16_avx2_coeffs_wrap(input: &[i32; 256]) -> [i32; 256] {
+    unsafe { crate::avx::dct16x16_avx2_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct32x32_avx2_coeffs_wrap(input: &[i32; 1024]) -> [i32; 1024] {
+    unsafe { crate::avx::dct32x32_avx2_coeffs(input) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct8x16_avx2_coeffs_wrap(input: &[i32; 128]) -> [i32; 128] {
+    unsafe { crate::avx::dct8x16_avx2_coeffs(input) }
+}
+
+#[inline]
+fn resolve_dct8x8_coeffs() -> Dct8x8CoeffsFn {
+    *DCT8X8_COEFFS.get_or_init(|| {
+        let mut _f: Dct8x8CoeffsFn = dct8x8_coeffs;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct8x8_neon_coeffs_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct8x8_avx2_coeffs_wrap;
+            }
+        }
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dct16x16_coeffs() -> Dct16x16CoeffsFn {
+    *DCT16X16_COEFFS.get_or_init(|| {
+        let mut _f: Dct16x16CoeffsFn = dct16x16_coeffs;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct16x16_neon_coeffs_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct16x16_avx2_coeffs_wrap;
+            }
+        }
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dct32x32_coeffs() -> Dct32x32CoeffsFn {
+    *DCT32X32_COEFFS.get_or_init(|| {
+        let mut _f: Dct32x32CoeffsFn = dct32x32_coeffs;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct32x32_neon_coeffs_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct32x32_avx2_coeffs_wrap;
+            }
+        }
+        _f
+    })
+}
+
+#[inline]
+fn resolve_dct8x16_coeffs() -> Dct8x16CoeffsFn {
+    *DCT8X16_COEFFS.get_or_init(|| {
+        let mut _f: Dct8x16CoeffsFn = dct8x16_coeffs;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct8x16_neon_coeffs_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct8x16_avx2_coeffs_wrap;
+            }
+        }
+        _f
+    })
+}
+
 #[inline]
 fn dct8x8_coeffs_sel(input: &[i32; 64]) -> [i32; 64] {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        unsafe { crate::neon::dct8x8_neon_coeffs(input) }
-    }
-    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-    {
-        dct8x8_coeffs(input)
-    }
+    resolve_dct8x8_coeffs()(input)
 }
 
 #[inline]
 fn dct16x16_coeffs_sel(input: &[i32; 256]) -> [i32; 256] {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        unsafe { crate::neon::dct16x16_neon_coeffs(input) }
-    }
-    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-    {
-        dct16x16_coeffs(input)
-    }
+    resolve_dct16x16_coeffs()(input)
 }
 
 #[inline]
 fn dct32x32_coeffs_sel(input: &[i32; 1024]) -> [i32; 1024] {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        unsafe { crate::neon::dct32x32_neon_coeffs(input) }
-    }
-    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-    {
-        dct32x32_coeffs(input)
-    }
+    resolve_dct32x32_coeffs()(input)
 }
 
 #[inline]
 fn dct8x16_coeffs_sel(input: &[i32; 128]) -> [i32; 128] {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        unsafe { crate::neon::dct8x16_neon_coeffs(input) }
-    }
-    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-    {
-        dct8x16_coeffs(input)
-    }
+    resolve_dct8x16_coeffs()(input)
 }
 
 pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {

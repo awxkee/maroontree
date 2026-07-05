@@ -395,22 +395,6 @@ impl Cdfs {
     }
 }
 
-// ============================ Adaptive quantization ==========================
-//
-// Variance-based adaptive quantization for AV1, signalled through the standard
-// superblock delta-Q mechanism (frame header `delta_q_present = 1`, and a
-// `read_delta_qindex()` token in the first block of every superblock). The
-// quantizer is reallocated per 64x64 superblock from local luma activity: flat
-// regions (smooth sky / water, where banding and blocking are most visible) get
-// a finer quantizer, busy/textured regions (where quantization error is masked)
-// get a coarser one. The deltas are centred on the per-tile mean activity, so
-// the average quantizer still tracks the requested base_q_idx and the rate stays
-// close to the non-AQ encode while perceived quality improves.
-//
-// This mirrors the AV2 path in `av2/aq.rs`; the only real difference is the
-// transport (AV1's `read_delta_qindex` symbol vs AV2's delta-q signalling) and
-// the fixed-point luma plane (`i32` here, `f32` there).
-
 /// log-resolution of the delta-q step: the signalled `delta_q_res` is `1 << this`
 /// (so a step of 4 qindex units). Matches `av2/aq.rs::AQ_RES_LOG2`.
 const AQ_RES_LOG2: u8 = 2;
@@ -1209,13 +1193,13 @@ impl<'a> LossyTile<'a> {
                     sse += (d * d) as i64;
                 }
             }
-            let eff = sse as f64 + mlam * block_rate_bits(&cf, &SCAN_8X8);
+            let eff = rd_cost_i64(sse, mlam, block_rate_bits(&cf, &SCAN_8X8));
             if eff < eff8 {
                 eff8 = eff;
             }
         }
         // best cost for four 4x4 (DC-pred / nd; current recon, decision-only)
-        let mut eff4_sum = mlam * 2.0; // PARTITION_SPLIT symbol allowance
+        let mut eff4_sum = rate_cost(mlam, 2.0f32); // PARTITION_SPLIT symbol allowance
         for (sx, sy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)] {
             let (bx, by) = (px + sx, py + sy);
             let mut best = f64::INFINITY;
@@ -1261,7 +1245,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 // +mode/skip signalling allowance per 4x4 sub-block
-                let eff = sse as f64 + mlam * (block_rate_bits(&cf, &SCAN_4X4) + 4.0);
+                let eff = rd_cost_i64(sse, mlam, block_rate_bits(&cf, &SCAN_4X4) + 4.0f32);
                 if eff < best {
                     best = eff;
                 }
@@ -1345,7 +1329,7 @@ impl<'a> LossyTile<'a> {
         let prdo = prdo * crate::cost::mode_lambda_weight(self.base_q_idx, tune);
         let part_lam = mode_lambda() * acq * acq * prdo;
         let rd_none = self.rd_cost_square(px, py, 16, false, false, prdo);
-        let mut rd_split = part_lam * SPLIT_SIGNAL_BITS;
+        let mut rd_split = rate_cost(part_lam, SPLIT_SIGNAL_BITS);
         for (sx, sy) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
             rd_split += self.rd_cost_square(px + sx, py + sy, 8, false, false, prdo);
         }
@@ -1695,7 +1679,7 @@ impl<'a> LossyTile<'a> {
                     let rr = idct_dequant_8x8(&cf, &self.quant);
                     let sse = sse_recon::<64, 8>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                     let bits = block_rate_bits(&cf, scan) + mode_signal_bits(m);
-                    let cost = sse as f64 + mlam * bits;
+                    let cost = rd_cost_i64(sse, mlam, bits);
                     if cost < best {
                         best = cost;
                     }
@@ -1744,7 +1728,7 @@ impl<'a> LossyTile<'a> {
                     let sse =
                         sse_recon::<256, 16>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                     let bits = block_rate_bits(&cf, scan) + mode_signal_bits(m);
-                    let cost = sse as f64 + mlam * bits;
+                    let cost = rd_cost_i64(sse, mlam, bits);
                     if cost < best {
                         best = cost;
                     }
@@ -1793,7 +1777,7 @@ impl<'a> LossyTile<'a> {
                     let sse =
                         sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                     let bits = block_rate_bits(&cf, scan) + mode_signal_bits(m);
-                    let cost = sse as f64 + mlam * bits;
+                    let cost = rd_cost_i64(sse, mlam, bits);
                     if cost < best {
                         best = cost;
                     }
@@ -1817,7 +1801,7 @@ impl<'a> LossyTile<'a> {
         // to be a valid R-D ordering.
         let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
         let maxv = (1 << self.bd) - 1;
-        let mut total = mlam * SPLIT_SIGNAL_BITS; // HORZ costs a partition symbol like SPLIT
+        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS); // HORZ costs a partition symbol like SPLIT
         for half in 0..2 {
             let sy = py + half * 8;
             let dc = dc_pred_16x8(&self.recon[0], self.w, px, sy, self.bd as i32);
@@ -1841,7 +1825,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let bits = block_rate_bits(&cf, &SCAN_16X8);
-            total += sse as f64 + mlam * bits;
+            total += rd_cost_i64(sse, mlam, bits);
         }
         total
     }
@@ -1852,7 +1836,7 @@ impl<'a> LossyTile<'a> {
         let lam = trellis_lambda();
         let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
         let maxv = (1 << self.bd) - 1;
-        let mut total = mlam * SPLIT_SIGNAL_BITS;
+        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS);
         for half in 0..2 {
             let sx = px + half * 8;
             let dc = dc_pred_8x16(&self.recon[0], self.w, sx, py, self.bd as i32);
@@ -1876,7 +1860,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let bits = block_rate_bits(&cf, &SCAN_8X16);
-            total += sse as f64 + mlam * bits;
+            total += rd_cost_i64(sse, mlam, bits);
         }
         total
     }
@@ -2406,7 +2390,7 @@ impl<'a> LossyTile<'a> {
         let mut lcf = [0i32; 256];
         let mut best_eff = f64::INFINITY;
         let mut best_dct_sse = 0i64;
-        let mut best_dct_bits = 0f64;
+        let mut best_dct_bits = 0f32;
         let mut ltf = [0f64; 256]; // winner transform coeffs (f64, for winner-only RDOQ)
         let modes = if self.speed.reduced_modes() {
             fast_nd_modes()
@@ -2485,7 +2469,7 @@ impl<'a> LossyTile<'a> {
             }
             let sse = blk_sse16(&idct_dequant_16x16(&cf, &self.quant));
             let bits = block_rate_bits(&cf, &SCAN_16X16);
-            let cost = sse as f64 + mlam * (bits + mode_signal_bits(m));
+            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m));
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -2506,7 +2490,7 @@ impl<'a> LossyTile<'a> {
             let mut ad_cdf = [0u16; 7];
             ad_cdf.copy_from_slice(&self.cdfs.angle_delta[best_mode - V_PRED]);
             let mut best_ad_cost =
-                best_dct_sse as f64 + mlam * (best_dct_bits + cdf_cost(&ad_cdf, 3));
+                rd_cost_i64(best_dct_sse, mlam, best_dct_bits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
                 let mut pred = [0i32; 256];
                 intra_predict_nd_ad(
@@ -2561,7 +2545,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let bits = block_rate_bits(&cf, &SCAN_16X16);
-                let cost = sse as f64 + mlam * (bits + cdf_cost(&ad_cdf, (d + 3) as usize));
+                let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if cost < best_ad_cost {
                     best_ad_cost = cost;
                     best_delta = d;
@@ -2637,7 +2621,7 @@ impl<'a> LossyTile<'a> {
             // genuine high-quality ADST wins (where it lowers SSE) and blocks the
             // low-quality "trade quality for bits" pathology.
             if asse <= best_dct_sse + (best_dct_sse >> 5)
-                && asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits
+                && rd_cost_i64(asse, mlam, abits) < rd_cost_i64(best_dct_sse, mlam, best_dct_bits)
             {
                 lcf = acf;
                 txtp16 = 1;
@@ -2709,7 +2693,8 @@ impl<'a> LossyTile<'a> {
                 }
                 let abits = block_rate_bits(&acf, &SCAN_16X16);
                 if asse <= best_dct_sse + (best_dct_sse >> 5)
-                    && asse as f64 + mlam * abits < best_txtp16_sse as f64 + mlam * best_txtp16_bits
+                    && rd_cost_i64(asse, mlam, abits)
+                        < rd_cost_i64(best_txtp16_sse, mlam, best_txtp16_bits)
                 {
                     lcf = acf;
                     txtp16 = if inv_dctadst { 3 } else { 2 };
@@ -2948,8 +2933,8 @@ impl<'a> LossyTile<'a> {
             let mlam = mode_lambda() * acq * acq;
             let mut cfl_ccf = [[0i32; 256]; 2];
             let mut cfl_a = [0i32; 2];
-            let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f64; 2]);
-            let (mut cfl_sse, mut cfl_bits) = ([0i64; 2], [0f64; 2]);
+            let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f32; 2]);
+            let (mut cfl_sse, mut cfl_bits) = ([0i64; 2], [0f32; 2]);
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = cpred[ci];
@@ -2988,11 +2973,15 @@ impl<'a> LossyTile<'a> {
                 cfl_bits[ci] = block_rate_bits(&q, &SCAN_16X16);
                 cpred16[ci] = cpr;
             }
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
-            let cfl_total =
-                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let dc_total = rd_cost_i64(dc_sse[0] + dc_sse[1], mlam, dc_bits[0] + dc_bits[1]);
+            let cfl_total = rd_cost_i64(
+                cfl_sse[0] + cfl_sse[1],
+                mlam,
+                cfl_bits[0] + cfl_bits[1] + sig,
+            );
             // Let the RD comparison decide DC-vs-CfL across the whole quality
             // range; the old `ac_q() > 300` quality gate suppressed CfL exactly
             // where it helps most (high quality).
@@ -3019,8 +3008,12 @@ impl<'a> LossyTile<'a> {
             let mut cur_total = 0f64;
             if let Some(a) = cfl_opt {
                 // CfL signals a non-DC uv_mode plus per-plane alpha (~4 bits each).
-                cur_total += mlam
-                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+                cur_total += rate_cost(
+                    mlam,
+                    4.0f32
+                        + if a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                        + if a[1] != 0 { 4.0f32 } else { 0.0f32 },
+                );
             }
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -3034,7 +3027,7 @@ impl<'a> LossyTile<'a> {
                         sse += (d * d) as i64;
                     }
                 }
-                cur_total += sse as f64 + mlam * block_rate_bits(&ccf[ci], &SCAN_16X16);
+                cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf[ci], &SCAN_16X16));
             }
 
             // Directional / smooth chroma modes, each with its decoder-derived
@@ -3070,11 +3063,11 @@ impl<'a> LossyTile<'a> {
                 // V/H and the Z2 angular modes (D135/D113/D157) all emit a chroma
                 // angle_delta symbol (~3 bits); they sit in the 1..=8 directional range.
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
-                let mut cand_total = mlam * sig_bits;
+                let mut cand_total = rate_cost(mlam, sig_bits);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     intra_predict_nd(
@@ -3117,7 +3110,7 @@ impl<'a> LossyTile<'a> {
                             sse += (d * d) as i64;
                         }
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X16);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X16));
                 }
                 if cand_total < best_total {
                     best_total = cand_total;
@@ -3256,7 +3249,7 @@ impl<'a> LossyTile<'a> {
                     sse += (d * d) as i64;
                 }
             }
-            dc_total += sse as f64 + mlam * block_rate_bits(&ccf_dc[ci], &SCAN_8X8);
+            dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf_dc[ci], &SCAN_8X8));
         }
         // Directional / smooth chroma modes, each with its decoder-derived chroma tx.
         // PAETH is empirically the strongest non-DC chroma mode, searched alongside
@@ -3287,11 +3280,11 @@ impl<'a> LossyTile<'a> {
             let mut cand_rr = [[0i32; 64]; 2];
             let mut cand_pred = [[0i32; 64]; 2];
             let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                7.0
+                7.0f32
             } else {
-                4.0
+                4.0f32
             };
-            let mut cand_total = mlam * sig_bits;
+            let mut cand_total = rate_cost(mlam, sig_bits);
             for ci in 0..2 {
                 let plane = ci + 1;
                 intra_predict_nd(
@@ -3334,7 +3327,7 @@ impl<'a> LossyTile<'a> {
                         sse += (d * d) as i64;
                     }
                 }
-                cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_8X8);
+                cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_8X8));
             }
             if cand_total < best_total {
                 best_total = cand_total;
@@ -3426,7 +3419,7 @@ impl<'a> LossyTile<'a> {
         // DC option (always computed).
         let mut dc_ccf = [[0i32; 128]; 2];
         let mut dc_sse = [0i64; 2];
-        let mut dc_bits = [0f64; 2];
+        let mut dc_bits = [0f32; 2];
         for ci in 0..2 {
             let plane = ci + 1;
             let pred = dc_pred_8x16(&self.recon[plane], self.cw, cx, py, self.bd as i32);
@@ -3482,7 +3475,7 @@ impl<'a> LossyTile<'a> {
             let mut cfl_ccf = [[0i32; 128]; 2];
             let mut cfl_a = [0i32; 2];
             let mut cfl_sse = [0i64; 2];
-            let mut cfl_bits = [0f64; 2];
+            let mut cfl_bits = [0f32; 2];
             for ci in 0..2 {
                 let dc = cpred[ci];
                 let src = src_planes[ci];
@@ -3508,11 +3501,15 @@ impl<'a> LossyTile<'a> {
                 cfl_bits[ci] = block_rate_bits(&q, &SCAN_8X16);
                 cpred_px[ci] = cpr;
             }
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
-            let cfl_total =
-                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let dc_total = rd_cost_i64(dc_sse[0] + dc_sse[1], mlam, dc_bits[0] + dc_bits[1]);
+            let cfl_total = rd_cost_i64(
+                cfl_sse[0] + cfl_sse[1],
+                mlam,
+                cfl_bits[0] + cfl_bits[1] + sig,
+            );
             if cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
                 use_cfl = true;
                 cfl_alpha_uv = cfl_a;
@@ -3663,7 +3660,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let bits = block_rate_bits(&cf, &SCAN_4X4);
-                let eff = sse as f64 + mlam * bits;
+                let eff = rd_cost_i64(sse, mlam, bits);
                 if eff < best_eff {
                     best_eff = eff;
                     best_mode = m;
@@ -3688,7 +3685,7 @@ impl<'a> LossyTile<'a> {
                 // value broadcast across the block).
                 let mut dc_ccf = [[0i32; 16]; 2];
                 let mut dc_sse = [0i64; 2];
-                let mut dc_bits = [0f64; 2];
+                let mut dc_bits = [0f32; 2];
                 let mut src_planes = [[0i32; 16]; 2];
                 for ci in 0..2 {
                     let plane = ci + 1;
@@ -3728,7 +3725,7 @@ impl<'a> LossyTile<'a> {
                 let mut cfl_a = [0i32; 2];
                 let mut cfl_px = [[0i32; 16]; 2];
                 let mut cfl_sse = [0i64; 2];
-                let mut cfl_bits = [0f64; 2];
+                let mut cfl_bits = [0f32; 2];
                 if cfl_eligible {
                     let lrr_cfl = idct_dequant_4x4(&lcf, &self.quant);
                     let mut luma_rec = [0i32; 16];
@@ -3768,12 +3765,15 @@ impl<'a> LossyTile<'a> {
                 // RD: pick CfL over DC only when it has a non-zero alpha and wins
                 // including the joint signalling cost (sign symbol + a magnitude
                 // per non-zero plane), mirroring the 8x8 4:4:4 path.
-                let sig = 4.0
-                    + if cfl_a[0] != 0 { 4.0 } else { 0.0 }
-                    + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-                let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
-                let cfl_total =
-                    (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+                let sig = 4.0f32
+                    + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                    + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+                let dc_total = rd_cost_i64(dc_sse[0] + dc_sse[1], mlam, dc_bits[0] + dc_bits[1]);
+                let cfl_total = rd_cost_i64(
+                    cfl_sse[0] + cfl_sse[1],
+                    mlam,
+                    cfl_bits[0] + cfl_bits[1] + sig,
+                );
                 if cfl_eligible && cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
                     use_cfl = true;
                     cfl_alpha_uv = cfl_a;
@@ -3920,7 +3920,7 @@ impl<'a> LossyTile<'a> {
         let mut lcf = [0i32; 64];
         let mut best_eff = f64::INFINITY;
         let mut best_dct_sse = 0i64;
-        let mut best_dct_bits = 0f64;
+        let mut best_dct_bits = 0f32;
         let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
         let mut ltf = [0f64; 64]; // winner transform coeffs (f64, for winner-only RDOQ)
         let modes = if self.speed.reduced_modes() {
@@ -4002,7 +4002,7 @@ impl<'a> LossyTile<'a> {
             }
             let sse = blk_sse(&idct_dequant_8x8(&cf, &self.quant));
             let bits = block_rate_bits(&cf, &SCAN_8X8);
-            let cost = sse as f64 + mlam * (bits + mode_signal_bits(m));
+            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m));
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -4026,7 +4026,7 @@ impl<'a> LossyTile<'a> {
             let mut ad_cdf = [0u16; 7];
             ad_cdf.copy_from_slice(&self.cdfs.angle_delta[best_mode - V_PRED]);
             let mut best_ad_cost =
-                best_dct_sse as f64 + mlam * (best_dct_bits + cdf_cost(&ad_cdf, 3));
+                rd_cost_i64(best_dct_sse, mlam, best_dct_bits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
                 let mut pred = [0i32; 64];
                 intra_predict_nd_ad(
@@ -4080,7 +4080,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let bits = block_rate_bits(&cf, &SCAN_8X8);
-                let cost = sse as f64 + mlam * (bits + cdf_cost(&ad_cdf, (d + 3) as usize));
+                let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if cost < best_ad_cost {
                     best_ad_cost = cost;
                     best_delta = d;
@@ -4149,7 +4149,7 @@ impl<'a> LossyTile<'a> {
             let abits = block_rate_bits(&acf, &SCAN_8X8);
             // Quality guard (see 16x16 ADST note): block low-q distortion-for-rate trades.
             if asse <= best_dct_sse + (best_dct_sse >> 5)
-                && asse as f64 + mlam * abits < best_dct_sse as f64 + mlam * best_dct_bits
+                && rd_cost_i64(asse, mlam, abits) < rd_cost_i64(best_dct_sse, mlam, best_dct_bits)
             {
                 lcf = acf;
                 best_is_adst = true;
@@ -4207,7 +4207,8 @@ impl<'a> LossyTile<'a> {
                 }
                 let abits = block_rate_bits(&acf, &SCAN_8X8);
                 if asse <= best_dct_sse + (best_dct_sse >> 5)
-                    && asse as f64 + mlam * abits < best_txtp_sse as f64 + mlam * best_txtp_bits
+                    && rd_cost_i64(asse, mlam, abits)
+                        < rd_cost_i64(best_txtp_sse, mlam, best_txtp_bits)
                 {
                     lcf = acf;
                     best_is_adst = false;
@@ -4257,7 +4258,7 @@ impl<'a> LossyTile<'a> {
             // is cheap to code, so at low-q lambda a pure RD test over-selects it
             // and flattens detail. Require SSE-non-worsening vs the best real tx.
             if isse <= best_txtp_sse + (best_txtp_sse >> 5)
-                && isse as f64 + mlam * ibits < best_txtp_sse as f64 + mlam * best_txtp_bits
+                && rd_cost_i64(isse, mlam, ibits) < rd_cost_i64(best_txtp_sse, mlam, best_txtp_bits)
             {
                 lcf = icf;
                 best_is_adst = false;
@@ -4346,8 +4347,8 @@ impl<'a> LossyTile<'a> {
             cfl_ac_444(&luma_rec, 8, 8, &mut ac);
             let mut cfl_ccf = [[0i32; 64]; 2];
             let mut cfl_a = [0i32; 2];
-            let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f64; 2]);
-            let (mut cfl_sse, mut cfl_bits) = ([0i64; 2], [0f64; 2]);
+            let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f32; 2]);
+            let (mut cfl_sse, mut cfl_bits) = ([0i64; 2], [0f32; 2]);
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = cpred[ci];
@@ -4389,11 +4390,15 @@ impl<'a> LossyTile<'a> {
                 cpred444[ci] = cpr;
             }
             // joint signalling cost estimate (sign symbol + 1 magnitude per non-zero plane)
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
-            let cfl_total =
-                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let dc_total = rd_cost_i64(dc_sse[0] + dc_sse[1], mlam, dc_bits[0] + dc_bits[1]);
+            let cfl_total = rd_cost_i64(
+                cfl_sse[0] + cfl_sse[1],
+                mlam,
+                cfl_bits[0] + cfl_bits[1] + sig,
+            );
             // Let the RD comparison decide DC-vs-CfL across the whole quality
             // range; the old `ac_q() > 300` quality gate suppressed CfL exactly
             // where it helps most (high quality).
@@ -4442,7 +4447,7 @@ impl<'a> LossyTile<'a> {
                     let d = src[i] - r;
                     sse += (d * d) as i64;
                 }
-                dc_total += sse as f64 + mlam * block_rate_bits(&ccf8[ci], &SCAN_8X8);
+                dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf8[ci], &SCAN_8X8));
             }
             // Try each directional candidate with its mode-derived transform;
             // keep the best that also beats DC by the mode-signalling margin.
@@ -4473,13 +4478,13 @@ impl<'a> LossyTile<'a> {
                 // mode symbol (~4 bits) + angle_delta symbol (~3 bits) for the
                 // directional modes (V/H and the Z2 angulars D135/D113/D157).
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
                 let mut cand_ccf = [[0i32; 64]; 2];
                 let mut cand_pred = [[0i32; 64]; 2];
-                let mut cand_total = mlam * sig_bits;
+                let mut cand_total = rate_cost(mlam, sig_bits);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let mut pp = [0i32; 64];
@@ -4511,7 +4516,7 @@ impl<'a> LossyTile<'a> {
                         let d = src_planes[ci][i] - r;
                         sse += (d * d) as i64;
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_8X8);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_8X8));
                     cand_ccf[ci] = q;
                     cand_pred[ci] = pp;
                 }
@@ -4661,7 +4666,7 @@ impl<'a> LossyTile<'a> {
             let mut cfl_ccf = [[0i32; 16]; 2];
             let mut cfl_a = [0i32; 2];
             let (mut cur_sse, mut cfl_sse) = (0i64, 0i64);
-            let (mut cur_bits, mut cfl_bits) = (0f64, 0f64);
+            let (mut cur_bits, mut cfl_bits) = (0f32, 0f32);
             let maxv = (1 << self.bd) - 1;
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -4702,10 +4707,11 @@ impl<'a> LossyTile<'a> {
                 cfl_ccf[ci] = q;
                 cpred420[ci] = cpr;
             }
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let cur_total = cur_sse as f64 + mlam * cur_bits;
-            let cfl_total = cfl_sse as f64 + mlam * (cfl_bits + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let cur_total = rd_cost_i64(cur_sse, mlam, cur_bits);
+            let cfl_total = rd_cost_i64(cfl_sse, mlam, cfl_bits + sig);
             if cfl_total < cur_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
                 use_cfl = true;
                 cfl_alpha_uv = cfl_a;
@@ -4734,7 +4740,7 @@ impl<'a> LossyTile<'a> {
                     let d = src[i] - r;
                     sse += (d * d) as i64;
                 }
-                dc_total += sse as f64 + mlam * block_rate_bits(&ccf44[ci], &SCAN_4X4);
+                dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf44[ci], &SCAN_4X4));
             }
             let mut best_total = dc_total;
             let mut best_mode_uv = DC_PRED;
@@ -4761,11 +4767,11 @@ impl<'a> LossyTile<'a> {
                 let mut cand_ccf = [[0i32; 16]; 2];
                 let mut cand_pred = [[0i32; 16]; 2];
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
-                let mut cand_total = mlam * sig_bits; // non-DC uv_mode (+angle_delta for V/H)
+                let mut cand_total = rate_cost(mlam, sig_bits); // non-DC uv_mode (+angle_delta for V/H)
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let mut pp = [0i32; 16];
@@ -4797,7 +4803,7 @@ impl<'a> LossyTile<'a> {
                         let d = src_planes[ci][i] - r;
                         sse += (d * d) as i64;
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_4X4);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_4X4));
                     cand_ccf[ci] = q;
                     cand_pred[ci] = pp;
                 }
@@ -4841,7 +4847,7 @@ impl<'a> LossyTile<'a> {
             let mut cfl_ccf = [[0i32; 32]; 2];
             let mut cfl_a = [0i32; 2];
             let (mut cur_sse, mut cfl_sse) = (0i64, 0i64);
-            let (mut cur_bits, mut cfl_bits) = (0f64, 0f64);
+            let (mut cur_bits, mut cfl_bits) = (0f32, 0f32);
             let maxv = (1 << self.bd) - 1;
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -4877,10 +4883,11 @@ impl<'a> LossyTile<'a> {
                 cfl_ccf[ci] = q;
                 cpred422[ci] = cpr;
             }
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let cur_total = cur_sse as f64 + mlam * cur_bits;
-            let cfl_total = cfl_sse as f64 + mlam * (cfl_bits + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let cur_total = rd_cost_i64(cur_sse, mlam, cur_bits);
+            let cfl_total = rd_cost_i64(cfl_sse, mlam, cfl_bits + sig);
             if cfl_total < cur_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
                 use_cfl = true;
                 cfl_alpha_uv = cfl_a;
@@ -4909,7 +4916,7 @@ impl<'a> LossyTile<'a> {
                     let d = src[i] - r;
                     sse += (d * d) as i64;
                 }
-                dc_total += sse as f64 + mlam * block_rate_bits(&ccf48[ci], &SCAN_4X8);
+                dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf48[ci], &SCAN_4X8));
             }
             let mut best_total = dc_total;
             let mut best_mode_uv = DC_PRED;
@@ -4936,11 +4943,11 @@ impl<'a> LossyTile<'a> {
                 let mut cand_ccf = [[0i32; 32]; 2];
                 let mut cand_pred = [[0i32; 32]; 2];
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
-                let mut cand_total = mlam * sig_bits;
+                let mut cand_total = rate_cost(mlam, sig_bits);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     let mut pp = [0i32; 32];
@@ -4972,7 +4979,7 @@ impl<'a> LossyTile<'a> {
                         let d = src_planes[ci][i] - r;
                         sse += (d * d) as i64;
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_4X8);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_4X8));
                     cand_ccf[ci] = q;
                     cand_pred[ci] = pp;
                 }
@@ -5345,7 +5352,7 @@ impl<'a> LossyTile<'a> {
         let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
         let maxv = (1 << self.bd) - 1;
         let (lw, lh) = if vert { (16usize, 32usize) } else { (32, 16) };
-        let mut total = mlam * SPLIT_SIGNAL_BITS;
+        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS);
         for half in 0..2 {
             let (sx, sy) = if vert {
                 (px + half * 16, py)
@@ -5385,7 +5392,7 @@ impl<'a> LossyTile<'a> {
                     sse += d * d;
                 }
             }
-            total += sse as f64 + mlam * block_rate_bits(&cf, scan);
+            total += rd_cost_i64(sse, mlam, block_rate_bits(&cf, scan));
         }
         total
     }
@@ -5469,7 +5476,7 @@ impl<'a> LossyTile<'a> {
                 sse += d * d;
             }
         }
-        sse as f64 + mlam * block_rate_bits(&cf, &SCAN_32X32)
+        rd_cost_i64(sse, mlam, block_rate_bits(&cf, &SCAN_32X32))
     }
 
     fn rd_cost_split32(&self, px: usize, py: usize, prdo: f64) -> f64 {
@@ -5477,7 +5484,7 @@ impl<'a> LossyTile<'a> {
         let lam = trellis_lambda() * prdo;
         let mlam = mode_lambda() * acq * acq * prdo;
         let maxv = (1 << self.bd) - 1;
-        let mut total = mlam * SPLIT_SIGNAL_BITS * 4.0;
+        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * 4.0f32);
         for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
             let dc = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
             let mut resid = [0i32; 256];
@@ -5499,7 +5506,7 @@ impl<'a> LossyTile<'a> {
                     sse += d * d;
                 }
             }
-            total += sse as f64 + mlam * block_rate_bits(&cf, &SCAN_16X16);
+            total += rd_cost_i64(sse, mlam, block_rate_bits(&cf, &SCAN_16X16));
         }
         total
     }
@@ -5637,7 +5644,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let bits = block_rate_bits(&cf, &SCAN_32X32) + mode_signal_bits(m);
-            let cost = sse as f64 + mlam * bits;
+            let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -5667,7 +5674,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             let wbits = block_rate_bits(&lcf, &SCAN_32X32);
-            let mut best_ad_cost = wsse as f64 + mlam * (wbits + cdf_cost(&ad_cdf, 3));
+            let mut best_ad_cost = rd_cost_i64(wsse, mlam, wbits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
                 let mut pred = [0i32; 1024];
                 intra_predict_nd_ad(
@@ -5722,7 +5729,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let bits = block_rate_bits(&cf, &SCAN_32X32);
-                let cost = sse as f64 + mlam * (bits + cdf_cost(&ad_cdf, (d + 3) as usize));
+                let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if cost < best_ad_cost {
                     best_ad_cost = cost;
                     best_delta = d;
@@ -6284,7 +6291,7 @@ impl<'a> LossyTile<'a> {
                     let d = src[i] - (dc + dcrr[i]).clamp(0, (1 << self.bd) - 1);
                     s += (d * d) as i64;
                 }
-                dc_cost[ci] = s as f64 + mlam * block_rate_bits(&ccf[ci], &SCAN_32X32);
+                dc_cost[ci] = rd_cost_i64(s, mlam, block_rate_bits(&ccf[ci], &SCAN_32X32));
                 let a = cfl_best_alpha(&ac, &src, dc, 1024, self.bd);
                 cfl_a[ci] = a;
                 let mut cpr = [0i32; 1024];
@@ -6303,18 +6310,19 @@ impl<'a> LossyTile<'a> {
                 }
                 cfl_ccf[ci] = q;
                 cfl_pred[ci] = cpr;
-                cfl_cost[ci] = s2 as f64 + mlam * block_rate_bits(&q, &SCAN_32X32);
+                cfl_cost[ci] = rd_cost_i64(s2, mlam, block_rate_bits(&q, &SCAN_32X32));
             }
         }
         // CfL signaling costs extra (sign + per-plane alpha); only use it when
         // it beats plain DC on both planes' summed cost by that overhead.
-        let cfl_sig =
-            4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
+        let cfl_sig = 4.0f32
+            + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+            + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
         // Gate CfL on low quality: at high quality DC prediction is accurate and CfL
         // alpha varying block-to-block creates visible colour stripes at boundaries.
         let use_cfl = acq > 300.0
             && (cfl_a[0] != 0 || cfl_a[1] != 0)
-            && cfl_cost[0] + cfl_cost[1] + mlam * cfl_sig < dc_cost[0] + dc_cost[1];
+            && cfl_cost[0] + cfl_cost[1] + rate_cost(mlam, cfl_sig) < dc_cost[0] + dc_cost[1];
         #[allow(unused_mut)] // cfl_opt mutated in 'sv block when SMOOTH_V wins
         let (cf_use, pred_dc, mut cfl_opt): (
             &[[i32; 1024]; 2],
@@ -6344,8 +6352,12 @@ impl<'a> LossyTile<'a> {
             let mut cur_total = 0f64;
             if use_cfl {
                 let a = cfl_a;
-                cur_total += mlam
-                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+                cur_total += rate_cost(
+                    mlam,
+                    4.0f32
+                        + if a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                        + if a[1] != 0 { 4.0f32 } else { 0.0f32 },
+                );
             }
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -6363,7 +6375,7 @@ impl<'a> LossyTile<'a> {
                         sse += (d * d) as i64;
                     }
                 }
-                cur_total += sse as f64 + mlam * block_rate_bits(&cf_use[ci], &SCAN_32X32);
+                cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&cf_use[ci], &SCAN_32X32));
             }
 
             let mut best_total = cur_total;
@@ -6392,11 +6404,11 @@ impl<'a> LossyTile<'a> {
                 // V/H also emit a chroma angle_delta symbol (~3 bits); transform stays
                 // DCT_DCT here (spec forces it at Tx_Size_Sqr >= TX_32X32).
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
-                let mut cand_total = mlam * sig_bits;
+                let mut cand_total = rate_cost(mlam, sig_bits);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     intra_predict_nd(
@@ -6440,7 +6452,7 @@ impl<'a> LossyTile<'a> {
                             sse += (d * d) as i64;
                         }
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_32X32);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_32X32));
                 }
                 if cand_total < best_total {
                     best_total = cand_total;
@@ -6573,7 +6585,7 @@ impl<'a> LossyTile<'a> {
                     sse += (d * d) as i64;
                 }
             }
-            dc_total += sse as f64 + mlam * block_rate_bits(&ccf_dc[ci], &SCAN_16X16);
+            dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf_dc[ci], &SCAN_16X16));
         }
         // Directional / smooth chroma modes (PAETH/SMOOTH/SMOOTH_V/SMOOTH_H), each
         // with its decoder-derived chroma tx. Winner must beat DC on the R-D metric.
@@ -6603,11 +6615,11 @@ impl<'a> LossyTile<'a> {
             let mut cand_rr = [[0i32; 256]; 2];
             let mut cand_pred = [[0i32; 256]; 2];
             let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                7.0
+                7.0f32
             } else {
-                4.0
+                4.0f32
             };
-            let mut cand_total = mlam * sig_bits;
+            let mut cand_total = rate_cost(mlam, sig_bits);
             for ci in 0..2 {
                 let plane = ci + 1;
                 intra_predict_nd(
@@ -6650,7 +6662,7 @@ impl<'a> LossyTile<'a> {
                         sse += (d * d) as i64;
                     }
                 }
-                cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X16);
+                cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X16));
             }
             if cand_total < best_total {
                 best_total = cand_total;
@@ -6750,7 +6762,7 @@ impl<'a> LossyTile<'a> {
         let mut src_planes = [[0i32; 512]; 2];
         let mut dc_ccf = [[0i32; 512]; 2];
         let mut dc_sse = [0i64; 2];
-        let mut dc_bits = [0f64; 2];
+        let mut dc_bits = [0f32; 2];
         for ci in 0..2 {
             let plane = ci + 1;
             let pred = dc_pred_16x32(&self.recon[plane], self.cw, cx, py, self.bd as i32);
@@ -6801,7 +6813,7 @@ impl<'a> LossyTile<'a> {
             let mut cfl_ccf = [[0i32; 512]; 2];
             let mut cfl_a = [0i32; 2];
             let mut cfl_sse = [0i64; 2];
-            let mut cfl_bits = [0f64; 2];
+            let mut cfl_bits = [0f32; 2];
             for ci in 0..2 {
                 let dc = cpred[ci];
                 let src = src_planes[ci];
@@ -6827,11 +6839,15 @@ impl<'a> LossyTile<'a> {
                 cfl_bits[ci] = block_rate_bits(&q, &SCAN_16X32);
                 cpred_px[ci] = cpr;
             }
-            let sig =
-                4.0 + if cfl_a[0] != 0 { 4.0 } else { 0.0 } + if cfl_a[1] != 0 { 4.0 } else { 0.0 };
-            let dc_total = (dc_sse[0] + dc_sse[1]) as f64 + mlam * (dc_bits[0] + dc_bits[1]);
-            let cfl_total =
-                (cfl_sse[0] + cfl_sse[1]) as f64 + mlam * (cfl_bits[0] + cfl_bits[1] + sig);
+            let sig = 4.0f32
+                + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
+            let dc_total = rd_cost_i64(dc_sse[0] + dc_sse[1], mlam, dc_bits[0] + dc_bits[1]);
+            let cfl_total = rd_cost_i64(
+                cfl_sse[0] + cfl_sse[1],
+                mlam,
+                cfl_bits[0] + cfl_bits[1] + sig,
+            );
             if cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
                 use_cfl = true;
                 cfl_alpha_uv = cfl_a;
@@ -6849,8 +6865,12 @@ impl<'a> LossyTile<'a> {
             let mut best_total = 0f64;
             if use_cfl {
                 let a = cfl_alpha_uv;
-                best_total += mlam
-                    * (4.0 + if a[0] != 0 { 4.0 } else { 0.0 } + if a[1] != 0 { 4.0 } else { 0.0 });
+                best_total += rate_cost(
+                    mlam,
+                    4.0f32
+                        + if a[0] != 0 { 4.0f32 } else { 0.0f32 }
+                        + if a[1] != 0 { 4.0f32 } else { 0.0f32 },
+                );
             }
             for ci in 0..2 {
                 let cur_ccf = if use_cfl { ccf[ci] } else { dc_ccf[ci] };
@@ -6861,7 +6881,7 @@ impl<'a> LossyTile<'a> {
                     let d = src_planes[ci][i] - (p + rr[i]).clamp(0, maxv);
                     sse += (d * d) as i64;
                 }
-                best_total += sse as f64 + mlam * block_rate_bits(&cur_ccf, &SCAN_16X32);
+                best_total += rd_cost_i64(sse, mlam, block_rate_bits(&cur_ccf, &SCAN_16X32));
             }
             for &cand in &[
                 SMOOTH_V_PRED,
@@ -6885,11 +6905,11 @@ impl<'a> LossyTile<'a> {
                 // V/H also emit a chroma angle_delta symbol (~3 bits); transform stays
                 // DCT_DCT here (spec forces it at Tx_Size_Sqr >= TX_32X32).
                 let sig_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
-                    7.0
+                    7.0f32
                 } else {
-                    4.0
+                    4.0f32
                 };
-                let mut cand_total = mlam * sig_bits;
+                let mut cand_total = rate_cost(mlam, sig_bits);
                 for ci in 0..2 {
                     let plane = ci + 1;
                     intra_predict_nd(
@@ -6927,7 +6947,7 @@ impl<'a> LossyTile<'a> {
                         let d = src[i] - r;
                         sse += (d * d) as i64;
                     }
-                    cand_total += sse as f64 + mlam * block_rate_bits(&q, &SCAN_16X32);
+                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X32));
                 }
                 if cand_total < best_total {
                     best_total = cand_total;
@@ -7309,7 +7329,7 @@ const LF_BAND_SMOOTH_RANGE: i32 = 32;
 /// the larger block on a tie, matching how a full RDO would price the extra
 /// syntax. Tuned conservatively — too low over-splits (bloats rate), too high
 /// under-splits (blurs detail).
-const SPLIT_SIGNAL_BITS: f64 = 24.0;
+const SPLIT_SIGNAL_BITS: f32 = 24.0;
 /// Minimum ac quantizer for the rectangular PARTITION_H candidate. Below this
 /// (high quality) the DC-only 16x8 sub-blocks lose to the square path's full
 /// mode search, so HORZ is gated off — libaom's Q-adaptive partition strategy.

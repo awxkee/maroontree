@@ -621,7 +621,7 @@ fn resolve_txfm_passes() -> ItxPassesFn {
         {
             _f = neon_lane::passes_neon as ItxPassesFn;
         }
-        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::av2::avx::inv_txfm_passes_avx2 as ItxPassesFn;
@@ -1217,7 +1217,7 @@ mod tests {
         unsafe { assert_itx_impl_matches_scalar("neon", neon_lane::passes_neon as ItxPassesFn) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn itx_avx2_passes_match_scalar() {
         if !std::is_x86_feature_detected!("avx2") {

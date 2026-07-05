@@ -565,7 +565,7 @@ fn resolve_fdct_rect() -> FdctRectFn {
         {
             _f = crate::av2::neon::fdct_rect_neon as FdctRectFn;
         }
-        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
                 _f = crate::av2::avx::fdct_rect_avx2 as FdctRectFn;
@@ -659,7 +659,7 @@ mod tests {
         unsafe { assert_fdct_impl_matches_scalar("neon", crate::av2::neon::fdct_rect_neon) };
     }
 
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn fdct_avx2_matches_scalar() {
         if !std::is_x86_feature_detected!("avx2") {

@@ -103,6 +103,7 @@ fn dot_i8<const N: usize>(
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
 fn store_dot<const N: usize>(
     dst: &mut [i32],
     stride: usize,
@@ -300,7 +301,7 @@ fn fdct64_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, zero_line:
 
 #[target_feature(enable = "neon")]
 fn fdct_1d_n(n: usize, src: &[i32], dst: &mut [i32], shift: i32, line: usize, zero: usize) {
-    debug_assert!(line % 4 == 0);
+    debug_assert!(line.is_multiple_of(4));
     let mut j = 0usize;
     while j + 4 <= line {
         match n {
@@ -320,8 +321,8 @@ fn fdct_1d_n(n: usize, src: &[i32], dst: &mut [i32], shift: i32, line: usize, ze
 fn scale_rect2_in_place(out: &mut [i32]) {
     let coeff = vdup_n_s32(5793);
     let add = vdupq_n_s64(2048);
-    let mut chunks = out.chunks_exact_mut(4);
-    for chunk in &mut chunks {
+    let chunks = out.as_chunks_mut::<4>();
+    for chunk in chunks.0.iter_mut() {
         unsafe {
             let v = vld1q_s32(chunk.as_ptr());
             let lo = vaddq_s64(vmull_s32(vget_low_s32(v), coeff), add);
@@ -330,7 +331,7 @@ fn scale_rect2_in_place(out: &mut [i32]) {
             vst1q_s32(chunk.as_mut_ptr(), r);
         }
     }
-    for v in chunks.into_remainder() {
+    for v in chunks.1.iter_mut() {
         *v = (((*v as i64) * 5793 + 2048) >> 12) as i32;
     }
 }
