@@ -26,6 +26,8 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod cost;
 mod fdct;
 
+pub(crate) use cost::{coeff_abs_rate_f32_neon, coeff_rate_f32_neon};
 pub(crate) use fdct::fdct_rect_neon;

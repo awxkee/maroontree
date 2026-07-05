@@ -380,7 +380,7 @@ impl Av2Encoder {
         let scan = &tables::SCAN;
         let lambda = crate::av2::leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
         // Cost of one plane coded as a single 64x64 transform (DC pred).
-        let whole_plane = |rec: &[f32], src: &[f32]| -> (f64, f64) {
+        let whole_plane = |rec: &[f32], src: &[f32]| -> (u64, f32) {
             let pred = dc_pred(rec, pw, sb_y, sb_x, 64, neutral);
             let lev = bases.chroma444.project(
                 &crate::av2::aq::scale_resid(
@@ -391,21 +391,14 @@ impl Av2Encoder {
             );
             let recon =
                 crate::av2::itx422::reconstruct_chroma(pred, &lev, sb_qstep, scan, 64, 64, bd);
-            let mut sse = 0f64;
-            for r in 0..64 {
-                let b = (sb_y + r) * pw + sb_x;
-                for c in 0..64 {
-                    let d = (src[b + c] - recon[r * 64 + c]) as f64;
-                    sse += d * d;
-                }
-            }
-            let bits: f64 = lev.iter().filter(|&&l| l != 0.0).count() as f64 * 4.0;
+            let sse = pixel_sse_rounded_block(src, pw, sb_y, sb_x, &recon, 64, 64, 64);
+            let bits = coeff_count_rate_f32(&lev, 4.0);
             (sse, bits)
         };
         // Cost of one plane coded as 4x 32x32 transforms (DC pred per sub-block).
-        let split_plane = |rec: &[f32], src: &[f32]| -> (f64, f64) {
-            let mut sse = 0f64;
-            let mut bits = 0f64;
+        let split_plane = |rec: &[f32], src: &[f32]| -> (u64, f32) {
+            let mut sse = 0u64;
+            let mut bits = 0f32;
             for (dr, dc) in [(0usize, 0usize), (0, 32), (32, 0), (32, 32)] {
                 let (by, bx) = (sb_y + dr, sb_x + dc);
                 let pred = dc_pred(rec, pw, by, bx, 32, neutral);
@@ -418,14 +411,8 @@ impl Av2Encoder {
                 );
                 let recon =
                     crate::av2::itx422::reconstruct_chroma(pred, &lev, sb_qstep, scan, 32, 32, bd);
-                for r in 0..32 {
-                    let b = (by + r) * pw + bx;
-                    for c in 0..32 {
-                        let d = (src[b + c] - recon[r * 32 + c]) as f64;
-                        sse += d * d;
-                    }
-                }
-                bits += lev.iter().filter(|&&l| l != 0.0).count() as f64 * 4.0;
+                sse += pixel_sse_rounded_block(src, pw, by, bx, &recon, 32, 32, 32);
+                bits += coeff_count_rate_f32(&lev, 4.0);
             }
             (sse, bits)
         };
@@ -439,8 +426,9 @@ impl Av2Encoder {
         // Luma is coded identically (4x TX_32X32) in both the whole-64 fast path and the
         // split, so it cancels and is excluded from this chroma-only comparison.
         // SS2-calibrated 4x: whole-64 chroma drops the >32x32 spectrum; SSE underweights it.
-        let j_whole = (whu_sse + whv_sse) * 4.0 + lambda * (whu_bits + whv_bits);
-        let j_split = (spu_sse + spv_sse) + lambda * (spu_bits + spv_bits + split_signal_bits);
+        let j_whole = ((whu_sse + whv_sse) * 4) as f64 + lambda * (whu_bits + whv_bits) as f64;
+        let j_split = (spu_sse + spv_sse) as f64
+            + lambda * ((spu_bits + spv_bits) as f64 + split_signal_bits);
         j_split < j_whole
     }
 
@@ -648,24 +636,21 @@ impl Av2Encoder {
                     // context (12276 in an all-whole-64 frame; differs next to a split SB).
                     let none_do_split_cdf =
                         partition::sb_none_do_split_cdf(row, col, &above_pctx, &left_pctx);
-                    let sse_region = |rec: &[f32]| -> f64 {
-                        let mut s = 0f64;
+                    let sse_region = |rec: &[f32]| -> u64 {
+                        let mut sse = 0u64;
                         for r in 0..64 {
                             let b = (sb_y + r) * pw + sb_x;
-                            for c in 0..64 {
-                                let d = (rec[b + c] - yp[b + c]) as f64;
-                                s += d * d;
-                            }
+                            sse += pixel_sse_rounded(&yp[b..b + 64], &rec[b..b + 64]);
                         }
-                        s
+                        sse
                     };
-                    let rate_proxy = |tus: &[Vec<Coeff>], ovh: f64| -> f64 {
-                        let mut bits = 0f64;
+                    let rate_proxy = |tus: &[Vec<Coeff>], ovh: f32| -> f32 {
+                        let mut bits = 0f32;
                         for tu in tus {
                             bits += ovh;
                             for &(_, l) in tu {
                                 if l != 0 {
-                                    bits += 2.0 + 2.0 * ((l.unsigned_abs() as f64) + 1.0).log2();
+                                    bits += 2.0 + 2.0 * (l.unsigned_abs() as f32 + 1.0).log2();
                                 }
                             }
                         }
@@ -692,9 +677,10 @@ impl Av2Encoder {
                         self.bit_depth as i32,
                         false, // non-directional path
                     );
-                    let j_s = sse_region(&recy)
+                    let j_s = sse_region(&recy) as f64
                         + lambda
-                            * (rate_proxy(&tus_s, 3.0) + if mode_idx != 0 { 6.0 } else { 0.0 });
+                            * (rate_proxy(&tus_s, 3.0) as f64
+                                + if mode_idx != 0 { 6.0 } else { 0.0 });
                     // partition strategy from tuning (was AV2_TXPART env)
                     // Rect tx-partition (VERT4/HORZ4) is only safe on FULL interior 64x64
                     // SBs: on a partial edge SB the rect strips cross the frame boundary
@@ -771,7 +757,8 @@ impl Av2Encoder {
                             );
                             *tus_v = levels_to_coeffs(&lev);
                         }
-                        let j_v = sse_region(&recy) + lambda * rate_proxy(&tus_v, 4.0);
+                        let j_v =
+                            sse_region(&recy) as f64 + lambda * rate_proxy(&tus_v, 4.0) as f64;
                         let take = force_vert4 || j_v < best_j;
                         if take {
                             best = Part::Vert4;
@@ -827,7 +814,8 @@ impl Av2Encoder {
                             );
                             *tus_h = levels_to_coeffs(&lev);
                         }
-                        let j_h = sse_region(&recy) + lambda * rate_proxy(&tus_h, 4.0);
+                        let j_h =
+                            sse_region(&recy) as f64 + lambda * rate_proxy(&tus_h, 4.0) as f64;
                         let take = force_horz4 || j_h < best_j;
                         if take {
                             best = Part::Horz4;
@@ -948,19 +936,14 @@ impl Av2Encoder {
                                     64,
                                     self.bit_depth as i32,
                                 );
-                                let mut sse = 0f64;
-                                for r in 0..64 {
-                                    let b = (sb_y + r) * pw + sb_x;
-                                    for c in 0..64 {
-                                        let du = up[b + c] - recu_b[r * 64 + c];
-                                        let dv = vp[b + c] - recv_b[r * 64 + c];
-                                        sse += (du * du + dv * dv) as f64;
-                                    }
-                                }
-                                let rate: f64 =
-                                    lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+                                let sse = pixel_sse_rounded_block(
+                                    &up, pw, sb_y, sb_x, &recu_b, 64, 64, 64,
+                                ) + pixel_sse_rounded_block(
+                                    &vp, pw, sb_y, sb_x, &recv_b, 64, 64, 64,
+                                );
+                                let rate = coeff_abs_rate_f32(&lu) + coeff_abs_rate_f32(&lv);
                                 let mode_bits = if m == 0 { 0.0 } else { 2.0 };
-                                let cost = sse + mode_lambda * (rate + mode_bits);
+                                let cost = sse as f64 + mode_lambda * (rate as f64 + mode_bits);
                                 if cost < best_cost {
                                     best_cost = cost;
                                     best_mode = m;
@@ -1729,9 +1712,16 @@ impl Av2Encoder {
                                 let dcv = dc_pred(&recv, pw, sb_y, sb_x, 32, neutral);
                                 let baseline_j = {
                                     // Incumbent DC J: SSE of DC-predicted residual.
-                                    let ru = get_residual(&up, pw, sb_y, sb_x, 32, dcu);
-                                    let rv = get_residual(&vp, pw, sb_y, sb_x, 32, dcv);
-                                    let sse: f32 = ru.iter().chain(rv.iter()).map(|&r| r * r).sum();
+                                    let dcu_i = pixel_to_i32(dcu);
+                                    let dcv_i = pixel_to_i32(dcv);
+                                    let mut sse = 0u64;
+                                    for r in 0..32 {
+                                        let b = (sb_y + r) * pw + sb_x;
+                                        for c in 0..32 {
+                                            sse += sq_diff_u64(pixel_to_i32(up[b + c]), dcu_i);
+                                            sse += sq_diff_u64(pixel_to_i32(vp[b + c]), dcv_i);
+                                        }
+                                    }
                                     sse as f64
                                 };
                                 let mut suf = [0f32; 32 * 32];
@@ -1911,22 +1901,9 @@ impl Av2Encoder {
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 16, 64, pred),
                                 split_resid_scale,
                             );
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse_vs = |rec: &[f32], h2: usize, yoff: usize| -> f64 {
-                                let mut s = 0f64;
-                                for r in 0..h2 {
-                                    for c in 0..16 {
-                                        let d = yp[(sb_y + yoff + r) * pw + sb_x + c] as f64
-                                            - rec[r * 16 + c] as f64;
-                                        s += d * d;
-                                    }
-                                }
-                                s
+                            let rate = coeff_rate_f32;
+                            let sse_vs = |rec: &[f32], h2: usize, yoff: usize| -> u64 {
+                                pixel_sse_rounded_block(&yp, pw, sb_y + yoff, sb_x, rec, 16, 16, h2)
                             };
                             let lambda = leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
                             let lev = bases.luma16x64.project_scan(&resid, 0.0, &SCAN16X32);
@@ -1939,7 +1916,7 @@ impl Av2Encoder {
                                 64,
                                 bd,
                             );
-                            let j_a = sse_vs(&rec_a, 64, 0) + lambda * rate(&lev);
+                            let j_a = sse_vs(&rec_a, 64, 0) as f64 + lambda * rate(&lev) as f64;
                             let mut levs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
                             let mut recs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
                             let mut j_b = lambda * 4.0;
@@ -1964,7 +1941,8 @@ impl Av2Encoder {
                                         bd,
                                     );
                                     put_block_rect(&mut scratch, pw, tuy, sb_x, 16, 32, &rec);
-                                    j_b += sse_vs(&rec, 32, half * 32) + lambda * rate(&l);
+                                    j_b += sse_vs(&rec, 32, half * 32) as f64
+                                        + lambda * rate(&l) as f64;
                                     levs_b[half] = l;
                                     recs_b[half] = rec;
                                 }
@@ -2117,22 +2095,9 @@ impl Av2Encoder {
                                 &get_residual_rect(&yp, pw, sb_y, sb_x, 64, 16, pred),
                                 split_resid_scale,
                             );
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse_vs = |rec: &[f32], w: usize, xoff: usize| -> f64 {
-                                let mut s = 0f64;
-                                for r in 0..16 {
-                                    for c in 0..w {
-                                        let d = yp[(sb_y + r) * pw + sb_x + xoff + c] as f64
-                                            - rec[r * w + c] as f64;
-                                        s += d * d;
-                                    }
-                                }
-                                s
+                            let rate = coeff_rate_f32;
+                            let sse_vs = |rec: &[f32], w: usize, xoff: usize| -> u64 {
+                                pixel_sse_rounded_block(&yp, pw, sb_y, sb_x + xoff, rec, w, w, 16)
                             };
                             let lambda = leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
                             let lev = bases.luma64x16.project_scan(&resid, 0.0, &SCAN32X16);
@@ -2145,7 +2110,7 @@ impl Av2Encoder {
                                 16,
                                 bd,
                             );
-                            let j_a = sse_vs(&rec_a, 64, 0) + lambda * rate(&lev);
+                            let j_a = sse_vs(&rec_a, 64, 0) as f64 + lambda * rate(&lev) as f64;
                             // Per-TU prediction (decoder predicts each sub-TU from prior
                             // recon), simulated on a scratch copy so cand A stays clean.
                             let mut levs_b: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
@@ -2172,7 +2137,8 @@ impl Av2Encoder {
                                         bd,
                                     );
                                     put_block_rect(&mut scratch, pw, sb_y, tux, 32, 16, &rec);
-                                    j_b += sse_vs(&rec, 32, half * 32) + lambda * rate(&l);
+                                    j_b += sse_vs(&rec, 32, half * 32) as f64
+                                        + lambda * rate(&l) as f64;
                                     levs_b[half] = l;
                                     recs_b[half] = rec;
                                 }
@@ -2489,20 +2455,8 @@ impl Av2Encoder {
                                     src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
                                 }
                             }
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse = |rec: &[f32]| -> f64 {
-                                (0..256)
-                                    .map(|i| {
-                                        let d = src16[i] as f64 - rec[i] as f64;
-                                        d * d
-                                    })
-                                    .sum()
-                            };
+                            let rate = coeff_rate_f32;
+                            let sse = |rec: &[f32]| -> u64 { pixel_sse_rounded(&src16, rec) };
                             let lambda =
                                 crate::av2::leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
                             // DCT_DCT candidate (idx 0).
@@ -2514,7 +2468,7 @@ impl Av2Encoder {
                                 &SCAN16,
                                 self.bit_depth as i32,
                             );
-                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let cost_dct = sse(&rec_dct) as f64 + lambda * rate(&lev_dct) as f64;
                             // ADST_ADST candidate (idx 1, DST-VII both axes).
                             let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = itx422::reconstruct_luma16_adst(
@@ -2526,7 +2480,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let cost_adst =
+                                sse(&rec_adst) as f64 + lambda * (rate(&lev_adst) as f64 + 0.2);
                             // ADST_DCT candidate (idx 2: ADST vertical, DCT horizontal →
                             // inverse row_adst=false, col_adst=true). The tx_type symbol
                             // costs ~3.1 bits more than DCT (idx 2 in the EXT_NEW_TX_SET
@@ -2542,7 +2497,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let cost_ad =
+                                sse(&rec_ad) as f64 + lambda * (rate(&lev_ad) as f64 + 3.12);
                             // DCT_ADST candidate (idx 3: DCT vertical, ADST horizontal →
                             // inverse row_adst=true, col_adst=false; ~2.7 extra bits).
                             let lev_da =
@@ -2556,7 +2512,8 @@ impl Av2Encoder {
                                 false,
                                 self.bit_depth as i32,
                             );
-                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let cost_da =
+                                sse(&rec_da) as f64 + lambda * (rate(&lev_da) as f64 + 2.71);
                             // Pick the best tx_type. Tie-break preserves the original
                             // DCT_DCT-over-ADST_ADST behavior (each alternative must be
                             // STRICTLY better), so byte output is unchanged wherever the
@@ -3009,19 +2966,6 @@ impl Av2Encoder {
                 }
                 enc.in_interior_split = false;
             }
-        }
-        if let Ok(p) = std::env::var("DUMP_REC") {
-            let mut o = Vec::with_capacity(width * height * 3);
-            for buf in [&recy, &recu, &recv] {
-                for r in 0..height {
-                    o.extend(
-                        buf[r * pw..r * pw + width]
-                            .iter()
-                            .map(|&v| v.clamp(0.0, 255.0) as u8),
-                    );
-                }
-            }
-            std::fs::write(p, o).unwrap();
         }
         enc
     }

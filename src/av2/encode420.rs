@@ -1199,20 +1199,8 @@ impl Av2Encoder {
                                     src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
                                 }
                             }
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse = |rec: &[f32]| -> f64 {
-                                (0..256)
-                                    .map(|i| {
-                                        let d = src16[i] as f64 - rec[i] as f64;
-                                        d * d
-                                    })
-                                    .sum()
-                            };
+                            let rate = coeff_rate_f32;
+                            let sse = |rec: &[f32]| -> u64 { pixel_sse_rounded(&src16, rec) };
                             let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                             let rec_dct = itx422::reconstruct_luma16(
@@ -1222,7 +1210,7 @@ impl Av2Encoder {
                                 &SCAN16,
                                 self.bit_depth as i32,
                             );
-                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let cost_dct = sse(&rec_dct) as f64 + lambda * rate(&lev_dct) as f64;
                             let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = itx422::reconstruct_luma16_adst(
                                 &pred_flat,
@@ -1233,7 +1221,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let cost_adst =
+                                sse(&rec_adst) as f64 + lambda * (rate(&lev_adst) as f64 + 0.2);
                             let lev_ad =
                                 bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
                             let rec_ad = itx422::reconstruct_luma16_adst(
@@ -1245,7 +1234,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let cost_ad =
+                                sse(&rec_ad) as f64 + lambda * (rate(&lev_ad) as f64 + 3.12);
                             let lev_da =
                                 bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_da = itx422::reconstruct_luma16_adst(
@@ -1257,7 +1247,8 @@ impl Av2Encoder {
                                 false,
                                 self.bit_depth as i32,
                             );
-                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let cost_da =
+                                sse(&rec_da) as f64 + lambda * (rate(&lev_da) as f64 + 2.71);
                             let mut best = cost_dct;
                             let mut choice = 0usize;
                             if cost_adst < best {
@@ -2230,20 +2221,13 @@ impl Av2Encoder {
                             32,
                             bd,
                         );
-                        let mut sse = 0f64;
-                        for r in 0..32 {
-                            let b = (cy + r) * pcw + cx;
-                            for c in 0..32 {
-                                let du = up[b + c] - recu_b[r * 32 + c];
-                                let dv = vp[b + c] - recv_b[r * 32 + c];
-                                sse += (du * du + dv * dv) as f64;
-                            }
-                        }
-                        let rate: f64 = lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+                        let sse = pixel_sse_rounded_block(&up, pcw, cy, cx, &recu_b, 32, 32, 32)
+                            + pixel_sse_rounded_block(&vp, pcw, cy, cx, &recv_b, 32, 32, 32);
+                        let rate = coeff_abs_rate_f32(&lu) + coeff_abs_rate_f32(&lv);
                         // Small bias toward DC to avoid spending uv-mode bits for a
                         // marginal SSE gain.
                         let mode_bits = if m == 0 { 0.0 } else { 2.0 };
-                        let cost = sse + lambda * (rate + mode_bits);
+                        let cost = sse as f64 + lambda * (rate as f64 + mode_bits);
                         if cost < best_cost {
                             best_cost = cost;
                             best_mode = m;
@@ -2381,15 +2365,7 @@ impl Av2Encoder {
             // ~rd_mult against SSE. Tuned so the per-SB flag cost is comparable to a
             // meaningful SSE change. rd_scale lets the threshold be retuned.
             let qstep = quant::qstep(self.base_q_idx as u32) as f64;
-            let rd_scale: f64 = std::env::var("CCSO_RD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(
-                    std::env::var("CCSO_RD")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(self.tune.ccso_rd_scale),
-                );
+            let rd_scale: f64 = self.tune.ccso_rd_scale;
             // RD multiplier matching AVM's RDCOST scaling. AVM compares
             // `(ssd << 7) + (rate*rdmult >> 9)`; dividing through by 128 gives
             // `ssd + rate * rdmult/65536`, so our per-SB rd_mult (weight on the
@@ -2431,51 +2407,14 @@ impl Av2Encoder {
                     enc.ccso_v_result = Some(edge_to_plane(r));
                 }
             } else {
-                // Decision pass: search all-on, decide per-SB, store result + grid on
-                // the encoder for the second pass. Filter is NOT applied here (the
-                // emit pass applies it gated); recon stays unfiltered.
-                // Optional SSIMULACRA2-inspired proxy: weight the per-SB decision SSE
-                // by inverse source activity so flat-region errors dominate the on/off
-                // choice. When proxy is on, rd_mult is rescaled (the weighting shrinks
-                // SSE magnitudes) so the flag-rate threshold stays comparable.
-                // The per-SB decision uses raw-SSE rate-distortion by default. An
-                // optional SSIMULACRA2-inspired proxy (`CCSO_PROXY`) instead weights
-                // the decision SSE by inverse source activity, which turns off
-                // superblocks where chroma filtering helps SSE but not perceptual
-                // quality — safer on flat/structured content, but it also suppresses
-                // the genuine gains on heavily textured chroma, so it is opt-in.
-                let proxy = std::env::var("CCSO_PROXY").is_ok();
-                let kc = 128.0 * (1u32 << (2 * (bd - 8))) as f64;
-                let (act_u, act_v, dec_rd) = if proxy {
-                    (
-                        Some(crate::av2::ccso::inv_activity_map(&up, pcw, pch, kc)),
-                        Some(crate::av2::ccso::inv_activity_map(&vp, pcw, pch, kc)),
-                        rd_mult / kc, // weighting divides SSE by ~kc; match the threshold
-                    )
-                } else {
-                    (None, None, rd_mult)
-                };
+                let dec_rd = rd_mult;
                 if ccso_search_u
-                    && let Some(r) = crate::av2::ccso::search_edge(
-                        &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, None,
-                    )
+                    && let Some(r) =
+                        ccso::search_edge(&ext, estride, &up, &recu, pcw, pch, 1, 1, bd, None)
                 {
-                    let (grid, any) = crate::av2::ccso::decide_blk_md(
-                        &ext,
-                        estride,
-                        &up,
-                        &recu,
-                        pcw,
-                        pch,
-                        1,
-                        1,
-                        bd,
-                        &r,
-                        sb_cols,
-                        sb_rows,
-                        dec_rd,
-                        act_u.as_deref(),
-                        1,
+                    let (grid, any) = ccso::decide_blk_md(
+                        &ext, estride, &up, &recu, pcw, pch, 1, 1, bd, &r, sb_cols, sb_rows,
+                        dec_rd, 1,
                     );
                     if any {
                         enc.ccso_decided_u = Some((r, grid));
@@ -2486,21 +2425,8 @@ impl Av2Encoder {
                         ccso::search_edge(&ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, None)
                 {
                     let (grid, any) = ccso::decide_blk_md(
-                        &ext,
-                        estride,
-                        &vp,
-                        &recv,
-                        pcw,
-                        pch,
-                        1,
-                        1,
-                        bd,
-                        &r,
-                        sb_cols,
-                        sb_rows,
-                        dec_rd,
-                        act_v.as_deref(),
-                        2,
+                        &ext, estride, &vp, &recv, pcw, pch, 1, 1, bd, &r, sb_cols, sb_rows,
+                        dec_rd, 2,
                     );
                     if any {
                         enc.ccso_decided_v = Some((r, grid));

@@ -304,31 +304,31 @@ fn encode_eob(
 /// (allow_update=0), so every `tok_cost` is a constant of the interval width `d = hi-lo`;
 /// caching `log2` turns the innermost RDOQ rate term from a transcendental into a lookup
 /// (values are bit-identical to the direct computation, so encoder output is unchanged).
-static TOK_LOG2_LUT: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+static TOK_LOG2_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 #[inline]
-fn tok_log2_lut() -> &'static [f64] {
+fn tok_log2_lut() -> &'static [f32] {
     TOK_LOG2_LUT.get_or_init(|| {
-        let mut v = vec![0.0f64; 32769];
+        let mut v = vec![0.0f32; 32769];
         for (d, slot) in v.iter_mut().enumerate().skip(1) {
-            *slot = (32768.0 / d as f64).log2();
+            *slot = (32768.0 / d as f32).log2();
         }
         v[0] = v[1];
         v
     })
 }
 
-fn tok_cost(icdf: &[u16], s: usize) -> f64 {
+fn tok_cost(icdf: &[u16], s: usize) -> f32 {
     let hi = if s == 0 { 32768i32 } else { icdf[s - 1] as i32 };
     let lo = if s < icdf.len() { icdf[s] as i32 } else { 0 };
     tok_log2_lut()[(hi - lo).max(1) as usize]
 }
 
 #[inline]
-fn rice_tail_bits(hr: u32) -> f64 {
-    2.0 * ((hr + 1) as f64).log2() + 2.0
+fn rice_tail_bits(hr: u32) -> f32 {
+    2.0 * ((hr + 1) as f32).log2() + 2.0
 }
 
-fn base_range_bits(level: u32, hi_range_ctx: usize, high_freq: bool, qc: usize) -> f64 {
+fn base_range_bits(level: u32, hi_range_ctx: usize, high_freq: bool, qc: usize) -> f32 {
     let limit = if high_freq { 3u32 } else { 5u32 };
     let over = level - limit;
     let cdf: &[u16] = if high_freq {
@@ -352,7 +352,7 @@ fn luma_level_bits(
     hi_range_ctx: usize,
     high_freq: bool,
     qc: usize,
-) -> f64 {
+) -> f32 {
     let mut bits = if !high_freq {
         if is_eob {
             if level <= 4 {
@@ -397,7 +397,7 @@ pub(crate) fn rdoq_luma(
     scan: &[u16],
     area: usize,
     lambda: f64,
-) -> f64 {
+) -> f32 {
     let n = lev.len();
     let mut eob = 0usize;
     for (k, &lev) in lev[..n].iter().enumerate() {
@@ -435,7 +435,7 @@ pub(crate) fn rdoq_luma(
     };
 
     // Phase A: per-coefficient magnitude RD (EOB fixed).
-    let mut total_bits = 0.0f64;
+    let mut total_bits = 0.0f32;
     for k in (0..=eob).rev() {
         let is_eob = k == eob;
         let high_freq = k >= LUMA_HI_TO_LOW;
@@ -449,7 +449,7 @@ pub(crate) fn rdoq_luma(
         for l in lo..=hi {
             let d = (a - l as f64) * (a - l as f64);
             let r = luma_level_bits(l, is_eob, bc, hc, high_freq, qc);
-            let cost = d + lambda * r;
+            let cost = d + lambda * r as f64;
             if cost < best_cost {
                 best_cost = cost;
                 best_l = l;
@@ -476,7 +476,7 @@ pub(crate) fn rdoq_luma(
         let (bc, hc) = ctx_at(&levels, p, true);
         let a = prm[p] as f64;
         let drop_bits = luma_level_bits(lev[p].abs() as u32, true, bc, hc, high_freq, qc);
-        if lambda * drop_bits > a * a {
+        if lambda * drop_bits as f64 > a * a {
             lev[p] = 0.0;
             let rc = scan[p] as i32;
             levels[plvl(rc) as usize] = 0;
@@ -500,7 +500,7 @@ fn chroma_level_bits(
     base_ctx: usize,
     hi_range_ctx: usize,
     qc: usize,
-) -> f64 {
+) -> f32 {
     let mut bits = if is_dc {
         if is_eob {
             // sym_chr_eob_lf (4 syms): mag-1 for mag<=4, else saturate at 4 + tail.
@@ -541,7 +541,7 @@ fn chroma_level_bits(
 /// Chroma high-range residual bits: the chroma BR symbol (limit 3, HF BR table)
 /// plus the adaptive-Rice/Golomb tail for magnitudes beyond `max_base_range`
 /// (5 for DC, 6 for HF — the threshold the sign pass uses for `encode_high_range`).
-fn chroma_base_range_bits(level: u32, hi_range_ctx: usize, is_dc: bool, qc: usize) -> f64 {
+fn chroma_base_range_bits(level: u32, hi_range_ctx: usize, is_dc: bool, qc: usize) -> f32 {
     let over = level - 3; // BR symbol residual (max_base_range for the BR symbol is 3)
     let bits = if over <= 2 {
         tok_cost(&CHROMA_BR_TOK_HF_QC[qc][hi_range_ctx], over as usize)
@@ -566,7 +566,7 @@ pub(crate) fn rdoq_chroma(
     area: usize,
     plane_offset: usize,
     lambda: f64,
-) -> f64 {
+) -> f32 {
     let n = lev.len();
     let mut eob = 0usize;
     for (k, &l) in lev[..n].iter().enumerate() {
@@ -602,7 +602,7 @@ pub(crate) fn rdoq_chroma(
     };
 
     // Phase A: per-coefficient magnitude RD (EOB fixed).
-    let mut total_bits = 0.0f64;
+    let mut total_bits = 0.0f32;
     for k in (0..=eob).rev() {
         let is_eob = k == eob;
         let is_dc = k == 0;
@@ -616,7 +616,7 @@ pub(crate) fn rdoq_chroma(
         for l in lo..=hi {
             let d = (a - l as f64) * (a - l as f64);
             let r = chroma_level_bits(l, is_eob, is_dc, bc, hc, qc);
-            let cost = d + lambda * r;
+            let cost = d + lambda * r as f64;
             if cost < best_cost {
                 best_cost = cost;
                 best_l = l;
@@ -644,7 +644,7 @@ pub(crate) fn rdoq_chroma(
         let (bc, hc) = ctx_at(&levels, p, true, is_dc);
         let a = prm[p] as f64;
         let drop_bits = chroma_level_bits(lev[p].abs() as u32, true, is_dc, bc, hc, qc);
-        if lambda * drop_bits > a * a {
+        if lambda * drop_bits as f64 > a * a {
             lev[p] = 0.0;
             let rc = scan[p] as i32;
             levels[plvl(rc) as usize] = 0;
@@ -1191,9 +1191,6 @@ fn encode_chroma_tokens_scan_w(
                 br_ctx_2d_chroma_w(&levels, rc, bwl),
             )
         };
-        if std::env::var("CBE").is_ok() && bwl == 4 && plane_offset == 0 && !is_eob && !lf {
-            eprintln!("CBE pos={} ctx={} mag={}", rc, base_ctx, mag);
-        }
         let sl = encode_chroma4_token(enc, mag, is_eob, base_ctx, hi_ctx, lf);
         levels[pidx_w(rc, bwl)] = sl as u8;
         stored.push((level, !lf));
@@ -1274,15 +1271,6 @@ fn encode_chroma_signs(enc: &mut RangeEncoder, stored: &[ChromaStored]) {
         let mag = level.unsigned_abs();
         enc.encode_bypass(if level < 0 { 1 } else { 0 }, 1);
         let max_base_range = if high_freq { 6u32 } else { 5u32 };
-        if std::env::var("SGE").is_ok() {
-            eprintln!(
-                "SGE mag={} hf={} maxbr={} hr={}",
-                mag,
-                high_freq,
-                max_base_range,
-                mag.saturating_sub(max_base_range)
-            );
-        }
         if mag >= max_base_range {
             running_avg = encode_high_range(enc, mag - max_base_range, running_avg);
         }

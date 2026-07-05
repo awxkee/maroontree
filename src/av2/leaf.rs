@@ -134,15 +134,11 @@ fn project_luma_rdoq(
 ) -> Vec<f32> {
     if lambda > 0.0 {
         let (mut l, prm) = luma.project_scan_with_prm(resid, scan);
-        *cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+        *cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda) as f64;
         l
     } else {
         let l = luma.project(resid, 0.0);
-        *cost += l
-            .iter()
-            .filter(|&&v| v != 0.0)
-            .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-            .sum::<f64>();
+        *cost += coeff_rate_f32(&l) as f64;
         l
     }
 }
@@ -234,15 +230,11 @@ pub(super) fn encode_luma_sb(
                     // Trellis RDOQ: pick coefficient levels by real rate-distortion
                     // (rate = true coded bits), then RD-trim the EOB.
                     let (mut l, prm) = luma.project_with_prm(&resid[..]);
-                    cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda);
+                    cost += coder::rdoq_luma(&prm, &mut l, qc, scan, 1024, lambda) as f64;
                     l
                 } else {
                     let l = luma.project(&resid[..], 0.0);
-                    cost += l
-                        .iter()
-                        .filter(|&&v| v != 0.0)
-                        .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                        .sum::<f64>();
+                    cost += coeff_rate_f32(&l) as f64;
                     l
                 };
                 let rb = reconstruct_luma(&pblk, &lev, qstep, scan, bd);

@@ -1001,20 +1001,8 @@ impl Av2Encoder {
                                     src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
                                 }
                             }
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse = |rec: &[f32]| -> f64 {
-                                (0..256)
-                                    .map(|i| {
-                                        let d = src16[i] as f64 - rec[i] as f64;
-                                        d * d
-                                    })
-                                    .sum()
-                            };
+                            let rate = coeff_rate_f32;
+                            let sse = |rec: &[f32]| -> u64 { pixel_sse_rounded(&src16, rec) };
                             let lambda = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
                             // DCT_DCT candidate (idx 0).
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
@@ -1025,7 +1013,7 @@ impl Av2Encoder {
                                 &SCAN16,
                                 self.bit_depth as i32,
                             );
-                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let cost_dct = sse(&rec_dct) as f64 + lambda * rate(&lev_dct) as f64;
                             // ADST_ADST candidate (idx 1, DST-VII both axes).
                             let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = itx422::reconstruct_luma16_adst(
@@ -1037,7 +1025,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let cost_adst =
+                                sse(&rec_adst) as f64 + lambda * (rate(&lev_adst) as f64 + 0.2);
                             // ADST_DCT candidate (idx 2: ADST vertical, DCT horizontal →
                             // inverse row_adst=false, col_adst=true; ~3.1 extra bits).
                             let lev_ad =
@@ -1051,7 +1040,8 @@ impl Av2Encoder {
                                 true,
                                 self.bit_depth as i32,
                             );
-                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let cost_ad =
+                                sse(&rec_ad) as f64 + lambda * (rate(&lev_ad) as f64 + 3.12);
                             // DCT_ADST candidate (idx 3: DCT vertical, ADST horizontal →
                             // inverse row_adst=true, col_adst=false; ~2.7 extra bits).
                             let lev_da =
@@ -1065,7 +1055,8 @@ impl Av2Encoder {
                                 false,
                                 self.bit_depth as i32,
                             );
-                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let cost_da =
+                                sse(&rec_da) as f64 + lambda * (rate(&lev_da) as f64 + 2.71);
                             // Strict-improvement tie-break (DCT_DCT default).
                             let mut best = cost_dct;
                             let mut choice = 0usize;

@@ -405,43 +405,34 @@ impl Av2Encoder {
                                     src16[r * 16 + c] = yp[(sb_y + r) * pw + sb_x + c];
                                 }
                             }
-                            let rate = |lev: &[f32]| -> f64 {
-                                lev.iter()
-                                    .filter(|&&v| v != 0.0)
-                                    .map(|&v| 2.0 + 2.0 * ((v.abs() as f64) + 1.0).log2())
-                                    .sum::<f64>()
-                            };
-                            let sse = |rec: &[f32]| -> f64 {
-                                (0..256)
-                                    .map(|i| {
-                                        let d = src16[i] as f64 - rec[i] as f64;
-                                        d * d
-                                    })
-                                    .sum()
-                            };
+                            let rate = coeff_rate_f32;
+                            let sse = |rec: &[f32]| -> u64 { pixel_sse_rounded(&src16, rec) };
                             let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
                             let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                             let rec_dct = itx422::reconstruct_luma16(
                                 &pred_flat, &lev_dct, sb_qstep, &SCAN16, bd,
                             );
-                            let cost_dct = sse(&rec_dct) + lambda * rate(&lev_dct);
+                            let cost_dct = sse(&rec_dct) as f64 + lambda * rate(&lev_dct) as f64;
                             let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_adst = itx422::reconstruct_luma16_adst(
                                 &pred_flat, &lev_adst, sb_qstep, &SCAN16, true, true, bd,
                             );
-                            let cost_adst = sse(&rec_adst) + lambda * (rate(&lev_adst) + 0.2);
+                            let cost_adst =
+                                sse(&rec_adst) as f64 + lambda * (rate(&lev_adst) as f64 + 0.2);
                             let lev_ad =
                                 bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
                             let rec_ad = itx422::reconstruct_luma16_adst(
                                 &pred_flat, &lev_ad, sb_qstep, &SCAN16, false, true, bd,
                             );
-                            let cost_ad = sse(&rec_ad) + lambda * (rate(&lev_ad) + 3.12);
+                            let cost_ad =
+                                sse(&rec_ad) as f64 + lambda * (rate(&lev_ad) as f64 + 3.12);
                             let lev_da =
                                 bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
                             let rec_da = itx422::reconstruct_luma16_adst(
                                 &pred_flat, &lev_da, sb_qstep, &SCAN16, true, false, bd,
                             );
-                            let cost_da = sse(&rec_da) + lambda * (rate(&lev_da) + 2.71);
+                            let cost_da =
+                                sse(&rec_da) as f64 + lambda * (rate(&lev_da) as f64 + 2.71);
                             let mut best = cost_dct;
                             let mut choice = 0usize;
                             if cost_adst < best {
@@ -686,17 +677,6 @@ impl Av2Encoder {
                     }
                 }
             }
-        }
-        if let Ok(p) = std::env::var("DUMP_REC") {
-            let mut o = Vec::with_capacity(width * height);
-            for r in 0..height {
-                o.extend(
-                    recy[r * pw..r * pw + width]
-                        .iter()
-                        .map(|&v| v.clamp(0.0, 255.0) as u8),
-                );
-            }
-            std::fs::write(p, o).unwrap();
         }
     }
 

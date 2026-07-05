@@ -315,36 +315,6 @@ pub(crate) enum PlaneResult {
     },
 }
 
-/// Per-pixel inverse-activity weight from a 3×3 local variance of `src`
-/// (cw×ch). `k` is the activity floor (8-bit ~128 for chroma; scale by
-/// `1 << (2*(bit_depth-8))` for high bit depth at the call site).
-pub(crate) fn inv_activity_map(src: &[f32], cw: usize, ch: usize, k: f64) -> Vec<f64> {
-    let mut out = vec![0f64; cw * ch];
-    for y in 0..ch {
-        let y0 = y.saturating_sub(1);
-        let y1 = (y + 1).min(ch - 1);
-        for x in 0..cw {
-            let x0 = x.saturating_sub(1);
-            let x1 = (x + 1).min(cw - 1);
-            let mut sum = 0f64;
-            let mut sum2 = 0f64;
-            let mut n = 0f64;
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let v = src[yy * cw + xx] as f64;
-                    sum += v;
-                    sum2 += v * v;
-                    n += 1.0;
-                }
-            }
-            let mean = sum / n;
-            let var = (sum2 / n - mean * mean).max(0.0);
-            out[y * cw + x] = 1.0 / (var + k);
-        }
-    }
-    out
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_blk_md(
     ext: &[i32],
@@ -360,7 +330,6 @@ pub(crate) fn decide_blk_md(
     sb_cols: usize,
     sb_rows: usize,
     rd_mult: f64,
-    activity: Option<&[f64]>,
     plane: usize,
 ) -> (Vec<u8>, bool) {
     let max_val = (1i32 << bit_depth) - 1;
@@ -396,7 +365,7 @@ pub(crate) fn decide_blk_md(
                 for x in x0..x1 {
                     let s = src_c[y * cw + x] as f64;
                     let r = rec_c[y * cw + x] as i32;
-                    let w = activity.map(|a| a[y * cw + x]).unwrap_or(1.0);
+                    let w = 1.0;
                     let du = r as f64 - s;
                     sse_off += du * du * w;
                     // filtered value

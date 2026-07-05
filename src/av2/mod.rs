@@ -94,10 +94,11 @@ use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for,
 use crate::av2::entropy::RangeEncoder;
 use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
-    dc_pred, dc_pred_rect, dc_pred_rect_subsampled, get_residual, get_residual_rect,
-    levels_to_coeffs, lossless_sb_tus, pad_plane, put_block, put_block_rect, sb_align,
-    sb_tu_contexts, sb_tu_contexts_64x32, sb_tu_contexts_pos, sb_tu_contexts_rect,
-    sb_tu4_chroma_skip, sb_tu4_contexts,
+    coeff_abs_rate_f32, coeff_count_rate_f32, coeff_rate_f32, dc_pred, dc_pred_rect,
+    dc_pred_rect_subsampled, get_residual, get_residual_rect, levels_to_coeffs, lossless_sb_tus,
+    pad_plane, pixel_sse_rounded, pixel_sse_rounded_block, pixel_to_i32, put_block, put_block_rect,
+    sb_align, sb_tu_contexts, sb_tu_contexts_64x32, sb_tu_contexts_pos, sb_tu_contexts_rect,
+    sb_tu4_chroma_skip, sb_tu4_contexts, sq_diff_u64,
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;

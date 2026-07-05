@@ -26,8 +26,10 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod cost;
 mod fdct;
 mod itx;
 
+pub(crate) use cost::{coeff_abs_rate_f32_avx2, coeff_rate_f32_avx2};
 pub(crate) use fdct::fdct_rect_avx2;
 pub(crate) use itx::inv_txfm_passes_avx2;

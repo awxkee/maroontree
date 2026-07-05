@@ -30,6 +30,7 @@ use crate::av2::cdfs_qctx::{CHROMA_SKIP_TX32_QC, SKIP_TX8_QC, SKIP_TX16_QC};
 use crate::av2::coder::Coeff;
 use crate::av2::lossless::levels_to_coeffs_4x4;
 use crate::av2::wht::fwht4x4;
+use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sb_tu_contexts(
@@ -517,6 +518,145 @@ pub(crate) fn put_block_rect(
         plane_dst.copy_from_slice(plane_src);
     }
 }
+
+#[inline(always)]
+pub(crate) fn pixel_to_i32(v: f32) -> i32 {
+    // Reconstructed AV2 sample planes are already clipped to the valid pixel range.
+    // Rounding here makes RD distortion operate on the same integer samples that are
+    // actually written to the reconstructed picture instead of accumulating float
+    // noise from the f32 scratch representation.
+    (v + 0.5) as i32
+}
+
+#[inline(always)]
+pub(crate) fn sq_diff_u64(a: i32, b: i32) -> u64 {
+    let d = a as i64 - b as i64;
+    (d * d) as u64
+}
+
+#[inline]
+pub(crate) fn pixel_sse_rounded(a: &[f32], b: &[f32]) -> u64 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| sq_diff_u64(pixel_to_i32(x), pixel_to_i32(y)))
+        .sum()
+}
+
+#[inline]
+pub(crate) fn pixel_sse_rounded_block(
+    src: &[f32],
+    src_stride: usize,
+    src_y: usize,
+    src_x: usize,
+    rec: &[f32],
+    rec_stride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    let mut sse = 0u64;
+    for r in 0..h {
+        let src_row = &src[(src_y + r) * src_stride + src_x..][..w];
+        let rec_row = &rec[r * rec_stride..][..w];
+        sse += pixel_sse_rounded(src_row, rec_row);
+    }
+    sse
+}
+
+pub(crate) type CoeffRateF32Fn = unsafe fn(&[f32]) -> f32;
+pub(crate) type CoeffAbsRateF32Fn = unsafe fn(&[f32]) -> f32;
+
+static COEFF_RATE_F32: OnceLock<CoeffRateF32Fn> = OnceLock::new();
+static COEFF_ABS_RATE_F32: OnceLock<CoeffAbsRateF32Fn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn log2p1_approx_f32(x: f32) -> f32 {
+    let y = 1.0 + x;
+    let bits = y.to_bits();
+    let e = ((bits >> 23) as i32 - 127) as f32;
+    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    let t = m - 1.0;
+
+    // Same Sollya-generated polynomial as the SIMD paths.
+    let mut p = 2.096841670572757720947265625e-2f32;
+    p = -9.749893844127655029296875e-2f32 + t * p;
+    p = 0.21719777584075927734375f32 + t * p;
+    p = -0.340080082416534423828125f32 + t * p;
+    p = 0.477900087833404541015625f32 + t * p;
+    p = -0.721179187297821044921875f32 + t * p;
+    p = 1.4426934719085693359375f32 + t * p;
+
+    e + t * p
+}
+
+#[inline]
+fn coeff_rate_f32_scalar(lev: &[f32]) -> f32 {
+    lev.iter()
+        .filter(|&&v| v != 0.0)
+        .map(|&v| 2.0 + 2.0 * log2p1_approx_f32(v.abs()))
+        .sum()
+}
+
+#[inline]
+fn coeff_abs_rate_f32_scalar(lev: &[f32]) -> f32 {
+    lev.iter().map(|&v| v.abs()).sum()
+}
+
+#[inline]
+fn resolve_coeff_rate_f32() -> CoeffRateF32Fn {
+    *COEFF_RATE_F32.get_or_init(|| {
+        let mut _f = coeff_rate_f32_scalar as CoeffRateF32Fn;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = crate::av2::neon::coeff_rate_f32_neon as CoeffRateF32Fn;
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                _f = crate::av2::avx::coeff_rate_f32_avx2 as CoeffRateF32Fn;
+            }
+        }
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn coeff_rate_f32(lev: &[f32]) -> f32 {
+    debug_assert!(lev.iter().all(|v| v.is_finite()));
+    let f = resolve_coeff_rate_f32();
+    unsafe { f(lev) }
+}
+
+#[inline]
+fn resolve_coeff_abs_rate_f32() -> CoeffAbsRateF32Fn {
+    *COEFF_ABS_RATE_F32.get_or_init(|| {
+        let mut _f = coeff_abs_rate_f32_scalar as CoeffAbsRateF32Fn;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = crate::av2::neon::coeff_abs_rate_f32_neon as CoeffAbsRateF32Fn;
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = crate::av2::avx::coeff_abs_rate_f32_avx2 as CoeffAbsRateF32Fn;
+            }
+        }
+        _f
+    })
+}
+
+#[inline]
+pub(crate) fn coeff_abs_rate_f32(lev: &[f32]) -> f32 {
+    debug_assert!(lev.iter().all(|v| v.is_finite()));
+    let f = resolve_coeff_abs_rate_f32();
+    unsafe { f(lev) }
+}
+
+#[inline]
+pub(crate) fn coeff_count_rate_f32(lev: &[f32], bits_per_nonzero: f32) -> f32 {
+    lev.iter().filter(|&&v| v != 0.0).count() as f32 * bits_per_nonzero
+}
+
 pub(crate) fn levels_to_coeffs(lev: &[f32]) -> Vec<Coeff> {
     lev.iter()
         .enumerate()
@@ -651,4 +791,107 @@ pub(crate) fn sb_tu4_chroma_skip(
         }
     }
     skip
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coeff_rate_case(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed
+            .wrapping_mul(747_796_405)
+            .wrapping_add((len as u32) << 9)
+            .wrapping_add(2_891_336_453);
+        let mut out = vec![0.0f32; len];
+        for (i, v) in out.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if (state & 7) == 0 {
+                continue;
+            }
+            let sign = if (state & 8) == 0 { 1.0 } else { -1.0 };
+            let mag = ((state >> 10) & 0x7ff) as f32 + ((i & 15) as f32 * 0.125);
+            *v = sign * mag;
+        }
+        out
+    }
+
+    fn assert_coeff_rate_impl_matches_scalar(name: &str, simd: CoeffRateF32Fn) {
+        for len in [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 256, 1024,
+        ] {
+            for seed in 0..16u32 {
+                let levels = coeff_rate_case(len, seed);
+                let expected = coeff_rate_f32_scalar(&levels);
+                let actual = unsafe { simd(&levels) };
+                let tol = 0.001 + expected.abs() * 2.0e-6;
+                assert!(
+                    (actual - expected).abs() <= tol,
+                    "{name} coeff-rate mismatch len {len} seed {seed}: actual={actual} expected={expected} tol={tol}"
+                );
+            }
+        }
+    }
+
+    fn assert_coeff_abs_rate_impl_matches_scalar(name: &str, simd: CoeffAbsRateF32Fn) {
+        for len in [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 256, 1024,
+        ] {
+            for seed in 0..16u32 {
+                let levels = coeff_rate_case(len, seed);
+                let expected = coeff_abs_rate_f32_scalar(&levels);
+                let actual = unsafe { simd(&levels) };
+                let tol = 0.001 + expected.abs() * 2.0e-6;
+                assert!(
+                    (actual - expected).abs() <= tol,
+                    "{name} coeff-abs-rate mismatch len {len} seed {seed}: actual={actual} expected={expected} tol={tol}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log2p1_approx_close_to_libm() {
+        for i in 0..8192u32 {
+            let x = i as f32 * 0.5;
+            let actual = log2p1_approx_f32(x);
+            let expected = (x + 1.0).log2();
+            assert!(
+                (actual - expected).abs() <= 4.0e-6,
+                "log2p1 mismatch x={x}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn coeff_rate_neon_matches_scalar() {
+        assert_coeff_rate_impl_matches_scalar("neon", crate::av2::neon::coeff_rate_f32_neon);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn coeff_abs_rate_neon_matches_scalar() {
+        assert_coeff_abs_rate_impl_matches_scalar(
+            "neon",
+            crate::av2::neon::coeff_abs_rate_f32_neon,
+        );
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[test]
+    fn coeff_rate_avx2_matches_scalar() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        assert_coeff_rate_impl_matches_scalar("avx2", crate::av2::avx::coeff_rate_f32_avx2);
+    }
+
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "avx"))]
+    #[test]
+    fn coeff_abs_rate_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        assert_coeff_abs_rate_impl_matches_scalar("avx2", crate::av2::avx::coeff_abs_rate_f32_avx2);
+    }
 }

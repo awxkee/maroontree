@@ -226,18 +226,11 @@ pub(super) fn chroma_mode_decide_leaf(
         );
         let recu_b = itx422::reconstruct_chroma_cfl(&pu_i, &lu, sb_qstep, scan, bs, bs, bd);
         let recv_b = itx422::reconstruct_chroma_cfl(&pv_i, &lv, sb_qstep, scan, bs, bs, bd);
-        let mut sse = 0f64;
-        for r in 0..bs {
-            let b = (cy + r) * pcw + cx;
-            for c in 0..bs {
-                let du = up[b + c] - recu_b[r * bs + c];
-                let dv = vp[b + c] - recv_b[r * bs + c];
-                sse += (du * du + dv * dv) as f64;
-            }
-        }
-        let rate: f64 = lu.iter().chain(lv.iter()).map(|&l| l.abs() as f64).sum();
+        let sse = pixel_sse_rounded_block(up, pcw, cy, cx, &recu_b, bs, bs, bs)
+            + pixel_sse_rounded_block(vp, pcw, cy, cx, &recv_b, bs, bs, bs);
+        let rate = coeff_abs_rate_f32(&lu) + coeff_abs_rate_f32(&lv);
         let mode_bits = if m == 0 { 0.0 } else { 2.0 };
-        let cost = sse + lambda * (rate + mode_bits);
+        let cost = sse as f64 + lambda * (rate as f64 + mode_bits);
         if cost < best_cost {
             best_cost = cost;
             best_mode = m;

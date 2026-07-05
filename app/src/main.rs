@@ -50,7 +50,7 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/biddhabrot3_small.png")
+    /*let img = image::open("./assets/biddhabrot3_small.png")
         .unwrap()
         .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
@@ -76,7 +76,7 @@ fn main() {
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
         fs::write("./out.avif", out).unwrap();
-    }
+    }*/
     let img = image::open("./assets/manhattan.png")
         .unwrap()
         // .resize_exact(1600, 900, FilterType::Nearest)
