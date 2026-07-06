@@ -33,7 +33,7 @@ pub(crate) const CDEF_VERY_LARGE: i32 = 0x4000;
 /// Per-direction primary tap offsets (2 taps per direction, mirrored).
 /// `cdef_directions[dir][k]` is a (row, col) offset; the mirrored tap is the
 /// negation. Matches the spec table `Cdef_Directions` (8 directions, 2 taps).
-const CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
+static CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
     [(-1, 1), (-2, 2)],
     [(0, 1), (-1, 2)],
     [(0, 1), (0, 2)],
@@ -45,9 +45,9 @@ const CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
 ];
 
 /// Primary tap weights, selected by `pri_strength & 1` (spec `Cdef_Pri_Taps`).
-const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+static CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 /// Secondary tap weights (spec `Cdef_Sec_Taps`), one row used for all strengths.
-const CDEF_SEC_TAPS: [i32; 2] = [2, 1];
+static CDEF_SEC_TAPS: [i32; 2] = [2, 1];
 
 /// Constrain a difference `diff` between a tap and the centre by `strength` and
 /// `damping` — see [`constrain_spec`]. Thin wrapper kept for readability at the
@@ -188,7 +188,7 @@ pub(crate) fn cdef_filter_8x8(
     damping: i32,
     bd: u8,
 ) {
-    cdef_filter_block(dst, src, stride, x, y, 8, 8, pri, sec, dir, damping, bd);
+    cdef_filter_block(dst, 0, src, stride, x, y, 8, 8, pri, sec, dir, damping, bd);
 }
 
 /// CDEF filter over a `bw` x `bh` block at (x, y). 8x8 for luma and 4:4:4
@@ -198,6 +198,7 @@ pub(crate) fn cdef_filter_8x8(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cdef_filter_block(
     dst: &mut [i32],
+    dst_y0: usize,
     src: &[i32],
     stride: usize,
     x: usize,
@@ -231,7 +232,7 @@ pub(crate) fn cdef_filter_block(
             }
             let centre = src[cy * stride + cx];
             if centre == CDEF_VERY_LARGE {
-                dst[cy * stride + cx] = centre;
+                dst[(cy - dst_y0) * stride + cx] = centre;
                 continue;
             }
             let mut sum = 0i32;
@@ -277,7 +278,7 @@ pub(crate) fn cdef_filter_block(
             if out > max {
                 out = max;
             }
-            dst[cy * stride + cx] = out.clamp(0, maxv);
+            dst[(cy - dst_y0) * stride + cx] = out.clamp(0, maxv);
         }
     }
 }
@@ -298,6 +299,6 @@ fn sample(plane: &[i32], stride: usize, x: i32, y: i32) -> i32 {
 }
 
 /// Candidate primary strengths searched per 64x64 (kept small for speed).
-pub(crate) const PRI_CANDIDATES: [i32; 4] = [0, 1, 2, 4];
+pub(crate) static PRI_CANDIDATES: [i32; 4] = [0, 1, 2, 4];
 /// Candidate secondary strengths (spec values 0,1,2,4).
-pub(crate) const SEC_CANDIDATES: [i32; 3] = [0, 1, 2];
+pub(crate) static SEC_CANDIDATES: [i32; 3] = [0, 1, 2];

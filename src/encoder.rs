@@ -127,6 +127,39 @@ const CR_R: i32 = 4096; // round( 0.5      * 8192)
 const CR_G: i32 = -3430; // round(-0.418688 * 8192)
 const CR_B: i32 = -666; // round(-0.081312 * 8192)
 
+/// Convert RGB rows to three output planes in parallel row bands. `f` maps one
+/// (r, g, b) pixel to the three outputs; planes are zipped per band.
+fn csc_rows_par<T: Pixel + Sync>(
+    pool: &crate::par::Pool,
+    w: usize,
+    rgb: [&[T]; 3],
+    out: [&mut [i32]; 3],
+    f: impl Fn(i32, i32, i32) -> (i32, i32, i32) + Sync,
+) {
+    const BAND: usize = 64; // rows per work item
+    let [o0, o1, o2] = out;
+    let items: Vec<(usize, (&mut [i32], (&mut [i32], &mut [i32])))> = o0
+        .chunks_mut(BAND * w)
+        .zip(o1.chunks_mut(BAND * w).zip(o2.chunks_mut(BAND * w)))
+        .enumerate()
+        .collect();
+    pool.for_each(pool.width(), items, |(bi, (b0, (b1, b2)))| {
+        let base = bi * BAND * w;
+        for (i, ((v0, v1), v2)) in b0
+            .iter_mut()
+            .zip(b1.iter_mut())
+            .zip(b2.iter_mut())
+            .enumerate()
+        {
+            let j = base + i;
+            let (a, b, c) = f(rgb[0][j].to_i32(), rgb[1][j].to_i32(), rgb[2][j].to_i32());
+            *v0 = a;
+            *v1 = b;
+            *v2 = c;
+        }
+    });
+}
+
 impl<T: Pixel> PlanarImage<T> {
     /// Build from interleaved RGB samples (`r,g,b,r,g,b,...`).
     /// AV1 identity matrix mapping: plane0=G, plane1=B, plane2=R. No alpha.
@@ -352,20 +385,21 @@ pub fn encode_still_lossy<T: Pixel>(
     let n = img.planes[0].len();
     let off_q = (off as i32) << Q;
     let mx_i = mx as i32;
+    let pool = crate::par::Pool::new(threads);
     let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
-    for (((((yv, cbv), crv), &rr), &gg), &bb) in y
-        .iter_mut()
-        .zip(cb.iter_mut())
-        .zip(cr.iter_mut())
-        .zip(img.planes[2].iter())
-        .zip(img.planes[0].iter())
-        .zip(img.planes[1].iter())
-    {
-        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
-        *cbv = ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
-        *crv = ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i);
-    }
+    csc_rows_par(
+        &pool,
+        img.width,
+        [&img.planes[2], &img.planes[0], &img.planes[1]],
+        [&mut y, &mut cb, &mut cr],
+        |ri, gi, bi| {
+            (
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
+                ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i),
+                ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i),
+            )
+        },
+    );
     crate::av1_coder::encode_av1_lossy_image_cs(
         base_q_idx,
         bd.bits(),
@@ -375,7 +409,7 @@ pub fn encode_still_lossy<T: Pixel>(
         &cb,
         &cr,
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,
@@ -415,38 +449,44 @@ pub fn encode_still_lossy_422<T: Pixel>(
     let mut fcb_q = vec![0i32; w * h];
     let mut fcr_q = vec![0i32; w * h];
 
-    for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
-        .iter_mut()
-        .zip(fcb_q.iter_mut())
-        .zip(fcr_q.iter_mut())
-        .zip(img.planes[2].iter())
-        .zip(img.planes[0].iter())
-        .zip(img.planes[1].iter())
-    {
-        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
-
-        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
-
-        *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
-        *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
-    }
+    let pool = crate::par::Pool::new(threads);
+    csc_rows_par(
+        &pool,
+        w,
+        [&img.planes[2], &img.planes[0], &img.planes[1]],
+        [&mut y, &mut fcb_q, &mut fcr_q],
+        |ri, gi, bi| {
+            (
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
+                CB_R * ri + CB_G * gi + CB_B * bi + off_q,
+                CR_R * ri + CR_G * gi + CR_B * bi + off_q,
+            )
+        },
+    );
     const HALF_AVG: i32 = 1 << Q;
 
     let (mut cb, mut cr) = (vec![0i32; cw * h], vec![0i32; cw * h]);
 
-    for row in 0..h {
-        for c in 0..cw {
-            let x0 = 2 * c;
-            let x1 = (2 * c + 1).min(w - 1);
-
-            let cb0 = fcb_q[row * w + x0];
-            let cb1 = fcb_q[row * w + x1];
-            let cr0 = fcr_q[row * w + x0];
-            let cr1 = fcr_q[row * w + x1];
-
-            cb[row * cw + c] = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
-            cr[row * cw + c] = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
-        }
+    // Horizontal 2:1 averaging, parallel over disjoint output row bands.
+    {
+        let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
+            .chunks_mut(cw)
+            .zip(cr.chunks_mut(cw))
+            .enumerate()
+            .collect();
+        let (fcb, fcr) = (&fcb_q, &fcr_q);
+        pool.for_each(pool.width(), items, |(row, (cbr, crr))| {
+            for (c, (cb, cr)) in cbr.iter_mut().zip(crr.iter_mut()).enumerate() {
+                let x0 = 2 * c;
+                let x1 = (2 * c + 1).min(w - 1);
+                let cb0 = fcb[row * w + x0];
+                let cb1 = fcb[row * w + x1];
+                let cr0 = fcr[row * w + x0];
+                let cr1 = fcr[row * w + x1];
+                *cb = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
+                *cr = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
+            }
+        });
     }
     crate::av1_coder::encode_av1_lossy_image_422(
         base_q_idx,
@@ -457,7 +497,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
         &cb,
         &cr,
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,
@@ -497,38 +537,45 @@ pub fn encode_still_lossy_420<T: Pixel>(
     let mut fcb_q = vec![0i32; w * h];
     let mut fcr_q = vec![0i32; w * h];
 
-    for (((((yv, fcbv), fcrv), &rr), &gg), &bb) in y
-        .iter_mut()
-        .zip(fcb_q.iter_mut())
-        .zip(fcr_q.iter_mut())
-        .zip(img.planes[2].iter())
-        .zip(img.planes[0].iter())
-        .zip(img.planes[1].iter())
-    {
-        let (ri, gi, bi) = (rr.to_i32(), gg.to_i32(), bb.to_i32());
+    let pool = crate::par::Pool::new(threads);
+    csc_rows_par(
+        &pool,
+        w,
+        [&img.planes[2], &img.planes[0], &img.planes[1]],
+        [&mut y, &mut fcb_q, &mut fcr_q],
+        |ri, gi, bi| {
+            (
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
+                CB_R * ri + CB_G * gi + CB_B * bi + off_q,
+                CR_R * ri + CR_G * gi + CR_B * bi + off_q,
+            )
+        },
+    );
 
-        *yv = ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i);
-        *fcbv = CB_R * ri + CB_G * gi + CB_B * bi + off_q;
-        *fcrv = CR_R * ri + CR_G * gi + CR_B * bi + off_q;
-    }
-
-    const HALF_AVG: i32 = 1 << (Q + 1); // rounding bias for >> (Q+2)
+    const HALF_AVG: i32 = 1 << (Q + 1); // rounding bias for >> (Q + 2)
 
     let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
 
-    for row in 0..ch {
-        let cb_r = &mut cb[row * cw..row * cw + cw];
-        let cr_r = &mut cr[row * cw..row * cw + cw];
-        for (c, (cb, cr)) in cb_r.iter_mut().zip(cr_r.iter_mut()).enumerate() {
-            let (x0, x1) = (2 * c, (2 * c + 1).min(w - 1));
-            let (y0, y1) = (2 * row, (2 * row + 1).min(h - 1));
+    // 2x2 averaging, parallel over disjoint output row bands.
+    {
+        let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
+            .chunks_mut(cw)
+            .zip(cr.chunks_mut(cw))
+            .enumerate()
+            .collect();
+        let (fcb, fcr) = (&fcb_q, &fcr_q);
+        pool.for_each(pool.width(), items, |(row, (cbr, crr))| {
+            for (c, (cb, cr)) in cbr.iter_mut().zip(crr.iter_mut()).enumerate() {
+                let (x0, x1) = (2 * c, (2 * c + 1).min(w - 1));
+                let (y0, y1) = (2 * row, (2 * row + 1).min(h - 1));
 
-            let avg_q =
-                |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
+                let avg_q =
+                    |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
 
-            *cb = ((avg_q(&fcb_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
-            *cr = ((avg_q(&fcr_q) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
-        }
+                *cb = ((avg_q(fcb) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+                *cr = ((avg_q(fcr) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+            }
+        });
     }
     crate::av1_coder::encode_av1_lossy_image_420(
         base_q_idx,
@@ -539,7 +586,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
         &cb,
         &cr,
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,
@@ -804,6 +851,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
+    let pool = crate::par::Pool::new(threads);
     let bytes = crate::av1_coder::encode_av1_lossy_image_cs(
         base_q_idx,
         bit_depth.bits(),
@@ -813,7 +861,7 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
         &to_i(&planar_image.planes[1]),
         &to_i(&planar_image.planes[2]),
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,
@@ -845,6 +893,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
+    let pool = crate::par::Pool::new(threads);
     let bytes = crate::av1_coder::encode_av1_lossy_image_422(
         base_q_idx,
         bit_depth.bits(),
@@ -854,7 +903,7 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
         &to_i(&planar_image.planes[1]),
         &to_i(&planar_image.planes[2]),
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,
@@ -886,6 +935,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
             .map(|v| v.to_i32().clamp(0, maxv))
             .collect::<Vec<i32>>()
     };
+    let pool = crate::par::Pool::new(threads);
     let bytes = crate::av1_coder::encode_av1_lossy_image_420(
         base_q_idx,
         bit_depth.bits(),
@@ -895,7 +945,7 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
         &to_i(&planar_image.planes[1]),
         &to_i(&planar_image.planes[2]),
         color,
-        threads,
+        &pool,
         speed,
         aq,
         vb,

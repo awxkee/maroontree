@@ -28,7 +28,7 @@
  */
 use crate::err::EncodeError;
 
-pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug {
+pub trait Pixel: Copy + Default + PartialEq + Send + Sync + std::fmt::Debug {
     /// Promote a stored sample to the signed working type used by the transform.
     fn to_i32(self) -> i32;
     fn to_f32(self) -> f32;

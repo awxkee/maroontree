@@ -28,7 +28,8 @@
  */
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
+    TxPart, av2_map_quality, encode_lossless, encode_rgb8, encode_rgb10, encode_rgba8,
+    encode_rgba10,
 };
 use std::fs;
 use std::hint::black_box;
@@ -50,26 +51,24 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/biddhabrot3_small.png")
-        .unwrap()
-        .to_rgb8();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
-        BitDepth::Eight,
-        &img,
+        BitDepth::Ten,
+        &img.iter().map(|&p| (p as u16) << 2).collect::<Vec<u16>>(),
     )
     .unwrap();
-    for i in 0..5 {
+    for i in 0..15 {
         let instant = Instant::now();
-        let out = encode_lossless(
+        let out = encode_rgb10(
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(60)
                 .with_cicp(Cicp::srgb_ycbcr())
-                .with_chroma(ChromaFormat::Yuv444)
+                .with_chroma(ChromaFormat::Yuv422)
                 .with_speed(Speed::Medium)
-                .with_threads(10)
+                .with_threads(12)
                 .with_variance_boost(true)
                 .with_cdef(false),
         )

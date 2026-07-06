@@ -180,8 +180,6 @@ impl Dct for Quant {
     }
 }
 
-/// Trellis (RDOQ) forward 8x8: the integer DCT levels plus the unrounded
-/// per-coefficient targets. `.0` is bit-identical to `forward_dct_quant_8x8`.
 pub(crate) fn forward_dct_quant_8x8_t(
     residual: &[i32; 64],
     q: &impl Dct,
@@ -189,13 +187,7 @@ pub(crate) fn forward_dct_quant_8x8_t(
     dct8x8_t(residual, q)
 }
 
-/// `forward_dct_quant_8x8`: orthonormal float DCT (rows then cols), scaled, then
-/// /q (dc_q for the (0,0) coefficient, ac_q otherwise). Output in dav1d order
-/// `cf[u*16+v]`. The scale is calibrated so the round-trip through the exact
-/// integer inverse recovers the residual; only the encoder uses this (recon is
-/// the exact inverse), so its precision does not affect bit-exactness.
 pub(crate) fn forward_dct_quant_16x16(residual: &mut [i32; 256], q: &impl Dct) {
-    // forward_dct_quant_16x16_t(residual, q).0
     dct16x16(residual, q)
 }
 

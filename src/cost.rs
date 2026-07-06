@@ -108,7 +108,6 @@ pub(crate) fn trellis_lambda() -> f64 {
 // existing thresholds were tuned against.
 
 /// libaom's DC-quant-domain KF rd multiplier: `3.3 + 0.0015*q`.
-#[allow(dead_code)]
 #[inline]
 fn def_kf_rd_multiplier(q: f64) -> f64 {
     3.3 + 0.0015 * q
@@ -234,11 +233,24 @@ pub(crate) fn block_rate_bits(cf: &[i32], scan: &[usize]) -> f32 {
 }
 
 /// R-D weight for the intra luma mode search (cost = pixel SSE + lambda * proxy
-/// bits, with `lambda = MODE_LAMBDA0 * ac_q^2` so it tracks the quantizer).
+/// Legacy mode-search lambda scale (`ac_q^2` units); retained as the calibration
+/// reference for `mode_lambda_q` and its tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MODE_LAMBDA0: f64 = 0.02;
+
+/// Calibration folding libaom's rdmult scale onto this crate's (proxy-bits, SSE)
+/// axis, fixed so `mode_lambda_q` matches the legacy `MODE_LAMBDA0*ac_q^2` at the
+/// q=128 reference. Only the *shape* changes, not the reference operating point.
+pub(crate) const MODE_AOM_CALIB: f64 = 0.009005174719460433;
+
+/// Mode-search lambda with libaom's key-frame rdmult *shape*
+/// `dc_q^2 * (3.3 + 0.0015*dc_q)` (av1/encoder/rd.c KF path) instead of the
+/// naive `ac_q^2`. The old law grew ~2x too fast at high qindex, over-dropping
+/// coefficients where libaom keeps them; this tracks libaom's q-dependence so
+/// equal-SSIM decisions match. `dc_q` is the bit-depth-correct DC dequant step.
 #[inline]
-pub(crate) fn mode_lambda() -> f64 {
-    MODE_LAMBDA0
+pub(crate) fn mode_lambda_q(dc_q: f64) -> f64 {
+    MODE_AOM_CALIB * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
 }
 
 #[inline]
@@ -263,3 +275,56 @@ pub(crate) fn mode_signal_bits(m: usize) -> f32 {
     if m == DC_PRED { 0.0 } else { MODE_SIGNAL_BITS }
 }
 pub(crate) const MODE_SIGNAL_BITS: f32 = 30.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quant::{ac_q, dc_q};
+
+    // libaom av1/encoder/rd.c KF path oracle: q=dc_quant, rdmult=q^2*(3.3+0.0015q).
+    fn aom_kf_rdmult(dcq: f64) -> f64 {
+        dcq * dcq * (3.3 + 0.0015 * dcq)
+    }
+
+    #[test]
+    fn mode_lambda_matches_aom_kf_shape() {
+        // The lambda must be proportional to libaom's KF rdmult across the whole
+        // qindex range (single constant), unlike the old ac_q^2 law.
+        let mut ratios = vec![];
+        for q in (16u8..=240).step_by(8) {
+            let dcq = dc_q(q, 8) as f64;
+            let lam = mode_lambda_q(dcq);
+            ratios.push(lam / aom_kf_rdmult(dcq));
+        }
+        let (lo, hi) = (
+            ratios.iter().cloned().fold(f64::MAX, f64::min),
+            ratios.iter().cloned().fold(0.0, f64::max),
+        );
+        assert!(
+            (hi - lo) / hi < 1e-9,
+            "lambda not proportional to aom rdmult"
+        );
+    }
+
+    #[test]
+    fn reference_q128_preserved() {
+        // Calibration keeps the q=128 operating point equal to the legacy law.
+        let acq = ac_q(128, 8) as f64;
+        let dcq = dc_q(128, 8) as f64;
+        let legacy = MODE_LAMBDA0 * acq * acq;
+        assert!((mode_lambda_q(dcq) - legacy).abs() / legacy < 1e-6);
+    }
+
+    #[test]
+    fn old_law_diverged_from_aom() {
+        // Guard: the old ac_q^2 law was NOT proportional to aom (that was the bug).
+        let r = |q: u8| {
+            let acq = ac_q(q, 8) as f64;
+            (MODE_LAMBDA0 * acq * acq) / aom_kf_rdmult(dc_q(q, 8) as f64)
+        };
+        assert!(
+            r(224) / r(32) > 1.5,
+            "expected old law to over-weight high q"
+        );
+    }
+}

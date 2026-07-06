@@ -46,6 +46,7 @@ use crate::obu::{
     wrap_obu_frame, wrap_obu_frame_split,
 };
 use crate::odec::OdEcEncoder;
+use crate::par::Pool;
 #[cfg(test)]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -390,7 +391,7 @@ impl Cdfs {
             // like every other symbol via OdEcEncoder::encode_symbol.
             delta_q: icdf(&[28160, 32120, 32677]),
             // Default LrWiener (use_wiener) CDF (AV1 Default_Wiener_Restore_Cdf).
-            wiener_restore: icdf(&[11570]),
+            wiener_restore: wiener_restore_icdf(),
         }
     }
 }
@@ -1136,6 +1137,26 @@ impl<'a> LossyTile<'a> {
     /// search (SSE + lambda*bits) for both options so the decision reflects
     /// 4x4's per-quadrant mode diversity, not just a DC estimate. Returns
     /// `true` to keep the 8x8 whole. Split is offered only for 4:2:0/4:4:4.
+    /// Mode-search lambda: libaom KF rdmult q-shape (`cost::mode_lambda_q`) times
+    /// the SSIMULACRA2 rdmult weight, AQ-correct via the active `self.quant`.
+    #[inline]
+    fn mlam(&self) -> f64 {
+        crate::cost::mode_lambda_q(self.quant.dc_q() as f64) * self.tune_weight()
+    }
+
+    /// As [`Self::mlam`] but for chroma planes (uses `self.cquant`).
+    #[inline]
+    fn mlam_c(&self) -> f64 {
+        crate::cost::mode_lambda_q(self.cquant.dc_q() as f64) * self.tune_weight()
+    }
+
+    /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
+    #[inline]
+    fn tune_weight(&self) -> f64 {
+        let tune = TUNE_SSIMULACRA2.load(std::sync::atomic::Ordering::Relaxed);
+        crate::cost::mode_lambda_weight(self.base_q_idx, tune)
+    }
+
     fn prefer_8x8_none(&self, x8: usize, y8: usize) -> bool {
         if self.mono || self.ss422 {
             return true;
@@ -1144,7 +1165,7 @@ impl<'a> LossyTile<'a> {
         let maxv = (1 << self.bd) - 1;
         let (dcq, acq) = (self.quant.dc_q() as f64, self.quant.ac_q() as f64);
         let lam = trellis_lambda();
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let modes = if self.speed.reduced_modes() {
             fast_nd_modes()
         } else {
@@ -1288,7 +1309,6 @@ impl<'a> LossyTile<'a> {
             return Part16::Split;
         }
         let (px, py) = (x8 * 8, y8 * 8);
-        let acq = self.quant.ac_q() as f64;
 
         let horz_on = HORZ_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
             && self.quant.ac_q() >= AC_Q_HORZ_MIN;
@@ -1314,20 +1334,10 @@ impl<'a> LossyTile<'a> {
             }
         }
 
-        // --- R-D on the surviving candidates ---
         // Anchor the perceptual R-D scale ONCE at the parent 16x16 region and use
-        // it for every candidate (NONE, the four SPLIT children, HORZ, and the
-        // partition-signal term). This guarantees all costs share one lambda axis
-        // so the min-selection is a valid R-D decision. (Previously each candidate
-        // recomputed its own scale on its own sub-region, mixing axes.)
+        // it for every candidate so all costs share one lambda axis.
         let prdo = self.perceptual_rd_scale(px, py, 16);
-        // libaom SSIMULACRA2 rdmult weight (qindex-dependent, 1.0 when the tune
-        // is off). Folded into the shared per-decision scale so it applies
-        // uniformly to NONE/SPLIT/HORZ and the partition-signal term — keeping
-        // every candidate on one lambda axis (see note above).
-        let tune = TUNE_SSIMULACRA2.load(std::sync::atomic::Ordering::Relaxed);
-        let prdo = prdo * crate::cost::mode_lambda_weight(self.base_q_idx, tune);
-        let part_lam = mode_lambda() * acq * acq * prdo;
+        let part_lam = self.mlam() * prdo;
         let rd_none = self.rd_cost_square(px, py, 16, false, false, prdo);
         let mut rd_split = rate_cost(part_lam, SPLIT_SIGNAL_BITS);
         for (sx, sy) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
@@ -1426,49 +1436,19 @@ impl<'a> LossyTile<'a> {
         let Some(unit) = self.wiener else {
             return;
         };
-        const UNIT: usize = 64;
-        const MI: usize = 4;
-        let count_units = |frame: usize| -> usize { (1).max((frame + (UNIT >> 1)) / UNIT) };
-        let unit_rows = count_units(self.frame_h);
-        let unit_cols = count_units(self.frame_w);
-        // Frame-absolute superblock position in 4x4 MI units (luma).
-        let r = (self.frame_y0 + sb_y) / MI;
-        let c = (self.frame_x0 + sb_x) / MI;
-        let sb_mi = UNIT / MI; // 16
-        let urs = (r * MI).div_ceil(UNIT);
-        let ure = unit_rows.min(((r + sb_mi) * MI).div_ceil(UNIT));
-        let ucs = (c * MI).div_ceil(UNIT);
-        let uce = unit_cols.min(((c + sb_mi) * MI).div_ceil(UNIT));
-        for _ur in urs..ure {
-            for _uc in ucs..uce {
-                self.emit_lr_unit(&unit);
-            }
-        }
-    }
-
-    /// Emit one `read_lr_unit` for a RESTORE_WIENER luma unit (spec 5.11.58).
-    fn emit_lr_unit(&mut self, unit: &crate::wiener::WienerUnit) {
-        use crate::wiener::{WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MIN};
-        // use_wiener: always 1 (we filter every unit with the global filter).
-        self.enc.encode_symbol(1, &mut self.cdfs.wiener_restore);
-        // read_wiener_filter: vertical taps (pass 0) then horizontal (pass 1),
-        // each signed-subexp coded with per-tap k against the running reference,
-        // which then updates to the coded value.
-        for axis in 0..2 {
-            let (taps, refs) = if axis == 0 {
-                (unit.v, &mut self.lr_ref_v)
-            } else {
-                (unit.h, &mut self.lr_ref_h)
-            };
-            for j in 0..3usize {
-                let lo = WIENER_TAPS_MIN[j];
-                let hi = WIENER_TAPS_MAX[j] + 1; // exclusive high
-                let k = WIENER_TAPS_K[j] as u32;
-                self.enc
-                    .encode_signed_subexp_with_ref(taps[j], lo, hi, k, refs[j]);
-                refs[j] = taps[j];
-            }
-        }
+        emit_lr_sb_syms(
+            &mut self.enc,
+            &mut self.cdfs.wiener_restore,
+            &mut self.lr_ref_v,
+            &mut self.lr_ref_h,
+            &unit,
+            self.frame_x0,
+            self.frame_y0,
+            self.frame_w,
+            self.frame_h,
+            sb_x,
+            sb_y,
+        );
     }
 
     fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
@@ -1621,7 +1601,7 @@ impl<'a> LossyTile<'a> {
         let acq = self.quant.ac_q() as f64;
         let dcq = self.quant.dc_q() as f64;
         let lam = trellis_lambda();
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         // `prdo` is the perceptual R-D scale of the PARENT partition decision,
         // passed in so every candidate (PARTITION_NONE, the four SPLIT children,
         // HORZ) is measured on ONE lambda axis. Previously each call recomputed
@@ -1799,7 +1779,7 @@ impl<'a> LossyTile<'a> {
         // Parent-anchored perceptual scale (see `rd_cost_square`): the HORZ
         // candidate must share the same lambda as NONE/SPLIT for the comparison
         // to be a valid R-D ordering.
-        let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
+        let (lam, mlam) = (lam * prdo, self.mlam() * prdo);
         let maxv = (1 << self.bd) - 1;
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS); // HORZ costs a partition symbol like SPLIT
         for half in 0..2 {
@@ -1834,7 +1814,7 @@ impl<'a> LossyTile<'a> {
         let acq = self.quant.ac_q() as f64;
         let dcq = self.quant.dc_q() as f64;
         let lam = trellis_lambda();
-        let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
+        let (lam, mlam) = (lam * prdo, self.mlam() * prdo);
         let maxv = (1 << self.bd) - 1;
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS);
         for half in 0..2 {
@@ -2381,7 +2361,7 @@ impl<'a> LossyTile<'a> {
             trellis_lambda(),
         );
         let dcs16 = self.dc_sign_ctx_16(0, px / 4, py / 4);
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let prdo = self.perceptual_rd_scale(px, py, 16);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         let mut best_mode = DC_PRED;
@@ -2930,7 +2910,7 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f64,
                 trellis_lambda(),
             );
-            let mlam = mode_lambda() * acq * acq;
+            let mlam = self.mlam();
             let mut cfl_ccf = [[0i32; 256]; 2];
             let mut cfl_a = [0i32; 2];
             let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f32; 2]);
@@ -3001,7 +2981,7 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f64,
                 trellis_lambda(),
             );
-            let mlam = mode_lambda() * acq * acq;
+            let mlam = self.mlam();
             let maxv = (1 << self.bd) - 1;
             // Reconstructed R-D of the CURRENT chroma choice (DC or CfL), using the
             // coeffs/prediction already selected above.
@@ -3234,7 +3214,7 @@ impl<'a> LossyTile<'a> {
             }
         }
         // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits, summed over U+V).
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let mut rr_dc = [[0i32; 64]; 2];
         let mut dc_total = 0f64;
         for ci in 0..2 {
@@ -3410,7 +3390,7 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f64,
             trellis_lambda(),
         );
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let mut ccf = [[0i32; 128]; 2];
         let mut cpred = [0i32; 2];
         // Per-pixel chroma prediction (DC broadcast, or CfL dc+alpha*ac).
@@ -3612,7 +3592,7 @@ impl<'a> LossyTile<'a> {
             // above row, left column and above-left corner, so top-right/
             // bottom-left availability is irrelevant; the tx-type is signalled
             // (DCT_DCT), so the mode choice never desyncs.
-            let mlam = mode_lambda() * acq * acq;
+            let mlam = self.mlam();
             let modes = fast_nd_modes();
             let mut best_mode = DC_PRED;
             let mut lpred = [0i32; 16];
@@ -3908,7 +3888,7 @@ impl<'a> LossyTile<'a> {
             self.quant.ac_q() as f64,
             trellis_lambda(),
         );
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         let mut best_mode = DC_PRED;
@@ -5349,7 +5329,7 @@ impl<'a> LossyTile<'a> {
     fn rd_cost_rect32(&self, px: usize, py: usize, vert: bool, prdo: f64) -> f64 {
         let (acq, dcq) = (self.quant.ac_q() as f64, self.quant.dc_q() as f64);
         let lam = trellis_lambda();
-        let (lam, mlam) = (lam * prdo, mode_lambda() * acq * acq * prdo);
+        let (lam, mlam) = (lam * prdo, self.mlam() * prdo);
         let maxv = (1 << self.bd) - 1;
         let (lw, lh) = if vert { (16usize, 32usize) } else { (32, 16) };
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS);
@@ -5454,7 +5434,7 @@ impl<'a> LossyTile<'a> {
     fn rd_cost_none32(&self, px: usize, py: usize, prdo: f64) -> f64 {
         let (acq, dcq) = (self.quant.ac_q() as f64, self.quant.dc_q() as f64);
         let lam = trellis_lambda() * prdo;
-        let mlam = mode_lambda() * acq * acq * prdo;
+        let mlam = self.mlam() * prdo;
         let maxv = (1 << self.bd) - 1;
         let dc = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
         let mut resid = [0i32; 1024];
@@ -5482,7 +5462,7 @@ impl<'a> LossyTile<'a> {
     fn rd_cost_split32(&self, px: usize, py: usize, prdo: f64) -> f64 {
         let (acq, dcq) = (self.quant.ac_q() as f64, self.quant.dc_q() as f64);
         let lam = trellis_lambda() * prdo;
-        let mlam = mode_lambda() * acq * acq * prdo;
+        let mlam = self.mlam() * prdo;
         let maxv = (1 << self.bd) - 1;
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * 4.0f32);
         for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
@@ -5559,7 +5539,7 @@ impl<'a> LossyTile<'a> {
             self.quant.ac_q() as f64,
             trellis_lambda(),
         );
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let prdo = self.perceptual_rd_scale(px, py, 32);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         // luma intra mode search (non-directional + directional; the TX_32X32
@@ -6269,7 +6249,7 @@ impl<'a> LossyTile<'a> {
         let mut cfl_pred = [[0i32; 1024]; 2];
         let mut cfl_a = [0i32; 2];
         let (mut dc_cost, mut cfl_cost) = ([0f64; 2], [0f64; 2]);
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         {
             let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
             let mut luma_rec = [0i32; 1024];
@@ -6346,7 +6326,7 @@ impl<'a> LossyTile<'a> {
             let dcq2 = self.cquant.dc_q() as f64;
             let acq2 = self.cquant.ac_q() as f64;
             let lam2 = trellis_lambda();
-            let mlam = mode_lambda() * acq2 * acq2;
+            let mlam = self.mlam_c();
             let maxv = (1 << self.bd) - 1;
             // R-D of the current winner (DC or CfL), residual already in `cf_use`.
             let mut cur_total = 0f64;
@@ -6570,7 +6550,7 @@ impl<'a> LossyTile<'a> {
         // decoder's derived chroma txtp. Offered at every quality; the Lagrangian
         // R-D decision below selects it only when it truly wins.
         // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits over U+V).
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let mut rr_dc = [[0i32; 256]; 2];
         let mut dc_total = 0f64;
         for ci in 0..2 {
@@ -6755,7 +6735,7 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f64,
             trellis_lambda(),
         );
-        let mlam = mode_lambda() * acq * acq;
+        let mlam = self.mlam();
         let mut ccf = [[0i32; 512]; 2];
         let mut cpred = [0i32; 2];
         let mut cpred_px = [[0i32; 512]; 2];
@@ -7483,6 +7463,75 @@ fn stitch_plane(
     }
 }
 
+/// Default (untrained) inverse CDF for the `use_wiener` flag, shared by tile
+/// entropy init and the LR replay path.
+pub(crate) fn wiener_restore_icdf() -> Vec<u16> {
+    crate::tables::icdf(&[11570])
+}
+
+/// `read_lr` symbols owed by the superblock at tile-local `(sb_x, sb_y)` (spec
+/// 5.11.57); geometry rationale on `LossyTile::emit_lr_sb`.
+#[allow(clippy::too_many_arguments)]
+fn emit_lr_sb_syms(
+    enc: &mut crate::odec::OdEcEncoder,
+    wr_cdf: &mut [u16],
+    lr_ref_v: &mut [i32; 3],
+    lr_ref_h: &mut [i32; 3],
+    unit: &crate::wiener::WienerUnit,
+    frame_x0: usize,
+    frame_y0: usize,
+    frame_w: usize,
+    frame_h: usize,
+    sb_x: usize,
+    sb_y: usize,
+) {
+    const UNIT: usize = 64;
+    const MI: usize = 4;
+    let count_units = |frame: usize| -> usize { (1).max((frame + (UNIT >> 1)) / UNIT) };
+    let unit_rows = count_units(frame_h);
+    let unit_cols = count_units(frame_w);
+    // Frame-absolute superblock position in 4x4 MI units (luma).
+    let r = (frame_y0 + sb_y) / MI;
+    let c = (frame_x0 + sb_x) / MI;
+    let sb_mi = UNIT / MI; // 16
+    let urs = (r * MI).div_ceil(UNIT);
+    let ure = unit_rows.min(((r + sb_mi) * MI).div_ceil(UNIT));
+    let ucs = (c * MI).div_ceil(UNIT);
+    let uce = unit_cols.min(((c + sb_mi) * MI).div_ceil(UNIT));
+    for _ur in urs..ure {
+        for _uc in ucs..uce {
+            emit_lr_unit_syms(enc, wr_cdf, lr_ref_v, lr_ref_h, unit);
+        }
+    }
+}
+
+/// One `read_lr_unit` for a RESTORE_WIENER luma unit (spec 5.11.58): `use_wiener`,
+/// then v/h taps signed-subexp coded against (and updating) the running refs.
+fn emit_lr_unit_syms(
+    enc: &mut crate::odec::OdEcEncoder,
+    wr_cdf: &mut [u16],
+    lr_ref_v: &mut [i32; 3],
+    lr_ref_h: &mut [i32; 3],
+    unit: &crate::wiener::WienerUnit,
+) {
+    use crate::wiener::{WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MIN};
+    enc.encode_symbol(1, wr_cdf);
+    for axis in 0..2 {
+        let (taps, refs) = if axis == 0 {
+            (unit.v, &mut *lr_ref_v)
+        } else {
+            (unit.h, &mut *lr_ref_h)
+        };
+        for j in 0..3usize {
+            let lo = WIENER_TAPS_MIN[j];
+            let hi = WIENER_TAPS_MAX[j] + 1; // exclusive high
+            let k = WIENER_TAPS_K[j] as u32;
+            enc.encode_signed_subexp_with_ref(taps[j], lo, hi, k, refs[j]);
+            refs[j] = taps[j];
+        }
+    }
+}
+
 /// Pixel rectangle of one tile, in both luma and (subsampled) chroma coords.
 #[derive(Clone, Copy)]
 struct TileRect {
@@ -7501,6 +7550,7 @@ struct TileRect {
 /// produced on a worker thread and moved back to the caller.
 struct TileOut {
     payload: Vec<u8>,
+    trace: Option<Box<crate::odec::SymbolTrace>>,
     recon: [Vec<i32>; 3],
     skip8: Vec<bool>, // per-8x8 luma-unit skip flag (tile-local, row-major over ceil(tw/8))
     blk4: Vec<u8>,    // per-4x4 luma block WIDTH map (tile-local), for frame-level deblocking
@@ -7525,7 +7575,7 @@ fn encode_one_tile(
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
-    wiener: Option<crate::wiener::WienerUnit>,
+    record: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -7550,7 +7600,6 @@ fn encode_one_tile(
         }
     }
     .with_speed(speed);
-    tile.wiener = wiener;
     // Loop restoration is frame-relative: record this tile's frame-absolute luma
     // origin and the full frame luma size so `read_lr` is computed in frame
     // coordinates regardless of tiling.
@@ -7564,8 +7613,14 @@ fn encode_one_tile(
         let ref_act = tile_ref_activity(&tile.src[0], tile.w, tile.w, tile.h);
         tile.enable_aq(base_q_idx, ref_act, vb);
     }
+    if record {
+        tile.enc.begin_trace();
+    }
     for sb_y in (0..r.th).step_by(64) {
         for sb_x in (0..r.tw).step_by(64) {
+            // The mark sits exactly where a replay would interleave the LR
+            // symbols owed by this superblock (`emit_lr_sb` is a no-op here).
+            tile.enc.trace_mark();
             tile.emit_lr_sb(sb_x, sb_y);
             tile.aq_begin_sb(sb_x, sb_y);
             tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
@@ -7582,9 +7637,11 @@ fn encode_one_tile(
     let skip8 = tile.skip8;
     let blk4 = tile.blk4;
     let blk4h = tile.blk4h;
+    let trace = tile.enc.take_trace();
     let payload = tile.enc.done();
     TileOut {
         payload,
+        trace,
         recon: tile.recon,
         skip8,
         blk4,
@@ -7592,9 +7649,46 @@ fn encode_one_tile(
     }
 }
 
+/// Replay a tile's recorded symbols with the Wiener `read_lr` symbols interleaved.
+/// LR touches only its own CDF + raw bits, so this is byte-identical to a re-encode.
+fn replay_tile_with_lr(
+    r: &TileRect,
+    trace: &crate::odec::SymbolTrace,
+    unit: &crate::wiener::WienerUnit,
+    frame_w: usize,
+    frame_h: usize,
+) -> Vec<u8> {
+    let mut enc = crate::odec::OdEcEncoder::new();
+    let mut wr_cdf = wiener_restore_icdf();
+    let mut lr_ref_v = crate::wiener::WIENER_TAPS_MID;
+    let mut lr_ref_h = crate::wiener::WIENER_TAPS_MID;
+    let mut i = 0usize;
+    for sb_y in (0..r.th).step_by(64) {
+        for sb_x in (0..r.tw).step_by(64) {
+            emit_lr_sb_syms(
+                &mut enc,
+                &mut wr_cdf,
+                &mut lr_ref_v,
+                &mut lr_ref_h,
+                unit,
+                r.x0,
+                r.y0,
+                frame_w,
+                frame_h,
+                sb_x,
+                sb_y,
+            );
+            enc.replay(trace.sb_ops(i));
+            i += 1;
+        }
+    }
+    debug_assert_eq!(i, trace.sb_count(), "trace/SB iteration mismatch");
+    enc.done()
+}
+
 /// Resolve the requested thread count: `0` => all available cores (fallback 1),
 /// otherwise the value as-is. The caller still caps this at the tile count.
-fn resolve_threads(threads: usize) -> usize {
+pub(crate) fn resolve_threads(threads: usize) -> usize {
     if threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -7602,46 +7696,6 @@ fn resolve_threads(threads: usize) -> usize {
     } else {
         threads
     }
-}
-
-fn par_map_indexed<T, F>(nthreads: usize, n: usize, f: F) -> Vec<T>
-where
-    T: Send,
-    F: Fn(usize) -> T + Sync,
-{
-    if nthreads <= 1 || n <= 1 {
-        return (0..n).map(f).collect();
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
-        let mut got: Vec<(usize, T)> = Vec::new();
-        loop {
-            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if i >= n {
-                break got;
-            }
-            got.push((i, f(i)));
-        }
-    };
-    let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
-        let spawned = nthreads.min(n) - 1;
-        let handles: Vec<_> = (0..spawned).map(|_| scope.spawn(work)).collect();
-        std::iter::once(work())
-            .chain(
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("worker panicked")),
-            )
-            .collect()
-    });
-    let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(n).collect();
-    for (i, v) in parts.into_iter().flatten() {
-        slots[i] = Some(v);
-    }
-    slots
-        .into_iter()
-        .map(|s| s.expect("index produced"))
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -7654,7 +7708,7 @@ fn encode_lossy_tilegroup(
     sub_x: usize,
     sub_y: usize,
     mono: bool,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
@@ -7673,7 +7727,7 @@ fn encode_lossy_tilegroup(
     // Aim for ~one tile per worker so small frames can be paralleled too.
     // `threads == 1` -> target 1 -> spec-minimum tiling (single tile for small
     // frames, byte-identical to the untiled output).
-    let want = resolve_threads(threads);
+    let want = pool.width();
     let plan = plan_tiling(sb_cols, sb_rows, want);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
@@ -7705,30 +7759,24 @@ fn encode_lossy_tilegroup(
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
+    let mut __t = std::time::Instant::now();
 
-    let encode_all = |wiener_unit: Option<crate::wiener::WienerUnit>| -> Vec<TileOut> {
-        par_map_indexed(nthreads, n, |i| {
-            encode_one_tile(
-                base_q_idx,
-                bd,
-                w8,
-                h8,
-                cw8,
-                sub_x,
-                sub_y,
-                mono,
-                src,
-                &rects[i],
-                speed,
-                aq,
-                vb,
-                wiener_unit,
-            )
-        })
-    };
-    let outs: Vec<TileOut> = encode_all(None);
+    // Recording the symbol trace lets a winning Wiener unit be signalled by a
+    // cheap replay instead of a second full encode of every tile.
+    let record = wiener_on && base_q_idx != 0;
+    let mut outs: Vec<TileOut> = pool.map_indexed(nthreads, n, |i| {
+        encode_one_tile(
+            base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb, record,
+        )
+    });
 
-    // Stitch reconstructions and collect payloads (raster order, serial).
+    let mut payloads: Vec<Vec<u8>> = outs
+        .iter_mut()
+        .map(|o| std::mem::take(&mut o.payload))
+        .collect();
+    let traces: Vec<_> = outs.iter_mut().map(|o| o.trace.take()).collect();
+
+    // Small per-8x8 / per-4x4 maps: stitched serially (they are tiny).
     // Monochrome has only a luma plane; chroma recon stays empty.
     let mut recon = if mono {
         [vec![0i32; w8 * h8], Vec::new(), Vec::new()]
@@ -7739,7 +7787,6 @@ fn encode_lossy_tilegroup(
             vec![0i32; cw8 * ch8],
         ]
     };
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n);
     let sb8w = w8.div_ceil(8);
     let sb8h = h8.div_ceil(8);
     let mut skip8 = vec![true; sb8w * sb8h];
@@ -7749,8 +7796,7 @@ fn encode_lossy_tilegroup(
     let nr4f = h8 / 4;
     let mut blk4f = vec![0u8; nc4f * nr4f];
     let mut blk4hf = vec![0u8; nc4f * nr4f];
-    for (r, out) in rects.iter().zip(outs) {
-        // stitch this tile's per-8x8 skip map into the frame map
+    for (r, out) in rects.iter().zip(outs.iter()) {
         let tsb8w = r.tw.div_ceil(8);
         let (ox8, oy8) = (r.x0 / 8, r.y0 / 8);
         for ty in 0..r.th.div_ceil(8) {
@@ -7761,8 +7807,6 @@ fn encode_lossy_tilegroup(
                 }
             }
         }
-        stitch_plane(&mut recon[0], w8, r.x0, r.y0, &out.recon[0], r.tw, r.th);
-        // stitch this tile's per-4x4 luma block-size map into the frame map
         let tnc4 = r.tw / 4;
         let (ox4, oy4) = (r.x0 / 4, r.y0 / 4);
         for ty in 0..(r.th / 4) {
@@ -7774,28 +7818,49 @@ fn encode_lossy_tilegroup(
                 }
             }
         }
-        if !mono {
-            stitch_plane(
-                &mut recon[1],
-                cw8,
-                r.cx0,
-                r.cy0,
-                &out.recon[1],
-                r.ctw,
-                r.cth,
-            );
-            stitch_plane(
-                &mut recon[2],
-                cw8,
-                r.cx0,
-                r.cy0,
-                &out.recon[2],
-                r.ctw,
-                r.cth,
-            );
-        }
-        payloads.push(out.payload);
     }
+
+    // Pixel planes: every tile row owns a disjoint horizontal band of each
+    // plane, so (plane, tile row) pairs stitch in parallel.
+    let ncols = col_starts.len();
+    {
+        let mut items: Vec<(usize, usize, &mut [i32])> = Vec::new();
+        for (pl, plane) in recon.iter_mut().enumerate() {
+            if plane.is_empty() {
+                continue;
+            }
+            let pw = if pl == 0 { w8 } else { cw8 };
+            let mut rest = &mut plane[..];
+            let mut consumed = 0usize;
+            for ti in 0..row_starts.len() {
+                let r0 = &rects[ti * ncols];
+                let (py0, pth) = if pl == 0 {
+                    (r0.y0, r0.th)
+                } else {
+                    (r0.cy0, r0.cth)
+                };
+                debug_assert_eq!(consumed, py0 * pw);
+                let (band, r2) = std::mem::take(&mut rest).split_at_mut(pth * pw);
+                rest = r2;
+                consumed += band.len();
+                items.push((pl, ti, band));
+            }
+        }
+        pool.for_each(nthreads, items, |(pl, ti, band)| {
+            for (r, out) in rects[ti * ncols..(ti + 1) * ncols]
+                .iter()
+                .zip(&outs[ti * ncols..(ti + 1) * ncols])
+            {
+                let (pw, px0, ptw, pth) = if pl == 0 {
+                    (w8, r.x0, r.tw, r.th)
+                } else {
+                    (cw8, r.cx0, r.ctw, r.cth)
+                };
+                stitch_plane(band, pw, px0, 0, &out.recon[pl], ptw, pth);
+            }
+        });
+    }
+    drop(outs);
 
     // Frame-level in-loop deblocking filter, applied once on the stitched
     // reconstruction so that inter-tile edges are filtered exactly as the
@@ -7810,6 +7875,7 @@ fn encode_lossy_tilegroup(
     let cdef = if cdef_on && base_q_idx != 0 {
         frame_cdef(
             &mut recon, src, &skip8, sb8w, w8, h8, cw8, ch8, sub_x, sub_y, mono, base_q_idx, bd,
+            pool,
         )
     } else {
         None
@@ -7817,13 +7883,16 @@ fn encode_lossy_tilegroup(
 
     // Frame-level luma Wiener loop restoration
     let lr = if wiener_on && base_q_idx != 0 {
-        if let Some(unit) = frame_wiener_search(&recon[0], &src[0], w8, h8, bd) {
-            // Re-encode tiles emitting the LR syntax (recon is unchanged because
-            // LR is a post-filter; only the payload gains the read_lr symbols).
-            let outs2 = encode_all(Some(unit));
-            payloads = outs2.into_iter().map(|o| o.payload).collect();
+        if let Some(unit) = frame_wiener_search(&recon[0], &src[0], w8, h8, bd, pool) {
+            // Signal the LR syntax by replaying each tile's recorded symbols
+            // with the read_lr symbols interleaved (byte-identical to a full
+            // re-encode; recon is unchanged because LR is a post-filter).
+            payloads = pool.map_indexed(nthreads, n, |i| {
+                let trace = traces[i].as_deref().expect("trace recorded when wiener_on");
+                replay_tile_with_lr(&rects[i], trace, &unit, w8, h8)
+            });
             // Apply the Wiener filter to the luma reconstruction in place.
-            apply_frame_wiener(&mut recon[0], w8, h8, &unit, bd);
+            apply_frame_wiener(&mut recon[0], w8, h8, &unit, bd, pool);
             Some(crate::obu::LrParams { luma_wiener: true })
         } else {
             None
@@ -7852,12 +7921,42 @@ fn apply_frame_wiener(
     h: usize,
     unit: &crate::wiener::WienerUnit,
     bd: u8,
+    pool: &Pool,
 ) {
-    use crate::wiener::{WienerKernel, wiener_filter_plane};
+    use crate::wiener::{WienerKernel, wiener_filter_rect, wiener_stripes};
     let hk = WienerKernel::from_coded(unit.h);
     let vk = WienerKernel::from_coded(unit.v);
     let src = plane.to_vec();
-    wiener_filter_plane(plane, &src, w, h, &hk, &vk, bd);
+    // Each restoration stripe reads only the snapshot and writes its own rows,
+    // so stripes filter in parallel with identical output to the serial pass.
+    let mut items: Vec<(usize, usize, &mut [i32])> = Vec::new();
+    let mut rest = &mut plane[..];
+    for (ytop, ybot) in wiener_stripes(h) {
+        let (band, r2) = std::mem::take(&mut rest).split_at_mut((ybot - ytop) * w);
+        rest = r2;
+        items.push((ytop, ybot, band));
+    }
+    pool.for_each(pool.width(), items, |(ytop, ybot, band)| {
+        let ctop = ytop.saturating_sub(2);
+        let cbot = (ybot + 2).min(h) - 1;
+        wiener_filter_rect(
+            band,
+            ytop,
+            &src,
+            w,
+            w,
+            h,
+            0,
+            ytop,
+            w,
+            ybot - ytop,
+            ctop,
+            cbot,
+            &hk,
+            &vk,
+            bd,
+        );
+    });
 }
 
 fn frame_wiener_search(
@@ -7866,6 +7965,7 @@ fn frame_wiener_search(
     w: usize,
     h: usize,
     bd: u8,
+    pool: &Pool,
 ) -> Option<crate::wiener::WienerUnit> {
     use crate::wiener::{WienerKernel, wiener_filter_plane};
     let sse = |a: &[i32]| -> i64 {
@@ -7881,23 +7981,31 @@ fn frame_wiener_search(
     // [t0,t1,t2]); the identity is implicit via `base`. These span gentle to
     // moderate smoothing within the spec tap ranges.
     const CANDS: [[i32; 3]; 4] = [[0, 0, 1], [-1, 2, 2], [0, 1, 3], [1, -3, 5]];
+    let cands: Vec<(&[i32; 3], &[i32; 3])> = CANDS
+        .iter()
+        .flat_map(|h_taps| CANDS.iter().map(move |v_taps| (h_taps, v_taps)))
+        .collect();
+    // Each candidate filters into its own buffer; the reduce below walks the
+    // original (h, v) order so ties break exactly as the sequential loop did.
+    let want = pool.width().min(cands.len());
+    let sses: Vec<i64> = pool.map_indexed(want, cands.len(), |i| {
+        let (h_taps, v_taps) = cands[i];
+        let hk = WienerKernel::from_coded(*h_taps);
+        let vk = WienerKernel::from_coded(*v_taps);
+        let mut tmp = vec![0i32; w * h];
+        wiener_filter_plane(&mut tmp, recon, w, h, &hk, &vk, bd);
+        sse(&tmp)
+    });
     let mut best: Option<(i64, crate::wiener::WienerUnit)> = None;
-    let mut tmp = recon.to_vec();
-    for &h_taps in &CANDS {
-        for &v_taps in &CANDS {
-            let hk = WienerKernel::from_coded(h_taps);
-            let vk = WienerKernel::from_coded(v_taps);
-            wiener_filter_plane(&mut tmp, recon, w, h, &hk, &vk, bd);
-            let s = sse(&tmp);
-            if s < base && best.as_ref().is_none_or(|b| s < b.0) {
-                best = Some((
-                    s,
-                    crate::wiener::WienerUnit {
-                        h: h_taps,
-                        v: v_taps,
-                    },
-                ));
-            }
+    for (&(h_taps, v_taps), &s) in cands.iter().zip(sses.iter()) {
+        if s < base && best.as_ref().is_none_or(|b| s < b.0) {
+            best = Some((
+                s,
+                crate::wiener::WienerUnit {
+                    h: *h_taps,
+                    v: *v_taps,
+                },
+            ));
         }
     }
     best.map(|b| b.1)
@@ -7919,6 +8027,7 @@ fn frame_cdef(
     mono: bool,
     base_q_idx: u8,
     bd: u8,
+    pool: &Pool,
 ) -> Option<crate::obu::CdefParams> {
     use crate::cdef;
     let signalled_damping = cdef_damping(base_q_idx) as i32;
@@ -7928,14 +8037,22 @@ fn frame_cdef(
     let nby = h8.div_ceil(8);
     let mut ldirs = vec![0usize; nbx * nby];
     let mut lvars = vec![0i32; nbx * nby];
-    for by in 0..nby {
-        for bx in 0..nbx {
-            if bx * 8 < w8 && by * 8 < h8 {
-                let (d, v) = cdef::cdef_direction(&recon[0], w8, bx * 8, by * 8, bd);
-                ldirs[by * nbx + bx] = d;
-                lvars[by * nbx + bx] = v;
+    {
+        let luma = &recon[0];
+        let items: Vec<(usize, (&mut [usize], &mut [i32]))> = ldirs
+            .chunks_mut(nbx)
+            .zip(lvars.chunks_mut(nbx))
+            .enumerate()
+            .collect();
+        pool.for_each(pool.width(), items, |(by, (drow, vrow))| {
+            for bx in 0..nbx {
+                if bx * 8 < w8 && by * 8 < h8 {
+                    let (d, v) = cdef::cdef_direction(luma, w8, bx * 8, by * 8, bd);
+                    drow[bx] = d;
+                    vrow[bx] = v;
+                }
             }
-        }
+        });
     }
 
     // Per-8x8 luma skip map: CDEF is NOT applied to skip blocks (the decoder
@@ -7962,6 +8079,7 @@ fn frame_cdef(
         bd,
         luma_margin,
         1000,
+        pool,
     );
 
     // Chroma reuses the LUMA direction (remapped via uv_dir) and damping-1, and
@@ -7992,6 +8110,7 @@ fn frame_cdef(
             sub_y,
             chroma_damping,
             bd,
+            pool,
         )
     };
 
@@ -8012,6 +8131,7 @@ fn frame_cdef(
         ys,
         damping,
         bd,
+        pool,
     );
     // Apply chroma (U, V) at sub-block granularity with remapped luma directions.
     if !mono && (up != 0 || us != 0) {
@@ -8033,6 +8153,7 @@ fn frame_cdef(
                 us,
                 chroma_damping,
                 bd,
+                pool,
             );
         }
     }
@@ -8058,6 +8179,7 @@ fn cdef_search_plane(
     bd: u8,
     margin_num: i64,
     margin_den: i64,
+    pool: &Pool,
 ) -> (i32, i32) {
     use crate::cdef;
     // First measure the no-filter SSE baseline.
@@ -8115,8 +8237,8 @@ fn cdef_search_plane(
 
     // Spread candidates across workers (caller included) with work stealing;
     // closures borrow `recon`, `src`, `dirs`, `vars`, `skip` immutably, no locks.
-    let want = resolve_threads(0).clamp(1, candidates.len().max(1));
-    let sses: Vec<i64> = par_map_indexed(want, candidates.len(), |i| {
+    let want = pool.width().min(candidates.len().max(1));
+    let sses: Vec<i64> = pool.map_indexed(want, candidates.len(), |i| {
         let (pri, sec) = candidates[i];
         eval(pri, sec)
     });
@@ -8156,7 +8278,7 @@ fn plane_block_sse(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, y: usize)
 fn apply_cdef_plane(
     plane: &mut [i32],
     w: usize,
-    h: usize,
+    _h: usize,
     dirs: &[usize],
     vars: &[i32],
     skip: &[bool],
@@ -8165,10 +8287,15 @@ fn apply_cdef_plane(
     sec: i32,
     damping: i32,
     bd: u8,
+    pool: &Pool,
 ) {
     use crate::cdef;
     let snapshot = plane.to_vec();
-    for y in (0..h).step_by(8) {
+    // Every 8x8 reads the pre-CDEF snapshot and writes only its own rows, so
+    // 8-row bands filter in parallel with identical output to the serial pass.
+    let items: Vec<(usize, &mut [i32])> = plane.chunks_mut(8 * w).enumerate().collect();
+    pool.for_each(pool.width(), items, |(bi8, band)| {
+        let y = bi8 * 8;
         for x in (0..w).step_by(8) {
             let bxi = x / 8;
             let byi = y / 8;
@@ -8183,12 +8310,15 @@ fn apply_cdef_plane(
             let var = vars[bi];
             // adjust_pri on the bit-depth-shifted strength (see search above).
             let apri = cdef::adjust_pri(pri << (bd - 8), var);
-            cdef::cdef_filter_8x8(
-                plane,
+            cdef::cdef_filter_block(
+                band,
+                y,
                 &snapshot,
                 w,
                 x,
                 y,
+                8,
+                8,
                 apri,
                 sec << (bd - 8),
                 dir,
@@ -8196,7 +8326,7 @@ fn apply_cdef_plane(
                 bd,
             );
         }
-    }
+    });
 }
 
 /// Per-luma-8x8 chroma CDEF. For each non-skip luma 8x8 block, the covering
@@ -8222,26 +8352,34 @@ fn apply_cdef_chroma(
     sec: i32,
     damping: i32,
     bd: u8,
+    pool: &Pool,
 ) {
     use crate::cdef;
     let snapshot = plane.to_vec();
     let cbw = 8 >> sub_x; // chroma sub-block width per luma 8x8
     let cbh = 8 >> sub_y;
-    for lby in 0..nby {
+    // One band per luma block-row (cbh chroma rows): disjoint writes, shared
+    // pre-CDEF snapshot reads — identical output to the serial pass.
+    let items: Vec<(usize, &mut [i32])> = plane.chunks_mut(cbh * cw).enumerate().collect();
+    pool.for_each(pool.width(), items, |(lby, band)| {
+        if lby >= nby {
+            return;
+        }
+        let cy = (lby * 8) >> sub_y;
         for lbx in 0..nbx {
             // Skip if the covering luma 8x8 is a skip block.
             if skip8.get(lby * sb8w + lbx).copied().unwrap_or(true) {
                 continue;
             }
             let cx = (lbx * 8) >> sub_x;
-            let cy = (lby * 8) >> sub_y;
             if cx >= cw || cy >= ch {
                 continue;
             }
             let ld = ldirs.get(lby * nbx + lbx).copied().unwrap_or(0);
             let dir = uv_dir[ld];
             cdef::cdef_filter_block(
-                plane,
+                band,
+                cy,
                 &snapshot,
                 cw,
                 cx,
@@ -8255,7 +8393,7 @@ fn apply_cdef_chroma(
                 bd,
             );
         }
-    }
+    });
 }
 
 /// Chroma CDEF strength search mirroring `apply_cdef_chroma`: it evaluates each
@@ -8277,6 +8415,7 @@ fn cdef_search_chroma(
     sub_y: usize,
     damping: i32,
     bd: u8,
+    pool: &Pool,
 ) -> (i32, i32) {
     use crate::cdef;
     let cbw = 8 >> sub_x;
@@ -8313,6 +8452,7 @@ fn cdef_search_chroma(
                 let dir = uv_dir[ld];
                 cdef::cdef_filter_block(
                     &mut tmp,
+                    0,
                     recon,
                     cw,
                     cx,
@@ -8336,8 +8476,8 @@ fn cdef_search_chroma(
         sse
     };
 
-    let want = resolve_threads(0).clamp(1, candidates.len().max(1));
-    let sses: Vec<i64> = par_map_indexed(want, candidates.len(), |i| {
+    let want = pool.width().min(candidates.len().max(1));
+    let sses: Vec<i64> = pool.map_indexed(want, candidates.len(), |i| {
         let (pri, sec) = candidates[i];
         eval(pri, sec)
     });
@@ -8509,7 +8649,8 @@ pub(crate) fn encode_lossless_frame_obus(
     src: &[Vec<i16>; 3],
     threads: usize,
 ) -> Vec<u8> {
-    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, src, threads);
+    let pool = Pool::new(threads);
+    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, src, &pool);
     assemble_lossless_frame_obus(&plan, &tilegroup)
 }
 
@@ -8531,11 +8672,11 @@ fn encode_lossless_tilegroup(
     w8: usize,
     h8: usize,
     src: &[Vec<i16>; 3],
-    threads: usize,
+    pool: &Pool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
-    let want = resolve_threads(threads);
+    let want = pool.width();
     let plan = plan_tiling(sb_cols, sb_rows, want);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
@@ -8555,7 +8696,7 @@ fn encode_lossless_tilegroup(
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
-    let payloads: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+    let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
         encode_one_lossless_tile(bd, w8, src, &rects[i])
     });
 
@@ -8604,11 +8745,11 @@ fn encode_lossless_mono_tilegroup(
     w8: usize,
     h8: usize,
     luma: &[i16],
-    threads: usize,
+    pool: &Pool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
-    let want = resolve_threads(threads);
+    let want = pool.width();
     let plan = plan_tiling(sb_cols, sb_rows, want);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
@@ -8627,7 +8768,7 @@ fn encode_lossless_mono_tilegroup(
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
-    let payloads: Vec<Vec<u8>> = par_map_indexed(nthreads, n, |i| {
+    let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
         encode_one_lossless_tile_mono(bd, w8, luma, &rects[i])
     });
 
@@ -8666,7 +8807,8 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     luma: &[i16],
     threads: usize,
 ) -> Vec<u8> {
-    let (tilegroup, plan) = encode_lossless_mono_tilegroup(bd, w8, h8, luma, threads);
+    let pool = Pool::new(threads);
+    let (tilegroup, plan) = encode_lossless_mono_tilegroup(bd, w8, h8, luma, &pool);
     assemble_lossless_mono_frame_obus(&plan, &tilegroup)
 }
 
@@ -8706,7 +8848,7 @@ pub(crate) fn encode_av1_lossy_image_cs(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
@@ -8714,7 +8856,7 @@ pub(crate) fn encode_av1_lossy_image_cs(
     wiener: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_cs_recon(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, &vb, cdef, wiener,
+        base_q_idx, bd, w, h, luma, u, v, color, pool, speed, aq, &vb, cdef, wiener,
     )
     .0
 }
@@ -8731,7 +8873,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
@@ -8747,7 +8889,7 @@ pub(crate) fn encode_av1_lossy_image_cs_recon(
         pad_to_mult8(v, w, h, w8, h8),
     ];
     let (payload, recon, plan, cdefp, lrp) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 0, 0, false, threads, speed, aq, vb, cdef, wiener,
+        base_q_idx, bd, w8, h8, &src, 0, 0, false, pool, speed, aq, vb, cdef, wiener,
     );
     let profile = if bd == 12 { 2 } else { 1 };
     let mut bytes = Vec::new();
@@ -8777,7 +8919,7 @@ pub(crate) fn encode_av1_lossy_image_422(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
@@ -8785,7 +8927,7 @@ pub(crate) fn encode_av1_lossy_image_422(
     wiener: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_422_recon(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef, wiener,
+        base_q_idx, bd, w, h, luma, u, v, color, pool, speed, aq, vb, cdef, wiener,
     )
     .0
 }
@@ -8800,7 +8942,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
@@ -8818,7 +8960,7 @@ pub(crate) fn encode_av1_lossy_image_422_recon(
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, h, cw8, h8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
     let (payload, recon, plan, cdefp, lrp) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 0, false, threads, speed, aq, &vb, cdef, wiener,
+        base_q_idx, bd, w8, h8, &src, 1, 0, false, pool, speed, aq, &vb, cdef, wiener,
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());
@@ -8851,7 +8993,7 @@ pub(crate) fn encode_av1_lossy_image_420(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
@@ -8859,7 +9001,7 @@ pub(crate) fn encode_av1_lossy_image_420(
     wiener: bool,
 ) -> Vec<u8> {
     encode_av1_lossy_image_420_recon(
-        base_q_idx, bd, w, h, luma, u, v, color, threads, speed, aq, vb, cdef, wiener,
+        base_q_idx, bd, w, h, luma, u, v, color, pool, speed, aq, vb, cdef, wiener,
     )
     .0
 }
@@ -8874,7 +9016,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon(
     u: &[i32],
     v: &[i32],
     color: Option<&crate::color::Cicp>,
-    threads: usize,
+    pool: &Pool,
     speed: Speed,
     aq: bool,
     vb: VarianceBoost,
@@ -8892,7 +9034,7 @@ pub(crate) fn encode_av1_lossy_image_420_recon(
     let pad_c = |p: &[i32]| -> Vec<i32> { pad_to_mult8(p, cw, ch, cw8, ch8) };
     let src = [luma_p, pad_c(u), pad_c(v)];
     let (payload, recon, plan, cdefp, lrp) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 1, 1, false, threads, speed, aq, &vb, cdef, wiener,
+        base_q_idx, bd, w8, h8, &src, 1, 1, false, pool, speed, aq, &vb, cdef, wiener,
     );
     let profile = if bd == 12 { 2 } else { 0 };
     let mut bytes = Vec::new();
@@ -8953,8 +9095,9 @@ pub(crate) fn encode_av1_mono_image_recon(
     assert!(w > 0 && h > 0, "width/height must be non-zero");
     let (w8, h8) = (align8(w), align8(h));
     let src = [pad_to_mult8(luma, w, h, w8, h8), Vec::new(), Vec::new()];
+    let pool = Pool::new(threads);
     let (payload, recon, plan, cdefp, lrp) = encode_lossy_tilegroup(
-        base_q_idx, bd, w8, h8, &src, 0, 0, true, threads, speed, aq, &vb, cdef, wiener,
+        base_q_idx, bd, w8, h8, &src, 0, 0, true, &pool, speed, aq, &vb, cdef, wiener,
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&temporal_delimiter());

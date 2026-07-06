@@ -59,6 +59,7 @@ mod msac_enc;
 mod neon;
 mod obu;
 mod odec;
+mod par;
 mod pixel;
 mod quant;
 mod rangecoder;

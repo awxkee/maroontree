@@ -31,9 +31,13 @@ use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
 use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
 
+/// Trellis RD lambda on libaom's KF rdmult shape `dc_q^2*(3.3+0.0015*dc_q)`
+/// (av1/encoder/txb_rdopt.c uses the frame DC-quant rdmult), calibrated to the
+/// legacy `TRELLIS_LAMBDA0*ac_q^2*2` at q=128.
+const TRELLIS_AOM_CALIB: f64 = 0.045025873597302174;
 #[inline]
-fn trellis_lambda_scale() -> f64 {
-    2.0
+fn trellis_lambda_aom(dc_q: f64, _ac_q: f64) -> f64 {
+    TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -55,7 +59,7 @@ pub(crate) fn trellis_optimize_ctx(
         return;
     }
     let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q * trellis_lambda_scale();
+    let lambda = trellis_lambda_aom(dc_q, ac_q);
     let log2w = w.trailing_zeros() as usize;
     let stride = w;
     // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
@@ -421,7 +425,7 @@ pub(crate) fn trellis_optimize(
         return; // trellis disabled
     }
     let n = scan.len();
-    let lambda = lambda0 * ac_q * ac_q * trellis_lambda_scale();
+    let lambda = trellis_lambda_aom(dc_q, ac_q);
     let (dc_q2, ac_q2) = (dc_q * dc_q, ac_q * ac_q);
     // Distortion of coding coeff `rc` at magnitude `lev`: dq^2*(|tf|-lev)^2.
     let d = |rc: usize, lev: i32| {

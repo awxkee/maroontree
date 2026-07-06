@@ -98,11 +98,47 @@ pub(crate) fn inverse_recenter(r: u32, v: u32) -> u32 {
     }
 }
 
+/// Raw `store` ops with per-superblock `mark`s; replaying through a fresh
+/// encoder reproduces the exact bytes while any recorded (fl, fh, nms) holds.
+#[derive(Default)]
+pub(crate) struct SymbolTrace {
+    ops: Vec<u64>, // fl:[24..41) fh:[8..24) nms:[0..8)
+    marks: Vec<u32>,
+}
+
+impl SymbolTrace {
+    #[inline]
+    fn push(&mut self, fl: u32, fh: u32, nms: u32) {
+        debug_assert!(fl <= 32768 && fh < 65536 && nms < 256);
+        self.ops
+            .push(((fl as u64) << 24) | ((fh as u64) << 8) | nms as u64);
+    }
+
+    pub(crate) fn mark(&mut self) {
+        self.marks.push(self.ops.len() as u32);
+    }
+
+    pub(crate) fn sb_count(&self) -> usize {
+        self.marks.len()
+    }
+
+    /// Ops of superblock `i`: from its mark up to the next mark (or the end).
+    pub(crate) fn sb_ops(&self, i: usize) -> &[u64] {
+        let a = self.marks[i] as usize;
+        let b = self
+            .marks
+            .get(i + 1)
+            .map_or(self.ops.len(), |&m| m as usize);
+        &self.ops[a..b]
+    }
+}
+
 pub(crate) struct OdEcEncoder {
     low: u32,
     rng: u16,
     cnt: i16,
     precarry: Vec<u16>,
+    trace: Option<Box<SymbolTrace>>,
 }
 
 impl Default for OdEcEncoder {
@@ -118,6 +154,34 @@ impl OdEcEncoder {
             rng: 0x8000,
             cnt: -9,
             precarry: Vec::new(),
+            trace: None,
+        }
+    }
+
+    /// Start recording every subsequent `store` into a fresh trace.
+    pub(crate) fn begin_trace(&mut self) {
+        self.trace = Some(Box::default());
+    }
+
+    /// Record a superblock boundary in the active trace (no-op otherwise).
+    pub(crate) fn trace_mark(&mut self) {
+        if let Some(t) = self.trace.as_mut() {
+            t.mark();
+        }
+    }
+
+    pub(crate) fn take_trace(&mut self) -> Option<Box<SymbolTrace>> {
+        self.trace.take()
+    }
+
+    /// Re-emit previously recorded ops through this encoder.
+    pub(crate) fn replay(&mut self, ops: &[u64]) {
+        for &op in ops {
+            self.store(
+                (op >> 24) as u32,
+                ((op >> 8) & 0xffff) as u32,
+                (op & 0xff) as u32,
+            );
         }
     }
 
@@ -136,6 +200,9 @@ impl OdEcEncoder {
 
     #[inline]
     fn store(&mut self, fl: u32, fh: u32, nms: u32) {
+        if let Some(t) = self.trace.as_mut() {
+            t.push(fl, fh, nms);
+        }
         let (l, r) = self.lr_compute(fl, fh, nms);
         let mut low = l + self.low;
         let mut c = self.cnt;

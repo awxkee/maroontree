@@ -1006,10 +1006,6 @@ pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128],
     quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// 16x8 (wide): residual `resid[row*16+col]` (8 tall x 16 wide). DCT-8 vertical,
-/// DCT-16 horizontal. The mirror of `dct8x16_coeffs`. Output ordering
-/// `out[fx*8 + fy]` (fy = vertical freq 0..8, fx = horizontal freq 0..16) pairs
-/// with `idct_dequant_16x8` which reads `coeff[row + col*8]`.
 fn dct16x8_coeffs(input: &[i32; 128]) -> [i32; 128] {
     // Pass 1: DCT-8 down each of the 16 columns (vertical).
     let mut tmp = [0i32; 128]; // tmp[fy*16 + col], fy = vertical freq 0..8
