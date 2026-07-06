@@ -29,5 +29,10 @@
 mod cost;
 mod fdct;
 
-pub(crate) use cost::{coeff_abs_rate_f32_neon, coeff_rate_f32_neon};
+pub(crate) use cost::{
+    cfl_sse_i32_neon, coeff_abs_rate_f32_neon, coeff_rate_f32_neon, pixel_sse_f32_neon,
+    pixel_sse_f32_u16_neon, pixel_sse_rounded_const_neon, pixel_sse_rounded_neon, sad_f32_neon,
+    sad_u8_neon, satd_f32_neon, scaled_residual_f32_neon, sum_sumsq_f32_neon,
+    weighted_pixel_sse_f32_neon,
+};
 pub(crate) use fdct::fdct_rect_neon;

@@ -116,7 +116,6 @@ impl ByteWriter {
         }
     }
 
-    /// Consume the writer and return the packed bytes.
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -129,6 +128,13 @@ pub(crate) struct RangeEncoder {
     pub(crate) range: u32,
     count: i32,
     output: Vec<u16>,
+    /// SB-relative (16x16) luma-mi coded mask, mirroring the decoder's
+    /// `xd->is_mi_coded`. The interior-split leaf loop resets it per SB and marks
+    /// each leaf's mi as it is coded; MHCCP reads it to resolve top-right /
+    /// bottom-left reference availability in the true (VERT-then-HORZ) coding
+    /// order. Left all-zero on paths that do not maintain it (whole-SB / edge
+    /// walks), where MHCCP's prev-SB-row/col special cases suffice.
+    pub(crate) sb_coded: [u8; 256],
     /// Coefficient-CDF q-context = get_q_ctx(base_q_idx). Selects the default
     /// CDF band avmdec loads (0:q<=90, 1:91..140, 2:141..190, 3:>=191).
     /// Defaults to 1 so legacy q120 paths are unchanged.
@@ -153,6 +159,8 @@ pub(crate) struct RangeEncoder {
     pub(crate) ccso_pending: bool,
     pub(crate) ccso_grid: Vec<u8>,
     pub(crate) ccso_grid_v: Vec<u8>,
+    /// Final recon planes (Y,U,V as f32) captured for the video DPB; empty for still.
+    pub(crate) recon: Vec<Vec<f32>>,
     pub(crate) ccso_cols: usize,
     pub(crate) ccso_sb_rc: (usize, usize),
     /// Derived CCSO U-plane band offsets (raw `ccso_offset` values) + params,
@@ -160,6 +168,36 @@ pub(crate) struct RangeEncoder {
     /// header is built. `None` when CCSO is off.
     pub(crate) ccso_u_result: Option<crate::av2::ccso::PlaneResult>,
     pub(crate) ccso_v_result: Option<crate::av2::ccso::PlaneResult>,
+    /// Frame-level CDEF strength `(y_str, uv_str, damping)` chosen by the
+    /// post-reconstruction search, or `None` when no strength beat "off".
+    /// Authoritative over the header default when the search ran.
+    pub(crate) cdef_result: Option<(u8, u8, u8)>,
+    /// Per-block CDEF emission state (pass 2). `cdef_nb` is nb_cdef_strengths;
+    /// per-SB emission is active only when it is >= 2. `cdef_grid[r*cols+c]` is the
+    /// chosen strength index for the CDEF unit (SB) at (row, col): 0 = off, 1 = the
+    /// active strength. `cdef_pending`/`cdef_sb_rc` mirror the CCSO deferral so the
+    /// index0 symbol is emitted once per SB at its first coded block.
+    pub(crate) cdef_pending: bool,
+    pub(crate) cdef_sb_rc: (usize, usize),
+    pub(crate) cdef_cols: usize,
+    pub(crate) cdef_grid: Vec<u8>,
+    pub(crate) cdef_nb: usize,
+    /// Pass-1 CDEF decision (strengths + per-SB grid) derived from the
+    /// reconstruction, handed to the pass-2 emit. `None` when CDEF stays off.
+    pub(crate) cdef_decided: Option<crate::av2::cdef_est::CdefDecision>,
+    /// MHCCP fit cached by the chroma-mode *preset* pass (which decides + emits the
+    /// mode flag before the luma residual) so the chroma *leaf* encode can reuse the
+    /// identical predictor instead of re-running the 3-direction filter fit. Keyed
+    /// by leaf `(y, x, w, h)`; taken (one-shot) by the matching leaf, else the leaf
+    /// re-fits. `preset` and `leaf` feed the fit identical inputs, so reusing is
+    /// bit-exact — and it removes the fragile "both searches agree" dependency.
+    pub(crate) mhccp_cache: Option<(
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<crate::av2::cfl::CflChoice>,
+    )>,
     /// Decision-pass outputs (Phase 3): the chosen edge filter + per-SB grid for
     /// each plane, and the SB column count, handed to the emit pass.
     pub(crate) ccso_decided_u: Option<(crate::av2::ccso::CcsoEdgeResult, Vec<u8>)>,
@@ -174,6 +212,10 @@ pub(crate) struct RangeEncoder {
     /// resolved joint-sign, per-plane magnitude indices and alpha-cdf contexts.
     pub(crate) cfl_ctx: usize,
     pub(crate) cfl_use: bool,
+    /// y-mode index context for the next intra luma mode emit: the decoder's
+    /// get_y_mode_idx_ctx = count of directional above-right/bottom-left
+    /// neighbor modes (0..=2). Set per block by the encoders.
+    pub(crate) y_ctx: usize,
     pub(crate) cfl_signaled: bool,
     pub(crate) cfl_js: u8,
     pub(crate) cfl_mag_u: u8,
@@ -194,7 +236,7 @@ pub(crate) struct RangeEncoder {
     pub(crate) mhccp_use: bool,
     /// True while coding leaves of an interior chroma-motivated square split. MHCCP in
     /// these 32x32 leaves is not yet bit-exact against the reference decoder (the implicit
-    /// luma-neighbour fetch differs for an interior split node), so it is suppressed there;
+    /// luma-neighbor fetch differs for an interior split node), so it is suppressed there;
     /// the split's quality gain comes from the 32x32 transform, not from MHCCP.
     pub(crate) in_interior_split: bool,
     pub(crate) mhccp_dir: u8,
@@ -205,6 +247,14 @@ pub(crate) struct RangeEncoder {
     pub(crate) uv_mode: usize,
     /// Per-tile mutable CDF working copies.
     pub(crate) cdf_state: Option<Box<CdfState>>,
+    /// Inter tile: emit intra_inter=0 before each block's mode-info. ctx set per block.
+    pub(crate) inter_tile: bool,
+    pub(crate) inter_txb: bool, // route TX32 txb_skip to inter plane
+    pub(crate) intra_inter_ctx: usize,
+    /// Discard all output: `normalize`/`normalize_bypass` become no-ops. Used by the
+    /// SB-wavefront decide (Capture) pass, whose bytes are thrown away — only the
+    /// serial Replay emits the real bitstream. Skips range coding + `output` growth.
+    pub(crate) sink: bool,
 }
 
 impl RangeEncoder {
@@ -214,6 +264,7 @@ impl RangeEncoder {
             range: 0x8000,
             count: -9,
             output: vec![],
+            sb_coded: [0u8; 256],
             qc: 1,
             delta_q_present: false,
             delta_q_signaled: 0,
@@ -222,17 +273,27 @@ impl RangeEncoder {
             ccso_v_enable: false,
             ccso_pending: false,
             ccso_grid: Vec::new(),
+            recon: Vec::new(),
             ccso_grid_v: Vec::new(),
             ccso_cols: 0,
             ccso_sb_rc: (0, 0),
             ccso_u_result: None,
             ccso_v_result: None,
+            cdef_result: None,
+            cdef_pending: false,
+            cdef_sb_rc: (0, 0),
+            cdef_cols: 0,
+            cdef_grid: Vec::new(),
+            cdef_nb: 1,
+            cdef_decided: None,
+            mhccp_cache: None,
             ccso_decided_u: None,
             ccso_decided_v: None,
             ccso_sb_cols_out: 0,
             cfl: false,
             cfl_ctx: 0,
             cfl_use: false,
+            y_ctx: 0,
             cfl_signaled: false,
             cfl_js: 0,
             cfl_mag_u: 0,
@@ -251,6 +312,10 @@ impl RangeEncoder {
             mhccp_size_group: 0,
             uv_mode: 0,
             cdf_state: None,
+            inter_tile: false,
+            inter_txb: false,
+            intra_inter_ctx: 0,
+            sink: false,
         }
     }
 
@@ -260,7 +325,108 @@ impl RangeEncoder {
         self.cdf_state = Some(Box::new(CdfState::new(qc)));
     }
 
+    /// Non-mutating ideal arithmetic-code length for one symbol in an inverse
+    /// CDF. `nsyms` excludes the adaptation metadata stored after the CDF
+    /// boundaries.
+    #[inline]
+    fn symbol_bits(cdf: &[u16], symbol: usize, nsyms: usize) -> f32 {
+        debug_assert!(symbol < nsyms);
+        let hi = if symbol == 0 {
+            32768i32
+        } else {
+            cdf[symbol - 1] as i32
+        };
+        let lo = if symbol + 1 < nsyms {
+            cdf[symbol] as i32
+        } else {
+            0
+        };
+        let probability = (hi - lo).max(1) as f32 / 32768.0;
+        -probability.log2()
+    }
+
+    /// Estimate the syntax rate from the tile's current adaptive CDFs without
+    /// advancing either the range coder or the adaptation state. The constants
+    /// are neutral fallbacks for non-adaptive callers; video tiles use the live
+    /// CDF state.
+    pub(crate) fn estimate_intra_inter_bits(&self, val: usize) -> f32 {
+        if !self.inter_tile {
+            return 0.0;
+        }
+        self.cdf_state.as_ref().map_or(1.0, |cs| {
+            Self::symbol_bits(&cs.intra_inter[self.intra_inter_ctx], val, 2)
+        })
+    }
+
+    pub(crate) fn estimate_skip_txfm_bits(&self, ctx: usize, val: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.skip_txfm_blk[ctx], val, 2))
+    }
+
+    pub(crate) fn estimate_inter_mode_bits(&self, ctx: usize, mode: usize) -> f32 {
+        self.cdf_state.as_ref().map_or(3.0f32.log2(), |cs| {
+            Self::symbol_bits(&cs.inter_single_mode[ctx], mode, 3)
+        })
+    }
+
+    pub(crate) fn estimate_drl_bits(&self, ctx: usize, bit: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.drl[ctx], bit, 2))
+    }
+
+    pub(crate) fn estimate_mvd_shell_set_bits(&self, bit: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.mvd_shell_set, bit, 2))
+    }
+
+    pub(crate) fn estimate_mvd_shell_class_bits(&self, set: usize, class: usize) -> f32 {
+        self.cdf_state.as_ref().map_or(3.0, |cs| {
+            let cdf = if set == 0 {
+                &cs.mvd_shell_class0
+            } else {
+                &cs.mvd_shell_class1
+            };
+            Self::symbol_bits(cdf, class, 8)
+        })
+    }
+
+    pub(crate) fn estimate_mvd_offset_low_bits(&self, ctx: usize, bit: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.mvd_offset_low[ctx], bit, 2))
+    }
+
+    pub(crate) fn estimate_mvd_offset_class2_bits(&self, bit: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.mvd_offset_class2, bit, 2))
+    }
+
+    pub(crate) fn estimate_mvd_offset_other_bits(&self, idx: usize, bit: usize) -> f32 {
+        self.cdf_state.as_ref().map_or(1.0, |cs| {
+            Self::symbol_bits(&cs.mvd_offset_other[idx], bit, 2)
+        })
+    }
+
+    pub(crate) fn estimate_mvd_col_greater_bits(&self, ctx: usize, bit: usize) -> f32 {
+        self.cdf_state.as_ref().map_or(1.0, |cs| {
+            Self::symbol_bits(&cs.mvd_col_greater[ctx], bit, 2)
+        })
+    }
+
+    pub(crate) fn estimate_mvd_col_index_bits(&self, ctx: usize, bit: usize) -> f32 {
+        self.cdf_state
+            .as_ref()
+            .map_or(1.0, |cs| Self::symbol_bits(&cs.mvd_col_index[ctx], bit, 2))
+    }
+
     fn normalize(&mut self, mut low: u64, range: u32) {
+        if self.sink {
+            return;
+        }
         let base_count = self.count;
         let shift = 16 - (32 - range.leading_zeros()) as i32;
         let mut remaining = base_count + shift;
@@ -288,7 +454,275 @@ impl RangeEncoder {
     }
 
     /// Encode symbol `s` against an inverse-CDF table covering `nsyms` symbols.
+    /// Emit intra_inter=0 (intra) for inter tiles, then adapt CDF. No-op otherwise.
+    pub(crate) fn emit_intra_inter(&mut self) {
+        self.emit_intra_inter_val(0);
+    }
+
+    /// Emit intra_inter flag: 0=intra, 1=inter. No-op outside inter tiles.
+    pub(crate) fn emit_intra_inter_val(&mut self, val: usize) {
+        if !self.inter_tile {
+            return;
+        }
+        let ctx = self.intra_inter_ctx;
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.intra_inter[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                val,
+                1,
+            );
+        }
+    }
+
+    /// Emit a single-ref inter mode symbol (NEARMV=0, GLOBALMV=1, NEWMV=2).
+    pub(crate) fn emit_inter_single_mode(&mut self, ctx: usize, mode: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.inter_single_mode[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                mode,
+                2, // nsyms_mt = 3-symbol alphabet
+            );
+        }
+    }
+
+    /// Emit DRL bit (drl_cdf[0][ctx], idx 0). bit=0 selects candidate 0.
+    pub(crate) fn emit_drl(&mut self, ctx: usize, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.drl[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit,
+                1,
+            );
+        }
+    }
+
+    // ---- adaptive MVD (QTR_PEL) — mirror AVM read_mv CDFs -------------------
+    /// True if adaptive cdf_state is active (MVD must use adaptive path).
+    pub(crate) fn mvd_adaptive(&self) -> bool {
+        self.cdf_state.is_some()
+    }
+    pub(crate) fn mvd_shell_set(&mut self, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_shell_set,
+                bit,
+                1,
+            );
+        }
+    }
+    pub(crate) fn mvd_shell_class0(&mut self, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_shell_class0,
+                s,
+                7,
+            );
+        }
+    }
+    pub(crate) fn mvd_shell_class1(&mut self, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_shell_class1,
+                s,
+                7,
+            );
+        }
+    }
+    pub(crate) fn mvd_offset_low(&mut self, ctx: usize, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_offset_low[ctx],
+                bit,
+                1,
+            );
+        }
+    }
+    pub(crate) fn mvd_offset_class2(&mut self, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_offset_class2,
+                bit,
+                1,
+            );
+        }
+    }
+    pub(crate) fn mvd_offset_other(&mut self, bit_idx: usize, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_offset_other[bit_idx],
+                bit,
+                1,
+            );
+        }
+    }
+    pub(crate) fn mvd_col_greater(&mut self, ctx: usize, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_col_greater[ctx],
+                bit,
+                1,
+            );
+        }
+    }
+    pub(crate) fn mvd_col_index(&mut self, ctx: usize, bit: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.mvd_col_index[ctx],
+                bit,
+                1,
+            );
+        }
+    }
+
+    /// Emit block-level skip_txfm (inter blocks); ctx 0..5.
+    pub(crate) fn emit_skip_txfm(&mut self, ctx: usize, val: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.skip_txfm_blk[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                val,
+                1,
+            );
+        }
+    }
+
+    /// Emit inter tx_type (set 3, flat 2-way). idx 0=IDTX, 1=DCT_DCT. eob_ctx 0-2.
+    pub(crate) fn emit_inter_tx_type(&mut self, eob_ctx: usize, idx: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.inter_ext_tx3[eob_ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                idx,
+                1,
+            );
+        }
+    }
+
+    /// Emit DCT_DCT for a TX16 inter transform. AV2 signals this through the
+    /// eset=2 split alphabet: bank 0 followed by symbol 3 in the 8-way bank.
+    pub(crate) fn emit_inter_tx16_dct(&mut self, eob_ctx: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.inter_tx16_set[eob_ctx],
+                0,
+                1,
+            );
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.inter_tx16_idx[eob_ctx],
+                3,
+                7,
+            );
+        } else {
+            const SET: [u32; 3] = [11933, 2048, 3911];
+            const IDX: [[u16; 7]; 3] = [
+                [31628, 31043, 30444, 18115, 13696, 9150, 4659],
+                [32710, 32507, 32181, 451, 212, 142, 60],
+                [15364, 15099, 14365, 8716, 6375, 4262, 2092],
+            ];
+            self.encode_bool(SET[eob_ctx], 0);
+            self.sym_static(&IDX[eob_ctx], 3, 7);
+        }
+    }
+
+    /// Emit inter 64x64 tx do_partition (0=none, 1=split).
+    pub(crate) fn emit_tx_do_partition(&mut self, val: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_do_partition;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                val,
+                1,
+            );
+        }
+    }
+
+    /// Emit inter 64x64 4-way tx partition type (SPLIT=0), 7-sym alphabet.
+    pub(crate) fn emit_tx_part_type(&mut self, ptype: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.tx_part_type;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                ptype,
+                6, // nsyms_mt for 7-sym alphabet
+            );
+        }
+    }
+
     pub(crate) fn encode_symbol(&mut self, icdf: &[u16], s: usize, nsyms: usize) {
+        if self.sink {
+            return;
+        }
         let range = self.range;
         let scaled_range = range >> 8;
         let min_prob = &MIN_PROB[nsyms - 1];
@@ -305,6 +739,9 @@ impl RangeEncoder {
     /// Encode an escape (last) symbol against `cdf` extended with a trailing 0,
     /// using a stack buffer instead of allocating (equivalent to with_escape()).
     pub(crate) fn encode_symbol_esc(&mut self, cdf: &[u16], s: usize, nsyms: usize) {
+        if self.sink {
+            return;
+        }
         let mut buf = [0u16; 16];
         let n = cdf.len();
         buf[..n].copy_from_slice(cdf);
@@ -313,6 +750,9 @@ impl RangeEncoder {
 
     /// Encode a single adaptive boolean with CDF `cdf` (probability of `0`).
     pub(crate) fn encode_bool(&mut self, cdf: u32, bit: u32) {
+        if self.sink {
+            return;
+        }
         let range = self.range;
         let split = (((range >> 8) * (((cdf >> 7) << 4) + 8)) >> 7) << 3;
         let (low, range) = if bit != 0 {
@@ -324,6 +764,9 @@ impl RangeEncoder {
     }
 
     fn normalize_bypass(&mut self, mut low: u64, range: u32, bypass_bits: i32) {
+        if self.sink {
+            return;
+        }
         let base_count = self.count + bypass_bits;
         let mut remaining = base_count;
         if remaining >= 0 {
@@ -349,6 +792,96 @@ impl RangeEncoder {
         let range = self.range;
         let low = (self.low << bit_count) + (range as u64) * (value as u64);
         self.normalize_bypass(low, range, bit_count as i32);
+    }
+
+    /// Encode AVM's `read_uniform(n)` syntax through the arithmetic bypass path.
+    pub(crate) fn encode_uniform(&mut self, value: u32, n: u32) {
+        debug_assert!(n > 1 && value < n);
+        let l = 32 - n.leading_zeros();
+        let m = (1u32 << l) - n;
+        if value < m {
+            self.encode_bypass(value, l - 1);
+        } else {
+            let v = value + m;
+            self.encode_bypass(v >> 1, l - 1);
+            self.encode_bypass(v & 1, 1);
+        }
+    }
+
+    /// Static palette syntax is used only by coded-lossless frames, for which
+    /// AVM forces `disable_cdf_update=1`.
+    pub(crate) fn sym_palette_y_mode(&mut self, val: usize) {
+        self.sym_static(&[2723], val, 1);
+    }
+
+    pub(crate) fn sym_palette_y_size(&mut self, size: usize) {
+        const CDF: [u16; 6] = [23989, 17673, 11991, 7865, 4845, 2365];
+        self.sym_static(&CDF, size - 2, 6);
+    }
+
+    pub(crate) fn sym_palette_identity_row_off(&mut self, first_row: bool) {
+        // The first row uses context 3; subsequent non-copy rows use context 0.
+        let cdf = if first_row {
+            [19769, 12]
+        } else {
+            [10253, 7017]
+        };
+        self.sym_static(&cdf, 0, 2);
+    }
+
+    pub(crate) fn sym_palette_y_color(&mut self, size: usize, ctx: usize, val: usize) {
+        const CDF: [[[u16; 7]; 5]; 7] = [
+            [
+                [4628, 0, 0, 0, 0, 0, 0],
+                [16384, 0, 0, 0, 0, 0, 0],
+                [24186, 0, 0, 0, 0, 0, 0],
+                [5355, 0, 0, 0, 0, 0, 0],
+                [2339, 0, 0, 0, 0, 0, 0],
+            ],
+            [
+                [7418, 3742, 0, 0, 0, 0, 0],
+                [21405, 7495, 0, 0, 0, 0, 0],
+                [25927, 4189, 0, 0, 0, 0, 0],
+                [11418, 6756, 0, 0, 0, 0, 0],
+                [2195, 1122, 0, 0, 0, 0, 0],
+            ],
+            [
+                [9062, 5806, 3708, 0, 0, 0, 0],
+                [22792, 10252, 5386, 0, 0, 0, 0],
+                [26077, 7308, 3534, 0, 0, 0, 0],
+                [13859, 8843, 4365, 0, 0, 0, 0],
+                [2460, 1692, 950, 0, 0, 0, 0],
+            ],
+            [
+                [8652, 5811, 4282, 2827, 0, 0, 0],
+                [23200, 12296, 8474, 3826, 0, 0, 0],
+                [27062, 7525, 4728, 2362, 0, 0, 0],
+                [12663, 9786, 5744, 3857, 0, 0, 0],
+                [1871, 1426, 1002, 569, 0, 0, 0],
+            ],
+            [
+                [11944, 8541, 6842, 5309, 3502, 0, 0],
+                [24627, 13779, 11169, 6586, 4192, 0, 0],
+                [27516, 8428, 6318, 4330, 2143, 0, 0],
+                [13249, 10073, 7181, 5796, 4345, 0, 0],
+                [2385, 1878, 1521, 1115, 618, 0, 0],
+            ],
+            [
+                [11140, 8256, 6895, 5714, 4637, 3229, 0],
+                [24740, 14504, 12155, 7344, 5656, 3862, 0],
+                [26279, 10526, 8307, 6374, 4418, 2258, 0],
+                [10720, 8339, 5778, 4824, 4351, 3194, 0],
+                [1967, 1563, 1296, 1040, 763, 463, 0],
+            ],
+            [
+                [10297, 7685, 6784, 5875, 5114, 4018, 2865],
+                [25226, 15711, 13617, 9218, 7309, 5702, 3964],
+                [25186, 12331, 10040, 8146, 6253, 4189, 2136],
+                [10666, 8624, 5852, 4617, 3922, 3556, 2615],
+                [2244, 1881, 1612, 1375, 1142, 857, 487],
+            ],
+        ];
+        self.sym_static(&CDF[size - 2][ctx], val, size - 1);
     }
 
     /// Flush the coder and return the packed tile bytes.
@@ -702,7 +1235,11 @@ impl RangeEncoder {
     // ---- EOB bin (7-symbol, used via encode_eob) --------------------------
     pub(crate) fn sym_eob_bin(&mut self, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.eob_bin;
+            let cdf = if self.inter_txb {
+                &mut cs.eob_bin_inter
+            } else {
+                &mut cs.eob_bin
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -766,6 +1303,23 @@ impl RangeEncoder {
         } else {
             use crate::av2::cdfs_qctx::EOB256_QC;
             self.sym_static(&EOB256_QC[self.qc], s, nsyms);
+        }
+    }
+
+    pub(crate) fn sym_eob256_inter(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.eob256_inter,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdfs_qctx::INTER_EOB256_QC;
+            self.sym_static(&INTER_EOB256_QC[self.qc], s, nsyms);
         }
     }
     pub(crate) fn sym_eob512(&mut self, s: usize, nsyms: usize) {
@@ -1020,8 +1574,11 @@ impl RangeEncoder {
                 5,
             );
         } else {
-            use crate::av2::cdfx_4tx::BASE_LF_UV_Q0;
-            self.sym_static(&BASE_LF_UV_Q0[ctx], s, 5);
+            // Lossy TX_4X4 chroma still uses the frame q-context.  Using the
+            // q0-only table here makes disable_cdf_update bitstreams diverge as
+            // soon as base_q_idx crosses the qc0/qc1 boundary.
+            use crate::av2::cdfs_uv_qcx::BASE_LF_UV_QCX;
+            self.sym_static(&BASE_LF_UV_QCX[self.qc][ctx], s, 5);
         }
     }
     pub(crate) fn sym_base_uv(&mut self, ctx: usize, s: usize) {
@@ -1037,8 +1594,8 @@ impl RangeEncoder {
                 3,
             );
         } else {
-            use crate::av2::cdfx_4tx::BASE_UV_Q0;
-            self.sym_static(&BASE_UV_Q0[ctx], s, 3);
+            use crate::av2::cdfs_uv_qcx::BASE_UV_QCX;
+            self.sym_static(&BASE_UV_QCX[self.qc][ctx], s, 3);
         }
     }
     pub(crate) fn sym_br_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
@@ -1054,8 +1611,8 @@ impl RangeEncoder {
                 nsyms,
             );
         } else {
-            use crate::av2::cdfx_4tx::BR_UV_Q0;
-            self.sym_static(&BR_UV_Q0[ctx], s, nsyms);
+            use crate::av2::cdfs_uv_qcx::BR_UV_QCX;
+            self.sym_static(&BR_UV_QCX[self.qc][ctx], s, nsyms);
         }
     }
     pub(crate) fn sym_base_lf_eob_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
@@ -1071,8 +1628,8 @@ impl RangeEncoder {
                 nsyms,
             );
         } else {
-            use crate::av2::cdfx_4tx::BASE_LF_EOB_UV_Q0;
-            self.sym_static(&BASE_LF_EOB_UV_Q0[ctx], s, nsyms);
+            use crate::av2::cdfs_uv_qcx::BASE_LF_EOB_UV_QCX;
+            self.sym_static(&BASE_LF_EOB_UV_QCX[self.qc][ctx], s, nsyms);
         }
     }
     pub(crate) fn sym_base_eob_uv(&mut self, ctx: usize, s: usize, nsyms: usize) {
@@ -1088,8 +1645,8 @@ impl RangeEncoder {
                 nsyms,
             );
         } else {
-            use crate::av2::cdfx_4tx::BASE_EOB_UV_Q0;
-            self.sym_static(&BASE_EOB_UV_Q0[ctx], s, nsyms);
+            use crate::av2::cdfs_uv_qcx::BASE_EOB_UV_QCX;
+            self.sym_static(&BASE_EOB_UV_QCX[self.qc][ctx], s, nsyms);
         }
     }
     // ---- intra mode -------------------------------------------------------
@@ -1284,6 +1841,26 @@ impl RangeEncoder {
         }
     }
 
+    /// Emit the per-CDEF-unit "strength is index 0" flag (`s = 1` => index 0 / off).
+    /// Used only for per-block CDEF (nb_cdef_strengths == 2, so index 1 = the single
+    /// active strength needs no further symbol).
+    pub(crate) fn sym_cdef(&mut self, ctx: usize, s: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.cdef[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                1,
+            );
+        } else {
+            unreachable!("CDEF strength flag emitted without adaptive CDF state");
+        }
+    }
+
     pub(crate) fn sym_tx_short_side(&mut self, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.tx_short_side[ctx];
@@ -1439,10 +2016,12 @@ impl RangeEncoder {
         if let Some(ref mut cs) = self.cdf_state {
             let (table, ctx) = cs.skip_slot_of(static_cdf as u16);
             let cdf = match table {
+                0 if self.inter_txb => &mut cs.txb_skip_inter[ctx],
                 0 => &mut cs.txb_skip[ctx],
                 1 => &mut cs.skip_tx64[ctx],
                 3 => &mut cs.skip_tx16[ctx],
                 4 => &mut cs.skip_tx8[ctx],
+                6 => &mut cs.skip_tx16_inter[ctx],
                 5 => &mut cs.skip_tx4[ctx],
                 _ => &mut cs.skip_v[ctx],
             };
@@ -1464,7 +2043,11 @@ impl RangeEncoder {
     /// neutral 16384 probability that appears in multiple skip tables.
     pub(crate) fn bool_u_skip32(&mut self, ctx: usize, bit: u32) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.txb_skip[ctx];
+            let cdf = if self.inter_txb {
+                &mut cs.txb_skip_inter[ctx]
+            } else {
+                &mut cs.txb_skip[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1483,7 +2066,11 @@ impl RangeEncoder {
     }
     pub(crate) fn bool_u_skip64(&mut self, ctx: usize, bit: u32) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.skip_tx64[ctx];
+            let cdf = if self.inter_txb {
+                &mut cs.skip_tx64_inter[ctx]
+            } else {
+                &mut cs.skip_tx64[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1496,6 +2083,24 @@ impl RangeEncoder {
         } else {
             self.encode_bool(
                 crate::av2::cdfs_qctx::CHROMA_SKIP_TX64_QC[self.qc][ctx] as u32,
+                bit,
+            );
+        }
+    }
+    pub(crate) fn bool_u_skip8_inter(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.skip_tx8_inter[ctx],
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(
+                crate::av2::cdfs_qctx::INTER_SKIP_TX8_QC[self.qc][ctx] as u32,
                 bit,
             );
         }
@@ -1532,10 +2137,12 @@ impl RangeEncoder {
                 cs.skip_slot_of(static_cdf as u16)
             };
             let cdf = match slot {
+                0 if self.inter_txb => &mut cs.txb_skip_inter[ctx],
                 0 => &mut cs.txb_skip[ctx],
                 1 => &mut cs.skip_tx64[ctx],
                 3 => &mut cs.skip_tx16[ctx],
                 4 => &mut cs.skip_tx8[ctx],
+                6 => &mut cs.skip_tx16_inter[ctx],
                 5 => &mut cs.skip_tx4[ctx],
                 _ => &mut cs.skip_v[ctx],
             };
@@ -1630,9 +2237,8 @@ impl RangeEncoder {
     /// Adaptive rect_type partition bool. In static mode this is byte-identical
     /// to encode_bool; in adaptive mode it adapts the per-context working copy
     /// (avm rect_type_cdf), matching avmdec which adapts this symbol.
-    pub(crate) fn bool_rect_type(&mut self, static_cdf: u32, bit: u32) {
+    pub(crate) fn bool_rect_type(&mut self, static_cdf: u32, bit: u32, ctx: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let ctx = cs.rect_type_ctx_of(static_cdf as u16);
             let cdf = &mut cs.rect_type[ctx];
             Self::sym_mut_inner(
                 &mut self.low,
@@ -1681,6 +2287,81 @@ impl RangeEncoder {
         } else {
             use crate::av2::cdf_state::INTRA_EXT_TX16_INIT;
             self.sym_static(&INTRA_EXT_TX16_INIT, s, nsyms);
+        }
+    }
+    /// Intra ext-tx type for a native TX_8X8 leaf. Mirrors [`sym_intra_ext_tx16`]:
+    /// the decoder's `intra_ext_tx_cdf[INTRA_TX_SET1][TX_8X8]` is adaptive, so this
+    /// MUST adapt too. Coding it with a static cdf desyncs after the first 8x8 leaf.
+    pub(crate) fn sym_intra_ext_tx8(&mut self, s: usize, nsyms: usize) {
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.intra_ext_tx8;
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                s,
+                nsyms,
+            );
+        } else {
+            use crate::av2::cdf_state::INTRA_EXT_TX8_INIT;
+            self.sym_static(&INTRA_EXT_TX8_INIT, s, nsyms);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RangeEncoder;
+
+    fn assert_static_matches_initial_adaptive<F>(qc: usize, emit: F)
+    where
+        F: Fn(&mut RangeEncoder),
+    {
+        let mut static_enc = RangeEncoder::new();
+        static_enc.qc = qc;
+
+        let mut adaptive_enc = RangeEncoder::new();
+        adaptive_enc.qc = qc;
+        adaptive_enc.enable_adaptive_cdf(qc);
+
+        emit(&mut static_enc);
+        emit(&mut adaptive_enc);
+
+        assert_eq!(static_enc.low, adaptive_enc.low);
+        assert_eq!(static_enc.range, adaptive_enc.range);
+        assert_eq!(static_enc.count, adaptive_enc.count);
+        assert_eq!(static_enc.output, adaptive_enc.output);
+    }
+
+    #[test]
+    fn static_tx4_chroma_uses_the_frame_q_context() {
+        for qc in 0..4 {
+            for ctx in 0..12 {
+                for s in 0..=5 {
+                    assert_static_matches_initial_adaptive(qc, |enc| enc.sym_base_lf_uv(ctx, s));
+                }
+                for s in 0..=3 {
+                    assert_static_matches_initial_adaptive(qc, |enc| enc.sym_base_uv(ctx, s));
+                }
+            }
+
+            for ctx in 0..4 {
+                for s in 0..=3 {
+                    assert_static_matches_initial_adaptive(qc, |enc| enc.sym_br_uv(ctx, s, 3));
+                }
+                for s in 0..=4 {
+                    assert_static_matches_initial_adaptive(qc, |enc| {
+                        enc.sym_base_lf_eob_uv(ctx, s, 4)
+                    });
+                }
+                for s in 0..=2 {
+                    assert_static_matches_initial_adaptive(qc, |enc| {
+                        enc.sym_base_eob_uv(ctx, s, 2)
+                    });
+                }
+            }
         }
     }
 }

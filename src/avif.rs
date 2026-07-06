@@ -140,6 +140,10 @@ impl Speed {
     pub(crate) fn chroma_angle_directional(self) -> bool {
         !matches!(self, Speed::Fast)
     }
+
+    pub(crate) fn try_directional(&self) -> bool {
+        matches!(self, Speed::Slow)
+    }
 }
 
 /// Encoder configuration shared by all entry points.

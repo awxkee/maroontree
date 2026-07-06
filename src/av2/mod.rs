@@ -26,13 +26,15 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-#[allow(unused_imports)]
 mod aq;
 mod avif;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod ccso;
+mod cdef_est;
+mod deblock;
+// Staged-threading Phase 1 scaffolding: per-SB decision record + replay for the
+// 4:4:4 core. Not yet wired into the encode path (converted path-by-path).
 mod cdf_para;
 mod cdf_state;
 mod cdfs_qctx;
@@ -45,10 +47,6 @@ mod coder;
 mod csc;
 #[allow(dead_code)]
 mod directional;
-mod encode400;
-mod encode420;
-mod encode422;
-mod encode444;
 mod entropy;
 mod fdct;
 mod headers;
@@ -59,61 +57,98 @@ pub mod itx422;
 mod layout;
 mod leaf;
 mod lossless;
+mod lossless_rd;
+mod metrics;
 mod mhccp;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
 mod partition;
 mod proj;
 mod quant;
+#[allow(dead_code)]
+mod replay;
 pub mod simple;
 pub(crate) mod tables;
 mod tables_tx32;
+mod tiling;
+pub mod video;
 mod wht;
+mod y400;
+mod y420;
+mod y422;
+mod y444;
 
 use crate::av2::avif::{Av2Color, Av2Format};
 use crate::av2::cdfs_qctx::{
-    CHROMA_EOB_HI_BIT_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, SKIP_TX8_QC, SKIP_TX16_QC,
+    CHROMA_EOB_HI_BIT_QC, CHROMA_SKIP_TX32_QC, CHROMA_SKIP_TX64_QC, INTER_SKIP_TX16_QC,
+    SKIP_TX8_QC, SKIP_TX16_QC,
 };
 use crate::av2::cdfx_4tx::{TXB_SKIP_TX4_Q0, V_TXB_SKIP_TX4_Q0};
 use crate::av2::chroma422::{
-    ChromaNeighbors, ChromaPlanes, ChromaTxSpec, code_422_chroma_tu, recon_422_chroma,
+    ChromaNeighbors, ChromaPlanes, ChromaTuInput, ChromaTxSpec, code_422_chroma_tu,
+    recon_422_chroma,
 };
 use crate::av2::coder::{
-    Coeff, EobCdf, encode_chroma_block, encode_chroma_block_ex, encode_chroma_block_rect,
-    encode_chroma_block_rect_w, encode_chroma_tu4, encode_lossless_luma_sb,
-    encode_luma_block_horz4, encode_luma_block_split, encode_luma_block_split_dir,
-    encode_luma_block_vert4, encode_luma_leaf_8x8, encode_luma_leaf_8x32,
-    encode_luma_leaf_16x16_full, encode_luma_leaf_16x32, encode_luma_leaf_16x64,
-    encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32, encode_luma_leaf_32x64,
-    encode_luma_leaf_64x16, encode_luma_leaf_64x32,
+    Coeff, EobCdf, InterResidualSpec, LosslessDpcm, LosslessIntrabc, LosslessLumaBlock,
+    LumaLeafRect128Spec, LumaSplitDirSpec, encode_chroma_block, encode_chroma_block_ex,
+    encode_chroma_block_rect, encode_chroma_block_rect_w, encode_chroma_tu4,
+    encode_lossless_luma_sb, encode_luma_block_horz4, encode_luma_block_split,
+    encode_luma_block_split_dir, encode_luma_block_vert4, encode_luma_leaf_8x8,
+    encode_luma_leaf_8x32, encode_luma_leaf_16x16_full, encode_luma_leaf_16x32,
+    encode_luma_leaf_16x64, encode_luma_leaf_32x8, encode_luma_leaf_32x16, encode_luma_leaf_32x32,
+    encode_luma_leaf_32x64, encode_luma_leaf_64x16, encode_luma_leaf_64x32,
 };
 use crate::av2::csc::{
     CB_B, CB_G, CB_R, CR_B, CR_G, CR_R, HALF, Q, Y_B, Y_G, Y_R, get_q_ctx, validate_dims,
 };
-use crate::av2::encode444::{assemble_multitile, extract_subplane, tile_grid_for, tile_specs};
 use crate::av2::entropy::RangeEncoder;
 use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
-    coeff_abs_rate_f32, coeff_count_rate_f32, coeff_rate_f32, dc_pred, dc_pred_rect,
-    dc_pred_rect_subsampled, get_residual, get_residual_rect, levels_to_coeffs, lossless_sb_tus,
-    pad_plane, par_map_indexed, pixel_sse_rounded, pixel_sse_rounded_block, pixel_to_i32,
-    put_block, put_block_rect, sb_align, sb_tu_contexts, sb_tu_contexts_64x32, sb_tu_contexts_pos,
-    sb_tu_contexts_rect, sb_tu4_chroma_skip, sb_tu4_contexts, sq_diff_u64,
+    BoundedIntraRect, PlaneRect, TX16_TYPE_RATE_DELTA, TxbContextSpec, choose_tx16_type,
+    coeff_abs_rate_f32, coeff_rate_f32, coeff_tu_rate_proxy_f32, coeff_tus_rate_proxy_f32, dc_pred,
+    dc_pred_rect, dc_pred_rect_bounded, dc_pred_rect_subsampled, get_residual, get_residual_rect,
+    levels_to_coeffs, lossless_sb_tus, pad_plane, par_map_indexed, pixel_sse_f32_u16_block,
+    pixel_sse_rounded_block, pixel_sse_rounded_block_const, put_block, put_block_rect, rect_rows,
+    rect_rows_mut, rect_sse_f32, sb_align, sb_tu_contexts, sb_tu_contexts_64x32,
+    sb_tu_contexts_pos, sb_tu_contexts_rect, sb_tu4_chroma_skip, sb_tu4_contexts, tx16_dc_only,
+    tx16_distortion,
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;
 use crate::av2::leaf::{
-    encode_luma_leaf_s32x32, encode_luma_leaf_v32x64, encode_luma_leaf32, encode_luma_sb,
+    LumaFrameBlock, LumaGridBlock, LumaPartitionDecision, LumaPartitionSearch, LumaQuantSpec,
+    LumaSbSearch, LumaSource, choose_luma_64x64_partition, encode_luma_leaf_s32x32,
+    encode_luma_leaf_v32x64, encode_luma_leaf32, encode_luma_sb,
 };
 use crate::av2::proj::Basis;
 use crate::av2::tables::{SCAN8X8, SCAN8X32, SCAN16, SCAN16X32, SCAN32X8, SCAN32X16};
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Orientation};
 use crate::{ChromaFormat, Cicp, Pixel, PlanarImage, Speed};
+pub use aq::DarkAq;
 
 // Free luma-leaf prediction/coding helpers live in `leaf`.
 
 // Q0.13 RGB→YCbCr coefficients, dimension validation, and `get_q_ctx` live in `csc`.
+
+/// Split the leading OBU off a stream. Our `obu()` writes leb128(size) then the
+/// header byte then payload, so an OBU spans `leb_len + size` bytes.
+fn split_one_obu(data: &[u8]) -> (&[u8], &[u8]) {
+    let mut size = 0u64;
+    let mut shift = 0;
+    let mut i = 0;
+    loop {
+        let b = data[i];
+        size |= ((b & 0x7f) as u64) << shift;
+        i += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    let total = i + size as usize;
+    (&data[..total], &data[total..])
+}
 
 /// Result of an encode: the AV2 bitstream plus the metadata needed to interpret it.
 pub struct Av2Frame {
@@ -128,11 +163,54 @@ pub struct Av2Frame {
     bit_depth: u8,
     color: Cicp,
     chroma_format: ChromaFormat,
+    /// Tile grid actually used (log2_cols, log2_rows, tile_size_bytes); (0,0,1) = single tile.
+    pub(crate) tile_grid: (usize, usize, usize),
+    /// Final recon planes (Y,U,V f32) for the video DPB; empty for still.
+    pub(crate) recon: Vec<Vec<f32>>,
+    /// Frame-level IBC decision used when a still tile payload is rewrapped as
+    /// a video key frame. It must match the still frame header stripped by video.
+    pub(crate) allow_intrabc: bool,
+    /// Exact frame config used to write the stripped still header. Video reuses
+    /// this so derived filters (CDEF/CCSO) cannot diverge while rewrapping tiles.
+    pub(crate) video_config: Config,
 }
 
 impl Av2Frame {
     pub fn view(&self) -> &[u8] {
         self.data.as_slice()
+    }
+
+    /// Retained post-filter reconstruction planes, when requested on the encoder.
+    pub fn reconstruction(&self) -> &[Vec<f32>] {
+        &self.recon
+    }
+
+    /// Coded (OBU-signaled) dimensions.
+    pub(crate) fn coded_dims(&self) -> (usize, usize) {
+        (self.coded_width, self.coded_height)
+    }
+
+    /// Tile grid (log2_cols, log2_rows, tile_size_bytes) used by to encode.
+    pub(crate) fn tile_grid(&self) -> (usize, usize, usize) {
+        self.tile_grid
+    }
+
+    pub(crate) fn recon_planes(&self) -> &[Vec<f32>] {
+        &self.recon
+    }
+
+    pub(crate) fn allow_intrabc(&self) -> bool {
+        self.allow_intrabc
+    }
+
+    pub(crate) fn video_config(&self) -> &Config {
+        &self.video_config
+    }
+
+    pub(crate) fn split_obus(&self) -> (&[u8], &[u8], &[u8]) {
+        let (td, rest) = split_one_obu(&self.data);
+        let (seq, frame) = split_one_obu(rest);
+        (td, seq, frame)
     }
 }
 
@@ -168,13 +246,13 @@ pub struct Tuning {
     pub txpart: TxPart,
     /// Trellis-RDOQ strength (level^2 per bit). `0.0` disables RDOQ (round-to-nearest
     /// + EOB truncation baseline).
-    pub rdoq_lambda: f64,
+    pub rdoq_lambda: f32,
     /// Trellis-RDOQ strength for chroma planes (level^2 per bit). `0.0` disables the
     /// chroma trellis (round-to-nearest + EOB truncation baseline), which is the
     /// default — chroma RDOQ is bitstream-affecting and opt-in.
-    pub chroma_rdoq_lambda: f64,
+    pub chroma_rdoq_lambda: f32,
     /// Multiplier `c` in the tx-partition RD lambda `lambda = c * qstep^2`.
-    pub part_lambda_c: f64,
+    pub part_lambda_c: f32,
     /// Enable the in-loop deblocking filter
     pub deblock: bool,
     /// Enable deblocking of the chroma (U/V) planes.
@@ -185,7 +263,7 @@ pub struct Tuning {
     pub ccso: bool,
     /// CCSO per-superblock RD on/off threshold scale (higher = more conservative,
     /// fewer superblocks filtered). Default 16.0.
-    pub ccso_rd_scale: f64,
+    pub ccso_rd_scale: f32,
     /// Deblock threshold quantizer-index offset for luma / chroma (range -2..=1
     /// with df_par_bits=2). 0 = thresholds derived purely from the frame qindex.
     pub db_delta_y: i32,
@@ -211,6 +289,10 @@ pub struct Tuning {
     /// extra bits for quality). When false (default), it also coarsens high-variance
     /// SBs so the average quantizer tracks the frame base (rate-balanced).
     pub vb_boost_only: bool,
+    /// Dark-structured-detail AQ protection (see [`aq::DarkAq`]). An independent boost,
+    /// combined with the variance boost by `max`, that preserves dark textured/edge SBs
+    /// at low quality. Only active when `aq` is true and base_q >= `dark_aq.min_q`.
+    pub dark_aq: aq::DarkAq,
     /// Enable the non-CfL chroma intra-mode search
     pub chroma_mode_search: bool,
     /// Enable RD-driven 64x64->4x32x32 chroma-motivated square split (4:4:4/4:2:2).
@@ -218,6 +300,14 @@ pub struct Tuning {
     /// into 32x32 transforms codes all frequencies, a large win on detailed chroma.
     pub chroma_split: bool,
     pub updating_cdf: bool,
+    /// Frame-level chroma AC/DC quantizer delta (AVM base_uv_ac_delta_q). Positive
+    /// coarsens chroma to shift bits toward luma; 0 = neutral.
+    pub uv_ac_delta_q: i32,
+    /// SS2-calibration penalty on the rect (VERT4/HORZ4) luma tx-partition distortion.
+    /// Rect strips (16x64 / 64x16) win on raw SSE while smearing detail along their long
+    /// axis, which SSIMULACRA2 penalizes heavily (observed -3 to -4 SS2 with no rate
+    /// benefit). A multiplier >1 makes rect win only when clearly better; 1.0 = off.
+    pub rect_part_penalty: f32,
 }
 
 impl Default for Tuning {
@@ -242,9 +332,15 @@ impl Default for Tuning {
             vb_octile: 6,
             vb_strength: 0.6,
             vb_boost_only: true,
+            dark_aq: aq::DarkAq {
+                enabled: true,
+                ..aq::DarkAq::default()
+            },
             chroma_mode_search: true,
             chroma_split: true,
+            uv_ac_delta_q: 0,
             updating_cdf: true,
+            rect_part_penalty: 1.05,
         }
     }
 }
@@ -256,9 +352,33 @@ pub struct Av2Encoder {
     bit_depth: u8,
     tune: Tuning,
     speed: Speed,
+    /// Full-pel motion-search radius selected by the video preset.
+    pub(crate) video_search_range: i32,
+    /// Normalized 8-bit SAD-per-pixel gate for skipping integer motion search.
+    /// Zero disables approximate predictor gating.
+    pub(crate) video_predictor_gate: u32,
+    /// Full-pel neighborhood radius reranked with SATD after integer SAD search.
+    pub(crate) video_integer_satd_radius: u8,
+    /// Smallest luma partition enabled by the active video preset.
+    pub(crate) video_min_block_size: u8,
+    /// Maximum recursive luma partition depth enabled by the video preset.
+    pub(crate) video_max_partition_depth: u8,
+    /// Hierarchical frame-analysis MV seed (eighth-pel units), used only as a
+    /// block-search predictor; it is never signaled as global motion.
+    pub(crate) video_mv_seed: std::sync::Mutex<video::mv::Mv>,
     /// Worker-thread budget for tile/superblock parallelism (`0`/`1` = serial).
     /// Sourced from `EncodeConfig::threads` via [`Av2Encoder::with_threads`].
     threads: usize,
+    /// When set, tiles emit intra_inter=0 per block (inter frame all-intra tile).
+    pub(crate) inter_tile: std::sync::atomic::AtomicBool,
+    /// Set by the video encoder for every frame it drives (key and inter alike).
+    /// Video frames must keep their historical tiled/serial path: the still-image
+    /// default (multi-threaded → single-tile SB-wavefront) is suppressed when this
+    /// is set, so a video cfg's `with_tiles`/`with_threads` behaves exactly as before.
+    pub(crate) video_mode: std::sync::atomic::AtomicBool,
+    pub(crate) capture_recon: std::sync::atomic::AtomicBool,
+    /// LAST reference recon planes (Y,U,V f32) for inter prediction; empty for intra.
+    pub(crate) last_ref: std::sync::Mutex<std::sync::Arc<Vec<Vec<f32>>>>,
 }
 
 /// Returns the AV2 mi-unit frame extents `(mc, mr)` for a native (no-pad) lossy 4:4:4
@@ -325,7 +445,7 @@ struct QuantCtx {
     neutral: f32,
     qstep: i32,
     /// Chroma trellis-RDOQ strength; 0.0 = round-to-nearest (no trellis).
-    rdoq_lambda: f64,
+    rdoq_lambda: f32,
 }
 
 /// Immutable per-pass geometry + quant parameters for a native edge-partition walk.
@@ -375,6 +495,12 @@ struct ChromaNeighborBufs<'a> {
 }
 
 impl Av2Encoder {
+    /// Retain the final reconstruction planes in the returned [`Av2Frame`].
+    pub fn with_reconstruction(self, retain: bool) -> Self {
+        self.capture_recon
+            .store(retain, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
     /// Build an 8-bit encoder for `base_q_idx` with default [`Tuning`].
     pub fn new(base_q_idx: u8) -> Self {
         Self::with_bit_depth(base_q_idx, 8)
@@ -391,14 +517,26 @@ impl Av2Encoder {
         );
         let mut bases = proj::default_bases().rescaled_to_q(base_q_idx as u32);
         bases.set_bit_depth(bit_depth);
-        Av2Encoder {
+        let mut enc = Av2Encoder {
             bases,
             base_q_idx,
             bit_depth,
             tune: Tuning::default(),
-            speed: crate::Speed::Slow,
+            speed: Speed::Slow,
+            video_search_range: 128,
+            video_predictor_gate: 0,
+            video_integer_satd_radius: 0,
+            video_min_block_size: 8,
+            video_max_partition_depth: 4,
+            video_mv_seed: std::sync::Mutex::new(video::mv::Mv::ZERO),
             threads: 1,
-        }
+            inter_tile: std::sync::atomic::AtomicBool::new(false),
+            video_mode: std::sync::atomic::AtomicBool::new(false),
+            capture_recon: std::sync::atomic::AtomicBool::new(false),
+            last_ref: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
+        };
+        enc.apply_hq_lambda_schedule();
+        enc
     }
 
     /// Set the worker-thread budget (builder style). `0` or `1` = serial; `N`
@@ -412,7 +550,25 @@ impl Av2Encoder {
     /// Replace the full [`Tuning`] (builder style).
     pub fn with_tuning(mut self, tune: Tuning) -> Self {
         self.tune = tune;
+        self.apply_hq_lambda_schedule();
         self
+    }
+
+    /// Apply the high-quality RDOQ-lambda schedule to any lambda still at the shipping
+    /// default, keyed on `base_q_idx`. Explicit lambda overrides are left untouched.
+    pub(crate) fn apply_hq_lambda_schedule(&mut self) {
+        let sched = proj::hq_rdoq_lambda(self.base_q_idx as u32);
+        if (self.tune.rdoq_lambda - proj::DEFAULT_RDOQ_LAMBDA).abs() < 1e-12 {
+            self.tune.rdoq_lambda = sched;
+        }
+        if (self.tune.chroma_rdoq_lambda - proj::DEFAULT_RDOQ_LAMBDA).abs() < 1e-12 {
+            self.tune.chroma_rdoq_lambda = sched;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn video_allows_16x16_partitions(&self) -> bool {
+        self.video_min_block_size <= 16 && self.video_max_partition_depth >= 2
     }
 
     /// Request a tile grid for parallel encoding. `cols`/`rows` are rounded up to a
@@ -432,13 +588,13 @@ impl Av2Encoder {
     }
 
     /// Set the trellis-RDOQ strength (`0.0` disables RDOQ).
-    pub fn with_rdoq_lambda(mut self, lambda: f64) -> Self {
+    pub fn with_rdoq_lambda(mut self, lambda: f32) -> Self {
         self.tune.rdoq_lambda = lambda;
         self
     }
 
     /// Set the chroma trellis-RDOQ strength (0.0 disables it; default 0.0).
-    pub fn with_chroma_rdoq_lambda(mut self, lambda: f64) -> Self {
+    pub fn with_chroma_rdoq_lambda(mut self, lambda: f32) -> Self {
         self.tune.chroma_rdoq_lambda = lambda.max(0.0);
         self
     }
@@ -497,6 +653,13 @@ impl Av2Encoder {
         self
     }
 
+    /// Force chroma partitioning on/off. Off routes 4:2:0 through the whole-SB fast
+    /// path (used to exercise the regular-tx deblock/CCSO path in tests).
+    pub fn with_chroma_split(mut self, on: bool) -> Self {
+        self.tune.chroma_split = on;
+        self
+    }
+
     pub fn with_mhccp(mut self, on: bool) -> Self {
         self.tune.mhccp = on;
         self
@@ -518,46 +681,79 @@ impl Av2Encoder {
         self.base_q_idx
     }
 
+    /// Retune the per-frame quantizer while preserving the encoder's pixel
+    /// representation and tool configuration. Used by video CQ before decision.
+    pub(crate) fn set_video_base_q(&mut self, base_q_idx: u8) {
+        if self.base_q_idx == base_q_idx {
+            return;
+        }
+        self.base_q_idx = base_q_idx;
+        self.bases = proj::default_bases().rescaled_to_q(base_q_idx as u32);
+        self.bases.set_bit_depth(self.bit_depth);
+    }
+
     fn config(&self, layout: Layout) -> Config {
-        // Quality-adaptive luma deblock delta. A +1 quantizer-index offset strengthens
-        // the luma filter, which helps at low/mid quality (large gains: man1024 +0.29,
-        // bship +1.60, buddha +0.99 BD-SSIM at low q) and is neutral at high quality.
-        // Applied automatically when `db_delta_y` is left at its `i32::MIN` "auto"
-        // default; any explicit value (including 0) overrides. Chroma deblock is left off by default (it over-smooths chroma:
-        // -0.77 BD-SSIM), so `db_delta_uv` is only used when chroma_deblock is set.
-        let adaptive_dy = if self.base_q_idx >= 48 { 1 } else { 0 };
+        // Deblock strength estimation from the filter's own quantizer threshold.
+        // The AV2 loop filter derives its edge threshold from the plane qindex via
+        // `df_quant_from_qindex(q) = ROUND_POWER_OF_TWO(ac_quant(q), QUANT_TABLE_BITS) >> 6`
+        // (== `((qstep + 4) >> 3) >> 6` since our `qstep` is `av2_ac_quant_QTX`). That
+        // threshold IS the filter's activity gate, so we estimate directly from it
+        // instead of signalling a blind fixed delta:
+        //   * df_quant == 0  -> the threshold is below any block-edge step, so the
+        //     filter is provably inert (verified: at q>=70 deblock on == off to the
+        //     SS2 digit). Don't apply it at all — signalling it is pure waste.
+        //   * df_quant >= 5  -> very low quality; the threshold is already large and a
+        //     `+1` offset over-smooths (measured: volcanic q40 delta +1 = -0.23 SS2 vs
+        //     delta 0 = +0.13). Use offset 0.
+        //   * 1 <= df_quant <= 4 -> low/mid quality; `+1` strengthens the filter for a
+        //     net gain (volcanic/DSC/manhattan q50-q65 all prefer +1). Use offset +1.
+        // Chroma deblock is gated separately by `chroma_deblock`. `db_delta_y` at its
+        // `i32::MIN` "auto" default uses this estimate; any explicit value overrides.
+        let df_quant = {
+            let qs = crate::av2::quant::qstep(self.base_q_idx as u32) as i32;
+            ((qs + 4) >> 3) >> 6
+        };
+        let filter_active = self.tune.deblock && df_quant >= 1;
+        let auto_dy = if df_quant >= 5 { 0 } else { 1 };
         let eff_dy = if self.tune.db_delta_y == i32::MIN {
-            adaptive_dy
+            auto_dy
         } else {
             self.tune.db_delta_y
         };
         Config {
             layout,
             base_q: self.base_q_idx as u32,
-            deblock: self.tune.deblock,
+            // Chroma delta-q is wired through the 4:4:4 coding paths only so far; other
+            // layouts must keep the header at delta 0 or the coding would desync.
+            uv_ac_delta_q: if layout == Layout::I444 {
+                self.tune.uv_ac_delta_q
+            } else {
+                0
+            },
+            deblock: filter_active,
             db_apply: (
-                self.tune.deblock,
-                self.tune.deblock,
-                self.tune.deblock && self.tune.chroma_deblock,
-                self.tune.deblock && self.tune.chroma_deblock,
+                filter_active,
+                filter_active,
+                filter_active && self.tune.chroma_deblock,
+                filter_active && self.tune.chroma_deblock,
             ),
             db_delta: (eff_dy, eff_dy, self.tune.db_delta_uv, self.tune.db_delta_uv),
             tx_switchable: true,
             guided_deblock: None,
-            cdef: if self.tune.cdef {
-                // q-derived global strength: scales with base_q_idx, off (None) at high
-                // quality. pri = clamp((q-120)/8, 0, 11); strength = pri*4 (sec=0).
-                let pri = ((self.base_q_idx as i32 - 120) / 8).clamp(0, 11) as u8;
-                (pri > 0).then_some((pri * 4, pri * 4, 3))
-            } else {
-                None
-            },
+            // The real strength is chosen by the two-pass per-block CDEF search and
+            // folded into the config in the tiled/finish path; off until then.
+            cdef: None,
+            // Per-block CDEF is decided by the two-pass search (pass 1 builds recon +
+            // grid, pass 2 emits); the header carries the 2-entry table only when the
+            // search produced a grid, set alongside `cdef` in the tiled/finish path.
+            cdef_per_block: false,
             // CCSO is computed as a post-reconstruction search pass (it needs the
             // final recon to derive offsets), so the Config carries None here and the
             // encoder fills it in just before writing the frame header.
             ccso: None,
             bit_depth: self.bit_depth,
             lossless: self.base_q_idx == 0,
+            allow_intrabc: false,
             cfl: self.tune.cfl && self.base_q_idx != 0,
             // MHCCP only makes sense with chroma and lossy coding; gated further
             // per-block by is_mhccp_allowed (not 4x4, block <= 64x64).
@@ -577,6 +773,10 @@ impl Av2Encoder {
         (1u32 << (self.bit_depth - 1)) as f32
     }
 
+    pub(crate) fn config_for(&self, layout: Layout) -> Config {
+        self.config(layout)
+    }
+
     /// Resolve a caller-supplied thread budget: `0` = use all available cores,
     /// `1` = serial, `N` = up to N threads. Replaces the old `SLIMAV_THREADS` env.
     fn resolve_threads(threads: usize) -> usize {
@@ -590,12 +790,12 @@ impl Av2Encoder {
     }
 
     // Per-format encode entry points (encode_yuv444/420/422/400, their lossless
-    // variants, and encode_image_*) live in the `encode444/420/422/400` modules,
+    // variants, and encode_image_*) live in `y400`, `y420`, `y422`, and `y444`,
     // each adding methods to this same `impl Av2Encoder`.
     #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
-        enc: RangeEncoder,
+        mut enc: RangeEncoder,
         config: &Config,
         pw: usize,
         ph: usize,
@@ -605,6 +805,10 @@ impl Av2Encoder {
     ) -> Av2Frame {
         let ccso_u_result = enc.ccso_u_result.clone();
         let ccso_v_result = enc.ccso_v_result.clone();
+        let cdef_result = enc.cdef_result;
+        let cdef_decided = enc.cdef_decided.clone();
+
+        let recon = std::mem::take(&mut enc.recon);
         let tile = enc.finish();
         // AV2 derives its mode-info grid by rounding the frame to 4px
         // (ALIGN_POWER_OF_TWO(dim, MI_SIZE_LOG2)); superblocks are 64px (16 mi).
@@ -634,6 +838,17 @@ impl Av2Encoder {
         let (sw, sh) = if exact { (width, height) } else { (pw, ph) };
         // Fold the derived CCSO U/V results into the config for the frame header.
         let mut config = (*config).clone();
+        // Fold the CDEF decision into the header. Per-block (pass 2) sets a 2-entry
+        // strength table + cdef_per_block; a legacy global result (tiled path) sets
+        // the single strength.
+        if self.tune.cdef {
+            if let Some(d) = &cdef_decided {
+                config.cdef = Some((d.y_str, d.uv_str, d.damping));
+                config.cdef_per_block = true;
+            } else {
+                config.cdef = cdef_result;
+            }
+        }
         let to_plane = |r: &ccso::PlaneResult| -> headers::CcsoPlane {
             use crate::av2::ccso::PlaneResult::*;
             match r {
@@ -684,6 +899,11 @@ impl Av2Encoder {
             // the AVIF muxer must use this.
             bit_depth: self.bit_depth,
             color: *color,
+
+            recon,
+            allow_intrabc: config.allow_intrabc,
+            video_config: config.clone(),
+            tile_grid: (0, 0, 1),
             chroma_format: match config.layout {
                 Layout::Monochrome => ChromaFormat::Monochrome,
                 Layout::I420 => ChromaFormat::Yuv420,

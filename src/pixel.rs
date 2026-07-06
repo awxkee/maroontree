@@ -83,6 +83,22 @@ impl Pixel for i32 {
     }
 }
 
+impl Pixel for f32 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn from_i32_clamped(v: i32, bit_depth: u8) -> Self {
+        let max = (1i32 << bit_depth) - 1;
+        v.clamp(0, max) as f32
+    }
+}
+
 /// Supported coded bit depths. AV1 profile 0/1 cover 8 and 10; 12 needs
 /// profile 2. We model all three; only storage type differs (u8 vs u16).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

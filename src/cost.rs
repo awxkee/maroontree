@@ -4,18 +4,15 @@
 use crate::intrapred::DC_PRED;
 use crate::tables::{COEFF_BASE_RANGE, EOB_BITW, NUM_BASE_LEVELS};
 
-pub(crate) fn est_block_bits(cf: &[i32], scan: &[usize]) -> u32 {
-    let mut eob_idx: i32 = -1;
-    for (i, &rc) in scan.iter().enumerate() {
-        if cf[rc] != 0 {
-            eob_idx = i as i32;
-        }
-    }
-    if eob_idx < 0 {
+pub(crate) fn est_block_bits(cf: &[i32], scan: &[u32]) -> u32 {
+    let Some(eob) = scan.iter().rposition(|&rc| cf[rc as usize] != 0) else {
         return 1;
-    }
-    let mag: u32 = cf.iter().map(|&c| c.unsigned_abs()).sum();
-    mag + EOB_BITW * (eob_idx as u32 + 1)
+    };
+    let mag: u32 = scan[..=eob]
+        .iter()
+        .map(|&rc| cf[rc as usize].unsigned_abs())
+        .sum();
+    mag + EOB_BITW * (eob as u32 + 1)
 }
 
 /// Static per-level bit estimate for the AV1 coefficient token structure (base
@@ -44,7 +41,7 @@ fn coef_rate_bits_slow(level: u32) -> f32 {
 
 // Rate LUT for the hot low-magnitude range (bit-identical to coef_rate_bits_slow);
 // ≥64 falls back to the closed form.
-static COEF_RATE_LUT: [f32; 64] = [
+pub(crate) static COEF_RATE_LUT: [f32; 64] = [
     0.9, 2.7, 3.6, 5.3, 5.3, 5.3, 6.6, 6.6, 6.6, 7.9, 7.9, 7.9, 9.2, 9.2, 9.2, 11.5, 13.5, 13.5,
     15.5, 15.5, 15.5, 15.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 17.5, 19.5, 19.5, 19.5, 19.5,
     19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 19.5, 21.5, 21.5, 21.5, 21.5,
@@ -64,7 +61,7 @@ pub(crate) fn coef_rate_bits(level: u32) -> f32 {
 /// behaviour is q-adaptive). Calibrated so the per-coefficient round-down and
 /// EOB-trim land on the R-D frontier: meaningfully smaller streams for a
 /// negligible PSNR cost, beating the naive "raise q" baseline.
-pub(crate) const TRELLIS_LAMBDA0: f64 = 0.05;
+pub(crate) const TRELLIS_LAMBDA0: f32 = 0.05;
 
 /// dav1d DTT4_IDTX_1DDCT set index for ADST_ADST at TX_8X8 intra.
 pub(crate) const ADST_ADST_TX8_IDX: usize = 4;
@@ -79,7 +76,7 @@ pub(crate) const ADST_ADST_TX16_IDX: usize = 2;
 pub(crate) const ADST_DCT_TX16_IDX: usize = 3;
 pub(crate) const DCT_ADST_TX16_IDX: usize = 4;
 
-pub(crate) fn trellis_lambda() -> f64 {
+pub(crate) fn trellis_lambda() -> f32 {
     TRELLIS_LAMBDA0
 }
 
@@ -109,7 +106,7 @@ pub(crate) fn trellis_lambda() -> f64 {
 
 /// libaom's DC-quant-domain KF rd multiplier: `3.3 + 0.0015*q`.
 #[inline]
-fn def_kf_rd_multiplier(q: f64) -> f64 {
+fn def_kf_rd_multiplier(q: f32) -> f32 {
     3.3 + 0.0015 * q
 }
 
@@ -118,25 +115,25 @@ fn def_kf_rd_multiplier(q: f64) -> f64 {
 /// as `weight/128`. Biases toward larger transforms at low/mid qindex and ramps
 /// to neutral by qindex 159 — libaom tuned this directly on SSIMULACRA2.
 #[inline]
-pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f64 {
+pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f32 {
     let w = (((255i32 - qindex as i32) * 3) / 4).clamp(0, 72) + 128;
-    w as f64 / 128.0
+    w as f32 / 128.0
 }
 
 #[allow(dead_code)]
-pub(crate) const AOM_RDMULT_CALIB: f64 = 1.0 / (1 << 4) as f64; // undo libaom's D<<4
+pub(crate) const AOM_RDMULT_CALIB: f32 = 1.0 / (1 << 4) as f32; // undo libaom's D<<4
 
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn mode_lambda_aom(dc_q: f64, qindex: u8, bd: u8, tune_ssimulacra2: bool) -> f64 {
+pub(crate) fn mode_lambda_aom(dc_q: f32, qindex: u8, bd: u8, tune_ssimulacra2: bool) -> f32 {
     let mut rdmult = dc_q * dc_q * def_kf_rd_multiplier(dc_q);
     if tune_ssimulacra2 {
         rdmult *= aom_ssimulacra2_rdmult_weight(qindex);
     }
     // Bit-depth normalisation (libaom: 10-bit >>4, 12-bit >>8).
     rdmult *= match bd {
-        10 => 1.0 / (1 << 4) as f64,
-        12 => 1.0 / (1 << 8) as f64,
+        10 => 1.0 / (1 << 4) as f32,
+        12 => 1.0 / (1 << 8) as f32,
         _ => 1.0,
     };
     // libaom RDCOST weights rate as rdmult/1024 against D<<4 distortion; our cost
@@ -145,7 +142,7 @@ pub(crate) fn mode_lambda_aom(dc_q: f64, qindex: u8, bd: u8, tune_ssimulacra2: b
 }
 
 #[inline]
-pub(crate) fn mode_lambda_weight(qindex: u8, tune: bool) -> f64 {
+pub(crate) fn mode_lambda_weight(qindex: u8, tune: bool) -> f32 {
     if tune {
         aom_ssimulacra2_rdmult_weight(qindex)
     } else {
@@ -156,7 +153,7 @@ pub(crate) fn mode_lambda_weight(qindex: u8, tune: bool) -> f64 {
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in
 /// `[1, 32768]`. Built once; replaces a per-call `log2()` (a libm transcendental
 /// that dominated the trellis) with a single array load. Q22 keeps the rounding
-/// error ~1e-7 bits, far below anything the R-D comparison can resolve, so the
+/// error ~1e-6 bits, far below anything the R-D comparison can resolve, so the
 /// chosen levels are identical to the float version.
 pub(crate) const COST_Q_FRAC: u32 = 22;
 pub(crate) const COST_Q_SCALE_INV: f32 = 1.0 / (1u32 << COST_Q_FRAC) as f32;
@@ -166,8 +163,8 @@ pub(crate) fn cost_q_table() -> &'static [u32; 32769] {
     TABLE.get_or_init(|| {
         let mut t = Box::new([0u32; 32769]);
         for (p, slot) in t.iter_mut().enumerate().skip(1) {
-            let bits = -((p as f64) * (1.0 / 32768.0)).log2();
-            *slot = (bits * (1u32 << COST_Q_FRAC) as f64).round() as u32;
+            let bits = -((p as f32) * (1.0 / 32768.0)).log2();
+            *slot = (bits * (1u32 << COST_Q_FRAC) as f32).round() as u32;
         }
         t
     })
@@ -215,19 +212,14 @@ pub(crate) fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f32 {
 
 /// Candidate non-directional luma modes evaluated by the mode search, in CDF
 /// symbol order (DC first).
-pub(crate) fn block_rate_bits(cf: &[i32], scan: &[usize]) -> f32 {
-    let mut eob: i32 = -1;
-    for (i, &rc) in scan.iter().enumerate() {
-        if cf[rc] != 0 {
-            eob = i as i32;
-        }
-    }
-    if eob < 0 {
+pub(crate) fn block_rate_bits(cf: &[i32], scan: &[u32]) -> f32 {
+    let Some(eob) = scan.iter().rposition(|&rc| cf[rc as usize] != 0) else {
         return 1.0; // all-zero: just the txb_skip flag
-    }
+    };
+
     let mut bits = 2.0f32; // eob_pt / skip-flag overhead
-    for &rc in scan.iter().take(eob as usize + 1) {
-        bits += coef_rate_bits(cf[rc].unsigned_abs());
+    for &rc32 in &scan[..=eob] {
+        bits += coef_rate_bits(cf[rc32 as usize].unsigned_abs());
     }
     bits
 }
@@ -236,12 +228,12 @@ pub(crate) fn block_rate_bits(cf: &[i32], scan: &[usize]) -> f32 {
 /// Legacy mode-search lambda scale (`ac_q^2` units); retained as the calibration
 /// reference for `mode_lambda_q` and its tests.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const MODE_LAMBDA0: f64 = 0.02;
+pub(crate) const MODE_LAMBDA0: f32 = 0.02;
 
 /// Calibration folding libaom's rdmult scale onto this crate's (proxy-bits, SSE)
 /// axis, fixed so `mode_lambda_q` matches the legacy `MODE_LAMBDA0*ac_q^2` at the
 /// q=128 reference. Only the *shape* changes, not the reference operating point.
-pub(crate) const MODE_AOM_CALIB: f64 = 0.009005174719460433;
+pub(crate) const MODE_AOM_CALIB: f32 = 0.009005174719460433;
 
 /// Mode-search lambda with libaom's key-frame rdmult *shape*
 /// `dc_q^2 * (3.3 + 0.0015*dc_q)` (av1/encoder/rd.c KF path) instead of the
@@ -249,18 +241,18 @@ pub(crate) const MODE_AOM_CALIB: f64 = 0.009005174719460433;
 /// coefficients where libaom keeps them; this tracks libaom's q-dependence so
 /// equal-SSIM decisions match. `dc_q` is the bit-depth-correct DC dequant step.
 #[inline]
-pub(crate) fn mode_lambda_q(dc_q: f64) -> f64 {
+pub(crate) fn mode_lambda_q(dc_q: f32) -> f32 {
     MODE_AOM_CALIB * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
 }
 
 #[inline]
-pub(crate) fn rate_cost(lambda: f64, rate: f32) -> f64 {
-    lambda * rate as f64
+pub(crate) fn rate_cost(lambda: f32, rate: f32) -> f32 {
+    lambda * rate
 }
 
 #[inline]
-pub(crate) fn rd_cost_i64(distortion: i64, lambda: f64, rate: f32) -> f64 {
-    distortion as f64 + rate_cost(lambda, rate)
+pub(crate) fn rd_cost_i64(distortion: i64, lambda: f32, rate: f32) -> f32 {
+    distortion as f32 + rate_cost(lambda, rate)
 }
 
 /// Rough extra bits to *signal* a non-DC luma mode (DC is the most probable
@@ -282,7 +274,7 @@ mod tests {
     use crate::quant::{ac_q, dc_q};
 
     // libaom av1/encoder/rd.c KF path oracle: q=dc_quant, rdmult=q^2*(3.3+0.0015q).
-    fn aom_kf_rdmult(dcq: f64) -> f64 {
+    fn aom_kf_rdmult(dcq: f32) -> f32 {
         dcq * dcq * (3.3 + 0.0015 * dcq)
     }
 
@@ -292,16 +284,16 @@ mod tests {
         // qindex range (single constant), unlike the old ac_q^2 law.
         let mut ratios = vec![];
         for q in (16u8..=240).step_by(8) {
-            let dcq = dc_q(q, 8) as f64;
+            let dcq = dc_q(q, 8) as f32;
             let lam = mode_lambda_q(dcq);
             ratios.push(lam / aom_kf_rdmult(dcq));
         }
         let (lo, hi) = (
-            ratios.iter().cloned().fold(f64::MAX, f64::min),
-            ratios.iter().cloned().fold(0.0, f64::max),
+            ratios.iter().cloned().fold(f32::MAX, f32::min),
+            ratios.iter().cloned().fold(0.0, f32::max),
         );
         assert!(
-            (hi - lo) / hi < 1e-9,
+            (hi - lo) / hi < 1e-5,
             "lambda not proportional to aom rdmult"
         );
     }
@@ -309,8 +301,8 @@ mod tests {
     #[test]
     fn reference_q128_preserved() {
         // Calibration keeps the q=128 operating point equal to the legacy law.
-        let acq = ac_q(128, 8) as f64;
-        let dcq = dc_q(128, 8) as f64;
+        let acq = ac_q(128, 8) as f32;
+        let dcq = dc_q(128, 8) as f32;
         let legacy = MODE_LAMBDA0 * acq * acq;
         assert!((mode_lambda_q(dcq) - legacy).abs() / legacy < 1e-6);
     }
@@ -319,8 +311,8 @@ mod tests {
     fn old_law_diverged_from_aom() {
         // Guard: the old ac_q^2 law was NOT proportional to aom (that was the bug).
         let r = |q: u8| {
-            let acq = ac_q(q, 8) as f64;
-            (MODE_LAMBDA0 * acq * acq) / aom_kf_rdmult(dc_q(q, 8) as f64)
+            let acq = ac_q(q, 8) as f32;
+            (MODE_LAMBDA0 * acq * acq) / aom_kf_rdmult(dc_q(q, 8) as f32)
         };
         assert!(
             r(224) / r(32) > 1.5,

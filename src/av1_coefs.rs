@@ -75,20 +75,11 @@ pub fn encode_coefs(
 ) -> u8 {
     let ci = chroma as usize;
     // find eob (last nonzero scan index)
-    let mut eob_idx: i32 = -1;
-    for i in (0..16).rev() {
-        if lev[SCAN_4X4[i]] != 0 {
-            eob_idx = i as i32;
-            break;
-        }
-    }
-    // all_zero / txb_skip
-    let all_skip = eob_idx < 0;
-    w.symbol(all_skip as u32, &C::C_SKIP[skip_ctx]);
-    if all_skip {
+    let Some(eob) = SCAN_4X4.iter().rposition(|&rc| lev[rc as usize] != 0) else {
+        w.symbol(1, &C::C_SKIP[skip_ctx]);
         return 0x40;
-    }
-    let eob = eob_idx as usize; // scan index of last nonzero
+    };
+    w.symbol(0, &C::C_SKIP[skip_ctx]);
 
     // ---- eob position coding ----
     let eob_bin: usize = if eob < 2 {
@@ -112,7 +103,7 @@ pub fn encode_coefs(
 
     if eob > 0 {
         // ---- EOB coefficient ----
-        let rc = SCAN_4X4[eob];
+        let rc = SCAN_4X4[eob] as usize;
         let x = rc >> 2;
         let y = rc & 3;
         let m = lev[rc].unsigned_abs();
@@ -133,7 +124,7 @@ pub fn encode_coefs(
         // ---- AC loop i = eob-1 .. 1 ----
         let mut i = eob as i32 - 1;
         while i > 0 {
-            let rc_i = SCAN_4X4[i as usize];
+            let rc_i = SCAN_4X4[i as usize] as usize;
             let x = rc_i >> 2;
             let y = rc_i & 3;
             let base = x * STRIDE + y;
@@ -201,7 +192,8 @@ pub fn encode_coefs(
     }
 
     // AC signs in increasing scan-index order (i = 1..=eob, nonzero only)
-    for &rc in SCAN_4X4[1..=eob].iter() {
+    for &rc32 in SCAN_4X4[1..=eob].iter() {
+        let rc = rc32 as usize;
         let v = lev[rc];
         if v == 0 {
             continue;

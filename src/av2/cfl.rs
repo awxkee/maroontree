@@ -27,7 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::av2::helpers::{coeff_rate_f32, dc_pred, pixel_sse_rounded, pixel_to_i32, sq_diff_u64};
+use crate::av2::helpers::{
+    cfl_sse_i32, coeff_rate_f32, dc_pred, dc_pred_cfl_subsampled, pixel_sse_rounded,
+};
 use crate::av2::mhccp;
 use crate::av2::proj::Basis;
 use crate::av2::{itx422, tables};
@@ -39,20 +41,65 @@ pub(crate) const CFL_ALPHABET_SIZE: u8 = 8; // magnitude indices 0..=7 -> |alpha
 /// Branchless round-half-away-from-zero by `2^n`, bit-identical to
 /// `if v < 0 { -round_pow2(-v, n) } else { round_pow2(v, n) }`.
 #[inline(always)]
-fn round_pow2_signed(v: i64, n: u32) -> i64 {
-    let s = v >> 63;
+fn round_pow2_signed(v: i32, n: u32) -> i32 {
+    let s = v >> 31;
     let av = (v ^ s) - s;
-    let q = (av + (1i64 << (n - 1))) >> n;
+    let q = (av + (1i32 << (n - 1))) >> n;
     (q ^ s) - s
+}
+
+/// Minimum variance (in Q0 luma², i.e. plain 8-bit luma units squared) that the
+/// MHCCP derivation reference region must have for the cross-component filter to
+/// be numerically well-conditioned.
+///
+/// MHCCP solves a 3-tap least-squares system whose columns are the luma tap, a
+/// non-linear luma term and a constant. When the reference luma is nearly
+/// constant (flat sky, smooth gradients) all three columns are ~constant, the
+/// system is near-singular, and the solved filter acquires an enormous gain.
+/// The encoder derives that filter from its own f32 reconstruction while the
+/// decoder derives from its integer reconstruction; the sub-LSB reference
+/// difference is then amplified into a catastrophically different (saturated)
+/// chroma prediction — the 4:4:4 low-quality "colored block" collapse. An
+/// encoder-side guard on the solved *parameters* cannot fix this: the decoder
+/// re-derives independently and can explode even when the encoder's params look
+/// tame. The reliable, drift-robust criterion is the *input* conditioning: the
+/// reference luma variance, which both sides see as ~equal (flat ± 1 LSB is
+/// still flat). Skipping MHCCP on low-variance blocks costs nothing — DC
+/// prediction already handles flat chroma — and removes the singular solves the
+/// decoder would otherwise explode on.
+const MHCCP_MIN_REF_VAR: f64 = 64.0;
+
+/// Population variance of the luma samples in the MHCCP derivation region — the
+/// L-shaped `above`/`left` border of `l`, matching the sample set
+/// [`mhccp::derive_params`] accumulates (interior `1..ref-1`, excluding the
+/// block body `i >= left && j >= above`).
+fn mhccp_ref_luma_variance(l: &mhccp::MhccpRefBuf, above: usize, left: usize) -> f64 {
+    let stride = mhccp::MHCCP_REF_STRIDE;
+    let mut sum = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut n = 0.0f64;
+    for j in 1..l.ref_height.saturating_sub(1) {
+        for i in 1..l.ref_width.saturating_sub(1) {
+            if i >= left && j >= above {
+                continue;
+            }
+            // Q3 luma -> Q0, matching the `>> 3` the derivation applies.
+            let v = (l.data[j * stride + i] >> 3) as f64;
+            sum += v;
+            sum2 += v * v;
+            n += 1.0;
+        }
+    }
+    if n < 1.0 {
+        return f64::INFINITY;
+    }
+    (sum2 - sum * sum / n) / n
 }
 
 /// avm `get_scaled_luma_q0`: round(alpha_q3 * ac_q3, 6 + CFL_ADD_BITS_ALPHA).
 #[inline(always)]
 pub(crate) fn scaled_luma_q0(alpha_q3: i32, ac_q3: i32) -> i32 {
-    round_pow2_signed(
-        (alpha_q3 as i64) * (ac_q3 as i64),
-        6 + CFL_ADD_BITS_ALPHA as u32,
-    ) as i32
+    round_pow2_signed(alpha_q3 * ac_q3, 6 + CFL_ADD_BITS_ALPHA as u32)
 }
 
 #[inline(always)]
@@ -124,19 +171,34 @@ pub(crate) fn subsample_luma_q3(
     out
 }
 
-#[allow(clippy::too_many_arguments, dead_code)]
-pub(crate) fn subsample_luma_ring_q3(
-    recy: &[f32],
-    pw: usize,
-    ly: usize,
-    lx: usize,
-    cw: usize,
-    ch: usize,
-    ssx: bool,
-    ssy: bool,
-    have_top: bool,
-    have_left: bool,
-) -> Vec<i32> {
+/// Luma-plane location, chroma dimensions and causal availability for a Q3
+/// subsampled reference ring.
+#[derive(Clone, Copy)]
+pub(crate) struct LumaRingSpec {
+    pub(crate) stride: usize,
+    pub(crate) luma_y: usize,
+    pub(crate) luma_x: usize,
+    pub(crate) chroma_width: usize,
+    pub(crate) chroma_height: usize,
+    pub(crate) subsample_x: bool,
+    pub(crate) subsample_y: bool,
+    pub(crate) have_top: bool,
+    pub(crate) have_left: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) fn subsample_luma_ring_q3(recy: &[f32], spec: &LumaRingSpec) -> Vec<i32> {
+    let LumaRingSpec {
+        stride: pw,
+        luma_y: ly,
+        luma_x: lx,
+        chroma_width: cw,
+        chroma_height: ch,
+        subsample_x: ssx,
+        subsample_y: ssy,
+        have_top,
+        have_left,
+    } = *spec;
     let sx = ssx as usize;
     let sy = ssy as usize;
     let stride = cw + 1;
@@ -164,7 +226,7 @@ pub(crate) fn subsample_luma_ring_q3(
             ring[idx] = q3;
         }
     }
-    // Edge replication when neighbours are unavailable.
+    // Edge replication when neighbors are unavailable.
     if !have_top {
         for x in 0..=cw {
             ring[x] = ring[stride + x];
@@ -182,8 +244,8 @@ pub(crate) fn subsample_luma_ring_q3(
 pub(crate) fn compute_ac(recon_q3: &[i32], w: usize, h: usize) -> (Vec<i32>, i32) {
     let npel = w * h;
     let log2 = npel.trailing_zeros();
-    let sum: i64 = recon_q3.iter().map(|&v| v as i64).sum::<i64>() + ((npel as i64) >> 1);
-    let avg = (sum >> log2) as i32;
+    let sum: i32 = recon_q3.iter().copied().sum::<i32>() + ((npel as i32) >> 1);
+    let avg = sum >> log2;
     (recon_q3.iter().map(|&v| v - avg).collect(), avg)
 }
 
@@ -195,52 +257,15 @@ pub(crate) fn cfl_predict(dc: i32, ac: &[i32], alpha_q3: i32, bitdepth: i32) -> 
         .collect()
 }
 
-/// Pick the per-plane alpha (sign, magnitude index) minimising SSE of the CfL
+/// Pick the per-plane alpha (sign, magnitude index) minimizing SSE of the CfL
 /// prediction vs. the chroma source. Returns `(sign, mag, sse)`; `sign == 0` (alpha
 /// zero, i.e. flat DC) is the baseline. Encoder-side only — any choice is valid as
-/// long as it is signalled; the decoder reproduces the prediction deterministically.
-pub(crate) fn pick_alpha_plane(src: &[i32], dc: i32, ac: &[i32], bitdepth: i32) -> (u8, u8, u64) {
+/// long as it is signaled; the decoder reproduces the prediction deterministically.
+pub(crate) fn pick_alpha_plane(src: &[i32], dc: i32, ac: &[i32], bitdepth: i32) -> (u8, u8, f32) {
     let maxv = (1i32 << bitdepth) - 1;
-    let dc_c = dc.clamp(0, maxv);
-    // SSE of the CfL prediction for a fixed alpha. i32-only inner math (see
-    // `scaled_luma_q0_i32`). For <=8-bit the squared-error sum is bounded by
-    // `64*64*255^2 < 2^31`, so an i32 accumulator is safe and the loop autovectorises;
-    // higher bit depths fall back to an i64 accumulator. Both are bit-identical.
-    let sse_of = |alpha_q3: i32| -> u64 {
-        if bitdepth <= 8 {
-            let mut sse: i32 = 0;
-            for (&s, &a) in src.iter().zip(ac.iter()) {
-                let p = (dc + scaled_luma_q0_i32(alpha_q3, a)).clamp(0, maxv);
-                let d = s - p;
-                sse += d * d;
-            }
-            sse as u64
-        } else {
-            let mut sse: i64 = 0;
-            for (&s, &a) in src.iter().zip(ac.iter()) {
-                let p = (dc + scaled_luma_q0_i32(alpha_q3, a)).clamp(0, maxv);
-                let d = (s - p) as i64;
-                sse += d * d;
-            }
-            sse as u64
-        }
-    };
-    // alpha == 0 baseline (prediction is flat dc)
-    let base_sse = if bitdepth <= 8 {
-        let mut s: i32 = 0;
-        for &v in src {
-            let d = v - dc_c;
-            s += d * d;
-        }
-        s as u64
-    } else {
-        let mut s: i64 = 0;
-        for &v in src {
-            let d = (v - dc_c) as i64;
-            s += d * d;
-        }
-        s as u64
-    };
+    let sse_of = |alpha_q3: i32| cfl_sse_i32(src, ac, alpha_q3, dc, maxv);
+    // alpha == 0 baseline (prediction is flat clipped DC).
+    let base_sse = sse_of(0);
     let mut best = (0u8, 0u8, base_sse);
     for sign in [1u8, 2u8] {
         for mag in 0u8..CFL_ALPHABET_SIZE {
@@ -304,6 +329,7 @@ pub(crate) fn cfl_sign_v(js: u8) -> u8 {
 /// The resolved CfL choice for a chroma block: joint sign, per-plane magnitude indices,
 /// alpha-cdf contexts, and the two prediction blocks (clipped, ready as reconstruction
 /// bases). `sign_*`/`mag_*` are encoder bookkeeping; the bitstream carries `js` + mags.
+#[derive(Clone)]
 pub(crate) struct CflChoice {
     pub(crate) js: u8,
     pub(crate) sign_u: u8,
@@ -327,10 +353,6 @@ pub(crate) struct MhccpDecision {
     pub(crate) size_group: u8,
 }
 
-/// Build the best-alpha CfL candidate for a chroma block: per-plane alpha (sign,mag) by
-/// SSE, resolved into joint sign + contexts + the two prediction blocks. Returns `None`
-/// when both planes prefer flat DC (no CfL). The DC-vs-CfL rate-distortion decision is the
-/// caller's job (it has the transform basis to measure real reconstructed cost).
 pub(crate) fn cfl_candidate(
     src_u: &[i32],
     src_v: &[i32],
@@ -383,9 +405,9 @@ pub(crate) fn cfl_avg_l(
     let have_left = sb_x > 0;
     let ss_h = if cw > 32 { 2 } else { 1 };
     let ss_v = if ch > 32 { 2 } else { 1 };
-    let l = |y: usize, x: usize| -> i64 { recy[y * pw + x].fast_round() as i64 };
-    let mut sum: i64 = 0;
-    let mut count: i64 = 0;
+    let l = |y: usize, x: usize| -> i32 { recy[y * pw + x].fast_round() as i32 };
+    let mut sum: i32 = 0;
+    let mut count: i32 = 0;
     if have_top {
         let mut kk = 0;
         while kk < cw {
@@ -429,7 +451,7 @@ pub(crate) fn cfl_avg_l(
         }
     }
     if count > 0 {
-        let val = ((sum + count / 2) / count) as i32;
+        let val = (sum + count / 2) / count;
         let max_v = (1 << (bd + 3)) - 1;
         val.min(max_v)
     } else {
@@ -437,7 +459,34 @@ pub(crate) fn cfl_avg_l(
     }
 }
 
-/// Reconstructed-neighbour context needed to evaluate MHCCP for a chroma block.
+/// Coded tile/frame extents used by MHCCP reference construction. The plane
+/// allocations are usually padded to whole superblocks, but samples beyond these
+/// extents are not causal neighbors from the decoder's point of view.
+#[derive(Clone, Copy)]
+pub(crate) struct MhccpBounds {
+    pub(crate) luma_width: usize,
+    pub(crate) luma_height: usize,
+    pub(crate) chroma_width: usize,
+    pub(crate) chroma_height: usize,
+}
+
+impl MhccpBounds {
+    /// Build bounds from the tile-local display dimensions. AVM's block grid is
+    /// 8-pixel aligned; chroma extents follow the format subsampling.
+    #[inline]
+    pub(crate) fn from_luma(width: usize, height: usize, ssx: bool, ssy: bool) -> Self {
+        let luma_width = (width + 7) & !7;
+        let luma_height = (height + 7) & !7;
+        Self {
+            luma_width,
+            luma_height,
+            chroma_width: luma_width >> (ssx as usize),
+            chroma_height: luma_height >> (ssy as usize),
+        }
+    }
+}
+
+/// Reconstructed-neighbor context needed to evaluate MHCCP for a chroma block.
 /// `recy` is the reconstructed luma plane (Q0, stride `pw`), `recu`/`recv` the
 /// reconstructed chroma planes (Q0, stride `pcw`). `(ly, lx)` is the block's
 /// luma top-left, `(cy, cx)` its chroma top-left. `ssx`/`ssy` are the format
@@ -450,6 +499,7 @@ pub(crate) struct MhccpCtx<'a> {
     pub(crate) recu: &'a [f32],
     pub(crate) recv: &'a [f32],
     pub(crate) pcw: usize,
+    pub(crate) bounds: MhccpBounds,
     pub(crate) ly: usize,
     pub(crate) lx: usize,
     pub(crate) cy: usize,
@@ -460,6 +510,14 @@ pub(crate) struct MhccpCtx<'a> {
     pub(crate) have_left: bool,
     pub(crate) is_top_sb_boundary: bool,
     pub(crate) size_group: u8,
+    /// SB-relative (16x16) luma-mi coded mask: `coded[r*16 + c] != 0` when that
+    /// luma mi has already been reconstructed. Mirrors the decoder's
+    /// `xd->is_mi_coded`, which gates MHCCP's top-right / bottom-left reference
+    /// extension (`has_top_right` / `has_bottom_left`). The interior split emits
+    /// leaves in VERT-then-HORZ order, so a leaf's top-right neighbor is often
+    /// coded LATER and its bottom-left neighbor EARLIER — the opposite of raster
+    /// order. An all-zero (or empty) mask means "no interior neighbor coded yet".
+    pub(crate) coded: &'a [u8],
 }
 
 /// Build the AVM-layout luma (Q3) reference buffer for a chroma block, matching
@@ -492,12 +550,14 @@ fn build_luma_ref(
     // chroma (cx-left, cy-above) -> luma ((cx-left)<<sx, (cy-above)<<sy)).
     let lx0 = ctx.lx as i32 - ((left as i32) << sx);
     let ly0 = ctx.ly as i32 - ((above as i32) << sy);
-    let pw = ctx.pw as i32;
-    let ph = (ctx.recy.len() / ctx.pw) as i32;
+    let stride = ctx.pw as i32;
+    let plane_height = ctx.recy.len() / ctx.pw;
+    let bound_width = ctx.bounds.luma_width.min(ctx.pw).max(1) as i32;
+    let bound_height = ctx.bounds.luma_height.min(plane_height).max(1) as i32;
     let lp = |y: i32, x: i32| -> i32 {
-        let yy = y.clamp(0, ph - 1);
-        let xx = x.clamp(0, pw - 1);
-        ctx.recy[(yy * pw + xx) as usize].fast_round() as i32
+        let yy = y.clamp(0, bound_height - 1);
+        let xx = x.clamp(0, bound_width - 1);
+        ctx.recy[(yy * stride + xx) as usize].fast_round() as i32
     };
     // AVM `av2_mhccp_implicit_fetch_neighbor_luma_420`: near the superblock top
     // boundary, only one line above is available, so the padding rows in the above
@@ -536,30 +596,51 @@ fn build_luma_ref(
     buf
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_chroma_ref(
-    rec: &[f32],
-    pcw: usize,
-    cy: usize,
-    cx: usize,
+/// Plane bounds, block geometry and causal extensions for one MHCCP chroma
+/// reference buffer.
+#[derive(Clone, Copy)]
+struct ChromaRefSpec {
+    stride: usize,
+    bound_width: usize,
+    bound_height: usize,
+    y: usize,
+    x: usize,
     width: usize,
     height: usize,
     above: usize,
     left: usize,
-    tr_ext: usize,
-    bl_ext: usize,
+    top_right_extension: usize,
+    bottom_left_extension: usize,
     is_top_sb: bool,
-) -> mhccp::MhccpRefBuf {
+}
+
+fn build_chroma_ref(rec: &[f32], spec: &ChromaRefSpec) -> mhccp::MhccpRefBuf {
+    let ChromaRefSpec {
+        stride: pcw,
+        bound_width,
+        bound_height,
+        y: cy,
+        x: cx,
+        width,
+        height,
+        above,
+        left,
+        top_right_extension: tr_ext,
+        bottom_left_extension: bl_ext,
+        is_top_sb,
+    } = *spec;
     let ref_width = left + width + tr_ext;
     let ref_height = above + height + bl_ext;
     let mut buf =
         mhccp::MhccpRefBuf::new(ref_width, ref_height, above, left, width, height, is_top_sb);
-    let pw = pcw as i32;
-    let ph = (rec.len() / pcw) as i32;
+    let stride = pcw as i32;
+    let plane_height = rec.len() / pcw;
+    let bound_width = bound_width.min(pcw).max(1) as i32;
+    let bound_height = bound_height.min(plane_height).max(1) as i32;
     let cp = |y: i32, x: i32| -> i32 {
-        let yy = y.clamp(0, ph - 1);
-        let xx = x.clamp(0, pw - 1);
-        rec[(yy * pw + xx) as usize].round() as i32
+        let yy = y.clamp(0, bound_height - 1);
+        let xx = x.clamp(0, bound_width - 1);
+        rec[(yy * stride + xx) as usize].round() as i32
     };
     // buffer (0,0) maps to chroma (cx-left, cy-above)
     let x0 = cx as i32 - left as i32;
@@ -586,31 +667,72 @@ fn build_chroma_ref(
     buf
 }
 
+/// Transform, quantizer and distortion-rate state shared by chroma mode trials.
+#[derive(Clone, Copy)]
+pub(crate) struct ChromaRdSpec<'a> {
+    pub(crate) basis: &'a Basis,
+    pub(crate) qstep: i32,
+    pub(crate) lambda: f32,
+    pub(crate) bit_depth: i32,
+}
+
+/// Source/reconstruction geometry and DC state for a classic CfL decision.
+#[derive(Clone, Copy)]
+pub(crate) struct CflDecisionInput<'a> {
+    pub(crate) reconstructed_luma: &'a [f32],
+    pub(crate) luma_stride: usize,
+    pub(crate) luma_y: usize,
+    pub(crate) luma_x: usize,
+    pub(crate) source_u: &'a [f32],
+    pub(crate) source_v: &'a [f32],
+    pub(crate) dc_u: f32,
+    pub(crate) dc_v: f32,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) subsample_x: bool,
+    pub(crate) subsample_y: bool,
+    pub(crate) luma_average_q3: i32,
+}
+
+/// Source and predictor pairs scored under one chroma RD configuration.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictorScoreInput<'a> {
+    pub(crate) source_u: &'a [f32],
+    pub(crate) source_v: &'a [f32],
+    pub(crate) predictor_u: &'a [i32],
+    pub(crate) predictor_v: &'a [i32],
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) mode_bits: f32,
+}
+
 /// `cw*ch` chroma source blocks (`src_u`/`src_v`), the DC intra predictions (`dc_u_f`/
 /// `dc_v_f`) and the neighbor luma DC (`avg_l` from `cfl_avg_l`). Builds the AC from the
 /// block luma (subsampled per `ssx`/`ssy`) minus `avg_l`, forms the best-alpha candidate,
 /// then does real rate-distortion: transform/quantise/reconstruct both DC and CfL per plane
 /// and pick CfL only when it lowers J = SSE + lambda*bits. `chroma` is the format's basis.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cfl_decide(
-    recy: &[f32],
-    pw: usize,
-    sb_y: usize,
-    sb_x: usize,
-    src_u: &[f32],
-    src_v: &[f32],
-    dc_u_f: f32,
-    dc_v_f: f32,
-    cw: usize,
-    ch: usize,
-    ssx: bool,
-    ssy: bool,
-    avg_l: i32,
-    bd: i32,
-    chroma: &Basis,
-    qstep: i32,
-    lambda: f64,
-) -> Option<CflChoice> {
+pub(crate) fn cfl_decide(input: &CflDecisionInput<'_>, rd: &ChromaRdSpec<'_>) -> Option<CflChoice> {
+    let CflDecisionInput {
+        reconstructed_luma: recy,
+        luma_stride: pw,
+        luma_y: sb_y,
+        luma_x: sb_x,
+        source_u: src_u,
+        source_v: src_v,
+        dc_u: dc_u_f,
+        dc_v: dc_v_f,
+        width: cw,
+        height: ch,
+        subsample_x: ssx,
+        subsample_y: ssy,
+        luma_average_q3: avg_l,
+    } = *input;
+    let ChromaRdSpec {
+        basis: chroma,
+        qstep,
+        lambda,
+        bit_depth: bd,
+    } = *rd;
     let n = cw * ch;
     let lw = cw << (ssx as usize);
     let lh = ch << (ssy as usize);
@@ -638,8 +760,8 @@ pub(crate) fn cfl_decide(
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
     let rec_dc_u = itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
     let rec_dc_v = itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
-    let j_dc = (pixel_sse_rounded(src_u, &rec_dc_u) + pixel_sse_rounded(src_v, &rec_dc_v)) as f64
-        + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v)) as f64;
+    let j_dc = (pixel_sse_rounded(src_u, &rec_dc_u) + pixel_sse_rounded(src_v, &rec_dc_v))
+        + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v));
     let res_cf_u: Vec<f32> = src_u[..n]
         .iter()
         .zip(cand.pred_u[..n].iter())
@@ -658,28 +780,30 @@ pub(crate) fn cfl_decide(
         + 3.0
         + if cand.sign_u != 0 { 3.0 } else { 0.0 }
         + if cand.sign_v != 0 { 3.0 } else { 0.0 };
-    let j_cfl = (pixel_sse_rounded(src_u, &rec_cf_u) + pixel_sse_rounded(src_v, &rec_cf_v)) as f64
-        + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f64 + alpha_bits);
+    let j_cfl = (pixel_sse_rounded(src_u, &rec_cf_u) + pixel_sse_rounded(src_v, &rec_cf_v)) as f32
+        + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f32 + alpha_bits);
     if j_cfl < j_dc { Some(cand) } else { None }
 }
 
 /// Score a chroma predictor pair with the same J metric used by `cfl_decide`
 /// (SSE + lambda*coeff_bits, excluding mode bits which the caller adds). Lets the
 /// caller obtain the incumbent CfL/DC J to compare against MHCCP on equal terms.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn score_predictor(
-    src_u: &[f32],
-    src_v: &[f32],
-    pred_u: &[i32],
-    pred_v: &[i32],
-    cw: usize,
-    ch: usize,
-    bd: i32,
-    chroma: &Basis,
-    qstep: i32,
-    lambda: f64,
-    mode_bits: f64,
-) -> f64 {
+pub(crate) fn score_predictor(input: &PredictorScoreInput<'_>, rd: &ChromaRdSpec<'_>) -> f32 {
+    let PredictorScoreInput {
+        source_u: src_u,
+        source_v: src_v,
+        predictor_u: pred_u,
+        predictor_v: pred_v,
+        width: cw,
+        height: ch,
+        mode_bits,
+    } = *input;
+    let ChromaRdSpec {
+        basis: chroma,
+        qstep,
+        lambda,
+        bit_depth: bd,
+    } = *rd;
     let n = cw * ch;
     let scan = &tables::SCAN;
     let res_u: Vec<f32> = src_u[..n]
@@ -696,8 +820,8 @@ pub(crate) fn score_predictor(
     let lev_v = chroma.project(&res_v, 0.0);
     let rec_u = itx422::reconstruct_chroma_cfl(pred_u, &lev_u, qstep, scan, cw, ch, bd);
     let rec_v = itx422::reconstruct_chroma_cfl(pred_v, &lev_v, qstep, scan, cw, ch, bd);
-    (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v)) as f64
-        + lambda * ((coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v)) as f64 + mode_bits)
+    (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v))
+        + lambda * ((coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v)) + mode_bits)
 }
 
 /// Map a block width/height in 4-sample units to the AVM `BLOCK_SIZE` enum
@@ -778,34 +902,42 @@ pub(crate) fn mhccp_size_group_32() -> u8 {
 
 /// MHCCP rate-distortion decision. Evaluates the three filter directions
 /// (`mh_dir` 0=center / 1=top / 2=left), each solving the 3-parameter model from
-/// the causal neighbour ring, reconstructing both chroma planes, and scoring
+/// the causal neighbor ring, reconstructing both chroma planes, and scoring
 /// J = SSE + lambda*(coeff_bits + mode_bits). Returns a `CflChoice` carrying the
 /// MHCCP predictor when the best direction beats `baseline_j` (the J of the
 /// incumbent — DC or classic CfL). Mirrors the `CFL_MULTI_PARAM` arm of avm's
 /// chroma intra RD loop.
-///
-/// `mode_bits_extra` is the approximate signaling delta of choosing MHCCP over
-/// the incumbent: the `cfl_mhccp_switch` symbol plus the 3-ary `filter_dir`
-/// symbol, minus the alpha/index bits the incumbent would have spent. It is
-/// supplied by a small model calibrated against SSIMULACRA2 (see `MHCCP_*` in
-/// mod.rs) so the tool is only taken when it actually helps perceptually.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn mhccp_decide(
-    ctx: &MhccpCtx,
-    src_u: &[f32],
-    src_v: &[f32],
-    cw: usize,
-    ch: usize,
-    bd: i32,
-    chroma: &Basis,
-    qstep: i32,
-    lambda: f64,
-    scan: &[u16],
-    baseline_j: f64,
-) -> Option<CflChoice> {
+/// Chroma source block, transform state and incumbent cost for one MHCCP trial.
+#[derive(Clone, Copy)]
+pub(crate) struct MhccpDecisionInput<'a> {
+    pub(crate) source_u: &'a [f32],
+    pub(crate) source_v: &'a [f32],
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) rd: ChromaRdSpec<'a>,
+    pub(crate) scan: &'a [u16],
+    pub(crate) baseline_j: f32,
+}
+
+pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Option<CflChoice> {
+    let MhccpDecisionInput {
+        source_u: src_u,
+        source_v: src_v,
+        width: cw,
+        height: ch,
+        rd,
+        scan,
+        baseline_j,
+    } = *input;
+    let ChromaRdSpec {
+        basis: chroma,
+        qstep,
+        lambda,
+        bit_depth: bd,
+    } = rd;
     let n = cw * ch;
 
-    // avm above_lines/left_lines: (LINE_NUM+1) chroma lines when the neighbour is
+    // avm above_lines/left_lines: (LINE_NUM+1) chroma lines when the neighbor is
     // available (interior blocks). At the top-of-superblock boundary avm uses the
     // same count but with a one-line padding offset handled inside the builders.
     let line_num1 = mhccp::LINE_NUM + 1;
@@ -814,47 +946,123 @@ pub(crate) fn mhccp_decide(
     if above == 0 && left == 0 {
         return None; // no causal support -> MHCCP degenerates
     }
+    // Native edge partitions may code a transform whose nominal rectangle extends
+    // beyond the tile's coded plane. The current MHCCP model does not reproduce the
+    // decoder's clipped partial-block syntax bit-exactly, so keep this optional mode
+    // off for those leaves. The DC fallback below uses explicit edge replication.
+    if ctx.cx.saturating_add(cw) > ctx.bounds.chroma_width
+        || ctx.cy.saturating_add(ch) > ctx.bounds.chroma_height
+    {
+        return None;
+    }
 
-    let pch = ctx.recu.len() / ctx.pcw;
     let sx = ctx.ssx as usize;
     let sy = ctx.ssy as usize;
+    // Coding-order availability of the top-right / bottom-left reference blocks,
+    // mirroring the decoder's `has_top_right` / `has_bottom_left` general case
+    // (checks `is_mi_coded` for the neighbor luma mi within the SB). Indices are
+    // SB-relative luma mi; leaf luma mi size = chroma size upsampled.
+    const SB_MI: usize = 16;
+    let sb_r = ((ctx.ly & 63) >> 2) as i32; // SB-relative luma mi row of the leaf
+    let sb_c = ((ctx.lx & 63) >> 2) as i32;
+    let w_mi = ((cw << sx) >> 2) as i32; // leaf luma width  in mi
+    let h_mi = ((ch << sy) >> 2) as i32; // leaf luma height in mi
+    let coded_at = |r: i32, c: i32| -> bool {
+        r >= 0
+            && c >= 0
+            && (r as usize) < SB_MI
+            && (c as usize) < SB_MI
+            && ctx
+                .coded
+                .get(r as usize * SB_MI + c as usize)
+                .copied()
+                .unwrap_or(0)
+                != 0
+    };
+    // has_top_right: neighbor luma mi at (sb_r-1, sb_c+w_mi).
+    let has_tr = ctx.have_top && {
+        let tr_row = sb_r - 1;
+        let tr_col = sb_c + w_mi;
+        if tr_row < 0 {
+            true // top-right lies in the (already coded) SB row above
+        } else if tr_col >= SB_MI as i32 {
+            false // right of this SB — not yet coded
+        } else {
+            coded_at(tr_row, tr_col)
+        }
+    };
+    // has_bottom_left: neighbor luma mi at (sb_r+h_mi, sb_c-1).
+    let has_bl = ctx.have_left && {
+        let bl_row = sb_r + h_mi;
+        let bl_col = sb_c - 1;
+        if bl_col < 0 {
+            // Bottom-left lies in the SB column to the left. Available only if the
+            // block does not already reach the SB's bottom edge.
+            ((sb_r + h_mi) as usize) < SB_MI
+        } else if bl_row >= SB_MI as i32 {
+            false // below this SB — not yet coded
+        } else {
+            coded_at(bl_row, bl_col)
+        }
+    };
     // AVM caps the reference region at 128 luma samples (64 chroma for 4:2:0)
-    // before subsampling; `ref_width = min(128, left+width+top_right) >> sub_x`.
-    let tr_avail = ctx.have_top && cw > 4 && ctx.cx + 2 * cw <= ctx.pcw;
-    let tr_ext = if tr_avail {
+    // before subsampling; also clamp to the coded tile extent.
+    let tr_ext = if has_tr && cw > 4 {
         let cap_c = 128usize >> sx;
-        cap_c.saturating_sub(left + cw)
+        let cap_room = cap_c.saturating_sub(left + cw);
+        let tile_room = ctx
+            .bounds
+            .chroma_width
+            .saturating_sub(ctx.cx.saturating_add(cw));
+        cap_room.min(tile_room).min(cw)
     } else {
         0
     };
-    let _ = (pch, sy);
-    let bl_ext = 0usize; // bottom-left block is not yet coded in raster order
+    let bl_ext = if has_bl && ch > 4 {
+        let cap_c = 128usize >> sy;
+        let cap_room = cap_c.saturating_sub(above + ch);
+        let tile_room = ctx
+            .bounds
+            .chroma_height
+            .saturating_sub(ctx.cy.saturating_add(ch));
+        cap_room.min(tile_room).min(ch)
+    } else {
+        0
+    };
     let luma_ref = build_luma_ref(ctx, cw, ch, above, left, tr_ext, bl_ext);
     let cref_u = build_chroma_ref(
         ctx.recu,
-        ctx.pcw,
-        ctx.cy,
-        ctx.cx,
-        cw,
-        ch,
-        above,
-        left,
-        tr_ext,
-        bl_ext,
-        ctx.is_top_sb_boundary,
+        &ChromaRefSpec {
+            stride: ctx.pcw,
+            bound_width: ctx.bounds.chroma_width,
+            bound_height: ctx.bounds.chroma_height,
+            y: ctx.cy,
+            x: ctx.cx,
+            width: cw,
+            height: ch,
+            above,
+            left,
+            top_right_extension: tr_ext,
+            bottom_left_extension: bl_ext,
+            is_top_sb: ctx.is_top_sb_boundary,
+        },
     );
     let cref_v = build_chroma_ref(
         ctx.recv,
-        ctx.pcw,
-        ctx.cy,
-        ctx.cx,
-        cw,
-        ch,
-        above,
-        left,
-        tr_ext,
-        bl_ext,
-        ctx.is_top_sb_boundary,
+        &ChromaRefSpec {
+            stride: ctx.pcw,
+            bound_width: ctx.bounds.chroma_width,
+            bound_height: ctx.bounds.chroma_height,
+            y: ctx.cy,
+            x: ctx.cx,
+            width: cw,
+            height: ch,
+            above,
+            left,
+            top_right_extension: tr_ext,
+            bottom_left_extension: bl_ext,
+            is_top_sb: ctx.is_top_sb_boundary,
+        },
     );
 
     // filter_dir signaling cost (3-ary) + mhccp switch (1 bit), approximated in
@@ -862,7 +1070,17 @@ pub(crate) fn mhccp_decide(
     // into `baseline_j`'s incumbent already, so here we only add MHCCP's own.
     let switch_bits = 1.0_f32;
 
-    let mut best: Option<(f64, CflChoice)> = None;
+    // Numerical-stability guard: skip MHCCP entirely on low-variance reference
+    // regions, where the cross-component least-squares is near-singular and the
+    // encoder's f32-derived filter diverges from the decoder's integer-derived
+    // one (see [`MHCCP_MIN_REF_VAR`]). Measured on the luma reference the
+    // decoder also sees, so the encoder's skip keeps the decoder from ever
+    // deriving the exploded filter.
+    if mhccp_ref_luma_variance(&luma_ref, above, left) < MHCCP_MIN_REF_VAR {
+        return None;
+    }
+
+    let mut best: Option<(f32, CflChoice)> = None;
     for dir in 0u8..mhccp::MHCCP_MODE_NUM as u8 {
         let pu = mhccp::derive_params(&luma_ref, &cref_u, dir, bd);
         let pv = mhccp::derive_params(&luma_ref, &cref_v, dir, bd);
@@ -902,10 +1120,10 @@ pub(crate) fn mhccp_decide(
         let rec_v = itx422::reconstruct_chroma_cfl(&pred_v, &lev_v, qstep, scan, cw, ch, bd);
         // filter_dir bits from the size-group default CDF.
         let dir_bits = filter_dir_bits(ctx.size_group as usize, dir);
-        let j = (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v)) as f64
+        let j = (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v)) as f32
             + lambda
                 * ((coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v) + switch_bits + dir_bits)
-                    as f64);
+                    as f32);
         if best.as_ref().map(|(bj, _)| j < *bj).unwrap_or(true) {
             best = Some((
                 j,
@@ -944,43 +1162,88 @@ pub(crate) fn mhccp_decide(
     }
 }
 
-/// Per-leaf MHCCP evaluation shared by all chroma leaves and formats
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn mhccp_eval_leaf(
-    recy: &[f32],
-    pw: usize,
-    recu: &[f32],
-    recv: &[f32],
-    pcw: usize,
-    ly: usize,
-    lx: usize,
-    cy: usize,
-    cx: usize,
-    cw: usize,
-    ch: usize,
-    ssx: bool,
-    ssy: bool,
-    have_top: bool,
-    have_left: bool,
-    src_u: &[f32],
-    src_v: &[f32],
-    dc_u: f32,
-    dc_v: f32,
-    chroma: &Basis,
-    qstep: i32,
-    lambda: f64,
-    scan: &[u16],
-    bd: i32,
-) -> Option<CflChoice> {
+/// Reconstruction, source, geometry and RD state for one per-leaf MHCCP trial.
+#[derive(Clone, Copy)]
+pub(crate) struct MhccpLeafInput<'a> {
+    pub(crate) reconstructed_luma: &'a [f32],
+    pub(crate) luma_stride: usize,
+    pub(crate) reconstructed_u: &'a [f32],
+    pub(crate) reconstructed_v: &'a [f32],
+    pub(crate) chroma_stride: usize,
+    pub(crate) bounds: MhccpBounds,
+    pub(crate) luma_y: usize,
+    pub(crate) luma_x: usize,
+    pub(crate) chroma_y: usize,
+    pub(crate) chroma_x: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) subsample_x: bool,
+    pub(crate) subsample_y: bool,
+    pub(crate) have_top: bool,
+    pub(crate) have_left: bool,
+    pub(crate) source_u: &'a [f32],
+    pub(crate) source_v: &'a [f32],
+    pub(crate) dc_u: f32,
+    pub(crate) dc_v: f32,
+    pub(crate) rd: ChromaRdSpec<'a>,
+    pub(crate) scan: &'a [u16],
+    /// SB-relative 16x16 luma-mi coded mask (see [`MhccpCtx::coded`]).
+    pub(crate) coded_mask: &'a [u8],
+}
+
+/// Per-leaf MHCCP evaluation shared by all chroma leaves and formats.
+pub(crate) fn mhccp_eval_leaf(input: &MhccpLeafInput<'_>) -> Option<CflChoice> {
+    let MhccpLeafInput {
+        reconstructed_luma: recy,
+        luma_stride: pw,
+        reconstructed_u: recu,
+        reconstructed_v: recv,
+        chroma_stride: pcw,
+        bounds,
+        luma_y: ly,
+        luma_x: lx,
+        chroma_y: cy,
+        chroma_x: cx,
+        width: cw,
+        height: ch,
+        subsample_x: ssx,
+        subsample_y: ssy,
+        have_top,
+        have_left,
+        source_u: src_u,
+        source_v: src_v,
+        dc_u,
+        dc_v,
+        rd,
+        scan,
+        coded_mask,
+    } = *input;
+    let ChromaRdSpec {
+        basis: chroma,
+        qstep,
+        lambda,
+        bit_depth: bd,
+    } = rd;
     let n = cw * ch;
-    // DC-incumbent J = SSE of the DC-predicted residual across both planes.
-    let mut sse = 0u64;
-    let dc_u_i = pixel_to_i32(dc_u);
-    let dc_v_i = pixel_to_i32(dc_v);
-    for i in 0..n {
-        sse += sq_diff_u64(pixel_to_i32(src_u[i]), dc_u_i);
-        sse += sq_diff_u64(pixel_to_i32(src_v[i]), dc_v_i);
-    }
+    // DC-incumbent J = the FULL RD cost of the actual DC-prediction path: code the
+    // DC-predicted chroma residual (project -> quantise -> reconstruct) and measure
+    // reconstructed SSE + lambda*coeff-rate, exactly like the MHCCP candidate's `j`.
+    // The previous baseline used only the flat DC-prediction SSE (no residual coding,
+    // no rate), which is far larger than the real DC path -> MHCCP always "won" the
+    // comparison and was selected even though DC+residuals reconstructs the chroma
+    // 8+ dB better (the 4:4:4 low/mid-quality "green cast" collapse).
+    let bres_u: Vec<f32> = src_u[..n].iter().map(|&s| s - dc_u).collect();
+    let bres_v: Vec<f32> = src_v[..n].iter().map(|&s| s - dc_v).collect();
+    let blev_u = chroma.project_scan(&bres_u, 0.0, scan);
+    let blev_v = chroma.project_scan(&bres_v, 0.0, scan);
+    // Match the actual non-MHCCP DC chroma path (code_444_chroma_leaf else-branch),
+    // which uses the scalar-pred `reconstruct_chroma` (its own dc tx-scale/index) —
+    // NOT the array-pred `_cfl` variant, which reconstructs differently and made the
+    // baseline underestimate the DC path, letting MHCCP win when DC was better.
+    let brec_u = itx422::reconstruct_chroma(dc_u, &blev_u, qstep, scan, cw, ch, bd);
+    let brec_v = itx422::reconstruct_chroma(dc_v, &blev_v, qstep, scan, cw, ch, bd);
+    let sse = (pixel_sse_rounded(&src_u[..n], &brec_u) + pixel_sse_rounded(&src_v[..n], &brec_v))
+        + lambda * (coeff_rate_f32(&blev_u) + coeff_rate_f32(&blev_v));
     let bw4 = (cw << (ssx as usize)) / 4;
     let bh4 = (ch << (ssy as usize)) / 4;
     let ctx = MhccpCtx {
@@ -989,6 +1252,7 @@ pub(crate) fn mhccp_eval_leaf(
         recu,
         recv,
         pcw,
+        bounds,
         ly,
         lx,
         cy,
@@ -997,11 +1261,25 @@ pub(crate) fn mhccp_eval_leaf(
         ssy,
         have_top,
         have_left,
-        is_top_sb_boundary: true,
+        // The current encoder uses 64x64 superblocks. AVM repeats the single
+        // available line above only for blocks whose top edge is an actual SB
+        // boundary; treating every partition leaf as such derives different
+        // MHCCP parameters from the decoder for leaves lower in the SB.
+        is_top_sb_boundary: (ly & 63) == 0,
         size_group: mhccp_size_group_wh4(bw4, bh4),
+        coded: coded_mask,
     };
     mhccp_decide(
-        &ctx, src_u, src_v, cw, ch, bd, chroma, qstep, lambda, scan, sse as f64,
+        &ctx,
+        &MhccpDecisionInput {
+            source_u: src_u,
+            source_v: src_v,
+            width: cw,
+            height: ch,
+            rd,
+            scan,
+            baseline_j: sse,
+        },
     )
 }
 
@@ -1108,13 +1386,13 @@ fn cfl_avg_l_444(
     let have_left = sb_x > 0;
     let ss_hor = if w > 32 { 2 } else { 1 };
     let ss_ver = if h > 32 { 2 } else { 1 };
-    let mut sum: i64 = 0;
-    let mut count: i64 = 0;
+    let mut sum: i32 = 0;
+    let mut count: i32 = 0;
     if have_top {
         let base = (sb_y - 1) * pw + sb_x;
         let mut i = 0;
         while i < w {
-            sum += (recy[base + i].fast_round() as i64) << 3;
+            sum += (recy[base + i].fast_round() as i32) << 3;
             count += 1;
             i += ss_hor;
         }
@@ -1122,13 +1400,13 @@ fn cfl_avg_l_444(
     if have_left {
         let mut i = 0;
         while i < h {
-            sum += (recy[(sb_y + i) * pw + sb_x - 1].fast_round() as i64) << 3;
+            sum += (recy[(sb_y + i) * pw + sb_x - 1].fast_round() as i32) << 3;
             count += 1;
             i += ss_ver;
         }
     }
     if count > 0 {
-        let val = ((sum + count / 2) / count) as i32;
+        let val = (sum + count / 2) / count;
         let max_v = (1 << (bd + 3)) - 1;
         val.min(max_v)
     } else {
@@ -1136,22 +1414,38 @@ fn cfl_avg_l_444(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cfl_decide_64(
-    recy: &[f32],
-    up: &[f32],
-    vp: &[f32],
-    recu: &[f32],
-    recv: &[f32],
-    pw: usize,
-    sb_y: usize,
-    sb_x: usize,
-    bd: i32,
-    neutral: f32,
-    chroma: &Basis,
-    qstep: i32,
-    lambda: f64,
-) -> Option<CflChoice> {
+/// Plane references and block origin for a whole 64x64 4:4:4 CfL decision.
+#[derive(Clone, Copy)]
+pub(crate) struct Cfl64Input<'a> {
+    pub(crate) reconstructed_luma: &'a [f32],
+    pub(crate) source_u: &'a [f32],
+    pub(crate) source_v: &'a [f32],
+    pub(crate) reconstructed_u: &'a [f32],
+    pub(crate) reconstructed_v: &'a [f32],
+    pub(crate) stride: usize,
+    pub(crate) y: usize,
+    pub(crate) x: usize,
+    pub(crate) neutral: f32,
+}
+
+pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Option<CflChoice> {
+    let Cfl64Input {
+        reconstructed_luma: recy,
+        source_u: up,
+        source_v: vp,
+        reconstructed_u: recu,
+        reconstructed_v: recv,
+        stride: pw,
+        y: sb_y,
+        x: sb_x,
+        neutral,
+    } = *input;
+    let ChromaRdSpec {
+        basis: chroma,
+        qstep,
+        lambda,
+        bit_depth: bd,
+    } = *rd;
     let scan = &tables::SCAN;
     let mut luma = vec![0i32; 64 * 64];
     let mut su = vec![0i32; 64 * 64];
@@ -1192,11 +1486,26 @@ pub(crate) fn cfl_decide_64(
     let luma_q3 = subsample_luma_q3(&luma, 64, 64, 64, false, false);
     let avg_l = cfl_avg_l_444(recy, pw, sb_y, sb_x, 64, 64, bd);
     let ac: Vec<i32> = luma_q3.iter().map(|&v| v - avg_l).collect();
+    // TX_64X64 is one CfL prediction block. AVM limits the transform's coded
+    // coefficient support to 32x32, but it does not split the intra predictor into
+    // four independently predicted TX_32X32 quadrants. The decoder first builds one
+    // 64x64 DC predictor and then adds the whole-block CfL AC signal to it.
+    // Flat-DC alternative (the non-CfL DC intra mode) uses the standard
+    // full-reference DC predictor, matching the caller's DC reconstruction path.
     let predu_f = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
     let predv_f = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
-    let dc_u = predu_f.fast_round() as i32;
-    let dc_v = predv_f.fast_round() as i32;
-    let cand = cfl_candidate(&su, &sv, &ac, dc_u, dc_v, bd)?;
+    // The CfL prediction base, however, must use AVM's subsampled-reference DC
+    // (`highbd_dc_predictor_subsampled`), applied for `uv_mode == CFL && tx > 32`.
+    let predu_cfl = dc_pred_cfl_subsampled(recu, pw, sb_y, sb_x, 64, neutral, bd);
+    let predv_cfl = dc_pred_cfl_subsampled(recv, pw, sb_y, sb_x, 64, neutral, bd);
+    let cand = cfl_candidate(
+        &su,
+        &sv,
+        &ac,
+        predu_cfl.fast_round() as i32,
+        predv_cfl.fast_round() as i32,
+        bd,
+    )?;
 
     // DC candidate (flat prediction) for both planes.
     let res_dc_u: Vec<f32> = suf.iter().map(|&s| s - predu_f).collect();
@@ -1205,8 +1514,8 @@ pub(crate) fn cfl_decide_64(
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
     let rec_dc_u = itx422::reconstruct_chroma(predu_f, &lev_dc_u, qstep, scan, 64, 64, bd);
     let rec_dc_v = itx422::reconstruct_chroma(predv_f, &lev_dc_v, qstep, scan, 64, 64, bd);
-    let j_dc = (pixel_sse_rounded(&suf, &rec_dc_u) + pixel_sse_rounded(&svf, &rec_dc_v)) as f64
-        + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v)) as f64;
+    let j_dc = (pixel_sse_rounded(&suf, &rec_dc_u) + pixel_sse_rounded(&svf, &rec_dc_v)) as f32
+        + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v)) as f32;
     // CfL candidate for both planes.
     let res_cf_u: Vec<f32> = suf
         .iter()
@@ -1227,7 +1536,7 @@ pub(crate) fn cfl_decide_64(
         + 3.0
         + if cand.sign_u != 0 { 3.0 } else { 0.0 }
         + if cand.sign_v != 0 { 3.0 } else { 0.0 };
-    let j_cfl = (pixel_sse_rounded(&suf, &rec_cf_u) + pixel_sse_rounded(&svf, &rec_cf_v)) as f64
-        + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f64 + alpha_bits);
+    let j_cfl = (pixel_sse_rounded(&suf, &rec_cf_u) + pixel_sse_rounded(&svf, &rec_cf_v)) as f32
+        + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f32 + alpha_bits);
     if j_cfl < j_dc { Some(cand) } else { None }
 }

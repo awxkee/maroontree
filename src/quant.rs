@@ -133,7 +133,7 @@ impl Quant {
 
     /// As [`Self::new_chroma`] but with an explicit chroma-DC qindex delta. Under
     /// adaptive quantization the per-superblock qindex (`CurrentQIndex`) changes,
-    /// but the chroma-DC delta is a frame-level constant signalled once in the
+    /// but the chroma-DC delta is a frame-level constant signaled once in the
     /// header (`DeltaQUDc`, derived from the frame `base_q_idx`). The decoder
     /// forms the chroma-DC qindex as `CurrentQIndex + DeltaQUDc`, so the encoder
     /// must apply that same frame-level delta to the AQ-adjusted qindex rather
@@ -183,7 +183,7 @@ impl Dct for Quant {
 pub(crate) fn forward_dct_quant_8x8_t(
     residual: &[i32; 64],
     q: &impl Dct,
-) -> ([i32; 64], [f64; 64]) {
+) -> ([i32; 64], [f32; 64]) {
     dct8x8_t(residual, q)
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn forward_dct_quant_16x16(residual: &mut [i32; 256], q: &impl Dct) {
 pub(crate) fn forward_dct_quant_16x16_t(
     residual: &[i32; 256],
     q: &impl Dct,
-) -> ([i32; 256], [f64; 256]) {
+) -> ([i32; 256], [f32; 256]) {
     dct16x16_t(residual, q)
 }
 
@@ -207,7 +207,7 @@ pub(crate) fn forward_dct_quant_32x32(residual: &mut [i32; 1024], q: &impl Dct) 
 pub(crate) fn forward_dct_quant_32x32_t(
     residual: &[i32; 1024],
     q: &impl Dct,
-) -> ([i32; 1024], [f64; 1024]) {
+) -> ([i32; 1024], [f32; 1024]) {
     dct32x32_t(residual, q)
 }
 
@@ -215,7 +215,7 @@ pub(crate) fn forward_dct_quant_32x32_t(
 pub(crate) fn forward_dct_quant_4x8_t(
     residual: &[i32; 32],
     q: &impl Dct,
-) -> ([i32; 32], [f64; 32]) {
+) -> ([i32; 32], [f32; 32]) {
     dct4x8_t(residual, q)
 }
 
@@ -223,20 +223,20 @@ pub(crate) fn forward_dct_quant_4x8_t(
 pub(crate) fn forward_dct_quant_8x16_t(
     residual: &[i32; 128],
     q: &impl Dct,
-) -> ([i32; 128], [f64; 128]) {
+) -> ([i32; 128], [f32; 128]) {
     dct8x16_t(residual, q)
 }
 
 pub(crate) fn forward_dct_quant_16x32_t(
     residual: &[i32; 512],
     q: &impl Dct,
-) -> ([i32; 512], [f64; 512]) {
+) -> ([i32; 512], [f32; 512]) {
     dct16x32_t(residual, q)
 }
 
 pub(crate) fn forward_dct_quant_4x4_t(
     residual: &[i32; 16],
     q: &impl Dct,
-) -> ([i32; 16], [f64; 16]) {
+) -> ([i32; 16], [f32; 16]) {
     dct4x4_t(residual, q)
 }

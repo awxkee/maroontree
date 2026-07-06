@@ -28,11 +28,19 @@
  */
 mod dct;
 mod idct;
+mod rd;
+mod trellis;
 mod wht;
 
 pub(crate) use dct::{
-    dct8x8_avx2_coeffs, dct8x16_avx2_coeffs, dct8x16_avx2_i32, dct16x16_avx2_coeffs,
-    dct16x16_avx2_i32, dct32x32_avx2_coeffs, dct32x32_avx2_i32,
+    adst16x16_avx2_quant_t, adstdct16x16_avx2_quant_t, dct8x8_avx2_quant_t, dct8x16_avx2_i32,
+    dct8x16_avx2_quant_t, dct16x16_avx2_i32, dct16x16_avx2_quant_t, dct16x32_avx2_quant_t,
+    dct32x16_avx2_quant_t, dct32x32_avx2_i32, dct32x32_avx2_quant_t, dctadst16x16_avx2_quant_t,
 };
-pub(crate) use idct::{idct_dequant_8x8_avx2, idct_dequant_16x16_avx2, idct_dequant_32x32_avx2};
+pub(crate) use idct::{
+    iadst_dequant_16x16_avx2, iadstdct_dequant_16x16_avx2, idct_dequant_8x8_avx2,
+    idct_dequant_16x16_avx2, idct_dequant_32x32_avx2, idctadst_dequant_16x16_avx2,
+};
+pub(crate) use rd::{residual_dc_avx2, residual_pred_avx2, sse_recon_avx2, sse_recon_dc_avx2};
+pub(crate) use trellis::{trellis_dist_current_zero_scan_avx2, trellis_round_down_scan_avx2};
 pub(crate) use wht::fwht_raw_avx2;

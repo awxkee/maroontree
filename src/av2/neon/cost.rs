@@ -111,3 +111,343 @@ pub(crate) fn coeff_abs_rate_f32_neon(lev: &[f32]) -> f32 {
     }
     out
 }
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn square_acc_i32x4(acc0: int64x2_t, acc1: int64x2_t, d: int32x4_t) -> (int64x2_t, int64x2_t) {
+    let lo = vget_low_s32(d);
+    let hi = vget_high_s32(d);
+    (vmlal_s32(acc0, lo, lo), vmlal_s32(acc1, hi, hi))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn reduce_i64x2x2(acc0: int64x2_t, acc1: int64x2_t) -> i64 {
+    vaddvq_s64(vaddq_s64(acc0, acc1))
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn pixel_sse_rounded_neon(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    let half = vdupq_n_f32(0.5);
+    let mut acc0 = vdupq_n_s64(0);
+    let mut acc1 = vdupq_n_s64(0);
+    let mut scalar = 0.0f32;
+
+    let (a4, a_tail) = a.as_chunks::<4>();
+    let (b4, b_tail) = b.as_chunks::<4>();
+    for (aa, bb) in a4.iter().zip(b4.iter()) {
+        let ax = unsafe { vld1q_f32(aa.as_ptr()) };
+        let bx = unsafe { vld1q_f32(bb.as_ptr()) };
+        let ai = vcvtq_s32_f32(vaddq_f32(ax, half));
+        let bi = vcvtq_s32_f32(vaddq_f32(bx, half));
+        let d = vsubq_s32(ai, bi);
+        (acc0, acc1) = square_acc_i32x4(acc0, acc1, d);
+    }
+
+    for (&x, &y) in a_tail.iter().zip(b_tail.iter()) {
+        scalar += crate::av2::helpers::sq_diff_f32(
+            crate::av2::helpers::pixel_to_i32(x),
+            crate::av2::helpers::pixel_to_i32(y),
+        );
+    }
+
+    reduce_i64x2x2(acc0, acc1) as f32 + scalar
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn pixel_sse_rounded_const_neon(a: &[f32], v: f32) -> f32 {
+    let half = vdupq_n_f32(0.5);
+    let vi = vcvtq_s32_f32(vaddq_f32(vdupq_n_f32(v), half));
+    let mut acc0 = vdupq_n_s64(0);
+    let mut acc1 = vdupq_n_s64(0);
+    let mut scalar = 0.0f32;
+
+    let (a4, a_tail) = a.as_chunks::<4>();
+    for aa in a4.iter() {
+        let ax = unsafe { vld1q_f32(aa.as_ptr()) };
+        let ai = vcvtq_s32_f32(vaddq_f32(ax, half));
+        let d = vsubq_s32(ai, vi);
+        (acc0, acc1) = square_acc_i32x4(acc0, acc1, d);
+    }
+
+    let vi = crate::av2::helpers::pixel_to_i32(v);
+    for &x in a_tail.iter() {
+        scalar += crate::av2::helpers::sq_diff_f32(crate::av2::helpers::pixel_to_i32(x), vi);
+    }
+
+    reduce_i64x2x2(acc0, acc1) as f32 + scalar
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn sad_u8_neon(a: &[u8], b: &[u8]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    let (a16, a_tail) = a.as_chunks::<16>();
+    let (b16, b_tail) = b.as_chunks::<16>();
+    let mut out = 0u32;
+    for (aa, bb) in a16.iter().zip(b16) {
+        let av = unsafe { vld1q_u8(aa.as_ptr()) };
+        let bv = unsafe { vld1q_u8(bb.as_ptr()) };
+        out = out.saturating_add(vaddlvq_u8(vabdq_u8(av, bv)) as u32);
+    }
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
+        out = out.saturating_add((x as i32 - y as i32).unsigned_abs());
+    }
+    out
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn scaled_residual_f32_neon(
+    dst: &mut [f32],
+    src: &[f32],
+    pred: &[f32],
+    spec: crate::av2::metrics::ResidualSpec,
+) {
+    let crate::av2::metrics::ResidualSpec {
+        src_stride,
+        pred_stride,
+        width,
+        height,
+        scale,
+    } = spec;
+    let scale = vdupq_n_f32(scale);
+    for y in 0..height {
+        let mut x = 0;
+        while x + 4 <= width {
+            let s = unsafe { vld1q_f32(src[y * src_stride + x..].as_ptr()) };
+            let p = unsafe { vld1q_f32(pred[y * pred_stride + x..].as_ptr()) };
+            unsafe {
+                vst1q_f32(
+                    dst[y * width + x..].as_mut_ptr(),
+                    vmulq_f32(vsubq_f32(s, p), scale),
+                )
+            };
+            x += 4;
+        }
+        while x < width {
+            dst[y * width + x] =
+                (src[y * src_stride + x] - pred[y * pred_stride + x]) * vgetq_lane_f32::<0>(scale);
+            x += 1;
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn pixel_sse_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = vdupq_n_f32(0.0);
+    let (a4, a_tail) = a.as_chunks::<4>();
+    let (b4, b_tail) = b.as_chunks::<4>();
+    for (aa, bb) in a4.iter().zip(b4) {
+        let d = vsubq_f32(unsafe { vld1q_f32(aa.as_ptr()) }, unsafe {
+            vld1q_f32(bb.as_ptr())
+        });
+        acc = vmlaq_f32(acc, d, d);
+    }
+    let mut out = vaddvq_f32(acc);
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
+        let d = x - y;
+        out += d * d;
+    }
+    out
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn pixel_sse_f32_u16_neon(a: &[f32], b: &[u16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = vdupq_n_f32(0.0);
+    let (a4, a_tail) = a.as_chunks::<4>();
+    let (b4, b_tail) = b.as_chunks::<4>();
+    for (aa, bb) in a4.iter().zip(b4) {
+        let av = unsafe { vld1q_f32(aa.as_ptr()) };
+        let bv = vcvtq_f32_u32(vmovl_u16(unsafe { vld1_u16(bb.as_ptr()) }));
+        let d = vsubq_f32(av, bv);
+        acc = vmlaq_f32(acc, d, d);
+    }
+    let mut out = vaddvq_f32(acc);
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
+        let d = x - y as f32;
+        out += d * d;
+    }
+    out
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn weighted_pixel_sse_f32_neon(a: &[f32], b: &[f32], weights: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), weights.len());
+    let mut acc = vdupq_n_f32(0.0);
+    let (a4, a_tail) = a.as_chunks::<4>();
+    let (b4, b_tail) = b.as_chunks::<4>();
+    let (w4, w_tail) = weights.as_chunks::<4>();
+    for ((aa, bb), ww) in a4.iter().zip(b4).zip(w4) {
+        let d = vsubq_f32(unsafe { vld1q_f32(aa.as_ptr()) }, unsafe {
+            vld1q_f32(bb.as_ptr())
+        });
+        let wv = unsafe { vld1q_f32(ww.as_ptr()) };
+        acc = vmlaq_f32(acc, vmulq_f32(d, d), wv);
+    }
+    let mut out = vaddvq_f32(acc);
+    for ((&x, &y), &w) in a_tail.iter().zip(b_tail).zip(w_tail) {
+        let d = x - y;
+        out += d * d * w;
+    }
+    out
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn sum_sumsq_f32_neon(v: &[f32]) -> (f32, f32) {
+    let mut sum_v = vdupq_n_f32(0.0);
+    let mut sq_v = vdupq_n_f32(0.0);
+    let (v4, tail) = v.as_chunks::<4>();
+    for x in v4 {
+        let xv = unsafe { vld1q_f32(x.as_ptr()) };
+        sum_v = vaddq_f32(sum_v, xv);
+        sq_v = vmlaq_f32(sq_v, xv, xv);
+    }
+    let mut sum = vaddvq_f32(sum_v);
+    let mut sumsq = vaddvq_f32(sq_v);
+    for &x in tail {
+        sum += x;
+        sumsq += x * x;
+    }
+    (sum, sumsq)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn cfl_sse_i32_neon(src: &[i32], ac: &[i32], alpha_q3: i32, dc: i32, maxv: i32) -> f32 {
+    debug_assert_eq!(src.len(), ac.len());
+    let alpha = vdupq_n_s32(alpha_q3);
+    let dc_v = vdupq_n_s32(dc);
+    let zero = vdupq_n_s32(0);
+    let maxv_v = vdupq_n_s32(maxv);
+    let round = vdupq_n_s32(1 << 10);
+    let mut acc0 = vdupq_n_s64(0);
+    let mut acc1 = vdupq_n_s64(0);
+    let (src4, src_tail) = src.as_chunks::<4>();
+    let (ac4, ac_tail) = ac.as_chunks::<4>();
+    for (ss, aa) in src4.iter().zip(ac4) {
+        let s = unsafe { vld1q_s32(ss.as_ptr()) };
+        let a = unsafe { vld1q_s32(aa.as_ptr()) };
+        let p = vmulq_s32(a, alpha);
+        let sign = vshrq_n_s32::<31>(p);
+        let abs = vsubq_s32(veorq_s32(p, sign), sign);
+        let q = vshrq_n_s32::<11>(vaddq_s32(abs, round));
+        let scaled = vsubq_s32(veorq_s32(q, sign), sign);
+        let pred = vmaxq_s32(zero, vminq_s32(maxv_v, vaddq_s32(dc_v, scaled)));
+        (acc0, acc1) = square_acc_i32x4(acc0, acc1, vsubq_s32(s, pred));
+    }
+    let mut out = reduce_i64x2x2(acc0, acc1) as f32;
+    for (&s, &a) in src_tail.iter().zip(ac_tail) {
+        let p = alpha_q3 * a;
+        let sign = p >> 31;
+        let abs = (p ^ sign) - sign;
+        let q = (abs + (1 << 10)) >> 11;
+        let scaled = (q ^ sign) - sign;
+        let pred = (dc + scaled).clamp(0, maxv);
+        out += crate::av2::helpers::sq_diff_f32(s, pred);
+    }
+    out
+}
+
+/// SAD over a `w x h` region with independent src/pred row strides. Inputs are
+/// integer-valued f32 (exact residual), summed in f32 (exact for intra block
+/// sizes) to match `metrics::sad_f32_scalar`.
+#[target_feature(enable = "neon")]
+pub(crate) fn sad_f32_neon(
+    src: &[f32],
+    sstride: usize,
+    pred: &[f32],
+    pstride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    let mut acc = vdupq_n_f32(0.0);
+    let mut extra = 0f32;
+    for r in 0..h {
+        let s = &src[r * sstride..];
+        let p = &pred[r * pstride..];
+        let mut k = 0;
+        while k + 4 <= w {
+            let d = vsubq_f32(unsafe { vld1q_f32(s[k..].as_ptr()) }, unsafe {
+                vld1q_f32(p[k..].as_ptr())
+            });
+            acc = vaddq_f32(acc, vabsq_f32(d));
+            k += 4;
+        }
+        while k < w {
+            extra += (s[k] - p[k]).abs();
+            k += 1;
+        }
+    }
+    (vaddvq_f32(acc) + extra) as u64
+}
+
+/// 4x4-Hadamard SATD over a `w x h` region (multiples of 4) with independent
+/// strides. Applies the had4 butterfly across the four rows, transposes, applies
+/// it again — the separable 2D Hadamard — then sums |coeff|. Matches
+/// `metrics::satd_f32_scalar` (order of the two passes is irrelevant for Σ|·|).
+#[target_feature(enable = "neon")]
+pub(crate) fn satd_f32_neon(
+    src: &[f32],
+    sstride: usize,
+    pred: &[f32],
+    pstride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    // had4 butterfly across four int32x4 lanes (pairs (r0,r2) and (r1,r3)); inlined
+    // via a macro so the intrinsics stay in this fn's `neon` target-feature context.
+    macro_rules! bfly {
+        ($r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+            let e = vaddq_s32($r0, $r2);
+            let f = vsubq_s32($r0, $r2);
+            let g = vaddq_s32($r1, $r3);
+            let hh = vsubq_s32($r1, $r3);
+            [
+                vaddq_s32(e, g),
+                vaddq_s32(f, hh),
+                vsubq_s32(f, hh),
+                vsubq_s32(e, g),
+            ]
+        }};
+    }
+    let mut total = 0u64;
+    let mut ty = 0;
+    while ty < h {
+        let mut tx = 0;
+        while tx < w {
+            unsafe {
+                macro_rules! ld {
+                    ($row:expr) => {
+                        vcvtq_s32_f32(vsubq_f32(
+                            vld1q_f32(src[(ty + $row) * sstride + tx..].as_ptr()),
+                            vld1q_f32(pred[(ty + $row) * pstride + tx..].as_ptr()),
+                        ))
+                    };
+                }
+                let (r0, r1, r2, r3) = (ld!(0), ld!(1), ld!(2), ld!(3));
+                let o = bfly!(r0, r1, r2, r3);
+                // transpose 4x4
+                let ab0 = vtrn1q_s32(o[0], o[1]);
+                let ab1 = vtrn2q_s32(o[0], o[1]);
+                let cd0 = vtrn1q_s32(o[2], o[3]);
+                let cd1 = vtrn2q_s32(o[2], o[3]);
+                let t0 = vcombine_s32(vget_low_s32(ab0), vget_low_s32(cd0));
+                let t1 = vcombine_s32(vget_low_s32(ab1), vget_low_s32(cd1));
+                let t2 = vcombine_s32(vget_high_s32(ab0), vget_high_s32(cd0));
+                let t3 = vcombine_s32(vget_high_s32(ab1), vget_high_s32(cd1));
+                let u = bfly!(t0, t1, t2, t3);
+                let s = vaddq_s32(
+                    vaddq_s32(vabsq_s32(u[0]), vabsq_s32(u[1])),
+                    vaddq_s32(vabsq_s32(u[2]), vabsq_s32(u[3])),
+                );
+                total += vaddvq_s32(s) as u64;
+            }
+            tx += 4;
+        }
+        ty += 4;
+    }
+    total
+}

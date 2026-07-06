@@ -183,13 +183,14 @@ fn update_pctx(
     left_pctx[base..(base + h).min(16)].fill(PCTX_LEFT[b]);
 }
 
-/// A partition op in pre-order. `RectType` is a signalled rect_type bool; `Leaf`
+/// A partition op in pre-order. `RectType` is a signaled rect_type bool; `Leaf`
 /// is a PARTITION_NONE block to code (with its do_split cdf, None if non-pp).
 #[derive(Clone, Debug)]
 pub(crate) enum Op {
     RectType {
         cdf: u32,
         val: u32,
+        ctx: usize,
     },
     /// Emit `do_split` bool (1 = split) with the given static cdf, then, when
     /// `square_cdf` is `Some`, emit `do_square_split = 1` selecting PARTITION_SPLIT.
@@ -258,16 +259,18 @@ fn walk(
             return;
         }
         part = decide_signaled(
-            mi_row,
-            mi_col,
-            b,
-            has_rows,
-            none_allowed,
-            rimp,
-            horz_valid,
-            vert_valid,
-            above_pctx,
-            left_pctx,
+            &SignaledNode {
+                mi_row,
+                mi_col,
+                block: b,
+                has_rows,
+                none_allowed,
+                implied_rect: rimp,
+                horz_valid,
+                vert_valid,
+                above_context: above_pctx,
+                left_context: left_pctx,
+            },
             out,
         );
     } else {
@@ -283,16 +286,18 @@ fn walk(
             };
         } else {
             part = decide_signaled(
-                mi_row,
-                mi_col,
-                b,
-                has_rows,
-                none_allowed,
-                rimp,
-                horz_valid,
-                vert_valid,
-                above_pctx,
-                left_pctx,
+                &SignaledNode {
+                    mi_row,
+                    mi_col,
+                    block: b,
+                    has_rows,
+                    none_allowed,
+                    implied_rect: rimp,
+                    horz_valid,
+                    vert_valid,
+                    above_context: above_pctx,
+                    left_context: left_pctx,
+                },
                 out,
             );
         }
@@ -320,23 +325,36 @@ fn walk(
     }
 }
 
-/// Resolve a signalled node. Emits a do_split=0 (NONE) — represented by returning
-/// 255 so the caller pushes the leaf — or, when NONE isn't allowed, picks a rect
-/// direction (emitting a rect_type bit only when both HORZ and VERT are valid).
-#[allow(clippy::too_many_arguments)]
-fn decide_signaled(
+/// Inputs for resolving one signaled partition node.
+struct SignaledNode<'a> {
     mi_row: usize,
     mi_col: usize,
-    b: usize,
+    block: usize,
     has_rows: bool,
     none_allowed: bool,
-    rimp: Option<u8>,
+    implied_rect: Option<u8>,
     horz_valid: bool,
     vert_valid: bool,
-    above_pctx: &[u8],
-    left_pctx: &[u8],
-    out: &mut Vec<Op>,
-) -> u8 {
+    above_context: &'a [u8],
+    left_context: &'a [u8],
+}
+
+/// Resolve a signaled node. Emits a do_split=0 (NONE) — represented by returning
+/// 255 so the caller pushes the leaf — or, when NONE isn't allowed, picks a rect
+/// direction (emitting a rect_type bit only when both HORZ and VERT are valid).
+fn decide_signaled(node: &SignaledNode<'_>, out: &mut Vec<Op>) -> u8 {
+    let SignaledNode {
+        mi_row,
+        mi_col,
+        block: b,
+        has_rows,
+        none_allowed,
+        implied_rect: rimp,
+        horz_valid,
+        vert_valid,
+        above_context: above_pctx,
+        left_context: left_pctx,
+    } = *node;
     if none_allowed {
         return 255; // PARTITION_NONE (do_split=0, cdf added by caller)
     }
@@ -355,6 +373,7 @@ fn decide_signaled(
             out.push(Op::RectType {
                 cdf: RECT_TYPE_CDF0[ctx],
                 val: r as u32,
+                ctx,
             });
             r
         }
@@ -437,7 +456,7 @@ pub(crate) fn sb_partition_ops(
 
 /// Update the partition contexts for a whole 64x64 SB coded as PARTITION_NONE, exactly
 /// as the decoder does (`update_pctx` for BLOCK_64X64). The whole-64 fast path must call
-/// this so that neighbours of a chroma-motivated split SB (which set pctx=56 on their
+/// this so that neighbors of a chroma-motivated split SB (which set pctx=56 on their
 /// 32x32 leaves) observe the correct do_split / rect_type contexts. Without it, a NONE SB
 /// following a split leaves stale context and the decoder mis-parses the next partition.
 pub(crate) fn sb_none_pctx(
@@ -452,7 +471,7 @@ pub(crate) fn sb_none_pctx(
 /// The `do_split` cdf a whole-64 PARTITION_NONE SB must use, given the current
 /// partition contexts. In an all-whole-64 frame every SB has raw_ctx 0 and this
 /// returns `DO_SPLIT_CDF0[12]` (== 12276), preserving the legacy fast path; once a
-/// neighbouring SB has been square-split (setting pctx=56 on its 32x32 leaves) the
+/// neighboring SB has been square-split (setting pctx=56 on its 32x32 leaves) the
 /// context becomes non-zero and the correct cdf is selected, matching the decoder.
 pub(crate) fn sb_none_do_split_cdf(
     sb_row: usize,
@@ -486,7 +505,7 @@ pub(crate) fn sb_square_split_ops(
     const B32X64: usize = 10; // BLOCK_32X64
     const B32: usize = 9; // BLOCK_32X32
     // 64x64 -> VERT: do_split=1 (implied by NONE-not-forced? no: NONE is allowed for a
-    // full interior block, so do_split is signalled), rect_type=VERT. do_ext implied off.
+    // full interior block, so do_split is signaled), rect_type=VERT. do_ext implied off.
     out.push(Op::Split {
         do_split_cdf: DO_SPLIT_CDF0
             [raw_ctx(above_pctx, left_pctx, mi_row, mi_col, B64) + BSIZE_MAP[B64] * 4],
@@ -496,6 +515,7 @@ pub(crate) fn sb_square_split_ops(
     out.push(Op::RectType {
         cdf: RECT_TYPE_CDF0[rt_ctx],
         val: VERT as u32,
+        ctx: rt_ctx,
     });
     // Two 32x64 children (left, right). Each does HORZ -> two 32x32.
     for dc in [0usize, 8usize] {
@@ -511,6 +531,7 @@ pub(crate) fn sb_square_split_ops(
         out.push(Op::RectType {
             cdf: RECT_TYPE_CDF0[rt2],
             val: HORZ as u32,
+            ctx: rt2,
         });
         // Two 32x32 leaves (top, bottom).
         for dr in [0usize, 8usize] {
@@ -528,4 +549,125 @@ pub(crate) fn sb_square_split_ops(
         }
     }
     out
+}
+
+/// Content-adaptive interior tree: always enters the 64→32 prediction split,
+/// then optionally splits each 32×32 child into four independently predicted
+/// 16×16 leaves. AV2 represents both square steps through VERT+HORZ rectangular
+/// nodes in this sequence configuration.
+pub(crate) fn sb_rd_split_ops(
+    sb_row: usize,
+    sb_col: usize,
+    split32: [bool; 4],
+    split16: [bool; 16],
+    above_pctx: &mut [u8],
+    left_pctx: &mut [u8],
+) -> Vec<Op> {
+    let mut out = Vec::new();
+    let mi_row = sb_row * 16;
+    let mi_col = sb_col * 16;
+    const B64: usize = 12;
+    const B32X64: usize = 10;
+    const B32: usize = 9;
+    const B16X32: usize = 7;
+    const B16: usize = 6;
+    const B8X16: usize = 4;
+    const B8: usize = 3;
+
+    push_rect_split(&mut out, above_pctx, left_pctx, mi_row, mi_col, B64, VERT);
+    for dc in [0usize, 8usize] {
+        push_rect_split(
+            &mut out,
+            above_pctx,
+            left_pctx,
+            mi_row,
+            mi_col + dc,
+            B32X64,
+            HORZ,
+        );
+        for dr in [0usize, 8usize] {
+            let (r, c) = (mi_row + dr, mi_col + dc);
+            let child = (dr / 8) * 2 + dc / 8;
+            if !split32[child] {
+                let ctx = raw_ctx(above_pctx, left_pctx, r, c, B32) + BSIZE_MAP[B32] * 4;
+                out.push(Op::Leaf {
+                    mi_row: r,
+                    mi_col: c,
+                    bw_mi: 8,
+                    bh_mi: 8,
+                    part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+                });
+                update_pctx(above_pctx, left_pctx, r, c, B32);
+                continue;
+            }
+            push_rect_split(&mut out, above_pctx, left_pctx, r, c, B32, VERT);
+            for dc16 in [0usize, 4usize] {
+                push_rect_split(&mut out, above_pctx, left_pctx, r, c + dc16, B16X32, HORZ);
+                for dr16 in [0usize, 4usize] {
+                    let (lr, lc) = (r + dr16, c + dc16);
+                    let child16 = ((lr - mi_row) / 4) * 4 + (lc - mi_col) / 4;
+                    if split16[child16] {
+                        push_rect_split(&mut out, above_pctx, left_pctx, lr, lc, B16, VERT);
+                        for dc8 in [0usize, 2usize] {
+                            push_rect_split(
+                                &mut out,
+                                above_pctx,
+                                left_pctx,
+                                lr,
+                                lc + dc8,
+                                B8X16,
+                                HORZ,
+                            );
+                            for dr8 in [0usize, 2usize] {
+                                let (r8, c8) = (lr + dr8, lc + dc8);
+                                let ctx =
+                                    raw_ctx(above_pctx, left_pctx, r8, c8, B8) + BSIZE_MAP[B8] * 4;
+                                out.push(Op::Leaf {
+                                    mi_row: r8,
+                                    mi_col: c8,
+                                    bw_mi: 2,
+                                    bh_mi: 2,
+                                    part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+                                });
+                                update_pctx(above_pctx, left_pctx, r8, c8, B8);
+                            }
+                        }
+                        continue;
+                    }
+                    let ctx = raw_ctx(above_pctx, left_pctx, lr, lc, B16) + BSIZE_MAP[B16] * 4;
+                    out.push(Op::Leaf {
+                        mi_row: lr,
+                        mi_col: lc,
+                        bw_mi: 4,
+                        bh_mi: 4,
+                        part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+                    });
+                    update_pctx(above_pctx, left_pctx, lr, lc, B16);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn push_rect_split(
+    out: &mut Vec<Op>,
+    above_pctx: &[u8],
+    left_pctx: &[u8],
+    row: usize,
+    col: usize,
+    bsize: usize,
+    rect_type: u8,
+) {
+    out.push(Op::Split {
+        do_split_cdf: DO_SPLIT_CDF0
+            [raw_ctx(above_pctx, left_pctx, row, col, bsize) + BSIZE_MAP[bsize] * 4],
+        square_cdf: 0,
+    });
+    let ctx = raw_ctx(above_pctx, left_pctx, row, col, bsize) + BSIZE_RECT_MAP[bsize] * 4;
+    out.push(Op::RectType {
+        cdf: RECT_TYPE_CDF0[ctx],
+        val: rect_type as u32,
+        ctx,
+    });
 }

@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+#![allow(clippy::needless_range_loop)]
 use crate::idct::IdctDequant;
 
 #[cfg(target_arch = "x86")]
@@ -54,20 +54,6 @@ fn load_i32x8(src: *const i32) -> I32x8 {
 #[target_feature(enable = "avx2")]
 fn store_i32x8(dst: *mut i32, v: I32x8) {
     unsafe { _mm256_storeu_si256(dst.cast::<__m256i>(), v.0) };
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn i32x8_to_array(v: I32x8) -> [i32; 8] {
-    let mut out = [0i32; 8];
-    store_i32x8(out.as_mut_ptr(), v);
-    out
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn i32x8_from_array(v: [i32; 8]) -> I32x8 {
-    load_i32x8(v.as_ptr())
 }
 
 impl I32x8 {
@@ -114,18 +100,71 @@ impl I32x8 {
 #[inline]
 #[target_feature(enable = "avx2")]
 fn transpose_8x8(c: &mut [I32x8; 8]) {
-    let mut rows = [[0i32; 8]; 8];
-    for (i, v) in c.iter().copied().enumerate() {
-        rows[i] = i32x8_to_array(v);
+    let r0 = c[0].0;
+    let r1 = c[1].0;
+    let r2 = c[2].0;
+    let r3 = c[3].0;
+    let r4 = c[4].0;
+    let r5 = c[5].0;
+    let r6 = c[6].0;
+    let r7 = c[7].0;
+
+    let t0 = _mm256_unpacklo_epi32(r0, r1);
+    let t1 = _mm256_unpackhi_epi32(r0, r1);
+    let t2 = _mm256_unpacklo_epi32(r2, r3);
+    let t3 = _mm256_unpackhi_epi32(r2, r3);
+    let t4 = _mm256_unpacklo_epi32(r4, r5);
+    let t5 = _mm256_unpackhi_epi32(r4, r5);
+    let t6 = _mm256_unpacklo_epi32(r6, r7);
+    let t7 = _mm256_unpackhi_epi32(r6, r7);
+
+    let u0 = _mm256_unpacklo_epi64(t0, t2);
+    let u1 = _mm256_unpackhi_epi64(t0, t2);
+    let u2 = _mm256_unpacklo_epi64(t1, t3);
+    let u3 = _mm256_unpackhi_epi64(t1, t3);
+    let u4 = _mm256_unpacklo_epi64(t4, t6);
+    let u5 = _mm256_unpackhi_epi64(t4, t6);
+    let u6 = _mm256_unpacklo_epi64(t5, t7);
+    let u7 = _mm256_unpackhi_epi64(t5, t7);
+
+    c[0] = I32x8(_mm256_permute2x128_si256::<0x20>(u0, u4));
+    c[1] = I32x8(_mm256_permute2x128_si256::<0x20>(u1, u5));
+    c[2] = I32x8(_mm256_permute2x128_si256::<0x20>(u2, u6));
+    c[3] = I32x8(_mm256_permute2x128_si256::<0x20>(u3, u7));
+    c[4] = I32x8(_mm256_permute2x128_si256::<0x31>(u0, u4));
+    c[5] = I32x8(_mm256_permute2x128_si256::<0x31>(u1, u5));
+    c[6] = I32x8(_mm256_permute2x128_si256::<0x31>(u2, u6));
+    c[7] = I32x8(_mm256_permute2x128_si256::<0x31>(u3, u7));
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn transpose_store_8x8(dst: *mut i32, stride: usize, tile: &mut [I32x8; 8]) {
+    transpose_8x8(tile);
+    for i in 0..8usize {
+        store_i32x8(unsafe { dst.add(i * stride) }, tile[i]);
     }
-    let mut transposed = [[0i32; 8]; 8];
-    for y in 0..8 {
-        for x in 0..8 {
-            transposed[y][x] = rows[x][y];
-        }
-    }
-    for (i, row) in transposed.iter().copied().enumerate() {
-        c[i] = i32x8_from_array(row);
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn store_transposed_rows_i32x8<const N: usize>(dst: *mut i32, y: usize, rows: &[I32x8; N]) {
+    debug_assert!(N.is_multiple_of(8));
+    let stride = N;
+    let mut x = 0usize;
+    while x < N {
+        let mut tile = [
+            rows[x],
+            rows[x + 1],
+            rows[x + 2],
+            rows[x + 3],
+            rows[x + 4],
+            rows[x + 5],
+            rows[x + 6],
+            rows[x + 7],
+        ];
+        transpose_store_8x8(unsafe { dst.add(y * N + x) }, stride, &mut tile);
+        x += 8;
     }
 }
 
@@ -329,6 +368,233 @@ fn inv_dct16_v(c: &mut [I32x8; 16], min: i32, max: i32) {
     c[13] = clip(e[2].sub(w13a));
     c[14] = clip(e[1].sub(v14));
     c[15] = clip(e[0].sub(v15a));
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv_adst16_v(c: &mut [I32x8; 16], min: i32, max: i32) {
+    let mn = splat(min);
+    let mx = splat(max);
+    let clip = |v: I32x8| v.clip(mn, mx);
+
+    let (in0, in1, in2, in3) = (c[0], c[1], c[2], c[3]);
+    let (in4, in5, in6, in7) = (c[4], c[5], c[6], c[7]);
+    let (in8, in9, in10, in11) = (c[8], c[9], c[10], c[11]);
+    let (in12, in13, in14, in15) = (c[12], c[13], c[14], c[15]);
+
+    let mut t0 = in15
+        .muli(4091 - 4096)
+        .add(in0.muli(201))
+        .rsh::<12>(2048)
+        .add(in15);
+    let mut t1 = in15
+        .muli(201)
+        .sub(in0.muli(4091 - 4096))
+        .rsh::<12>(2048)
+        .sub(in0);
+    let mut t2 = in13
+        .muli(3973 - 4096)
+        .add(in2.muli(995))
+        .rsh::<12>(2048)
+        .add(in13);
+    let mut t3 = in13
+        .muli(995)
+        .sub(in2.muli(3973 - 4096))
+        .rsh::<12>(2048)
+        .sub(in2);
+    let mut t4 = in11
+        .muli(3703 - 4096)
+        .add(in4.muli(1751))
+        .rsh::<12>(2048)
+        .add(in11);
+    let mut t5 = in11
+        .muli(1751)
+        .sub(in4.muli(3703 - 4096))
+        .rsh::<12>(2048)
+        .sub(in4);
+    let mut t6 = in9.muli(1645).add(in6.muli(1220)).rsh::<11>(1024);
+    let mut t7 = in9.muli(1220).sub(in6.muli(1645)).rsh::<11>(1024);
+    let mut t8 = in7
+        .muli(2751)
+        .add(in8.muli(3035 - 4096))
+        .rsh::<12>(2048)
+        .add(in8);
+    let mut t9 = in7
+        .muli(3035 - 4096)
+        .sub(in8.muli(2751))
+        .rsh::<12>(2048)
+        .add(in7);
+    let mut t10 = in5
+        .muli(2106)
+        .add(in10.muli(3513 - 4096))
+        .rsh::<12>(2048)
+        .add(in10);
+    let mut t11 = in5
+        .muli(3513 - 4096)
+        .sub(in10.muli(2106))
+        .rsh::<12>(2048)
+        .add(in5);
+    let mut t12 = in3
+        .muli(1380)
+        .add(in12.muli(3857 - 4096))
+        .rsh::<12>(2048)
+        .add(in12);
+    let mut t13 = in3
+        .muli(3857 - 4096)
+        .sub(in12.muli(1380))
+        .rsh::<12>(2048)
+        .add(in3);
+    let mut t14 = in1
+        .muli(601)
+        .add(in14.muli(4052 - 4096))
+        .rsh::<12>(2048)
+        .add(in14);
+    let mut t15 = in1
+        .muli(4052 - 4096)
+        .sub(in14.muli(601))
+        .rsh::<12>(2048)
+        .add(in1);
+
+    let t0a = clip(t0.add(t8));
+    let t1a = clip(t1.add(t9));
+    let t2a = clip(t2.add(t10));
+    let t3a = clip(t3.add(t11));
+    let t4a = clip(t4.add(t12));
+    let t5a = clip(t5.add(t13));
+    let t6a = clip(t6.add(t14));
+    let t7a = clip(t7.add(t15));
+    let mut t8a = clip(t0.sub(t8));
+    let mut t9a = clip(t1.sub(t9));
+    let mut t10a = clip(t2.sub(t10));
+    let mut t11a = clip(t3.sub(t11));
+    let mut t12a = clip(t4.sub(t12));
+    let mut t13a = clip(t5.sub(t13));
+    let mut t14a = clip(t6.sub(t14));
+    let mut t15a = clip(t7.sub(t15));
+
+    t8 = t8a
+        .muli(4017 - 4096)
+        .add(t9a.muli(799))
+        .rsh::<12>(2048)
+        .add(t8a);
+    t9 = t8a
+        .muli(799)
+        .sub(t9a.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .sub(t9a);
+    t10 = t10a
+        .muli(2276)
+        .add(t11a.muli(3406 - 4096))
+        .rsh::<12>(2048)
+        .add(t11a);
+    t11 = t10a
+        .muli(3406 - 4096)
+        .sub(t11a.muli(2276))
+        .rsh::<12>(2048)
+        .add(t10a);
+    t12 = t13a
+        .muli(4017 - 4096)
+        .sub(t12a.muli(799))
+        .rsh::<12>(2048)
+        .add(t13a);
+    t13 = t13a
+        .muli(799)
+        .add(t12a.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .add(t12a);
+    t14 = t15a
+        .muli(2276)
+        .sub(t14a.muli(3406 - 4096))
+        .rsh::<12>(2048)
+        .sub(t14a);
+    t15 = t15a
+        .muli(3406 - 4096)
+        .add(t14a.muli(2276))
+        .rsh::<12>(2048)
+        .add(t15a);
+
+    t0 = clip(t0a.add(t4a));
+    t1 = clip(t1a.add(t5a));
+    t2 = clip(t2a.add(t6a));
+    t3 = clip(t3a.add(t7a));
+    t4 = clip(t0a.sub(t4a));
+    t5 = clip(t1a.sub(t5a));
+    t6 = clip(t2a.sub(t6a));
+    t7 = clip(t3a.sub(t7a));
+    t8a = clip(t8.add(t12));
+    t9a = clip(t9.add(t13));
+    t10a = clip(t10.add(t14));
+    t11a = clip(t11.add(t15));
+    t12a = clip(t8.sub(t12));
+    t13a = clip(t9.sub(t13));
+    t14a = clip(t10.sub(t14));
+    t15a = clip(t11.sub(t15));
+
+    let t4b = t4
+        .muli(3784 - 4096)
+        .add(t5.muli(1567))
+        .rsh::<12>(2048)
+        .add(t4);
+    let t5b = t4
+        .muli(1567)
+        .sub(t5.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t5);
+    let t6b = t7
+        .muli(3784 - 4096)
+        .sub(t6.muli(1567))
+        .rsh::<12>(2048)
+        .add(t7);
+    let t7b = t7
+        .muli(1567)
+        .add(t6.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .add(t6);
+    t12 = t12a
+        .muli(3784 - 4096)
+        .add(t13a.muli(1567))
+        .rsh::<12>(2048)
+        .add(t12a);
+    t13 = t12a
+        .muli(1567)
+        .sub(t13a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t13a);
+    t14 = t15a
+        .muli(3784 - 4096)
+        .sub(t14a.muli(1567))
+        .rsh::<12>(2048)
+        .add(t15a);
+    t15 = t15a
+        .muli(1567)
+        .add(t14a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .add(t14a);
+
+    c[0] = clip(t0.add(t2));
+    c[15] = clip(t1.add(t3)).neg();
+    let t2b = clip(t0.sub(t2));
+    let t3b = clip(t1.sub(t3));
+    c[3] = clip(t4b.add(t6b)).neg();
+    c[12] = clip(t5b.add(t7b));
+    t6 = clip(t4b.sub(t6b));
+    t7 = clip(t5b.sub(t7b));
+    c[1] = clip(t8a.add(t10a)).neg();
+    c[14] = clip(t9a.add(t11a));
+    t10 = clip(t8a.sub(t10a));
+    t11 = clip(t9a.sub(t11a));
+    c[2] = clip(t12.add(t14));
+    c[13] = clip(t13.add(t15)).neg();
+    let t14b = clip(t12.sub(t14));
+    let t15b = clip(t13.sub(t15));
+    c[7] = t2b.add(t3b).muli(181).rsh::<8>(128).neg();
+    c[8] = t2b.sub(t3b).muli(181).rsh::<8>(128);
+    c[4] = t6.add(t7).muli(181).rsh::<8>(128);
+    c[11] = t6.sub(t7).muli(181).rsh::<8>(128).neg();
+    c[6] = t10.add(t11).muli(181).rsh::<8>(128);
+    c[9] = t10.sub(t11).muli(181).rsh::<8>(128).neg();
+    c[5] = t14b.add(t15b).muli(181).rsh::<8>(128).neg();
+    c[10] = t14b.sub(t15b).muli(181).rsh::<8>(128);
 }
 
 #[inline]
@@ -592,6 +858,93 @@ fn inv_dct32_v(c: &mut [I32x8; 32], min: i32, max: i32) {
     c[31] = clip(e[0].sub(t31));
 }
 
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_dequant16_i32x8(levels: &[i32; 256], x: usize, y: usize, dequant: &IdctDequant) -> I32x8 {
+    let q = if x == 0 && y == 0 {
+        _mm256_setr_epi32(
+            dequant.dc_q,
+            dequant.ac_q,
+            dequant.ac_q,
+            dequant.ac_q,
+            dequant.ac_q,
+            dequant.ac_q,
+            dequant.ac_q,
+            dequant.ac_q,
+        )
+    } else {
+        splat(dequant.ac_q)
+    };
+    let lvl = unsafe { _mm256_loadu_si256(levels.as_ptr().add(x * 16 + y).cast::<__m256i>()) };
+    I32x8(dequant8(lvl, q, splat(dequant.cf_max)))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv16x16_mixed_dequant_avx2<const ROW_ADST: bool, const COL_ADST: bool>(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    let cmn = splat(dequant.cmin);
+    let cmx = splat(dequant.cmax);
+
+    // First inverse dimension consumes quantized levels directly. This fuses
+    // dequantization with the first transform pass and stores a real transposed
+    // scratch: scratch[y_frequency * 16 + x_spatial].
+    let mut scratch_u = MaybeUninit::<[i32; 256]>::uninit();
+    for y in (0..16usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|x| load_dequant16_i32x8(levels, x, y, dequant));
+        if ROW_ADST {
+            inv_adst16_v(&mut rows, dequant.rmin, dequant.rmax);
+        } else {
+            inv_dct16_v(&mut rows, dequant.rmin, dequant.rmax);
+        }
+        for row in rows.iter_mut() {
+            *row = row.rsh::<2>(2).clip(cmn, cmx);
+        }
+        store_transposed_rows_i32x8::<16>(scratch_u.as_mut_ptr().cast(), y, &rows);
+    }
+    let scratch = unsafe { scratch_u.assume_init() };
+
+    let mut out = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(8) {
+        let mut cols: [I32x8; 16] =
+            std::array::from_fn(|y| load_i32x8(unsafe { scratch.as_ptr().add(y * 16 + x) }));
+        if COL_ADST {
+            inv_adst16_v(&mut cols, dequant.cmin, dequant.cmax);
+        } else {
+            inv_dct16_v(&mut cols, dequant.cmin, dequant.cmax);
+        }
+        for y in 0..16usize {
+            let r = cols[y].rsh::<4>(8);
+            store_i32x8(unsafe { (out.as_mut_ptr() as *mut i32).add(y * 16 + x) }, r);
+        }
+    }
+    unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn iadstdct_dequant_16x16_avx2(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    inv16x16_mixed_dequant_avx2::<false, true>(levels, dequant)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn idctadst_dequant_16x16_avx2(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    inv16x16_mixed_dequant_avx2::<true, false>(levels, dequant)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn iadst_dequant_16x16_avx2(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
+    inv16x16_mixed_dequant_avx2::<true, true>(levels, dequant)
+}
+
 #[target_feature(enable = "avx2")]
 pub(crate) fn idct_dequant_8x8_avx2(levels: &[i32; 64], dequant: &IdctDequant) -> [i32; 64] {
     let coeff = dequant_levels::<64, false>(levels, dequant);
@@ -619,46 +972,7 @@ pub(crate) fn idct_dequant_8x8_avx2(levels: &[i32; 64], dequant: &IdctDequant) -
 
 #[target_feature(enable = "avx2")]
 pub(crate) fn idct_dequant_16x16_avx2(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
-    let coeff = dequant_levels::<256, false>(levels, dequant);
-
-    let mut c_l: [I32x8; 16] =
-        std::array::from_fn(|x| load_i32x8(unsafe { coeff.as_ptr().add(x * 16) }));
-    let mut c_r: [I32x8; 16] =
-        std::array::from_fn(|x| load_i32x8(unsafe { coeff.as_ptr().add(x * 16 + 8) }));
-
-    inv_dct16_v(&mut c_l, dequant.rmin, dequant.rmax);
-    inv_dct16_v(&mut c_r, dequant.rmin, dequant.rmax);
-
-    let cmn = splat(dequant.cmin);
-    let cmx = splat(dequant.cmax);
-    for vv in c_l.iter_mut().chain(c_r.iter_mut()) {
-        *vv = vv.rsh::<2>(2).clip(cmn, cmx);
-    }
-
-    let mut ll: [I32x8; 8] = c_l[0..8].try_into().unwrap();
-    let mut lr: [I32x8; 8] = c_l[8..16].try_into().unwrap();
-    let mut rl: [I32x8; 8] = c_r[0..8].try_into().unwrap();
-    let mut rr: [I32x8; 8] = c_r[8..16].try_into().unwrap();
-    transpose_8x8(&mut ll);
-    transpose_8x8(&mut lr);
-    transpose_8x8(&mut rl);
-    transpose_8x8(&mut rr);
-
-    let mut w_l: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { ll[i] } else { rl[i - 8] });
-    let mut w_r: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { lr[i] } else { rr[i - 8] });
-
-    inv_dct16_v(&mut w_l, dequant.cmin, dequant.cmax);
-    inv_dct16_v(&mut w_r, dequant.cmin, dequant.cmax);
-
-    let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for r in 0..16 {
-        let lo = w_l[r].rsh::<4>(8);
-        let hi = w_r[r].rsh::<4>(8);
-        let dst = unsafe { (out.as_mut_ptr() as *mut i32).add(r * 16) };
-        store_i32x8(dst, lo);
-        store_i32x8(unsafe { dst.add(8) }, hi);
-    }
-    unsafe { out.assume_init() }
+    inv16x16_mixed_dequant_avx2::<false, false>(levels, dequant)
 }
 
 #[target_feature(enable = "avx2")]
@@ -668,38 +982,27 @@ pub(crate) fn idct_dequant_32x32_avx2(levels: &[i32; 1024], dequant: &IdctDequan
     let cmx = splat(dequant.cmax);
 
     let mut scratch_u = MaybeUninit::<[i32; 1024]>::uninit();
-    for yg in (0..32).step_by(8) {
-        let mut cols: [I32x8; 32] =
-            std::array::from_fn(|x| load_i32x8(unsafe { coeff.as_ptr().add(x * 32 + yg) }));
-        inv_dct32_v(&mut cols, dequant.rmin, dequant.rmax);
-        for (x, cv) in cols.iter().copied().enumerate() {
-            let r = cv.rsh::<2>(2).clip(cmn, cmx);
-            store_i32x8(
-                unsafe { (scratch_u.as_mut_ptr() as *mut i32).add(x * 32 + yg) },
-                r,
-            );
+    for y in (0..32usize).step_by(8) {
+        let mut rows: [I32x8; 32] =
+            std::array::from_fn(|x| load_i32x8(unsafe { coeff.as_ptr().add(x * 32 + y) }));
+        inv_dct32_v(&mut rows, dequant.rmin, dequant.rmax);
+        for row in rows.iter_mut() {
+            *row = row.rsh::<2>(2).clip(cmn, cmx);
         }
+        store_transposed_rows_i32x8::<32>(scratch_u.as_mut_ptr().cast(), y, &rows);
     }
     let scratch = unsafe { scratch_u.assume_init() };
 
-    let mut out_u = MaybeUninit::<[i32; 1024]>::uninit();
-    for xg in (0..32).step_by(8) {
-        let mut rows2: [I32x8; 32] = std::array::from_fn(|_| I32x8(_mm256_setzero_si256()));
-        for yg2 in (0..32).step_by(8) {
-            let mut seg: [I32x8; 8] = std::array::from_fn(|v| {
-                load_i32x8(unsafe { scratch.as_ptr().add((xg + v) * 32 + yg2) })
-            });
-            transpose_8x8(&mut seg);
-            rows2[yg2..yg2 + 8].copy_from_slice(&seg);
-        }
-        inv_dct32_v(&mut rows2, dequant.cmin, dequant.cmax);
-        for (y, rv) in rows2.iter().copied().enumerate() {
-            let r = rv.rsh::<4>(8);
-            store_i32x8(
-                unsafe { (out_u.as_mut_ptr() as *mut i32).add(y * 32 + xg) },
-                r,
-            );
+    // Vertical inverse pass in 8 x lanes with contiguous loads from scratch.
+    let mut out = MaybeUninit::<[i32; 1024]>::uninit();
+    for x in (0..32usize).step_by(8) {
+        let mut cols: [I32x8; 32] =
+            std::array::from_fn(|y| load_i32x8(unsafe { scratch.as_ptr().add(y * 32 + x) }));
+        inv_dct32_v(&mut cols, dequant.cmin, dequant.cmax);
+        for y in 0..32usize {
+            let r = cols[y].rsh::<4>(8);
+            store_i32x8(unsafe { (out.as_mut_ptr() as *mut i32).add(y * 32 + x) }, r);
         }
     }
-    unsafe { out_u.assume_init() }
+    unsafe { out.assume_init() }
 }

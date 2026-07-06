@@ -30,24 +30,27 @@ use crate::av1_coder::*;
 use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
 use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
+use crate::trellis_dist::{
+    trellis_dist_current_zero_scan, trellis_dist_one, trellis_round_down_scan,
+};
 
 /// Trellis RD lambda on libaom's KF rdmult shape `dc_q^2*(3.3+0.0015*dc_q)`
 /// (av1/encoder/txb_rdopt.c uses the frame DC-quant rdmult), calibrated to the
 /// legacy `TRELLIS_LAMBDA0*ac_q^2*2` at q=128.
-const TRELLIS_AOM_CALIB: f64 = 0.045025873597302174;
+const TRELLIS_AOM_CALIB: f32 = 0.045025873597302174;
 #[inline]
-fn trellis_lambda_aom(dc_q: f64, _ac_q: f64) -> f64 {
+fn trellis_lambda_aom(dc_q: f32, _ac_q: f32) -> f32 {
     TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn trellis_optimize_ctx(
     cf: &mut [i32],
-    tf: &[f64],
-    dc_q: f64,
-    ac_q: f64,
-    scan: &[usize],
-    lambda0: f64,
+    tf: &[f32],
+    dc_q: f32,
+    ac_q: f32,
+    scan: &[u32],
+    lambda0: f32,
     w: usize,
     cdfs: &Cdfs,
     cls: usize,
@@ -71,11 +74,7 @@ pub(crate) fn trellis_optimize_ctx(
     let dc_sign = &cdfs.dc_sign[plane];
     let dq2_dc = dc_q * dc_q;
     let dq2_ac = ac_q * ac_q;
-    let dist = |rc: usize, lev: i32| {
-        let dq2 = if rc == 0 { dq2_dc } else { dq2_ac };
-        let e = tf[rc].abs() - (lev.abs() as f64);
-        dq2 * (e * e)
-    };
+    let dist = |rc: usize, lev: i32| trellis_dist_one(tf, rc, lev, dq2_dc, dq2_ac);
 
     // Precompute the base-range (hi_tok) ladder cost for every br context and
     // every total_br in 0..=12, once per call. `hi_tok_cost` otherwise reruns a
@@ -125,7 +124,7 @@ pub(crate) fn trellis_optimize_ctx(
 
     let eob: i32 = scan
         .iter()
-        .rposition(|&rc| cf[rc] != 0)
+        .rposition(|&rc| cf[rc as usize] != 0)
         .map_or(-1, |i| i as i32);
     if eob < 0 {
         return;
@@ -133,131 +132,105 @@ pub(crate) fn trellis_optimize_ctx(
     let eu = eob as usize;
 
     thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<f64>, Vec<f64>, Vec<f32>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+        static SCRATCH: std::cell::RefCell<(
+            Vec<u8>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+        )> = const {
+            std::cell::RefCell::new((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))
+        };
     }
-    let (mut levels, mut pre, mut suf0, mut irate) = SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        (
-            std::mem::take(&mut b.0),
-            std::mem::take(&mut b.1),
-            std::mem::take(&mut b.2),
-            std::mem::take(&mut b.3),
-        )
-    });
-    levels.clear();
-    levels.resize(w * (w + 4), 0);
-    let set_level = |levels: &mut [u8], rc: usize, m: u32| {
-        levels[(rc >> log2w) * stride + (rc & (w - 1))] = level_byte(m);
-    };
-    for &rc in &scan[..eu + 1] {
-        set_level(&mut levels, rc, cf[rc].unsigned_abs());
-    }
+    SCRATCH.with_borrow_mut(|scratch| {
+        let (levels, pre, suf0, dist_cur, dist_zero) = (
+            &mut scratch.0,
+            &mut scratch.1,
+            &mut scratch.2,
+            &mut scratch.3,
+            &mut scratch.4,
+        );
+        levels.clear();
+        levels.resize(w * (w + 4), 0);
+        let set_level = |levels: &mut [u8], rc: usize, m: u32| {
+            levels[(rc >> log2w) * stride + (rc & (w - 1))] = level_byte(m);
+        };
+        for &rc32 in &scan[..eu + 1] {
+            let rc = rc32 as usize;
+            set_level(levels, rc, cf[rc].unsigned_abs());
+        }
 
-    // Interior base-token context + br context for a position, from `levels`.
-    let interior_ctx = |levels: &[u8], rc: usize| -> (usize, usize) {
-        let (x, y) = (rc >> log2w, rc & (w - 1));
-        let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, &LO_CTX_OFF, stride);
-        let mag = hi_mag & 63;
-        let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
-        (ctx, bc as usize)
-    };
-    let dc_brc = |levels: &[u8]| -> usize {
-        let mag = (levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32) & 63;
-        if mag > 12 {
-            6
-        } else {
-            ((mag + 1) >> 1) as usize
-        }
-    };
-    // Rate of an interior coefficient at level k (base_tok + br + AC sign).
-    let interior_rate = |ctx: usize, bc: usize, k: u32| -> f32 {
-        if k == 0 {
-            return cdf_cost(&base_tok[ctx], 0);
-        }
-        let tok = k.min(3);
-        let mut b = cdf_cost(&base_tok[ctx], tok as usize);
-        if tok == 3 {
-            b += hi_cost(k, bc);
-        }
-        b + 1.0 // AC sign (bypass)
-    };
-
-    // Step A: reverse-scan per-coefficient RD-best level (interior), then DC.
-    for i in (1..(eob as usize)).rev() {
-        let rc = scan[i];
-        let l = cf[rc].unsigned_abs();
-        if l == 0 {
-            continue;
-        }
-        let (ctx, bc) = interior_ctx(&levels, rc);
-        // Hoist the four base-token costs (tok 0..=3) out of the k-loop; only the
-        // br/Golomb tail (k >= 3) and distortion vary per candidate. Float-op
-        // order matches `interior_rate` exactly so the choice is unchanged.
-        let bt = &base_tok[ctx];
-        let bt0 = cdf_cost(bt, 0);
-        let bt1 = cdf_cost(bt, 1);
-        let bt2 = cdf_cost(bt, 2);
-        let bt3 = cdf_cost(bt, 3);
-        let rate_k = |k: u32| -> f32 {
-            match k {
-                0 => bt0,
-                1 => bt1 + 1.0,
-                2 => bt2 + 1.0,
-                _ => (bt3 + hi_cost(k, bc)) + 1.0,
+        // Interior base-token context + br context for a position, from `levels`.
+        let interior_ctx = |levels: &[u8], rc: usize| -> (usize, usize) {
+            let (x, y) = (rc >> log2w, rc & (w - 1));
+            let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, &LO_CTX_OFF, stride);
+            let mag = hi_mag & 63;
+            let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
+            (ctx, bc as usize)
+        };
+        let dc_brc = |levels: &[u8]| -> usize {
+            let mag = (levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32) & 63;
+            if mag > 12 {
+                6
+            } else {
+                ((mag + 1) >> 1) as usize
             }
         };
-        let mut best_k = l;
-        let mut best_c = dist(rc, l as i32) + rate_cost(lambda, rate_k(l));
+        // Rate of an interior coefficient at level k (base_tok + br + AC sign).
+        let interior_rate = |ctx: usize, bc: usize, k: u32| -> f32 {
+            if k == 0 {
+                return cdf_cost(&base_tok[ctx], 0);
+            }
+            let tok = k.min(3);
+            let mut b = cdf_cost(&base_tok[ctx], tok as usize);
+            if tok == 3 {
+                b += hi_cost(k, bc);
+            }
+            b + 1.0 // AC sign (bypass)
+        };
 
-        for k in (0..l).rev() {
-            let dk = dist(rc, k as i32);
-            // dist grows monotonically as k falls below l (l <= |tf|), and the
-            // rate is non-negative, so once dist alone reaches best_c no smaller
-            // level can win. Exact, just stops the scan early.
-            if dk >= best_c {
-                break;
+        // Step A: reverse-scan per-coefficient RD-best level (interior), then DC.
+        for i in (1..(eob as usize)).rev() {
+            let rc = scan[i] as usize;
+            let l = cf[rc].unsigned_abs();
+            if l == 0 {
+                continue;
             }
-            let c = dk + rate_cost(lambda, rate_k(k));
-            if c < best_c {
-                best_c = c;
-                best_k = k;
-            }
-        }
-        if best_k != l {
-            cf[rc] = if cf[rc] < 0 {
-                -(best_k as i32)
-            } else {
-                best_k as i32
-            };
-            set_level(&mut levels, rc, best_k);
-        }
-    }
-    {
-        let rc = scan[0];
-        let l = cf[rc].unsigned_abs();
-        if l != 0 {
-            let bc = dc_brc(&levels);
-            let sgn = (cf[rc] < 0) as usize;
-            let dc_rate = |k: u32| -> f32 {
-                if k == 0 {
-                    return cdf_cost(&base_tok[0], 0);
+            let (ctx, bc) = interior_ctx(levels, rc);
+            // Hoist the four base-token costs (tok 0..=3) out of the k-loop; only the
+            // br/Golomb tail (k >= 3) and distortion vary per candidate. Float-op
+            // order matches `interior_rate` exactly so the choice is unchanged.
+            let bt = &base_tok[ctx];
+            let bt0 = cdf_cost(bt, 0);
+            let bt1 = cdf_cost(bt, 1);
+            let bt2 = cdf_cost(bt, 2);
+            let bt3 = cdf_cost(bt, 3);
+            let rate_k = |k: u32| -> f32 {
+                match k {
+                    0 => bt0,
+                    1 => bt1 + 1.0,
+                    2 => bt2 + 1.0,
+                    _ => (bt3 + hi_cost(k, bc)) + 1.0,
                 }
-                let tok = k.min(3);
-                let mut b = cdf_cost(&base_tok[0], tok as usize);
-                if tok == 3 {
-                    b += hi_cost(k, bc);
-                }
-                b + cdf_cost(&dc_sign[dcs_ctx], sgn)
             };
             let mut best_k = l;
-            let mut best_c = dist(rc, l as i32) + rate_cost(lambda, dc_rate(l));
+            let mut best_c = dist(rc, l as i32) + rate_cost(lambda, rate_k(l));
+
             for k in (0..l).rev() {
                 let dk = dist(rc, k as i32);
+                // dist grows monotonically as k falls below l (l <= |tf|), and the
+                // rate is non-negative, so once dist alone reaches best_c no smaller
+                // level can win. Exact, just stops the scan early.
                 if dk >= best_c {
                     break;
                 }
-                let c = dk + rate_cost(lambda, dc_rate(k));
+                let c = dk + rate_cost(lambda, rate_k(k));
                 if c < best_c {
                     best_c = c;
                     best_k = k;
@@ -269,157 +242,215 @@ pub(crate) fn trellis_optimize_ctx(
                 } else {
                     best_k as i32
                 };
-                set_level(&mut levels, rc, best_k);
+                set_level(levels, rc, best_k);
             }
         }
-    }
+        {
+            let rc = scan[0] as usize;
+            let l = cf[rc].unsigned_abs();
+            if l != 0 {
+                let bc = dc_brc(levels);
+                let sgn = (cf[rc] < 0) as usize;
+                let dc_rate = |k: u32| -> f32 {
+                    if k == 0 {
+                        return cdf_cost(&base_tok[0], 0);
+                    }
+                    let tok = k.min(3);
+                    let mut b = cdf_cost(&base_tok[0], tok as usize);
+                    if tok == 3 {
+                        b += hi_cost(k, bc);
+                    }
+                    b + cdf_cost(&dc_sign[dcs_ctx], sgn)
+                };
+                let mut best_k = l;
+                let mut best_c = dist(rc, l as i32) + rate_cost(lambda, dc_rate(l));
+                for k in (0..l).rev() {
+                    let dk = dist(rc, k as i32);
+                    if dk >= best_c {
+                        break;
+                    }
+                    let c = dk + rate_cost(lambda, dc_rate(k));
+                    if c < best_c {
+                        best_c = c;
+                        best_k = k;
+                    }
+                }
+                if best_k != l {
+                    cf[rc] = if cf[rc] < 0 {
+                        -(best_k as i32)
+                    } else {
+                        best_k as i32
+                    };
+                    set_level(levels, rc, best_k);
+                }
+            }
+        }
 
-    // Step B: EOB-position selection with accurate eob_pt / eob_base costs.
-    let eob_pt_cost = |e: usize| -> f32 {
-        let bin = if e < 2 {
-            e
-        } else {
-            32 - (e as u32).leading_zeros() as usize
+        // Step B: EOB-position selection with accurate eob_pt / eob_base costs.
+        let eob_pt_cost = |e: usize| -> f32 {
+            let bin = if e < 2 {
+                e
+            } else {
+                32 - (e as u32).leading_zeros() as usize
+            };
+            let mut c = cdf_cost(eob_bin_cdf, bin);
+            if bin > 1 {
+                let nbits = bin - 2;
+                c += cdf_cost(&eob_hi[bin], (e >> nbits) & 1);
+                c += nbits as f32; // remaining eob offset bits (bypass)
+            }
+            c
         };
-        let mut c = cdf_cost(eob_bin_cdf, bin);
-        if bin > 1 {
-            let nbits = bin - 2;
-            c += cdf_cost(&eob_hi[bin], (e >> nbits) & 1);
-            c += nbits as f32; // remaining eob offset bits (bypass)
-        }
-        c
-    };
-    let eob_coeff_cost = |e: usize, m: u32| -> f32 {
-        let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
-        let tok = m.min(3);
-        let mut c = cdf_cost(&eob_base[ctx_e], tok as usize - 1);
-        if tok == 3 {
-            let rc = scan[e];
-            let (ex, ey) = (rc >> log2w, rc & (w - 1));
-            let bc = if (ex | ey) > 1 { 14 } else { 7 };
-            c += hi_cost(m, bc);
-        }
-        c + 1.0 // sign
-    };
+        let eob_coeff_cost = |e: usize, m: u32| -> f32 {
+            let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
+            let tok = m.min(3);
+            let mut c = cdf_cost(&eob_base[ctx_e], tok as usize - 1);
+            if tok == 3 {
+                let rc = scan[e] as usize;
+                let (ex, ey) = (rc >> log2w, rc & (w - 1));
+                let bc = if (ex | ey) > 1 { 14 } else { 7 };
+                c += hi_cost(m, bc);
+            }
+            c + 1.0 // sign
+        };
 
-    // Interior (base_tok) rate of each position at its current level, for the
-    // running prefix; positions are priced as interior even if they will end up
-    // being the EOB (corrected by swapping in eob_coeff_cost at the candidate).
-    // Driven by zipped slice iterators so the sequential index checks drop out;
-    // accumulation order (`acc + lambda*r + d`) matches the indexed form exactly.
-    pre.resize(n + 1, 0.0);
-    irate.resize(n, 0.0);
-    let mut acc = 0.0f64; // pre[1]: empty prefix
-    // Interior positions [1, eob]: priced with neighbor context.
-    for ((&rc, ir), p) in scan[1..eu + 1]
-        .iter()
-        .zip(irate[1..eu + 1].iter_mut())
-        .zip(pre[2..eu + 2].iter_mut())
-    {
-        let (ctx, bc) = interior_ctx(&levels, rc);
-        let r = interior_rate(ctx, bc, cf[rc].unsigned_abs());
-        *ir = r;
-        acc = (acc + rate_cost(lambda, r)) + dist(rc, cf[rc]);
-        *p = acc;
-    }
-    // Trailing positions (eob, n): coded as zeros, distortion only.
-    for (&rc, p) in scan[eu + 1..n].iter().zip(pre[eu + 2..n + 1].iter_mut()) {
-        acc += dist(rc, 0);
-        *p = acc;
-    }
-    suf0.resize(n + 1, 0.0);
-    suf0[n] = 0.0; // suffix seed (read as suf0[n]; not written by the loop below)
-    let mut sacc = 0.0f64;
-    for (&rc, s) in scan[1..n].iter().rev().zip(suf0[1..n].iter_mut().rev()) {
-        sacc += dist(rc, 0);
-        *s = sacc;
-    }
-    // DC contribution (rate + distortion), constant across EOB choices ≥ 1.
-    let dc_rc = scan[0];
-    let dc_m = cf[dc_rc].unsigned_abs();
-    let dc_cost = if dc_m == 0 {
-        rate_cost(lambda, cdf_cost(&base_tok[0], 0))
-    } else {
-        let bc = dc_brc(&levels);
-        let tok = dc_m.min(3);
-        let mut b = cdf_cost(&base_tok[0], tok as usize);
-        if tok == 3 {
-            b += hi_cost(dc_m, bc);
-        }
-        b += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
-        rate_cost(lambda, b)
-    } + dist(dc_rc, cf[dc_rc]);
+        // pre[e] = interior cost of positions [1, e-1]; an EOB candidate at e then
+        // adds only e's own eob-coeff cost. dist precomputed in scan order.
+        pre.resize(n + 1, 0.0);
+        pre[0] = 0.0;
+        pre[1] = 0.0;
+        dist_cur.resize(n, 0.0);
+        dist_zero.resize(n, 0.0);
+        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, scan, dq2_dc, dq2_ac);
+        let mut acc = 0.0f32; // pre[1]: empty prefix
 
-    let mut best_e: i32 = -1;
-    let mut best_cost = f64::INFINITY;
+        // Interior positions 1..=eu written to pre[2..=eu+1]: pre[i+1]=sum_{1..i}.
+        let scan_it = scan[1..=eu].iter();
+        let dist_it = dist_cur[1..=eu].iter();
+        let pre_it = pre[2..=eu + 1].iter_mut();
+        for ((&rc_u32, &dist), out_pre) in scan_it.zip(dist_it).zip(pre_it) {
+            let rc = rc_u32 as usize;
+            let (ctx, bc) = interior_ctx(levels, rc);
+            let r = interior_rate(ctx, bc, cf[rc].unsigned_abs());
+            acc += rate_cost(lambda, r) + dist;
+            *out_pre = acc;
+        }
 
-    assert!(scan.len() >= n, "scan must be indexed up to n-1");
-    assert!(irate.len() >= n, "irate must be indexed up to n");
-    assert!(pre.len() > n, "pre must be indexed up to n+1");
-    assert!(suf0.len() > n, "suf0 must be indexed up to n+1");
+        // Trailing positions eu+1..n coded as zero: distortion only.
+        let dist_tail = dist_zero[eu + 1..n].iter();
+        let pre_tail = pre[eu + 2..n + 1].iter_mut();
+        for (&dist, out_pre) in dist_tail.zip(pre_tail) {
+            acc += dist;
+            *out_pre = acc;
+        }
 
-    for e in 1..n {
-        let rc = scan[e];
-        if cf[rc] == 0 {
-            continue; // EOB must land on a nonzero
+        suf0.resize(n + 1, 0.0);
+        suf0[n] = 0.0;
+
+        let mut sacc = 0.0f32;
+
+        // Suffix over 1..n, reversed.
+        for (&dist, out_suf) in dist_zero[1..n]
+            .iter()
+            .rev()
+            .zip(suf0[1..n].iter_mut().rev())
+        {
+            sacc += dist;
+            *out_suf = sacc;
         }
-        // pre[e] prices position e as interior; replace with eob_coeff cost.
-        // A nonzero at `e` implies `e <= eob`, so `irate[e]` was filled above
-        // (identical value to interior_rate here, just cached).
-        let interior_e = rate_cost(lambda, irate[e]);
-        let c = dc_cost
-            + (pre[e + 1] - interior_e)
-            + rate_cost(
-                lambda,
-                eob_pt_cost(e) + eob_coeff_cost(e, cf[rc].unsigned_abs()),
-            )
-            + suf0[e + 1];
-        if c < best_cost {
-            best_cost = c;
-            best_e = e as i32;
+        // DC contribution (rate + distortion), constant across EOB choices ≥ 1.
+        let dc_rc = scan[0] as usize;
+        let dc_m = cf[dc_rc].unsigned_abs();
+        let dc_cost = if dc_m == 0 {
+            rate_cost(lambda, cdf_cost(&base_tok[0], 0))
+        } else {
+            let bc = dc_brc(levels);
+            let tok = dc_m.min(3);
+            let mut b = cdf_cost(&base_tok[0], tok as usize);
+            if tok == 3 {
+                b += hi_cost(dc_m, bc);
+            }
+            b += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
+            rate_cost(lambda, b)
+        } + dist_cur[0];
+
+        let mut best_e: i32 = -1;
+        let mut best_m: u32 = 0; // chosen level at the EOB coefficient
+        let mut best_cost = f32::INFINITY;
+
+        // eob_coeff cost + distortion for magnitude m at position e (m >= 1).
+        let eob_cand = |e: usize, m: u32| -> f32 {
+            rate_cost(lambda, eob_coeff_cost(e, m)) + dist(scan[e] as usize, m as i32)
+        };
+
+        for (e, (&pre_e, &suf_next)) in pre[..n].iter().zip(&suf0[1..=n]).enumerate().skip(1) {
+            let rc = scan[e] as usize;
+            let m = cf[rc].unsigned_abs();
+            if m == 0 {
+                continue; // EOB must land on a nonzero
+            }
+            let base = dc_cost + pre_e + rate_cost(lambda, eob_pt_cost(e)) + suf_next;
+            // Try the EOB coefficient at its level and, like libaom, at level-1.
+            let mut m_best = m;
+            let mut c = base + eob_cand(e, m);
+            if m >= 2 {
+                let c_low = base + eob_cand(e, m - 1);
+                if c_low < c {
+                    c = c_low;
+                    m_best = m - 1;
+                }
+            }
+            if c < best_cost {
+                best_cost = c;
+                best_e = e as i32;
+                best_m = m_best;
+            }
         }
-    }
-    // EOB at DC (only DC nonzero) and the all-zero (txb_skip) alternative.
-    if dc_m != 0 {
-        let ctx_e = 1usize; // e == 0
-        let tok = dc_m.min(3);
-        let mut c0 = cdf_cost(eob_bin_cdf, 0) + cdf_cost(&eob_base[ctx_e], tok as usize - 1);
-        if tok == 3 {
-            c0 += hi_cost(dc_m, dc_brc(&levels));
+        // EOB at DC (only DC nonzero) and the all-zero (txb_skip) alternative.
+        if dc_m != 0 {
+            let ctx_e = 1usize; // e == 0
+            let tok = dc_m.min(3);
+            let mut c0 = cdf_cost(eob_bin_cdf, 0) + cdf_cost(&eob_base[ctx_e], tok as usize - 1);
+            if tok == 3 {
+                c0 += hi_cost(dc_m, dc_brc(levels));
+            }
+            c0 += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
+            let total0 = rate_cost(lambda, c0) + dist_cur[0] + suf0[1];
+            if total0 < best_cost {
+                best_cost = total0;
+                best_e = 0;
+                best_m = dc_m;
+            }
         }
-        c0 += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
-        let total0 = rate_cost(lambda, c0) + dist(dc_rc, cf[dc_rc]) + suf0[1];
-        if total0 < best_cost {
-            best_cost = total0;
-            best_e = 0;
+        let skip_cost = suf0[1] + dist_zero[0] + rate_cost(lambda, 1.0f32);
+        if best_e < 0 || skip_cost < best_cost {
+            for &rc32 in scan.iter() {
+                cf[rc32 as usize] = 0;
+            }
+        } else {
+            let e = best_e as usize;
+            let rc = scan[e] as usize;
+            if best_m != cf[rc].unsigned_abs() {
+                cf[rc] = if cf[rc] < 0 {
+                    -(best_m as i32)
+                } else {
+                    best_m as i32
+                };
+            }
+            for i in (e + 1)..n {
+                cf[scan[i] as usize] = 0;
+            }
         }
-    }
-    let skip_cost = suf0[1] + dist(dc_rc, 0) + rate_cost(lambda, 1.0f32);
-    if best_e < 0 || skip_cost < best_cost {
-        for &rc in scan.iter() {
-            cf[rc] = 0;
-        }
-    } else {
-        for i in (best_e as usize + 1)..n {
-            cf[scan[i]] = 0;
-        }
-    }
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        b.0 = std::mem::take(&mut levels);
-        b.1 = std::mem::take(&mut pre);
-        b.2 = std::mem::take(&mut suf0);
-        b.3 = std::mem::take(&mut irate);
     });
 }
 
 pub(crate) fn trellis_optimize(
     cf: &mut [i32],
-    tf: &[f64],
-    dc_q: f64,
-    ac_q: f64,
-    scan: &[usize],
-    lambda0: f64,
+    tf: &[f32],
+    dc_q: f32,
+    ac_q: f32,
+    scan: &[u32],
+    lambda0: f32,
 ) {
     if lambda0 <= 0.0 {
         return; // trellis disabled
@@ -427,104 +458,145 @@ pub(crate) fn trellis_optimize(
     let n = scan.len();
     let lambda = trellis_lambda_aom(dc_q, ac_q);
     let (dc_q2, ac_q2) = (dc_q * dc_q, ac_q * ac_q);
-    // Distortion of coding coeff `rc` at magnitude `lev`: dq^2*(|tf|-lev)^2.
-    let d = |rc: usize, lev: i32| {
-        let dq2 = if rc == 0 { dc_q2 } else { ac_q2 };
-        let e = tf[rc].abs() - lev.unsigned_abs() as f64;
-        dq2 * e * e
-    };
 
-    let mut eob_idx: i32 = -1;
-    for (i, &x) in scan[..n].iter().enumerate() {
-        if cf[x] != 0 {
-            eob_idx = i as i32;
-        }
-    }
-    if eob_idx < 0 {
+    let Some(eob_idx) = scan[..n].iter().rposition(|&rc| cf[rc as usize] != 0) else {
         return; // already all-zero
-    }
+    };
 
     // Step A: per-coefficient round-down (toward zero) by local R-D.
-    for &rc in scan[..=eob_idx as usize].iter() {
-        let c = cf[rc];
-        if c == 0 {
-            continue;
-        }
-        let l = c.unsigned_abs();
-        let dq2 = if rc == 0 { dc_q2 } else { ac_q2 };
-        let at = tf[rc].abs();
-        let (e_l, e_dn) = (at - l as f64, at - (l - 1) as f64);
-        let cost_l = dq2 * e_l * e_l + rate_cost(lambda, coef_rate_bits(l));
-        let cost_dn = dq2 * e_dn * e_dn + rate_cost(lambda, coef_rate_bits(l - 1));
-        if cost_dn < cost_l {
-            cf[rc] = if c < 0 { -(l as i32 - 1) } else { l as i32 - 1 };
-        }
-    }
+    trellis_round_down_scan(cf, tf, &scan[..=eob_idx], dc_q2, ac_q2, lambda);
 
     thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<f64>, Vec<f64>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        #[allow(clippy::type_complexity)]
+        static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
     }
-    let (mut suf0, mut pre) = SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        (std::mem::take(&mut b.0), std::mem::take(&mut b.1))
-    });
+    SCRATCH.with_borrow_mut(|scratch| {
+        let (suf0, pre, dist_cur, dist_zero) = (
+            &mut scratch.0,
+            &mut scratch.1,
+            &mut scratch.2,
+            &mut scratch.3,
+        );
 
-    suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
-    suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
-    assert!(suf0.len() > n, "suf0 must be indexed up to n");
-    for (i, &s) in (0..n).rev().zip(scan[..n].iter().rev()) {
-        suf0[i] = suf0[i + 1] + d(s, 0);
-    }
-    pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
-    assert!(pre.len() > n, "pre must be indexed up to n");
+        dist_cur.resize(n, 0.0);
+        dist_zero.resize(n, 0.0);
+        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, scan, dc_q2, ac_q2);
 
-    pre[0] = 0.0; // empty-prefix seed
-    for (i, &rc) in scan[..n].iter().enumerate() {
-        pre[i + 1] =
-            pre[i] + d(rc, cf[rc]) + rate_cost(lambda, coef_rate_bits(cf[rc].unsigned_abs()));
-    }
-    let eob_sig = |e: usize| -> f32 {
-        let bin = if e < 2 {
-            e
-        } else {
-            (32 - (e as u32).leading_zeros()) as usize
+        suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
+        suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
+        assert!(suf0.len() > n, "suf0 must be indexed up to n");
+        for i in (0..n).rev() {
+            suf0[i] = suf0[i + 1] + dist_zero[i];
+        }
+        pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
+        assert!(pre.len() > n, "pre must be indexed up to n");
+
+        pre[0] = 0.0; // empty-prefix seed
+        for (i, &rc32) in scan[..n].iter().enumerate() {
+            let rc = rc32 as usize;
+            pre[i + 1] =
+                pre[i] + dist_cur[i] + rate_cost(lambda, coef_rate_bits(cf[rc].unsigned_abs()));
+        }
+        let eob_sig = |e: usize| -> f32 {
+            let bin = if e < 2 {
+                e
+            } else {
+                (32 - (e as u32).leading_zeros()) as usize
+            };
+            let extra = if bin > 1 { bin - 2 } else { 0 };
+            (bin as f32) * 0.9 + extra as f32 + 2.0 // eob_pt + extra bits + eob_base token
         };
-        let extra = if bin > 1 { bin - 2 } else { 0 };
-        (bin as f32) * 0.9 + extra as f32 + 2.0 // eob_pt + extra bits + eob_base token
-    };
 
-    let mut best_e: i32 = -1;
-    let mut best_cost = f64::INFINITY;
-    for (e, ((&rc, &pre), &suf0)) in scan[..n]
-        .iter()
-        .zip(pre.iter())
-        .zip(suf0[1..].iter())
-        .enumerate()
-    {
-        if cf[rc] == 0 {
-            continue; // the EOB must land on a nonzero
+        let mut best_e: i32 = -1;
+        let mut best_cost = f32::INFINITY;
+        for (e, ((&rc32, &pre), &suf0)) in scan[..n]
+            .iter()
+            .zip(pre.iter())
+            .zip(suf0[1..].iter())
+            .enumerate()
+        {
+            let rc = rc32 as usize;
+            if cf[rc] == 0 {
+                continue; // the EOB must land on a nonzero
+            }
+            let c = pre + dist_cur[e] + rate_cost(lambda, eob_sig(e)) + suf0;
+            if c < best_cost {
+                best_cost = c;
+                best_e = e as i32;
+            }
         }
-        let c = pre + d(rc, cf[rc]) + rate_cost(lambda, eob_sig(e)) + suf0;
-        if c < best_cost {
-            best_cost = c;
-            best_e = e as i32;
+        let skip_cost = suf0[0] + rate_cost(lambda, 1.0f32); // zero everything + the txb_skip flag
+        if best_e < 0 || skip_cost < best_cost {
+            for &rc32 in scan.iter() {
+                cf[rc32 as usize] = 0;
+            }
+        } else {
+            for &x32 in scan[(best_e as usize + 1)..n].iter() {
+                cf[x32 as usize] = 0;
+            }
         }
-    }
-    let skip_cost = suf0[0] + rate_cost(lambda, 1.0f32); // zero everything + the txb_skip flag
-    if best_e < 0 || skip_cost < best_cost {
-        for &rc in scan.iter() {
-            cf[rc] = 0;
-        }
-    } else {
-        for &x in scan[(best_e as usize + 1)..n].iter() {
-            cf[x] = 0;
-        }
-    }
-
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        b.0 = std::mem::take(&mut suf0);
-        b.1 = std::mem::take(&mut pre);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::av1_coder::Cdfs;
+    use crate::tables::SCAN_16X16;
+
+    fn random_block(rng: &mut impl FnMut() -> u64) -> ([f32; 256], [i32; 256]) {
+        let (mut tf, mut cf) = ([0.0f32; 256], [0i32; 256]);
+        for _ in 0..1 + (rng() % 40) as usize {
+            let rc = (rng() % 256) as usize;
+            let mag = (rng() % 6) as f32 + rng() as f32 / u64::MAX as f32;
+            let sign = if rng() & 1 == 0 { 1.0 } else { -1.0 };
+            tf[rc] = sign * mag;
+            cf[rc] = (sign * mag.round()) as i32;
+        }
+        (tf, cf)
+    }
+
+    // Trellis only zeroes past the EOB and lowers magnitudes toward |tf|; it never
+    // raises a level, flips a sign, or exceeds the original magnitude.
+    #[test]
+    fn trellis_output_is_valid() {
+        let cdfs = Cdfs::new(0);
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..1000 {
+            let (tf, cf) = random_block(&mut rng);
+            let mut opt = cf;
+            trellis_optimize_ctx(
+                &mut opt,
+                &tf,
+                200.0,
+                220.0,
+                &SCAN_16X16,
+                0.05,
+                16,
+                &cdfs,
+                2,
+                0,
+                &cdfs.eob_bin_256_l,
+                0,
+            );
+            if let Some(e) = SCAN_16X16.iter().rposition(|&r| opt[r as usize] != 0) {
+                for &r in &SCAN_16X16[e + 1..] {
+                    assert_eq!(opt[r as usize], 0);
+                }
+            }
+            for rc in 0..256 {
+                assert!(opt[rc].unsigned_abs() <= cf[rc].unsigned_abs());
+                if opt[rc] != 0 {
+                    assert_eq!(opt[rc].signum(), cf[rc].signum());
+                }
+            }
+        }
+    }
 }

@@ -138,6 +138,7 @@ fn csc_rows_par<T: Pixel + Sync>(
 ) {
     const BAND: usize = 64; // rows per work item
     let [o0, o1, o2] = out;
+    #[allow(clippy::type_complexity)]
     let items: Vec<(usize, (&mut [i32], (&mut [i32], &mut [i32])))> = o0
         .chunks_mut(BAND * w)
         .zip(o1.chunks_mut(BAND * w).zip(o2.chunks_mut(BAND * w)))
@@ -201,7 +202,7 @@ impl<T: Pixel> PlanarImage<T> {
 
     /// Build from interleaved RGBA samples (`r,g,b,a,r,g,b,a,...`) in a single
     /// pass: plane0=G, plane1=B, plane2=R, plane3=A. This is the deinterleave
-    /// the `*_with_alpha` paths use — the colour planes and the alpha plane are
+    /// the `*_with_alpha` paths use — the color planes and the alpha plane are
     /// split once, with no intermediate RGB buffer.
     pub fn from_interleaved_rgba(
         width: usize,
@@ -469,6 +470,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
 
     // Horizontal 2:1 averaging, parallel over disjoint output row bands.
     {
+        #[allow(clippy::type_complexity)]
         let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
             .chunks_mut(cw)
             .zip(cr.chunks_mut(cw))
@@ -558,6 +560,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
 
     // 2x2 averaging, parallel over disjoint output row bands.
     {
+        #[allow(clippy::type_complexity)]
         let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
             .chunks_mut(cw)
             .zip(cr.chunks_mut(cw))

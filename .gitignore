@@ -11,3 +11,8 @@ Cargo.lock
 *.jxl
 *.heic
 *.heif
+avmdec
+tests
+libavif-main
+avm-main
+.DS_Store

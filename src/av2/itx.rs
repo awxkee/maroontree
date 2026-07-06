@@ -560,11 +560,13 @@ fn inv_txfm_passes(
     let (sw, sh) = (w.min(32), h.min(32));
     let coeff = &coeff[..sw * sh];
 
-    // Row pass: each row is contiguous; gather (with the rect2 prescale) and transform.
+    let coef_clip_max = (1 << (bd + 7)) - 1;
+    let coef_clip_min = -(1 << (bd + 7));
     for (col, row) in tmp[..sw * sh].chunks_exact_mut(sw).enumerate() {
         for (x, slot) in row.iter_mut().enumerate() {
             let v = coeff[col + x * sh];
-            *slot = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            let v = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            *slot = v.clamp(coef_clip_min, coef_clip_max);
         }
         first(row);
     }
@@ -655,7 +657,10 @@ pub(crate) fn inv_txfm_recon_f32<F: Fn(usize) -> i32>(
     let (sw, sh, w, h, s1) = txfm_passes(&mut tmp, coeff, txtp, tx, bd);
     let pmax = (1 << bd) - 1;
     let rnd1 = (1 << s1) >> 1;
-    let cf = |t: i32| (t + rnd1) >> s1;
+    // AVM clamps each column-pass output (the residual) to [-2^bd, 2^bd-1]
+    // (idct.c col_rng_min/max); required for enc/dec recon match at large qstep.
+    let (res_min, res_max) = (-(1 << bd), (1 << bd) - 1);
+    let cf = |t: i32| ((t + rnd1) >> s1).clamp(res_min, res_max);
     let xs = if w > sw { 2 } else { 1 };
     let ys = if h > sh { 2 } else { 1 };
     for col in 0..sh {
@@ -689,7 +694,8 @@ pub(crate) fn inv_txfm_add(
 
     // Output: round/shift, add to dst, clip; nearest-duplicate for 64-wide/tall.
     let rnd1 = (1 << s1) >> 1;
-    let cf = |t: i32| (t + rnd1) >> s1;
+    let (res_min, res_max) = (-(1 << bd), (1 << bd) - 1);
+    let cf = |t: i32| ((t + rnd1) >> s1).clamp(res_min, res_max);
     match (w > sw, h > sh) {
         (false, false) => {
             for col in 0..sh {
@@ -1018,8 +1024,10 @@ fn inv_txfm_passes_lanes<V: Lane>(
     let (s0, s1) = TXSH[tx];
     let (w, h) = (4 * tw, 4 * th);
     let is_rect2 = (lw + lh) & 1 != 0;
-    let row_clip_min = -(1 << (bd + 7));
-    let row_clip_max = !row_clip_min;
+    let coef_clip_min = -(1 << (bd + 7));
+    let coef_clip_max = (1 << (bd + 7)) - 1;
+    let row_clip_min = coef_clip_min;
+    let row_clip_max = coef_clip_max;
     let first = pick_lane::<V>(lw, txtp & 7).expect("invalid horizontal tx");
     let second = pick_lane::<V>(lh, (txtp >> 5) & 7).expect("invalid vertical tx");
     let (sw, sh) = (w.min(32), h.min(32));
@@ -1030,7 +1038,13 @@ fn inv_txfm_passes_lanes<V: Lane>(
 
     for (col, row) in tmp.chunks_exact_mut(sw).enumerate() {
         for (slot, &v) in row.iter_mut().zip(coeff.iter().skip(col).step_by(sh)) {
-            *slot = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            let v = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            // The decoder clamps each dequantized coefficient before the first
+            // inverse-transform pass.  Large TX64 coefficients reach this range
+            // at low qidx; omitting the clamp makes the SIMD encoder reconstruct
+            // a different reference picture even though the emitted levels are
+            // valid and entropy-decode correctly.
+            *slot = v.clamp(coef_clip_min, coef_clip_max);
         }
     }
     let mut lanes = [V::zero(); 32];
@@ -1178,17 +1192,35 @@ mod tests {
         coeff
     }
 
+    fn coeff_clip_case(sw: usize, sh: usize, bd: i32) -> Vec<i32> {
+        let mut coeff = vec![0i32; sw * sh];
+        let lim = 1 << (bd + 7);
+        // Keep the vector sparse so every legal bit depth remains comfortably
+        // inside i32 during the transform while still exercising both clamp ends.
+        coeff[0] = lim + 257;
+        if coeff.len() > 1 {
+            coeff[1] = -lim - 193;
+        }
+        if coeff.len() > sw {
+            coeff[sw] = lim + 65;
+        }
+        coeff
+    }
+
     unsafe fn assert_itx_impl_matches_scalar(name: &str, simd: ItxPassesFn) {
-        for tx in 0..DIM.len() {
-            let (tw, th, lw, lh) = DIM[tx];
+        for (tx, &(tw, th, lw, lh)) in DIM.iter().enumerate() {
             let sw = (4 * tw).min(32);
             let sh = (4 * th).min(32);
             for &hor in valid_1d_types(lw) {
                 for &ver in valid_1d_types(lh) {
                     let txtp = hor | (ver << 5);
                     for &bd in &[8, 10, 12] {
-                        for seed in 0..3u32 {
-                            let coeff = coeff_case(sw, sh, tx, hor, ver, seed);
+                        for case in 0..4u32 {
+                            let coeff = if case < 3 {
+                                coeff_case(sw, sh, tx, hor, ver, case)
+                            } else {
+                                coeff_clip_case(sw, sh, bd)
+                            };
                             let mut expected = [0x5555_5555i32; 32 * 32];
                             let mut actual = [0x3333_3333i32; 32 * 32];
 
@@ -1196,13 +1228,13 @@ mod tests {
                             let actual_ret = unsafe { simd(&mut actual, &coeff, txtp, tx, bd) };
                             assert_eq!(
                                 actual_ret, expected_ret,
-                                "{name} return mismatch tx={tx} hor={hor} ver={ver} bd={bd} seed={seed}"
+                                "{name} return mismatch tx={tx} hor={hor} ver={ver} bd={bd} case={case}"
                             );
                             let area = expected_ret.0 * expected_ret.1;
                             assert_eq!(
                                 &actual[..area],
                                 &expected[..area],
-                                "{name} coeff mismatch tx={tx} hor={hor} ver={ver} bd={bd} seed={seed}"
+                                "{name} coeff mismatch tx={tx} hor={hor} ver={ver} bd={bd} case={case}"
                             );
                         }
                     }

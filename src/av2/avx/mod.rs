@@ -30,6 +30,11 @@ mod cost;
 mod fdct;
 mod itx;
 
-pub(crate) use cost::{coeff_abs_rate_f32_avx2, coeff_rate_f32_avx2};
+pub(crate) use cost::{
+    cfl_sse_i32_avx2, coeff_abs_rate_f32_avx2, coeff_rate_f32_avx2, pixel_sse_f32_avx2,
+    pixel_sse_f32_u16_avx2, pixel_sse_rounded_avx2, pixel_sse_rounded_const_avx2, sad_f32_avx2,
+    sad_u8_avx2, satd_f32_avx2, scaled_residual_f32_avx2, sum_sumsq_f32_avx2,
+    weighted_pixel_sse_f32_avx2,
+};
 pub(crate) use fdct::fdct_rect_avx2;
 pub(crate) use itx::inv_txfm_passes_avx2;

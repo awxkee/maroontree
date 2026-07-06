@@ -76,7 +76,7 @@ pub(crate) fn frame_header_lossless() -> Vec<u8> {
 
 /// Like [`frame_header_lossless`] but emits the tile-count increment bits needed
 /// when the frame spans more than one 64x64 superblock (single tile is always
-/// signalled; see `frame_header_lossy_multitile` for the tiling rationale).
+/// signaled; see `frame_header_lossy_multitile` for the tiling rationale).
 pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8> {
     // Single tile: one `0` stop-bit per dimension that spans >1 superblock.
     let cols = if sb_cols > 1 { vec![false] } else { vec![] };

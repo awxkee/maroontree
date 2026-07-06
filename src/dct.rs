@@ -26,16 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-// Coefficients in Q0.16 fixed-point
-// WC4[0] = 0.5411961  -> 35468
-// WC4[1] = 1.3065630  -> 85627
-// WC8[0] = 0.5097956  -> 33410
-// WC8[1] = 0.6013449  -> 39393
-// WC8[2] = 0.8999762  -> 58981
-// WC8[3] = 2.5629156  -> 167982
-// SQRT_2  = 1.4142136  -> 92682
-
+#![allow(clippy::needless_range_loop)]
 use crate::quant::Dct;
 use std::sync::OnceLock;
 
@@ -225,6 +216,32 @@ pub(crate) fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
     out
 }
 
+#[inline]
+fn dct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        dct1d_8_i32(&mut col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = col[r];
+        }
+    }
+
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f32; 64];
+    for r in 0..8usize {
+        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut row);
+        for u in 0..8 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, row[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
 /// Forward ADST8 (1-D), Q12 matrix derived as the gain-matched transpose of
 /// dav1d's integer inverse ADST8 (`inv_adst8_1d`). Calibrated so the forward/
 /// inverse round-trip gain equals the DCT pair's, so the same quant multipliers
@@ -254,99 +271,21 @@ fn fwd_adst8_1d(inp: &[i32; 8]) -> [i32; 8] {
     out
 }
 
-/// Forward 2-D ADST_ADST for an 8x8 residual, same output layout as
-/// `dct8x8_coeffs` (`out[horiz_freq*8 + vert_freq]`, DC at 0).
-pub(crate) fn adst8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    for x in 0..8usize {
-        let mut col = [0i32; 8];
-        for r in 0..8 {
-            col[r] = input[r * 8 + x];
-        }
-        let c = fwd_adst8_1d(&col);
-        for r in 0..8 {
-            tmp[r * 8 + x] = c[r];
-        }
-    }
-    let mut out = [0i32; 64];
-    for r in 0..8usize {
-        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
-        let rr = fwd_adst8_1d(&row);
-        for u in 0..8 {
-            out[u * 8 + r] = rr[u];
-        }
-    }
-    out
-}
-
 /// Trellis (RDOQ) forward ADST8: levels + unrounded targets, mirroring
 /// `dct8x8_t`. Ratio is 1.0 for 8x8, so the quant multipliers apply directly.
-pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
-    let coeffs = adst8x8_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    adst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// Forward ADST_DCT 8x8: ADST on columns (vertical), DCT on rows (horizontal).
-/// AV1 `ADST_DCT`. Stored transposed like the other 8x8 forwards.
-fn adstdct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    for x in 0..8usize {
-        let mut col = [0i32; 8];
-        for r in 0..8 {
-            col[r] = input[r * 8 + x];
-        }
-        let c = fwd_adst8_1d(&col);
-        for r in 0..8 {
-            tmp[r * 8 + x] = c[r];
-        }
-    }
-    let mut out = [0i32; 64];
-    for r in 0..8usize {
-        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
-        dct1d_8_i32(&mut row);
-        for u in 0..8 {
-            out[u * 8 + r] = row[u];
-        }
-    }
-    out
+pub(crate) fn adstdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    adstdct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// Forward DCT_ADST 8x8: DCT on columns (vertical), ADST on rows (horizontal).
-/// AV1 `DCT_ADST`.
-fn dctadst8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    for x in 0..8usize {
-        let mut col = [0i32; 8];
-        for r in 0..8 {
-            col[r] = input[r * 8 + x];
-        }
-        dct1d_8_i32(&mut col);
-        for r in 0..8 {
-            tmp[r * 8 + x] = col[r];
-        }
-    }
-    let mut out = [0i32; 64];
-    for r in 0..8usize {
-        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
-        let rr = fwd_adst8_1d(&row);
-        for u in 0..8 {
-            out[u * 8 + r] = rr[u];
-        }
-    }
-    out
+pub(crate) fn dctadst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    dctadst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-pub(crate) fn adstdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
-    let coeffs = adstdct8x8_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
-}
-
-pub(crate) fn dctadst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
-    let coeffs = dctadst8x8_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
-}
-
-static ADST16_FWD_Q12: [[i16; 16]; 16] = [
+pub(crate) static ADST16_FWD_Q12: [[i16; 16]; 16] = [
     [
         284, 850, 1408, 1951, 2477, 2978, 3451, 3891, 4294, 4653, 4969, 5236, 5455, 5619, 5731,
         5788,
@@ -426,93 +365,16 @@ fn fwd_adst16_1d(inp: &[i32; 16]) -> [i32; 16] {
     out
 }
 
-/// Forward 2-D ADST_ADST for a 16x16 residual. Mirrors `dct16x16_coeffs`
-/// exactly (column pass, row pass, then the same `*0.5` gain normalization),
-/// so coefficients land at the DCT16 scale that the quant multipliers expect.
-pub(crate) fn adst16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    let mut tmp = [0i32; 256];
-    for u in 0..16 {
-        let mut col = [0i32; 16];
-        for i in 0..16 {
-            col[i] = input[i * 16 + u];
-        }
-        let c = fwd_adst16_1d(&col);
-        for v in 0..16 {
-            tmp[v * 16 + u] = c[v];
-        }
-    }
-    let mut out = [0i32; 256];
-    for v in 0..16 {
-        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
-        let rr = fwd_adst16_1d(&row);
-        for u in 0..16 {
-            out[u * 16 + v] = mul_q16(rr[u], 32768);
-        }
-    }
-    out
+pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
+    resolve_adst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
-    let coeffs = adst16x16_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn adstdct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
+    resolve_adstdct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// Forward ADST_DCT 16x16: ADST cols (vertical), DCT rows (horizontal).
-fn adstdct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    let mut tmp = [0i32; 256];
-    for u in 0..16 {
-        let mut col = [0i32; 16];
-        for i in 0..16 {
-            col[i] = input[i * 16 + u];
-        }
-        let c = fwd_adst16_1d(&col);
-        for v in 0..16 {
-            tmp[v * 16 + u] = c[v];
-        }
-    }
-    let mut out = [0i32; 256];
-    for v in 0..16 {
-        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
-        dct1d_16_i32(&mut row);
-        for u in 0..16 {
-            out[u * 16 + v] = mul_q16(row[u], 32768);
-        }
-    }
-    out
-}
-
-/// Forward DCT_ADST 16x16: DCT cols (vertical), ADST rows (horizontal).
-fn dctadst16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    let mut tmp = [0i32; 256];
-    for u in 0..16 {
-        let mut col = [0i32; 16];
-        for i in 0..16 {
-            col[i] = input[i * 16 + u];
-        }
-        dct1d_16_i32(&mut col);
-        for v in 0..16 {
-            tmp[v * 16 + u] = col[v];
-        }
-    }
-    let mut out = [0i32; 256];
-    for v in 0..16 {
-        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
-        let rr = fwd_adst16_1d(&row);
-        for u in 0..16 {
-            out[u * 16 + v] = mul_q16(rr[u], 32768);
-        }
-    }
-    out
-}
-
-pub(crate) fn adstdct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
-    let coeffs = adstdct16x16_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
-}
-
-pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
-    let coeffs = dctadst16x16_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
+    resolve_dctadst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
 #[inline]
@@ -589,6 +451,33 @@ pub(crate) fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
         }
     }
     out
+}
+
+#[inline]
+fn dct16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [f32; 256]) {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        dct1d_16_i32(&mut col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = col[v];
+        }
+    }
+
+    let mut cf = [0i32; 256];
+    let mut tf = [0.0f32; 256];
+    for v in 0..16 {
+        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut row);
+        for u in 0..16 {
+            let coeff = mul_q16(row[u], 32768);
+            store_quant_target_scalar(&mut cf, &mut tf, u * 16 + v, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
 }
 
 #[allow(unused)]
@@ -714,6 +603,39 @@ pub(crate) fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     out
 }
 
+#[inline]
+fn dct32x32_quant_t_direct(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    const B: i32 = 6;
+    let mut tmp = [0i32; 1024];
+    for u in 0..32 {
+        let mut col = [0i32; 32];
+        for i in 0..32 {
+            col[i] = input[i * 32 + u] << B;
+        }
+        dct1d_32_i32(&mut col);
+        for v in 0..32 {
+            tmp[v * 32 + u] = col[v];
+        }
+    }
+
+    let mut cf = [0i32; 1024];
+    let mut tf = [0.0f32; 1024];
+    for v in 0..32 {
+        let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
+        dct1d_32_i32(&mut row);
+        for u in 0..32 {
+            let prod = (row[u] as i64) * 16384;
+            let coeff = ((prod + (1i64 << (15 + B))) >> (16 + B)) as i32;
+            store_quant_target_scalar(&mut cf, &mut tf, u * 32 + v, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
 #[allow(unused)]
 pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     let coeffs = dct32x32_coeffs(input);
@@ -791,6 +713,33 @@ pub(crate) fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     out
 }
 
+#[inline]
+fn dct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..8usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 8 + col];
+        }
+        dct1d_16_i32(&mut c);
+        for fy in 0..16 {
+            tmp[fy * 8 + col] = c[fy];
+        }
+    }
+
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..16usize {
+        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut r);
+        for fx in 0..8 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
 #[allow(unused)]
 pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_coeffs(input);
@@ -799,84 +748,606 @@ pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     }
 }
 
+#[inline(always)]
+fn store_quant_target_scalar<const N: usize>(
+    cf: &mut [i32; N],
+    tf: &mut [f32; N],
+    idx: usize,
+    coeff: i32,
+    q_mult_dc: i32,
+    q_mult_ac: i32,
+) {
+    let m = if idx == 0 { q_mult_dc } else { q_mult_ac };
+    cf[idx] = quant_q16(coeff, m);
+    tf[idx] = coeff as f32 * m as f32 * (1.0 / 65536.0);
+}
+
 #[inline]
+#[allow(unused)]
 fn quant_levels_and_targets<const N: usize>(
     coeffs: &[i32; N],
     q_mult_dc: i32,
     q_mult_ac: i32,
-) -> ([i32; N], [f64; N]) {
+) -> ([i32; N], [f32; N]) {
     let mut cf = [0i32; N];
-    let mut tf = [0.0f64; N];
-    for i in 0..N {
-        let m = if i == 0 { q_mult_dc } else { q_mult_ac };
-        cf[i] = quant_q16(coeffs[i], m);
-        tf[i] = coeffs[i] as f64 * m as f64 * (1. / 65536.0);
+    let mut tf = [0.0f32; N];
+    for (i, &coeff) in coeffs.iter().enumerate() {
+        store_quant_target_scalar(&mut cf, &mut tf, i, coeff, q_mult_dc, q_mult_ac);
     }
     (cf, tf)
 }
 
-type Dct8x8CoeffsFn = fn(&[i32; 64]) -> [i32; 64];
-type Dct16x16CoeffsFn = fn(&[i32; 256]) -> [i32; 256];
-type Dct32x32CoeffsFn = fn(&[i32; 1024]) -> [i32; 1024];
-type Dct8x16CoeffsFn = fn(&[i32; 128]) -> [i32; 128];
-
-static DCT8X8_COEFFS: OnceLock<Dct8x8CoeffsFn> = OnceLock::new();
-static DCT16X16_COEFFS: OnceLock<Dct16x16CoeffsFn> = OnceLock::new();
-static DCT32X32_COEFFS: OnceLock<Dct32x32CoeffsFn> = OnceLock::new();
-static DCT8X16_COEFFS: OnceLock<Dct8x16CoeffsFn> = OnceLock::new();
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn dct8x8_neon_coeffs_wrap(input: &[i32; 64]) -> [i32; 64] {
-    unsafe { crate::neon::dct8x8_neon_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn dct16x16_neon_coeffs_wrap(input: &[i32; 256]) -> [i32; 256] {
-    unsafe { crate::neon::dct16x16_neon_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn dct32x32_neon_coeffs_wrap(input: &[i32; 1024]) -> [i32; 1024] {
-    unsafe { crate::neon::dct32x32_neon_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn dct8x16_neon_coeffs_wrap(input: &[i32; 128]) -> [i32; 128] {
-    unsafe { crate::neon::dct8x16_neon_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn dct8x8_avx2_coeffs_wrap(input: &[i32; 64]) -> [i32; 64] {
-    unsafe { crate::avx::dct8x8_avx2_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn dct16x16_avx2_coeffs_wrap(input: &[i32; 256]) -> [i32; 256] {
-    unsafe { crate::avx::dct16x16_avx2_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn dct32x32_avx2_coeffs_wrap(input: &[i32; 1024]) -> [i32; 1024] {
-    unsafe { crate::avx::dct32x32_avx2_coeffs(input) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn dct8x16_avx2_coeffs_wrap(input: &[i32; 128]) -> [i32; 128] {
-    unsafe { crate::avx::dct8x16_avx2_coeffs(input) }
+#[inline]
+fn adst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        let c = fwd_adst8_1d(&col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = c[r];
+        }
+    }
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f32; 64];
+    for r in 0..8usize {
+        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let rr = fwd_adst8_1d(&row);
+        for u in 0..8 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, rr[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
 }
 
 #[inline]
-fn resolve_dct8x8_coeffs() -> Dct8x8CoeffsFn {
-    *DCT8X8_COEFFS.get_or_init(|| {
-        let mut _f: Dct8x8CoeffsFn = dct8x8_coeffs;
+fn adstdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        let c = fwd_adst8_1d(&col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = c[r];
+        }
+    }
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f32; 64];
+    for r in 0..8usize {
+        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut row);
+        for u in 0..8 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, row[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn dctadst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for x in 0..8usize {
+        let mut col = [0i32; 8];
+        for r in 0..8 {
+            col[r] = input[r * 8 + x];
+        }
+        dct1d_8_i32(&mut col);
+        for r in 0..8 {
+            tmp[r * 8 + x] = col[r];
+        }
+    }
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f32; 64];
+    for r in 0..8usize {
+        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let rr = fwd_adst8_1d(&row);
+        for u in 0..8 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, rr[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adst16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [f32; 256]) {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        let c = fwd_adst16_1d(&col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = c[v];
+        }
+    }
+    let mut cf = [0i32; 256];
+    let mut tf = [0.0f32; 256];
+    for v in 0..16 {
+        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let rr = fwd_adst16_1d(&row);
+        for u in 0..16 {
+            store_quant_target_scalar(
+                &mut cf,
+                &mut tf,
+                u * 16 + v,
+                mul_q16(rr[u], 32768),
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adstdct16x16_quant_t_direct(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        let c = fwd_adst16_1d(&col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = c[v];
+        }
+    }
+    let mut cf = [0i32; 256];
+    let mut tf = [0.0f32; 256];
+    for v in 0..16 {
+        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut row);
+        for u in 0..16 {
+            store_quant_target_scalar(
+                &mut cf,
+                &mut tf,
+                u * 16 + v,
+                mul_q16(row[u], 32768),
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn dctadst16x16_quant_t_direct(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp = [0i32; 256];
+    for u in 0..16 {
+        let mut col = [0i32; 16];
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        dct1d_16_i32(&mut col);
+        for v in 0..16 {
+            tmp[v * 16 + u] = col[v];
+        }
+    }
+    let mut cf = [0i32; 256];
+    let mut tf = [0.0f32; 256];
+    for v in 0..16 {
+        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let rr = fwd_adst16_1d(&row);
+        for u in 0..16 {
+            store_quant_target_scalar(
+                &mut cf,
+                &mut tf,
+                u * 16 + v,
+                mul_q16(rr[u], 32768),
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        let c = fwd_adst4_1d(&col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = c[r];
+        }
+    }
+    let mut cf = [0i32; 16];
+    let mut tf = [0.0f32; 16];
+    for r in 0..4usize {
+        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let rr = fwd_adst4_1d(&row);
+        for u in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, rr[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adstdct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        let c = fwd_adst4_1d(&col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = c[r];
+        }
+    }
+    let mut cf = [0i32; 16];
+    let mut tf = [0.0f32; 16];
+    for r in 0..4usize {
+        let mut row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        dct1d_4_i32(&mut row);
+        for u in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, row[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn dctadst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    let mut tmp = [0i32; 16];
+    for x in 0..4usize {
+        let mut col = [0i32; 4];
+        for r in 0..4 {
+            col[r] = input[r * 4 + x];
+        }
+        dct1d_4_i32(&mut col);
+        for r in 0..4 {
+            tmp[r * 4 + x] = col[r];
+        }
+    }
+    let mut cf = [0i32; 16];
+    let mut tf = [0.0f32; 16];
+    for r in 0..4usize {
+        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let rr = fwd_adst4_1d(&row);
+        for u in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, rr[u], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adst4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        let cc = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = cc[fy];
+        }
+    }
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        let rr = fwd_adst4_1d(&r);
+        for fx in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, rr[fx], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn adstdct4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        let cc = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = cc[fy];
+        }
+    }
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        dct1d_4_i32(&mut r);
+        for fx in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, r[fx], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[inline]
+fn dctadst4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
+    for col in 0..4 {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 4 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fy in 0..8 {
+            tmp[fy * 4 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
+    for fy in 0..8 {
+        let mut r = [0i32; 4];
+        for col in 0..4 {
+            r[col] = tmp[fy * 4 + col];
+        }
+        let rr = fwd_adst4_1d(&r);
+        for fx in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, rr[fx], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+type Dct8x8QuantTFn = fn(&[i32; 64], i32, i32) -> ([i32; 64], [f32; 64]);
+type Dct8x16QuantTFn = fn(&[i32; 128], i32, i32) -> ([i32; 128], [f32; 128]);
+type Dct16x16QuantTFn = fn(&[i32; 256], i32, i32) -> ([i32; 256], [f32; 256]);
+type Tx16x16QuantTFn = fn(&[i32; 256], i32, i32) -> ([i32; 256], [f32; 256]);
+type Dct32x32QuantTFn = fn(&[i32; 1024], i32, i32) -> ([i32; 1024], [f32; 1024]);
+type Dct16x32QuantTFn = fn(&[i32; 512], i32, i32) -> ([i32; 512], [f32; 512]);
+type Dct32x16QuantTFn = fn(&[i32; 512], i32, i32) -> ([i32; 512], [f32; 512]);
+
+static DCT8X8_QUANT_T: OnceLock<Dct8x8QuantTFn> = OnceLock::new();
+static DCT8X16_QUANT_T: OnceLock<Dct8x16QuantTFn> = OnceLock::new();
+static DCT16X16_QUANT_T: OnceLock<Dct16x16QuantTFn> = OnceLock::new();
+static ADST16X16_QUANT_T: OnceLock<Tx16x16QuantTFn> = OnceLock::new();
+static ADSTDCT16X16_QUANT_T: OnceLock<Tx16x16QuantTFn> = OnceLock::new();
+static DCTADST16X16_QUANT_T: OnceLock<Tx16x16QuantTFn> = OnceLock::new();
+static DCT32X32_QUANT_T: OnceLock<Dct32x32QuantTFn> = OnceLock::new();
+static DCT16X32_QUANT_T: OnceLock<Dct16x32QuantTFn> = OnceLock::new();
+static DCT32X16_QUANT_T: OnceLock<Dct32x16QuantTFn> = OnceLock::new();
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct8x8_neon_quant_t_wrap(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    unsafe { crate::neon::dct8x8_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct16x16_neon_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::neon::dct16x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn adst16x16_neon_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::neon::adst16x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn adstdct16x16_neon_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::neon::adstdct16x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dctadst16x16_neon_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::neon::dctadst16x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct32x32_neon_quant_t_wrap(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    unsafe { crate::neon::dct32x32_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct8x16_neon_quant_t_wrap(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    unsafe { crate::neon::dct8x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct16x32_neon_quant_t_wrap(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    unsafe { crate::neon::dct16x32_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn dct32x16_neon_quant_t_wrap(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    unsafe { crate::neon::dct32x16_neon_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct8x8_avx2_quant_t_wrap(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    unsafe { crate::avx::dct8x8_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct16x16_avx2_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::avx::dct16x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn adst16x16_avx2_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::avx::adst16x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn adstdct16x16_avx2_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::avx::adstdct16x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dctadst16x16_avx2_quant_t_wrap(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    unsafe { crate::avx::dctadst16x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct32x32_avx2_quant_t_wrap(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    unsafe { crate::avx::dct32x32_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct8x16_avx2_quant_t_wrap(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    unsafe { crate::avx::dct8x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct16x32_avx2_quant_t_wrap(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    unsafe { crate::avx::dct16x32_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn dct32x16_avx2_quant_t_wrap(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    unsafe { crate::avx::dct32x16_avx2_quant_t(input, dc_q, ac_q) }
+}
+
+#[inline]
+fn dct8x8_quant_t_scalar(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    dct8x8_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dct8x16_quant_t_scalar(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    dct8x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dct16x16_quant_t_scalar(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [f32; 256]) {
+    dct16x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn adst16x16_quant_t_scalar(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [f32; 256]) {
+    adst16x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn adstdct16x16_quant_t_scalar(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    adstdct16x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dctadst16x16_quant_t_scalar(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    dctadst16x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dct32x32_quant_t_scalar(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    dct32x32_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dct16x32_quant_t_scalar(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 512], [f32; 512]) {
+    dct16x32_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn dct32x16_quant_t_scalar(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 512], [f32; 512]) {
+    dct32x16_quant_t_direct(input, dc_q, ac_q)
+}
+
+#[inline]
+fn resolve_dct8x8_quant_t() -> Dct8x8QuantTFn {
+    *DCT8X8_QUANT_T.get_or_init(|| {
+        let mut _f: Dct8x8QuantTFn = dct8x8_quant_t_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            _f = dct8x8_neon_coeffs_wrap;
+            _f = dct8x8_neon_quant_t_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
-                _f = dct8x8_avx2_coeffs_wrap;
+                _f = dct8x8_avx2_quant_t_wrap;
             }
         }
         _f
@@ -884,17 +1355,17 @@ fn resolve_dct8x8_coeffs() -> Dct8x8CoeffsFn {
 }
 
 #[inline]
-fn resolve_dct16x16_coeffs() -> Dct16x16CoeffsFn {
-    *DCT16X16_COEFFS.get_or_init(|| {
-        let mut _f: Dct16x16CoeffsFn = dct16x16_coeffs;
+fn resolve_dct8x16_quant_t() -> Dct8x16QuantTFn {
+    *DCT8X16_QUANT_T.get_or_init(|| {
+        let mut _f: Dct8x16QuantTFn = dct8x16_quant_t_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            _f = dct16x16_neon_coeffs_wrap;
+            _f = dct8x16_neon_quant_t_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
-                _f = dct16x16_avx2_coeffs_wrap;
+                _f = dct8x16_avx2_quant_t_wrap;
             }
         }
         _f
@@ -902,17 +1373,17 @@ fn resolve_dct16x16_coeffs() -> Dct16x16CoeffsFn {
 }
 
 #[inline]
-fn resolve_dct32x32_coeffs() -> Dct32x32CoeffsFn {
-    *DCT32X32_COEFFS.get_or_init(|| {
-        let mut _f: Dct32x32CoeffsFn = dct32x32_coeffs;
+fn resolve_dct16x16_quant_t() -> Dct16x16QuantTFn {
+    *DCT16X16_QUANT_T.get_or_init(|| {
+        let mut _f: Dct16x16QuantTFn = dct16x16_quant_t_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            _f = dct32x32_neon_coeffs_wrap;
+            _f = dct16x16_neon_quant_t_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
-                _f = dct32x32_avx2_coeffs_wrap;
+                _f = dct16x16_avx2_quant_t_wrap;
             }
         }
         _f
@@ -920,17 +1391,17 @@ fn resolve_dct32x32_coeffs() -> Dct32x32CoeffsFn {
 }
 
 #[inline]
-fn resolve_dct8x16_coeffs() -> Dct8x16CoeffsFn {
-    *DCT8X16_COEFFS.get_or_init(|| {
-        let mut _f: Dct8x16CoeffsFn = dct8x16_coeffs;
+fn resolve_adst16x16_quant_t() -> Tx16x16QuantTFn {
+    *ADST16X16_QUANT_T.get_or_init(|| {
+        let mut _f: Tx16x16QuantTFn = adst16x16_quant_t_scalar;
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            _f = dct8x16_neon_coeffs_wrap;
+            _f = adst16x16_neon_quant_t_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
             if std::is_x86_feature_detected!("avx2") {
-                _f = dct8x16_avx2_coeffs_wrap;
+                _f = adst16x16_avx2_quant_t_wrap;
             }
         }
         _f
@@ -938,28 +1409,97 @@ fn resolve_dct8x16_coeffs() -> Dct8x16CoeffsFn {
 }
 
 #[inline]
-fn dct8x8_coeffs_sel(input: &[i32; 64]) -> [i32; 64] {
-    resolve_dct8x8_coeffs()(input)
+fn resolve_adstdct16x16_quant_t() -> Tx16x16QuantTFn {
+    *ADSTDCT16X16_QUANT_T.get_or_init(|| {
+        let mut _f: Tx16x16QuantTFn = adstdct16x16_quant_t_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = adstdct16x16_neon_quant_t_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = adstdct16x16_avx2_quant_t_wrap;
+            }
+        }
+        _f
+    })
 }
 
 #[inline]
-fn dct16x16_coeffs_sel(input: &[i32; 256]) -> [i32; 256] {
-    resolve_dct16x16_coeffs()(input)
+fn resolve_dctadst16x16_quant_t() -> Tx16x16QuantTFn {
+    *DCTADST16X16_QUANT_T.get_or_init(|| {
+        let mut _f: Tx16x16QuantTFn = dctadst16x16_quant_t_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dctadst16x16_neon_quant_t_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dctadst16x16_avx2_quant_t_wrap;
+            }
+        }
+        _f
+    })
 }
 
 #[inline]
-fn dct32x32_coeffs_sel(input: &[i32; 1024]) -> [i32; 1024] {
-    resolve_dct32x32_coeffs()(input)
+fn resolve_dct32x32_quant_t() -> Dct32x32QuantTFn {
+    *DCT32X32_QUANT_T.get_or_init(|| {
+        let mut _f: Dct32x32QuantTFn = dct32x32_quant_t_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct32x32_neon_quant_t_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct32x32_avx2_quant_t_wrap;
+            }
+        }
+        _f
+    })
 }
 
 #[inline]
-fn dct8x16_coeffs_sel(input: &[i32; 128]) -> [i32; 128] {
-    resolve_dct8x16_coeffs()(input)
+fn resolve_dct16x32_quant_t() -> Dct16x32QuantTFn {
+    *DCT16X32_QUANT_T.get_or_init(|| {
+        let mut _f: Dct16x32QuantTFn = dct16x32_quant_t_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct16x32_neon_quant_t_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct16x32_avx2_quant_t_wrap;
+            }
+        }
+        _f
+    })
 }
 
-pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
-    let coeffs = dct8x8_coeffs_sel(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+#[inline]
+fn resolve_dct32x16_quant_t() -> Dct32x16QuantTFn {
+    *DCT32X16_QUANT_T.get_or_init(|| {
+        let mut _f: Dct32x16QuantTFn = dct32x16_quant_t_scalar;
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            _f = dct32x16_neon_quant_t_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                _f = dct32x16_avx2_quant_t_wrap;
+            }
+        }
+        _f
+    })
+}
+
+pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    resolve_dct8x8_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
 /// Forward TX_8X8 **IDTX** (identity): produce quantized levels + unquantized
@@ -969,16 +1509,16 @@ pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f
 /// `round(residual[y,x] * 8 / q)` with the same full-step dead-zone as
 /// `quant_q16`. Bit-exactness with dav1d is carried entirely by the inverse;
 /// this only decides which levels get coded.
-pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f64; 64]) {
+pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
     let (dc_q, ac_q) = (quant.dc_q(), quant.ac_q());
     let mut cf = [0i32; 64];
-    let mut tf = [0.0f64; 64];
+    let mut tf = [0.0f32; 64];
     for y in 0..8 {
         for x in 0..8 {
             let rc = y + x * 8;
             let qd = if rc == 0 { dc_q } else { ac_q };
             let num = residual[y * 8 + x] * 8;
-            tf[rc] = num as f64 / qd as f64;
+            tf[rc] = num as f32 / qd as f32;
             let am = num.unsigned_abs() as i32;
             cf[rc] = if am < qd {
                 0
@@ -991,24 +1531,21 @@ pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 6
     (cf, tf)
 }
 
-pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f64; 256]) {
-    let coeffs = dct16x16_coeffs_sel(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
+    resolve_dct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-pub(crate) fn dct32x32_t(residual: &[i32; 1024], quant: &impl Dct) -> ([i32; 1024], [f64; 1024]) {
-    let coeffs = dct32x32_coeffs_sel(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn dct32x32_t(residual: &[i32; 1024], quant: &impl Dct) -> ([i32; 1024], [f32; 1024]) {
+    resolve_dct32x32_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f64; 128]) {
-    let coeffs = dct8x16_coeffs_sel(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    resolve_dct8x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-fn dct16x8_coeffs(input: &[i32; 128]) -> [i32; 128] {
-    // Pass 1: DCT-8 down each of the 16 columns (vertical).
-    let mut tmp = [0i32; 128]; // tmp[fy*16 + col], fy = vertical freq 0..8
+#[inline]
+fn dct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
     for col in 0..16usize {
         let mut c = [0i32; 8];
         for row in 0..8 {
@@ -1019,29 +1556,27 @@ fn dct16x8_coeffs(input: &[i32; 128]) -> [i32; 128] {
             tmp[fy * 16 + col] = c[fy];
         }
     }
-    // Pass 2: DCT-16 across each of the 8 rows (horizontal).
-    let mut out = [0i32; 128];
+
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
     for fy in 0..8usize {
         let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
         dct1d_16_i32(&mut r);
-        // Same rect2 1/sqrt(2) gain normalization as 8x16.
         for fx in 0..16 {
-            out[fx * 8 + fy] = mul_q16(r[fx], 46341);
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, coeff, dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
-pub(crate) fn dct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f64; 128]) {
-    let coeffs = dct16x8_coeffs(residual);
-    quant_levels_and_targets(&coeffs, quant.q_mult_dc(), quant.q_mult_ac())
+pub(crate) fn dct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    dct16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
 }
 
-/// 4x4: residual `resid[row*4+col]`. DCT-4 vertical then DCT-4 horizontal.
-/// Returns native (orthonormal*sqrt(16)=*4) coefficients; the *8/sqrt(W*H) gain
-/// normalization is folded into the trellis multiplier for full precision.
-fn dct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
-    let mut tmp = [0i32; 16]; // tmp[fy*4 + col]
+#[inline]
+fn dct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    let mut tmp = [0i32; 16];
     for col in 0..4 {
         let mut c = [0i32; 4];
         for row in 0..4 {
@@ -1052,7 +1587,9 @@ fn dct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
             tmp[fy * 4 + col] = c[fy];
         }
     }
-    let mut out = [0i32; 16];
+
+    let mut cf = [0i32; 16];
+    let mut tf = [0.0f32; 16];
     for fy in 0..4 {
         let mut r = [0i32; 4];
         for col in 0..4 {
@@ -1060,16 +1597,15 @@ fn dct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
         }
         dct1d_4_i32(&mut r);
         for fx in 0..4 {
-            out[fx * 4 + fy] = r[fx];
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 4 + fy, r[fx], dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
-/// 4x8: residual `resid[row*4+col]` (8 tall x 4 wide). DCT-8 vertical, DCT-4
-/// horizontal. Native (orthonormal*sqrt(32)) coefficients.
-fn dct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
-    let mut tmp = [0i32; 32]; // tmp[fy*4 + col], fy in 0..8
+#[inline]
+fn dct4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
     for col in 0..4 {
         let mut c = [0i32; 8];
         for row in 0..8 {
@@ -1080,7 +1616,9 @@ fn dct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
             tmp[fy * 4 + col] = c[fy];
         }
     }
-    let mut out = [0i32; 32];
+
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
     for fy in 0..8 {
         let mut r = [0i32; 4];
         for col in 0..4 {
@@ -1088,22 +1626,16 @@ fn dct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
         }
         dct1d_4_i32(&mut r);
         for fx in 0..4 {
-            out[fx * 8 + fy] = r[fx];
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, r[fx], dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
-/// 16x32: residual `resid[row*16+col]` (32 tall x 16 wide). DCT-32 vertical,
-/// DCT-16 horizontal. Native (orthonormal*sqrt(512)) coefficients.
-fn dct16x32_coeffs(input: &[i32; 512]) -> [i32; 512] {
-    // B headroom bits + rounded normalization, same fix as dct32x32_coeffs: the
-    // truncating mul_q16 in the two dct1d passes otherwise floors the round-trip
-    // (~37 dB on noise, ~48 dB on a ramp). Pre-shift left by B, drop it with
-    // round-to-nearest at the end; output scale (sqrt(512)*ortho) is unchanged so
-    // the exact integer inverse and quantizer are untouched.
+#[inline]
+fn dct16x32_quant_t_direct(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 512], [f32; 512]) {
     const B: i32 = 6;
-    let mut tmp = [0i32; 512]; // tmp[fy*16 + col], fy in 0..32
+    let mut tmp = [0i32; 512];
     for col in 0..16 {
         let mut c = [0i32; 32];
         for row in 0..32 {
@@ -1114,7 +1646,9 @@ fn dct16x32_coeffs(input: &[i32; 512]) -> [i32; 512] {
             tmp[fy * 16 + col] = c[fy];
         }
     }
-    let mut out = [0i32; 512];
+
+    let mut cf = [0i32; 512];
+    let mut tf = [0.0f32; 512];
     for fy in 0..32 {
         let mut r = [0i32; 16];
         for col in 0..16 {
@@ -1122,10 +1656,11 @@ fn dct16x32_coeffs(input: &[i32; 512]) -> [i32; 512] {
         }
         dct1d_16_i32(&mut r);
         for fx in 0..16 {
-            out[fx * 32 + fy] = (r[fx] + (1 << (B - 1))) >> B;
+            let coeff = (r[fx] + (1 << (B - 1))) >> B;
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 32 + fy, coeff, dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
 // Per-size gain ratios `8 / sqrt(W*H)` in Q0.16, folded into the quant
@@ -1162,114 +1697,35 @@ fn fwd_adst4_1d(inp: &[i32; 4]) -> [i32; 4] {
     out
 }
 
-/// Forward 2D ADST_ADST 4x4: ADST on columns then ADST on rows, stored
-/// transposed (out[u*4+r]) like the other forwards in this module.
-fn adst4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
-    let mut tmp = [0i32; 16];
-    for x in 0..4usize {
-        let mut col = [0i32; 4];
-        for r in 0..4 {
-            col[r] = input[r * 4 + x];
-        }
-        let c = fwd_adst4_1d(&col);
-        for r in 0..4 {
-            tmp[r * 4 + x] = c[r];
-        }
-    }
-    let mut out = [0i32; 16];
-    for r in 0..4usize {
-        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
-        let rr = fwd_adst4_1d(&row);
-        for u in 0..4 {
-            out[u * 4 + r] = rr[u];
-        }
-    }
-    out
-}
-
 /// Trellis (RDOQ) forward ADST_ADST 4x4: levels + unrounded targets, mirroring
 /// `dct4x4_t` (same `RATIO_4X4_Q16` quant scaling).
-pub(crate) fn adst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
-    let coeffs = adst4x4_coeffs(residual);
+pub(crate) fn adst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    adst4x4_quant_t_direct(residual, m_dc, m_ac)
 }
 
-/// Forward ADST_DCT 4x4: ADST on columns (vertical), DCT on rows (horizontal).
-/// AV1 `ADST_DCT`; mirrors `adstdct8x8_coeffs` with the 4-point kernels.
-fn adstdct4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
-    let mut tmp = [0i32; 16];
-    for x in 0..4usize {
-        let mut col = [0i32; 4];
-        for r in 0..4 {
-            col[r] = input[r * 4 + x];
-        }
-        let c = fwd_adst4_1d(&col);
-        for r in 0..4 {
-            tmp[r * 4 + x] = c[r];
-        }
-    }
-    let mut out = [0i32; 16];
-    for r in 0..4usize {
-        let mut row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
-        dct1d_4_i32(&mut row);
-        for u in 0..4 {
-            out[u * 4 + r] = row[u];
-        }
-    }
-    out
-}
-
-/// Forward DCT_ADST 4x4: DCT on columns (vertical), ADST on rows (horizontal).
-/// AV1 `DCT_ADST`; mirrors `dctadst8x8_coeffs` with the 4-point kernels.
-fn dctadst4x4_coeffs(input: &[i32; 16]) -> [i32; 16] {
-    let mut tmp = [0i32; 16];
-    for x in 0..4usize {
-        let mut col = [0i32; 4];
-        for r in 0..4 {
-            col[r] = input[r * 4 + x];
-        }
-        dct1d_4_i32(&mut col);
-        for r in 0..4 {
-            tmp[r * 4 + x] = col[r];
-        }
-    }
-    let mut out = [0i32; 16];
-    for r in 0..4usize {
-        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
-        let rr = fwd_adst4_1d(&row);
-        for u in 0..4 {
-            out[u * 4 + r] = rr[u];
-        }
-    }
-    out
-}
-
-pub(crate) fn adstdct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
-    let coeffs = adstdct4x4_coeffs(residual);
+pub(crate) fn adstdct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    adstdct4x4_quant_t_direct(residual, m_dc, m_ac)
 }
 
-pub(crate) fn dctadst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
-    let coeffs = dctadst4x4_coeffs(residual);
+pub(crate) fn dctadst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    dctadst4x4_quant_t_direct(residual, m_dc, m_ac)
 }
 
-pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f64; 16]) {
-    let coeffs = dct4x4_coeffs(residual);
+pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    dct4x4_quant_t_direct(residual, m_dc, m_ac)
 }
 
-/// 8x4 forward: residual `resid[row*8+col]` (4 tall x 8 wide). Transpose of 4x8.
-fn dct8x4_coeffs(input: &[i32; 32]) -> [i32; 32] {
-    let mut tmp = [0i32; 32]; // tmp[fx*4 + row]
+#[inline]
+fn dct8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
     for row in 0..4 {
         let mut c = [0i32; 8];
         for col in 0..8 {
@@ -1280,7 +1736,9 @@ fn dct8x4_coeffs(input: &[i32; 32]) -> [i32; 32] {
             tmp[fx * 4 + row] = c[fx];
         }
     }
-    let mut out = [0i32; 32];
+
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
     for fx in 0..8 {
         let mut r = [0i32; 4];
         for row in 0..4 {
@@ -1288,138 +1746,46 @@ fn dct8x4_coeffs(input: &[i32; 32]) -> [i32; 32] {
         }
         dct1d_4_i32(&mut r);
         for fy in 0..4 {
-            out[fx * 4 + fy] = r[fy];
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 4 + fy, r[fy], dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
-pub(crate) fn dct8x4_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    let coeffs = dct8x4_coeffs(residual);
+pub(crate) fn dct8x4_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    dct8x4_quant_t_direct(residual, m_dc, m_ac)
 }
 
-pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    let coeffs = dct4x8_coeffs(residual);
+pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    dct4x8_quant_t_direct(residual, m_dc, m_ac)
 }
 
-/// Forward 2D ADST_ADST 4x8: height-8 ADST on columns, then width-4 ADST on
-/// rows, stored `out[fx*8+fy]` exactly like `dct4x8_coeffs`. Composes
-/// `fwd_adst8_1d` (row-norm sqrt(8), matches dct8) and `fwd_adst4_1d` (row-norm
-/// 2, matches the scaled dct4), so the intrinsic scale equals the 4x8 DCT path
-/// and `RATIO_4X8_Q16` carries over unchanged.
-fn adst4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
-    let mut tmp = [0i32; 32]; // tmp[fy*4 + col], fy in 0..8
-    for col in 0..4 {
-        let mut c = [0i32; 8];
-        for row in 0..8 {
-            c[row] = input[row * 4 + col];
-        }
-        let cc = fwd_adst8_1d(&c);
-        for fy in 0..8 {
-            tmp[fy * 4 + col] = cc[fy];
-        }
-    }
-    let mut out = [0i32; 32];
-    for fy in 0..8 {
-        let mut r = [0i32; 4];
-        for col in 0..4 {
-            r[col] = tmp[fy * 4 + col];
-        }
-        let rr = fwd_adst4_1d(&r);
-        for fx in 0..4 {
-            out[fx * 8 + fy] = rr[fx];
-        }
-    }
-    out
-}
-
-pub(crate) fn adst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    let coeffs = adst4x8_coeffs(residual);
+pub(crate) fn adst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    adst4x8_quant_t_direct(residual, m_dc, m_ac)
 }
 
-/// Forward ADST_DCT 4x8: ADST on columns (height-8, vertical), DCT on rows
-/// (width-4, horizontal). Mirrors `adst4x8_coeffs` (col pass then row pass,
-/// out[fx*8+fy]) with the vertical kernel ADST and the horizontal kernel DCT.
-fn adstdct4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
-    let mut tmp = [0i32; 32];
-    for col in 0..4 {
-        let mut c = [0i32; 8];
-        for row in 0..8 {
-            c[row] = input[row * 4 + col];
-        }
-        let cc = fwd_adst8_1d(&c);
-        for fy in 0..8 {
-            tmp[fy * 4 + col] = cc[fy];
-        }
-    }
-    let mut out = [0i32; 32];
-    for fy in 0..8 {
-        let mut r = [0i32; 4];
-        for col in 0..4 {
-            r[col] = tmp[fy * 4 + col];
-        }
-        dct1d_4_i32(&mut r);
-        for fx in 0..4 {
-            out[fx * 8 + fy] = r[fx];
-        }
-    }
-    out
-}
-
-/// Forward DCT_ADST 4x8: DCT on columns (height-8, vertical), ADST on rows
-/// (width-4, horizontal).
-fn dctadst4x8_coeffs(input: &[i32; 32]) -> [i32; 32] {
-    let mut tmp = [0i32; 32];
-    for col in 0..4 {
-        let mut c = [0i32; 8];
-        for row in 0..8 {
-            c[row] = input[row * 4 + col];
-        }
-        dct1d_8_i32(&mut c);
-        for fy in 0..8 {
-            tmp[fy * 4 + col] = c[fy];
-        }
-    }
-    let mut out = [0i32; 32];
-    for fy in 0..8 {
-        let mut r = [0i32; 4];
-        for col in 0..4 {
-            r[col] = tmp[fy * 4 + col];
-        }
-        let rr = fwd_adst4_1d(&r);
-        for fx in 0..4 {
-            out[fx * 8 + fy] = rr[fx];
-        }
-    }
-    out
-}
-
-pub(crate) fn adstdct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    let coeffs = adstdct4x8_coeffs(residual);
+pub(crate) fn adstdct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    adstdct4x8_quant_t_direct(residual, m_dc, m_ac)
 }
 
-pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f64; 32]) {
-    let coeffs = dctadst4x8_coeffs(residual);
+pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    dctadst4x8_quant_t_direct(residual, m_dc, m_ac)
 }
 
-fn dct32x16_coeffs(input: &[i32; 512]) -> [i32; 512] {
+#[inline]
+fn dct32x16_quant_t_direct(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 512], [f32; 512]) {
     const B: i32 = 6;
-    let mut tmp = [0i32; 512]; // tmp[fx*16 + row], fx in 0..32
+    let mut tmp = [0i32; 512];
     for row in 0..16 {
         let mut c = [0i32; 32];
         for col in 0..32 {
@@ -1430,7 +1796,9 @@ fn dct32x16_coeffs(input: &[i32; 512]) -> [i32; 512] {
             tmp[fx * 16 + row] = c[fx];
         }
     }
-    let mut out = [0i32; 512];
+
+    let mut cf = [0i32; 512];
+    let mut tf = [0.0f32; 512];
     for fx in 0..32 {
         let mut r = [0i32; 16];
         for row in 0..16 {
@@ -1438,24 +1806,23 @@ fn dct32x16_coeffs(input: &[i32; 512]) -> [i32; 512] {
         }
         dct1d_16_i32(&mut r);
         for fy in 0..16 {
-            out[fx * 16 + fy] = (r[fy] + (1 << (B - 1))) >> B;
+            let coeff = (r[fy] + (1 << (B - 1))) >> B;
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, coeff, dc_q, ac_q);
         }
     }
-    out
+    (cf, tf)
 }
 
-pub(crate) fn dct32x16_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f64; 512]) {
-    let coeffs = dct32x16_coeffs(residual);
+pub(crate) fn dct32x16_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    resolve_dct32x16_quant_t()(residual, m_dc, m_ac)
 }
 
-pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f64; 512]) {
-    let coeffs = dct16x32_coeffs(residual);
+pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    quant_levels_and_targets(&coeffs, m_dc, m_ac)
+    resolve_dct16x32_quant_t()(residual, m_dc, m_ac)
 }
 
 #[cfg(test)]

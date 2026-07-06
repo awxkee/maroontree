@@ -89,7 +89,7 @@ pub(crate) fn encode_av1_lossless(
                         img.width() as usize,
                         img.height() as usize,
                         BitDepth::Eight,
-                        &&img.to_luma8(),
+                        &img.to_luma8(),
                     )?,
                     &cfg,
                 )?

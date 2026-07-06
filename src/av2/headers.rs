@@ -3,6 +3,16 @@
 use crate::av2::entropy::ByteWriter;
 use crate::av2::layout::Layout;
 
+/// The directional intra implementation filters its top/left reference edge before
+/// prediction. Keep this sequence capability shared by still and video headers: a
+/// mismatch changes the predictor itself and therefore corrupts reconstructed blocks.
+pub(crate) const ENABLE_INTRA_EDGE_FILTER: bool = true;
+
+/// Tiles are encoded as independent regions and the encoder does not reconstruct any
+/// in-loop filtering that reads samples from a neighboring tile. Tell the decoder to
+/// use the same tile-local filtering domain. This is a no-op for a one-tile frame.
+pub(crate) const DISABLE_LOOPFILTERS_ACROSS_TILES: bool = true;
+
 /// Optional guided-deblock-filter parameters (currently unused by the encoder).
 #[derive(Clone, Copy)]
 pub(crate) struct GuidedDeblock {
@@ -39,19 +49,30 @@ pub(crate) struct CcsoConfig {
 pub(crate) struct Config {
     pub(crate) layout: Layout,
     pub(crate) base_q: u32,
+    pub(crate) uv_ac_delta_q: i32,
     pub(crate) deblock: bool,
     pub(crate) db_apply: (bool, bool, bool, bool),
     pub(crate) db_delta: (i32, i32, i32, i32),
     pub(crate) tx_switchable: bool,
     pub(crate) guided_deblock: Option<GuidedDeblock>,
-    /// In-loop CDEF.
+    /// In-loop CDEF: `(y_str, uv_str, damping)`. With `cdef_per_block` this is the
+    /// single *active* strength (index 1); the header codes a 2-entry table
+    /// `[(0,0), (y_str, uv_str)]` and each SB signals which it uses. Without it,
+    /// the frame uses this one global strength (index 0).
     pub(crate) cdef: Option<(u8, u8, u8)>,
+    /// When true, CDEF is signaled per superblock (nb_cdef_strengths = 2) with
+    /// `cdef_on_skip_txfm_frame_enable = 1` so the per-unit index reads at the SB's
+    /// first block. When false, a single global strength (nb = 1).
+    pub(crate) cdef_per_block: bool,
     /// CCSO (cross-component sample offset). `Some((plane_enables, blk_size_is_sb,
     /// offsets))` when enabled. Phase 1: U plane only, band-offset-only mode.
     pub(crate) ccso: Option<CcsoConfig>,
     /// Coded bit depth: 8, 10 or 12.
     pub(crate) bit_depth: u8,
     pub(crate) lossless: bool,
+    /// Frame-level intra block copy enable. The lossless encoders set this only
+    /// after finding an exact default-BVP match in the current picture.
+    pub(crate) allow_intrabc: bool,
     pub(crate) cfl: bool,
     /// Enable MHCCP (multi-hypothesis cross-component prediction), avm
     /// `enable_mhccp` sequence-header flag. Requires chroma.
@@ -124,10 +145,12 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     b.write_bit(0); // partition
     b.write_bit(0);
     b.write_bit(0); // segmentation
-    b.write_bit(0);
-    b.write_bit(0);
-    b.write_bit(0);
-    b.write_bit(config.cfl as u32); // dip, edge filter, mrl, cfl_intra (this bit = enable_cfl_intra)
+    b.write_bit(0); // enable_intra_dip
+    // The directional predictors apply the normative intra-edge filter, so the
+    // decoder must use the same reference samples.
+    b.write_bit(ENABLE_INTRA_EDGE_FILTER as u32);
+    b.write_bit(0); // enable_mrls
+    b.write_bit(config.cfl as u32); // enable_cfl_intra
     if has_chroma {
         b.write_bits(0, 2); // cfl downsample filter index
     }
@@ -156,10 +179,11 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     }
     b.write_bit(1); // equal ac/dc quant
     if has_chroma {
-        b.write_bits(23, 5); // base uv-ac delta-q (raw 23 => delta 0)
+        let uv_raw = (23 + config.uv_ac_delta_q).clamp(0, 31) as u32;
+        b.write_bits(uv_raw, 5); // base uv-ac delta-q (raw 23 => delta 0)
         b.write_bit(0); // uv-ac delta-q enabled
     }
-    b.write_bit(0); // disable_loopfilters_across_tiles
+    b.write_bit(DISABLE_LOOPFILTERS_ACROSS_TILES as u32);
     b.write_bit(config.cdef.is_some() as u32); // enable_cdef
     if config.guided_deblock.is_some() {
         b.write_bit(1);
@@ -191,15 +215,43 @@ pub(crate) fn frame_header(
 ) -> Vec<u8> {
     let has_chroma = config.layout.has_chroma();
     let mut b = ByteWriter::new();
+    // Single-picture preamble (inferred fields before disable_cdf_update).
     b.write_bit(1);
     b.write_uvlc(0);
     b.write_uvlc(0);
-    b.write_bit(0);
-    b.write_bit(0);
-    // This bit is read by the decoder as `disable_cdf_update` (decodeframe.c:9155),
-    // immediately before read_tile_info. The original encoder hard-coded it to 1
-    // (static CDFs). It now carries !updating_cdf: 1 = static, 0 = adaptive.
-    b.write_bit(!config.updating_cdf as u32); // disable_cdf_update
+    // Reduced/single-picture sequence headers infer SELECT_SCREEN_CONTENT_TOOLS.
+    // Lossless frames enable SCC for palettes and optionally intra block copy.
+    b.write_bit(config.lossless as u32); // allow_screen_content_tools
+    if config.lossless {
+        b.write_bit(0); // cur_frame_force_integer_mv
+    }
+    b.write_bit(config.allow_intrabc as u32);
+    if config.allow_intrabc {
+        b.write_bit(1); // allow_global_intrabc
+        b.write_bit(1); // allow_local_intrabc
+    }
+    frame_header_body(
+        &mut b, config, width, height, tiles, has_chroma, false, false,
+    );
+    b.align_with_zero();
+    b.into_bytes()
+}
+
+/// Shared frame-header body from `disable_cdf_update` onward. Identical for
+/// single-picture (still) and video (key) frames when filters match.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frame_header_body(
+    b: &mut ByteWriter,
+    config: &Config,
+    width: u32,
+    height: u32,
+    tiles: (usize, usize, usize),
+    has_chroma: bool,
+    video: bool,
+    inter: bool,
+) {
+    // disable_cdf_update (decodeframe.c:9155), immediately before read_tile_info.
+    b.write_bit(!config.updating_cdf as u32);
 
     let sb_cols = (width as usize).div_ceil(64);
     let sb_rows = (height as usize).div_ceil(64);
@@ -234,10 +286,13 @@ pub(crate) fn frame_header(
         b.write_bit(0);
     }
     if log2c > 0 || log2r > 0 {
-        // NB: single_picture_header_flag=1 forces enable_avg_cdf=avg_cdf_type=1 in the
-        // sequence header, which makes the decoder OMIT context_update_tile_id in
-        // tile_info(). Emitting it here would shift tile_size_bytes and misalign the
-        // tile data. So we write only tile_size_bytes_minus_1.
+        // Multi-tile tile_info tail. single_picture_header_flag=1 (still) forces
+        // enable_avg_cdf=avg_cdf_type=1, so the decoder OMITS context_update_tile_id.
+        // The video sequence header sets enable_avg_cdf=0, so the decoder READS
+        // context_update_tile_id (log2_rows+log2_cols bits) before tile_size_bytes.
+        if video {
+            b.write_bits(0, (log2c + log2r) as u32); // context_update_tile_id = tile 0
+        }
         b.write_bits((tsb - 1) as u32, 2); // tile_size_bytes_minus_1
     }
     // AV2 frame_header quant.yac is 8 bits for 8-bit streams and 9 bits for
@@ -265,7 +320,7 @@ pub(crate) fn frame_header(
             b.write_bit(0); // tile_start_and_end_present_flag = 0
         }
         b.align_with_zero();
-        return b.into_bytes();
+        return;
     }
 
     if config.deblock {
@@ -294,11 +349,11 @@ pub(crate) fn frame_header(
         }
         // Per-direction luma deltas (delta_side mirrors delta_q). Direction 0's
         // "no delta" means 0; direction 1's "no delta" means reuse direction 0.
-        write_delta(&mut b, av, dy0);
-        write_delta(&mut b, ah, dy1);
+        write_delta(b, av, dy0);
+        write_delta(b, ah, dy1);
         // Chroma deltas.
-        write_delta(&mut b, has_chroma && (av || ah) && au, du);
-        write_delta(&mut b, has_chroma && (av || ah) && avv, dv);
+        write_delta(b, has_chroma && (av || ah) && au, du);
+        write_delta(b, has_chroma && (av || ah) && avv, dv);
     } else {
         b.write_bit(0);
         b.write_bit(0);
@@ -310,11 +365,22 @@ pub(crate) fn frame_header(
         b.write_bits(gdf.scale_minus_one, 2);
     }
     if let Some((y_str, uv_str, damping)) = config.cdef {
-        // setup_cdef: single_picture_header forces cdef_frame_enable=1 (no bit) and
-        // enable_cdef_on_skip_txfm=ADAPTIVE (one frame bit). nb_cdef_strengths=1.
+        // Video codes cdef_frame_enable (=1); single-picture infers it.
+        if video {
+            b.write_bit(1);
+        }
         b.write_bits((damping as u32).saturating_sub(3) & 3, 2); // cdef_damping-3
-        b.write_bits(0, 3); // nb_cdef_strengths - 1 (== 0)
-        b.write_bit(0); // cdef_on_skip_txfm_frame_enable
+        // Per-block CDEF signals a 2-entry strength table [(0,0), (y,uv)] and codes
+        // cdef_on_skip_txfm=1 so the per-unit index reads at each SB's first block
+        // (matching the encoder's CCSO-style deferred emission). Global CDEF keeps
+        // the single-strength table with cdef_on_skip=0.
+        let strengths: &[(u8, u8)] = if config.cdef_per_block {
+            &[(0, 0), (y_str, uv_str)]
+        } else {
+            &[(y_str, uv_str)]
+        };
+        b.write_bits(strengths.len() as u32 - 1, 3); // nb_cdef_strengths - 1
+        b.write_bit(config.cdef_per_block as u32); // cdef_on_skip_txfm_frame_enable
         let mut wstr = |s: u8| {
             if s < 4 {
                 b.write_bit(1);
@@ -324,9 +390,11 @@ pub(crate) fn frame_header(
                 b.write_bits(s as u32, 6); // CDEF_STRENGTH_BITS
             }
         };
-        wstr(y_str);
-        if has_chroma {
-            wstr(uv_str);
+        for &(y, uv) in strengths {
+            wstr(y);
+            if has_chroma {
+                wstr(uv);
+            }
         }
     }
     // CCSO frame params (setup_ccso). single_picture_header_flag => ccso_frame_flag
@@ -335,6 +403,10 @@ pub(crate) fn frame_header(
     // quant_idx (2b) + ext_filter_support (3b) + [edge_clf (1b) when quant_sz != 0] +
     // max_band_log2 (2b) for edge mode; followed by the offset LUT (unary indices).
     if let Some(cc) = &config.ccso {
+        // Video codes ccso_frame_flag (=1); single-picture infers it.
+        if video {
+            b.write_bit(1);
+        }
         const CCSO_OFFSET: [i32; 8] = [0, 1, -1, 3, -3, 7, -7, -10];
         // quant_sz[scale][quant]: a zero entry means edge_clf is implied 0 (no bit).
         const QUANT_SZ: [[u16; 4]; 4] = [
@@ -369,7 +441,7 @@ pub(crate) fn frame_header(
                 let max_band = 1usize << p.max_band_log2;
                 for band in 0..max_band {
                     let off = p.offsets.get(band << 4).copied().unwrap_or(0);
-                    write_off(&mut b, off);
+                    write_off(b, off);
                 }
             } else {
                 b.write_bits(p.quant_idx as u32, 2);
@@ -385,7 +457,7 @@ pub(crate) fn frame_header(
                         for band in 0..max_band {
                             let lut = (band << 4) + (d0 << 2) + d1;
                             let off = p.offsets.get(lut).copied().unwrap_or(0);
-                            write_off(&mut b, off);
+                            write_off(b, off);
                         }
                     }
                 }
@@ -393,11 +465,15 @@ pub(crate) fn frame_header(
         }
     }
     b.write_bit(if config.tx_switchable { 1 } else { 0 }); // txfm_mode: 1=SWITCHABLE
+    // Inter: reference_mode (1b, SINGLE_REFERENCE=0), then skip_mode_flag (1b=0;
+    // skip_mode_allowed stays 1 for single-ref per AVM). bawp/warp/global 0b.
+    if inter {
+        b.write_bit(0); // reference_select = SINGLE_REFERENCE
+        b.write_bit(0); // skip_mode_flag = 0
+    }
     b.write_bits(0, 2); // reduced_txtp_set
     if log2c > 0 || log2r > 0 {
         b.write_bit(0); // tile_start_and_end_present_flag = 0 (decoder reads it here,
         // folded into the frame header's own byte alignment)
     }
-    b.align_with_zero();
-    b.into_bytes()
 }

@@ -209,13 +209,14 @@ fn worker(sh: &Shared) {
                 if s.shutdown {
                     return;
                 }
-                if s.epoch != seen && s.unclaimed > 0 {
-                    if let Some(job) = s.job {
-                        seen = s.epoch;
-                        s.unclaimed -= 1;
-                        s.running += 1;
-                        break job;
-                    }
+                if s.epoch != seen
+                    && s.unclaimed > 0
+                    && let Some(job) = s.job
+                {
+                    seen = s.epoch;
+                    s.unclaimed -= 1;
+                    s.running += 1;
+                    break job;
                 }
                 s = sh.post.wait(s).expect("pool poisoned");
             }

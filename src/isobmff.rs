@@ -112,7 +112,7 @@ fn write_colr_icc(f: &mut Vec<u8>, icc: &[u8]) {
     patch(f, sh);
 }
 
-/// Write the colour-information `colr` boxes (optional `nclx`, optional `prof`),
+/// Write the color-information `colr` boxes (optional `nclx`, optional `prof`),
 /// pushing each box's 1-based ipco index into `colr_props` and advancing
 /// `next_idx`. Either, both, or neither may be written.
 fn write_colr_boxes(
@@ -379,7 +379,7 @@ pub(crate) fn wrap_av1_image(
                 f.extend_from_slice(&av1c_data);
                 patch(&mut f, sh);
             }
-            // prop 4 (+5): colr. MIAF allows at most one colr per colour_type,
+            // prop 4 (+5): colr. MIAF allows at most one colr per color_type,
             // so a CICP `nclx` and an ICC `prof` may coexist. Either may be
             // absent: when `color_meta` is None we skip `nclx`; when no ICC is
             // supplied we skip `prof`. Each written box's 1-based ipco index is

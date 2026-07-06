@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 image = "0.25.10"
-maroontree = { path = "../" }
+maroontree = { path = "../",default-features = false }
 img-parts = "0.4.0"
 yuv = "0.8.15"
 anyhow = "1.0.102"
