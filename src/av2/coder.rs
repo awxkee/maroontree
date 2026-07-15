@@ -3788,6 +3788,7 @@ pub(crate) struct LosslessIntrabc {
 /// Direction selected by the AV2 lossless DPCM syntax. The coded bit follows
 /// the specification directly: zero is vertical and one is horizontal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Quarantined until block-wide DPCM residuals are bit-exact.
 pub(crate) enum LosslessDpcmMode {
     Vertical,
     Horizontal,

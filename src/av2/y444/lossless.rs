@@ -225,8 +225,6 @@ impl Av2Encoder {
                                         rows: lrows,
                                         cols: lcols,
                                         neutral,
-                                        qc: enc.qc,
-                                        y_ctx,
                                     },
                                 );
                                 let palette_ctx = palette_grid.context(mi_row, mi_col);
@@ -254,22 +252,7 @@ impl Av2Encoder {
                                 };
                                 let base_u = slice(utus);
                                 let base_v = slice(vtus);
-                                let ccand = lossless_rd::best_chroma_block(
-                                    &up,
-                                    &vp,
-                                    pw,
-                                    &base_u,
-                                    &base_v,
-                                    lossless_rd::ChromaBlockRd {
-                                        y: ly,
-                                        x: lx,
-                                        rows: lrows,
-                                        cols: lcols,
-                                        neutral,
-                                        qc: enc.qc,
-                                        luma_directional: dpcm_y.is_some(),
-                                    },
-                                );
+                                let ccand = lossless_rd::best_chroma_block(&base_u, &base_v);
                                 (
                                     lytus,
                                     ccand.u_tus,

@@ -18,7 +18,7 @@ jixel = "0.2.4"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
 garnetash = "0.1.0"
-tealdust = { version = "0.1.3", git = "https://github.com/awxkee/tealdust", rev = "ab1895091fa2eb71a7781a67ec199daf47df82be" }
+tealdust = { version = "0.1.3" }
 
 [features]
 default = ["heic", "vvc"]
