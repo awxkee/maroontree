@@ -186,8 +186,6 @@ impl Av2Encoder {
                                         rows: lrows,
                                         cols: lcols,
                                         neutral,
-                                        qc: enc.qc,
-                                        y_ctx,
                                     },
                                 );
                                 let palette_ctx = palette_grid.context(mi_row, mi_col);

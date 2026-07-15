@@ -3,7 +3,7 @@ members = ["app", "cli"]
 
 [package]
 name = "maroontree"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "AV1 image & AV2 video & image encoder"
 readme = "README.md"
