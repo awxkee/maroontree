@@ -859,7 +859,7 @@ impl Av2Encoder {
                     edge_clf,
                     max_band_log2,
                     offsets,
-                } => crate::av2::headers::CcsoPlane {
+                } => headers::CcsoPlane {
                     bo_only: false,
                     scale_idx: *scale_idx,
                     quant_idx: *quant_idx,

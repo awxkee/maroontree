@@ -27,19 +27,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Encoder-side block-distortion estimators: SAD (sum of absolute differences)
-//! and SATD (sum of absolute Hadamard-transformed differences). These are
-//! *decision* metrics only — they never touch the bitstream, so they cannot
-//! cause decoder drift. SATD approximates post-transform coding cost far better
-//! than SAD and is used to cheaply rank/prune candidate intra modes before the
-//! expensive forward-transform + RDOQ + reconstruct RD pass runs on the winners.
-//!
-//! Reconstruction and source planes are stored as integer-valued `f32`, so the
-//! rounded residual `d = round(src - pred)` is exact. Both metrics operate on 4x4
-//! tiles (`w`, `h` multiples of 4) which is all the intra transform sizes need.
-
-/// Sum of absolute differences over a `w x h` region. `src`/`pred` slices are
-/// pre-offset to the block's top-left; `sstride`/`pstride` are their row strides.
 pub(crate) fn sad_f32(
     src: &[f32],
     sstride: usize,
@@ -308,7 +295,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn avx2_motion_metrics_match_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
