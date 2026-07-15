@@ -42,7 +42,7 @@ pub(crate) fn sad_f32(
             return unsafe { crate::av2::neon::sad_f32_neon(src, sstride, pred, pstride, w, h) };
         }
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe { crate::av2::avx::sad_f32_avx2(src, sstride, pred, pstride, w, h) };
@@ -90,7 +90,7 @@ pub(crate) fn scaled_residual_f32(dst: &mut [f32], src: &[f32], pred: &[f32], sp
             return;
         }
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe { crate::av2::avx::scaled_residual_f32_avx2(dst, src, pred, spec) };
@@ -121,18 +121,12 @@ pub(crate) fn scaled_residual_f32_scalar(
     }
 }
 
-/// Orthonormal 4-point Hadamard butterfly (a fixed 2x scale that cancels in any
-/// SATD comparison).
 #[inline(always)]
 pub(crate) fn had4(a: i32, b: i32, c: i32, d: i32) -> [i32; 4] {
     let (e, f, g, h) = (a + c, a - c, b + d, b - d);
     [e + g, f + h, f - h, e - g]
 }
 
-/// Sum of absolute 4x4-Hadamard-transformed differences over a `w x h` region.
-/// The transform-domain magnitude tracks the number of coded bits far better than
-/// raw SAD, so it discriminates well between intra-mode candidates. The overall
-/// constant Hadamard scale is left in (it cancels in comparisons).
 pub(crate) fn satd_f32(
     src: &[f32],
     sstride: usize,
@@ -147,7 +141,7 @@ pub(crate) fn satd_f32(
             return unsafe { crate::av2::neon::satd_f32_neon(src, sstride, pred, pstride, w, h) };
         }
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe { crate::av2::avx::satd_f32_avx2(src, sstride, pred, pstride, w, h) };
