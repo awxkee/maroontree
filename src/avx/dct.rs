@@ -43,12 +43,6 @@ struct I32x8(__m256i);
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn zero() -> I32x8 {
-    I32x8(_mm256_setzero_si256())
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
 fn splat(v: i32) -> __m256i {
     _mm256_set1_epi32(v)
 }
@@ -96,6 +90,56 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     out[0] = mq(coeffs[0], dc_q);
     for i in 1..N {
         out[i] = mq(coeffs[i], ac_q);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn quant_prod_i64(prod: __m256i) -> __m256i {
+    let zero = _mm256_setzero_si256();
+    let sign = _mm256_cmpgt_epi64(zero, prod);
+    let mag = _mm256_sub_epi64(_mm256_xor_si256(prod, sign), sign);
+    let active = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(65535));
+    let lvl = _mm256_srli_epi64::<16>(_mm256_add_epi64(mag, _mm256_set1_epi64x(32768)));
+    let neg = _mm256_sub_epi64(zero, lvl);
+    let signed = _mm256_blendv_epi8(lvl, neg, sign);
+    _mm256_and_si256(signed, active)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn quant_q16_epi32(v: __m256i, q: __m256i) -> __m256i {
+    let even = quant_prod_i64(_mm256_mul_epi32(v, q));
+    let odd_v = _mm256_srli_epi64::<32>(v);
+    let odd_q = _mm256_srli_epi64::<32>(q);
+    let odd = _mm256_slli_epi64::<32>(quant_prod_i64(_mm256_mul_epi32(odd_v, odd_q)));
+    _mm256_blend_epi32::<0b1010_1010>(even, odd)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn store_quant_target_i32x8(
+    cf: *mut i32,
+    tf: *mut f32,
+    coeff: I32x8,
+    base: usize,
+    dc_q: i32,
+    ac_q: i32,
+) {
+    let ac = _mm256_set1_epi32(ac_q);
+    let q = if base == 0 {
+        _mm256_blend_epi32::<0b0000_0001>(ac, _mm256_set1_epi32(dc_q))
+    } else {
+        ac
+    };
+    let levels = quant_q16_epi32(coeff.0, q);
+    let target = _mm256_mul_ps(
+        _mm256_mul_ps(_mm256_cvtepi32_ps(coeff.0), _mm256_cvtepi32_ps(q)),
+        _mm256_set1_ps(1.0 / 65536.0),
+    );
+    unsafe {
+        _mm256_storeu_si256(cf.add(base).cast::<__m256i>(), levels);
+        _mm256_storeu_ps(tf.add(base), target);
     }
 }
 
@@ -184,6 +228,37 @@ fn transpose_8x8_i32(c: &mut [I32x8; 8]) {
     c[5] = I32x8(_mm256_permute2x128_si256::<0x31>(u1, u5));
     c[6] = I32x8(_mm256_permute2x128_si256::<0x31>(u2, u6));
     c[7] = I32x8(_mm256_permute2x128_si256::<0x31>(u3, u7));
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn transpose_store_8x8_i32(dst: *mut i32, stride: usize, tile: &mut [I32x8; 8]) {
+    transpose_8x8_i32(tile);
+    for i in 0..8usize {
+        store_i32x8(unsafe { dst.add(i * stride) }, tile[i]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn store_transposed_cols_i32x8<const N: usize>(dst: *mut i32, x: usize, c: &[I32x8; N]) {
+    debug_assert!(N.is_multiple_of(8));
+    let stride = N;
+    let mut v = 0usize;
+    while v < N {
+        let mut tile = [
+            c[v],
+            c[v + 1],
+            c[v + 2],
+            c[v + 3],
+            c[v + 4],
+            c[v + 5],
+            c[v + 6],
+            c[v + 7],
+        ];
+        transpose_store_8x8_i32(unsafe { dst.add(x * N + v) }, stride, &mut tile);
+        v += 8;
+    }
 }
 
 #[inline]
@@ -345,56 +420,197 @@ fn load32_i32(ptr: &[i32], stride: usize) -> [I32x8; 32] {
 }
 
 #[target_feature(enable = "avx2")]
-pub(crate) fn dct8x8_avx2_coeffs(input: &[i32; 64]) -> [i32; 64] {
+pub(crate) fn dct8x8_avx2_quant_t(
+    input: &[i32; 64],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 64], [f32; 64]) {
     let mut cols = load8_i32(input, 8);
     dct1d_8_v_i32(&mut cols);
     transpose_8x8_i32(&mut cols);
     dct1d_8_v_i32(&mut cols);
 
-    let mut out = MaybeUninit::<[i32; 64]>::uninit();
+    let mut cf = MaybeUninit::<[i32; 64]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 64]>::uninit();
     for (k, col) in cols.iter().copied().enumerate() {
-        unsafe { store_i32x8((out.as_mut_ptr() as *mut i32).add(k * 8), col) };
+        store_quant_target_i32x8(
+            cf.as_mut_ptr().cast(),
+            tf.as_mut_ptr().cast(),
+            col,
+            k * 8,
+            dc_q,
+            ac_q,
+        );
     }
-    unsafe { out.assume_init() }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[target_feature(enable = "avx2")]
 pub(crate) fn dct16x16_avx2_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    let mut c_l = load16_i32(input, 16);
-    let mut c_r = load16_i32(&input[8..], 16);
+    // Stage 1: vertical DCT-16 in 8-column groups. Store a real transposed
+    // scratch: tmp[x * 16 + vertical_frequency]. The second pass can then
+    // use contiguous loads instead of scalar strided reconstruction.
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(8) {
+        let mut cols = load16_i32(&input[x..], 16);
+        dct1d_16_v_i32(&mut cols);
+        store_transposed_cols_i32x8::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
 
-    dct1d_16_v_i32(&mut c_l);
-    dct1d_16_v_i32(&mut c_r);
-
-    let mut top_l: [I32x8; 8] = c_l[..8].try_into().unwrap();
-    let mut bot_l: [I32x8; 8] = c_l[8..16].try_into().unwrap();
-    let mut top_r: [I32x8; 8] = c_r[..8].try_into().unwrap();
-    let mut bot_r: [I32x8; 8] = c_r[8..16].try_into().unwrap();
-
-    transpose_8x8_i32(&mut top_l);
-    transpose_8x8_i32(&mut bot_l);
-    transpose_8x8_i32(&mut top_r);
-    transpose_8x8_i32(&mut bot_r);
-
-    let mut d_a = [zero(); 16];
-    let mut d_b = [zero(); 16];
-    d_a[..8].copy_from_slice(&top_l);
-    d_a[8..16].copy_from_slice(&top_r);
-    d_b[..8].copy_from_slice(&bot_l);
-    d_b[8..16].copy_from_slice(&bot_r);
-
-    dct1d_16_v_i32(&mut d_a);
-    dct1d_16_v_i32(&mut d_b);
-
+    // Stage 2: horizontal DCT-16 in 8 vertical-frequency lanes.
     let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for u in 0..16usize {
-        unsafe {
-            let dst = (out.as_mut_ptr() as *mut i32).add(u * 16);
-            store_i32x8(dst, d_a[u].shr::<1>());
-            store_i32x8(dst.add(8), d_b[u].shr::<1>());
+    for y in (0..16usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        dct1d_16_v_i32(&mut rows);
+        for u in 0..16usize {
+            unsafe {
+                store_i32x8(
+                    (out.as_mut_ptr() as *mut i32).add(u * 16 + y),
+                    rows[u].shr::<1>(),
+                );
+            }
         }
     }
     unsafe { out.assume_init() }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn sar_epi64_12(v: __m256i) -> __m256i {
+    let sign = _mm256_cmpgt_epi64(_mm256_setzero_si256(), v);
+    _mm256_or_si256(_mm256_srli_epi64::<12>(v), _mm256_slli_epi64::<52>(sign))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn adst16_round_shift_pair(even: __m256i, odd: __m256i) -> __m256i {
+    let even32 = sar_epi64_12(even);
+    let odd32 = _mm256_slli_epi64::<32>(sar_epi64_12(odd));
+    _mm256_blend_epi32::<0b1010_1010>(even32, odd32)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn adst1d_16_v_i32(c: &mut [I32x8; 16]) {
+    let mut out = [I32x8(_mm256_setzero_si256()); 16];
+    for o in 0..16usize {
+        let mut even = _mm256_set1_epi64x(2048);
+        let mut odd = _mm256_set1_epi64x(2048);
+        for j in 0..16usize {
+            let k = _mm256_set1_epi32(crate::dct::ADST16_FWD_Q12[o][j] as i32);
+            let v = c[j].0;
+            even = _mm256_add_epi64(even, _mm256_mul_epi32(v, k));
+            odd = _mm256_add_epi64(odd, _mm256_mul_epi32(_mm256_srli_epi64::<32>(v), k));
+        }
+        out[o] = I32x8(adst16_round_shift_pair(even, odd));
+    }
+    *c = out;
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn tx16x16_adst_dct_avx2_quant_t<const COL_ADST: bool, const ROW_ADST: bool>(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(8) {
+        let mut cols = load16_i32(&input[x..], 16);
+        if COL_ADST {
+            adst1d_16_v_i32(&mut cols);
+        } else {
+            dct1d_16_v_i32(&mut cols);
+        }
+        store_transposed_cols_i32x8::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 256]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 256]>::uninit();
+    for y in (0..16usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        if ROW_ADST {
+            adst1d_16_v_i32(&mut rows);
+        } else {
+            dct1d_16_v_i32(&mut rows);
+        }
+        for u in 0..16usize {
+            store_quant_target_i32x8(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr::<1>(),
+                u * 16 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn adst16x16_avx2_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_avx2_quant_t::<true, true>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn adstdct16x16_avx2_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_avx2_quant_t::<true, false>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dctadst16x16_avx2_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_avx2_quant_t::<false, true>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dct16x16_avx2_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(8) {
+        let mut cols = load16_i32(&input[x..], 16);
+        dct1d_16_v_i32(&mut cols);
+        store_transposed_cols_i32x8::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 256]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 256]>::uninit();
+    for y in (0..16usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        dct1d_16_v_i32(&mut rows);
+        for u in 0..16usize {
+            store_quant_target_i32x8(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr::<1>(),
+                u * 16 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[target_feature(enable = "avx2")]
@@ -405,60 +621,72 @@ pub(crate) fn dct16x16_avx2_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
 
 #[target_feature(enable = "avx2")]
 pub(crate) fn dct32x32_avx2_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
+    // Stage 1: vertical DCT-32 in 8-column groups. Store a true transposed
+    // scratch: tmp[x * 32 + vertical_frequency].
     let mut tmp_u = MaybeUninit::<[i32; 1024]>::uninit();
-
-    for group in 0..4usize {
-        let col_start = group * 8;
-        let mut cols = load32_i32(&input[col_start..], 32);
+    for x in (0..32usize).step_by(8) {
+        let mut cols = load32_i32(&input[x..], 32);
         for c in cols.iter_mut() {
             *c = c.shl::<6>();
         }
         dct1d_32_v_i32(&mut cols);
-        for v in 0..32usize {
-            unsafe {
-                store_i32x8(
-                    (tmp_u.as_mut_ptr() as *mut i32).add(v * 32 + col_start),
-                    cols[v],
-                );
-            }
-        }
+        store_transposed_cols_i32x8::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
     }
-
     let tmp = unsafe { tmp_u.assume_init() };
+
+    // Stage 2: horizontal DCT-32 with contiguous loads from the transposed scratch.
     let mut out = MaybeUninit::<[i32; 1024]>::uninit();
-
-    for group in 0..4usize {
-        let row_start = group * 8;
-        let base_off = row_start * 32;
-
-        let mut seg_a = load8_i32(&tmp[base_off..], 32);
-        let mut seg_b = load8_i32(&tmp[base_off + 8..], 32);
-        let mut seg_c = load8_i32(&tmp[base_off + 16..], 32);
-        let mut seg_d = load8_i32(&tmp[base_off + 24..], 32);
-
-        transpose_8x8_i32(&mut seg_a);
-        transpose_8x8_i32(&mut seg_b);
-        transpose_8x8_i32(&mut seg_c);
-        transpose_8x8_i32(&mut seg_d);
-
-        let mut rows = [zero(); 32];
-        rows[..8].copy_from_slice(&seg_a);
-        rows[8..16].copy_from_slice(&seg_b);
-        rows[16..24].copy_from_slice(&seg_c);
-        rows[24..32].copy_from_slice(&seg_d);
-
+    for y in (0..32usize).step_by(8) {
+        let mut rows: [I32x8; 32] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 32 + y) }));
         dct1d_32_v_i32(&mut rows);
         for u in 0..32usize {
             unsafe {
                 store_i32x8(
-                    (out.as_mut_ptr() as *mut i32).add(u * 32 + row_start),
+                    (out.as_mut_ptr() as *mut i32).add(u * 32 + y),
                     rows[u].shr_round::<8>(),
                 );
             }
         }
     }
-
     unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dct32x32_avx2_quant_t(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    let mut tmp_u = MaybeUninit::<[i32; 1024]>::uninit();
+    for x in (0..32usize).step_by(8) {
+        let mut cols = load32_i32(&input[x..], 32);
+        for c in cols.iter_mut() {
+            *c = c.shl::<6>();
+        }
+        dct1d_32_v_i32(&mut cols);
+        store_transposed_cols_i32x8::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 1024]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 1024]>::uninit();
+    for y in (0..32usize).step_by(8) {
+        let mut rows: [I32x8; 32] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 32 + y) }));
+        dct1d_32_v_i32(&mut rows);
+        for u in 0..32usize {
+            store_quant_target_i32x8(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr_round::<8>(),
+                u * 32 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[target_feature(enable = "avx2")]
@@ -491,17 +719,184 @@ pub(crate) fn dct8x16_avx2_coeffs(input: &[i32; 128]) -> [i32; 128] {
 }
 
 #[target_feature(enable = "avx2")]
+pub(crate) fn dct8x16_avx2_quant_t(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut rows = load16_i32(input, 8);
+    dct1d_16_v_i32(&mut rows);
+
+    let mut a: [I32x8; 8] = rows[..8].try_into().unwrap();
+    let mut b: [I32x8; 8] = rows[8..16].try_into().unwrap();
+    transpose_8x8_i32(&mut a);
+    transpose_8x8_i32(&mut b);
+    dct1d_8_v_i32(&mut a);
+    dct1d_8_v_i32(&mut b);
+
+    let mut cf = MaybeUninit::<[i32; 128]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 128]>::uninit();
+    for fx in 0..8usize {
+        store_quant_target_i32x8(
+            cf.as_mut_ptr().cast(),
+            tf.as_mut_ptr().cast(),
+            a[fx].muls_q16(46341),
+            fx * 16,
+            dc_q,
+            ac_q,
+        );
+        store_quant_target_i32x8(
+            cf.as_mut_ptr().cast(),
+            tf.as_mut_ptr().cast(),
+            b[fx].muls_q16(46341),
+            fx * 16 + 8,
+            dc_q,
+            ac_q,
+        );
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "avx2")]
 pub(crate) fn dct8x16_avx2_i32(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_avx2_coeffs(input);
     quant_flat(&coeffs, dc_q, ac_q, input);
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dct16x32_avx2_quant_t(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    // TX_16X32 scalar path does the 32-point vertical pass first, with a
+    // temporary << 6 scale, then the 16-point horizontal pass and rounded >> 6.
+    // Keep the same order so the Q16 truncation points stay byte-identical.
+    let mut tmp_u = MaybeUninit::<[i32; 512]>::uninit();
+    for x in (0..16usize).step_by(8) {
+        let mut cols = load32_i32(&input[x..], 16);
+        for c in cols.iter_mut() {
+            *c = c.shl::<6>();
+        }
+        dct1d_32_v_i32(&mut cols);
+        // tmp[x * 32 + fy], i.e. contiguous vertical-frequency lanes for
+        // the second pass.
+        store_transposed_cols_i32x8::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 512]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 512]>::uninit();
+    for fy in (0..32usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 32 + fy) }));
+        dct1d_16_v_i32(&mut rows);
+        for fx in 0..16usize {
+            store_quant_target_i32x8(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[fx].shr_round::<6>(),
+                fx * 32 + fy,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dct32x16_avx2_quant_t(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    // TX_32X16 scalar path does the 32-point horizontal pass first. Load 8 rows
+    // at a time, transpose four 8x8 tiles so each vector holds one x-frequency
+    // candidate across eight rows, then store a normal row-major scratch for
+    // the vertical 16-point pass.
+    let mut tmp_u = MaybeUninit::<[i32; 512]>::uninit();
+    let tmp_ptr = tmp_u.as_mut_ptr().cast::<i32>();
+    for y in (0..16usize).step_by(8) {
+        let zero = I32x8(_mm256_setzero_si256());
+        let mut cols = [zero; 32];
+        for x in (0..32usize).step_by(8) {
+            let mut tile = [
+                load_i32x8(unsafe { input.as_ptr().add(y * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 1) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 2) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 3) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 4) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 5) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 6) * 32 + x) }),
+                load_i32x8(unsafe { input.as_ptr().add((y + 7) * 32 + x) }),
+            ];
+            transpose_8x8_i32(&mut tile);
+            for i in 0..8usize {
+                cols[x + i] = tile[i].shl::<6>();
+            }
+        }
+        dct1d_32_v_i32(&mut cols);
+
+        // Store row-major scratch: tmp[row * 32 + fx]. Each 8x8 tile is
+        // transposed back from frequency vectors with row lanes into row vectors
+        // with frequency lanes.
+        for fx in (0..32usize).step_by(8) {
+            let mut tile = [
+                cols[fx],
+                cols[fx + 1],
+                cols[fx + 2],
+                cols[fx + 3],
+                cols[fx + 4],
+                cols[fx + 5],
+                cols[fx + 6],
+                cols[fx + 7],
+            ];
+            transpose_store_8x8_i32(unsafe { tmp_ptr.add(y * 32 + fx) }, 32, &mut tile);
+        }
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 512]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 512]>::uninit();
+    for fx in (0..32usize).step_by(8) {
+        let mut rows: [I32x8; 16] =
+            std::array::from_fn(|y| load_i32x8(unsafe { tmp.as_ptr().add(y * 32 + fx) }));
+        dct1d_16_v_i32(&mut rows);
+
+        for fy in (0..16usize).step_by(8) {
+            let mut tile = [
+                rows[fy].shr_round::<6>(),
+                rows[fy + 1].shr_round::<6>(),
+                rows[fy + 2].shr_round::<6>(),
+                rows[fy + 3].shr_round::<6>(),
+                rows[fy + 4].shr_round::<6>(),
+                rows[fy + 5].shr_round::<6>(),
+                rows[fy + 6].shr_round::<6>(),
+                rows[fy + 7].shr_round::<6>(),
+            ];
+            transpose_8x8_i32(&mut tile);
+            for i in 0..8usize {
+                store_quant_target_i32x8(
+                    cf.as_mut_ptr().cast(),
+                    tf.as_mut_ptr().cast(),
+                    tile[i],
+                    (fx + i) * 16 + fy,
+                    dc_q,
+                    ac_q,
+                );
+            }
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[cfg(test)]
 mod avx2_vs_scalar {
     use super::*;
     use crate::dct::{
-        dct8x8_coeffs, dct8x16_coeffs, dct8x16_i32_scalar, dct16x16_coeffs, dct16x16_scalar,
-        dct32x32_coeffs, dct32x32_scalar,
+        dct8x16_coeffs, dct8x16_i32_scalar, dct16x16_coeffs, dct16x16_scalar, dct32x32_coeffs,
+        dct32x32_scalar,
     };
 
     const QUANT_PAIRS: &[(i32, i32)] = &[(65536, 65536), (65536, 46341), (32768, 32768)];
@@ -515,20 +910,6 @@ mod avx2_vs_scalar {
         let mut s = seed;
         for v in buf.iter_mut() {
             *v = (lcg(&mut s) & mask) - ((mask + 1) >> 1);
-        }
-    }
-
-    #[test]
-    fn dct8x8_coeffs_match_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
-            return;
-        }
-        for seed in [0x1234_5678, 0xdead_beef, 0xabcd_1234] {
-            let mut input = [0i32; 64];
-            fill_lcg(&mut input, seed, 0xff);
-            let s = dct8x8_coeffs(&input);
-            let a = unsafe { dct8x8_avx2_coeffs(&input) };
-            assert_eq!(s, a, "8x8 coeff mismatch seed={seed:#x}");
         }
     }
 

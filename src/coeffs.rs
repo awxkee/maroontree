@@ -57,7 +57,16 @@ pub(crate) fn get_lo_ctx_2d(
     (ctx as usize, hi_mag)
 }
 
-/// Encode the hi_tok (base-range) ladder for magnitude `m` (>=3) with `br_cdf`.
+#[inline]
+fn eob_and_cul<const N: usize>(cf: &[i32; N], scan: &[u32]) -> Option<(usize, u32)> {
+    let eob = scan.iter().rposition(|&rc| cf[rc as usize] != 0)?;
+    let cul = scan[..=eob]
+        .iter()
+        .map(|&rc| cf[rc as usize].unsigned_abs())
+        .sum();
+    Some((eob, cul))
+}
+
 pub(crate) fn encode_hi_tok(enc: &mut OdEcEncoder, m: u32, br_cdf: &mut [u16]) {
     let total_br = (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE);
     let mut coded = 0;
@@ -110,19 +119,10 @@ pub(crate) fn encode_tx8_coeffs_adapt(
     txtp: usize,
 ) -> u8 {
     let pl = chroma as usize;
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_8X8.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X8) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]); // luma: 1=DCT_DCT, 4=ADST_ADST
@@ -175,7 +175,7 @@ pub(crate) fn encode_tx8_coeffs_adapt(
     }
     let mut levels = [0u8; 80];
     let ctx_e = 1 + (eob > 8) as usize + (eob > 16) as usize;
-    let rc = SCAN_8X8[eob];
+    let rc = SCAN_8X8[eob] as usize;
     let (ex, ey) = (rc >> 3, rc & 7);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1; // 0,1,2
@@ -186,7 +186,7 @@ pub(crate) fn encode_tx8_coeffs_adapt(
     }
     levels[ex * 8 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_8X8[i];
+        let rc_i = SCAN_8X8[i] as usize;
         let (x, y) = (rc_i >> 3, rc_i & 7);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 8);
         let m = cf[rc_i].unsigned_abs();
@@ -214,7 +214,7 @@ pub(crate) fn encode_tx8_coeffs_adapt(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_8X8[i]];
+        let c = cf[SCAN_8X8[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -243,19 +243,10 @@ pub(crate) fn encode_tx16_coeffs_adapt(
     txtp: usize,
 ) -> u8 {
     let pl = chroma as usize;
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_16X16.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X16) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp16[y_mode]); // luma TX_16X16: 1=DCT_DCT, 2=ADST_ADST
@@ -308,7 +299,7 @@ pub(crate) fn encode_tx16_coeffs_adapt(
     }
     let mut levels = [0u8; 320]; // stride 16, neighbor reads up to (x+2)*16+(y+2)=289
     let ctx_e = 1 + (eob > 32) as usize + (eob > 64) as usize;
-    let rc = SCAN_16X16[eob];
+    let rc = SCAN_16X16[eob] as usize;
     let (ex, ey) = (rc >> 4, rc & 15);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1; // 0,1,2
@@ -319,7 +310,7 @@ pub(crate) fn encode_tx16_coeffs_adapt(
     }
     levels[ex * 16 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_16X16[i];
+        let rc_i = SCAN_16X16[i] as usize;
         let (x, y) = (rc_i >> 4, rc_i & 15);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 16);
         let m = cf[rc_i].unsigned_abs();
@@ -347,7 +338,7 @@ pub(crate) fn encode_tx16_coeffs_adapt(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_16X16[i]];
+        let c = cf[SCAN_16X16[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -375,19 +366,10 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     dcs_ctx: usize,
 ) -> u8 {
     let pl = chroma as usize;
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_32X32.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X32) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 0
     // NO txtp symbol for intra TX_32X32 (DCT_DCT implied).
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -438,7 +420,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     }
     let mut levels = [0u8; 1156]; // stride 32, neighbor reads up to (x+2)*32+(y+2)
     let ctx_e = 1 + (eob > 128) as usize + (eob > 256) as usize;
-    let rc = SCAN_32X32[eob];
+    let rc = SCAN_32X32[eob] as usize;
     let (ex, ey) = (rc >> 5, rc & 31);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1; // 0,1,2
@@ -449,7 +431,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     }
     levels[ex * 32 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_32X32[i];
+        let rc_i = SCAN_32X32[i] as usize;
         let (x, y) = (rc_i >> 5, rc_i & 31);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 32);
         let m = cf[rc_i].unsigned_abs();
@@ -477,7 +459,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_32X32[i]];
+        let c = cf[SCAN_32X32[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -501,19 +483,10 @@ pub(crate) fn encode_4x8_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_4X8.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X8) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     // chroma infers txtp (no symbol)
 
@@ -554,7 +527,7 @@ pub(crate) fn encode_4x8_chroma_coeffs(
     let mut levels = [0u8; 80];
     // eob coeff: eob-ctx thresholds use sw*sh = imin(w,8)*imin(h,8) = 1*2 = 2
     let ctx_e = 1 + (eob > 4) as usize + (eob > 8) as usize;
-    let rc = SCAN_4X8[eob];
+    let rc = SCAN_4X8[eob] as usize;
     let (ex, ey) = (rc >> 3, rc & 7);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -565,7 +538,7 @@ pub(crate) fn encode_4x8_chroma_coeffs(
     }
     levels[ex * 8 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_4X8[i];
+        let rc_i = SCAN_4X8[i] as usize;
         let (x, y) = (rc_i >> 3, rc_i & 7);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 8);
         let m = cf[rc_i].unsigned_abs();
@@ -594,7 +567,7 @@ pub(crate) fn encode_4x8_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_4X8[i]];
+        let c = cf[SCAN_4X8[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -615,19 +588,10 @@ pub(crate) fn encode_4x8_luma_coeffs(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_4X8.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X8) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]);
     // chroma infers txtp (no symbol)
@@ -669,7 +633,7 @@ pub(crate) fn encode_4x8_luma_coeffs(
     let mut levels = [0u8; 80];
     // eob coeff: eob-ctx thresholds use sw*sh = imin(w,8)*imin(h,8) = 1*2 = 2
     let ctx_e = 1 + (eob > 4) as usize + (eob > 8) as usize;
-    let rc = SCAN_4X8[eob];
+    let rc = SCAN_4X8[eob] as usize;
     let (ex, ey) = (rc >> 3, rc & 7);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -680,7 +644,7 @@ pub(crate) fn encode_4x8_luma_coeffs(
     }
     levels[ex * 8 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_4X8[i];
+        let rc_i = SCAN_4X8[i] as usize;
         let (x, y) = (rc_i >> 3, rc_i & 7);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 8);
         let m = cf[rc_i].unsigned_abs();
@@ -709,7 +673,7 @@ pub(crate) fn encode_4x8_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_4X8[i]];
+        let c = cf[SCAN_4X8[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -728,19 +692,10 @@ pub(crate) fn encode_8x4_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_8X4.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X4) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     // chroma infers txtp (no symbol)
 
@@ -781,7 +736,7 @@ pub(crate) fn encode_8x4_chroma_coeffs(
     let mut levels = [0u8; 80];
     // eob coeff: eob-ctx thresholds use sw*sh = imin(w,8)*imin(h,8) = 1*2 = 2
     let ctx_e = 1 + (eob > 4) as usize + (eob > 8) as usize;
-    let rc = SCAN_8X4[eob];
+    let rc = SCAN_8X4[eob] as usize;
     let (ex, ey) = (rc >> 2, rc & 3);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -792,7 +747,7 @@ pub(crate) fn encode_8x4_chroma_coeffs(
     }
     levels[ex * 4 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_8X4[i];
+        let rc_i = SCAN_8X4[i] as usize;
         let (x, y) = (rc_i >> 2, rc_i & 3);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 4);
         let m = cf[rc_i].unsigned_abs();
@@ -821,7 +776,7 @@ pub(crate) fn encode_8x4_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_8X4[i]];
+        let c = cf[SCAN_8X4[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -842,19 +797,10 @@ pub(crate) fn encode_8x4_luma_coeffs(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_8X4.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X4) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]);
     // chroma infers txtp (no symbol)
@@ -896,7 +842,7 @@ pub(crate) fn encode_8x4_luma_coeffs(
     let mut levels = [0u8; 80];
     // eob coeff: eob-ctx thresholds use sw*sh = imin(w,8)*imin(h,8) = 1*2 = 2
     let ctx_e = 1 + (eob > 4) as usize + (eob > 8) as usize;
-    let rc = SCAN_8X4[eob];
+    let rc = SCAN_8X4[eob] as usize;
     let (ex, ey) = (rc >> 2, rc & 3);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -907,7 +853,7 @@ pub(crate) fn encode_8x4_luma_coeffs(
     }
     levels[ex * 4 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_8X4[i];
+        let rc_i = SCAN_8X4[i] as usize;
         let (x, y) = (rc_i >> 2, rc_i & 3);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 4);
         let m = cf[rc_i].unsigned_abs();
@@ -936,7 +882,7 @@ pub(crate) fn encode_8x4_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_8X4[i]];
+        let c = cf[SCAN_8X4[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -965,19 +911,10 @@ pub(crate) fn encode_16x8_luma_coeffs(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_16X8.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X8) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]); // luma signals txtp
 
@@ -1016,7 +953,7 @@ pub(crate) fn encode_16x8_luma_coeffs(
     }
     let mut levels = [0u8; 200];
     let ctx_e = 1 + (eob > 16) as usize + (eob > 32) as usize;
-    let rc = SCAN_16X8[eob];
+    let rc = SCAN_16X8[eob] as usize;
     let (ex, ey) = (rc >> 3, rc & 7); // x in 0..16, y in 0..8
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1027,7 +964,7 @@ pub(crate) fn encode_16x8_luma_coeffs(
     }
     levels[ex * 8 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_16X8[i];
+        let rc_i = SCAN_16X8[i] as usize;
         let (x, y) = (rc_i >> 3, rc_i & 7);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 8);
         let m = cf[rc_i].unsigned_abs();
@@ -1055,7 +992,7 @@ pub(crate) fn encode_16x8_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_16X8[i]];
+        let c = cf[SCAN_16X8[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1076,19 +1013,10 @@ pub(crate) fn encode_16x8_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_16X8.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X8) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -1125,7 +1053,7 @@ pub(crate) fn encode_16x8_chroma_coeffs(
     }
     let mut levels = [0u8; 200];
     let ctx_e = 1 + (eob > 16) as usize + (eob > 32) as usize;
-    let rc = SCAN_16X8[eob];
+    let rc = SCAN_16X8[eob] as usize;
     let (ex, ey) = (rc >> 3, rc & 7);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1136,7 +1064,7 @@ pub(crate) fn encode_16x8_chroma_coeffs(
     }
     levels[ex * 8 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_16X8[i];
+        let rc_i = SCAN_16X8[i] as usize;
         let (x, y) = (rc_i >> 3, rc_i & 7);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 8);
         let m = cf[rc_i].unsigned_abs();
@@ -1164,7 +1092,7 @@ pub(crate) fn encode_16x8_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_16X8[i]];
+        let c = cf[SCAN_16X8[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1188,19 +1116,10 @@ pub(crate) fn encode_8x16_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_8X16.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X16) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
     // chroma infers txtp (no symbol)
 
@@ -1241,7 +1160,7 @@ pub(crate) fn encode_8x16_chroma_coeffs(
     let mut levels = [0u8; 200];
     // eob coeff: 128 coeffs -> thresholds 128>>3 = 16, 128>>2 = 32
     let ctx_e = 1 + (eob > 16) as usize + (eob > 32) as usize;
-    let rc = SCAN_8X16[eob];
+    let rc = SCAN_8X16[eob] as usize;
     let (ex, ey) = (rc >> 4, rc & 15);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1252,7 +1171,7 @@ pub(crate) fn encode_8x16_chroma_coeffs(
     }
     levels[ex * 16 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_8X16[i];
+        let rc_i = SCAN_8X16[i] as usize;
         let (x, y) = (rc_i >> 4, rc_i & 15);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 16);
         let m = cf[rc_i].unsigned_abs();
@@ -1281,7 +1200,7 @@ pub(crate) fn encode_8x16_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_8X16[i]];
+        let c = cf[SCAN_8X16[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1302,19 +1221,10 @@ pub(crate) fn encode_8x16_luma_coeffs(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_8X16.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X16) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]);
 
@@ -1355,7 +1265,7 @@ pub(crate) fn encode_8x16_luma_coeffs(
     let mut levels = [0u8; 200];
     // eob coeff: 128 coeffs -> thresholds 128>>3 = 16, 128>>2 = 32
     let ctx_e = 1 + (eob > 16) as usize + (eob > 32) as usize;
-    let rc = SCAN_8X16[eob];
+    let rc = SCAN_8X16[eob] as usize;
     let (ex, ey) = (rc >> 4, rc & 15);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1366,7 +1276,7 @@ pub(crate) fn encode_8x16_luma_coeffs(
     }
     levels[ex * 16 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_8X16[i];
+        let rc_i = SCAN_8X16[i] as usize;
         let (x, y) = (rc_i >> 4, rc_i & 15);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 16);
         let m = cf[rc_i].unsigned_abs();
@@ -1395,7 +1305,7 @@ pub(crate) fn encode_8x16_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_8X16[i]];
+        let c = cf[SCAN_8X16[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1413,19 +1323,10 @@ pub(crate) fn encode_4x4_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_4X4.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X4) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1465,7 +1366,7 @@ pub(crate) fn encode_4x4_chroma_coeffs(
     let mut levels = [0u8; 80];
     // eob-ctx thresholds: sw*sh = imin(w,8)*imin(h,8) = 1*1 = 1
     let ctx_e = 1 + (eob > 2) as usize + (eob > 4) as usize;
-    let rc = SCAN_4X4[eob];
+    let rc = SCAN_4X4[eob] as usize;
     let (ex, ey) = (rc >> 2, rc & 3);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1476,7 +1377,7 @@ pub(crate) fn encode_4x4_chroma_coeffs(
     }
     levels[ex * 4 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_4X4[i];
+        let rc_i = SCAN_4X4[i] as usize;
         let (x, y) = (rc_i >> 2, rc_i & 3);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 4);
         let m = cf[rc_i].unsigned_abs();
@@ -1505,7 +1406,7 @@ pub(crate) fn encode_4x4_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_4X4[i]];
+        let c = cf[SCAN_4X4[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1528,19 +1429,10 @@ pub(crate) fn encode_tx4_luma_coeffs_adapt(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_4X4.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X4) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]); // luma TX_4X4: 0=IDTX,1=DCT_DCT,4=ADST_ADST
 
@@ -1581,7 +1473,7 @@ pub(crate) fn encode_tx4_luma_coeffs_adapt(
     let mut levels = [0u8; 80];
     // eob-ctx thresholds: sw*sh = imin(w,8)*imin(h,8) = 1*1 = 1
     let ctx_e = 1 + (eob > 2) as usize + (eob > 4) as usize;
-    let rc = SCAN_4X4[eob];
+    let rc = SCAN_4X4[eob] as usize;
     let (ex, ey) = (rc >> 2, rc & 3);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1592,7 +1484,7 @@ pub(crate) fn encode_tx4_luma_coeffs_adapt(
     }
     levels[ex * 4 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_4X4[i];
+        let rc_i = SCAN_4X4[i] as usize;
         let (x, y) = (rc_i >> 2, rc_i & 3);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 4);
         let m = cf[rc_i].unsigned_abs();
@@ -1621,7 +1513,7 @@ pub(crate) fn encode_tx4_luma_coeffs_adapt(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_4X4[i]];
+        let c = cf[SCAN_4X4[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1644,19 +1536,10 @@ pub(crate) fn encode_16x32_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_16X32.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X32) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -1693,7 +1576,7 @@ pub(crate) fn encode_16x32_chroma_coeffs(
     }
     let mut levels = [0u8; 640]; // stride 32, max read (15+2)*32+(31+2)=577
     let ctx_e = 1 + (eob > 64) as usize + (eob > 128) as usize;
-    let rc = SCAN_16X32[eob];
+    let rc = SCAN_16X32[eob] as usize;
     let (ex, ey) = (rc >> 5, rc & 31);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1704,7 +1587,7 @@ pub(crate) fn encode_16x32_chroma_coeffs(
     }
     levels[ex * 32 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_16X32[i];
+        let rc_i = SCAN_16X32[i] as usize;
         let (x, y) = (rc_i >> 5, rc_i & 31);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 32);
         let m = cf[rc_i].unsigned_abs();
@@ -1732,7 +1615,7 @@ pub(crate) fn encode_16x32_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_16X32[i]];
+        let c = cf[SCAN_16X32[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1751,19 +1634,10 @@ pub(crate) fn encode_16x32_luma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_16X32.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X32) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -1800,7 +1674,7 @@ pub(crate) fn encode_16x32_luma_coeffs(
     }
     let mut levels = [0u8; 640]; // stride 32, max read (15+2)*32+(31+2)=577
     let ctx_e = 1 + (eob > 64) as usize + (eob > 128) as usize;
-    let rc = SCAN_16X32[eob];
+    let rc = SCAN_16X32[eob] as usize;
     let (ex, ey) = (rc >> 5, rc & 31);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1811,7 +1685,7 @@ pub(crate) fn encode_16x32_luma_coeffs(
     }
     levels[ex * 32 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_16X32[i];
+        let rc_i = SCAN_16X32[i] as usize;
         let (x, y) = (rc_i >> 5, rc_i & 31);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WLH, 32);
         let m = cf[rc_i].unsigned_abs();
@@ -1839,7 +1713,7 @@ pub(crate) fn encode_16x32_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_16X32[i]];
+        let c = cf[SCAN_16X32[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1858,19 +1732,10 @@ pub(crate) fn encode_32x16_luma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_32X16.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X16) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -1907,7 +1772,7 @@ pub(crate) fn encode_32x16_luma_coeffs(
     }
     let mut levels = [0u8; 640]; // stride 32, max read (15+2)*32+(31+2)=577
     let ctx_e = 1 + (eob > 64) as usize + (eob > 128) as usize;
-    let rc = SCAN_32X16[eob];
+    let rc = SCAN_32X16[eob] as usize;
     let (ex, ey) = (rc >> 4, rc & 15);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -1918,7 +1783,7 @@ pub(crate) fn encode_32x16_luma_coeffs(
     }
     levels[ex * 16 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_32X16[i];
+        let rc_i = SCAN_32X16[i] as usize;
         let (x, y) = (rc_i >> 4, rc_i & 15);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 16);
         let m = cf[rc_i].unsigned_abs();
@@ -1946,7 +1811,7 @@ pub(crate) fn encode_32x16_luma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_32X16[i]];
+        let c = cf[SCAN_32X16[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {
@@ -1965,19 +1830,10 @@ pub(crate) fn encode_32x16_chroma_coeffs(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
-    let mut eob = 0usize;
-    let mut cul: u32 = 0u32;
-    for (i, &rc) in SCAN_32X16.iter().enumerate() {
-        let v = cf[rc].unsigned_abs();
-        cul += v;
-        if v != 0 {
-            eob = i;
-        }
-    }
-    if cul == 0 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X16) else {
         enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
         return 0x40;
-    }
+    };
     enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -2014,7 +1870,7 @@ pub(crate) fn encode_32x16_chroma_coeffs(
     }
     let mut levels = [0u8; 640]; // stride 32, max read (15+2)*32+(31+2)=577
     let ctx_e = 1 + (eob > 64) as usize + (eob > 128) as usize;
-    let rc = SCAN_32X16[eob];
+    let rc = SCAN_32X16[eob] as usize;
     let (ex, ey) = (rc >> 4, rc & 15);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1;
@@ -2025,7 +1881,7 @@ pub(crate) fn encode_32x16_chroma_coeffs(
     }
     levels[ex * 16 + ey] = level_byte(m);
     for i in (1..eob).rev() {
-        let rc_i = SCAN_32X16[i];
+        let rc_i = SCAN_32X16[i] as usize;
         let (x, y) = (rc_i >> 4, rc_i & 15);
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF_WGH, 16);
         let m = cf[rc_i].unsigned_abs();
@@ -2053,7 +1909,7 @@ pub(crate) fn encode_32x16_chroma_coeffs(
         }
     }
     for i in 1..=eob {
-        let c = cf[SCAN_32X16[i]];
+        let c = cf[SCAN_32X16[i] as usize];
         if c != 0 {
             enc.encode_bool(c < 0, 16384);
             if c.unsigned_abs() >= 15 {

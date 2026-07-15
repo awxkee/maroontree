@@ -206,7 +206,7 @@ pub(crate) fn cfl_pred_pixel(dc: i32, ac: i32, alpha: i32, bd: u8) -> i32 {
 /// Energy-minimising CfL alpha for one plane, in dav1d alpha units (the predictor
 /// applies `alpha/64` after the <<3 AC scaling). Returns the best of the analytic
 /// optimum and its +/-1 neighbors by pre-quantisation residual energy, clamped to
-/// the signalled range [-16, 16] (0 means "CfL useless for this plane").
+/// the signaled range [-16, 16] (0 means "CfL useless for this plane").
 pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8) -> i32 {
     let mut num: i64 = 0;
     let mut den: i64 = 0;

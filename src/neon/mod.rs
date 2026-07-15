@@ -28,11 +28,19 @@
  */
 mod dct;
 mod idct;
+mod rd;
+mod trellis;
 mod wht;
 
 pub(crate) use dct::{
-    dct8x8_neon_coeffs, dct8x16_neon_coeffs, dct8x16_neon_i32, dct16x16_neon_coeffs,
-    dct16x16_neon_i32, dct32x32_neon_coeffs, dct32x32_neon_i32,
+    adst16x16_neon_quant_t, adstdct16x16_neon_quant_t, dct8x8_neon_quant_t, dct8x16_neon_i32,
+    dct8x16_neon_quant_t, dct16x16_neon_i32, dct16x16_neon_quant_t, dct16x32_neon_quant_t,
+    dct32x16_neon_quant_t, dct32x32_neon_i32, dct32x32_neon_quant_t, dctadst16x16_neon_quant_t,
 };
-pub(crate) use idct::{idct_dequant_8x8_neon, idct_dequant_16x16_neon, idct_dequant_32x32_neon};
+pub(crate) use idct::{
+    iadst_dequant_16x16_neon, iadstdct_dequant_16x16_neon, idct_dequant_8x8_neon,
+    idct_dequant_16x16_neon, idct_dequant_32x32_neon, idctadst_dequant_16x16_neon,
+};
+pub(crate) use rd::{residual_dc_neon, residual_pred_neon, sse_recon_dc_neon, sse_recon_neon};
+pub(crate) use trellis::{trellis_dist_current_zero_scan_neon, trellis_round_down_scan_neon};
 pub(crate) use wht::fwht_raw_neon;

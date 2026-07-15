@@ -273,14 +273,14 @@ pub(crate) const NUM_BASE_LEVELS: i32 = 2;
 pub(crate) const COEFF_BASE_RANGE: i32 = 12;
 
 /// AV1 up-right diagonal scan for an 8x8 transform (`scan_8x8`).
-pub(crate) static SCAN_16X16: [usize; 256] = crate::coef_q::SCAN_16X16;
-pub(crate) static SCAN_32X32: [usize; 1024] = crate::coef_q::SCAN_32X32;
-pub(crate) static SCAN_8X16: [usize; 128] = crate::coef_q::SCAN_8X16;
-pub(crate) static SCAN_16X8: [usize; 128] = crate::coef_q::SCAN_16X8;
-pub(crate) static SCAN_16X32: [usize; 512] = crate::coef_q::SCAN_16X32;
-pub(crate) static SCAN_32X16: [usize; 512] = crate::coef_q::SCAN_32X16;
+pub(crate) static SCAN_16X16: [u32; 256] = crate::coef_q::SCAN_16X16;
+pub(crate) static SCAN_32X32: [u32; 1024] = crate::coef_q::SCAN_32X32;
+pub(crate) static SCAN_8X16: [u32; 128] = crate::coef_q::SCAN_8X16;
+pub(crate) static SCAN_16X8: [u32; 128] = crate::coef_q::SCAN_16X8;
+pub(crate) static SCAN_16X32: [u32; 512] = crate::coef_q::SCAN_16X32;
+pub(crate) static SCAN_32X16: [u32; 512] = crate::coef_q::SCAN_32X16;
 pub(crate) const OVERHEAD_16: u32 = 8;
-pub(crate) static SCAN_8X8: [usize; 64] = [
+pub(crate) static SCAN_8X8: [u32; 64] = [
     0, 8, 1, 2, 9, 16, 24, 17, 10, 3, 4, 11, 18, 25, 32, 40, 33, 26, 19, 12, 5, 6, 13, 20, 27, 34,
     41, 48, 56, 49, 42, 35, 28, 21, 14, 7, 15, 22, 29, 36, 43, 50, 57, 58, 51, 44, 37, 30, 23, 31,
     38, 45, 52, 59, 60, 53, 46, 39, 47, 54, 61, 62, 55, 63,
@@ -361,14 +361,14 @@ pub(crate) static TXTP_INTRA1_TX4: [[u16; 6]; 13] = [
 ];
 
 /// 4x4 scan order (dav1d `scan_4x4`): scan index -> raster rc = fx*4 + fy.
-pub(crate) static SCAN_4X4: [usize; 16] = [0, 4, 1, 2, 5, 8, 12, 9, 6, 3, 7, 10, 13, 14, 11, 15];
+pub(crate) static SCAN_4X4: [u32; 16] = [0, 4, 1, 2, 5, 8, 12, 9, 6, 3, 7, 10, 13, 14, 11, 15];
 
 /// 4x8 scan order (dav1d `scan_4x8`): scan index -> raster rc = fx*8 + fy.
-pub(crate) static SCAN_4X8: [usize; 32] = [
+pub(crate) static SCAN_4X8: [u32; 32] = [
     0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
     29, 22, 15, 30, 23, 31,
 ];
-pub(crate) static SCAN_8X4: [usize; 32] = [
+pub(crate) static SCAN_8X4: [u32; 32] = [
     0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
     23, 26, 29, 27, 30, 31,
 ];

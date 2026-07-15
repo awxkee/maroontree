@@ -26,7 +26,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 use crate::util::FastRound;
 
 #[inline]
@@ -264,19 +263,36 @@ mod neon {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_refs(
-    rec: &[f32],
-    pw: usize,
-    y0: usize,
-    x0: usize,
-    bs: usize,
-    have_above: bool,
-    have_left: bool,
-    tr_px: usize, // available top-right pixels (0 = none)
-    bl_px: usize, // available bottom-left pixels (0 = none)
-    neutral: f32,
-) -> (Vec<i32>, Vec<i32>, i32) {
+/// Geometry and causal-neighbor availability for building one intra reference ring.
+#[derive(Clone, Copy)]
+pub(crate) struct IntraRefSpec {
+    pub(crate) stride: usize,
+    pub(crate) y: usize,
+    pub(crate) x: usize,
+    pub(crate) block_size: usize,
+    pub(crate) have_above: bool,
+    pub(crate) have_left: bool,
+    pub(crate) top_right: usize,
+    pub(crate) bottom_left: usize,
+    pub(crate) neutral: f32,
+    pub(crate) available_above: usize,
+    pub(crate) available_left: usize,
+}
+
+pub(crate) fn build_refs(rec: &[f32], spec: &IntraRefSpec) -> (Vec<i32>, Vec<i32>, i32) {
+    let IntraRefSpec {
+        stride: pw,
+        y: y0,
+        x: x0,
+        block_size: bs,
+        have_above,
+        have_left,
+        top_right: tr_px,
+        bottom_left: bl_px,
+        neutral,
+        available_above: avail_above,
+        available_left: avail_left,
+    } = *spec;
     // AVM initializes missing intra references to the mid-sample value for
     // the coded bit depth: 128 for 8-bit, 512 for 10-bit, 2048 for 12-bit.
     // Using the 8-bit constant for high-bit-depth streams makes the encoder
@@ -293,7 +309,8 @@ pub(crate) fn build_refs(
     // NEED_ABOVE
     if n_top > 0 {
         for (c, dst) in above[0..bs].iter_mut().enumerate() {
-            *dst = g(y0 - 1, x0 + c);
+            // replicate the last in-frame column beyond avail_above (matches decoder edge)
+            *dst = g(y0 - 1, x0 + c.min(avail_above - 1));
         }
         let tr = tr_px.min(bs);
         for c in 0..tr {
@@ -321,7 +338,8 @@ pub(crate) fn build_refs(
     // NEED_LEFT
     if n_left > 0 {
         for (r, dst) in left[..bs].iter_mut().enumerate() {
-            *dst = g(y0 + r, x0 - 1);
+            // replicate the last in-frame row beyond avail_left (matches decoder edge)
+            *dst = g(y0 + r.min(avail_left - 1), x0 - 1);
         }
         let bln = bl_px.min(bs);
         for (r, dst) in left[bs..bs + bln].iter_mut().enumerate() {

@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+#![allow(clippy::needless_range_loop)]
 use crate::idct::IdctDequant;
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
@@ -38,6 +38,47 @@ use std::mem::MaybeUninit;
 struct I32x8 {
     lo: int32x4_t,
     hi: int32x4_t,
+}
+
+#[derive(Clone, Copy)]
+struct I32x4(int32x4_t);
+
+impl I32x4 {
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn add(self, rhs: I32x4) -> I32x4 {
+        I32x4(vaddq_s32(self.0, rhs.0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn sub(self, rhs: I32x4) -> I32x4 {
+        I32x4(vsubq_s32(self.0, rhs.0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn muli(self, k: i32) -> I32x4 {
+        I32x4(vmulq_s32(self.0, vdupq_n_s32(k)))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn rsh<const SH: i32>(self, add: i32) -> I32x4 {
+        I32x4(vshrq_n_s32(vaddq_s32(self.0, vdupq_n_s32(add)), SH))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn clip(self, min: int32x4_t, max: int32x4_t) -> I32x4 {
+        I32x4(vminq_s32(vmaxq_s32(self.0, min), max))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn neg(self) -> I32x4 {
+        I32x4(vnegq_s32(self.0))
+    }
 }
 
 impl I32x8 {
@@ -88,16 +129,6 @@ impl I32x8 {
         I32x8 {
             lo: vminq_s32(vmaxq_s32(self.lo, min), max),
             hi: vminq_s32(vmaxq_s32(self.hi, min), max),
-        }
-    }
-
-    /// Lane-wise negate (for the `-(...)` rotation terms in inv_dct32).
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn neg(self) -> I32x8 {
-        I32x8 {
-            lo: vnegq_s32(self.lo),
-            hi: vnegq_s32(self.hi),
         }
     }
 }
@@ -200,94 +231,63 @@ fn inv_dct8_v(c: &mut [I32x8; 8], min: i32, max: i32) {
     c[7] = clip(p0.sub(t7));
 }
 
-/// Dequant 4 levels: `coeff = sign(lvl) * min((|lvl|*q) & 0xff_ffff, cf_max + (lvl<0))`.
-/// `lvl==0` falls out to 0 naturally. Matches the scalar dequant loop bit-for-bit.
+// Low-register NEON inverse kernels for large transforms. They process four
+// spatial/frequency lanes at once and avoid the I32x8 pair representation that
+// doubles physical NEON register pressure.
 #[inline]
 #[target_feature(enable = "neon")]
-fn dequant4(lvl: int32x4_t, q: int32x4_t, cf_max: int32x4_t) -> int32x4_t {
-    let absl = vabsq_s32(lvl);
-    // 64-bit widening |lvl|*q (both >= 0), then mask the low 24 bits.
-    let mask = vdupq_n_s64(0xff_ffff);
-    let plo = vandq_s64(vmull_s32(vget_low_s32(absl), vget_low_s32(q)), mask);
-    let phi = vandq_s64(vmull_s32(vget_high_s32(absl), vget_high_s32(q)), mask);
-    // Masked value <= 0xff_ffff, so the narrow to i32 is exact.
-    let masked = vcombine_s32(vmovn_s64(plo), vmovn_s64(phi));
-    // cap = cf_max + (lvl < 0 ? 1 : 0)
-    let neg1 = vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(lvl), 31));
-    let cap = vaddq_s32(cf_max, neg1);
-    let mag = vminq_s32(masked, cap);
-    // Apply sign of lvl: negative lanes take -mag.
-    let neg = vnegq_s32(mag);
-    let signmask = vcltq_s32(lvl, vdupq_n_s32(0));
-    vbslq_s32(signmask, neg, mag)
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn idct_dequant_8x8_neon(levels: &[i32; 64], dequant: &IdctDequant) -> [i32; 64] {
-    let (rmin, rmax, cmin, cmax, cf_max) = (
-        dequant.rmin,
-        dequant.rmax,
-        dequant.cmin,
-        dequant.cmax,
-        dequant.cf_max,
-    );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
-
-    let cfm = vdupq_n_s32(cf_max);
-    let mut coeff = [0i32; 64];
-    // first group of 4: lane 0 is DC.
-    let q_dc = vsetq_lane_s32(dc_q, vdupq_n_s32(ac_q), 0);
-    let q_ac = vdupq_n_s32(ac_q);
-    unsafe {
-        let l = vld1q_s32(levels.as_ptr());
-        vst1q_s32(coeff.as_mut_ptr(), dequant4(l, q_dc, cfm));
-        let mut i = 4;
-        while i < 64 {
-            let l = vld1q_s32(levels.as_ptr().add(i));
-            vst1q_s32(coeff.as_mut_ptr().add(i), dequant4(l, q_ac, cfm));
-            i += 4;
-        }
-    }
-
-    let load = |x: usize| unsafe {
-        I32x8 {
-            lo: vld1q_s32(coeff[x * 8..].as_ptr()),
-            hi: vld1q_s32(coeff[x * 8 + 4..].as_ptr()),
-        }
-    };
-    let mut v: [I32x8; 8] = std::array::from_fn(load);
-
-    inv_dct8_v(&mut v, rmin, rmax);
-
-    let cmn = vdupq_n_s32(cmin);
-    let cmx = vdupq_n_s32(cmax);
-    for vv in v.iter_mut() {
-        *vv = vv.rsh::<1>(1).clip(cmn, cmx);
-    }
-
-    transpose_8x8(&mut v);
-    inv_dct8_v(&mut v, cmin, cmax);
-
-    let mut out = MaybeUninit::<[i32; 64]>::uninit();
-    for (y, vv) in v.iter().enumerate() {
-        let r = vv.rsh::<4>(8);
-        unsafe {
-            vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8), r.lo);
-            vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8 + 4), r.hi);
-        }
-    }
-    unsafe { out.assume_init() }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn inv_dct16_v(c: &mut [I32x8; 16], min: i32, max: i32) {
+fn inv_dct8_v_x4(c: &mut [I32x4; 8], min: i32, max: i32) {
     let mn = vdupq_n_s32(min);
     let mx = vdupq_n_s32(max);
-    let clip = |v: I32x8| v.clip(mn, mx);
+    let clip = |v: I32x4| v.clip(mn, mx);
 
-    let mut e: [I32x8; 8] = std::array::from_fn(|i| c[2 * i]);
-    inv_dct8_v(&mut e, min, max);
+    // --- even half: inv_dct4 on c[0], c[2], c[4], c[6] ---
+    let (e0, e1, e2, e3) = (c[0], c[2], c[4], c[6]);
+    let d0 = e0.add(e2).muli(181).rsh::<8>(128); // ((in0+in2)*181+128)>>8
+    let d1 = e0.sub(e2).muli(181).rsh::<8>(128); // ((in0-in2)*181+128)>>8
+    let d2 = e1.muli(1567).sub(e3.muli(-312)).rsh::<12>(2048).sub(e3); // *1567 - *(3784-4096)
+    let d3 = e1.muli(-312).add(e3.muli(1567)).rsh::<12>(2048).add(e1);
+    let p0 = clip(d0.add(d3)); // even outputs (scalar c[0],c[2],c[4],c[6])
+    let p2 = clip(d1.add(d2));
+    let p4 = clip(d1.sub(d2));
+    let p6 = clip(d0.sub(d3));
+
+    // --- odd half ---
+    let (in1, in3, in5, in7) = (c[1], c[3], c[5], c[7]);
+    // t4a = ((in1*799 - in7*(4017-4096) + 2048)>>12) - in7   ; (4017-4096) = -79
+    let t4a = in1.muli(799).sub(in7.muli(-79)).rsh::<12>(2048).sub(in7);
+    let t5a0 = in5.muli(1703).sub(in3.muli(1138)).rsh::<11>(1024);
+    let t6a0 = in5.muli(1138).add(in3.muli(1703)).rsh::<11>(1024);
+    let t7a = in1.muli(-79).add(in7.muli(799)).rsh::<12>(2048).add(in1);
+
+    let t4 = clip(t4a.add(t5a0));
+    let t5a = clip(t4a.sub(t5a0));
+    let t7 = clip(t7a.add(t6a0));
+    let t6a = clip(t7a.sub(t6a0));
+
+    let t5 = t6a.sub(t5a).muli(181).rsh::<8>(128); // ((t6a-t5a)*181+128)>>8
+    let t6 = t6a.add(t5a).muli(181).rsh::<8>(128); // ((t6a+t5a)*181+128)>>8
+
+    // --- combine (scalar t0..t3 are the even outputs p0,p2,p4,p6) ---
+    c[0] = clip(p0.add(t7));
+    c[1] = clip(p2.add(t6));
+    c[2] = clip(p4.add(t5));
+    c[3] = clip(p6.add(t4));
+    c[4] = clip(p6.sub(t4));
+    c[5] = clip(p4.sub(t5));
+    c[6] = clip(p2.sub(t6));
+    c[7] = clip(p0.sub(t7));
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct16_v_x4(c: &mut [I32x4; 16], min: i32, max: i32) {
+    let mn = vdupq_n_s32(min);
+    let mx = vdupq_n_s32(max);
+    let clip = |v: I32x4| v.clip(mn, mx);
+
+    let mut e: [I32x4; 8] = std::array::from_fn(|i| c[2 * i]);
+    inv_dct8_v_x4(&mut e, min, max);
 
     // odd inputs (read before any write-back to c)
     let (in1, in3, in5, in7) = (c[1], c[3], c[5], c[7]);
@@ -363,122 +363,243 @@ fn inv_dct16_v(c: &mut [I32x8; 16], min: i32, max: i32) {
     c[15] = clip(e[0].sub(v15a));
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn idct_dequant_16x16_neon(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
-    let (rmin, rmax, cmin, cmax, cf_max) = (
-        dequant.rmin,
-        dequant.rmax,
-        dequant.cmin,
-        dequant.cmax,
-        dequant.cf_max,
-    );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
-
-    let cfm = vdupq_n_s32(cf_max);
-    let q_dc = vsetq_lane_s32(dc_q, vdupq_n_s32(ac_q), 0);
-    let q_ac = vdupq_n_s32(ac_q);
-    let mut coeff_u = MaybeUninit::<[i32; 256]>::uninit();
-    unsafe {
-        vst1q_s32(
-            coeff_u.as_mut_ptr().cast(),
-            dequant4(vld1q_s32(levels.as_ptr()), q_dc, cfm),
-        );
-        let mut i = 4;
-        while i < 256 {
-            let l = vld1q_s32(levels.as_ptr().add(i));
-            let coeff_ptr = coeff_u.as_mut_ptr() as *mut i32;
-            vst1q_s32(coeff_ptr.add(i), dequant4(l, q_ac, cfm));
-            i += 4;
-        }
-    }
-
-    let coeff = unsafe { coeff_u.assume_init() };
-
-    let load_l = |x: usize| unsafe {
-        I32x8 {
-            lo: vld1q_s32(coeff.as_ptr().add(x * 16)),
-            hi: vld1q_s32(coeff.as_ptr().add(x * 16 + 4)),
-        }
-    };
-    let load_r = |x: usize| unsafe {
-        I32x8 {
-            lo: vld1q_s32(coeff.as_ptr().add(x * 16 + 8)),
-            hi: vld1q_s32(coeff.as_ptr().add(x * 16 + 12)),
-        }
-    };
-    let mut c_l: [I32x8; 16] = std::array::from_fn(load_l);
-    let mut c_r: [I32x8; 16] = std::array::from_fn(load_r);
-
-    inv_dct16_v(&mut c_l, rmin, rmax);
-    inv_dct16_v(&mut c_r, rmin, rmax);
-
-    let cmn = vdupq_n_s32(cmin);
-    let cmx = vdupq_n_s32(cmax);
-    for vv in c_l.iter_mut().chain(c_r.iter_mut()) {
-        *vv = vv.rsh::<2>(2).clip(cmn, cmx);
-    }
-
-    let mut ll: [I32x8; 8] = c_l[0..8].try_into().unwrap();
-    let mut lr: [I32x8; 8] = c_l[8..16].try_into().unwrap();
-    let mut rl: [I32x8; 8] = c_r[0..8].try_into().unwrap();
-    let mut rr: [I32x8; 8] = c_r[8..16].try_into().unwrap();
-    transpose_8x8(&mut ll);
-    transpose_8x8(&mut lr);
-    transpose_8x8(&mut rl);
-    transpose_8x8(&mut rr);
-    // w_l: cols 0..8, rows 0..8 = ll, rows 8..16 = rl ; w_r: cols 8..16, lr / rr
-    let mut w_l: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { ll[i] } else { rl[i - 8] });
-    let mut w_r: [I32x8; 16] = std::array::from_fn(|i| if i < 8 { lr[i] } else { rr[i - 8] });
-
-    // --- col pass: inv_dct16 across y (vector index) per lane x; clip [cmin,cmax] ---
-    inv_dct16_v(&mut w_l, cmin, cmax);
-    inv_dct16_v(&mut w_r, cmin, cmax);
-
-    // final: (t + 8) >> 4 (no clamp), store row-major out[y*16 + x]
-    let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for r in 0..16 {
-        let lo = w_l[r].rsh::<4>(8); // cols 0..8
-        let hi = w_r[r].rsh::<4>(8); // cols 8..16
-        unsafe {
-            let dst_ptr = out.as_mut_ptr() as *mut i32;
-            vst1q_s32(dst_ptr.add(r * 16), lo.lo);
-            vst1q_s32(dst_ptr.add(r * 16 + 4), lo.hi);
-            vst1q_s32(dst_ptr.add(r * 16 + 8), hi.lo);
-            vst1q_s32(dst_ptr.add(r * 16 + 12), hi.hi);
-        }
-    }
-    unsafe { out.assume_init() }
-}
-
-/// Dequant 4 levels with `dq_shift = 1` (TX_32X32):
-/// `coeff = sign(lvl) * min(((|lvl|*q) & 0xff_ffff) >> 1, cf_max + (lvl<0))`.
 #[inline]
 #[target_feature(enable = "neon")]
-fn dequant4_dq1(lvl: int32x4_t, q: int32x4_t, cf_max: int32x4_t) -> int32x4_t {
-    let absl = vabsq_s32(lvl);
-    let mask = vdupq_n_s64(0xff_ffff);
-    let plo = vandq_s64(vmull_s32(vget_low_s32(absl), vget_low_s32(q)), mask);
-    let phi = vandq_s64(vmull_s32(vget_high_s32(absl), vget_high_s32(q)), mask);
-    // masked <= 0xff_ffff (non-negative) so >>1 and the narrow are exact.
-    let masked = vshrq_n_s32(vcombine_s32(vmovn_s64(plo), vmovn_s64(phi)), 1);
-    let neg1 = vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(lvl), 31));
-    let cap = vaddq_s32(cf_max, neg1);
-    let mag = vminq_s32(masked, cap);
-    let neg = vnegq_s32(mag);
-    let signmask = vcltq_s32(lvl, vdupq_n_s32(0));
-    vbslq_s32(signmask, neg, mag)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn inv_dct32_v(c: &mut [I32x8; 32], min: i32, max: i32) {
+fn inv_adst16_v_x4(c: &mut [I32x4; 16], min: i32, max: i32) {
     let mn = vdupq_n_s32(min);
     let mx = vdupq_n_s32(max);
-    let clip = |v: I32x8| v.clip(mn, mx);
+    let clip = |v: I32x4| v.clip(mn, mx);
+
+    let (in0, in1, in2, in3) = (c[0], c[1], c[2], c[3]);
+    let (in4, in5, in6, in7) = (c[4], c[5], c[6], c[7]);
+    let (in8, in9, in10, in11) = (c[8], c[9], c[10], c[11]);
+    let (in12, in13, in14, in15) = (c[12], c[13], c[14], c[15]);
+
+    let mut t0 = in15
+        .muli(4091 - 4096)
+        .add(in0.muli(201))
+        .rsh::<12>(2048)
+        .add(in15);
+    let mut t1 = in15
+        .muli(201)
+        .sub(in0.muli(4091 - 4096))
+        .rsh::<12>(2048)
+        .sub(in0);
+    let mut t2 = in13
+        .muli(3973 - 4096)
+        .add(in2.muli(995))
+        .rsh::<12>(2048)
+        .add(in13);
+    let mut t3 = in13
+        .muli(995)
+        .sub(in2.muli(3973 - 4096))
+        .rsh::<12>(2048)
+        .sub(in2);
+    let mut t4 = in11
+        .muli(3703 - 4096)
+        .add(in4.muli(1751))
+        .rsh::<12>(2048)
+        .add(in11);
+    let mut t5 = in11
+        .muli(1751)
+        .sub(in4.muli(3703 - 4096))
+        .rsh::<12>(2048)
+        .sub(in4);
+    let mut t6 = in9.muli(1645).add(in6.muli(1220)).rsh::<11>(1024);
+    let mut t7 = in9.muli(1220).sub(in6.muli(1645)).rsh::<11>(1024);
+    let mut t8 = in7
+        .muli(2751)
+        .add(in8.muli(3035 - 4096))
+        .rsh::<12>(2048)
+        .add(in8);
+    let mut t9 = in7
+        .muli(3035 - 4096)
+        .sub(in8.muli(2751))
+        .rsh::<12>(2048)
+        .add(in7);
+    let mut t10 = in5
+        .muli(2106)
+        .add(in10.muli(3513 - 4096))
+        .rsh::<12>(2048)
+        .add(in10);
+    let mut t11 = in5
+        .muli(3513 - 4096)
+        .sub(in10.muli(2106))
+        .rsh::<12>(2048)
+        .add(in5);
+    let mut t12 = in3
+        .muli(1380)
+        .add(in12.muli(3857 - 4096))
+        .rsh::<12>(2048)
+        .add(in12);
+    let mut t13 = in3
+        .muli(3857 - 4096)
+        .sub(in12.muli(1380))
+        .rsh::<12>(2048)
+        .add(in3);
+    let mut t14 = in1
+        .muli(601)
+        .add(in14.muli(4052 - 4096))
+        .rsh::<12>(2048)
+        .add(in14);
+    let mut t15 = in1
+        .muli(4052 - 4096)
+        .sub(in14.muli(601))
+        .rsh::<12>(2048)
+        .add(in1);
+
+    let t0a = clip(t0.add(t8));
+    let t1a = clip(t1.add(t9));
+    let t2a = clip(t2.add(t10));
+    let t3a = clip(t3.add(t11));
+    let t4a = clip(t4.add(t12));
+    let t5a = clip(t5.add(t13));
+    let t6a = clip(t6.add(t14));
+    let t7a = clip(t7.add(t15));
+    let mut t8a = clip(t0.sub(t8));
+    let mut t9a = clip(t1.sub(t9));
+    let mut t10a = clip(t2.sub(t10));
+    let mut t11a = clip(t3.sub(t11));
+    let mut t12a = clip(t4.sub(t12));
+    let mut t13a = clip(t5.sub(t13));
+    let mut t14a = clip(t6.sub(t14));
+    let mut t15a = clip(t7.sub(t15));
+
+    t8 = t8a
+        .muli(4017 - 4096)
+        .add(t9a.muli(799))
+        .rsh::<12>(2048)
+        .add(t8a);
+    t9 = t8a
+        .muli(799)
+        .sub(t9a.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .sub(t9a);
+    t10 = t10a
+        .muli(2276)
+        .add(t11a.muli(3406 - 4096))
+        .rsh::<12>(2048)
+        .add(t11a);
+    t11 = t10a
+        .muli(3406 - 4096)
+        .sub(t11a.muli(2276))
+        .rsh::<12>(2048)
+        .add(t10a);
+    t12 = t13a
+        .muli(4017 - 4096)
+        .sub(t12a.muli(799))
+        .rsh::<12>(2048)
+        .add(t13a);
+    t13 = t13a
+        .muli(799)
+        .add(t12a.muli(4017 - 4096))
+        .rsh::<12>(2048)
+        .add(t12a);
+    t14 = t15a
+        .muli(2276)
+        .sub(t14a.muli(3406 - 4096))
+        .rsh::<12>(2048)
+        .sub(t14a);
+    t15 = t15a
+        .muli(3406 - 4096)
+        .add(t14a.muli(2276))
+        .rsh::<12>(2048)
+        .add(t15a);
+
+    t0 = clip(t0a.add(t4a));
+    t1 = clip(t1a.add(t5a));
+    t2 = clip(t2a.add(t6a));
+    t3 = clip(t3a.add(t7a));
+    t4 = clip(t0a.sub(t4a));
+    t5 = clip(t1a.sub(t5a));
+    t6 = clip(t2a.sub(t6a));
+    t7 = clip(t3a.sub(t7a));
+    t8a = clip(t8.add(t12));
+    t9a = clip(t9.add(t13));
+    t10a = clip(t10.add(t14));
+    t11a = clip(t11.add(t15));
+    t12a = clip(t8.sub(t12));
+    t13a = clip(t9.sub(t13));
+    t14a = clip(t10.sub(t14));
+    t15a = clip(t11.sub(t15));
+
+    let t4b = t4
+        .muli(3784 - 4096)
+        .add(t5.muli(1567))
+        .rsh::<12>(2048)
+        .add(t4);
+    let t5b = t4
+        .muli(1567)
+        .sub(t5.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t5);
+    let t6b = t7
+        .muli(3784 - 4096)
+        .sub(t6.muli(1567))
+        .rsh::<12>(2048)
+        .add(t7);
+    let t7b = t7
+        .muli(1567)
+        .add(t6.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .add(t6);
+    t12 = t12a
+        .muli(3784 - 4096)
+        .add(t13a.muli(1567))
+        .rsh::<12>(2048)
+        .add(t12a);
+    t13 = t12a
+        .muli(1567)
+        .sub(t13a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .sub(t13a);
+    t14 = t15a
+        .muli(3784 - 4096)
+        .sub(t14a.muli(1567))
+        .rsh::<12>(2048)
+        .add(t15a);
+    t15 = t15a
+        .muli(1567)
+        .add(t14a.muli(3784 - 4096))
+        .rsh::<12>(2048)
+        .add(t14a);
+
+    c[0] = clip(t0.add(t2));
+    c[15] = clip(t1.add(t3)).neg();
+    let t2b = clip(t0.sub(t2));
+    let t3b = clip(t1.sub(t3));
+    c[3] = clip(t4b.add(t6b)).neg();
+    c[12] = clip(t5b.add(t7b));
+    t6 = clip(t4b.sub(t6b));
+    t7 = clip(t5b.sub(t7b));
+    c[1] = clip(t8a.add(t10a)).neg();
+    c[14] = clip(t9a.add(t11a));
+    t10 = clip(t8a.sub(t10a));
+    t11 = clip(t9a.sub(t11a));
+    c[2] = clip(t12.add(t14));
+    c[13] = clip(t13.add(t15)).neg();
+    let t14b = clip(t12.sub(t14));
+    let t15b = clip(t13.sub(t15));
+    c[7] = t2b.add(t3b).muli(181).rsh::<8>(128).neg();
+    c[8] = t2b.sub(t3b).muli(181).rsh::<8>(128);
+    c[4] = t6.add(t7).muli(181).rsh::<8>(128);
+    c[11] = t6.sub(t7).muli(181).rsh::<8>(128).neg();
+    c[6] = t10.add(t11).muli(181).rsh::<8>(128);
+    c[9] = t10.sub(t11).muli(181).rsh::<8>(128).neg();
+    c[5] = t14b.add(t15b).muli(181).rsh::<8>(128).neg();
+    c[10] = t14b.sub(t15b).muli(181).rsh::<8>(128);
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct32_v_x4(c: &mut [I32x4; 32], min: i32, max: i32) {
+    let mn = vdupq_n_s32(min);
+    let mx = vdupq_n_s32(max);
+    let clip = |v: I32x4| v.clip(mn, mx);
 
     // even half: inv_dct16 on the 16 even-indexed vectors -> e[0..16] = t0..t15
-    let mut e: [I32x8; 16] = std::array::from_fn(|i| c[2 * i]);
-    inv_dct16_v(&mut e, min, max);
+    let mut e: [I32x4; 16] = std::array::from_fn(|i| c[2 * i]);
+    inv_dct16_v_x4(&mut e, min, max);
 
     // odd inputs (read before any write-back)
     let (in1, in3, in5, in7) = (c[1], c[3], c[5], c[7]);
@@ -730,6 +851,225 @@ fn inv_dct32_v(c: &mut [I32x8; 32], min: i32, max: i32) {
     c[31] = clip(e[0].sub(t31));
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_i32x4(ptr: *const i32) -> I32x4 {
+    unsafe { I32x4(vld1q_s32(ptr)) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_i32x4(dst: *mut i32, v: I32x4) {
+    unsafe {
+        vst1q_s32(dst, v.0);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_store_4x4(dst: *mut i32, stride: usize, tile: &mut [I32x4; 4]) {
+    let (r0, r1, r2, r3) = transpose_4x4(tile[0].0, tile[1].0, tile[2].0, tile[3].0);
+    unsafe {
+        vst1q_s32(dst, r0);
+        vst1q_s32(dst.add(stride), r1);
+        vst1q_s32(dst.add(2 * stride), r2);
+        vst1q_s32(dst.add(3 * stride), r3);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_transposed_rows_i32x4<const N: usize>(dst: *mut i32, y: usize, rows: &[I32x4; N]) {
+    debug_assert!(N.is_multiple_of(4));
+    let stride = N;
+    let mut x = 0usize;
+    while x < N {
+        let mut tile = [rows[x], rows[x + 1], rows[x + 2], rows[x + 3]];
+        transpose_store_4x4(unsafe { dst.add(y * N + x) }, stride, &mut tile);
+        x += 4;
+    }
+}
+
+/// Dequant 4 levels: `coeff = sign(lvl) * min((|lvl|*q) & 0xff_ffff, cf_max + (lvl<0))`.
+/// `lvl==0` falls out to 0 naturally. Matches the scalar dequant loop bit-for-bit.
+#[inline]
+#[target_feature(enable = "neon")]
+fn dequant4(lvl: int32x4_t, q: int32x4_t, cf_max: int32x4_t) -> int32x4_t {
+    let absl = vabsq_s32(lvl);
+    // 64-bit widening |lvl|*q (both >= 0), then mask the low 24 bits.
+    let mask = vdupq_n_s64(0xff_ffff);
+    let plo = vandq_s64(vmull_s32(vget_low_s32(absl), vget_low_s32(q)), mask);
+    let phi = vandq_s64(vmull_s32(vget_high_s32(absl), vget_high_s32(q)), mask);
+    // Masked value <= 0xff_ffff, so the narrow to i32 is exact.
+    let masked = vcombine_s32(vmovn_s64(plo), vmovn_s64(phi));
+    // cap = cf_max + (lvl < 0 ? 1 : 0)
+    let neg1 = vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(lvl), 31));
+    let cap = vaddq_s32(cf_max, neg1);
+    let mag = vminq_s32(masked, cap);
+    // Apply sign of lvl: negative lanes take -mag.
+    let neg = vnegq_s32(mag);
+    let signmask = vcltq_s32(lvl, vdupq_n_s32(0));
+    vbslq_s32(signmask, neg, mag)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_dequant16_i32x4(levels: &[i32; 256], x: usize, y: usize, dequant: &IdctDequant) -> I32x4 {
+    let q = if x == 0 && y == 0 {
+        vsetq_lane_s32(dequant.dc_q, vdupq_n_s32(dequant.ac_q), 0)
+    } else {
+        vdupq_n_s32(dequant.ac_q)
+    };
+    let lvl = unsafe { vld1q_s32(levels.as_ptr().add(x * 16 + y)) };
+    I32x4(dequant4(lvl, q, vdupq_n_s32(dequant.cf_max)))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv16x16_mixed_dequant_neon<const ROW_ADST: bool, const COL_ADST: bool>(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    let cmn = vdupq_n_s32(dequant.cmin);
+    let cmx = vdupq_n_s32(dequant.cmax);
+
+    // Fused dequant + first inverse dimension. Store a real transposed scratch:
+    // scratch[y_frequency * 16 + x_spatial].
+    let mut scratch_u = MaybeUninit::<[i32; 256]>::uninit();
+    for y in (0..16usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|x| load_dequant16_i32x4(levels, x, y, dequant));
+        if ROW_ADST {
+            inv_adst16_v_x4(&mut rows, dequant.rmin, dequant.rmax);
+        } else {
+            inv_dct16_v_x4(&mut rows, dequant.rmin, dequant.rmax);
+        }
+        for row in rows.iter_mut() {
+            *row = row.rsh::<2>(2).clip(cmn, cmx);
+        }
+        store_transposed_rows_i32x4::<16>(scratch_u.as_mut_ptr().cast(), y, &rows);
+    }
+    let scratch = unsafe { scratch_u.assume_init() };
+
+    let mut out = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(4) {
+        let mut cols: [I32x4; 16] =
+            std::array::from_fn(|y| load_i32x4(unsafe { scratch.as_ptr().add(y * 16 + x) }));
+        if COL_ADST {
+            inv_adst16_v_x4(&mut cols, dequant.cmin, dequant.cmax);
+        } else {
+            inv_dct16_v_x4(&mut cols, dequant.cmin, dequant.cmax);
+        }
+        for y in 0..16usize {
+            let r = cols[y].rsh::<4>(8);
+            unsafe { store_i32x4((out.as_mut_ptr() as *mut i32).add(y * 16 + x), r) };
+        }
+    }
+    unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn iadstdct_dequant_16x16_neon(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    inv16x16_mixed_dequant_neon::<false, true>(levels, dequant)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn idctadst_dequant_16x16_neon(
+    levels: &[i32; 256],
+    dequant: &IdctDequant,
+) -> [i32; 256] {
+    inv16x16_mixed_dequant_neon::<true, false>(levels, dequant)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn iadst_dequant_16x16_neon(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
+    inv16x16_mixed_dequant_neon::<true, true>(levels, dequant)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn idct_dequant_8x8_neon(levels: &[i32; 64], dequant: &IdctDequant) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
+
+    let cfm = vdupq_n_s32(cf_max);
+    let mut coeff = [0i32; 64];
+    // first group of 4: lane 0 is DC.
+    let q_dc = vsetq_lane_s32(dc_q, vdupq_n_s32(ac_q), 0);
+    let q_ac = vdupq_n_s32(ac_q);
+    unsafe {
+        let l = vld1q_s32(levels.as_ptr());
+        vst1q_s32(coeff.as_mut_ptr(), dequant4(l, q_dc, cfm));
+        let mut i = 4;
+        while i < 64 {
+            let l = vld1q_s32(levels.as_ptr().add(i));
+            vst1q_s32(coeff.as_mut_ptr().add(i), dequant4(l, q_ac, cfm));
+            i += 4;
+        }
+    }
+
+    let load = |x: usize| unsafe {
+        I32x8 {
+            lo: vld1q_s32(coeff[x * 8..].as_ptr()),
+            hi: vld1q_s32(coeff[x * 8 + 4..].as_ptr()),
+        }
+    };
+    let mut v: [I32x8; 8] = std::array::from_fn(load);
+
+    inv_dct8_v(&mut v, rmin, rmax);
+
+    let cmn = vdupq_n_s32(cmin);
+    let cmx = vdupq_n_s32(cmax);
+    for vv in v.iter_mut() {
+        *vv = vv.rsh::<1>(1).clip(cmn, cmx);
+    }
+
+    transpose_8x8(&mut v);
+    inv_dct8_v(&mut v, cmin, cmax);
+
+    let mut out = MaybeUninit::<[i32; 64]>::uninit();
+    for (y, vv) in v.iter().enumerate() {
+        let r = vv.rsh::<4>(8);
+        unsafe {
+            vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8), r.lo);
+            vst1q_s32((out.as_mut_ptr() as *mut i32).add(y * 8 + 4), r.hi);
+        }
+    }
+    unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn idct_dequant_16x16_neon(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
+    inv16x16_mixed_dequant_neon::<false, false>(levels, dequant)
+}
+
+/// Dequant 4 levels with `dq_shift = 1` (TX_32X32):
+/// `coeff = sign(lvl) * min(((|lvl|*q) & 0xff_ffff) >> 1, cf_max + (lvl<0))`.
+#[inline]
+#[target_feature(enable = "neon")]
+fn dequant4_dq1(lvl: int32x4_t, q: int32x4_t, cf_max: int32x4_t) -> int32x4_t {
+    let absl = vabsq_s32(lvl);
+    let mask = vdupq_n_s64(0xff_ffff);
+    let plo = vandq_s64(vmull_s32(vget_low_s32(absl), vget_low_s32(q)), mask);
+    let phi = vandq_s64(vmull_s32(vget_high_s32(absl), vget_high_s32(q)), mask);
+    // masked <= 0xff_ffff (non-negative) so >>1 and the narrow are exact.
+    let masked = vshrq_n_s32(vcombine_s32(vmovn_s64(plo), vmovn_s64(phi)), 1);
+    let neg1 = vreinterpretq_s32_u32(vshrq_n_u32(vreinterpretq_u32_s32(lvl), 31));
+    let cap = vaddq_s32(cf_max, neg1);
+    let mag = vminq_s32(masked, cap);
+    let neg = vnegq_s32(mag);
+    let signmask = vcltq_s32(lvl, vdupq_n_s32(0));
+    vbslq_s32(signmask, neg, mag)
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn idct_dequant_32x32_neon(levels: &[i32; 1024], dequant: &IdctDequant) -> [i32; 1024] {
     let (rmin, rmax, cmin, cmax, cf_max) = (
@@ -761,55 +1101,31 @@ pub(crate) fn idct_dequant_32x32_neon(levels: &[i32; 1024], dequant: &IdctDequan
     let cmn = vdupq_n_s32(cmin);
     let cmx = vdupq_n_s32(cmax);
 
+    // Horizontal inverse pass in four y-frequency lanes. Store a true transposed
+    // scratch: scratch[y_frequency * 32 + x_spatial].
     let mut scratch_u = MaybeUninit::<[i32; 1024]>::uninit();
-    for yg in (0..32).step_by(8) {
-        // cols[x].lane[yl] = coeff[x*32 + yg + yl]  (== tmp[(yg+yl)*32 + x] = coeff[(yg+yl)+x*32])
-        let mut cols: [I32x8; 32] = std::array::from_fn(|x| unsafe {
-            I32x8 {
-                lo: vld1q_s32(coeff.as_ptr().add(x * 32 + yg)),
-                hi: vld1q_s32(coeff.as_ptr().add(x * 32 + yg + 4)),
-            }
-        });
-        inv_dct32_v(&mut cols, rmin, rmax);
-        for (x, cv) in cols.iter().enumerate() {
-            let r = cv.rsh::<2>(2).clip(cmn, cmx);
-            unsafe {
-                let scratch_ptr = scratch_u.as_mut_ptr() as *mut i32;
-                vst1q_s32(scratch_ptr.add(x * 32 + yg), r.lo);
-                vst1q_s32(scratch_ptr.add(x * 32 + yg + 4), r.hi);
-            }
+    for y in (0..32usize).step_by(4) {
+        let mut rows: [I32x4; 32] =
+            std::array::from_fn(|x| load_i32x4(unsafe { coeff.as_ptr().add(x * 32 + y) }));
+        inv_dct32_v_x4(&mut rows, rmin, rmax);
+        for row in rows.iter_mut() {
+            *row = row.rsh::<2>(2).clip(cmn, cmx);
         }
+        store_transposed_rows_i32x4::<32>(scratch_u.as_mut_ptr().cast(), y, &rows);
     }
-
     let scratch = unsafe { scratch_u.assume_init() };
 
-    let mut out_u = MaybeUninit::<[i32; 1024]>::uninit();
-    for xg in (0..32).step_by(8) {
-        // Build rows2[y].lane[xl] = clipped[y][xg+xl] via four load8 + transpose blocks.
-        let mut rows2 = [I32x8 {
-            lo: vdupq_n_s32(0),
-            hi: vdupq_n_s32(0),
-        }; 32];
-        for yg2 in (0..32).step_by(8) {
-            // seg[v].lane[j] = scratch[(xg+v)*32 + yg2 + j] = clipped[yg2+j][xg+v]
-            let mut seg: [I32x8; 8] = std::array::from_fn(|v| unsafe {
-                I32x8 {
-                    lo: vld1q_s32(scratch.as_ptr().add((xg + v) * 32 + yg2)),
-                    hi: vld1q_s32(scratch.as_ptr().add((xg + v) * 32 + yg2 + 4)),
-                }
-            });
-            transpose_8x8(&mut seg); // seg[j].lane[v] = clipped[yg2+j][xg+v]
-            rows2[yg2..yg2 + 8].copy_from_slice(&seg);
-        }
-        inv_dct32_v(&mut rows2, cmin, cmax);
-        for (y, rv) in rows2.iter().enumerate() {
-            let r = rv.rsh::<4>(8);
+    let mut out = MaybeUninit::<[i32; 1024]>::uninit();
+    for x in (0..32usize).step_by(4) {
+        let mut cols: [I32x4; 32] =
+            std::array::from_fn(|y| load_i32x4(unsafe { scratch.as_ptr().add(y * 32 + x) }));
+        inv_dct32_v_x4(&mut cols, cmin, cmax);
+        for y in 0..32usize {
+            let r = cols[y].rsh::<4>(8);
             unsafe {
-                let out_ptr = out_u.as_mut_ptr() as *mut i32;
-                vst1q_s32(out_ptr.add(y * 32 + xg), r.lo);
-                vst1q_s32(out_ptr.add(y * 32 + xg + 4), r.hi);
+                store_i32x4((out.as_mut_ptr() as *mut i32).add(y * 32 + x), r);
             }
         }
     }
-    unsafe { out_u.assume_init() }
+    unsafe { out.assume_init() }
 }

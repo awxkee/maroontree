@@ -56,33 +56,37 @@ fn iclip(v: i32, lo: i32, hi: i32) -> i32 {
 
 /// Intra-edge reference filter strength (non-smooth branch; is_sm = false).
 fn filter_strength(wh: i32, angle: i32) -> i32 {
+    // AVM intra_edge_filter_strength type 0 (reconintra.c:958).
+    let d = angle.abs();
     if wh <= 8 {
-        if angle >= 56 {
+        if d >= 56 {
             return 1;
         }
     } else if wh <= 16 {
-        if angle >= 40 {
+        if d >= 40 {
             return 1;
         }
     } else if wh <= 24 {
-        if angle >= 32 {
+        if d >= 32 {
             return 3;
         }
-        if angle >= 16 {
+        if d >= 16 {
             return 2;
         }
-        if angle >= 8 {
+        if d >= 8 {
             return 1;
         }
     } else if wh <= 32 {
-        if angle >= 32 {
+        if d >= 32 {
             return 3;
         }
-        if angle >= 4 {
+        if d >= 4 {
             return 2;
         }
-        return 1;
-    } else {
+        if d >= 1 {
+            return 1;
+        }
+    } else if d >= 1 {
         return 3;
     }
     0
@@ -227,7 +231,7 @@ fn z3(
     let (w, h) = (bs, bs);
     let dy = DR[(270 - angle) as usize];
     let max_base_y = (w + h) as i32 - 1;
-    let mut filt = vec![0i32; 141];
+    let mut filt = [0i32; 141];
     let left_off = 1 + w + h;
     let sz = 1 + w + h;
     let str = if edge {
@@ -236,6 +240,15 @@ fn z3(
         0
     };
     if str > 0 {
+        // The decoder filters the left column together with the above-left corner:
+        // av2_filter_intra_edge_high(left_col - ab_le, n_left + ab_le + txwpx, ...) with
+        // ab_le = 1 for angle > 180 (need_above_left). In decoder order the samples are
+        // [corner, left[0], left[1], ...]; the filter leaves index 0 (corner) unchanged
+        // and filters the rest. Our `tl` buffer stores the left column in reverse with the
+        // corner at the deep end (tl[o]); filtering that reversed order with the symmetric
+        // kernel matches the decoder for the interior, but the corner must sit at the far
+        // (unfiltered) end so it plays the same boundary role. sz = 1 + w + h already
+        // includes the corner, so filter the whole span.
         filter_edge(
             &mut filt[2..],
             sz,
@@ -284,28 +297,55 @@ fn z3(
     }
 }
 
-/// z2: both-edge directional prediction (angles 90..180), port of `ipred_z2`.
-#[allow(clippy::too_many_arguments)]
-fn z2(
-    dst: &mut [i32],
-    bs: usize,
-    tl: &[i32],
-    o: usize,
-    angle: i32,
+/// Edge-filter and geometry state used by the z2 directional predictor.
+#[derive(Clone, Copy)]
+struct Z2Spec {
+    block_size: usize,
     is_luma: bool,
-    edge: bool,
+    filter_corner: bool,
+    filter_top: bool,
+    filter_left: bool,
     max_width: i32,
     max_height: i32,
-) {
+}
+
+/// z2: both-edge directional prediction (angles 90..180), port of `ipred_z2`.
+fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
+    let Z2Spec {
+        block_size: bs,
+        is_luma,
+        filter_corner,
+        filter_top,
+        filter_left,
+        max_width,
+        max_height,
+    } = *spec;
     let (w, h) = (bs, bs);
     let dy = DR[(angle - 90) as usize];
     let dx = DR[(180 - angle) as usize];
 
+    // Corner filter (decoder `filter_intra_edge_corner_high`): for z2, when the intra
+    // edge filter is enabled and w+h >= 24, the above-left sample is smoothed with a
+    // 5-6-5 kernel over [left[0], corner, above[0]] BEFORE the per-edge filters run and
+    // independent of their strengths. The smoothed corner feeds both edges.
+    let sz_t = 1 + w;
+    let sz_l = 1 + h;
+    let corner_s = if filter_corner && w + h >= 24 {
+        (tl[o - 1] * 5 + tl[o] * 6 + tl[o + 1] * 5 + 8) >> 4
+    } else {
+        tl[o]
+    };
+    let mut top_in = [0i32; 72];
+    top_in[..sz_t].copy_from_slice(&tl[o..o + sz_t]);
+    top_in[0] = corner_s;
+    let mut left_in = [0i32; 72];
+    left_in[..sz_l].copy_from_slice(&tl[o - h..o + 1]);
+    left_in[sz_l - 1] = corner_s;
+
     // top edge buffer
     let mut filt = [0i32; 72];
     let top_off = 0usize;
-    let sz_t = 1 + w;
-    let str_t = if edge {
+    let str_t = if filter_top {
         filter_strength((w + h) as i32, angle - 90)
     } else {
         0
@@ -316,13 +356,13 @@ fn z2(
             sz_t,
             1,
             sz_t as i32 + max_width - w as i32,
-            &tl[o..],
+            &top_in,
             0,
             sz_t as i32,
             str_t as usize,
         );
     } else {
-        filt[1..1 + sz_t].copy_from_slice(&tl[o..o + sz_t]);
+        filt[1..1 + sz_t].copy_from_slice(&top_in[..sz_t]);
     }
     filt[0] = filt[1];
     filt[sz_t + 1] = filt[sz_t];
@@ -330,8 +370,7 @@ fn z2(
     // left edge buffer
     let mut filt2 = [0i32; 72];
     let left_off = h + 2;
-    let sz_l = 1 + h;
-    let str_l = if edge {
+    let str_l = if filter_left {
         filter_strength((w + h) as i32, 180 - angle)
     } else {
         0
@@ -342,13 +381,13 @@ fn z2(
             sz_l,
             h as i32 - max_height,
             sz_l as i32 - 1,
-            &tl[o - h..],
+            &left_in,
             0,
             sz_l as i32,
             str_l as usize,
         );
     } else {
-        filt2[1..1 + sz_l].copy_from_slice(&tl[o - h..o + 1]);
+        filt2[1..1 + sz_l].copy_from_slice(&left_in[..sz_l]);
     }
     filt2[1 + sz_l] = filt2[sz_l];
     filt2[0] = filt2[1];
@@ -422,41 +461,43 @@ impl Dir {
     }
 }
 
-/// Directional predictor for a square `bs`x`bs` block, conformant to the
-/// decoder. `is_luma` selects 4-tap vs 2-tap interpolation; `have_top`/
-/// `have_left`/`edge_filter` gate the normative intra-edge reference filter
-/// (it applies only when both neighbors exist, mrl==0 and the seq flag is on).
-/// `max_width`/`max_height` are the available real-sample bounds for the edge
-/// filter (pass `bs` for a fully-available interior block).
-#[allow(clippy::too_many_arguments)]
+/// Geometry, angle delta and edge availability for one directional prediction.
+#[derive(Clone, Copy)]
+pub(crate) struct DirectionalSpec {
+    pub(crate) angle_delta: i32,
+    pub(crate) block_size: usize,
+    pub(crate) is_luma: bool,
+    pub(crate) have_top: bool,
+    pub(crate) have_left: bool,
+    pub(crate) edge_filter: bool,
+    pub(crate) max_width: i32,
+    pub(crate) max_height: i32,
+}
+
+/// Directional predictor for a square block, conformant to the decoder.
 pub(crate) fn directional(
     dir: Dir,
-    angle_delta: i32,
-    bs: usize,
     above: &[i32],
     left: &[i32],
     corner: i32,
-    is_luma: bool,
-    have_top: bool,
-    have_left: bool,
-    edge_filter: bool,
-    max_width: i32,
-    max_height: i32,
+    spec: &DirectionalSpec,
 ) -> Vec<f32> {
+    let DirectionalSpec {
+        angle_delta,
+        block_size: bs,
+        is_luma,
+        have_top,
+        have_left,
+        edge_filter,
+        max_width,
+        max_height,
+    } = *spec;
     let mut out = vec![0i32; bs * bs];
-    // The decoder gates the edge filter on have_top && have_left && mrl0 &&
-    // seq_edge_filter && (tw4+th4>=6); for bs>=4 the size test always holds.
-    let edge = edge_filter && have_top && have_left;
-    // Actual angle = nominal + 3*delta. Square blocks only (32x32 TUs), so no
-    // wide-angle remap. Exactly 90/180 are pure copies (VertPred/HorPred); any
-    // other angle (incl. V/H with a non-zero delta) takes the z-path.
+    // AVM filters the above edge when have_top and the left edge when have_left,
+    // independently (reconintra.c:1301-1311). z1 uses above, z3 uses left, z2 both.
     let ang = dir.angle() + angle_delta * 3;
-    // Decoder fallback (prepare_intra_edges): exactly 90/180 are pure copies,
-    // and a z1 angle (<90) with no top edge falls back to VertPred while a z3
-    // angle (>180) with no left edge falls back to HorPred. z2 (90<ang<180)
-    // always runs (it fills the missing side). Without this remap the encoder
-    // runs z1/z3 on filled refs where the decoder copies, diverging at every
-    // block that touches a tile top/left edge.
+    let edge_top = edge_filter && have_top;
+    let edge_left = edge_filter && have_left;
     let vert_copy = ang == 90 || (ang < 90 && !have_top);
     let hor_copy = ang == 180 || (ang > 180 && !have_left);
     if vert_copy {
@@ -470,13 +511,28 @@ pub(crate) fn directional(
     } else {
         let (tl, o) = edge_buffer(bs, above, left, corner);
         if ang < 90 {
-            z1(&mut out, bs, &tl, o, ang, is_luma, edge, max_width);
+            z1(&mut out, bs, &tl, o, ang, is_luma, edge_top, max_width);
         } else if ang < 180 {
+            // z2 filters each edge independently when its neighbor exists; the corner
+            // is prepared whenever the edge filter is enabled (missing physical samples
+            // were already synthesized by build_refs), matching AVM.
             z2(
-                &mut out, bs, &tl, o, ang, is_luma, edge, max_width, max_height,
+                &mut out,
+                &tl,
+                o,
+                ang,
+                &Z2Spec {
+                    block_size: bs,
+                    is_luma,
+                    filter_corner: edge_filter,
+                    filter_top: edge_top,
+                    filter_left: edge_left,
+                    max_width,
+                    max_height,
+                },
             );
         } else {
-            z3(&mut out, bs, &tl, o, ang, is_luma, edge, max_height);
+            z3(&mut out, bs, &tl, o, ang, is_luma, edge_left, max_height);
         }
     }
     out.iter().map(|&v| v as f32).collect()
@@ -502,8 +558,38 @@ mod tests {
     #[test]
     fn v_h_are_copies() {
         let (a, l, c) = refs(8, 1);
-        let v = directional(Dir::V, 0, 8, &a, &l, c, true, true, true, true, 8, 8);
-        let h = directional(Dir::H, 0, 8, &a, &l, c, true, true, true, true, 8, 8);
+        let v = directional(
+            Dir::V,
+            &a,
+            &l,
+            c,
+            &DirectionalSpec {
+                angle_delta: 0,
+                block_size: 8,
+                is_luma: true,
+                have_top: true,
+                have_left: true,
+                edge_filter: true,
+                max_width: 8,
+                max_height: 8,
+            },
+        );
+        let h = directional(
+            Dir::H,
+            &a,
+            &l,
+            c,
+            &DirectionalSpec {
+                angle_delta: 0,
+                block_size: 8,
+                is_luma: true,
+                have_top: true,
+                have_left: true,
+                edge_filter: true,
+                max_width: 8,
+                max_height: 8,
+            },
+        );
         for r in 0..8 {
             for x in 0..8 {
                 assert_eq!(v[r * 8 + x], a[x] as f32);
@@ -515,7 +601,22 @@ mod tests {
     #[test]
     fn d45_no_edge_filter_is_exact_diagonal() {
         let (a, l, c) = refs(8, 3);
-        let p = directional(Dir::D45, 0, 8, &a, &l, c, true, true, false, false, 8, 8);
+        let p = directional(
+            Dir::D45,
+            &a,
+            &l,
+            c,
+            &DirectionalSpec {
+                angle_delta: 0,
+                block_size: 8,
+                is_luma: true,
+                have_top: true,
+                have_left: false,
+                edge_filter: false,
+                max_width: 8,
+                max_height: 8,
+            },
+        );
         for r in 0..8 {
             for x in 0..8 {
                 assert_eq!(p[r * 8 + x], a[x + r + 1] as f32);

@@ -67,16 +67,6 @@ fn load4(src: &[i32], line: usize, j: usize, k: usize) -> int32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn store4(dst: &mut [i32], n: usize, j: usize, k: usize, v: int32x4_t) {
-    let base = j * n + k;
-    dst[base] = vgetq_lane_s32::<0>(v);
-    dst[base + n] = vgetq_lane_s32::<1>(v);
-    dst[base + 2 * n] = vgetq_lane_s32::<2>(v);
-    dst[base + 3 * n] = vgetq_lane_s32::<3>(v);
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn madd_n(acc: int32x4_t, v: int32x4_t, c: i32) -> int32x4_t {
     if c == 0 {
         acc
@@ -103,41 +93,92 @@ fn dot_i8<const N: usize>(
 
 #[inline]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-fn store_dot<const N: usize>(
-    dst: &mut [i32],
-    stride: usize,
-    j: usize,
-    row: usize,
+fn dot_shift<const N: usize>(
     shift: i32,
     v: &[int32x4_t; N],
     kernel: &[i8],
+    row: usize,
     width: usize,
+) -> int32x4_t {
+    round_shift(dot_i8(v, kernel, row, width), shift)
+}
+
+/// Transpose four frequency vectors whose lanes hold four adjacent transform
+/// lines. The returned vectors are complete contiguous coefficient rows.
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_4x4_i32(r: [int32x4_t; 4]) -> [int32x4_t; 4] {
+    let t0 = vtrn1q_s32(r[0], r[1]);
+    let t1 = vtrn2q_s32(r[0], r[1]);
+    let t2 = vtrn1q_s32(r[2], r[3]);
+    let t3 = vtrn2q_s32(r[2], r[3]);
+    [
+        vreinterpretq_s32_s64(vtrn1q_s64(
+            vreinterpretq_s64_s32(t0),
+            vreinterpretq_s64_s32(t2),
+        )),
+        vreinterpretq_s32_s64(vtrn1q_s64(
+            vreinterpretq_s64_s32(t1),
+            vreinterpretq_s64_s32(t3),
+        )),
+        vreinterpretq_s32_s64(vtrn2q_s64(
+            vreinterpretq_s64_s32(t0),
+            vreinterpretq_s64_s32(t2),
+        )),
+        vreinterpretq_s32_s64(vtrn2q_s64(
+            vreinterpretq_s64_s32(t1),
+            vreinterpretq_s64_s32(t3),
+        )),
+    ]
+}
+
+/// Store a complete four-line SIMD batch after a register transpose. Every
+/// write is one contiguous 128-bit store into the transposed scratch consumed
+/// by the next 1-D pass.
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_store<const N: usize>(
+    dst: &mut [i32],
+    j: usize,
+    coeff: &[int32x4_t; N],
+    valid: usize,
 ) {
-    let acc = dot_i8(v, kernel, row, width);
-    store4(dst, stride, j, row, round_shift(acc, shift));
+    debug_assert!(valid <= N && valid.is_multiple_of(4));
+    let dst = dst.as_mut_ptr();
+    for freq in (0..valid).step_by(4) {
+        let rows = transpose_4x4_i32([
+            coeff[freq],
+            coeff[freq + 1],
+            coeff[freq + 2],
+            coeff[freq + 3],
+        ]);
+        for lane in 0..4 {
+            unsafe { vst1q_s32(dst.add((j + lane) * N + freq), rows[lane]) };
+        }
+    }
 }
 
 #[target_feature(enable = "neon")]
-fn fdct4_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, j: usize) {
+fn fdct4_1d(src: &[i32], shift: i32, line: usize, j: usize) -> [int32x4_t; 4] {
     let s0 = load4(src, line, j, 0);
     let s1 = load4(src, line, j, 1);
     let s2 = load4(src, line, j, 2);
     let s3 = load4(src, line, j, 3);
-
     let a = [vaddq_s32(s0, s3), vaddq_s32(s1, s2)];
     let b = [vsubq_s32(s0, s3), vsubq_s32(s1, s2)];
-
-    store_dot(dst, 4, j, 0, shift, &a, &DCT4_FWD_KERNEL, 4);
-    store_dot(dst, 4, j, 2, shift, &a, &DCT4_FWD_KERNEL, 4);
-    store_dot(dst, 4, j, 1, shift, &b, &DCT4_FWD_KERNEL, 4);
-    store_dot(dst, 4, j, 3, shift, &b, &DCT4_FWD_KERNEL, 4);
+    let mut out = [vdupq_n_s32(0); 4];
+    out[0] = dot_shift(shift, &a, &DCT4_FWD_KERNEL, 0, 4);
+    out[2] = dot_shift(shift, &a, &DCT4_FWD_KERNEL, 2, 4);
+    out[1] = dot_shift(shift, &b, &DCT4_FWD_KERNEL, 1, 4);
+    out[3] = dot_shift(shift, &b, &DCT4_FWD_KERNEL, 3, 4);
+    out
 }
 
 #[target_feature(enable = "neon")]
-fn fdct8_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, j: usize) {
-    let mut a = [vdupq_n_s32(0); 4];
-    let mut b = [vdupq_n_s32(0); 4];
+fn fdct8_1d(src: &[i32], shift: i32, line: usize, j: usize) -> [int32x4_t; 8] {
+    let z = vdupq_n_s32(0);
+    let mut a = [z; 4];
+    let mut b = [z; 4];
     for k in 0..4 {
         let lo = load4(src, line, j, k);
         let hi = load4(src, line, j, 7 - k);
@@ -146,173 +187,173 @@ fn fdct8_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, j: usize) {
     }
     let c = [vaddq_s32(a[0], a[3]), vaddq_s32(a[1], a[2])];
     let d = [vsubq_s32(a[0], a[3]), vsubq_s32(a[1], a[2])];
-
-    store_dot(dst, 8, j, 0, shift, &c, &DCT8_FWD_KERNEL, 8);
-    store_dot(dst, 8, j, 4, shift, &c, &DCT8_FWD_KERNEL, 8);
-    store_dot(dst, 8, j, 2, shift, &d, &DCT8_FWD_KERNEL, 8);
-    store_dot(dst, 8, j, 6, shift, &d, &DCT8_FWD_KERNEL, 8);
-    let mut row = 1;
-    while row < 8 {
-        store_dot(dst, 8, j, row, shift, &b, &DCT8_FWD_KERNEL, 8);
-        row += 2;
+    let mut out = [z; 8];
+    out[0] = dot_shift(shift, &c, &DCT8_FWD_KERNEL, 0, 8);
+    out[4] = dot_shift(shift, &c, &DCT8_FWD_KERNEL, 4, 8);
+    out[2] = dot_shift(shift, &d, &DCT8_FWD_KERNEL, 2, 8);
+    out[6] = dot_shift(shift, &d, &DCT8_FWD_KERNEL, 6, 8);
+    for row in (1..8).step_by(2) {
+        out[row] = dot_shift(shift, &b, &DCT8_FWD_KERNEL, row, 8);
     }
+    out
 }
 
 #[target_feature(enable = "neon")]
-fn fdct16_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, j: usize) {
-    let mut a = [vdupq_n_s32(0); 8];
-    let mut b = [vdupq_n_s32(0); 8];
+fn fdct16_1d(src: &[i32], shift: i32, line: usize, j: usize) -> [int32x4_t; 16] {
+    let z = vdupq_n_s32(0);
+    let mut a = [z; 8];
+    let mut b = [z; 8];
     for k in 0..8 {
         let lo = load4(src, line, j, k);
         let hi = load4(src, line, j, 15 - k);
         a[k] = vaddq_s32(lo, hi);
         b[k] = vsubq_s32(lo, hi);
     }
-    let mut c = [vdupq_n_s32(0); 4];
-    let mut d = [vdupq_n_s32(0); 4];
+    let mut c = [z; 4];
+    let mut d = [z; 4];
     for k in 0..4 {
         c[k] = vaddq_s32(a[k], a[7 - k]);
         d[k] = vsubq_s32(a[k], a[7 - k]);
     }
     let e = [vaddq_s32(c[0], c[3]), vaddq_s32(c[1], c[2])];
     let f = [vsubq_s32(c[0], c[3]), vsubq_s32(c[1], c[2])];
-
-    store_dot(dst, 16, j, 0, shift, &e, &DCT16_FWD_KERNEL, 16);
-    store_dot(dst, 16, j, 8, shift, &e, &DCT16_FWD_KERNEL, 16);
-    store_dot(dst, 16, j, 4, shift, &f, &DCT16_FWD_KERNEL, 16);
-    store_dot(dst, 16, j, 12, shift, &f, &DCT16_FWD_KERNEL, 16);
-    let mut row = 2;
-    while row < 16 {
-        store_dot(dst, 16, j, row, shift, &d, &DCT16_FWD_KERNEL, 16);
-        row += 4;
+    let mut out = [z; 16];
+    out[0] = dot_shift(shift, &e, &DCT16_FWD_KERNEL, 0, 16);
+    out[8] = dot_shift(shift, &e, &DCT16_FWD_KERNEL, 8, 16);
+    out[4] = dot_shift(shift, &f, &DCT16_FWD_KERNEL, 4, 16);
+    out[12] = dot_shift(shift, &f, &DCT16_FWD_KERNEL, 12, 16);
+    for row in (2..16).step_by(4) {
+        out[row] = dot_shift(shift, &d, &DCT16_FWD_KERNEL, row, 16);
     }
-    let mut row = 1;
-    while row < 16 {
-        store_dot(dst, 16, j, row, shift, &b, &DCT16_FWD_KERNEL, 16);
-        row += 2;
+    for row in (1..16).step_by(2) {
+        out[row] = dot_shift(shift, &b, &DCT16_FWD_KERNEL, row, 16);
     }
+    out
 }
 
 #[target_feature(enable = "neon")]
-fn fdct32_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, j: usize) {
-    let mut a = [vdupq_n_s32(0); 16];
-    let mut b = [vdupq_n_s32(0); 16];
+fn fdct32_1d(src: &[i32], shift: i32, line: usize, j: usize) -> [int32x4_t; 32] {
+    let z = vdupq_n_s32(0);
+    let mut a = [z; 16];
+    let mut b = [z; 16];
     for k in 0..16 {
         let lo = load4(src, line, j, k);
         let hi = load4(src, line, j, 31 - k);
         a[k] = vaddq_s32(lo, hi);
         b[k] = vsubq_s32(lo, hi);
     }
-    let mut c = [vdupq_n_s32(0); 8];
-    let mut d = [vdupq_n_s32(0); 8];
+    let mut c = [z; 8];
+    let mut d = [z; 8];
     for k in 0..8 {
         c[k] = vaddq_s32(a[k], a[15 - k]);
         d[k] = vsubq_s32(a[k], a[15 - k]);
     }
-    let mut e = [vdupq_n_s32(0); 4];
-    let mut f = [vdupq_n_s32(0); 4];
+    let mut e = [z; 4];
+    let mut f = [z; 4];
     for k in 0..4 {
         e[k] = vaddq_s32(c[k], c[7 - k]);
         f[k] = vsubq_s32(c[k], c[7 - k]);
     }
     let g = [vaddq_s32(e[0], e[3]), vaddq_s32(e[1], e[2])];
     let h = [vsubq_s32(e[0], e[3]), vsubq_s32(e[1], e[2])];
-
-    store_dot(dst, 32, j, 0, shift, &g, &DCT32_FWD_KERNEL, 32);
-    store_dot(dst, 32, j, 16, shift, &g, &DCT32_FWD_KERNEL, 32);
-    store_dot(dst, 32, j, 8, shift, &h, &DCT32_FWD_KERNEL, 32);
-    store_dot(dst, 32, j, 24, shift, &h, &DCT32_FWD_KERNEL, 32);
-    let mut row = 4;
-    while row < 32 {
-        store_dot(dst, 32, j, row, shift, &f, &DCT32_FWD_KERNEL, 32);
-        row += 8;
+    let mut out = [z; 32];
+    out[0] = dot_shift(shift, &g, &DCT32_FWD_KERNEL, 0, 32);
+    out[16] = dot_shift(shift, &g, &DCT32_FWD_KERNEL, 16, 32);
+    out[8] = dot_shift(shift, &h, &DCT32_FWD_KERNEL, 8, 32);
+    out[24] = dot_shift(shift, &h, &DCT32_FWD_KERNEL, 24, 32);
+    for row in (4..32).step_by(8) {
+        out[row] = dot_shift(shift, &f, &DCT32_FWD_KERNEL, row, 32);
     }
-    let mut row = 2;
-    while row < 32 {
-        store_dot(dst, 32, j, row, shift, &d, &DCT32_FWD_KERNEL, 32);
-        row += 4;
+    for row in (2..32).step_by(4) {
+        out[row] = dot_shift(shift, &d, &DCT32_FWD_KERNEL, row, 32);
     }
-    let mut row = 1;
-    while row < 32 {
-        store_dot(dst, 32, j, row, shift, &b, &DCT32_FWD_KERNEL, 32);
-        row += 2;
+    for row in (1..32).step_by(2) {
+        out[row] = dot_shift(shift, &b, &DCT32_FWD_KERNEL, row, 32);
     }
+    out
 }
 
 #[target_feature(enable = "neon")]
-fn fdct64_1d_4(src: &[i32], dst: &mut [i32], shift: i32, line: usize, zero_line: usize, j: usize) {
+fn fdct64_1d(src: &[i32], shift: i32, line: usize, zero_line: usize, j: usize) -> [int32x4_t; 64] {
     let top = if zero_line != 0 { 32 } else { 64 };
-    let mut a = [vdupq_n_s32(0); 32];
-    let mut b = [vdupq_n_s32(0); 32];
+    let z = vdupq_n_s32(0);
+    let mut a = [z; 32];
+    let mut b = [z; 32];
     for k in 0..32 {
         let lo = load4(src, line, j, k);
         let hi = load4(src, line, j, 63 - k);
         a[k] = vaddq_s32(lo, hi);
         b[k] = vsubq_s32(lo, hi);
     }
-    let mut c = [vdupq_n_s32(0); 16];
-    let mut d = [vdupq_n_s32(0); 16];
+    let mut c = [z; 16];
+    let mut d = [z; 16];
     for k in 0..16 {
         c[k] = vaddq_s32(a[k], a[31 - k]);
         d[k] = vsubq_s32(a[k], a[31 - k]);
     }
-    let mut e = [vdupq_n_s32(0); 8];
-    let mut f = [vdupq_n_s32(0); 8];
+    let mut e = [z; 8];
+    let mut f = [z; 8];
     for k in 0..8 {
         e[k] = vaddq_s32(c[k], c[15 - k]);
         f[k] = vsubq_s32(c[k], c[15 - k]);
     }
-    let mut g = [vdupq_n_s32(0); 4];
-    let mut h = [vdupq_n_s32(0); 4];
+    let mut g = [z; 4];
+    let mut h = [z; 4];
     for k in 0..4 {
         g[k] = vaddq_s32(e[k], e[7 - k]);
         h[k] = vsubq_s32(e[k], e[7 - k]);
     }
     let i0 = [vaddq_s32(g[0], g[3]), vaddq_s32(g[1], g[2])];
     let u0 = [vsubq_s32(g[0], g[3]), vsubq_s32(g[1], g[2])];
-
-    store_dot(dst, 64, j, 0, shift, &i0, &DCT64_FWD_KERNEL, 64);
-    store_dot(dst, 64, j, 16, shift, &u0, &DCT64_FWD_KERNEL, 64);
+    let mut out = [z; 64];
+    out[0] = dot_shift(shift, &i0, &DCT64_FWD_KERNEL, 0, 64);
+    out[16] = dot_shift(shift, &u0, &DCT64_FWD_KERNEL, 16, 64);
     if top == 64 {
-        store_dot(dst, 64, j, 32, shift, &i0, &DCT64_FWD_KERNEL, 64);
-        store_dot(dst, 64, j, 48, shift, &u0, &DCT64_FWD_KERNEL, 64);
+        out[32] = dot_shift(shift, &i0, &DCT64_FWD_KERNEL, 32, 64);
+        out[48] = dot_shift(shift, &u0, &DCT64_FWD_KERNEL, 48, 64);
     }
-    let mut row = 8;
-    while row < top {
-        store_dot(dst, 64, j, row, shift, &h, &DCT64_FWD_KERNEL, 64);
-        row += 16;
+    for row in (8..top).step_by(16) {
+        out[row] = dot_shift(shift, &h, &DCT64_FWD_KERNEL, row, 64);
     }
-    let mut row = 4;
-    while row < top {
-        store_dot(dst, 64, j, row, shift, &f, &DCT64_FWD_KERNEL, 64);
-        row += 8;
+    for row in (4..top).step_by(8) {
+        out[row] = dot_shift(shift, &f, &DCT64_FWD_KERNEL, row, 64);
     }
-    let mut row = 2;
-    while row < top {
-        store_dot(dst, 64, j, row, shift, &d, &DCT64_FWD_KERNEL, 64);
-        row += 4;
+    for row in (2..top).step_by(4) {
+        out[row] = dot_shift(shift, &d, &DCT64_FWD_KERNEL, row, 64);
     }
-    let mut row = 1;
-    while row < top {
-        store_dot(dst, 64, j, row, shift, &b, &DCT64_FWD_KERNEL, 64);
-        row += 2;
+    for row in (1..top).step_by(2) {
+        out[row] = dot_shift(shift, &b, &DCT64_FWD_KERNEL, row, 64);
+    }
+    out
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn fdct_batch(
+    n: usize,
+    src: &[i32],
+    dst: &mut [i32],
+    shift: i32,
+    line: usize,
+    zero: usize,
+    j: usize,
+) {
+    let valid = if n == 64 && zero != 0 { 32 } else { n };
+    match n {
+        4 => transpose_store(dst, j, &fdct4_1d(src, shift, line, j), valid),
+        8 => transpose_store(dst, j, &fdct8_1d(src, shift, line, j), valid),
+        16 => transpose_store(dst, j, &fdct16_1d(src, shift, line, j), valid),
+        32 => transpose_store(dst, j, &fdct32_1d(src, shift, line, j), valid),
+        64 => transpose_store(dst, j, &fdct64_1d(src, shift, line, zero, j), valid),
+        _ => unreachable!("unsupported 1D size {n}"),
     }
 }
 
 #[target_feature(enable = "neon")]
 fn fdct_1d_n(n: usize, src: &[i32], dst: &mut [i32], shift: i32, line: usize, zero: usize) {
     debug_assert!(line.is_multiple_of(4));
-    let mut j = 0usize;
-    while j + 4 <= line {
-        match n {
-            4 => fdct4_1d_4(src, dst, shift, line, j),
-            8 => fdct8_1d_4(src, dst, shift, line, j),
-            16 => fdct16_1d_4(src, dst, shift, line, j),
-            32 => fdct32_1d_4(src, dst, shift, line, j),
-            64 => fdct64_1d_4(src, dst, shift, line, zero, j),
-            _ => unreachable!("unsupported 1D size {n}"),
-        }
-        j += 4;
+    for j in (0..line).step_by(4) {
+        fdct_batch(n, src, dst, shift, line, zero, j);
     }
 }
 
@@ -347,10 +388,11 @@ pub(crate) fn fdct_rect_neon(resid: &[i32], w: usize, h: usize, out: &mut [i32])
         let s = &mut *cell.borrow_mut();
         fdct_1d_n(h, resid, &mut s.buf[..w * h], s1, w, zh);
         fdct_1d_n(w, &s.buf[..w * h], &mut s.coeff[..w * h], s2, h, zw);
-        for vf in 0..ch {
-            let src = &s.coeff[vf * w..vf * w + cw];
-            let dst = &mut out[vf * cw..vf * cw + cw];
-            dst.copy_from_slice(src);
+        for (dst_row, src_row) in out[..cw * ch]
+            .chunks_exact_mut(cw)
+            .zip(s.coeff.chunks_exact(w).take(ch))
+        {
+            dst_row.copy_from_slice(&src_row[..cw]);
         }
     });
 

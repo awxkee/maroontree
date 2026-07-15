@@ -40,16 +40,58 @@ struct I32x8 {
     hi: int32x4_t,
 }
 
-impl I32x8 {
+#[derive(Clone, Copy)]
+struct I32x4(int32x4_t);
+
+impl I32x4 {
     #[inline]
     #[target_feature(enable = "neon")]
-    fn zero() -> Self {
-        Self {
-            lo: vdupq_n_s32(0),
-            hi: vdupq_n_s32(0),
-        }
+    fn add(self, rhs: I32x4) -> I32x4 {
+        I32x4(vaddq_s32(self.0, rhs.0))
     }
 
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn sub(self, rhs: I32x4) -> I32x4 {
+        I32x4(vsubq_s32(self.0, rhs.0))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn muls_q16(self, coeff: i32) -> I32x4 {
+        let c = vdup_n_s32(coeff);
+        I32x4(vcombine_s32(
+            vshrn_n_s64(vmull_s32(vget_low_s32(self.0), c), 16),
+            vshrn_n_s64(vmull_s32(vget_high_s32(self.0), c), 16),
+        ))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn fma_sqrt2(self, b: I32x4) -> I32x4 {
+        self.muls_q16(SQRT2).add(b)
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shr<const N: i32>(self) -> I32x4 {
+        I32x4(vshrq_n_s32(self.0, N))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shl<const N: i32>(self) -> I32x4 {
+        I32x4(vshlq_n_s32(self.0, N))
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn shr_round<const N: i32>(self) -> I32x4 {
+        I32x4(vrshrq_n_s32(self.0, N))
+    }
+}
+
+impl I32x8 {
     #[inline]
     #[target_feature(enable = "neon")]
     fn add(self, rhs: I32x8) -> I32x8 {
@@ -77,12 +119,12 @@ impl I32x8 {
         let c = vdup_n_s32(coeff);
         I32x8 {
             lo: vcombine_s32(
-                vshrn_n_s64(vmull_s32(vget_low_s32(self.lo), c), 16),
-                vshrn_n_s64(vmull_s32(vget_high_s32(self.lo), c), 16),
+                vshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.lo), c)),
+                vshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.lo), c)),
             ),
             hi: vcombine_s32(
-                vshrn_n_s64(vmull_s32(vget_low_s32(self.hi), c), 16),
-                vshrn_n_s64(vmull_s32(vget_high_s32(self.hi), c), 16),
+                vshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.hi), c)),
+                vshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.hi), c)),
             ),
         }
     }
@@ -92,39 +134,6 @@ impl I32x8 {
     #[target_feature(enable = "neon")]
     fn fma_sqrt2(self, b: I32x8) -> I32x8 {
         self.muls_q16(SQRT2).add(b)
-    }
-
-    /// Arithmetic right shift by N (normalize / quantize step).
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn shr<const N: i32>(self) -> I32x8 {
-        I32x8 {
-            lo: vshrq_n_s32(self.lo, N),
-            hi: vshrq_n_s32(self.hi, N),
-        }
-    }
-
-    /// Logical/arithmetic left shift by N (add headroom bits before the DCT
-    /// butterflies so the per-stage `muls_q16` truncation is relatively smaller).
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn shl<const N: i32>(self) -> I32x8 {
-        I32x8 {
-            lo: vshlq_n_s32(self.lo, N),
-            hi: vshlq_n_s32(self.hi, N),
-        }
-    }
-
-    /// Rounding arithmetic right shift by N (round-to-nearest, ties toward +inf —
-    /// matches the scalar `(x + (1<<(N-1))) >> N`). Used to drop the headroom in
-    /// the final normalization without the bias of a truncating shift.
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn shr_round<const N: i32>(self) -> I32x8 {
-        I32x8 {
-            lo: vrshrq_n_s32(self.lo, N),
-            hi: vrshrq_n_s32(self.hi, N),
-        }
     }
 }
 
@@ -235,7 +244,61 @@ fn dct1d_8_v_i32(c: &mut [I32x8; 8]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn dct1d_16_v_i32(c: &mut [I32x8; 16]) {
+fn dct1d_4_v4_i32(c: &mut [I32x4; 4]) {
+    let t0 = c[0].add(c[3]);
+    let t1 = c[1].add(c[2]);
+    let sum = t0.add(t1);
+    let diff = t0.sub(t1);
+
+    let t2 = c[0].sub(c[3]).muls_q16(WC4_0);
+    let t3 = c[1].sub(c[2]).muls_q16(WC4_1);
+    let t2p = t2.add(t3);
+    let t3p = t2.sub(t3);
+    let t2pp = t2p.fma_sqrt2(t3p);
+
+    c[0] = sum;
+    c[1] = t2pp;
+    c[2] = diff;
+    c[3] = t3p;
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_8_v4_i32(c: &mut [I32x4; 8]) {
+    let mut evens = [
+        c[0].add(c[7]),
+        c[1].add(c[6]),
+        c[2].add(c[5]),
+        c[3].add(c[4]),
+    ];
+    dct1d_4_v4_i32(&mut evens);
+
+    let mut odds = [
+        c[0].sub(c[7]).muls_q16(WC8_0),
+        c[1].sub(c[6]).muls_q16(WC8_1),
+        c[2].sub(c[5]).muls_q16(WC8_2),
+        c[3].sub(c[4]).muls_q16(WC8_3),
+    ];
+    dct1d_4_v4_i32(&mut odds);
+
+    // Post-butterfly odd-half combine — mirrors scalar exactly
+    odds[0] = odds[0].fma_sqrt2(odds[1]); // odds[0]*SQRT2 + odds[1]
+    odds[1] = odds[1].add(odds[2]);
+    odds[2] = odds[2].add(odds[3]);
+
+    c[0] = evens[0];
+    c[1] = odds[0];
+    c[2] = evens[1];
+    c[3] = odds[1];
+    c[4] = evens[2];
+    c[5] = odds[2];
+    c[6] = evens[3];
+    c[7] = odds[3];
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_16_v4_i32(c: &mut [I32x4; 16]) {
     let mut evens = [
         c[0].add(c[15]),
         c[1].add(c[14]),
@@ -257,8 +320,8 @@ fn dct1d_16_v_i32(c: &mut [I32x8; 16]) {
         c[7].sub(c[8]).muls_q16(WC16_7),
     ];
 
-    dct1d_8_v_i32(&mut evens);
-    dct1d_8_v_i32(&mut odds);
+    dct1d_8_v4_i32(&mut evens);
+    dct1d_8_v4_i32(&mut odds);
 
     odds[0] = odds[0].fma_sqrt2(odds[1]);
     odds[1] = odds[1].add(odds[2]);
@@ -288,22 +351,92 @@ fn dct1d_16_v_i32(c: &mut [I32x8; 16]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load8_i32(ptr: &[i32], stride: usize) -> [I32x8; 8] {
-    unsafe {
-        let row = |y: usize| {
-            let p = ptr.get_unchecked(y * stride..);
-            I32x8 {
-                lo: vld1q_s32(p.as_ptr()),
-                hi: vld1q_s32(p.get_unchecked(4..).as_ptr()),
-            }
-        };
-        std::array::from_fn(row)
+fn dct1d_32_v4_i32(c: &mut [I32x4; 32]) {
+    let mut evens = std::array::from_fn::<I32x4, 16, _>(|i| c[i].add(c[31 - i]));
+    let mut odds = std::array::from_fn::<I32x4, 16, _>(|i| c[i].sub(c[31 - i]));
+
+    dct1d_16_v4_i32(&mut evens);
+
+    for i in 0..16 {
+        odds[i] = odds[i].muls_q16(WC32[i]);
+    }
+    dct1d_16_v4_i32(&mut odds);
+
+    odds[0] = odds[0].fma_sqrt2(odds[1]);
+    odds[1] = odds[1].add(odds[2]);
+    odds[2] = odds[2].add(odds[3]);
+    odds[3] = odds[3].add(odds[4]);
+    odds[4] = odds[4].add(odds[5]);
+    odds[5] = odds[5].add(odds[6]);
+    odds[6] = odds[6].add(odds[7]);
+    odds[7] = odds[7].add(odds[8]);
+    odds[8] = odds[8].add(odds[9]);
+    odds[9] = odds[9].add(odds[10]);
+    odds[10] = odds[10].add(odds[11]);
+    odds[11] = odds[11].add(odds[12]);
+    odds[12] = odds[12].add(odds[13]);
+    odds[13] = odds[13].add(odds[14]);
+    odds[14] = odds[14].add(odds[15]);
+
+    for i in 0..16 {
+        c[2 * i] = evens[i];
+        c[2 * i + 1] = odds[i];
     }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load16_i32(ptr: &[i32], stride: usize) -> [I32x8; 16] {
+fn load_n_i32x4<const N: usize>(ptr: &[i32], stride: usize) -> [I32x4; N] {
+    unsafe {
+        std::array::from_fn(|y| {
+            let p = ptr.get_unchecked(y * stride..).as_ptr();
+            I32x4(vld1q_s32(p))
+        })
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_i32x4(ptr: *const i32) -> I32x4 {
+    unsafe { I32x4(vld1q_s32(ptr)) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_i32x4(dst: *mut i32, v: I32x4) {
+    unsafe {
+        vst1q_s32(dst, v.0);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn transpose_store_4x4_i32(dst: *mut i32, stride: usize, tile: &mut [I32x4; 4]) {
+    let (r0, r1, r2, r3) = transpose_4x4_i32(tile[0].0, tile[1].0, tile[2].0, tile[3].0);
+    unsafe {
+        vst1q_s32(dst, r0);
+        vst1q_s32(dst.add(stride), r1);
+        vst1q_s32(dst.add(2 * stride), r2);
+        vst1q_s32(dst.add(3 * stride), r3);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_transposed_cols_i32x4<const N: usize>(dst: *mut i32, x: usize, c: &[I32x4; N]) {
+    debug_assert!(N.is_multiple_of(4));
+    let stride = N;
+    let mut v = 0usize;
+    while v < N {
+        let mut tile = [c[v], c[v + 1], c[v + 2], c[v + 3]];
+        transpose_store_4x4_i32(unsafe { dst.add(x * N + v) }, stride, &mut tile);
+        v += 4;
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load8_i32(ptr: &[i32], stride: usize) -> [I32x8; 8] {
     unsafe {
         let row = |y: usize| {
             let p = ptr.get_unchecked(y * stride..);
@@ -349,70 +482,234 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     }
 }
 
+#[inline]
 #[target_feature(enable = "neon")]
-pub(crate) fn dct8x8_neon_coeffs(input: &[i32; 64]) -> [i32; 64] {
+fn quant_q16_half_i64(prod: int64x2_t) -> int32x2_t {
+    let zero64 = vdupq_n_s64(0);
+    let mag = vabsq_s64(prod);
+    let active = vcgtq_s64(mag, vdupq_n_s64(65535));
+    let lvl = vshrq_n_s64::<16>(vaddq_s64(mag, vdupq_n_s64(32768)));
+    let neg = vnegq_s64(lvl);
+    let signed = vbslq_s64(vcltq_s64(prod, zero64), neg, lvl);
+    vmovn_s64(vbslq_s64(active, signed, zero64))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn quant_q16_vec_i32(v: int32x4_t, q: int32x4_t) -> int32x4_t {
+    vcombine_s32(
+        quant_q16_half_i64(vmull_s32(vget_low_s32(v), vget_low_s32(q))),
+        quant_q16_half_i64(vmull_s32(vget_high_s32(v), vget_high_s32(q))),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_quant_target_i32x4(
+    cf: *mut i32,
+    tf: *mut f32,
+    coeff: I32x4,
+    base: usize,
+    dc_q: i32,
+    ac_q: i32,
+) {
+    let q = if base == 0 {
+        vsetq_lane_s32::<0>(dc_q, vdupq_n_s32(ac_q))
+    } else {
+        vdupq_n_s32(ac_q)
+    };
+    let levels = quant_q16_vec_i32(coeff.0, q);
+    let target = vmulq_f32(
+        vmulq_f32(vcvtq_f32_s32(coeff.0), vcvtq_f32_s32(q)),
+        vdupq_n_f32(1.0 / 65536.0),
+    );
+    unsafe {
+        vst1q_s32(cf.add(base), levels);
+        vst1q_f32(tf.add(base), target);
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x8_neon_quant_t(
+    input: &[i32; 64],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 64], [f32; 64]) {
     let mut cols = load8_i32(input, 8);
     dct1d_8_v_i32(&mut cols);
     transpose_8x8_i32(&mut cols);
     dct1d_8_v_i32(&mut cols);
-    // cols[u].lane[j] = coeff(horiz=u, vert=j) -> out[horiz*8 + vert].
-    let mut out = MaybeUninit::<[i32; 64]>::uninit();
-    for (k, col) in cols.iter().enumerate() {
-        unsafe {
-            let dst_ptr = out.as_mut_ptr() as *mut i32;
-            vst1q_s32(dst_ptr.add(k * 8), col.lo);
-            vst1q_s32(dst_ptr.add(k * 8 + 4), col.hi);
+
+    let mut cf = MaybeUninit::<[i32; 64]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 64]>::uninit();
+    for (k, col) in cols.iter().copied().enumerate() {
+        store_quant_target_i32x4(
+            cf.as_mut_ptr().cast(),
+            tf.as_mut_ptr().cast(),
+            I32x4(col.lo),
+            k * 8,
+            dc_q,
+            ac_q,
+        );
+        store_quant_target_i32x4(
+            cf.as_mut_ptr().cast(),
+            tf.as_mut_ptr().cast(),
+            I32x4(col.hi),
+            k * 8 + 4,
+            dc_q,
+            ac_q,
+        );
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
+    // Stage 1: vertical DCT-16 in four-column groups. Store a real transposed
+    // scratch: tmp[x * 16 + vertical_frequency].
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(4) {
+        let mut cols = load_n_i32x4::<16>(&input[x..], 16);
+        dct1d_16_v4_i32(&mut cols);
+        store_transposed_cols_i32x4::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    // Stage 2: horizontal DCT-16 in four vertical-frequency lanes.
+    let mut out = MaybeUninit::<[i32; 256]>::uninit();
+    for y in (0..16usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        dct1d_16_v4_i32(&mut rows);
+        for u in 0..16usize {
+            let n = rows[u].shr::<1>();
+            unsafe {
+                store_i32x4((out.as_mut_ptr() as *mut i32).add(u * 16 + y), n);
+            }
         }
     }
     unsafe { out.assume_init() }
 }
 
+#[inline]
 #[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    unsafe {
-        let mut c_l = load16_i32(input, 16);
-        let mut c_r = load16_i32(&input[8..], 16);
-
-        dct1d_16_v_i32(&mut c_l);
-        dct1d_16_v_i32(&mut c_r);
-
-        // Split into row-frequency groups 0..8 and 8..16, then transpose each
-        let mut top_l: [I32x8; 8] = c_l[..8].try_into().unwrap();
-        let mut bot_l: [I32x8; 8] = c_l[8..16].try_into().unwrap();
-        let mut top_r: [I32x8; 8] = c_r[0..8].try_into().unwrap();
-        let mut bot_r: [I32x8; 8] = c_r[8..16].try_into().unwrap();
-
-        transpose_8x8_i32(&mut top_l);
-        transpose_8x8_i32(&mut bot_l);
-        transpose_8x8_i32(&mut top_r);
-        transpose_8x8_i32(&mut bot_r);
-
-        let mut d_a = [I32x8::zero(); 16];
-        let mut d_b = [I32x8::zero(); 16];
-        d_a[0..8].copy_from_slice(&top_l);
-        d_a[8..16].copy_from_slice(&top_r);
-        d_b[0..8].copy_from_slice(&bot_l);
-        d_b[8..16].copy_from_slice(&bot_r);
-
-        // Row-wise DCT-16
-        dct1d_16_v_i32(&mut d_a);
-        dct1d_16_v_i32(&mut d_b);
-
-        let mut out = MaybeUninit::<[i32; 256]>::uninit();
-        for u in 0..16usize {
-            // Normalize the integer DCT-16 gain (sqrt(16) per pass -> 16x) to the
-            // orthonormal*8 scale by 1/2; matches scalar `mul_q16(_, 32768)`.
-            let na = d_a[u].shr::<1>();
-            let nb = d_b[u].shr::<1>();
-            let dst_ptr = out.as_mut_ptr() as *mut i32;
-            let base = dst_ptr.add(u * 16);
-            vst1q_s32(base, na.lo);
-            vst1q_s32(base.add(4), na.hi);
-            vst1q_s32(base.add(8), nb.lo);
-            vst1q_s32(base.add(12), nb.hi);
+fn adst1d_16_v4_i32(c: &mut [I32x4; 16]) {
+    let mut out = [I32x4(vdupq_n_s32(0)); 16];
+    for o in 0..16usize {
+        let mut lo = vdupq_n_s64(2048);
+        let mut hi = vdupq_n_s64(2048);
+        for j in 0..16usize {
+            let k = vdup_n_s32(crate::dct::ADST16_FWD_Q12[o][j] as i32);
+            lo = vmlal_s32(lo, vget_low_s32(c[j].0), k);
+            hi = vmlal_s32(hi, vget_high_s32(c[j].0), k);
         }
-        out.assume_init()
+        out[o] = I32x4(vcombine_s32(vshrn_n_s64::<12>(lo), vshrn_n_s64::<12>(hi)));
     }
+    *c = out;
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn tx16x16_adst_dct_neon_quant_t<const COL_ADST: bool, const ROW_ADST: bool>(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(4) {
+        let mut cols = load_n_i32x4::<16>(&input[x..], 16);
+        if COL_ADST {
+            adst1d_16_v4_i32(&mut cols);
+        } else {
+            dct1d_16_v4_i32(&mut cols);
+        }
+        store_transposed_cols_i32x4::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 256]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 256]>::uninit();
+    for y in (0..16usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        if ROW_ADST {
+            adst1d_16_v4_i32(&mut rows);
+        } else {
+            dct1d_16_v4_i32(&mut rows);
+        }
+        for u in 0..16usize {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr::<1>(),
+                u * 16 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn adst16x16_neon_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_neon_quant_t::<true, true>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn adstdct16x16_neon_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_neon_quant_t::<true, false>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dctadst16x16_neon_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    tx16x16_adst_dct_neon_quant_t::<false, true>(input, dc_q, ac_q)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x16_neon_quant_t(
+    input: &[i32; 256],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 256], [f32; 256]) {
+    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
+    for x in (0..16usize).step_by(4) {
+        let mut cols = load_n_i32x4::<16>(&input[x..], 16);
+        dct1d_16_v4_i32(&mut cols);
+        store_transposed_cols_i32x4::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 256]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 256]>::uninit();
+    for y in (0..16usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 16 + y) }));
+        dct1d_16_v4_i32(&mut rows);
+        for u in 0..16usize {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr::<1>(),
+                u * 16 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[target_feature(enable = "neon")]
@@ -421,124 +718,72 @@ pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
     quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn dct1d_32_v_i32(c: &mut [I32x8; 32]) {
-    let mut evens = std::array::from_fn::<I32x8, 16, _>(|i| c[i].add(c[31 - i]));
-    let mut odds = std::array::from_fn::<I32x8, 16, _>(|i| c[i].sub(c[31 - i]));
-
-    dct1d_16_v_i32(&mut evens);
-
-    // Scale lane-by-lane using the scalar WC32 coefficients.
-    // Each I32x8 holds the same logical element across 8 independent columns,
-    // so the coefficient is scalar (same for all 8 lanes).
-    for i in 0..16 {
-        odds[i] = odds[i].muls_q16(WC32[i]);
-    }
-    dct1d_16_v_i32(&mut odds);
-
-    odds[0] = odds[0].fma_sqrt2(odds[1]);
-    odds[1] = odds[1].add(odds[2]);
-    odds[2] = odds[2].add(odds[3]);
-    odds[3] = odds[3].add(odds[4]);
-    odds[4] = odds[4].add(odds[5]);
-    odds[5] = odds[5].add(odds[6]);
-    odds[6] = odds[6].add(odds[7]);
-    odds[7] = odds[7].add(odds[8]);
-    odds[8] = odds[8].add(odds[9]);
-    odds[9] = odds[9].add(odds[10]);
-    odds[10] = odds[10].add(odds[11]);
-    odds[11] = odds[11].add(odds[12]);
-    odds[12] = odds[12].add(odds[13]);
-    odds[13] = odds[13].add(odds[14]);
-    odds[14] = odds[14].add(odds[15]);
-
-    for i in 0..16 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
-    }
-}
-
-/// Load 32 rows × 8 cols (left or right half) with given column stride.
-#[inline]
-#[target_feature(enable = "neon")]
-fn load32_i32(ptr: &[i32], stride: usize) -> [I32x8; 32] {
-    unsafe {
-        std::array::from_fn(|y| {
-            let p = &ptr[y * stride..];
-            I32x8 {
-                lo: vld1q_s32(p.as_ptr()),
-                hi: vld1q_s32(p[4..].as_ptr()),
-            }
-        })
-    }
-}
-
-/// Forward 2-D integer DCT-32 (NEON) -> normalized coefficients `out[u*32+v]`
-/// (DC at index 0), pre-quantization. Mirrors scalar `dct32x32_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x32_neon_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
+    // Stage 1: vertical DCT-32 in four-column groups. Store a true transposed
+    // scratch: tmp[x * 32 + vertical_frequency].
     let mut tmp_u = MaybeUninit::<[i32; 1024]>::uninit();
-
-    for group in 0..4usize {
-        let col_start = group * 8;
-        let mut cols = load32_i32(&input[col_start..], 32);
-        // B=6 headroom bits before the butterflies (mirrors scalar dct32x32_coeffs):
-        // keeps the per-stage muls_q16 truncation 2^B times smaller than the signal,
-        // removing the round-trip floor. Dropped (with rounding) in the final norm.
+    for x in (0..32usize).step_by(4) {
+        let mut cols = load_n_i32x4::<32>(&input[x..], 32);
         for c in cols.iter_mut() {
             *c = c.shl::<6>();
         }
-        dct1d_32_v_i32(&mut cols);
-        for v in 0..32usize {
-            let dst_ptr = tmp_u.as_mut_ptr() as *mut i32;
-            let base = unsafe { dst_ptr.add(v * 32 + col_start) };
-            unsafe {
-                vst1q_s32(base, cols[v].lo);
-                vst1q_s32(base.add(4), cols[v].hi);
-            }
-        }
+        dct1d_32_v4_i32(&mut cols);
+        store_transposed_cols_i32x4::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
     }
-
     let tmp = unsafe { tmp_u.assume_init() };
 
+    // Stage 2: horizontal DCT-32 with contiguous loads from transposed scratch.
     let mut out = MaybeUninit::<[i32; 1024]>::uninit();
-    for group in 0..4usize {
-        let row_start = group * 8;
-        let base_off = row_start * 32;
-
-        let mut seg_a = load8_i32(&tmp[base_off..], 32);
-        let mut seg_b = load8_i32(&tmp[base_off + 8..], 32);
-        let mut seg_c = load8_i32(&tmp[base_off + 16..], 32);
-        let mut seg_d = load8_i32(&tmp[base_off + 24..], 32);
-
-        transpose_8x8_i32(&mut seg_a);
-        transpose_8x8_i32(&mut seg_b);
-        transpose_8x8_i32(&mut seg_c);
-        transpose_8x8_i32(&mut seg_d);
-
-        let mut rows = [I32x8::zero(); 32];
-        rows[..8].copy_from_slice(&seg_a);
-        rows[8..16].copy_from_slice(&seg_b);
-        rows[16..24].copy_from_slice(&seg_c);
-        rows[24..32].copy_from_slice(&seg_d);
-
-        dct1d_32_v_i32(&mut rows);
-
-        // rows[u].lane[y] = coeff(horiz=u, vert=row_start+y) -> out[u*32 + row].
-        // Normalize the integer DCT-32 gain (32x) to orthonormal*8 by 1/4 AND drop
-        // the B=6 headroom bits, with round-to-nearest (2 + B = 8). Matches scalar.
+    for y in (0..32usize).step_by(4) {
+        let mut rows: [I32x4; 32] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 32 + y) }));
+        dct1d_32_v4_i32(&mut rows);
         for u in 0..32usize {
             let n = rows[u].shr_round::<8>();
             unsafe {
-                let dst_ptr = out.as_mut_ptr() as *mut i32;
-                let base = dst_ptr.add(u * 32 + row_start);
-                vst1q_s32(base, n.lo);
-                vst1q_s32(base.add(4), n.hi);
+                store_i32x4((out.as_mut_ptr() as *mut i32).add(u * 32 + y), n);
             }
         }
     }
     unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x32_neon_quant_t(
+    input: &[i32; 1024],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 1024], [f32; 1024]) {
+    let mut tmp_u = MaybeUninit::<[i32; 1024]>::uninit();
+    for x in (0..32usize).step_by(4) {
+        let mut cols = load_n_i32x4::<32>(&input[x..], 32);
+        for c in cols.iter_mut() {
+            *c = c.shl::<6>();
+        }
+        dct1d_32_v4_i32(&mut cols);
+        store_transposed_cols_i32x4::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 1024]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 1024]>::uninit();
+    for y in (0..32usize).step_by(4) {
+        let mut rows: [I32x4; 32] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 32 + y) }));
+        dct1d_32_v4_i32(&mut rows);
+        for u in 0..32usize {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[u].shr_round::<8>(),
+                u * 32 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[target_feature(enable = "neon")]
@@ -552,37 +797,121 @@ pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
 /// pre-quantization. Mirrors scalar `dct8x16_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
-    let mut rows = load16_i32(input, 8); // rows[r].lane[c] = input[r*8 + c]
-    dct1d_16_v_i32(&mut rows); // rows[fy].lane[c] = vertical DCT-16 freq fy, col c
+    // Stage 1: vertical DCT-16 in two 4-column groups.  This avoids the old
+    // [I32x8; 16] shape, which is 32 physical NEON registers before any
+    // butterfly temporaries.  Store row-major scratch: tmp[fy * 8 + x].
+    let mut tmp_u = MaybeUninit::<[i32; 128]>::uninit();
+    for x in (0..8usize).step_by(4) {
+        let mut cols: [I32x4; 16] =
+            std::array::from_fn(|y| load_i32x4(unsafe { input.as_ptr().add(y * 8 + x) }));
+        dct1d_16_v4_i32(&mut cols);
+        for fy in 0..16usize {
+            unsafe {
+                store_i32x4((tmp_u.as_mut_ptr() as *mut i32).add(fy * 8 + x), cols[fy]);
+            }
+        }
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
 
-    // Pass 2: DCT-8 across each of the 16 rows (horizontal). Bring the 8 columns
-    // onto the vector axis via two 8x8 transposes (vert-freq groups 0..8, 8..16).
-    let mut a: [I32x8; 8] = rows[0..8].try_into().unwrap();
-    let mut b: [I32x8; 8] = rows[8..16].try_into().unwrap();
-    transpose_8x8_i32(&mut a);
-    transpose_8x8_i32(&mut b);
-    dct1d_8_v_i32(&mut a); // a[fx].lane[fy]  = coeff(horiz fx, vert fy   0..8)
-    dct1d_8_v_i32(&mut b); // b[fx].lane[fy'] = coeff(horiz fx, vert fy'+8 8..16)
-
-    // Normalize the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8 by
-    // 1/sqrt(2) (round(65536/sqrt2) = 46341), matching scalar.
+    // Stage 2: horizontal DCT-8 in 4-frequency groups.  Load four contiguous
+    // scratch rows, transpose two 4x4 tiles normally, then run an 8-point DCT
+    // with one int32x4_t register set.
     let nrm = vdupq_n_s32(46341);
     let mut out = MaybeUninit::<[i32; 128]>::uninit();
-    for fx in 0..8usize {
-        let a_lo = mul_q16_vec(a[fx].lo, nrm);
-        let a_hi = mul_q16_vec(a[fx].hi, nrm);
-        let b_lo = mul_q16_vec(b[fx].lo, nrm);
-        let b_hi = mul_q16_vec(b[fx].hi, nrm);
-        unsafe {
-            let dst_ptr = out.as_mut_ptr() as *mut i32;
-            let base = dst_ptr.add(fx * 16);
-            vst1q_s32(base, a_lo);
-            vst1q_s32(base.add(4), a_hi);
-            vst1q_s32(base.add(8), b_lo);
-            vst1q_s32(base.add(12), b_hi);
+    for y in (0..16usize).step_by(4) {
+        let r0 = unsafe { vld1q_s32(tmp.as_ptr().add(y * 8)) };
+        let r1 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 1) * 8)) };
+        let r2 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 2) * 8)) };
+        let r3 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 3) * 8)) };
+        let (c0, c1, c2, c3) = transpose_4x4_i32(r0, r1, r2, r3);
+
+        let r4 = unsafe { vld1q_s32(tmp.as_ptr().add(y * 8 + 4)) };
+        let r5 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 1) * 8 + 4)) };
+        let r6 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 2) * 8 + 4)) };
+        let r7 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 3) * 8 + 4)) };
+        let (c4, c5, c6, c7) = transpose_4x4_i32(r4, r5, r6, r7);
+
+        let mut rows = [
+            I32x4(c0),
+            I32x4(c1),
+            I32x4(c2),
+            I32x4(c3),
+            I32x4(c4),
+            I32x4(c5),
+            I32x4(c6),
+            I32x4(c7),
+        ];
+        dct1d_8_v4_i32(&mut rows);
+        for fx in 0..8usize {
+            unsafe {
+                vst1q_s32(
+                    (out.as_mut_ptr() as *mut i32).add(fx * 16 + y),
+                    mul_q16_vec(rows[fx].0, nrm),
+                );
+            }
         }
     }
     unsafe { out.assume_init() }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x16_neon_quant_t(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut tmp_u = MaybeUninit::<[i32; 128]>::uninit();
+    for x in (0..8usize).step_by(4) {
+        let mut cols: [I32x4; 16] =
+            std::array::from_fn(|y| load_i32x4(unsafe { input.as_ptr().add(y * 8 + x) }));
+        dct1d_16_v4_i32(&mut cols);
+        for fy in 0..16usize {
+            unsafe {
+                store_i32x4((tmp_u.as_mut_ptr() as *mut i32).add(fy * 8 + x), cols[fy]);
+            }
+        }
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let nrm = vdupq_n_s32(46341);
+    let mut cf = MaybeUninit::<[i32; 128]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 128]>::uninit();
+    for y in (0..16usize).step_by(4) {
+        let r0 = unsafe { vld1q_s32(tmp.as_ptr().add(y * 8)) };
+        let r1 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 1) * 8)) };
+        let r2 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 2) * 8)) };
+        let r3 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 3) * 8)) };
+        let (c0, c1, c2, c3) = transpose_4x4_i32(r0, r1, r2, r3);
+
+        let r4 = unsafe { vld1q_s32(tmp.as_ptr().add(y * 8 + 4)) };
+        let r5 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 1) * 8 + 4)) };
+        let r6 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 2) * 8 + 4)) };
+        let r7 = unsafe { vld1q_s32(tmp.as_ptr().add((y + 3) * 8 + 4)) };
+        let (c4, c5, c6, c7) = transpose_4x4_i32(r4, r5, r6, r7);
+
+        let mut rows = [
+            I32x4(c0),
+            I32x4(c1),
+            I32x4(c2),
+            I32x4(c3),
+            I32x4(c4),
+            I32x4(c5),
+            I32x4(c6),
+            I32x4(c7),
+        ];
+        dct1d_8_v4_i32(&mut rows);
+        for fx in 0..8usize {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                I32x4(mul_q16_vec(rows[fx].0, nrm)),
+                fx * 16 + y,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[allow(unused)]
@@ -590,6 +919,110 @@ pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
 pub(crate) fn dct8x16_neon_i32(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_neon_coeffs(input);
     quant_flat(&coeffs, dc_q, ac_q, input);
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x32_neon_quant_t(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    // Match scalar TX_16X32 ordering: vertical DCT-32 with input << 6,
+    // horizontal DCT-16, then rounded >> 6 before quant/target generation.
+    let mut tmp_u = MaybeUninit::<[i32; 512]>::uninit();
+    for x in (0..16usize).step_by(4) {
+        let mut cols = load_n_i32x4::<32>(&input[x..], 16);
+        for c in cols.iter_mut() {
+            *c = c.shl::<6>();
+        }
+        dct1d_32_v4_i32(&mut cols);
+        store_transposed_cols_i32x4::<32>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 512]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 512]>::uninit();
+    for fy in (0..32usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 32 + fy) }));
+        dct1d_16_v4_i32(&mut rows);
+        for fx in 0..16usize {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[fx].shr_round::<6>(),
+                fx * 32 + fy,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x16_neon_quant_t(
+    input: &[i32; 512],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 512], [f32; 512]) {
+    // Match scalar TX_32X16 ordering: horizontal DCT-32 first. Four rows are
+    // processed in one int32x4_t lane set, then stored as normal row-major
+    // scratch for the vertical DCT-16 pass.
+    let mut tmp_u = MaybeUninit::<[i32; 512]>::uninit();
+    let tmp_ptr = tmp_u.as_mut_ptr().cast::<i32>();
+    for y in (0..16usize).step_by(4) {
+        let z = I32x4(vdupq_n_s32(0));
+        let mut cols = [z; 32];
+        for x in (0..32usize).step_by(4) {
+            let r0 = unsafe { vld1q_s32(input.as_ptr().add(y * 32 + x)) };
+            let r1 = unsafe { vld1q_s32(input.as_ptr().add((y + 1) * 32 + x)) };
+            let r2 = unsafe { vld1q_s32(input.as_ptr().add((y + 2) * 32 + x)) };
+            let r3 = unsafe { vld1q_s32(input.as_ptr().add((y + 3) * 32 + x)) };
+            let (c0, c1, c2, c3) = transpose_4x4_i32(r0, r1, r2, r3);
+            cols[x] = I32x4(c0).shl::<6>();
+            cols[x + 1] = I32x4(c1).shl::<6>();
+            cols[x + 2] = I32x4(c2).shl::<6>();
+            cols[x + 3] = I32x4(c3).shl::<6>();
+        }
+        dct1d_32_v4_i32(&mut cols);
+
+        for fx in (0..32usize).step_by(4) {
+            let mut tile = [cols[fx], cols[fx + 1], cols[fx + 2], cols[fx + 3]];
+            transpose_store_4x4_i32(unsafe { tmp_ptr.add(y * 32 + fx) }, 32, &mut tile);
+        }
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; 512]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 512]>::uninit();
+    for fx in (0..32usize).step_by(4) {
+        let mut rows: [I32x4; 16] =
+            std::array::from_fn(|y| load_i32x4(unsafe { tmp.as_ptr().add(y * 32 + fx) }));
+        dct1d_16_v4_i32(&mut rows);
+
+        for fy in (0..16usize).step_by(4) {
+            let mut tile = [
+                rows[fy].shr_round::<6>(),
+                rows[fy + 1].shr_round::<6>(),
+                rows[fy + 2].shr_round::<6>(),
+                rows[fy + 3].shr_round::<6>(),
+            ];
+            let (c0, c1, c2, c3) = transpose_4x4_i32(tile[0].0, tile[1].0, tile[2].0, tile[3].0);
+            tile = [I32x4(c0), I32x4(c1), I32x4(c2), I32x4(c3)];
+            for i in 0..4usize {
+                store_quant_target_i32x4(
+                    cf.as_mut_ptr().cast(),
+                    tf.as_mut_ptr().cast(),
+                    tile[i],
+                    (fx + i) * 16 + fy,
+                    dc_q,
+                    ac_q,
+                );
+            }
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
 #[cfg(test)]

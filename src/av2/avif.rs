@@ -140,34 +140,50 @@ fn build_av2c(fmt: &Av2Format, width: u32, height: u32) -> [u8; 4] {
 /// An alpha auxiliary item to mux alongside the color image. The alpha is a
 /// monochrome AV2 image (encode_yuv400) linked to the color item via `auxl` and
 /// carrying an `auxC` property declaring the standard alpha aux-type URN.
+#[derive(Clone, Copy)]
 pub(crate) struct AlphaItem<'a> {
     pub(crate) obu: &'a [u8],
     /// Coded (decoder-output) size signaled in the alpha OBU.
     pub(crate) coded_width: u32,
     pub(crate) coded_height: u32,
-    /// Display size (== colour  isplay size); a `clap` crops the coded alpha to it.
+    /// Display size (== color  isplay size); a `clap` crops the coded alpha to it.
     pub(crate) disp_width: u32,
     pub(crate) disp_height: u32,
     pub(crate) bit_depth: u8,
 }
 
-/// Wrap an AV2 OBU stream (`Encoded::data` = TD + sequence + frame OBUs) into an
-/// AVIF-style ISOBMFF file. `width`/`height` are the *display* dimensions
-/// (`ispe`); the bitstream may decode to a padded size and be cropped on output.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn wrap_av2_image(
-    obu: &[u8],
-    width: u32,
-    height: u32,
+/// Metadata and dimensions needed to mux one color AV2 item, plus optional
+/// EXIF, orientation, content-light and alpha auxiliary metadata.
+#[derive(Clone, Copy)]
+pub(crate) struct Av2ImageSpec<'a> {
+    coded_width: u32,
+    coded_height: u32,
     disp_width: u32,
     disp_height: u32,
-    fmt: &Av2Format,
-    color: &Av2Color,
-    exif: Option<&[u8]>,
+    format: &'a Av2Format,
+    color: &'a Av2Color,
+    exif: Option<&'a [u8]>,
     orientation: Orientation,
     clli: Option<ContentLightLevel>,
-    alpha: Option<AlphaItem>,
-) -> Vec<u8> {
+    alpha: Option<AlphaItem<'a>>,
+}
+
+/// Wrap an AV2 OBU stream (`Encoded::data` = TD + sequence + frame OBUs) into an
+/// AVIF-style ISOBMFF file. The coded and display dimensions may differ when the
+/// decoder output is padded and cropped with `clap`.
+pub(crate) fn wrap_av2_image(obu: &[u8], spec: &Av2ImageSpec<'_>) -> Vec<u8> {
+    let Av2ImageSpec {
+        coded_width: width,
+        coded_height: height,
+        disp_width,
+        disp_height,
+        format: fmt,
+        color,
+        exif,
+        orientation,
+        clli,
+        alpha,
+    } = *spec;
     let channels = fmt.channels();
     let av2c = build_av2c(fmt, width, height);
     // Item IDs: color = 1, alpha = 2 (if present), Exif = next free.
@@ -238,7 +254,7 @@ pub(crate) fn wrap_av2_image(
         f.push(0x00); // base_offset_size=0, index_size=0
         let item_count = 1 + has_alpha as u16 + has_exif as u16;
         w16(&mut f, item_count);
-        // item 1: the AV2 colour image
+        // item 1: the AV2 color image
         w16(&mut f, 1); // item_ID
         w16(&mut f, 0); // data_reference_index (0 = this file)
         w16(&mut f, 1); // extent_count
@@ -295,21 +311,21 @@ pub(crate) fn wrap_av2_image(
         }
         patch(&mut f, s);
     }
-    // iref — alpha (auxl) and Exif (cdsc) both reference the colour image (1).
+    // iref — alpha (auxl) and Exif (cdsc) both reference the color image (1).
     if has_alpha || has_exif {
         let s = write_fullbox(&mut f, b"iref", 0, 0);
         if has_alpha {
             let si = write_box(&mut f, b"auxl");
             w16(&mut f, alpha_id); // from_item_ID = alpha
             w16(&mut f, 1); // reference_count
-            w16(&mut f, 1); // to_item_ID = colour image
+            w16(&mut f, 1); // to_item_ID = color image
             patch(&mut f, si);
         }
         if has_exif {
             let si = write_box(&mut f, b"cdsc");
             w16(&mut f, exif_id); // from_item_ID = Exif
             w16(&mut f, 1); // reference_count
-            w16(&mut f, 1); // to_item_ID = colour image
+            w16(&mut f, 1); // to_item_ID = color image
             patch(&mut f, si);
         }
         patch(&mut f, s);
@@ -431,7 +447,7 @@ pub(crate) fn wrap_av2_image(
             next_prop += 1;
         }
         // Alpha auxiliary item properties: ispe, pixi(1ch), av2C(mono), auxC, clap?.
-        // (No colr — alpha is auxiliary and carries no colour information.)
+        // (No colr — alpha is auxiliary and carries no color information.)
         let mut alpha_props: Option<(u8, u8, u8, u8, Option<u8>)> = None;
         if let Some(a) = alpha.as_ref() {
             let ispe_a = next_prop;
@@ -491,7 +507,7 @@ pub(crate) fn wrap_av2_image(
         {
             let p = write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 1 + has_alpha as u32); // entry_count
-            // colour item (1): ispe, pixi, av2C(ess), colr(s), clap?(ess), irot?/imir?(ess), clli?
+            // color item (1): ispe, pixi, av2C(ess), colr(s), clap?(ess), irot?/imir?(ess), clli?
             w16(&mut f, 1);
             let assoc = 3
                 + colr_props.len() as u8
@@ -562,7 +578,7 @@ pub(crate) fn wrap_av2_image(
     f
 }
 
-/// Wrap an `Encoded` result into an AVIF-style file with explicit colour info.
+/// Wrap an `Encoded` result into an AVIF-style file with explicit color info.
 pub(crate) fn to_avif_color(
     enc: &Av2Frame,
     fmt: &Av2Format,
@@ -573,21 +589,23 @@ pub(crate) fn to_avif_color(
 ) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
-        enc.coded_width as u32,
-        enc.coded_height as u32,
-        enc.width as u32,
-        enc.height as u32,
-        fmt,
-        color,
-        exif,
-        orientation,
-        clli,
-        None,
+        &Av2ImageSpec {
+            coded_width: enc.coded_width as u32,
+            coded_height: enc.coded_height as u32,
+            disp_width: enc.width as u32,
+            disp_height: enc.height as u32,
+            format: fmt,
+            color,
+            exif,
+            orientation,
+            clli,
+            alpha: None,
+        },
     )
 }
 
 /// Like `to_avif_color` but muxes a monochrome alpha auxiliary item (`alpha`, an
-/// `encode_yuv400` result) linked to the colour image via `auxl` + `auxC`.
+/// `encode_yuv400` result) linked to the color image via `auxl` + `auxC`.
 pub(crate) fn to_avif_color_alpha(
     enc: &Av2Frame,
     alpha: &Av2Frame,
@@ -599,22 +617,24 @@ pub(crate) fn to_avif_color_alpha(
 ) -> Vec<u8> {
     wrap_av2_image(
         &enc.data,
-        enc.coded_width as u32,
-        enc.coded_height as u32,
-        enc.width as u32,
-        enc.height as u32,
-        fmt,
-        color,
-        exif,
-        orientation,
-        clli,
-        Some(AlphaItem {
-            obu: &alpha.data,
-            coded_width: alpha.coded_width as u32,
-            coded_height: alpha.coded_height as u32,
-            disp_width: alpha.width as u32,
-            disp_height: alpha.height as u32,
-            bit_depth: alpha.bit_depth,
-        }),
+        &Av2ImageSpec {
+            coded_width: enc.coded_width as u32,
+            coded_height: enc.coded_height as u32,
+            disp_width: enc.width as u32,
+            disp_height: enc.height as u32,
+            format: fmt,
+            color,
+            exif,
+            orientation,
+            clli,
+            alpha: Some(AlphaItem {
+                obu: &alpha.data,
+                coded_width: alpha.coded_width as u32,
+                coded_height: alpha.coded_height as u32,
+                disp_width: alpha.width as u32,
+                disp_height: alpha.height as u32,
+                bit_depth: alpha.bit_depth,
+            }),
+        },
     )
 }

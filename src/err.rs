@@ -32,16 +32,30 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum EncodeError {
-    InvalidDimensions { width: u32, height: u32 },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
     InvalidInput,
     DctError(String),
     BitstreamError(String),
     IsobmffError(String),
     Io(std::io::Error),
-    DimensionTooLarge { width: usize, height: usize },
+    DimensionTooLarge {
+        width: usize,
+        height: usize,
+    },
     InvalidQuality,
     UnsupportedChromaFormat(ChromaFormat),
     UnsupportedChromaBitDepth(BitDepth),
+    /// The inter-video product deliberately accepts only the formats that pass
+    /// the complete prediction -> reconstruction -> in-loop-filter -> DPB gate.
+    UnsupportedVideoMode {
+        chroma: ChromaFormat,
+        bit_depth: BitDepth,
+    },
+    /// A frame changed a property fixed by the emitted sequence header.
+    SequenceMismatch(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -69,6 +83,13 @@ impl fmt::Display for EncodeError {
             }
             EncodeError::UnsupportedChromaBitDepth(bp) => {
                 write!(f, "Bit-depth {:?} is not supported", bp)
+            }
+            EncodeError::UnsupportedVideoMode { chroma, bit_depth } => write!(
+                f,
+                "unsupported AV2 inter-video mode: {chroma:?} {bit_depth:?}; only 4:2:0 8/10-bit is currently supported"
+            ),
+            EncodeError::SequenceMismatch(field) => {
+                write!(f, "{field} changed after the sequence header was emitted")
             }
         }
     }

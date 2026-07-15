@@ -455,8 +455,10 @@ pub(crate) fn inv_txfm_passes_avx2(
     let (s0, s1) = TXSH[tx];
     let (w, h) = (4 * tw, 4 * th);
     let is_rect2 = (lw + lh) & 1 != 0;
-    let row_clip_min = -(1 << (bd + 7));
-    let row_clip_max = !row_clip_min;
+    let coef_clip_min = -(1 << (bd + 7));
+    let coef_clip_max = (1 << (bd + 7)) - 1;
+    let row_clip_min = coef_clip_min;
+    let row_clip_max = coef_clip_max;
     let hor_ty = txtp & 7;
     let ver_ty = (txtp >> 5) & 7;
     let (sw, sh) = (w.min(32), h.min(32));
@@ -471,7 +473,8 @@ pub(crate) fn inv_txfm_passes_avx2(
 
     for (col, row) in tmp.chunks_exact_mut(sw).enumerate() {
         for (slot, &v) in row.iter_mut().zip(coeff.iter().skip(col).step_by(sh)) {
-            *slot = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            let v = if is_rect2 { (v * 181 + 128) >> 8 } else { v };
+            *slot = v.clamp(coef_clip_min, coef_clip_max);
         }
     }
 

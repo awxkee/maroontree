@@ -73,13 +73,13 @@ fn ceil_log2(n: i32) -> i32 {
     }
 }
 
-/// avm `floorLog2Uint64`.
+/// Floor log2 for the 32-bit regression denominator.
 #[inline(always)]
-fn floor_log2_u64(x: u64) -> i32 {
+fn floor_log2_u32(x: u32) -> i32 {
     if x == 0 {
         return 0;
     }
-    63 - x.leading_zeros() as i32
+    31 - x.leading_zeros() as i32
 }
 
 /// avm `mul_fixed32_adapt`: overflow-safe fixed-point multiply `(a*b) >> shift`
@@ -130,7 +130,7 @@ fn division_scale_shift(denom: u32) -> (i32, i32, i32) {
     static POW2O: [i32; 8] = [4822, 5952, 6624, 6792, 6408, 5424, 3792, 1466];
     static POW2B: [i32; 8] = [12784, 12054, 11670, 11583, 11764, 12195, 12870, 13782];
 
-    let shift = floor_log2_u64(denom as u64);
+    let shift = floor_log2_u32(denom);
     let round = if shift == 0 {
         0
     } else {
@@ -474,13 +474,13 @@ mod tests {
         }
         let mut ata = [[0i32; 3]; 3];
         let mut ty = [0i32; 3];
-        for c0 in 0..3 {
-            for c1 in c0..3 {
+        for (c0, row) in ata.iter_mut().enumerate() {
+            for (c1, cell) in row.iter_mut().enumerate().skip(c0) {
                 let mut acc = 0i32;
-                for r in 0..count {
-                    acc += a[r][c0] as i32 * a[r][c1] as i32;
+                for values in a.iter().take(count) {
+                    acc += values[c0] as i32 * values[c1] as i32;
                 }
-                ata[c0][c1] = acc;
+                *cell = acc;
             }
         }
         for c in 0..3 {
@@ -492,9 +492,9 @@ mod tests {
         }
         let ms = (MHCCP_DECIM_BITS + 6) - 2 * bd - ceil_log2(count as i32);
         if ms > 0 {
-            for c0 in 0..3 {
-                for c1 in c0..3 {
-                    ata[c0][c1] <<= ms;
+            for (c0, row) in ata.iter_mut().enumerate() {
+                for value in row.iter_mut().skip(c0) {
+                    *value <<= ms;
                 }
             }
             for t in ty.iter_mut() {
@@ -502,9 +502,9 @@ mod tests {
             }
         } else if ms < 0 {
             let m = -ms;
-            for c0 in 0..3 {
-                for c1 in c0..3 {
-                    ata[c0][c1] >>= m;
+            for (c0, row) in ata.iter_mut().enumerate() {
+                for value in row.iter_mut().skip(c0) {
+                    *value >>= m;
                 }
             }
             for t in ty.iter_mut() {
@@ -539,7 +539,7 @@ mod tests {
             let count = 20 + cfg * 7;
             let params = solve_config(dir, count, &mut rng, bd);
             assert_eq!(params, expect_params[cfg], "params cfg {cfg}");
-            for t in 0..6 {
+            for (t, &expected) in expect_pred[cfg].iter().enumerate() {
                 let c = rng.next10();
                 let a = rng.next10();
                 let l = rng.next10();
@@ -550,7 +550,7 @@ mod tests {
                 };
                 let vector = [h_tap, non_linear(c, mid, bd), mid];
                 let pred = clip_pixel_highbd(convolve(&params, &vector), bd);
-                assert_eq!(pred, expect_pred[cfg][t], "pred cfg {cfg} t {t}");
+                assert_eq!(pred, expected, "pred cfg {cfg} t {t}");
             }
         }
     }

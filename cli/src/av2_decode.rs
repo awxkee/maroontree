@@ -81,21 +81,20 @@ fn finalize<T: Copy + Default, const N: usize>(
     let mut height = avif_image.height as usize;
 
     // clap is defined in coded space, so crop BEFORE orientation (clap → irot → imir).
-    if let Some(clap) = avif_image.clean_aperture.as_ref() {
-        if let Some((left, top, cw, ch)) = clap.to_crop_rect(avif_image.width, avif_image.height) {
-            if cw as usize != width || ch as usize != height {
-                let (src_stride, dst_stride) = (width * N, cw as usize * N);
-                let mut cropped = vec![T::default(); cw as usize * ch as usize * N];
-                for row in 0..ch {
-                    let s = (top + row) as usize * src_stride + left as usize * N;
-                    let d = row as usize * dst_stride;
-                    cropped[d..d + dst_stride].copy_from_slice(&data[s..s + dst_stride]);
-                }
-                data = cropped;
-                width = cw as usize;
-                height = ch as usize;
-            }
+    if let Some(clap) = avif_image.clean_aperture.as_ref()
+        && let Some((left, top, cw, ch)) = clap.to_crop_rect(avif_image.width, avif_image.height)
+        && (cw as usize != width || ch as usize != height)
+    {
+        let (src_stride, dst_stride) = (width * N, cw as usize * N);
+        let mut cropped = vec![T::default(); cw as usize * ch as usize * N];
+        for row in 0..ch {
+            let s = (top + row) as usize * src_stride + left as usize * N;
+            let d = row as usize * dst_stride;
+            cropped[d..d + dst_stride].copy_from_slice(&data[s..s + dst_stride]);
         }
+        data = cropped;
+        width = cw as usize;
+        height = ch as usize;
     }
 
     Ok(FinalizedView {

@@ -134,7 +134,7 @@ Options:
   -t, --threads <N>                     Worker threads; 0 = all cores   [default: all]
       --no-alpha                        Discard alpha channel
       --no-exif                         Strip EXIF metadata from output
-      --no-icc                          Strip ICC colour profile from output
+      --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
   -s, --speed                           Encoding effort (default = slow)
   -v, --verbose                         Print timing and file stats
@@ -513,7 +513,7 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
         _image_container,
         fmt,
         if let Some(ext) = fmt.as_ref() {
-            is_heif_format(&ext)
+            is_heif_format(ext)
         } else {
             false
         }
@@ -556,12 +556,11 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
 fn main() {
     let args = parse_args();
 
-    if args.lossless {
-        if let Some(c) = args.chroma {
-            if c != Chroma::C444 {
-                die("--lossless requires --chroma 444");
-            }
-        }
+    if args.lossless
+        && let Some(c) = args.chroma
+        && c != Chroma::C444
+    {
+        die("--lossless requires --chroma 444");
     }
 
     let (img, have_icc) = load_image(&args.input);

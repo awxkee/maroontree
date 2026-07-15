@@ -27,7 +27,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::util::FastRound;
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
@@ -273,12 +272,16 @@ pub(crate) fn quantize_to_levels(
     coeff: &[i32],
     n: usize,
     qstep: i32,
-    factor: f64,
+    factor: f32,
     thresh: f32,
     scan: &[u16],
 ) -> (Vec<f32>, Vec<f32>) {
-    let inv_q = (factor / qstep as f64) as f32;
+    let inv_q = factor / qstep as f32;
     let th = thresh;
+    // Dead-zone quantizer: round with a bias < 0.5 toward zero (AV1/AV2 use ~0.36 for AC),
+    // instead of round-to-nearest. Zeros more small coefficients, cutting rate at matched
+    // distortion. Overridable for calibration; 0.5 == plain round-to-nearest.
+    let dz: f32 = 0.5;
     let mut lev = vec![0f32; scan.len()];
     let mut prm = vec![0f32; scan.len()];
     // Width-w AVM scans (rc=row*cw+col) index the row-major fdct out directly;
@@ -291,7 +294,7 @@ pub(crate) fn quantize_to_levels(
         let a = pr.abs();
         *prm = a;
         if a >= th {
-            *lev = pr.fast_round();
+            *lev = pr.signum() * (a + (dz - 0.5)).max(0.0).round();
         }
     }
     (lev, prm)
@@ -543,10 +546,11 @@ unsafe fn fdct_rect_scalar(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -
         let s = &mut *cell.borrow_mut();
         fdct_1d_n(h, resid, &mut s.buf[..w * h], s1, w, zh); // col pass (height)
         fdct_1d_n(w, &s.buf[..w * h], &mut s.coeff[..w * h], s2, h, zw); // row pass (width)
-        for vf in 0..ch {
-            for hf in 0..cw {
-                out[vf * cw + hf] = s.coeff[vf * w + hf];
-            }
+        for (dst_row, src_row) in out[..cw * ch]
+            .chunks_exact_mut(cw)
+            .zip(s.coeff.chunks_exact(w).take(ch))
+        {
+            dst_row.copy_from_slice(&src_row[..cw]);
         }
     });
     if (w.trailing_zeros() + h.trailing_zeros()) & 1 == 1 {

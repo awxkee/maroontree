@@ -44,7 +44,22 @@ pub(crate) struct Basis {
 
 /// RD end-of-block (EOB) truncation threshold, in unrounded-coefficient-magnitude units.
 pub(crate) const RDOQ_EOB_T: f32 = 0.9;
-pub(crate) const DEFAULT_RDOQ_LAMBDA: f64 = 0.07;
+pub(crate) const DEFAULT_RDOQ_LAMBDA: f32 = 0.07;
+
+pub(crate) fn hq_rdoq_lambda(base_q_idx: u32) -> f32 {
+    const BASE: f32 = DEFAULT_RDOQ_LAMBDA;
+    const PEAK: f32 = 0.13;
+    if base_q_idx >= 50 || base_q_idx == 0 {
+        return BASE;
+    }
+    let t = (50 - base_q_idx) as f32 / 46.0; // ramp toward the top
+    let mut boost = PEAK * t.min(1.0);
+    if base_q_idx <= 4 {
+        // ease off near-lossless so the absolute top keeps full precision
+        boost *= base_q_idx as f32 / 5.0;
+    }
+    BASE + boost
+}
 
 /// Zero trailing coefficients (scan order) whose unrounded magnitude `prm[k]` is below the
 /// EOB threshold `t`, stopping at the first kept coefficient. `lev`/`prm` are in scan order.
@@ -262,7 +277,7 @@ impl Basis {
             FwdKind::Dct(w, h) => {
                 let n = w * h;
                 let cw = w.min(32);
-                let factor = (1u32 << (3 + dc_tx_scale(w, h))) as f64;
+                let factor = (1u32 << (3 + dc_tx_scale(w, h))) as f32;
                 // Thread-local residual + coded-coeff scratch (reused, never re-zeroed).
                 FWD_SCRATCH.with(|cell| {
                     let s = &mut *cell.borrow_mut();

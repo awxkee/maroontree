@@ -37,7 +37,7 @@ fn resolve_color(cfg: &EncodeConfig) -> Cicp {
     cfg.color_encoding.unwrap_or_else(Cicp::srgb_ycbcr)
 }
 
-/// Encode an interleaved-RGB (GBR-plane) image to a colour [`Av2Frame`],
+/// Encode an interleaved-RGB (GBR-plane) image to a color [`Av2Frame`],
 /// dispatching on the requested chroma format.
 fn encode_rgb_color<T: Pixel>(
     enc: &Av2Encoder,
@@ -53,7 +53,7 @@ fn encode_rgb_color<T: Pixel>(
     }
 }
 
-/// Encode a pre-converted YCbCr image to a colour [`Av2Frame`], dispatching on
+/// Encode a pre-converted YCbCr image to a color [`Av2Frame`], dispatching on
 /// the requested chroma format.
 fn encode_yuv_color<T: Pixel>(
     enc: &Av2Encoder,
@@ -84,6 +84,26 @@ fn encode_alpha<T: Pixel>(
         .encode_image_400(alpha_mono, color)
 }
 
+/// Choose a tile grid. Tiles are maroontree's only unit of thread parallelism (the
+/// superblock loop is serial within a tile), so use about as many tiles as threads
+/// — but keep each tile at least ~512 px per side. Tiny tiles waste bits: every
+/// tile resets the entropy contexts and cannot predict across its boundary, costing
+/// ~40 bytes each, so the old fixed 8x8 = 64 tiles threw away ~2.5 KB on a 1 MP
+/// frame (≈27% of the file at very low bitrate).
+fn auto_tiles(width: usize, height: usize, threads: usize) -> (usize, usize) {
+    let t = if threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        threads
+    }
+    .max(1);
+    let tc = width.div_ceil(512).clamp(1, t);
+    let tr = height.div_ceil(512).clamp(1, t.div_ceil(tc));
+    (tc, tr)
+}
+
 /// Common preamble: enforce the expected bit depth, validate dims + config, and
 /// build a color encoder at the mapped quality.
 fn prepare(
@@ -98,6 +118,7 @@ fn prepare(
     }
     validate_dims(width as u32, height as u32)?;
     cfg.validate()?;
+    let (tc, tr) = auto_tiles(width, height, cfg.threads);
     Ok(Av2Encoder::with_bit_depth(
         if cfg.quality == 0 {
             0
@@ -106,11 +127,15 @@ fn prepare(
         },
         bit_depth.bits(),
     )
-    .with_tiles(8, 8)
+    .with_tiles(tc, tr)
     .with_txpart(TxPart::ThreeWay)
     .with_speed(cfg.speed)
     .with_threads(cfg.threads)
     .with_cfl(true)
+    // CDEF is chosen by a self-gating post-reconstruction search (picks a strength
+    // only when it reduces distortion, else stays off), so enabling it cannot
+    // regress content the filter would hurt.
+    .with_cdef(cfg.cdef)
     .with_aq(cfg.adaptive_quant))
 }
 

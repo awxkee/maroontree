@@ -32,11 +32,11 @@ pub(crate) const FILTER_BITS: i32 = 7;
 
 /// The three coded taps per axis have spec-defined ranges, sub-exponential `k`
 /// parameters and reference midpoints. Index 0..=2 = innermost..outermost coded
-/// tap (the 7-tap kernel is `[t0, t1, t2, centre, t2, t1, t0]`).
-pub(crate) const WIENER_TAPS_MIN: [i32; 3] = [-5, -23, -17];
-pub(crate) const WIENER_TAPS_MAX: [i32; 3] = [10, 8, 46];
-pub(crate) const WIENER_TAPS_K: [i32; 3] = [1, 2, 3];
-pub(crate) const WIENER_TAPS_MID: [i32; 3] = [3, -7, 15];
+/// tap (the 7-tap kernel is `[t0, t1, t2, center, t2, t1, t0]`).
+pub(crate) static WIENER_TAPS_MIN: [i32; 3] = [-5, -23, -17];
+pub(crate) static WIENER_TAPS_MAX: [i32; 3] = [10, 8, 46];
+pub(crate) static WIENER_TAPS_K: [i32; 3] = [1, 2, 3];
+pub(crate) static WIENER_TAPS_MID: [i32; 3] = [3, -7, 15];
 
 /// A full 7-tap symmetric kernel built from the three coded taps. `taps[3]` is
 /// the derived centre so the kernel sums to `1 << FILTER_BITS`.
@@ -91,14 +91,11 @@ fn get(plane: &[i32], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 
 
 /// Apply a Wiener filter to the rectangle `[x0, x0+rw) x [y0, y0+rh)` of `plane`
 /// (reading from `src`, writing to `dst`), using the separable kernel
-/// `(hk, vk)`. Vertical context is clamped to `[ytop, ybot]` (inclusive), the
-/// current restoration *stripe*: AV1 loop restoration processes the frame in
-/// 64-row stripes and never lets the vertical filter read across a stripe
-/// boundary — it replicates the stripe-edge row instead. Horizontal context is
-/// clamped to the plane edges.
+/// `(hk, vk)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_filter_rect(
     dst: &mut [i32],
+    dst_y0: usize,
     src: &[i32],
     stride: usize,
     w: usize,
@@ -150,15 +147,22 @@ pub(crate) fn wiener_filter_rect(
                 s += vk.taps[t] * inter[iy as usize * rw + c];
             }
             let v = (s - offset_correction + round1_offset) >> round1;
-            dst[(y0 + r) * stride + (x0 + c)] = v.clamp(0, maxv);
+            dst[(y0 + r - dst_y0) * stride + (x0 + c)] = v.clamp(0, maxv);
         }
     }
 }
 
-/// Apply a single global Wiener filter to a whole luma plane, honoring AV1's
-/// 64-row restoration stripes. The first stripe is rows `0..=55` (height 56);
-/// subsequent stripes are 64 rows starting at 56 (`56..=119`, `120..=183`, ...).
-/// The vertical filter context is clamped within each stripe.
+pub(crate) fn wiener_stripes(h: usize) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    let mut ytop = 0usize;
+    while ytop < h {
+        let ybot = (ytop + if ytop == 0 { 56 } else { 64 }).min(h);
+        v.push((ytop, ybot));
+        ytop = ybot;
+    }
+    v
+}
+
 pub(crate) fn wiener_filter_plane(
     dst: &mut [i32],
     src: &[i32],
@@ -179,6 +183,7 @@ pub(crate) fn wiener_filter_plane(
         let cbot = (ybot + 2).min(h) - 1;
         wiener_filter_rect(
             dst,
+            0,
             src,
             w,
             w,

@@ -59,19 +59,26 @@ mod msac_enc;
 mod neon;
 mod obu;
 mod odec;
+mod par;
 mod pixel;
 mod quant;
 mod rangecoder;
+mod rd_sse;
 mod tables;
 mod transform;
 mod trellis;
+mod trellis_dist;
 mod util;
 mod wiener;
 
 pub mod av2_image {
     pub use crate::av2::simple::*;
 }
-pub use av2::{Av2Encoder, Av2Frame, Tuning, TxPart, av2_map_quality};
+pub use av2::video::{
+    Av2VideoEncoder, VideoPreset, VideoPresetConfig, VideoRdoqEffort, VideoThreadingPolicy,
+    VideoTransformSearch, encode_ivf,
+};
+pub use av2::{Av2Encoder, Av2Frame, DarkAq, Tuning, TxPart, av2_map_quality};
 pub use avif::{
     ChromaFormat, EncodeConfig, Speed, encode_gray_alpha8, encode_gray_alpha10,
     encode_gray_alpha12, encode_gray8, encode_gray10, encode_gray12, encode_rgb8, encode_rgb10,

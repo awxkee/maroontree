@@ -26,16 +26,21 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod y4m2ivf;
+
 use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
+    Av2Encoder, BitDepth, Cicp, Orientation, PlanarImage, Speed, TxPart, av2_map_quality,
 };
-use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
+    y4m2ivf::convert(
+        "./assets/file_example_MP4_480_1_5MG.y4m".to_string(),
+        "./file_example_MP4_480_1_5MG.ivf".to_string(),
+        av2_map_quality(60),
+    );
     // let (w, h) = (64usize, 64usize);
     // let mut rgb = vec![0u8; w * h * 3];
     // for y in 0..h {
@@ -50,86 +55,84 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/biddhabrot3_small.png")
-        .unwrap()
-        .to_rgb8();
+    /*let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
-        BitDepth::Eight,
-        &img,
+        BitDepth::Ten,
+        &img.iter().map(|&x| (x as u16) << 2).collect::<Vec<u16>>(),
     )
     .unwrap();
-    for i in 0..5 {
+    for i in 0..15 {
         let instant = Instant::now();
-        let out = encode_lossless(
+        let out = encode_rgb10(
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(60)
                 .with_cicp(Cicp::srgb_ycbcr())
-                .with_chroma(ChromaFormat::Yuv444)
+                .with_chroma(ChromaFormat::Yuv422)
                 .with_speed(Speed::Medium)
-                .with_threads(10)
+                .with_threads(12)
                 .with_variance_boost(true)
                 .with_cdef(false),
         )
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
         fs::write("./out.avif", out).unwrap();
+    }*/
+    let img = image::open("./assets/manhattan.png")
+        .unwrap()
+        // .resize_exact(1600, 900, FilterType::Nearest)
+        .to_rgb8();
+    let pimg = PlanarImage::from_interleaved_rgb(
+        img.width() as usize,
+        img.height() as usize,
+        BitDepth::Eight,
+        &img,
+    )
+    .unwrap();
+    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(60), 8)
+        .with_tiles(8, 8)
+        .with_txpart(TxPart::ThreeWay)
+        .with_rdoq_lambda(0.09)
+        .with_speed(Speed::Fast)
+        .with_threads(12)
+        .with_cfl(true)
+        .with_updating_cdf(true)
+        .with_chroma_mode_search(true)
+        .with_chroma_rdoq_lambda(0.05)
+        .with_ccso(false)
+        .with_cdef(false)
+        .with_mhccp(true);
+    let encoded = av2_encoder
+        .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
+        .unwrap();
+    for _i in 0..10 {
+        let instant = Instant::now();
+        let _encoded = av2_encoder
+            .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
+            .unwrap();
+        println!("Av2 Encoded in {}ms", instant.elapsed().as_millis());
     }
-    /* let img = image::open("./assets/manhattan.png")
-         .unwrap()
-         // .resize_exact(1600, 900, FilterType::Nearest)
-         .to_rgb8();
-     let pimg = PlanarImage::from_interleaved_rgb(
-         img.width() as usize,
-         img.height() as usize,
-         BitDepth::Eight,
-         &img,
-     )
-     .unwrap();
-     let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(70), 8)
-         .with_tiles(8, 8)
-         .with_txpart(TxPart::ThreeWay)
-         .with_rdoq_lambda(0.09)
-         .with_speed(Speed::Fast)
-         .with_threads(12)
-         .with_cfl(true)
-         .with_updating_cdf(true)
-         .with_chroma_mode_search(true)
-         .with_chroma_rdoq_lambda(0.05)
-         .with_ccso(false)
-         .with_mhccp(true);
-     let encoded = av2_encoder
-         .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
-         .unwrap();
-     for i in 0..10 {
-         let instant = Instant::now();
-         let encoded = av2_encoder
-             .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
-             .unwrap();
-         println!("Av2 Encoded in {}ms", instant.elapsed().as_millis());
-     }
-     // let out_obu = encoded.view();
-     // let path = std::env::args()
-     //     .nth(1)
-     //     .unwrap_or_else(|| "out10.avif".into());
-     // let mut f = std::fs::File::create(&path).unwrap();
-     // f.write_all(&out).unwrap();
-     // eprintln!("wrote {} bytes to {}", out.len(), path);
-     //
-     // let path = std::env::args()
-     //     .nth(1)
-     //     .unwrap_or_else(|| "out10_av2.obu".into());
-     // let mut f = std::fs::File::create(&path).unwrap();
-     // f.write_all(&out_obu).unwrap();
-     //
-     let encoded_avif_av2 =
-         Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
-     let path = std::env::args()
-         .nth(1)
-         .unwrap_or_else(|| "out10_avif.avif".into());
-     let mut f = std::fs::File::create(&path).unwrap();
-     f.write_all(&encoded_avif_av2).unwrap();
-    */
+    // let out_obu = encoded.view();
+    // let path = std::env::args()
+    //     .nth(1)
+    //     .unwrap_or_else(|| "out10.avif".into());
+    // let mut f = std::fs::File::create(&path).unwrap();
+    // f.write_all(&out).unwrap();
+    // eprintln!("wrote {} bytes to {}", out.len(), path);
+    //
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "out10_av2.obu".into());
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(encoded.view()).unwrap();
+    //
+    let encoded_avif_av2 =
+        Av2Encoder::wrap_avif(&encoded, None, None, Orientation::Normal, None).unwrap();
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "out10_avif.avif".into());
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&encoded_avif_av2).unwrap();
 }

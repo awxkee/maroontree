@@ -28,7 +28,7 @@
  */
 use crate::err::EncodeError;
 
-pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug {
+pub trait Pixel: Copy + Default + PartialEq + Send + Sync + std::fmt::Debug {
     /// Promote a stored sample to the signed working type used by the transform.
     fn to_i32(self) -> i32;
     fn to_f32(self) -> f32;
@@ -80,6 +80,22 @@ impl Pixel for i32 {
     fn from_i32_clamped(v: i32, bit_depth: u8) -> Self {
         let max = (1i32 << bit_depth) - 1;
         v.clamp(0, max)
+    }
+}
+
+impl Pixel for f32 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn from_i32_clamped(v: i32, bit_depth: u8) -> Self {
+        let max = (1i32 << bit_depth) - 1;
+        v.clamp(0, max) as f32
     }
 }
 

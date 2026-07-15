@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub(crate) static SCAN_4X4: [usize; 16] = [0, 4, 1, 2, 5, 8, 12, 9, 6, 3, 7, 10, 13, 14, 11, 15];
+pub(crate) static SCAN_4X4: [u32; 16] = [0, 4, 1, 2, 5, 8, 12, 9, 6, 3, 7, 10, 13, 14, 11, 15];
 pub(crate) static LO_CTX_2D: [[u8; 5]; 5] = [
     [0, 1, 6, 6, 21],
     [1, 6, 6, 21, 21],
