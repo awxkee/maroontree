@@ -132,6 +132,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
 
     let w = image_info.width;
     let h = image_info.height;
+    let (wu, hu) = (w as usize, h as usize);
     let bit_depth = image_info.bits_per_component as u32;
     let high_bit = bit_depth > 8;
     let is_12 = bit_depth >= 12;
@@ -146,6 +147,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
         transfer_characteristics: TransferCharacteristics::Srgb,
         full_range: true,
     });
+    let is_identity = cicp.matrix_coefficients == MatrixCoefficients::Identity;
     let matrix = match cicp.matrix_coefficients {
         MatrixCoefficients::Bt709 => YuvStandardMatrix::Bt709,
         MatrixCoefficients::Bt2020Ncl | MatrixCoefficients::Bt2020Cl => YuvStandardMatrix::Bt2020,
@@ -213,7 +215,38 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
         c_stride = w.div_ceil(sub_w);
         y_stride = w;
 
-        if is_ycgco {
+        if is_identity {
+            if image_info.pixel_layout != PixelLayout::I444 {
+                return Err(AvifError::Format(
+                    "identity matrix requires 4:4:4 chroma".into(),
+                ));
+            }
+            if let Some(a) = alpha16.as_deref() {
+                let mut out = Vec::with_capacity(wu * hu * 4);
+                for (((&g, &b), &r), &alpha) in y16.iter().zip(&cb16).zip(&cr16).zip(a) {
+                    out.extend_from_slice(&[r, g, b, alpha]);
+                }
+                let mut final_view = finalize::<u16, 4>(out, &image)?;
+                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                rgba16_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
+            } else {
+                let mut out = Vec::with_capacity(wu * hu * 3);
+                for ((&g, &b), &r) in y16.iter().zip(&cb16).zip(&cr16) {
+                    out.extend_from_slice(&[r, g, b]);
+                }
+                let mut final_view = finalize::<u16, 3>(out, &image)?;
+                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                rgb16_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
+            }
+        } else if is_ycgco {
             if let Some(a) = alpha16.as_deref() {
                 let yuva = YuvPlanarImageWithAlpha {
                     y_plane: &y16,
@@ -339,7 +372,47 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
         let cr8 = &image.planes[2];
         let alpha8: Option<&[u8]> = image.alpha.as_ref().map(|a| a.data.as_slice());
 
-        if is_ycgco {
+        if is_identity {
+            if image_info.pixel_layout != PixelLayout::I444 {
+                return Err(AvifError::Format(
+                    "identity matrix requires 4:4:4 chroma".into(),
+                ));
+            }
+            if let Some(a) = alpha8 {
+                let a_stride = image.alpha.as_ref().map(|x| x.stride).unwrap_or(w as usize);
+                let mut rgba = Vec::with_capacity(wu * hu * 4);
+                for row in 0..hu {
+                    let (yo, co, ao) = (
+                        row * y_stride as usize,
+                        row * c_stride as usize,
+                        row * a_stride,
+                    );
+                    for x in 0..wu {
+                        rgba.extend_from_slice(&[cr8[co + x], y8[yo + x], cb8[co + x], a[ao + x]]);
+                    }
+                }
+                let final_view = finalize::<u8, 4>(rgba, &image)?;
+                rgba8_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
+            } else {
+                let mut rgb = Vec::with_capacity(wu * hu * 3);
+                for row in 0..hu {
+                    let (yo, co) = (row * y_stride as usize, row * c_stride as usize);
+                    for x in 0..wu {
+                        rgb.extend_from_slice(&[cr8[co + x], y8[yo + x], cb8[co + x]]);
+                    }
+                }
+                let final_view = finalize::<u8, 3>(rgb, &image)?;
+                rgb8_image(
+                    final_view.width as u32,
+                    final_view.height as u32,
+                    final_view.data,
+                )?
+            }
+        } else if is_ycgco {
             if let Some(a) = alpha8 {
                 let yuv = YuvPlanarImageWithAlpha {
                     y_plane: y8,

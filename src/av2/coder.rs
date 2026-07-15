@@ -322,60 +322,107 @@ fn tok_cost(icdf: &[u16], s: usize) -> f32 {
 
 #[inline]
 fn rice_tail_bits(hr: u32) -> f32 {
-    2.0 * ((hr + 1) as f32).log2() + 2.0
+    const LUT_LEN: usize = 1 << 16;
+    static LUT: std::sync::OnceLock<Box<[f32; LUT_LEN]>> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        Box::new(std::array::from_fn(|hr| {
+            2.0 * ((hr + 1) as f32).log2() + 2.0
+        }))
+    });
+    lut.get(hr as usize)
+        .copied()
+        .unwrap_or_else(|| 2.0 * ((hr + 1) as f32).log2() + 2.0)
 }
 
-fn base_range_bits(level: u32, hi_range_ctx: usize, high_freq: bool, qc: usize) -> f32 {
+struct LumaRateTable {
+    base_lf: [[f32; 6]; 33],
+    eob_lf: [[f32; 5]; 4],
+    base_hf: [[f32; 4]; 20],
+    eob_hf: [[f32; 3]; 4],
+    br_lf: [[f32; 4]; 14],
+    br_hf: [[f32; 4]; 7],
+}
+
+impl LumaRateTable {
+    fn new(qc: usize) -> Self {
+        Self {
+            base_lf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&LUMA32_BASE_TOK_LF_QC[qc][ctx], symbol))
+            }),
+            eob_lf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&LUMA32_EOB_TOK_LF_QC[qc][ctx], symbol))
+            }),
+            base_hf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&LUMA32_BASE_TOK_HF_QC[qc][ctx], symbol))
+            }),
+            eob_hf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&LUMA32_EOB_TOK_HF_QC[qc][ctx], symbol))
+            }),
+            br_lf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&BR_TOK_QC[qc][ctx], symbol))
+            }),
+            br_hf: std::array::from_fn(|ctx| {
+                std::array::from_fn(|symbol| tok_cost(&BR_TOK_HF_QC[qc][ctx], symbol))
+            }),
+        }
+    }
+}
+
+#[inline]
+fn luma_rate_table(qc: usize) -> &'static LumaRateTable {
+    static TABLES: std::sync::OnceLock<[LumaRateTable; 4]> = std::sync::OnceLock::new();
+    &TABLES.get_or_init(|| std::array::from_fn(LumaRateTable::new))[qc]
+}
+
+#[inline]
+fn base_range_bits(level: u32, hi_range_ctx: usize, high_freq: bool, rates: &LumaRateTable) -> f32 {
     let limit = if high_freq { 3u32 } else { 5u32 };
     let over = level - limit;
-    let cdf: &[u16] = if high_freq {
-        &BR_TOK_HF_QC[qc][hi_range_ctx]
+    let costs = if high_freq {
+        &rates.br_hf[hi_range_ctx]
     } else {
-        &BR_TOK_QC[qc][hi_range_ctx]
+        &rates.br_lf[hi_range_ctx]
     };
     if over <= 2 {
-        tok_cost(cdf, over as usize)
+        costs[over as usize]
     } else {
-        tok_cost(cdf, 3) + rice_tail_bits(level - (limit + 3))
+        costs[3] + rice_tail_bits(level - (limit + 3))
     }
 }
 
 /// Estimated bits to code a luma coefficient of magnitude `level` at the given
 /// context, matching `encode_luma32_token`. ~1-bit sign for nonzero levels.
+#[inline]
 fn luma_level_bits(
     level: u32,
     is_eob: bool,
     base_ctx: usize,
     hi_range_ctx: usize,
     high_freq: bool,
-    qc: usize,
+    rates: &LumaRateTable,
 ) -> f32 {
     let mut bits = if !high_freq {
         if is_eob {
             if level <= 4 {
-                tok_cost(&LUMA32_EOB_TOK_LF_QC[qc][base_ctx], (level - 1) as usize)
+                rates.eob_lf[base_ctx][(level - 1) as usize]
             } else {
-                tok_cost(&LUMA32_EOB_TOK_LF_QC[qc][base_ctx], 4)
-                    + base_range_bits(level, hi_range_ctx, false, qc)
+                rates.eob_lf[base_ctx][4] + base_range_bits(level, hi_range_ctx, false, rates)
             }
         } else if level <= 4 {
-            tok_cost(&LUMA32_BASE_TOK_LF_QC[qc][base_ctx], level as usize)
+            rates.base_lf[base_ctx][level as usize]
         } else {
-            tok_cost(&LUMA32_BASE_TOK_LF_QC[qc][base_ctx], 5)
-                + base_range_bits(level, hi_range_ctx, false, qc)
+            rates.base_lf[base_ctx][5] + base_range_bits(level, hi_range_ctx, false, rates)
         }
     } else if is_eob {
         if level <= 2 {
-            tok_cost(&LUMA32_EOB_TOK_HF_QC[qc][base_ctx], (level - 1) as usize)
+            rates.eob_hf[base_ctx][(level - 1) as usize]
         } else {
-            tok_cost(&LUMA32_EOB_TOK_HF_QC[qc][base_ctx], 2)
-                + base_range_bits(level, hi_range_ctx, true, qc)
+            rates.eob_hf[base_ctx][2] + base_range_bits(level, hi_range_ctx, true, rates)
         }
     } else if level <= 2 {
-        tok_cost(&LUMA32_BASE_TOK_HF_QC[qc][base_ctx], level as usize)
+        rates.base_hf[base_ctx][level as usize]
     } else {
-        tok_cost(&LUMA32_BASE_TOK_HF_QC[qc][base_ctx], 3)
-            + base_range_bits(level, hi_range_ctx, true, qc)
+        rates.base_hf[base_ctx][3] + base_range_bits(level, hi_range_ctx, true, rates)
     };
     if level > 0 {
         bits += 1.0;
@@ -405,8 +452,9 @@ pub(crate) fn rdoq_luma(
     if lev[eob] == 0.0 {
         return 0.0;
     }
+    let rates = luma_rate_table(qc);
     let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
+    let mut levels = [0i32; PLVL_BUF];
 
     let ctx_at = |levels: &[i32], k: usize, is_eob: bool| -> (usize, usize) {
         if is_eob {
@@ -445,7 +493,7 @@ pub(crate) fn rdoq_luma(
         let mut best_cost = f32::INFINITY;
         for l in lo..=hi {
             let d = (a - l as f32) * (a - l as f32);
-            let r = luma_level_bits(l, is_eob, bc, hc, high_freq, qc);
+            let r = luma_level_bits(l, is_eob, bc, hc, high_freq, rates);
             let cost = d + lambda * r;
             if cost < best_cost {
                 best_cost = cost;
@@ -454,7 +502,7 @@ pub(crate) fn rdoq_luma(
         }
         lev[k] = best_l as f32 * lev[k].signum();
         store(&mut levels, k, best_l as i32);
-        total_bits += luma_level_bits(best_l, is_eob, bc, hc, high_freq, qc);
+        total_bits += luma_level_bits(best_l, is_eob, bc, hc, high_freq, rates);
     }
 
     // Phase B: EOB RD-trim.
@@ -472,7 +520,7 @@ pub(crate) fn rdoq_luma(
         let high_freq = p >= LUMA_HI_TO_LOW;
         let (bc, hc) = ctx_at(&levels, p, true);
         let a = prm[p];
-        let drop_bits = luma_level_bits(lev[p].abs() as u32, true, bc, hc, high_freq, qc);
+        let drop_bits = luma_level_bits(lev[p].abs() as u32, true, bc, hc, high_freq, rates);
         if lambda * drop_bits > a * a {
             lev[p] = 0.0;
             let rc = scan[p] as i32;
@@ -575,7 +623,7 @@ pub(crate) fn rdoq_chroma(
         return 0.0;
     }
     let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
+    let mut levels = [0i32; PLVL_BUF];
 
     // Context for a coefficient at scan position `k`. For EOB the chroma model
     // uses a fixed DC context (0) or the HF eob-position bucket; for non-EOB it
@@ -653,12 +701,35 @@ pub(crate) fn rdoq_chroma(
     total_bits
 }
 
-fn level_at(coeffs: &[Coeff], scan_pos: usize) -> i32 {
-    coeffs
-        .iter()
-        .find(|&&(s, _)| s == scan_pos)
-        .map(|&(_, l)| l)
-        .unwrap_or(0)
+struct ReverseCoeffCursor<'a> {
+    coeffs: &'a [Coeff],
+    next: usize,
+}
+
+impl<'a> ReverseCoeffCursor<'a> {
+    #[inline]
+    fn new(coeffs: &'a [Coeff]) -> Self {
+        debug_assert!(coeffs.windows(2).all(|w| w[0].0 < w[1].0));
+        Self {
+            coeffs,
+            next: coeffs.len(),
+        }
+    }
+
+    #[inline]
+    fn level_at(&mut self, scan_pos: usize) -> i32 {
+        if self.next == 0 {
+            return 0;
+        }
+        let &(pos, level) = &self.coeffs[self.next - 1];
+        debug_assert!(pos <= scan_pos);
+        if pos == scan_pos {
+            self.next -= 1;
+            level
+        } else {
+            0
+        }
+    }
 }
 
 #[rustfmt::skip]
@@ -1734,11 +1805,12 @@ fn encode_chroma_tokens_scan_w(
     let height = area >> bwl;
     let t1 = (height << bwl) / 8;
     let t2 = (height << bwl) / 4;
-    let mut levels = vec![0u8; PLVL_BUF];
-    let mut stored: Vec<ChromaStored> = vec![];
+    let mut levels = [0u8; PLVL_BUF];
+    let mut stored = Vec::with_capacity(coeffs.len());
+    let mut coeff_cursor = ReverseCoeffCursor::new(coeffs);
     let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
-        let level = level_at(coeffs, scan_pos);
+        let level = coeff_cursor.level_at(scan_pos);
         let rc = scan[scan_pos] as usize;
         let row = rc >> bwl;
         let col = rc & mask;
@@ -1768,7 +1840,9 @@ fn encode_chroma_tokens_scan_w(
         };
         let sl = encode_chroma4_token(enc, mag, is_eob, base_ctx, hi_ctx, lf);
         levels[pidx_w(rc, bwl)] = sl as u8;
-        stored.push((level, !lf));
+        if level != 0 {
+            stored.push((level, !lf));
+        }
     }
     stored
 }
@@ -2006,11 +2080,12 @@ fn encode_luma16_tokens_scan_w(
     bwl: i32,
 ) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
-    let mut stored: Vec<LumaStored> = vec![];
+    let mut levels = [0i32; PLVL_BUF];
+    let mut stored = Vec::with_capacity(coeffs.len());
+    let mut coeff_cursor = ReverseCoeffCursor::new(coeffs);
     let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
-        let level = level_at(coeffs, scan_pos);
+        let level = coeff_cursor.level_at(scan_pos);
         let rc = scan[scan_pos] as i32;
         let x = rc >> bwl;
         let y = rc & mask;
@@ -2035,7 +2110,9 @@ fn encode_luma16_tokens_scan_w(
         };
         let stored_level = encode_luma16_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
         levels[plvl_w(rc, bwl) as usize] = stored_level;
-        stored.push((rc, x, y, level, high_freq));
+        if level != 0 {
+            stored.push((rc, x, y, level, high_freq));
+        }
     }
     stored
 }
@@ -2187,11 +2264,12 @@ fn encode_luma8_tokens_scan_w(
     bwl: i32,
 ) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
-    let mut stored: Vec<LumaStored> = vec![];
+    let mut levels = [0i32; PLVL_BUF];
+    let mut stored = Vec::with_capacity(coeffs.len());
+    let mut coeff_cursor = ReverseCoeffCursor::new(coeffs);
     let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
-        let level = level_at(coeffs, scan_pos);
+        let level = coeff_cursor.level_at(scan_pos);
         let rc = scan[scan_pos] as i32;
         let x = rc >> bwl;
         let y = rc & mask;
@@ -2216,7 +2294,9 @@ fn encode_luma8_tokens_scan_w(
         };
         let stored_level = encode_luma8_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
         levels[plvl_w(rc, bwl) as usize] = stored_level;
-        stored.push((rc, x, y, level, high_freq));
+        if level != 0 {
+            stored.push((rc, x, y, level, high_freq));
+        }
     }
     stored
 }
@@ -2370,11 +2450,12 @@ fn encode_luma_tokens_scan_w(
     bwl: i32,
 ) -> Vec<LumaStored> {
     let (th1, th2) = (area / 8, area / 4);
-    let mut levels = vec![0i32; PLVL_BUF];
-    let mut stored: Vec<LumaStored> = vec![];
+    let mut levels = [0i32; PLVL_BUF];
+    let mut stored = Vec::with_capacity(coeffs.len());
+    let mut coeff_cursor = ReverseCoeffCursor::new(coeffs);
     let mask = (1 << bwl) - 1;
     for scan_pos in (0..=eob).rev() {
-        let level = level_at(coeffs, scan_pos);
+        let level = coeff_cursor.level_at(scan_pos);
         let rc = scan[scan_pos] as i32;
         let x = rc >> bwl;
         let y = rc & mask;
@@ -2399,7 +2480,9 @@ fn encode_luma_tokens_scan_w(
         };
         let stored_level = encode_luma32_token(enc, mag, is_eob, base_ctx, hi_range_ctx, high_freq);
         levels[plvl_w(rc, bwl) as usize] = stored_level;
-        stored.push((rc, x, y, level, high_freq));
+        if level != 0 {
+            stored.push((rc, x, y, level, high_freq));
+        }
     }
     stored
 }

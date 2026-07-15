@@ -47,12 +47,15 @@ pub(super) fn tile_grid_for(
         k
     };
     let (mut lc, mut lr) = (log2(tile_cols.max(1)), log2(tile_rows.max(1)));
-    // AV2 computes maxLog2Tile{Cols,Rows} from the CEIL SB count. In particular, a
-    // partial final SB is a real tile candidate; clamping against only full SBs silently
-    // reduced grids such as 484px/8 requested tiles to four tiles.
-    let (sbc, sbr) = (width.div_ceil(64).max(1), height.div_ceil(64).max(1));
-    lc = lc.min(log2(sbc.min(64)));
-    lr = lr.min(log2(sbr.min(64)));
+    // A uniform tile needs at least one complete SB on every non-final span.
+    // Do not count the partial last SB when clamping the requested power-of-two
+    // count: allowing tile_sbs == 0 makes the encoder and consumers disagree on
+    // the number of tile payloads for sizes such as 453x604. This direct clamp
+    // retains the largest valid power-of-two grid (4x8 for that example).
+    let floor_log2 = |n: usize| usize::BITS as usize - 1 - n.max(1).leading_zeros() as usize;
+    let full_sbs = |dim: usize| ((dim + 7) >> 6).clamp(1, 64);
+    lc = lc.min(floor_log2(full_sbs(width)));
+    lr = lr.min(floor_log2(full_sbs(height)));
     if lc == 0 && lr == 0 {
         return None;
     }
@@ -295,7 +298,7 @@ mod tests {
         // 484 px -> 122 mi -> 7 full SBs plus one partial SB. AV2's tileSb==0
         // branch gives all eight existing SBs their own tile.
         assert_eq!(tile_starts(484, 3), (0usize..=8).collect::<Vec<_>>());
-        assert_eq!(tile_grid_for(8, 1, 484, 64), Some((3, 0)));
+        assert_eq!(tile_grid_for(8, 1, 484, 64), Some((2, 0)));
     }
 
     #[test]
@@ -308,7 +311,16 @@ mod tests {
     #[test]
     fn requested_grid_and_emitted_tile_count_stay_in_sync() {
         let grid = tile_grid_for(8, 8, 484, 484).unwrap();
-        assert_eq!(grid, (3, 3));
-        assert_eq!(tile_specs(484, 484, grid.0, grid.1).len(), 64);
+        assert_eq!(grid, (2, 2));
+        assert_eq!(tile_specs(484, 484, grid.0, grid.1).len(), 16);
+    }
+
+    #[test]
+    fn excessive_request_clamps_to_complete_superblocks() {
+        let grid = tile_grid_for(8, 8, 453, 604).unwrap();
+        assert_eq!(grid, (2, 3));
+        let specs = tile_specs(453, 604, grid.0, grid.1);
+        assert_eq!(specs.len(), 32);
+        assert!(specs.iter().all(|&(_, _, w, h)| w != 0 && h != 0));
     }
 }
