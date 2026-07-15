@@ -86,7 +86,9 @@ fn encode_alpha<T: Pixel>(
 
 /// Choose a tile grid. Tiles are maroontree's only unit of thread parallelism (the
 /// superblock loop is serial within a tile), so use about as many tiles as threads
-/// — but keep each tile at least ~512 px per side. Tiny tiles waste bits: every
+/// — but keep each tile at least ~256 px per side. `tile_grid_for` clamps an
+/// excessive request to the largest grid supported by the frame's complete
+/// superblocks. Tiny tiles waste bits: every
 /// tile resets the entropy contexts and cannot predict across its boundary, costing
 /// ~40 bytes each, so the old fixed 8x8 = 64 tiles threw away ~2.5 KB on a 1 MP
 /// frame (≈27% of the file at very low bitrate).
@@ -99,8 +101,8 @@ fn auto_tiles(width: usize, height: usize, threads: usize) -> (usize, usize) {
         threads
     }
     .max(1);
-    let tc = width.div_ceil(512).clamp(1, t);
-    let tr = height.div_ceil(512).clamp(1, t.div_ceil(tc));
+    let tc = width.div_ceil(256).clamp(1, t);
+    let tr = height.div_ceil(256).clamp(1, t.div_ceil(tc));
     (tc, tr)
 }
 

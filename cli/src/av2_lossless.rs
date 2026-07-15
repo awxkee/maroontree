@@ -31,10 +31,13 @@ use maroontree::{
     Av2Encoder, BitDepth, ChromaSamplePosition, Cicp, MatrixCoefficients, Orientation, PlanarImage,
     Primaries, TransferFunction, TxPart,
 };
-use yuv::{
-    YuvChromaSubsampling, YuvPlanarImageMut, YuvRange, rgb_to_ycgco444, rgb10_to_icgc410,
-    rgba12_to_icgc412,
-};
+
+fn lossless_tiles(width: usize, height: usize, threads: usize) -> (usize, usize) {
+    let workers = threads.max(1);
+    let cols = width.div_ceil(256).clamp(1, workers);
+    let rows = height.div_ceil(256).clamp(1, workers.div_ceil(cols));
+    (cols, rows)
+}
 
 fn extract_alpha<T: Copy + Default>(rgba: &[T], w: usize, h: usize) -> Vec<T> {
     let npx = w * h;
@@ -61,7 +64,7 @@ pub(crate) fn encode_av2_lossless_image(
     let color = Cicp {
         primaries: Primaries::Bt709,
         transfer: TransferFunction::Srgb,
-        matrix: MatrixCoefficients::YCgCo,
+        matrix: MatrixCoefficients::Identity,
         full_range: true,
         chroma_sample_position: ChromaSamplePosition::Unknown,
     };
@@ -70,6 +73,7 @@ pub(crate) fn encode_av2_lossless_image(
         return Err("Chroma mode is not supported for lossless".into());
     }
 
+    let (tile_cols, tile_rows) = lossless_tiles(w, h, args.threads);
     let enc = Av2Encoder::with_bit_depth(
         0,
         match effective_depth {
@@ -78,7 +82,7 @@ pub(crate) fn encode_av2_lossless_image(
             Depth::D12 => 12,
         },
     )
-    .with_tiles(8, 8)
+    .with_tiles(tile_cols, tile_rows)
     .with_txpart(TxPart::ThreeWay)
     .with_speed(args.speed.to_maroontreee())
     .with_threads(args.threads);
@@ -90,7 +94,7 @@ pub(crate) fn encode_av2_lossless_image(
             Depth::D12 => 12,
         },
     )
-    .with_tiles(8, 8)
+    .with_tiles(tile_cols, tile_rows)
     .with_txpart(TxPart::ThreeWay)
     .with_speed(args.speed.to_maroontreee())
     .with_threads(args.threads);
@@ -121,64 +125,21 @@ pub(crate) fn encode_av2_lossless_image(
 
     let encode_color_8 = || -> Result<_, anyhow::Error> {
         let rgb8 = img.to_rgb8();
-        let mut planar_image =
-            YuvPlanarImageMut::alloc(rgb8.width(), rgb8.height(), YuvChromaSubsampling::Yuv444);
-        rgb_to_ycgco444(&mut planar_image, &rgb8, rgb8.width() * 3, YuvRange::Full)
-            .map_err(|x| anyhow::anyhow!(x))?;
-        let planar_image = PlanarImage {
-            width: rgb8.width() as usize,
-            height: rgb8.height() as usize,
-            bit_depth: BitDepth::Eight,
-            planes: [
-                planar_image.y_plane.borrow().to_vec(),
-                planar_image.u_plane.borrow().to_vec(),
-                planar_image.v_plane.borrow().to_vec(),
-                vec![],
-            ],
-        };
+        let planar_image = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, rgb8.as_raw())?;
         enc.encode_image_444(&planar_image, &color)
             .map_err(|x| anyhow::anyhow!(x))
     };
 
     let encode_color_16 = |bit_depth: u8| -> Result<_, anyhow::Error> {
         let diff = 16 - bit_depth;
-        let mut planar_image: YuvPlanarImageMut<u16>;
-        if bit_depth == 10 {
-            planar_image =
-                YuvPlanarImageMut::alloc(img.width(), img.height(), YuvChromaSubsampling::Yuv444);
-            let rgb16 = img.to_rgb16();
-            let rgb_data = rgb16.iter().map(|&x| x >> diff).collect::<Vec<_>>();
-            rgb10_to_icgc410(
-                &mut planar_image,
-                &rgb_data,
-                rgb16.width() * 3,
-                YuvRange::Full,
-            )
-            .map_err(|x| anyhow::anyhow!(x))?;
+        let rgb16 = img.to_rgb16();
+        let rgb_data = rgb16.iter().map(|&x| x >> diff).collect::<Vec<_>>();
+        let depth = if bit_depth == 10 {
+            BitDepth::Ten
         } else {
-            planar_image =
-                YuvPlanarImageMut::alloc(img.width(), img.height(), YuvChromaSubsampling::Yuv444);
-            let rgb16 = img.to_rgba16();
-            let rgb_data = rgb16.iter().map(|&x| x >> diff).collect::<Vec<_>>();
-            rgba12_to_icgc412(
-                &mut planar_image,
-                &rgb_data,
-                rgb16.width() * 4,
-                YuvRange::Full,
-            )
-            .map_err(|x| anyhow::anyhow!(x))?;
-        }
-        let planar_image = PlanarImage {
-            width: img.width() as usize,
-            height: img.height() as usize,
-            bit_depth: BitDepth::Eight,
-            planes: [
-                planar_image.y_plane.borrow().to_vec(),
-                planar_image.u_plane.borrow().to_vec(),
-                planar_image.v_plane.borrow().to_vec(),
-                vec![],
-            ],
+            BitDepth::Twelve
         };
+        let planar_image = PlanarImage::from_interleaved_rgb(w, h, depth, &rgb_data)?;
         enc.encode_image_444(&planar_image, &color)
             .map_err(|x| anyhow::anyhow!(x))
     };
@@ -194,7 +155,7 @@ pub(crate) fn encode_av2_lossless_image(
                 None,
             )?)
         } else {
-            let a = extract_alpha(&scale16_to_10(img.to_rgba16().as_raw()), w, h);
+            let a = extract_alpha(img.to_rgba8().as_raw(), w, h);
             let frame = encode_color_8()?;
             let alpha_frame = alpha_enc
                 .encode_yuv400(&PlanarImage::from_luma(w, h, BitDepth::Eight, &a)?, &color)?;
