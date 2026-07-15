@@ -20,10 +20,9 @@ rust-version = "1.93.0"
 [dependencies]
 
 [features]
-default = ["video", "neon", "avx"]
+default = ["neon", "avx"]
 neon = []
 avx = []
-video = []
 
 [profile.release]
 debug = "full"
