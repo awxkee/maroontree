@@ -27,8 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::av1_coefs::encode_coefs;
 use crate::cdf_tables as C;
+use crate::coefs::encode_coefs;
 use crate::cost::coef_rate_bits;
 use crate::intrapred::INTRA_MODE_CTX;
 use crate::msac_enc::Writer;

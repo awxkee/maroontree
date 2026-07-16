@@ -788,6 +788,7 @@ pub(crate) fn emit_inter_residual_block(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, 1); // GLOBALMV
     // tx partition: SPLIT (do_partition=1, type=0) -> four TX_32X32.
 
@@ -865,6 +866,7 @@ pub(crate) fn emit_inter_newmv_residual_block(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, mode); // 0=NEARMV, 2=NEWMV
     enc.emit_drl(drl_ctx, 0);
     if mode == 2 {
@@ -924,6 +926,7 @@ pub(crate) fn emit_inter_residual_leaf_32(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, mode);
     enc.emit_drl(drl_ctx, 0);
     if mode == 2 {
@@ -998,6 +1001,7 @@ pub(crate) fn emit_inter_residual_leaf_16(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, mode);
     enc.emit_drl(drl_ctx, 0);
     if mode == 2 {
@@ -1087,6 +1091,7 @@ pub(crate) fn emit_inter_newmv_residual_block_multi(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, mode); // 0=NEARMV, 2=NEWMV
     enc.emit_drl(drl_ctx, 0);
     if mode == 2 {
@@ -1161,6 +1166,7 @@ pub(crate) fn emit_inter_mode_leaf(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, mode);
     // DRL idx=0 (max_drl_bits=1): one drl bit = 0.
     enc.emit_drl(drl_ctx, 0);
@@ -1175,6 +1181,33 @@ pub(crate) fn emit_inter_mode_leaf(
     }
     if scaled_col != 0 {
         enc.encode_bypass((scaled_col < 0) as u32, 1);
+    }
+}
+
+/// av2_get_ref_pred_context at rank granularity. The line-buffer neighbors
+/// resolve to the left and above blocks (AVM scans bottom-left → above-right →
+/// left → above and keeps the first two, and both pairs land in the same
+/// neighbor block at our coding granularities); when only one side is
+/// available it fills both slots, so it counts twice. `None` = side
+/// unavailable, `Some(None)` = intra neighbor, `Some(Some(rank))` = inter
+/// neighbor predicting from `rank`.
+pub(crate) fn single_ref_bit_ctx(
+    above: Option<Option<usize>>,
+    left: Option<Option<usize>>,
+) -> usize {
+    let mut counts = [0u32; 2];
+    let weight = if above.is_some() && left.is_some() {
+        1
+    } else {
+        2
+    };
+    for rank in [above, left].into_iter().flatten().flatten() {
+        counts[rank.min(1)] += weight;
+    }
+    match counts[0].cmp(&counts[1]) {
+        std::cmp::Ordering::Less => 0,
+        std::cmp::Ordering::Equal => 1,
+        std::cmp::Ordering::Greater => 2,
     }
 }
 
@@ -1212,7 +1245,9 @@ pub(crate) fn emit_inter_skip_leaf(
         emit_delta_q(enc, enc.delta_q_signaled);
         enc.delta_q_pending = false;
     }
-    // single-ref: tip 0b, reference_mode SINGLE 0b, read_single_ref 0b (n_refs=1).
+    // tip 0b, reference_mode SINGLE 0b; read_single_ref codes one bit when the
+    // frame lists two references (none for n_refs=1).
+    enc.emit_single_ref_rank();
     enc.emit_inter_single_mode(mode_ctx, 1); // GLOBALMV
     // motion_mode SIMPLE_TRANSLATION 0b; interp_filter non-switchable 0b.
 }

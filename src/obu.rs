@@ -216,6 +216,7 @@ fn frame_header_lossless_impl(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn frame_header_lossy_multitile(
     base_q_idx: u8,
+    qm: crate::quant::QmLevels,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
@@ -227,6 +228,7 @@ pub(crate) fn frame_header_lossy_multitile(
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
+        qm,
         cols_incr,
         rows_incr,
         false,
@@ -243,6 +245,7 @@ pub(crate) fn frame_header_lossy_multitile(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn frame_header_lossy_multitile_th(
     base_q_idx: u8,
+    qm: crate::quant::QmLevels,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
@@ -254,6 +257,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
+        qm,
         cols_incr,
         rows_incr,
         false,
@@ -313,9 +317,12 @@ fn write_cdef_params(w: &mut BitWriter, cdef: &CdefParams, mono: bool) {
     w.f(cdef.bits as u32, 2); // cdef_bits
     let n = 1usize << cdef.bits;
     let map_sec = |s: u8| -> u32 {
-        // spec: cdef_y_sec_strength; if it is 3 it becomes 4 (skip value 3).
+        // `s` is the ACTUAL secondary strength (0, 1, 2 or 4); the spec codes 4
+        // as field value 3 (decoder: `if (v == 3) v += 1`). 3 itself is not a
+        // valid strength.
+        debug_assert_ne!(s, 3, "secondary strength 3 is not codable");
         let v = s as u32;
-        if v == 3 { 4 } else { v }
+        if v == 4 { 3 } else { v }
     };
     for i in 0..n {
         let (yp, ys, up, us) = cdef.strengths.get(i).copied().unwrap_or((0, 0, 0, 0));
@@ -365,6 +372,7 @@ fn write_lr_params(w: &mut BitWriter, lr: &LrParams, num_planes: usize) {
 #[allow(clippy::too_many_arguments)]
 fn frame_header_lossy_impl(
     base_q_idx: u8,
+    qm: crate::quant::QmLevels,
     cols_incr: &[bool],
     rows_incr: &[bool],
     disable_cdf_update: bool,
@@ -409,7 +417,15 @@ fn frame_header_lossy_impl(
         }
         w.flag(false); // DeltaQUAc delta_coded (== 0)
     }
-    w.flag(false); // using_qmatrix
+    let using_qmatrix = qm.y < 15 || qm.u < 15 || qm.v < 15;
+    w.flag(using_qmatrix);
+    if using_qmatrix {
+        w.f(qm.y as u32, 4);
+        w.f(qm.u as u32, 4);
+        // All sequence headers emitted here set separate_uv_delta_q = 0, so
+        // qm_v is inferred from qm_u and is not present in the bitstream.
+        debug_assert_eq!(qm.v, qm.u);
+    }
     // segmentation_params()
     w.flag(false); // segmentation_enabled
     // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded). When
@@ -418,7 +434,7 @@ fn frame_header_lossy_impl(
     // delta_lf_present flag is coded and we leave loop-filter deltas off).
     if aq {
         w.flag(true); // delta_q_present = 1
-        w.f(crate::av1_coder::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
+        w.f(crate::coder::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
         w.flag(false); // delta_lf_present = 0
     } else {
         w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
@@ -478,12 +494,23 @@ pub(crate) fn sequence_header_cicp(
     profile: u32,
     bit_depth: u8,
     color: Option<&crate::color::Cicp>,
+    enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
-    seq_header_ss(width, height, profile, bit_depth, color, 0, 0)
+    seq_header_ss(
+        width,
+        height,
+        profile,
+        bit_depth,
+        color,
+        0,
+        0,
+        enable_intra_edge_filter,
+    )
 }
 
 /// Like [`sequence_header_cicp`] but with explicit chroma subsampling flags:
 /// `(ss_x, ss_y)` = `(0,0)` → 4:4:4, `(1,0)` → 4:2:2, `(1,1)` → 4:2:0.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sequence_header_cicp_ss(
     width: u32,
     height: u32,
@@ -492,8 +519,18 @@ pub(crate) fn sequence_header_cicp_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
-    seq_header_ss(width, height, profile, bit_depth, color, ss_x, ss_y)
+    seq_header_ss(
+        width,
+        height,
+        profile,
+        bit_depth,
+        color,
+        ss_x,
+        ss_y,
+        enable_intra_edge_filter,
+    )
 }
 
 /// Monochrome (`mono_chrome = 1`, `NumPlanes = 1`) sequence header — a single
@@ -507,6 +544,7 @@ pub(crate) fn sequence_header_mono(
     height: u32,
     bit_depth: u8,
     full_range: bool,
+    enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     let profile: u32 = if bit_depth == 12 { 2 } else { 0 };
     let mut w = BitWriter::new();
@@ -524,7 +562,7 @@ pub(crate) fn sequence_header_mono(
 
     w.flag(false); // use_128x128_superblock
     w.flag(false); // enable_filter_intra
-    w.flag(false); // enable_intra_edge_filter
+    w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
     w.flag(true); // enable_restoration (loop restoration: luma Wiener)
@@ -557,6 +595,7 @@ pub(crate) fn sequence_header_mono(
 /// MC_IDENTITY path is unreachable, so `color_range` and the subsampling/CSP
 /// bits are always coded; `color_range` defaults to limited (0) and
 /// `chroma_sample_position` to CSP_UNKNOWN (0).
+#[allow(clippy::too_many_arguments)]
 fn seq_header_ss(
     width: u32,
     height: u32,
@@ -565,6 +604,7 @@ fn seq_header_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     use crate::color::MatrixCoefficients;
     let mut w = BitWriter::new();
@@ -583,7 +623,7 @@ fn seq_header_ss(
 
     w.flag(false); // use_128x128_superblock
     w.flag(false); // enable_filter_intra
-    w.flag(false); // enable_intra_edge_filter
+    w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
     w.flag(true); // enable_restoration (loop restoration: luma Wiener)

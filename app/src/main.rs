@@ -29,18 +29,19 @@
 mod y4m2ivf;
 
 use maroontree::{
-    Av2Encoder, BitDepth, Cicp, Orientation, PlanarImage, Speed, TxPart, av2_map_quality,
+    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
+    TxPart, encode_rgb10,
 };
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
-    y4m2ivf::convert(
-        "./assets/file_example_MP4_480_1_5MG.y4m".to_string(),
-        "./file_example_MP4_480_1_5MG.ivf".to_string(),
-        av2_map_quality(60),
-    );
+    // y4m2ivf::convert(
+    //     "./assets/file_example_MP4_480_1_5MG.y4m".to_string(),
+    //     "./file_example_MP4_480_1_5MG.ivf".to_string(),
+    //     av2_map_quality(70),
+    // );
     // let (w, h) = (64usize, 64usize);
     // let mut rgb = vec![0u8; w * h * 3];
     // for y in 0..h {
@@ -55,7 +56,9 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    /*let img = image::open("./assets/spring_tree.png").unwrap().to_rgb8();
+    let img = image::open("./assets/biddhabrot3_small.png")
+        .unwrap()
+        .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -63,24 +66,25 @@ fn main() {
         &img.iter().map(|&x| (x as u16) << 2).collect::<Vec<u16>>(),
     )
     .unwrap();
-    for i in 0..15 {
+    for _i in 0..15 {
         let instant = Instant::now();
         let out = encode_rgb10(
             &planar_rgb,
             &EncodeConfig::new()
-                .with_quality(60)
+                .with_quality(67)
                 .with_cicp(Cicp::srgb_ycbcr())
-                .with_chroma(ChromaFormat::Yuv422)
-                .with_speed(Speed::Medium)
+                .with_chroma(ChromaFormat::Yuv444)
+                .with_speed(Speed::Slow)
                 .with_threads(12)
-                .with_variance_boost(true)
-                .with_cdef(false),
+                .with_variance_boost(true),
+            // .with_cdef(true)
+            // .with_wiener(true),
         )
         .unwrap();
         println!("encoding time {:?}", instant.elapsed());
-        fs::write("./out.avif", out).unwrap();
-    }*/
-    let img = image::open("./assets/manhattan.png")
+        std::fs::write("./out.avif", out).unwrap();
+    }
+    let img = image::open("./assets/dst_000.png")
         .unwrap()
         // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
@@ -91,7 +95,7 @@ fn main() {
         &img,
     )
     .unwrap();
-    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(60), 8)
+    let av2_encoder = Av2Encoder::with_bit_depth(0, 8)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)

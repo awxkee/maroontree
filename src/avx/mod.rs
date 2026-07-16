@@ -41,6 +41,6 @@ pub(crate) use idct::{
     iadst_dequant_16x16_avx2, iadstdct_dequant_16x16_avx2, idct_dequant_8x8_avx2,
     idct_dequant_16x16_avx2, idct_dequant_32x32_avx2, idctadst_dequant_16x16_avx2,
 };
-pub(crate) use rd::{residual_dc_avx2, residual_pred_avx2, sse_recon_avx2, sse_recon_dc_avx2};
+pub(crate) use rd::{residual_dc_avx2, residual_pred_avx2, sse_recon_avx2};
 pub(crate) use trellis::{trellis_dist_current_zero_scan_avx2, trellis_round_down_scan_avx2};
 pub(crate) use wht::fwht_raw_avx2;

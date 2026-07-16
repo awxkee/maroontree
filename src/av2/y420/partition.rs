@@ -38,6 +38,10 @@ const ENABLE_DENSE_INTER_16: bool = true;
 #[cfg(test)]
 pub(crate) static INTER_SKIP_32_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Whole-64 GLOBALMV-skip blocks committed on reference rank 1 (partition walk).
+#[cfg(test)]
+pub(crate) static PARTITION_SKIP_RANK1_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static INTER_SKIP_RECT_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -167,6 +171,9 @@ struct WfScratch420 {
     mva: Vec<Option<Mv>>,
     ska: Vec<u8>,
     ina: Vec<u8>,
+    rfa: Vec<u8>,   // SB-granular reference rank (above)
+    rfmia: Vec<u8>, // mi-granular reference rank (above)
+    rfmil: Vec<u8>, // mi-granular reference rank (left)
     dbq: Vec<u16>,
     me: me::MeScratch<f32>,
     inter_pred: InterPredScratch420,
@@ -292,6 +299,12 @@ struct Sb420Decision<'a, 'record> {
     mv_above: &'a mut [Option<Mv>],
     skip_above: &'a mut [u8],
     inter_above: &'a mut [u8],
+    // Reference rank grids for two-reference frames (meaningful where the inter
+    // grid is 1). SB-granular for the whole-64 skip mode ctx; mi-granular for
+    // the per-block single_ref bit context read by every leaf.
+    ref_above: &'a mut [u8],
+    ref_mi_above: &'a mut [u8],
+    ref_mi_left: &'a mut [u8],
     tx_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
     skip_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
     sb_qidx: &'a mut [u16],
@@ -301,6 +314,10 @@ struct Sb420Decision<'a, 'record> {
     ref_ls: usize,
     ref_cs: usize,
     has_last: bool,
+    // Rank-1 reference planes (raw f32 Y,U,V) for the zero-motion skip mode on
+    // two-reference frames; empty when the frame lists a single reference.
+    second_ref: &'a [Vec<f32>],
+    has_second: bool,
     inter_luma: Option<&'a (Vec<f32>, usize, usize)>,
     inter_chroma: Option<&'a [(Vec<f32>, usize); 2]>,
     me_scratch: &'a mut me::MeScratch<f32>,
@@ -323,6 +340,7 @@ struct Sb420Decision<'a, 'record> {
     inter_left: u8,
     newmv_left: u8,
     mv_left: Option<Mv>,
+    ref_left: u8,
     row: usize,
     col: usize,
 }
@@ -370,6 +388,9 @@ impl WfScratch420 {
         self.mva.resize(sb_cols.max(1), None);
         self.ska.resize(sb_cols.max(1), 0);
         self.ina.resize(sb_cols.max(1), 0);
+        self.rfa.resize(sb_cols.max(1), 0);
+        self.rfmia.resize(mc, 0);
+        self.rfmil.resize(mr, 0);
         self.dbq.resize(sb_cols * sb_rows, 0);
     }
 
@@ -397,6 +418,9 @@ impl WfScratch420 {
         self.mva.fill(None);
         self.ska.fill(0);
         self.ina.fill(0);
+        self.rfa.fill(0);
+        self.rfmia.fill(0);
+        self.rfmil.fill(0);
         self.dbq.fill(0);
     }
 }
@@ -488,6 +512,10 @@ impl Av2Encoder {
         let mut newmv_mi_left = vec![0u8; tmr as usize + 16];
         let mut mv_mi_above = vec![None; tmc as usize + 16];
         let mut mv_mi_left = vec![None; tmr as usize + 16];
+        // Per-mi reference rank neighbors (two-reference frames): the single_ref
+        // bit context for every leaf reads the mi-granular neighbor rank.
+        let mut ref_mi_above = vec![0u8; tmc as usize + 16];
+        let mut ref_mi_left = vec![0u8; tmr as usize + 16];
         // SB-granular NEWMV neighbor tracking. The inter mode context adds +2 when a
         // neighbor was coded NEWMV (AVM mvref newmv_count term); matches core.rs.
         let mut newmv_above = vec![0u8; sb_cols.max(1)];
@@ -496,6 +524,8 @@ impl Av2Encoder {
         // searched MV as an MVD. Once a left/above inter block existed, the decoder
         // added that spatial predictor again, making motion accumulate across SBs.
         let mut mv_above: Vec<Option<Mv>> = vec![None; sb_cols.max(1)];
+        // SB-granular reference rank for the whole-64 skip mode context.
+        let mut ref_above = vec![0u8; sb_cols.max(1)];
         let mhccp_bounds = cfl::MhccpBounds::from_luma(width, height, true, true);
         // Variance Boost on the partition path: one AqState per tile, queried per 64x64 SB.
         // When delta-Q is off (or base_q==0) `per_sb` returns `(qstep_i, 1.0)` and signals 0,
@@ -545,6 +575,15 @@ impl Av2Encoder {
             (std::sync::Arc::new(Vec::new()), 0, 0, pw, pcw)
         };
         let has_last = last_ref.len() >= 3 && !last_ref[0].is_empty();
+        // Rank-1 reference for the zero-motion skip mode (whole-frame, untiled
+        // two-reference frames only; tiled frames carry a single ref per tile).
+        let second_ref: std::sync::Arc<Vec<Vec<f32>>> =
+            if enc.inter_tile && tile_ref.is_none() && enc.num_refs >= 2 {
+                std::sync::Arc::clone(&self.second_ref.lock().unwrap())
+            } else {
+                std::sync::Arc::new(Vec::new())
+            };
+        let has_second = second_ref.len() >= 3 && !second_ref[0].is_empty();
         let frame_mv_seed = *self.video_mv_seed.lock().unwrap();
         // Prepare edge-extended references once for the entire partition pass.
         // NEWMV used to clone and border the full luma plane, then both chroma
@@ -681,9 +720,9 @@ impl Av2Encoder {
             let adaptive = self.tune.updating_cdf && self.base_q_idx != 0;
             let base_q = self.base_q_idx as i32;
             let nthreads = Self::resolve_threads(self.threads);
-            let wy = crate::av2::helpers::PlaneWriter::new(recy, pw);
-            let wu = crate::av2::helpers::PlaneWriter::new(recu, pcw);
-            let wv = crate::av2::helpers::PlaneWriter::new(recv, pcw);
+            let wy = helpers::PlaneWriter::new(recy, pw);
+            let wu = helpers::PlaneWriter::new(recu, pcw);
+            let wv = helpers::PlaneWriter::new(recv, pcw);
             // Persistent-pool WPP wavefront: workers spawn once and loop over the
             // diagonals with a barrier between each, so each worker's thread_local
             // recon scratch is allocated once (not re-allocated per diagonal).
@@ -791,6 +830,9 @@ impl Av2Encoder {
                             mv_above: &mut s.mva,
                             skip_above: &mut s.ska,
                             inter_above: &mut s.ina,
+                            ref_above: &mut s.rfa,
+                            ref_mi_above: &mut s.rfmia,
+                            ref_mi_left: &mut s.rfmil,
                             tx_leaves: &mut cell_tx,
                             skip_leaves: &mut cell_skips,
                             sb_qidx: &mut s.dbq,
@@ -800,6 +842,8 @@ impl Av2Encoder {
                             ref_ls,
                             ref_cs,
                             has_last,
+                            second_ref: second_ref.as_slice(),
+                            has_second,
                             inter_luma: inter_luma.as_ref(),
                             inter_chroma: inter_chroma.as_ref(),
                             me_scratch: &mut s.me,
@@ -822,6 +866,7 @@ impl Av2Encoder {
                             inter_left: 0,
                             newmv_left: 0,
                             mv_left: None,
+                            ref_left: 0,
                             row: r,
                             col: c,
                         });
@@ -891,6 +936,7 @@ impl Av2Encoder {
             let mut inter_left = 0u8;
             let mut newmv_left = 0u8;
             let mut mv_left: Option<Mv> = None;
+            let mut ref_left = 0u8;
             left_pctx.iter_mut().for_each(|p| *p = 0);
             for col in 0..sb_cols {
                 if fresh_ctx {
@@ -927,7 +973,7 @@ impl Av2Encoder {
                 } else {
                     (&mut *recy, &mut *recu, &mut *recv)
                 };
-                let (n_sl, n_il, n_nl, n_ml) = self.decide_sb_420(Sb420Decision {
+                let (n_sl, n_il, n_nl, n_ml, n_rl) = self.decide_sb_420(Sb420Decision {
                     enc,
                     aqs: &mut aqs,
                     decide_mode: &mut decide_mode,
@@ -959,6 +1005,9 @@ impl Av2Encoder {
                     mv_above: &mut mv_above,
                     skip_above: &mut skip_above,
                     inter_above: &mut inter_above,
+                    ref_above: &mut ref_above,
+                    ref_mi_above: &mut ref_mi_above,
+                    ref_mi_left: &mut ref_mi_left,
                     tx_leaves,
                     skip_leaves,
                     sb_qidx,
@@ -968,6 +1017,8 @@ impl Av2Encoder {
                     ref_ls,
                     ref_cs,
                     has_last,
+                    second_ref: second_ref.as_slice(),
+                    has_second,
                     inter_luma: inter_luma.as_ref(),
                     inter_chroma: inter_chroma.as_ref(),
                     me_scratch: &mut me_scratch,
@@ -990,6 +1041,7 @@ impl Av2Encoder {
                     inter_left,
                     newmv_left,
                     mv_left,
+                    ref_left,
                     row,
                     col,
                 });
@@ -997,6 +1049,7 @@ impl Av2Encoder {
                 inter_left = n_il;
                 newmv_left = n_nl;
                 mv_left = n_ml;
+                ref_left = n_rl;
                 if halo_mode {
                     copy_own_luma(recy, &recy_p, sb_y, sb_x);
                     copy_own_chroma(recu, &recu_p, sb_y, sb_x);
@@ -1009,7 +1062,7 @@ impl Av2Encoder {
     /// walk loop). Behaviour-preserving; byte-identical. Split out so the
     /// SB-wavefront can drive it per cell with private recon + fresh contexts.
     /// The per-row left-neighbour scalars are threaded in by value and returned.
-    fn decide_sb_420(&self, decision: Sb420Decision<'_, '_>) -> (u8, u8, u8, Option<Mv>) {
+    fn decide_sb_420(&self, decision: Sb420Decision<'_, '_>) -> (u8, u8, u8, Option<Mv>, u8) {
         let Sb420Decision {
             enc,
             aqs,
@@ -1042,6 +1095,9 @@ impl Av2Encoder {
             mv_above,
             skip_above,
             inter_above,
+            ref_above,
+            ref_mi_above,
+            ref_mi_left,
             tx_leaves,
             skip_leaves,
             sb_qidx,
@@ -1051,6 +1107,8 @@ impl Av2Encoder {
             ref_ls,
             ref_cs,
             has_last,
+            second_ref,
+            has_second,
             inter_luma,
             inter_chroma,
             me_scratch,
@@ -1073,6 +1131,7 @@ impl Av2Encoder {
             mut inter_left,
             mut newmv_left,
             mut mv_left,
+            mut ref_left,
             row,
             col,
         } = decision;
@@ -1202,6 +1261,17 @@ impl Av2Encoder {
             tx_leaves.push((lmr, lmc, bw_mi, bh_mi));
             let sb_y = lmr * 4;
             let sb_x = lmc * 4;
+            // Snapshot the four AVM line-buffer probes before the default-rank
+            // commit below overwrites this leaf's above/left spans. In particular,
+            // `ref_mi_left[lmr..]` still belongs to the immediate-left block at
+            // this point; clearing it early made non-aligned edge leaves treat a
+            // rank-1 left neighbor as rank 0.
+            let ar_mi = (lmc + bw_mi - 1).min(ref_mi_above.len() - 1);
+            let bl_mi = (lmr + bh_mi - 1).min(ref_mi_left.len() - 1);
+            let bl_ref_rank = ref_mi_left[bl_mi];
+            let ar_ref_rank = ref_mi_above[ar_mi];
+            let left_ref_rank = ref_mi_left[lmr];
+            let above_ref_rank = ref_mi_above[lmc];
             // intra_inter ctx: AVM fills 2 neighbor slots when up OR left
             // available (above+above_right, or left+bottom_left), so all-intra
             // gives 3 for any edge; 0 only at the top-left corner.
@@ -1216,28 +1286,17 @@ impl Av2Encoder {
                 let lf_av = lmc > 0;
                 let ar_c = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
                 let bl_r = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                // (is_inter?) for each candidate, in AVM priority order.
-                let bottom_left = if lf_av {
-                    Some(inter_mi_left[bl_r] == 1)
-                } else {
-                    None
+                // Each candidate as Option<Option<usize>> in AVM priority order:
+                // None = unavailable, Some(None) = intra neighbor,
+                // Some(Some(rank)) = inter neighbor predicting from that rank.
+                let cand = |avail: bool, inter: u8, rank: u8| {
+                    avail.then(|| (inter == 1).then_some(rank as usize))
                 };
-                let above_right = if up_av {
-                    Some(inter_mi_above[ar_c] == 1)
-                } else {
-                    None
-                };
-                let left = if lf_av {
-                    Some(inter_mi_left[lmr] == 1)
-                } else {
-                    None
-                };
-                let above = if up_av {
-                    Some(inter_mi_above[lmc] == 1)
-                } else {
-                    None
-                };
-                let mut slots: [Option<bool>; 2] = [None, None];
+                let bottom_left = cand(lf_av, inter_mi_left[bl_r], bl_ref_rank);
+                let above_right = cand(up_av, inter_mi_above[ar_c], ar_ref_rank);
+                let left = cand(lf_av, inter_mi_left[lmr], left_ref_rank);
+                let above = cand(up_av, inter_mi_above[lmc], above_ref_rank);
+                let mut slots: [Option<Option<usize>>; 2] = [None, None];
                 let mut i = 0;
                 for n in [bottom_left, above_right, left, above]
                     .into_iter()
@@ -1251,18 +1310,54 @@ impl Av2Encoder {
                 }
                 enc.intra_inter_ctx = match (slots[0], slots[1]) {
                     (Some(a), Some(b)) => {
-                        let a_intra = !a;
-                        let b_intra = !b;
+                        let a_intra = a.is_none();
+                        let b_intra = b.is_none();
                         if a_intra && b_intra {
                             3
                         } else {
                             (a_intra || b_intra) as usize
                         }
                     }
-                    (Some(n), None) | (None, Some(n)) => 2 * (!n) as usize,
+                    (Some(n), None) | (None, Some(n)) => 2 * n.is_none() as usize,
                     (None, None) => 0,
                 };
+                // Single-ref rank-bit ctx (n_refs=2 frames): av2_get_ref_pred_context
+                // over the same two resolved line-buffer slots. Each distinct slot
+                // counts once (AVM neighbors_ref_counts iterates the 2-entry buffer);
+                // rank-0 count vs rank-1 count gives 0 (A<B) / 1 (A==B) / 2 (A>B).
+                let mut rank_counts = [0u32; 2];
+                for rank in slots.into_iter().flatten().flatten() {
+                    rank_counts[rank.min(1)] += 1;
+                }
+                enc.ref_bit_ctx = match rank_counts[0].cmp(&rank_counts[1]) {
+                    std::cmp::Ordering::Less => 0,
+                    std::cmp::Ordering::Equal => 1,
+                    std::cmp::Ordering::Greater => 2,
+                };
+                enc.ref_rank = 0;
             }
+            // Capture the SB-granular above/left neighbor ranks BEFORE the reset
+            // below overwrites this column/row. The whole-64 skip's same-rank mode
+            // context reads these; reading the post-reset zeros would disagree with
+            // the decoder (which sees the real neighbor rank) and desync.
+            let sb_above_rank = ref_above[col];
+            let sb_left_rank = ref_left;
+            // Reset this block's reference rank to 0 across both grids. Every
+            // inter commit except the whole-64 rank-1 skip predicts from rank 0,
+            // so clearing here and letting only that branch overwrite keeps the
+            // per-block rank correct without touching every commit site (the
+            // ref-bit context only reads a rank where inter_mi is set). The reset
+            // also propagates the correct rank forward: a non-skip SB leaves 0, a
+            // rank-1 skip overwrites with 1, so the next block's neighbor read is
+            // right.
+            for c in lmc..(lmc + bw_mi).min(ref_mi_above.len()) {
+                ref_mi_above[c] = 0;
+            }
+            for r in lmr..(lmr + bh_mi).min(ref_mi_left.len()) {
+                ref_mi_left[r] = 0;
+            }
+            ref_above[col] = 0;
+            ref_left = 0;
             // avm get_entropy_context_1d checks whether ANY 4x4 unit along
             // the block's above/left edge is nonzero (not just the first).
             // A single-entry read desyncs the chroma txb-skip context when a
@@ -1365,11 +1460,23 @@ impl Av2Encoder {
                 // av2_find_mode_ctx collapses both probes on an axis to one
                 // row/column match; skip_txfm instead sums the two selected
                 // line-buffer entries above.
-                let left_match = lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
-                let above_match = lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
+                // This block predicts from rank 0, so AVM's same-reference mode ctx
+                // counts only rank-0 inter neighbors (a rank-1 neighbor, from a
+                // whole-64 skip that chose the second reference, is excluded). The
+                // rank filter is a no-op when no rank-1 block exists.
+                let left_match = lmc > 0
+                    && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
+                        || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
+                let above_match = lmr > 0
+                    && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
+                        || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
                 let nearest_match = usize::from(left_match) + usize::from(above_match);
-                let any_newmv = (lmc > 0 && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
-                    || (lmr > 0 && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
+                let any_newmv = (lmc > 0
+                    && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
+                        || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
+                    || (lmr > 0
+                        && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
+                            || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
                 let mode_ctx = nearest_match + 2 * usize::from(any_newmv);
                 let rate = crate::av2::video::rd::inter_syntax_bits(
                     enc, skip_ctx, mode_ctx, true, 1, None,
@@ -1464,11 +1571,26 @@ impl Av2Encoder {
                         && matches!(block_w, 16 | 32 | 64)
                         && matches!(block_h, 16 | 32 | 64));
                 if motion_leaf {
+                    // DRL[0] scans same-reference (rank-0) neighbors only: AVM's
+                    // setup_ref_mv_list gates spatial candidates on ref==rf, so a
+                    // rank-1 neighbor (a whole-64 skip that chose the second
+                    // reference, always zero motion) is skipped. Its AVM "derived"
+                    // contribution would be the zero MV projected — i.e. zero — which
+                    // is exactly the ZERO fallback, so no explicit derived term is
+                    // needed. No-op when no rank-1 block exists.
                     let pred_mv = [
-                        (lmc > 0).then_some(mv_mi_left[bl]).flatten(),
-                        (lmr > 0).then_some(mv_mi_above[ar]).flatten(),
-                        (lmc > 0).then_some(mv_mi_left[lmr]).flatten(),
-                        (lmr > 0).then_some(mv_mi_above[lmc]).flatten(),
+                        (lmc > 0 && bl_ref_rank == 0)
+                            .then_some(mv_mi_left[bl])
+                            .flatten(),
+                        (lmr > 0 && ar_ref_rank == 0)
+                            .then_some(mv_mi_above[ar])
+                            .flatten(),
+                        (lmc > 0 && left_ref_rank == 0)
+                            .then_some(mv_mi_left[lmr])
+                            .flatten(),
+                        (lmr > 0 && above_ref_rank == 0)
+                            .then_some(mv_mi_above[lmc])
+                            .flatten(),
                     ]
                     .into_iter()
                     .flatten()
@@ -2213,136 +2335,159 @@ impl Av2Encoder {
                 let bw = 64.min(width - sb_x);
                 let bh = 64.min(height - sb_y);
                 if bw == 64 && bh == 64 {
-                    let ly = &last_ref[0];
-                    let mut sse = rect_sse_f32(
-                        &PlaneRect {
-                            plane: yp,
-                            stride: pw,
-                            y: sb_y,
-                            x: sb_x,
-                        },
-                        &PlaneRect {
-                            plane: ly,
-                            stride: ref_ls,
-                            y: ref_y0 + sb_y,
-                            x: ref_x0 + sb_x,
-                        },
-                        64,
-                        64,
-                    );
-                    // Add chroma SSE so chroma-only changes aren't wrongly skipped.
                     let (cy, cx) = (sb_y / 2, sb_x / 2);
                     let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
-                    for (src_c, ref_c) in [(&up, &last_ref[1]), (&vp, &last_ref[2])] {
-                        sse += rect_sse_f32(
+                    // Full-SB SSE (luma + chroma) against a candidate reference at
+                    // zero motion, so chroma-only changes aren't wrongly skipped.
+                    let full_sse = |refp: &[Vec<f32>]| -> f32 {
+                        let mut sse = rect_sse_f32(
                             &PlaneRect {
-                                plane: src_c,
-                                stride: pcw,
-                                y: cy,
-                                x: cx,
+                                plane: yp,
+                                stride: pw,
+                                y: sb_y,
+                                x: sb_x,
                             },
                             &PlaneRect {
-                                plane: ref_c,
-                                stride: ref_cs,
-                                y: rcy,
-                                x: rcx,
+                                plane: &refp[0],
+                                stride: ref_ls,
+                                y: ref_y0 + sb_y,
+                                x: ref_x0 + sb_x,
                             },
-                            32,
-                            32,
+                            64,
+                            64,
                         );
-                    }
-                    let up = row > 0;
-                    let lf = col > 0;
+                        for (src_c, ref_c) in [(&up, &refp[1]), (&vp, &refp[2])] {
+                            sse += rect_sse_f32(
+                                &PlaneRect {
+                                    plane: src_c,
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                },
+                                &PlaneRect {
+                                    plane: ref_c,
+                                    stride: ref_cs,
+                                    y: rcy,
+                                    x: rcx,
+                                },
+                                32,
+                                32,
+                            );
+                        }
+                        sse
+                    };
+                    let up_n = row > 0;
+                    let lf_n = col > 0;
                     let ia = inter_above[col] == 1;
                     let il = inter_left == 1;
-                    enc.intra_inter_ctx = if up && lf {
+                    enc.intra_inter_ctx = if up_n && lf_n {
                         let n_intra = (!il as u8) + (!ia as u8);
                         if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up {
+                    } else if up_n {
                         if ia { 0 } else { 3 }
-                    } else if lf {
+                    } else if lf_n {
                         if il { 0 } else { 3 }
                     } else {
                         0
                     };
                     let sa = skip_above[col];
                     let sl = skip_left;
-                    let skip_ctx = if up && lf {
+                    let skip_ctx = if up_n && lf_n {
                         (sl + sa) as usize
-                    } else if up {
+                    } else if up_n {
                         (2 * sa) as usize
-                    } else if lf {
+                    } else if lf_n {
                         (2 * sl) as usize
                     } else {
                         0
                     };
+                    // RD skip mode context: single reference keeps the legacy
+                    // mi-granular formula verbatim (byte-exact). Two references use
+                    // the same-rank SB-granular ctx (AVM av2_find_mode_ctx counts
+                    // only neighbors predicting from this rank), which reduces to the
+                    // legacy value when every neighbor is rank 0.
                     let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
                     let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                    let left_match = lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
-                    let above_match =
-                        lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
-                    let any_newmv = (lmc > 0
-                        && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
-                        || (lmr > 0 && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
-                    let mode_ctx = usize::from(left_match)
-                        + usize::from(above_match)
-                        + 2 * usize::from(any_newmv);
-                    let skip_dist = sse * crate::av2::video::rd::SS2_INTER_DIST_W;
-                    let skip_rate = crate::av2::video::rd::inter_syntax_bits(
-                        enc, skip_ctx, mode_ctx, true, 1, None,
-                    );
-                    let skip_cost =
-                        crate::av2::video::rd::rd_cost(skip_dist, skip_rate, sb_qstep as u32);
-                    let intra_bound =
-                        crate::av2::video::rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, sb_qstep as u32);
-                    if skip_cost < intra_bound {
-                        let up = row > 0;
-                        let lf = col > 0;
-                        let ia = inter_above[col] == 1;
-                        let il = inter_left == 1;
-                        enc.intra_inter_ctx = if up && lf {
-                            let n_intra = (!il as u8) + (!ia as u8);
-                            if n_intra == 2 { 3 } else { n_intra as usize }
-                        } else if up {
-                            if ia { 0 } else { 3 }
-                        } else if lf {
-                            if il { 0 } else { 3 }
-                        } else {
-                            0
-                        };
-                        let sa = skip_above[col];
-                        let sl = skip_left;
-                        let skip_ctx = if up && lf {
-                            (sl + sa) as usize
-                        } else if up {
-                            (2 * sa) as usize
-                        } else if lf {
-                            (2 * sl) as usize
-                        } else {
-                            0
-                        };
-                        let mode_ctx = (inter_above[col] + inter_left) as usize
-                            + if newmv_above[col] != 0 || newmv_left != 0 {
+                    let legacy_mode_ctx = {
+                        let left_match =
+                            lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
+                        let above_match =
+                            lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
+                        let any_newmv = (lmc > 0
+                            && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
+                            || (lmr > 0 && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
+                        usize::from(left_match)
+                            + usize::from(above_match)
+                            + 2 * usize::from(any_newmv)
+                    };
+                    // The context that goes into the bitstream (SB-granular, same-rank).
+                    // Uses the neighbor ranks captured before the per-leaf reset.
+                    let emit_mode_ctx = |rank: u8| -> usize {
+                        let am = ia && sb_above_rank == rank;
+                        let lm = il && sb_left_rank == rank;
+                        (am as usize + lm as usize)
+                            + if (am && newmv_above[col] != 0) || (lm && newmv_left != 0) {
                                 2
                             } else {
                                 0
-                            };
+                            }
+                    };
+                    let intra_bound =
+                        crate::av2::video::rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, sb_qstep as u32);
+                    // Pick the RD-best listed reference at zero motion. Rank 0's RD
+                    // uses the legacy mi-granular ctx so single-reference decisions are
+                    // byte-identical; the emitted ctx is always the decoder-matching
+                    // SB-granular value.
+                    let mut skip_choice: Option<(f32, u8, usize)> = None;
+                    for rank in 0..if has_second { 2u8 } else { 1u8 } {
+                        let refp: &[Vec<f32>] = if rank == 0 { last_ref } else { second_ref };
+                        let sse = full_sse(refp);
+                        let rd_ctx = if rank == 0 {
+                            legacy_mode_ctx
+                        } else {
+                            emit_mode_ctx(rank)
+                        };
+                        enc.ref_rank = rank as usize;
+                        let rate = crate::av2::video::rd::inter_syntax_bits(
+                            enc, skip_ctx, rd_ctx, true, 1, None,
+                        );
+                        let cost = crate::av2::video::rd::rd_cost(
+                            sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                            rate,
+                            sb_qstep as u32,
+                        );
+                        if skip_choice.is_none_or(|(best, _, _)| cost < best) {
+                            skip_choice = Some((cost, rank, emit_mode_ctx(rank)));
+                        }
+                    }
+                    let (skip_cost, skip_rank, mode_ctx) =
+                        skip_choice.expect("rank 0 always evaluated");
+                    // The RD loop left `ref_rank` at the last evaluated rank. Reset
+                    // it so the fall-through GLOBALMV-residual / NEWMV branches (which
+                    // always predict rank 0) don't emit a stale rank-1 ref bit.
+                    enc.ref_rank = 0;
+                    if skip_cost < intra_bound {
+                        let refp: &[Vec<f32>] = if skip_rank == 0 { last_ref } else { second_ref };
+                        enc.ref_rank = skip_rank as usize;
                         crate::av2::coder::emit_inter_skip_block(enc, pc, skip_ctx, mode_ctx);
                         skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
                         for (dst_row, src_row) in rect_rows_mut(recy, pw, sb_y, sb_x, 64, 64).zip(
-                            rect_rows(&last_ref[0], ref_ls, ref_y0 + sb_y, ref_x0 + sb_x, 64, 64),
+                            rect_rows(&refp[0], ref_ls, ref_y0 + sb_y, ref_x0 + sb_x, 64, 64),
                         ) {
                             dst_row.copy_from_slice(src_row);
                         }
-                        let (cy, cx) = (sb_y / 2, sb_x / 2);
-                        let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
                         let dst_rows = rect_rows_mut(recu, pcw, cy, cx, 32, 32)
                             .zip(rect_rows_mut(recv, pcw, cy, cx, 32, 32));
-                        let src_rows = rect_rows(&last_ref[1], ref_cs, rcy, rcx, 32, 32)
-                            .zip(rect_rows(&last_ref[2], ref_cs, rcy, rcx, 32, 32));
+                        let src_rows = rect_rows(&refp[1], ref_cs, rcy, rcx, 32, 32)
+                            .zip(rect_rows(&refp[2], ref_cs, rcy, rcx, 32, 32));
                         for ((dst_u, dst_v), (src_u, src_v)) in dst_rows.zip(src_rows) {
                             dst_u.copy_from_slice(src_u);
                             dst_v.copy_from_slice(src_v);
+                        }
+                        #[cfg(test)]
+                        if skip_rank == 1 {
+                            PARTITION_SKIP_RANK1_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         skip_above[col] = 1;
                         skip_left = 1;
@@ -2351,17 +2496,21 @@ impl Av2Encoder {
                         newmv_left = 0;
                         mv_above[col] = Some(Mv::ZERO);
                         mv_left = Some(Mv::ZERO);
+                        ref_above[col] = skip_rank;
+                        ref_left = skip_rank;
                         for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
                             inter_mi_above[c] = 1;
                             skip_mi_above[c] = 1;
                             newmv_mi_above[c] = 0;
                             mv_mi_above[c] = Some(Mv::ZERO);
+                            ref_mi_above[c] = skip_rank;
                         }
                         for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
                             inter_mi_left[r] = 1;
                             skip_mi_left[r] = 1;
                             newmv_mi_left[r] = 0;
                             mv_mi_left[r] = Some(Mv::ZERO);
+                            ref_mi_left[r] = skip_rank;
                         }
                         // Skip block has no residual: reset coeff context (AVM av2_reset_entropy_context).
                         for c in lmc..(lmc + bw_mi).min(above.len()) {
@@ -2453,8 +2602,10 @@ impl Av2Encoder {
                 } else {
                     0
                 };
-                let mode_ctx = (inter_above[col] + inter_left) as usize
-                    + if newmv_above[col] != 0 || newmv_left != 0 {
+                let am0 = inter_above[col] == 1 && sb_above_rank == 0;
+                let lm0 = inter_left == 1 && sb_left_rank == 0;
+                let mode_ctx = (am0 as usize + lm0 as usize)
+                    + if (am0 && newmv_above[col] != 0) || (lm0 && newmv_left != 0) {
                         2
                     } else {
                         0
@@ -2582,12 +2733,20 @@ impl Av2Encoder {
                     };
                     let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
                     let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                    let left_match = lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
-                    let above_match =
-                        lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
+                    // Rank-0 block: count only rank-0 inter neighbors (excludes a
+                    // whole-64 rank-1 skip neighbor). No-op when no rank-1 exists.
+                    let left_match = lmc > 0
+                        && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
+                            || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
+                    let above_match = lmr > 0
+                        && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
+                            || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
                     let any_newmv = (lmc > 0
-                        && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
-                        || (lmr > 0 && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
+                        && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
+                            || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
+                        || (lmr > 0
+                            && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
                     let mode_ctx = usize::from(left_match)
                         + usize::from(above_match)
                         + 2 * usize::from(any_newmv);
@@ -2664,7 +2823,20 @@ impl Av2Encoder {
                 } else {
                     None
                 };
-                let pred_mv = drl0_mv(mv_left, above_mv, above_right_mv);
+                // DRL[0] scans same-reference (rank-0) neighbors only. A rank-1
+                // neighbor (whole-64 skip on the second reference, zero motion) is
+                // excluded; its AVM derived contribution is the zero MV projected
+                // = zero = the drl0_mv fallback. `ref_above[col]`/`ref_left` were
+                // reset for this leaf, so use the captured neighbor ranks; the
+                // above-right column (col+1) is untouched this row.
+                let left_r0 = if sb_left_rank == 0 { mv_left } else { None };
+                let above_r0 = if sb_above_rank == 0 { above_mv } else { None };
+                let above_right_r0 = if row > 0 && col + 1 < sb_cols && ref_above[col + 1] == 0 {
+                    above_right_mv
+                } else {
+                    None
+                };
+                let pred_mv = drl0_mv(left_r0, above_r0, above_right_r0);
                 let mut preds = me::MeCandidates::new();
                 if frame_mv_seed != Mv::ZERO {
                     preds.push_unique(frame_mv_seed);
@@ -2766,8 +2938,10 @@ impl Av2Encoder {
                     } else {
                         0
                     };
-                    let mode_ctx = (inter_above[col] + inter_left) as usize
-                        + if newmv_above[col] != 0 || newmv_left != 0 {
+                    let am0 = inter_above[col] == 1 && sb_above_rank == 0;
+                    let lm0 = inter_left == 1 && sb_left_rank == 0;
+                    let mode_ctx = (am0 as usize + lm0 as usize)
+                        + if (am0 && newmv_above[col] != 0) || (lm0 && newmv_left != 0) {
                             2
                         } else {
                             0
@@ -3001,8 +3175,10 @@ impl Av2Encoder {
                         } else {
                             0
                         };
-                        let mode_ctx = (inter_above[col] + inter_left) as usize
-                            + if newmv_above[col] != 0 || newmv_left != 0 {
+                        let am0 = inter_above[col] == 1 && sb_above_rank == 0;
+                        let lm0 = inter_left == 1 && sb_left_rank == 0;
+                        let mode_ctx = (am0 as usize + lm0 as usize)
+                            + if (am0 && newmv_above[col] != 0) || (lm0 && newmv_left != 0) {
                                 2
                             } else {
                                 0
@@ -4887,7 +5063,7 @@ impl Av2Encoder {
         } else {
             aqs.current_qidx() as u16
         };
-        (skip_left, inter_left, newmv_left, mv_left)
+        (skip_left, inter_left, newmv_left, mv_left, ref_left)
     }
 }
 

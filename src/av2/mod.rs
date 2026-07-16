@@ -379,6 +379,13 @@ pub struct Av2Encoder {
     pub(crate) capture_recon: std::sync::atomic::AtomicBool,
     /// LAST reference recon planes (Y,U,V f32) for inter prediction; empty for intra.
     pub(crate) last_ref: std::sync::Mutex<std::sync::Arc<Vec<Vec<f32>>>>,
+    /// Rank-1 reference recon planes when the frame header lists two references;
+    /// empty for single-reference frames. Every inter block then codes one
+    /// single_ref rank bit, so the tile coders and the header must agree on this.
+    pub(crate) second_ref: std::sync::Mutex<std::sync::Arc<Vec<Vec<f32>>>>,
+    /// Current-frame → reference order-hint distance per rank; scales the
+    /// cross-rank derived MV predictor on two-reference frames.
+    pub(crate) ref_dists: std::sync::Mutex<[i32; 2]>,
 }
 
 /// Returns the AV2 mi-unit frame extents `(mc, mr)` for a native (no-pad) lossy 4:4:4
@@ -534,6 +541,8 @@ impl Av2Encoder {
             video_mode: std::sync::atomic::AtomicBool::new(false),
             capture_recon: std::sync::atomic::AtomicBool::new(false),
             last_ref: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
+            second_ref: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
+            ref_dists: std::sync::Mutex::new([1, 1]),
         };
         enc.apply_hq_lambda_schedule();
         enc

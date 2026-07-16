@@ -251,6 +251,13 @@ pub(crate) struct RangeEncoder {
     pub(crate) inter_tile: bool,
     pub(crate) inter_txb: bool, // route TX32 txb_skip to inter plane
     pub(crate) intra_inter_ctx: usize,
+    /// Reference count listed in this frame's header. When 2, every inter block
+    /// codes one single_ref bit (rank via `ref_rank`, context via `ref_bit_ctx`).
+    pub(crate) num_refs: u8,
+    /// av2_get_ref_pred_context result for the current block (set per block).
+    pub(crate) ref_bit_ctx: usize,
+    /// Reference rank (0 or 1) the current inter block predicts from.
+    pub(crate) ref_rank: usize,
     /// Discard all output: `normalize`/`normalize_bypass` become no-ops. Used by the
     /// SB-wavefront decide (Capture) pass, whose bytes are thrown away — only the
     /// serial Replay emits the real bitstream. Skips range coding + `output` growth.
@@ -315,6 +322,9 @@ impl RangeEncoder {
             inter_tile: false,
             inter_txb: false,
             intra_inter_ctx: 0,
+            num_refs: 1,
+            ref_bit_ctx: 0,
+            ref_rank: 0,
             sink: false,
         }
     }
@@ -509,6 +519,41 @@ impl RangeEncoder {
                 1,
             );
         }
+    }
+
+    /// Emit the current block's single-ref rank bit when the frame lists two
+    /// references (AVM read_single_ref, n_refs=2): bit=1 selects rank 0.
+    /// No-op for single-reference frames.
+    pub(crate) fn emit_single_ref_rank(&mut self) {
+        if self.num_refs < 2 {
+            return;
+        }
+        let bit = usize::from(self.ref_rank == 0);
+        let ctx = self.ref_bit_ctx;
+        if let Some(ref mut cs) = self.cdf_state {
+            let cdf = &mut cs.single_ref[ctx];
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                cdf,
+                bit,
+                1,
+            );
+        }
+    }
+
+    /// Rate of the single-ref rank bit for `rank` under the current block's
+    /// context; zero when the frame lists a single reference.
+    pub(crate) fn estimate_single_ref_bits(&self, rank: usize) -> f32 {
+        if self.num_refs < 2 {
+            return 0.0;
+        }
+        let bit = usize::from(rank == 0);
+        self.cdf_state.as_ref().map_or(1.0, |cs| {
+            Self::symbol_bits(&cs.single_ref[self.ref_bit_ctx], bit, 2)
+        })
     }
 
     // ---- adaptive MVD (QTR_PEL) — mirror AVM read_mv CDFs -------------------

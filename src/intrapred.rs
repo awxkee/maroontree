@@ -29,9 +29,7 @@
 
 pub(crate) const DC_PRED: usize = 0;
 
-/// directional modes (V/H and the diagonals, 1..=8) are intentionally omitted
-/// from this set: they would also require the `angle_delta` symbol on >= 8x8
-/// blocks. These four need no extra symbols beyond `y_mode` itself.
+/// Non-directional modes need no angle-delta symbol.
 pub(crate) const SMOOTH_PRED: usize = 9;
 pub(crate) const SMOOTH_V_PRED: usize = 10;
 pub(crate) const SMOOTH_H_PRED: usize = 11;
@@ -43,11 +41,7 @@ pub(crate) const PAETH_PRED: usize = 12;
 /// plain copy predictors, with no top-right/bottom-left edge extension.
 pub(crate) const V_PRED: usize = 1;
 pub(crate) const H_PRED: usize = 2;
-/// Z2 diagonal modes (down-right directions). At `angle_delta = 0` their angles
-/// are 135/113/157, all in (90,180) -> the dav1d `ipred_z2` path, which reads
-/// only top + left + corner (no top-right/bottom-left edge extension), so they
-/// reuse the same reference arrays as the other modes. The Z1 (D45/D67) and Z3
-/// (D203) diagonals — which DO need the extension samples — are still deferred.
+/// Z2 diagonal modes (down-right directions).
 pub(crate) const D135_PRED: usize = 4;
 pub(crate) const D113_PRED: usize = 5;
 pub(crate) const D157_PRED: usize = 6;
@@ -62,6 +56,146 @@ pub(crate) const D203_PRED: usize = 7;
 /// Chroma-from-luma. Signalled as a `uv_mode` symbol; its tx-type is **not** in
 /// `txtp_from_uvmode`, so it defaults to `DCT_DCT` — i.e. CfL needs no ADST.
 pub(crate) const CFL_PRED: usize = 13;
+
+const EDGE_ORIGIN: usize = 2;
+const EDGE_CAPACITY: usize = 132;
+
+#[derive(Clone)]
+struct IntraEdge {
+    samples: [i32; EDGE_CAPACITY],
+}
+
+impl IntraEdge {
+    fn new() -> Self {
+        Self {
+            samples: [0; EDGE_CAPACITY],
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: i32) -> i32 {
+        self.samples[(index + EDGE_ORIGIN as i32) as usize]
+    }
+
+    #[inline]
+    fn set(&mut self, index: i32, value: i32) {
+        self.samples[(index + EDGE_ORIGIN as i32) as usize] = value;
+    }
+}
+
+#[inline]
+pub(crate) fn is_smooth_mode(mode: usize) -> bool {
+    matches!(mode, SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED)
+}
+
+fn intra_edge_filter_strength(w: usize, h: usize, filter_type: bool, delta: i32) -> u8 {
+    let d = delta.abs();
+    let wh = w + h;
+    let mut strength = 0;
+    if !filter_type {
+        if wh <= 8 {
+            if d >= 56 {
+                strength = 1;
+            }
+        } else if wh <= 16 {
+            if d >= 40 {
+                strength = 1;
+            }
+        } else if wh <= 24 {
+            if d >= 8 {
+                strength = 1;
+            }
+            if d >= 16 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if wh <= 32 {
+            if d >= 1 {
+                strength = 1;
+            }
+            if d >= 4 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if d >= 1 {
+            strength = 3;
+        }
+    } else if wh <= 8 {
+        if d >= 40 {
+            strength = 1;
+        }
+        if d >= 64 {
+            strength = 2;
+        }
+    } else if wh <= 16 {
+        if d >= 20 {
+            strength = 1;
+        }
+        if d >= 48 {
+            strength = 2;
+        }
+    } else if wh <= 24 {
+        if d >= 4 {
+            strength = 3;
+        }
+    } else if d >= 1 {
+        strength = 3;
+    }
+    strength
+}
+
+fn filter_intra_edge(edge: &mut IntraEdge, size: usize, strength: u8) {
+    if strength == 0 {
+        return;
+    }
+    const KERNELS: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+    let mut source = [0i32; EDGE_CAPACITY];
+    for (i, dst) in source[..size].iter_mut().enumerate() {
+        *dst = edge.get(i as i32 - 1);
+    }
+    let kernel = KERNELS[strength as usize - 1];
+    for i in 1..size {
+        let mut sum = 0;
+        for (j, &tap) in kernel.iter().enumerate() {
+            let k = (i as i32 - 2 + j as i32).clamp(0, size as i32 - 1);
+            sum += tap * source[k as usize];
+        }
+        edge.set(i as i32 - 1, (sum + 8) >> 4);
+    }
+}
+
+fn filter_intra_corner(above: &mut IntraEdge, left: &mut IntraEdge) {
+    let filtered = (5 * left.get(0) + 6 * above.get(-1) + 5 * above.get(0) + 8) >> 4;
+    above.set(-1, filtered);
+    left.set(-1, filtered);
+}
+
+#[inline]
+fn use_intra_edge_upsample(w: usize, h: usize, filter_type: bool, delta: i32) -> bool {
+    let d = delta.abs();
+    d != 0 && d < 40 && if filter_type { w + h <= 8 } else { w + h <= 16 }
+}
+
+fn upsample_intra_edge(edge: &mut IntraEdge, num_px: usize, bd: u8) {
+    let mut input = [0i32; EDGE_CAPACITY];
+    input[0] = edge.get(-1);
+    input[1] = edge.get(-1);
+    for i in 0..num_px {
+        input[i + 2] = edge.get(i as i32);
+    }
+    input[num_px + 2] = edge.get(num_px as i32 - 1);
+    edge.set(-2, input[0]);
+    let max_sample = (1 << bd) - 1;
+    for i in 0..num_px {
+        let value = -input[i] + 9 * input[i + 1] + 9 * input[i + 2] - input[i + 3];
+        edge.set(2 * i as i32 - 1, ((value + 8) >> 4).clamp(0, max_sample));
+        edge.set(2 * i as i32, input[i + 2]);
+    }
+}
 
 /// `default_cfl_sign_cdf` (libaom/dav1d): joint sign of the U/V alphas, 8 symbols.
 pub(crate) static CFL_SIGN_CDF: [u16; 7] = [1418, 2123, 13340, 18405, 26972, 28343, 32294];
@@ -250,11 +384,26 @@ pub(crate) fn intra_predict_nd(
     have_bl: bool,
     fw: usize,
     fh: usize,
+    filter_type: bool,
     out: &mut [i32],
     bd: u8,
 ) {
     intra_predict_nd_ad(
-        mode, 0, recon, stride, ox, oy, bw, bh, have_tr, have_bl, fw, fh, out, bd,
+        mode,
+        0,
+        recon,
+        stride,
+        ox,
+        oy,
+        bw,
+        bh,
+        have_tr,
+        have_bl,
+        fw,
+        fh,
+        filter_type,
+        out,
+        bd,
     )
 }
 
@@ -263,8 +412,8 @@ pub(crate) fn intra_predict_nd(
 /// modes (D45/D67/D135/D113/D157/D203), whose ±9° range stays within a single
 /// z1/z2/z3 prediction path so the existing dispatch and reference setup are
 /// reused unchanged; V/H/DC/SMOOTH*/PAETH ignore it. The `DR_INTRA_DERIVATIVE`
-/// table has valid entries at every `base + delta*3` angle, so this is bit-exact
-/// with dav1d (edge filter / upsampling remain off).
+/// table has valid entries at every `base + delta*3` angle. Directional edges
+/// are filtered and optionally upsampled before the zone projector runs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn intra_predict_nd_ad(
     mode: usize,
@@ -279,20 +428,19 @@ pub(crate) fn intra_predict_nd_ad(
     have_bl: bool,
     fw: usize,
     fh: usize,
+    filter_type: bool,
     out: &mut [i32],
     bd: u8,
 ) {
     let have_top = oy > 0;
     let have_left = ox > 0;
     let base = 1i32 << (bd - 1);
-    // Sized for the directional reach at the largest supported block (32): top
-    // row + top-right extension (Z1) and left column + bottom-left extension
-    // (Z3), each up to 2x the block dim, so 2*32 = 64.
-    let mut top = [0i32; 64];
-    let mut left = [0i32; 64];
+    let mut above = IntraEdge::new();
+    let mut left_edge = IntraEdge::new();
+    let edge_len = bw + bh;
     if have_top {
         for i in 0..bw {
-            top[i] = recon[(oy - 1) * stride + ox + i];
+            above.set(i as i32, recon[(oy - 1) * stride + ox + i]);
         }
     } else {
         let fill = if have_left {
@@ -300,11 +448,13 @@ pub(crate) fn intra_predict_nd_ad(
         } else {
             base - 1
         };
-        top[..bw].fill(fill);
+        for i in 0..edge_len {
+            above.set(i as i32, fill);
+        }
     }
     if have_left {
         for j in 0..bh {
-            left[j] = recon[(oy + j) * stride + ox - 1];
+            left_edge.set(j as i32, recon[(oy + j) * stride + ox - 1]);
         }
     } else {
         let fill = if have_top {
@@ -312,7 +462,9 @@ pub(crate) fn intra_predict_nd_ad(
         } else {
             base + 1
         };
-        left[..bh].fill(fill);
+        for i in 0..edge_len {
+            left_edge.set(i as i32, fill);
+        }
     }
     let corner = if have_left {
         if have_top {
@@ -325,39 +477,85 @@ pub(crate) fn intra_predict_nd_ad(
     } else {
         base
     };
-    // Top-right extension (top[bw..2bw]) for Z1, and bottom-left extension
-    // (left[bh..2bh]) for Z3, following dav1d_prepare_intra_edges: copy the
-    // available samples (clamped to the frame edge) then replicate, or — when
-    // the neighbor is unavailable — replicate the last edge sample.
-    if have_tr {
-        let px_have = bw.min(fw - (ox + bw));
+    above.set(-1, corner);
+    left_edge.set(-1, corner);
+    if have_top {
+        let px_have = if have_tr {
+            bh.min(fw.saturating_sub(ox + bw))
+        } else {
+            0
+        };
         for i in 0..px_have {
-            top[bw + i] = recon[(oy - 1) * stride + ox + bw + i];
+            above.set((bw + i) as i32, recon[(oy - 1) * stride + ox + bw + i]);
         }
-        let fill = top[bw + px_have - 1];
-        for i in px_have..bw {
-            top[bw + i] = fill;
-        }
-    } else {
-        let fill = top[bw - 1];
-        for i in 0..bw {
-            top[bw + i] = fill;
+        let fill = above.get((bw + px_have).saturating_sub(1) as i32);
+        for i in bw + px_have..edge_len {
+            above.set(i as i32, fill);
         }
     }
-    if have_bl {
-        let px_have = bh.min(fh - (oy + bh));
+    if have_left {
+        let px_have = if have_bl {
+            bw.min(fh.saturating_sub(oy + bh))
+        } else {
+            0
+        };
         for i in 0..px_have {
-            left[bh + i] = recon[(oy + bh + i) * stride + ox - 1];
+            left_edge.set((bh + i) as i32, recon[(oy + bh + i) * stride + ox - 1]);
         }
-        let fill = left[bh + px_have - 1];
-        for i in px_have..bh {
-            left[bh + i] = fill;
+        let fill = left_edge.get((bh + px_have).saturating_sub(1) as i32);
+        for i in bh + px_have..edge_len {
+            left_edge.set(i as i32, fill);
         }
-    } else {
-        let fill = left[bh - 1];
-        for i in 0..bh {
-            left[bh + i] = fill;
+    }
+
+    let angle = match mode {
+        V_PRED => 90,
+        H_PRED => 180,
+        D45_PRED => 45 + angle_delta * 3,
+        VERT_LEFT_PRED => 67 + angle_delta * 3,
+        D135_PRED => 135 + angle_delta * 3,
+        D113_PRED => 113 + angle_delta * 3,
+        D157_PRED => 157 + angle_delta * 3,
+        D203_PRED => 203 + angle_delta * 3,
+        _ => 0,
+    };
+    let directional = (V_PRED..=VERT_LEFT_PRED).contains(&mode);
+    let mut upsample_above = false;
+    let mut upsample_left = false;
+    if directional && angle != 90 && angle != 180 {
+        if angle > 90 && angle < 180 && have_top && have_left && edge_len >= 24 {
+            filter_intra_corner(&mut above, &mut left_edge);
         }
+        if have_top {
+            let strength = intra_edge_filter_strength(bw, bh, filter_type, angle - 90);
+            filter_intra_edge(
+                &mut above,
+                bw + 1 + if angle < 90 { bh } else { 0 },
+                strength,
+            );
+        }
+        if have_left {
+            let strength = intra_edge_filter_strength(bh, bw, filter_type, angle - 180);
+            filter_intra_edge(
+                &mut left_edge,
+                bh + 1 + if angle > 180 { bw } else { 0 },
+                strength,
+            );
+        }
+        upsample_above = use_intra_edge_upsample(bw, bh, filter_type, angle - 90);
+        upsample_left = use_intra_edge_upsample(bh, bw, filter_type, angle - 180);
+        if have_top && upsample_above {
+            upsample_intra_edge(&mut above, bw + if angle < 90 { bh } else { 0 }, bd);
+        }
+        if have_left && upsample_left {
+            upsample_intra_edge(&mut left_edge, bh + if angle > 180 { bw } else { 0 }, bd);
+        }
+    }
+    let mut top = [0i32; 64];
+    let mut left = [0i32; 64];
+    for i in 0..edge_len {
+        top[i] = above.get(i as i32);
+        left[i] = left_edge.get(i as i32);
     }
 
     match mode {
@@ -372,95 +570,76 @@ pub(crate) fn intra_predict_nd_ad(
             }
         }
         D45_PRED | VERT_LEFT_PRED => {
-            // dav1d ipred_z1 (edge filter/upsampling off): project from the top
-            // row (extended with top-right samples). D45 -> 45 deg, D67 -> 67 deg.
-            let angle: i32 = (if mode == D45_PRED { 45 } else { 67 }) + angle_delta * 3;
             let dx = DR_INTRA_DERIVATIVE[(angle >> 1) as usize];
-            let max_base_x = (bw + bw.min(bh) - 1) as i32;
+            let up = upsample_above as i32;
+            let max_base_x = (edge_len as i32 - 1) << up;
+            let frac_bits = 6 - up;
+            let base_inc = 1 << up;
             for y in 0..bh {
                 let xpos = dx * (y as i32 + 1);
-                let frac = xpos & 0x3E;
-                let mut bx = xpos >> 6;
-                #[allow(clippy::explicit_counter_loop)]
+                let frac = ((xpos << up) & 0x3f) >> 1;
+                let mut bx = xpos >> frac_bits;
                 for x in 0..bw {
                     if bx < max_base_x {
-                        let v = top[bx as usize] * (64 - frac) + top[(bx + 1) as usize] * frac;
-                        out[y * bw + x] = (v + 32) >> 6;
+                        let v = above.get(bx) * (32 - frac) + above.get(bx + 1) * frac;
+                        out[y * bw + x] = (v + 16) >> 5;
                     } else {
-                        let fill = top[max_base_x as usize];
+                        let fill = above.get(max_base_x);
                         let row = y * bw;
                         out[row + x..row + bw].fill(fill);
                         break;
                     }
-                    bx += 1;
+                    bx += base_inc;
                 }
             }
         }
         D203_PRED => {
-            // dav1d ipred_z3 (edge filter/upsampling off): project from the left
-            // column (extended with bottom-left samples). D203 -> 203 deg.
-            let angle: i32 = 203 + angle_delta * 3;
             let dy = DR_INTRA_DERIVATIVE[((270 - angle) >> 1) as usize];
-            let max_base_y = (bh + bw.min(bh) - 1) as i32;
+            let up = upsample_left as i32;
+            let max_base_y = (edge_len as i32 - 1) << up;
+            let frac_bits = 6 - up;
+            let base_inc = 1 << up;
             for x in 0..bw {
                 let ypos = dy * (x as i32 + 1);
-                let frac = ypos & 0x3E;
-                let mut by = ypos >> 6;
-                #[allow(clippy::explicit_counter_loop)]
+                let frac = ((ypos << up) & 0x3f) >> 1;
+                let mut by = ypos >> frac_bits;
                 for y in 0..bh {
                     if by < max_base_y {
-                        let v = left[by as usize] * (64 - frac) + left[(by + 1) as usize] * frac;
-                        out[y * bw + x] = (v + 32) >> 6;
+                        let v = left_edge.get(by) * (32 - frac) + left_edge.get(by + 1) * frac;
+                        out[y * bw + x] = (v + 16) >> 5;
                     } else {
-                        let fill = left[max_base_y as usize];
+                        let fill = left_edge.get(max_base_y);
                         for yy in y..bh {
                             out[yy * bw + x] = fill;
                         }
                         break;
                     }
-                    by += 1;
+                    by += base_inc;
                 }
             }
         }
         D135_PRED | D113_PRED | D157_PRED => {
-            // dav1d ipred_z2 with edge filter/upsampling disabled: pure angular
-            // projection from the top row, left column and corner.
-            let angle: i32 = (match mode {
-                D135_PRED => 135,
-                D113_PRED => 113,
-                _ => 157,
-            }) + angle_delta * 3;
             let dy = DR_INTRA_DERIVATIVE[((angle - 90) >> 1) as usize];
             let dx = DR_INTRA_DERIVATIVE[((180 - angle) >> 1) as usize];
-            // topleft[idx]: idx 0 = corner, idx>=1 = top[idx-1], idx<0 = left[-idx-1]
-            let tl = |idx: i32| -> i32 {
-                if idx >= 0 {
-                    if idx == 0 {
-                        corner
+            let up_a = upsample_above as i32;
+            let up_l = upsample_left as i32;
+            let min_base_x = -(1 << up_a);
+            let frac_bits_x = 6 - up_a;
+            let frac_bits_y = 6 - up_l;
+            for y in 0..bh {
+                for x in 0..bw {
+                    let xpos = ((x as i32) << 6) - (y as i32 + 1) * dx;
+                    let base_x = xpos >> frac_bits_x;
+                    let v = if base_x >= min_base_x {
+                        let shift = ((xpos * (1 << up_a)) & 0x3f) >> 1;
+                        above.get(base_x) * (32 - shift) + above.get(base_x + 1) * shift
                     } else {
-                        top[((idx - 1) as usize).min(bw - 1)]
-                    }
-                } else {
-                    left[((-idx - 1) as usize).min(bh - 1)]
-                }
-            };
-            for y in 0..bh as i32 {
-                let xpos = (1 << 6) - dx * (y + 1);
-                let mut base_x = xpos >> 6;
-                let frac_x = xpos & 0x3E;
-                let mut ypos = (y << 6) - dy;
-                #[allow(clippy::explicit_counter_loop)]
-                for x in 0..bw as i32 {
-                    let v = if base_x >= 0 {
-                        tl(base_x) * (64 - frac_x) + tl(base_x + 1) * frac_x
-                    } else {
-                        let base_y = ypos >> 6;
-                        let frac_y = ypos & 0x3E;
-                        tl(-1 - base_y) * (64 - frac_y) + tl(-2 - base_y) * frac_y
+                        let ypos = ((y as i32) << 6) - (x as i32 + 1) * dy;
+                        let base_y = ypos >> frac_bits_y;
+                        let shift = ((ypos * (1 << up_l)) & 0x3f) >> 1;
+                        left_edge.get(base_y) * (32 - shift) + left_edge.get(base_y + 1) * shift
                     };
-                    out[(y * bw as i32 + x) as usize] = (v + 32) >> 6;
-                    base_x += 1;
-                    ypos -= dy;
+                    out[y * bw + x] = (v + 16) >> 5;
                 }
             }
         }
@@ -1044,5 +1223,71 @@ pub(crate) fn dc_pred_16x32(recon: &[i32], stride: usize, ox: usize, oy: usize, 
             s >> 5
         }
         (false, false) => 1 << (bd - 1),
+    }
+}
+
+#[cfg(test)]
+mod intra_edge_tests {
+    use super::*;
+
+    #[test]
+    fn strength_thresholds_match_av1() {
+        assert_eq!(intra_edge_filter_strength(4, 4, false, 55), 0);
+        assert_eq!(intra_edge_filter_strength(4, 4, false, 56), 1);
+        assert_eq!(intra_edge_filter_strength(8, 16, false, 8), 1);
+        assert_eq!(intra_edge_filter_strength(8, 16, false, 16), 2);
+        assert_eq!(intra_edge_filter_strength(8, 16, false, 32), 3);
+    }
+
+    #[test]
+    fn upsample_thresholds_match_av1() {
+        assert!(use_intra_edge_upsample(8, 8, false, 23));
+        assert!(!use_intra_edge_upsample(8, 8, false, 40));
+        assert!(!use_intra_edge_upsample(8, 8, true, 23));
+    }
+
+    #[test]
+    fn filtering_preserves_constant_edge_and_corner() {
+        for strength in 1..=3 {
+            let mut edge = IntraEdge::new();
+            for i in -1..16 {
+                edge.set(i, 317);
+            }
+            filter_intra_edge(&mut edge, 17, strength);
+            assert_eq!(edge.get(-1), 317);
+            for i in 0..16 {
+                assert_eq!(edge.get(i), 317);
+            }
+        }
+    }
+
+    #[test]
+    fn upsampling_preserves_original_samples_and_range() {
+        let mut edge = IntraEdge::new();
+        edge.set(-1, 9);
+        let original = [12, 80, 220, 255, 17, 91, 43, 199];
+        for (i, &value) in original.iter().enumerate() {
+            edge.set(i as i32, value);
+        }
+        upsample_intra_edge(&mut edge, original.len(), 8);
+        for (i, &value) in original.iter().enumerate() {
+            assert_eq!(edge.get(2 * i as i32), value);
+        }
+        for i in -2..(2 * original.len() as i32 - 1) {
+            assert!((0..=255).contains(&edge.get(i)));
+        }
+    }
+
+    #[test]
+    fn corner_filter_updates_both_copies() {
+        let mut above = IntraEdge::new();
+        let mut left = IntraEdge::new();
+        above.set(-1, 100);
+        left.set(-1, 100);
+        above.set(0, 140);
+        left.set(0, 60);
+        filter_intra_corner(&mut above, &mut left);
+        assert_eq!(above.get(-1), left.get(-1));
+        assert_eq!(above.get(-1), 100);
     }
 }

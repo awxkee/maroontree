@@ -81,60 +81,7 @@ fn to_i32(p: &[f32]) -> Vec<i32> {
     p.iter().map(|&v| v as i32).collect()
 }
 
-fn block_sse(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, y: usize) -> i64 {
-    let mut s = 0i64;
-    let yh = (y + 8).min(h);
-    let xw = (x + 8).min(w);
-    for yy in y..yh {
-        for xx in x..xw {
-            let d = (a[yy * w + xx] - b[yy * w + xx]) as i64;
-            s += d * d;
-        }
-    }
-    s
-}
-
-/// libaom's perceptual CDEF distortion for one 8x8 block (`dist_8x8_16bit`): the
-/// SSE weighted by `0.5 * (svar + dvar + c1) / sqrt(c2 + svar*dvar)`, where `svar`
-/// / `dvar` are the (x64) source / reconstructed variances. The weight up-weights
-/// error in flat blocks (where ringing is visible) and down-weights it in
-/// high-variance textured blocks (masking) — so filtering, which cuts a block's
-/// variance, raises its weight and only wins where the SSE drop is real ringing.
-/// `dst` is the candidate (filtered/unfiltered) recon, `src` the source. Partial
-/// edge blocks fall back to plain SSE (the ×64 variance calibration needs a full
-/// 8x8). This is an encoder-side decision metric, not part of the bitstream.
-fn cdef_dist_8x8(
-    src: &[i32],
-    dst: &[i32],
-    w: usize,
-    h: usize,
-    x: usize,
-    y: usize,
-    coeff_shift: u32,
-) -> i64 {
-    if x + 8 > w || y + 8 > h {
-        return block_sse(dst, src, w, h, x, y);
-    }
-    let (mut ss, mut sd, mut ss2, mut sd2, mut ssd) = (0i64, 0i64, 0i64, 0i64, 0i64);
-    for yy in y..y + 8 {
-        for xx in x..x + 8 {
-            let s = src[yy * w + xx] as i64;
-            let d = dst[yy * w + xx] as i64;
-            ss += s;
-            sd += d;
-            ss2 += s * s;
-            sd2 += d * d;
-            ssd += s * d;
-        }
-    }
-    let svar = ss2 - ((ss * ss + 32) >> 6);
-    let dvar = sd2 - ((sd * sd + 32) >> 6);
-    let sse = (sd2 + ss2 - 2 * ssd) as f64;
-    let c1 = (400i64 << (2 * coeff_shift)) as f64;
-    let c2 = (20000i64 << (4 * coeff_shift)) as f64;
-    let w = 0.5 * (svar as f64 + dvar as f64 + c1) / (c2 + svar as f64 * dvar as f64).sqrt();
-    (0.5 + sse * w).floor() as i64
-}
+use crate::cdef::cdef_dist_8x8;
 
 // ---------------------------------------------------------------------------
 // Per-block CDEF: one active strength, chosen per superblock (64x64 CDEF unit).
@@ -206,7 +153,9 @@ fn luma_sse_per_sb(
                     y,
                     apri,
                     sec << (bd - 8),
-                    dirs[bi],
+                    // AVM passes dir 0 when the signaled pri strength is 0
+                    // (`pri_strength ? dir[by][bx] : 0`).
+                    if pri == 0 { 0 } else { dirs[bi] },
                     damping,
                     bd,
                 );
@@ -259,7 +208,12 @@ fn chroma_sse_per_sb(
                 continue;
             }
             let sse = if pri != 0 || sec != 0 {
-                let dir = uv_dir[ldirs.get(lby * nbx + lbx).copied().unwrap_or(0)];
+                // AVM passes dir 0 when the signaled pri strength is 0.
+                let dir = if pri == 0 {
+                    0
+                } else {
+                    uv_dir[ldirs.get(lby * nbx + lbx).copied().unwrap_or(0)]
+                };
                 cdef::cdef_filter_block(
                     &mut tmp,
                     0,
@@ -387,7 +341,8 @@ pub(crate) fn apply_per_block(
                 by * 8,
                 cdef::adjust_pri(y_pri << coeff_shift, vars[bi]),
                 y_sec << coeff_shift,
-                dirs[bi],
+                // AVM passes dir 0 when the signaled pri strength is 0.
+                if y_pri == 0 { 0 } else { dirs[bi] },
                 decision.damping as i32,
                 bd,
             );
@@ -432,7 +387,12 @@ pub(crate) fn apply_per_block(
                     cbh,
                     uv_pri << coeff_shift,
                     uv_sec << coeff_shift,
-                    uv_dir[dirs[by * nbx + bx]],
+                    // AVM passes dir 0 when the signaled pri strength is 0.
+                    if uv_pri == 0 {
+                        0
+                    } else {
+                        uv_dir[dirs[by * nbx + bx]]
+                    },
                     (decision.damping as i32 - 1).max(1),
                     bd,
                 );

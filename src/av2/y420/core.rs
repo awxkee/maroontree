@@ -35,6 +35,14 @@ use crate::av2::video::mc;
 // (dense inter-TX32 coefficient coding is not yet bit-exact).
 const NEWMV_MAX_TU_NZ: usize = 1024;
 
+/// Whole-64 blocks committed on reference rank 1 (two-reference frames).
+#[cfg(test)]
+pub(crate) static CORE_SKIP_RANK1_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static CORE_NEWMV_RANK1_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Phase 3 precomputed CCSO state: per-plane edge-filter result and the per-SB
 /// on/off decision grid, derived in a first pass over the completed recon.
 pub(super) struct CcsoPrecomp {
@@ -74,12 +82,12 @@ impl Av2Encoder {
         // `Some`, it carries the FULL reference frame plus this tile's frame origin;
         // inter reads add that origin so motion vectors that cross tile boundaries
         // resolve against real neighbor content, matching the decoder.
-        tile_ref: Option<&crate::av2::tiling::TileRefCtx>,
+        tile_ref: Option<&tiling::TileRefCtx>,
         // Per-block CDEF pass 2: the frame decision (strengths + per-SB grid).
-        cdef_pre: Option<&crate::av2::cdef_est::CdefDecision>,
+        cdef_pre: Option<&cdef_est::CdefDecision>,
         // Staged replay: `Off` = search+emit (today); `Capture` logs the whole-64
         // luma mode-search winner; `Replay` reuses it (skips `encode_luma_sb`).
-        mut decide_mode: crate::av2::replay::DecideMode<'_>,
+        mut decide_mode: replay::DecideMode<'_>,
     ) -> RangeEncoder {
         let bases = &self.bases;
         let (pw, ph) = (sb_align(width), sb_align(height));
@@ -92,6 +100,14 @@ impl Av2Encoder {
         let mut recv = vec![0f32; pcw * pch + 1];
         let mut enc = RangeEncoder::new();
         enc.inter_tile = self.inter_tile.load(std::sync::atomic::Ordering::Relaxed);
+        // Two-reference frames code one single_ref rank bit per inter block; the
+        // frame header (video_inter_frame) derives num_total_refs from the same
+        // `second_ref` state, so tile syntax and header stay in agreement.
+        enc.num_refs = if enc.inter_tile && !self.second_ref.lock().unwrap().is_empty() {
+            2
+        } else {
+            1
+        };
         enc.qc = get_q_ctx(self.base_q_idx);
         if self.tune.updating_cdf && self.base_q_idx != 0 {
             enc.enable_adaptive_cdf(enc.qc);
@@ -396,84 +412,175 @@ impl Av2Encoder {
         } else {
             None
         };
+        // Rank-1 reference (two-reference frames, whole-frame path only): the
+        // same bordered preparation, plus cur→ref order-hint distances for the
+        // cross-rank derived MV prediction. Tiled frames keep rank 0 everywhere.
+        let core_second_ref: std::sync::Arc<Vec<Vec<f32>>> =
+            if enc.inter_tile && tile_ref.is_none() && enc.num_refs >= 2 {
+                std::sync::Arc::clone(&self.second_ref.lock().unwrap())
+            } else {
+                std::sync::Arc::new(Vec::new())
+            };
+        let core_has_second = core_second_ref.len() >= 3 && !core_second_ref[0].is_empty();
+        let inter_luma2: Option<(Vec<f32>, usize, usize)> = if core_has_second {
+            let refh = core_second_ref[0].len() / ref_ls;
+            let (bref, bstride) = mc::bordered(&core_second_ref[0], ref_ls, refh, ref_ls, BRD);
+            Some((bref, bstride, refh))
+        } else {
+            None
+        };
+        let inter_chroma2: Option<[(Vec<f32>, usize); 2]> = if core_has_second {
+            let cbrd = BRD / 2;
+            let build = |plane: &[f32]| {
+                let ch = plane.len() / ref_cs;
+                mc::bordered(plane, ref_cs, ch, ref_cs, cbrd)
+            };
+            Some([build(&core_second_ref[1]), build(&core_second_ref[2])])
+        } else {
+            None
+        };
+        let core_ref_dists = *self.ref_dists.lock().unwrap();
         let mut core_skip_above = vec![0u8; sb_cols.max(1)];
         // Per-SB inter-ness for intra_inter context (0=intra,1=inter).
         let mut core_inter_above = vec![0u8; sb_cols.max(1)];
         let mut core_newmv_above = vec![0u8; sb_cols.max(1)];
-        // Per-SB decoded MVs (eighth-pel) for the DRL[0] predictor model.
-        let mut core_mv_above: Vec<Option<crate::av2::video::mv::Mv>> = vec![None; sb_cols.max(1)];
+        // Per-SB reference rank (meaningful only where the inter grid is 1).
+        let mut core_ref_above = vec![0u8; sb_cols.max(1)];
+        // Per-SB decoded (MV, reference rank) for the DRL[0] predictor model.
+        let mut core_mv_above: Vec<Option<(crate::av2::video::mv::Mv, u8)>> =
+            vec![None; sb_cols.max(1)];
         let mut core_me_scratch = crate::av2::video::me::MeScratch::default();
         let mut core_mc_tmp = Vec::new();
         for row in 0..sb_rows {
             let mut core_skip_left = 0u8;
             let mut core_inter_left = 0u8;
             let mut core_newmv_left = 0u8;
-            let mut core_mv_left: Option<crate::av2::video::mv::Mv> = None;
+            let mut core_ref_left = 0u8;
+            let mut core_mv_left: Option<(crate::av2::video::mv::Mv, u8)> = None;
             for col in 0..sb_cols {
                 let sb_y = row * 64;
                 let sb_x = col * 64;
+                // Single-ref rank-bit context (n_refs=2 frames): the line-buffer
+                // neighbors resolve to the left and above SBs.
+                enc.ref_bit_ctx = coder::single_ref_bit_ctx(
+                    (row > 0).then(|| {
+                        (core_inter_above[col] == 1).then(|| core_ref_above[col] as usize)
+                    }),
+                    (col > 0).then(|| (core_inter_left == 1).then_some(core_ref_left as usize)),
+                );
+                enc.ref_rank = 0;
                 if enc.cdef_nb >= 2 {
                     enc.cdef_pending = true;
                     enc.cdef_sb_rc = (row, col);
                 }
-                // GLOBALMV zero-motion skip: static full 64x64 block copies LAST.
+                // GLOBALMV zero-motion skip: static full 64x64 block copies the
+                // RD-best listed reference at zero motion.
                 if core_has_last && sb_x + 64 <= width && sb_y + 64 <= height {
-                    let ly = &core_last_ref[0];
-                    let sse = rect_sse_f32(
-                        &PlaneRect {
-                            plane: &yp,
-                            stride: pw,
-                            y: sb_y,
-                            x: sb_x,
-                        },
-                        &PlaneRect {
-                            plane: ly,
-                            stride: ref_ls,
-                            y: ref_y0 + sb_y,
-                            x: ref_x0 + sb_x,
-                        },
-                        64,
-                        64,
-                    );
-                    let up = row > 0;
-                    let lf = col > 0;
+                    let upn = row > 0;
+                    let lfn = col > 0;
                     let ia = core_inter_above[col] == 1;
                     let il = core_inter_left == 1;
-                    enc.intra_inter_ctx = if up && lf {
+                    enc.intra_inter_ctx = if upn && lfn {
                         let n_intra = (!il as u8) + (!ia as u8);
                         if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up {
+                    } else if upn {
                         if ia { 0 } else { 3 }
-                    } else if lf {
+                    } else if lfn {
                         if il { 0 } else { 3 }
                     } else {
                         0
                     };
                     let sa = core_skip_above[col];
                     let sl = core_skip_left;
-                    let skip_ctx = if up && lf {
+                    let skip_ctx = if upn && lfn {
                         (sl + sa) as usize
-                    } else if up {
+                    } else if upn {
                         (2 * sa) as usize
-                    } else if lf {
+                    } else if lfn {
                         (2 * sl) as usize
                     } else {
                         0
                     };
-                    let mode_ctx = (core_inter_above[col] + core_inter_left) as usize
-                        + if core_newmv_above[col] != 0 || core_newmv_left != 0 {
-                            2
-                        } else {
-                            0
-                        };
+                    // Same-rank nearest/newmv mode context: AVM's ctx scan counts
+                    // only neighbors predicting from this block's reference.
+                    let mode_ctx_for = |rank: u8| -> usize {
+                        let am = ia && core_ref_above[col] == rank;
+                        let lm = il && core_ref_left == rank;
+                        (am as usize + lm as usize)
+                            + if (am && core_newmv_above[col] != 0) || (lm && core_newmv_left != 0)
+                            {
+                                2
+                            } else {
+                                0
+                            }
+                    };
                     // Zero-motion skip vs intra: skip wins when its full block
                     // syntax plus distortion beats the intra rate proxy. AVM's rdmult is
                     // ~q^2, so the accept bound scales with q^2, not linear q. The
                     // reference intra rate proxy (~2 bits/px) is folded into the
-                    // bound; SS2 weight retunes the operating point.
+                    // bound; SS2 weight retunes the operating point. The accept
+                    // decision stays luma-only; the rank comparison adds chroma so
+                    // a chroma-only change cannot select the wrong reference.
                     use crate::av2::video::rd;
-                    let skip_dist = sse * rd::SS2_INTER_DIST_W;
-                    let skip_rate = rd::inter_syntax_bits(&enc, skip_ctx, mode_ctx, true, 1, None);
+                    let mut skip_choice: Option<(f32, u8, f32, usize)> = None;
+                    for rank in 0..if core_has_second { 2u8 } else { 1u8 } {
+                        let refp: &[Vec<f32>] = if rank == 0 {
+                            &core_last_ref
+                        } else {
+                            &core_second_ref
+                        };
+                        let luma_sse = rect_sse_f32(
+                            &PlaneRect {
+                                plane: &yp,
+                                stride: pw,
+                                y: sb_y,
+                                x: sb_x,
+                            },
+                            &PlaneRect {
+                                plane: &refp[0],
+                                stride: ref_ls,
+                                y: ref_y0 + sb_y,
+                                x: ref_x0 + sb_x,
+                            },
+                            64,
+                            64,
+                        );
+                        let (cy, cx) = (sb_y / 2, sb_x / 2);
+                        let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
+                        let mut full_sse = luma_sse;
+                        for (src_c, ref_c) in [(&up, &refp[1]), (&vp, &refp[2])] {
+                            full_sse += rect_sse_f32(
+                                &PlaneRect {
+                                    plane: src_c,
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                },
+                                &PlaneRect {
+                                    plane: ref_c,
+                                    stride: ref_cs,
+                                    y: rcy,
+                                    x: rcx,
+                                },
+                                32,
+                                32,
+                            );
+                        }
+                        let mode_ctx = mode_ctx_for(rank);
+                        enc.ref_rank = rank as usize;
+                        let rate = rd::inter_syntax_bits(&enc, skip_ctx, mode_ctx, true, 1, None);
+                        let cost =
+                            rd::rd_cost(full_sse * rd::SS2_INTER_DIST_W, rate, qstep_i as u32);
+                        if skip_choice.is_none_or(|(best, _, _, _)| cost < best) {
+                            skip_choice = Some((cost, rank, luma_sse, mode_ctx));
+                        }
+                    }
+                    let (_, skip_rank, skip_luma_sse, skip_mode_ctx) =
+                        skip_choice.expect("rank 0 always evaluated");
+                    enc.ref_rank = skip_rank as usize;
+                    let skip_dist = skip_luma_sse * rd::SS2_INTER_DIST_W;
+                    let skip_rate =
+                        rd::inter_syntax_bits(&enc, skip_ctx, skip_mode_ctx, true, 1, None);
                     let skip_cost = rd::rd_cost(skip_dist, skip_rate, qstep_i as u32);
                     let intra_bound = rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, qstep_i as u32);
                     if skip_cost < intra_bound {
@@ -510,17 +617,22 @@ impl Av2Encoder {
                         } else {
                             0
                         };
-                        // mode_ctx = nearest_match + (newmv_count>0)*2 (AVM mvref_common.c:2796).
-                        let mode_ctx = (core_inter_above[col] + core_inter_left) as usize
-                            + if core_newmv_above[col] != 0 || core_newmv_left != 0 {
-                                2
-                            } else {
-                                0
-                            };
+                        // mode_ctx = same-rank nearest_match + (newmv_count>0)*2.
+                        let mode_ctx = skip_mode_ctx;
+                        let skip_ref: &[Vec<f32>] = if skip_rank == 0 {
+                            &core_last_ref
+                        } else {
+                            &core_second_ref
+                        };
+                        #[cfg(test)]
+                        if skip_rank == 1 {
+                            CORE_SKIP_RANK1_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         coder::emit_inter_skip_block(&mut enc, 12276, skip_ctx, mode_ctx);
                         for (dst_row, src_row) in rect_rows_mut(&mut recy, pw, sb_y, sb_x, 64, 64)
                             .zip(rect_rows(
-                                &core_last_ref[0],
+                                &skip_ref[0],
                                 ref_ls,
                                 ref_y0 + sb_y,
                                 ref_x0 + sb_x,
@@ -534,8 +646,8 @@ impl Av2Encoder {
                         let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
                         let dst_rows = rect_rows_mut(&mut recu, pcw, cy, cx, 32, 32)
                             .zip(rect_rows_mut(&mut recv, pcw, cy, cx, 32, 32));
-                        let src_rows = rect_rows(&core_last_ref[1], ref_cs, rcy, rcx, 32, 32)
-                            .zip(rect_rows(&core_last_ref[2], ref_cs, rcy, rcx, 32, 32));
+                        let src_rows = rect_rows(&skip_ref[1], ref_cs, rcy, rcx, 32, 32)
+                            .zip(rect_rows(&skip_ref[2], ref_cs, rcy, rcx, 32, 32));
                         for ((dst_u, dst_v), (src_u, src_v)) in dst_rows.zip(src_rows) {
                             dst_u.copy_from_slice(src_u);
                             dst_v.copy_from_slice(src_v);
@@ -546,9 +658,11 @@ impl Av2Encoder {
                         core_inter_left = 1;
                         core_newmv_above[col] = 0;
                         core_newmv_left = 0;
+                        core_ref_above[col] = skip_rank;
+                        core_ref_left = skip_rank;
                         // GLOBALMV stores mv=0; it feeds the DRL[0] scan as a candidate.
-                        core_mv_above[col] = Some(video::mv::Mv::ZERO);
-                        core_mv_left = Some(video::mv::Mv::ZERO);
+                        core_mv_above[col] = Some((video::mv::Mv::ZERO, skip_rank));
+                        core_mv_left = Some((video::mv::Mv::ZERO, skip_rank));
                         u_has[row * sb_cols + col] = 0;
                         v_has[row * sb_cols + col] = 0;
                         cfl_has[row * sb_cols + col] = 0;
@@ -570,27 +684,57 @@ impl Av2Encoder {
                         continue;
                     }
                 }
-                // NEWMV residual (CORE 64x64): search LAST; MC residual if a nonzero
-                // MV beats the intra estimate.
+                // NEWMV residual (CORE 64x64): search every listed reference; MC
+                // residual on the RD-best rank if a nonzero MV beats the intra
+                // estimate.
                 if core_has_last && sb_x + 64 <= width && sb_y + 64 <= height {
+                    use crate::av2::video::rd;
                     use crate::av2::video::{me, mv::Mv};
                     let bd = self.bit_depth as i32;
                     let (_ly, lu, lv) = (&core_last_ref[0], &core_last_ref[1], &core_last_ref[2]);
                     let (nmv_qstep, nmv_scale, _, _) =
                         aqs.per_sb_probe(&yp, pw, sb_y, sb_x, width, height);
-                    // Frame-scoped buffers built once before the loop; borrow them.
-                    let (bref, bstride, refh) = {
-                        let (b, s, h) = inter_luma.as_ref().unwrap();
-                        (b.as_slice(), *s, *h)
+                    let upn = row > 0;
+                    let lfn = col > 0;
+                    let ia = core_inter_above[col] == 1;
+                    let il = core_inter_left == 1;
+                    enc.intra_inter_ctx = if upn && lfn {
+                        let n_intra = (!il as u8) + (!ia as u8);
+                        if n_intra == 2 { 3 } else { n_intra as usize }
+                    } else if upn {
+                        if ia { 0 } else { 3 }
+                    } else if lfn {
+                        if il { 0 } else { 3 }
+                    } else {
+                        0
                     };
-                    // Spatial MV predictors: zero, left, above, above-right. These
-                    // seed the diamond so real camera/object motion is found without
-                    // relying on the exhaustive grid alone (AVM DRL-style candidates).
-                    let mut preds = me::MeCandidates::new();
-                    if frame_mv_seed != Mv::ZERO {
-                        preds.push_unique(frame_mv_seed);
-                    }
-                    for cand in [
+                    let sa = core_skip_above[col];
+                    let sl = core_skip_left;
+                    let skip_ctx = if upn && lfn {
+                        (sl + sa) as usize
+                    } else if upn {
+                        (2 * sa) as usize
+                    } else if lfn {
+                        (2 * sl) as usize
+                    } else {
+                        0
+                    };
+                    // Same-rank mode context (AVM counts only matching-reference
+                    // neighbors for nearest_match and the newmv term).
+                    let mode_ctx_for = |rank: u8| -> usize {
+                        let am = ia && core_ref_above[col] == rank;
+                        let lm = il && core_ref_left == rank;
+                        (am as usize + lm as usize)
+                            + if (am && core_newmv_above[col] != 0) || (lm && core_newmv_left != 0)
+                            {
+                                2
+                            } else {
+                                0
+                            }
+                    };
+                    // Adjacent DRL candidates in the validated scan order (left,
+                    // above, above-right), tagged with their reference rank.
+                    let adj = [
                         core_mv_left,
                         if row > 0 { core_mv_above[col] } else { None },
                         if row > 0 && col + 1 < sb_cols {
@@ -598,59 +742,100 @@ impl Av2Encoder {
                         } else {
                             None
                         },
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        preds.push_unique(cand);
-                    }
-                    let ref_mv = core_mv_left
-                        .or(if row > 0 { core_mv_above[col] } else { None })
-                        .or(if row > 0 && col + 1 < sb_cols {
-                            core_mv_above[col + 1]
-                        } else {
-                            None
-                        })
-                        .unwrap_or(Mv::ZERO);
-                    let (mv, _) = me::search(
-                        &me::MePlanes {
-                            current: &yp[sb_y * pw + sb_x..],
-                            current_stride: pw,
-                            reference: bref,
-                            reference_stride: bstride,
-                        },
-                        preds.as_slice(),
-                        &me::MeSearchSpec {
-                            origin_x: (ref_x0 + sb_x + BRD) as isize,
-                            origin_y: (ref_y0 + sb_y + BRD) as isize,
-                            width: 64,
-                            height: 64,
-                            reference_mv: ref_mv,
-                            lambda_mv: (nmv_qstep as u32).max(1),
-                            max_dx: self.video_search_range,
-                            max_dy: self.video_search_range,
-                            predictor_gate_sad_per_pixel: self.video_predictor_gate,
-                            integer_satd_radius: self.video_integer_satd_radius,
-                            bit_depth: self.bit_depth,
-                            frame_width: bstride,
-                            frame_height: refh + 2 * BRD,
-                        },
-                        &mut core_me_scratch,
-                    );
-                    let mut mv = mc::clamp_umv(
-                        mv,
-                        (ref_x0 + sb_x) as i32,
-                        (ref_y0 + sb_y) as i32,
-                        64,
-                        64,
-                        ref_ls as i32,
-                        refh as i32,
-                    );
-                    // Drop the fixed magnitude clamp that discarded moderate camera
-                    // motion the search had already found; the NEWMV attempt still
-                    // requires nonzero MV (zero-motion is handled by the skip branch).
-                    if mv.row != 0 || mv.col != 0 {
-                        let mut pred_u = [0f32; 64 * 64];
+                    ];
+                    // DRL[0] per rank: first same-rank candidate; else the first
+                    // cross-rank candidate scaled by the order-hint distance ratio
+                    // (AVM derived SMVP — both references are past frames in low
+                    // delay, so the same-side gate always holds); else zero.
+                    let drl0_for = |rank: u8| -> Mv {
+                        for (cand, r) in adj.into_iter().flatten() {
+                            if r == rank {
+                                return cand;
+                            }
+                        }
+                        if let Some((cand, r)) = adj.into_iter().flatten().next() {
+                            return video::mv::mv_projection(
+                                cand,
+                                core_ref_dists[rank as usize],
+                                core_ref_dists[r as usize],
+                            );
+                        }
+                        Mv::ZERO
+                    };
+                    // Per-rank motion search + syntax-aware RD; the rank bit, the
+                    // same-rank mode ctx and the MVD against that rank's DRL[0]
+                    // all differ per rank.
+                    let mut newmv_choice: Option<(f32, u8, Mv, f32)> = None;
+                    let mut pred_u = [0f32; 64 * 64];
+                    for rank in 0..if core_has_second { 2u8 } else { 1u8 } {
+                        let (bref, bstride, refh) = {
+                            let (b, s, h) = if rank == 0 {
+                                inter_luma.as_ref().unwrap()
+                            } else {
+                                inter_luma2.as_ref().unwrap()
+                            };
+                            (b.as_slice(), *s, *h)
+                        };
+                        // Search seeds: the frame-level seed (primary-reference
+                        // analysis), same-rank neighbor MVs verbatim, cross-rank
+                        // neighbors projected onto this rank. Seeds only steer the
+                        // search; they never reach the bitstream.
+                        let mut preds = me::MeCandidates::new();
+                        if rank == 0 && frame_mv_seed != Mv::ZERO {
+                            preds.push_unique(frame_mv_seed);
+                        }
+                        for (cand, r) in adj.into_iter().flatten() {
+                            let seed = if r == rank {
+                                cand
+                            } else {
+                                crate::av2::video::mv::mv_projection(
+                                    cand,
+                                    core_ref_dists[rank as usize],
+                                    core_ref_dists[r as usize],
+                                )
+                            };
+                            preds.push_unique(seed);
+                        }
+                        let ref_mv = drl0_for(rank);
+                        let (mv, _) = me::search(
+                            &me::MePlanes {
+                                current: &yp[sb_y * pw + sb_x..],
+                                current_stride: pw,
+                                reference: bref,
+                                reference_stride: bstride,
+                            },
+                            preds.as_slice(),
+                            &me::MeSearchSpec {
+                                origin_x: (ref_x0 + sb_x + BRD) as isize,
+                                origin_y: (ref_y0 + sb_y + BRD) as isize,
+                                width: 64,
+                                height: 64,
+                                reference_mv: ref_mv,
+                                lambda_mv: (nmv_qstep as u32).max(1),
+                                max_dx: self.video_search_range,
+                                max_dy: self.video_search_range,
+                                predictor_gate_sad_per_pixel: self.video_predictor_gate,
+                                integer_satd_radius: self.video_integer_satd_radius,
+                                bit_depth: self.bit_depth,
+                                frame_width: bstride,
+                                frame_height: refh + 2 * BRD,
+                            },
+                            &mut core_me_scratch,
+                        );
+                        let mv = mc::clamp_umv(
+                            mv,
+                            (ref_x0 + sb_x) as i32,
+                            (ref_y0 + sb_y) as i32,
+                            64,
+                            64,
+                            ref_ls as i32,
+                            refh as i32,
+                        );
+                        // The NEWMV attempt still requires a nonzero MV
+                        // (zero-motion is handled by the skip branch).
+                        if mv.row == 0 && mv.col == 0 {
+                            continue;
+                        }
                         mc::predict_with_tmp(
                             &mut pred_u,
                             64,
@@ -666,7 +851,7 @@ impl Av2Encoder {
                             },
                             &mut core_mc_tmp,
                         );
-                        let mut sse = rect_sse_f32(
+                        let sse = rect_sse_f32(
                             &PlaneRect {
                                 plane: &yp,
                                 stride: pw,
@@ -682,41 +867,57 @@ impl Av2Encoder {
                             64,
                             64,
                         );
-                        // NEWMV residual vs intra: include the live mode/skip/DRL
-                        // syntax and the searched MV's signaling cost.
-                        use crate::av2::video::rd;
-                        let upn = row > 0;
-                        let lfn = col > 0;
-                        let ia = core_inter_above[col] == 1;
-                        let il = core_inter_left == 1;
-                        enc.intra_inter_ctx = if upn && lfn {
-                            let n_intra = (!il as u8) + (!ia as u8);
-                            if n_intra == 2 { 3 } else { n_intra as usize }
-                        } else if upn {
-                            if ia { 0 } else { 3 }
-                        } else if lfn {
-                            if il { 0 } else { 3 }
-                        } else {
-                            0
-                        };
-                        let sa = core_skip_above[col];
-                        let sl = core_skip_left;
-                        let skip_ctx = if upn && lfn {
-                            (sl + sa) as usize
-                        } else if upn {
-                            (2 * sa) as usize
-                        } else if lfn {
-                            (2 * sl) as usize
-                        } else {
-                            0
-                        };
-                        let mode_ctx = (core_inter_above[col] + core_inter_left) as usize
-                            + if core_newmv_above[col] != 0 || core_newmv_left != 0 {
-                                2
+                        let delta = mv.diff(ref_mv);
+                        let cand_mode = if delta == Mv::ZERO { 0 } else { 2 };
+                        let scaled = (cand_mode == 2).then_some(Mv {
+                            row: delta.row / 2,
+                            col: delta.col / 2,
+                        });
+                        enc.ref_rank = rank as usize;
+                        let rate = rd::inter_syntax_bits(
+                            &enc,
+                            skip_ctx,
+                            mode_ctx_for(rank),
+                            false,
+                            cand_mode,
+                            scaled,
+                        );
+                        let cost = rd::rd_cost(sse * rd::SS2_INTER_DIST_W, rate, nmv_qstep as u32);
+                        if newmv_choice.is_none_or(|(best, _, _, _)| cost < best) {
+                            newmv_choice = Some((cost, rank, mv, sse));
+                        }
+                    }
+                    if let Some((_, nmv_rank, chosen_mv, chosen_sse)) = newmv_choice {
+                        let mut mv = chosen_mv;
+                        let mut sse = chosen_sse;
+                        enc.ref_rank = nmv_rank as usize;
+                        let (bref, bstride, refh) = {
+                            let (b, s, h) = if nmv_rank == 0 {
+                                inter_luma.as_ref().unwrap()
                             } else {
-                                0
+                                inter_luma2.as_ref().unwrap()
                             };
-                        let pred_mv = ref_mv;
+                            (b.as_slice(), *s, *h)
+                        };
+                        // pred_u may hold the other rank's prediction; rebuild for
+                        // the chosen (reference, MV) pair.
+                        mc::predict_with_tmp(
+                            &mut pred_u,
+                            64,
+                            bref,
+                            bstride,
+                            &mc::MotionBlock {
+                                origin_x: (ref_x0 + sb_x + BRD) as isize,
+                                origin_y: (ref_y0 + sb_y + BRD) as isize,
+                                mv,
+                                width: 64,
+                                height: 64,
+                                bit_depth: self.bit_depth,
+                            },
+                            &mut core_mc_tmp,
+                        );
+                        let mode_ctx = mode_ctx_for(nmv_rank);
+                        let pred_mv = drl0_for(nmv_rank);
                         let bounded_pred_mv = mc::clamp_umv(
                             pred_mv,
                             (ref_x0 + sb_x) as i32,
@@ -858,7 +1059,12 @@ impl Av2Encoder {
                                 let _ = ref_c; // reference now borrowed frame-scoped
                                 let cbrd = BRD / 2;
                                 let (bcref, bcstride) = {
-                                    let (b, s) = &inter_chroma.as_ref().unwrap()[pi];
+                                    let planes = if nmv_rank == 0 {
+                                        inter_chroma.as_ref().unwrap()
+                                    } else {
+                                        inter_chroma2.as_ref().unwrap()
+                                    };
+                                    let (b, s) = &planes[pi];
                                     (b.as_slice(), *s)
                                 };
                                 let mut cpredu = [0f32; 32 * 32];
@@ -885,11 +1091,11 @@ impl Av2Encoder {
                                 );
                                 let mut cres = [0f32; 1024];
                                 let mut cpred = [0i32; 1024];
-                                crate::av2::metrics::scaled_residual_f32(
+                                metrics::scaled_residual_f32(
                                     &mut cres,
                                     &src_c[cy * pcw + cx..],
                                     &cpredu,
-                                    crate::av2::metrics::ResidualSpec {
+                                    metrics::ResidualSpec {
                                         src_stride: pcw,
                                         pred_stride: 32,
                                         width: 32,
@@ -942,22 +1148,8 @@ impl Av2Encoder {
                             } else {
                                 0
                             };
-                            let mode_ctx = (core_inter_above[col] + core_inter_left) as usize
-                                + if core_newmv_above[col] != 0 || core_newmv_left != 0 {
-                                    2
-                                } else {
-                                    0
-                                };
-                            // DRL[0] predictor (AVM scan, reorder disabled, single LAST,
-                            // no TMVP): left SB's MV, else above, else above-right, else 0.
-                            let pred_mv = core_mv_left
-                                .or(if row > 0 { core_mv_above[col] } else { None })
-                                .or(if row > 0 && col + 1 < sb_cols {
-                                    core_mv_above[col + 1]
-                                } else {
-                                    None
-                                })
-                                .unwrap_or(Mv::ZERO);
+                            // mode_ctx and the DRL[0] predictor are the chosen
+                            // rank's values computed before the residual pass.
                             let mvd_row = mv.row - pred_mv.row;
                             let mvd_col = mv.col - pred_mv.col;
                             // mv == DRL[0] -> NEARMV (no MVD); else NEWMV.
@@ -1000,7 +1192,7 @@ impl Av2Encoder {
                                     );
                                     coder::emit_inter_newmv_residual_block_multi(
                                         &mut enc,
-                                        &coder::InterResidualSpec {
+                                        &InterResidualSpec {
                                             part_cdf: 12276,
                                             skip_ctx,
                                             mode_ctx,
@@ -1024,7 +1216,7 @@ impl Av2Encoder {
                                     v_has[row * sb_cols + col] = v_present as i32;
                                     cfl_has[row * sb_cols + col] = 0;
                                 } else {
-                                    crate::av2::coder::emit_inter_mode_block(
+                                    coder::emit_inter_mode_block(
                                         &mut enc,
                                         12276,
                                         skip_ctx,
@@ -1056,8 +1248,15 @@ impl Av2Encoder {
                                 core_inter_left = 1;
                                 core_newmv_above[col] = (inter_mode == 2) as u8;
                                 core_newmv_left = (inter_mode == 2) as u8;
-                                core_mv_above[col] = Some(mv);
-                                core_mv_left = Some(mv);
+                                core_ref_above[col] = nmv_rank;
+                                core_ref_left = nmv_rank;
+                                #[cfg(test)]
+                                if nmv_rank == 1 {
+                                    CORE_NEWMV_RANK1_COUNT
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                core_mv_above[col] = Some((mv, nmv_rank));
+                                core_mv_left = Some((mv, nmv_rank));
                                 continue;
                             }
                         }
@@ -1087,6 +1286,8 @@ impl Av2Encoder {
                 core_inter_left = 0;
                 core_newmv_above[col] = 0;
                 core_newmv_left = 0;
+                core_ref_above[col] = 0;
+                core_ref_left = 0;
                 core_mv_above[col] = None;
                 core_mv_left = None;
                 // Per-SB adaptive quantization: pick this SB's qstep from source

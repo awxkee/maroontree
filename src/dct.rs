@@ -28,6 +28,7 @@
  */
 #![allow(clippy::needless_range_loop)]
 use crate::quant::Dct;
+use crate::util::FastRound;
 use std::sync::OnceLock;
 
 pub(crate) const WC4_0: i32 = 35468; // 0.541196  * 65536
@@ -60,6 +61,31 @@ fn quant_q16(data: i32, coeff: i32) -> i32 {
     } // dead-zone: |coeff/step| < 1.0 -> zero (preserves compression)
     let lvl = ((mag + 32768) >> 16) as i32; // round-to-nearest for kept coefficients (de-biases the corner)
     if prod >= 0 { lvl } else { -lvl }
+}
+
+/// Apply AV1's forward quantization-matrix reciprocal to already normalized
+/// transform targets. Level 15 is flat, so the normal SIMD path remains
+/// untouched unless matrices are enabled.
+#[inline]
+fn apply_qmatrix<const N: usize>(
+    mut quantized: ([i32; N], [f32; N]),
+    quant: &impl Dct,
+    w: usize,
+    h: usize,
+) -> ([i32; N], [f32; N]) {
+    if !quant.has_qmatrix() {
+        return quantized;
+    }
+    for rc in 0..N {
+        let target = quantized.1[rc] * quant.forward_qm_weight(rc, w, h) as f32 / 32.0;
+        quantized.1[rc] = target;
+        quantized.0[rc] = if target.abs() < 1.0 {
+            0
+        } else {
+            target.fast_round() as i32
+        };
+    }
+    quantized
 }
 
 /// fmla equivalent: a * SQRT2 + b, all in Q15 domain
@@ -274,15 +300,30 @@ fn fwd_adst8_1d(inp: &[i32; 8]) -> [i32; 8] {
 /// Trellis (RDOQ) forward ADST8: levels + unrounded targets, mirroring
 /// `dct8x8_t`. Ratio is 1.0 for 8x8, so the quant multipliers apply directly.
 pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    adst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        adst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        8,
+    )
 }
 
 pub(crate) fn adstdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    adstdct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        adstdct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        8,
+    )
 }
 
 pub(crate) fn dctadst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    dctadst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        dctadst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        8,
+    )
 }
 
 pub(crate) static ADST16_FWD_Q12: [[i16; 16]; 16] = [
@@ -366,15 +407,30 @@ fn fwd_adst16_1d(inp: &[i32; 16]) -> [i32; 16] {
 }
 
 pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    resolve_adst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_adst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        16,
+    )
 }
 
 pub(crate) fn adstdct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    resolve_adstdct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_adstdct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        16,
+    )
 }
 
 pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    resolve_dctadst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_dctadst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        16,
+    )
 }
 
 #[inline]
@@ -1499,7 +1555,12 @@ fn resolve_dct32x16_quant_t() -> Dct32x16QuantTFn {
 }
 
 pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    resolve_dct8x8_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_dct8x8_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        8,
+    )
 }
 
 /// Forward TX_8X8 **IDTX** (identity): produce quantized levels + unquantized
@@ -1532,15 +1593,30 @@ pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 6
 }
 
 pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    resolve_dct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_dct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        16,
+    )
 }
 
 pub(crate) fn dct32x32_t(residual: &[i32; 1024], quant: &impl Dct) -> ([i32; 1024], [f32; 1024]) {
-    resolve_dct32x32_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_dct32x32_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        32,
+        32,
+    )
 }
 
 pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    resolve_dct8x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        resolve_dct8x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        16,
+    )
 }
 
 #[inline]
@@ -1571,7 +1647,12 @@ fn dct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 12
 }
 
 pub(crate) fn dct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    dct16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac())
+    apply_qmatrix(
+        dct16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        8,
+    )
 }
 
 #[inline]
@@ -1702,25 +1783,25 @@ fn fwd_adst4_1d(inp: &[i32; 4]) -> [i32; 4] {
 pub(crate) fn adst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    adst4x4_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(adst4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
 }
 
 pub(crate) fn adstdct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    adstdct4x4_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(adstdct4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
 }
 
 pub(crate) fn dctadst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    dctadst4x4_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(dctadst4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
 }
 
 pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    dct4x4_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(dct4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
 }
 
 #[inline]
@@ -1755,31 +1836,31 @@ fn dct8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32],
 pub(crate) fn dct8x4_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    dct8x4_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(dct8x4_quant_t_direct(residual, m_dc, m_ac), quant, 8, 4)
 }
 
 pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    dct4x8_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(dct4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
 }
 
 pub(crate) fn adst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    adst4x8_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(adst4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
 }
 
 pub(crate) fn adstdct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    adstdct4x8_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(adstdct4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
 }
 
 pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    dctadst4x8_quant_t_direct(residual, m_dc, m_ac)
+    apply_qmatrix(dctadst4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
 }
 
 #[inline]
@@ -1816,13 +1897,23 @@ fn dct32x16_quant_t_direct(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 5
 pub(crate) fn dct32x16_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    resolve_dct32x16_quant_t()(residual, m_dc, m_ac)
+    apply_qmatrix(
+        resolve_dct32x16_quant_t()(residual, m_dc, m_ac),
+        quant,
+        32,
+        16,
+    )
 }
 
 pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    resolve_dct16x32_quant_t()(residual, m_dc, m_ac)
+    apply_qmatrix(
+        resolve_dct16x32_quant_t()(residual, m_dc, m_ac),
+        quant,
+        16,
+        32,
+    )
 }
 
 #[cfg(test)]

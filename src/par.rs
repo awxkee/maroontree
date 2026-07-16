@@ -63,7 +63,7 @@ pub(crate) struct Pool {
 impl Pool {
     /// `threads` follows the encoder's budget (`0` = all cores); serial when 1.
     pub(crate) fn new(threads: usize) -> Self {
-        let width = crate::av1_coder::resolve_threads(threads).max(1);
+        let width = crate::coder::resolve_threads(threads).max(1);
         let shared = Arc::new(Shared {
             job: Mutex::new(State {
                 job: None,

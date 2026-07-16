@@ -130,10 +130,6 @@ impl Speed {
         matches!(self, Speed::Fast)
     }
 
-    pub(crate) fn try_chroma_directional(self) -> bool {
-        !matches!(self, Speed::Fast)
-    }
-
     /// Whether the diagonal (angle) chroma directional modes (D45..D203) are
     /// searched. Only Medium speed and above (i.e. not [`Speed::Fast`]); nominal
     /// V/H are searched in every tier.
@@ -142,7 +138,7 @@ impl Speed {
     }
 
     pub(crate) fn try_directional(&self) -> bool {
-        matches!(self, Speed::Slow)
+        true
     }
 }
 
@@ -183,10 +179,25 @@ pub struct EncodeConfig {
     /// also true; off by default, so the shipping AV1 output is unchanged. Uses the
     /// same defaults as the AV2 encoder (octile 6, strength 0.6, boost-only).
     pub variance_boost: bool,
+    /// Enable the AV2-style **dark-structured-detail** AQ protection on the AV1 path:
+    /// an extra qindex reduction for dark superblocks carrying real cross-scale
+    /// structure (rock texture, boundaries) that raw variance would quantize to
+    /// extinction at low quality. Independent of [`Self::variance_boost`] (it applies
+    /// in both the Variance Boost and classic-AQ schemes), but like all AQ it only
+    /// takes effect when `adaptive_quant` is also true. Gated to low quality
+    /// (`base_q_idx >= 150`); on by default. Mirrors the AV2 encoder's `dark_aq`.
+    pub dark_aq: bool,
     /// Enable CDEF
     pub cdef: bool,
     /// Enable luma Wiener loop restoration (off by default).
     pub wiener: bool,
+    /// Enable AV1 quantization matrices. These are standard AV1 syntax and
+    /// redistribute quantization error toward higher spatial frequencies.
+    pub quantization_matrices: bool,
+    /// Explicit matrix level (0..=15), or `None` for the conservative level-10
+    /// tuning validated on the Jixel still-image corpus. Lower levels weight
+    /// high frequencies more strongly; level 15 is flat.
+    pub qmatrix_level: Option<u8>,
 }
 
 impl Default for EncodeConfig {
@@ -201,8 +212,11 @@ impl Default for EncodeConfig {
             speed: Speed::Slow,
             adaptive_quant: true,
             variance_boost: true,
+            dark_aq: true,
             cdef: false,
             wiener: false,
+            quantization_matrices: false,
+            qmatrix_level: None,
         }
     }
 }
@@ -276,6 +290,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Enable the AV2-style dark-structured-detail AQ protection on the AV1 path.
+    /// Has no effect unless [`Self::with_adaptive_quant`] is also enabled.
+    pub fn with_dark_aq(mut self, v: bool) -> Self {
+        self.dark_aq = v;
+        self
+    }
+
     /// Enable the in-loop CDEF filter
     pub fn with_cdef(mut self, v: bool) -> Self {
         self.cdef = v;
@@ -288,16 +309,49 @@ impl EncodeConfig {
         self
     }
 
-    pub(crate) fn vb(&self) -> crate::av1_coder::VarianceBoost {
-        if self.variance_boost {
-            crate::av1_coder::VarianceBoost::on()
+    /// Enable or disable standard AV1 quantization matrices.
+    pub fn with_quantization_matrices(mut self, v: bool) -> Self {
+        self.quantization_matrices = v;
+        self
+    }
+
+    /// Use one explicit matrix level for luma and chroma. This also enables
+    /// quantization matrices. Level 15 is the flat/no-reshaping matrix.
+    pub fn with_qmatrix_level(mut self, level: u8) -> Self {
+        self.quantization_matrices = true;
+        self.qmatrix_level = Some(level);
+        self
+    }
+
+    pub(crate) fn vb(&self) -> crate::coder::VarianceBoost {
+        let mut vb = if self.variance_boost {
+            crate::coder::VarianceBoost::on()
         } else {
-            crate::av1_coder::VarianceBoost::off()
-        }
+            crate::coder::VarianceBoost::off()
+        };
+        // Dark protection is independent of the Variance Boost scheme, so honor its
+        // own flag rather than inheriting `variance_boost`.
+        vb.dark = if self.dark_aq {
+            crate::aq_common::DarkAq::on()
+        } else {
+            crate::aq_common::DarkAq::off()
+        };
+        vb.qm = if self.quantization_matrices {
+            self.qmatrix_level
+                .map(crate::quant::QmLevels::uniform)
+                .unwrap_or_else(|| crate::quant::QmLevels::uniform(10))
+        } else {
+            crate::quant::QmLevels::FLAT
+        };
+        vb
     }
 
     pub(crate) fn validate(&self) -> Result<(), EncodeError> {
-        validate_quality(self.quality)
+        validate_quality(self.quality)?;
+        if self.qmatrix_level.is_some_and(|level| level > 15) {
+            return Err(EncodeError::InvalidQuality);
+        }
+        Ok(())
     }
 }
 
@@ -457,7 +511,7 @@ fn dispatch_lossy<T: crate::Pixel>(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1_coder::VarianceBoost,
+    vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Vec<u8> {
@@ -1225,7 +1279,7 @@ fn dispatch_yuv_u8(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1_coder::VarianceBoost,
+    vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -1280,7 +1334,7 @@ fn dispatch_yuv_u16(
     threads: usize,
     speed: Speed,
     aq: bool,
-    vb: crate::av1_coder::VarianceBoost,
+    vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -1322,5 +1376,105 @@ fn dispatch_yuv_u16(
             cdef,
             wiener,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn patterned_rgb(width: usize, height: usize) -> PlanarImage<u8> {
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 3;
+                rgb[i] = ((x * 37 + y * 11) & 255) as u8;
+                rgb[i + 1] = (((x / 4) * 83 + (y / 7) * 29) & 255) as u8;
+                rgb[i + 2] = ((x * 13 + y * 53 + ((x ^ y) & 15) * 7) & 255) as u8;
+            }
+        }
+        PlanarImage::from_interleaved_rgb(width, height, BitDepth::Eight, &rgb).unwrap()
+    }
+
+    fn png_dimensions(bytes: &[u8]) -> Option<(usize, usize)> {
+        if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+            return None;
+        }
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as usize;
+        Some((width, height))
+    }
+
+    fn temp_path(stem: &str, ext: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("maroontree-{stem}-{}.{ext}", std::process::id()))
+    }
+
+    #[test]
+    fn chroma_partition_boundary_sizes_encode_and_decode() {
+        let sizes = [
+            (8, 8),
+            (9, 9),
+            (15, 17),
+            (16, 16),
+            (17, 19),
+            (31, 33),
+            (32, 32),
+            (33, 35),
+            (63, 65),
+            (64, 64),
+            (65, 67),
+            (127, 95),
+        ];
+        let formats = [
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv422,
+            ChromaFormat::Yuv444,
+        ];
+        let avifdec = std::env::var_os("AVIFDEC");
+
+        for &(width, height) in &sizes {
+            let image = patterned_rgb(width, height);
+            for &chroma in &formats {
+                let cfg = EncodeConfig::new()
+                    .with_quality(35)
+                    .with_chroma(chroma)
+                    .with_threads(1)
+                    .with_speed(Speed::Fast)
+                    .with_adaptive_quant(false);
+                let avif = encode_rgb8(&image, &cfg)
+                    .unwrap_or_else(|e| panic!("{width}x{height} {chroma:?} encode failed: {e}"));
+                assert!(
+                    !avif.is_empty(),
+                    "{width}x{height} {chroma:?} produced an empty AVIF"
+                );
+
+                if let Some(decoder) = &avifdec {
+                    let tag = format!("{width}x{height}-{chroma:?}");
+                    let input = temp_path(&tag, "avif");
+                    let output = temp_path(&tag, "png");
+                    std::fs::write(&input, &avif).unwrap();
+                    let result = Command::new(decoder)
+                        .arg(&input)
+                        .arg(&output)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "avifdec rejected {width}x{height} {chroma:?}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let decoded = std::fs::read(&output).unwrap();
+                    assert_eq!(
+                        png_dimensions(&decoded),
+                        Some((width, height)),
+                        "decoded dimensions changed for {width}x{height} {chroma:?}"
+                    );
+                    let _ = std::fs::remove_file(input);
+                    let _ = std::fs::remove_file(output);
+                }
+            }
+        }
     }
 }

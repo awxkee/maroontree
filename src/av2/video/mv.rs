@@ -44,6 +44,36 @@ impl Mv {
     }
 }
 
+/// AVM `div_mult` reciprocal table for MV projection (mvref_common.h).
+static DIV_MULT: [i64; 32] = [
+    0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170, 1092,
+    1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
+];
+
+/// AVM MAX_FRAME_DISTANCE ((1 << FRAME_OFFSET_BITS) - 1).
+const MAX_FRAME_DISTANCE: i32 = 31;
+
+/// AVM `get_mv_projection`: scale a neighbor MV taken against a reference at
+/// distance `den` onto this block's reference at distance `num`. Feeds the
+/// cross-reference derived DRL candidates on two-reference frames. Component
+/// clamp is MV_LOW+1..=MV_UPP-1 (MV_IN_USE_BITS = 16).
+pub(crate) fn mv_projection(mv: Mv, num: i32, den: i32) -> Mv {
+    let den = den.clamp(1, MAX_FRAME_DISTANCE);
+    let num = num.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+    let round_signed = |value: i64| -> i32 {
+        let rounded = if value < 0 {
+            -(((-value) + (1 << 13)) >> 14)
+        } else {
+            (value + (1 << 13)) >> 14
+        };
+        rounded.clamp(-(1 << 16) + 1, (1 << 16) - 1) as i32
+    };
+    Mv {
+        row: round_signed(mv.row as i64 * num as i64 * DIV_MULT[den as usize]),
+        col: round_signed(mv.col as i64 * num as i64 * DIV_MULT[den as usize]),
+    }
+}
+
 /// MV coding cost proxy: bits(mv - ref) scaled by lambda_mv.
 /// AVM ref: `av2/encoder/mcomp.c` mv_cost = `lambda * (mvjoint + mvcomp bits)`.
 /// Exact component-CDF cost is added once inter CDFs land; this Exp-Golomb

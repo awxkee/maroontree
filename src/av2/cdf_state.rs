@@ -254,6 +254,9 @@ pub(crate) struct CdfState {
     /// single-ref inter mode [5 ctx] (avm inter_single_mode_cdf, 3 syms).
     pub(crate) inter_single_mode: Vec<Vec<u16>>,
     pub(crate) drl: Vec<Vec<u16>>, // drl_cdf[0][ctx] (idx0)
+    /// single-ref rank bit [3 ctx] (avm single_ref_cdf[ctx][0]); coded per inter
+    /// block only when the frame lists two references. bit=1 selects rank 0.
+    pub(crate) single_ref: Vec<Vec<u16>>,
     // Adaptive MVD (QTR_PEL) CDFs — mirror AVM nmv_context so encoder/decoder adapt
     // in lockstep (static CDFs desync after the first motion vector in a frame).
     pub(crate) mvd_shell_set: Vec<u16>, // joint_shell_set_cdf [2]
@@ -576,6 +579,12 @@ impl CdfState {
                     (19449, (3, 4, 5)),
                 ];
                 defs.iter().map(|&(a, p)| bool_wc(a, p)).collect()
+            },
+            single_ref: {
+                // avm default_single_ref_cdf[ctx][0]; para = AVM_PARA2(a,b,c)=(a+2,b+3,c+4).
+                let defs: [(u16, (u8, u8, u8)); 3] =
+                    [(26469, (2, 3, 4)), (13631, (2, 2, 3)), (2599, (2, 3, 4))];
+                defs.iter().map(|&(a0, p)| bool_wc(32768 - a0, p)).collect()
             },
             // AVM default_nmv_context (QTR_PEL). icdf0 = 32768 - AVM_CDF arg;
             // PARA stored AVM_PARA-encoded (arg + base offset), always >= 0.

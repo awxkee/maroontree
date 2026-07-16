@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::av1_coder::*;
+use crate::coder::*;
 use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
 use crate::tables::{COEFF_BASE_RANGE, LO_CTX_OFF, NUM_BASE_LEVELS, level_byte};
@@ -41,6 +41,11 @@ const TRELLIS_AOM_CALIB: f32 = 0.045025873597302174;
 #[inline]
 fn trellis_lambda_aom(dc_q: f32, _ac_q: f32) -> f32 {
     TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
+}
+
+#[inline]
+fn scaled_trellis_lambda(dc_q: f32, ac_q: f32, lambda0: f32) -> f32 {
+    trellis_lambda_aom(dc_q, ac_q) * (lambda0 / TRELLIS_LAMBDA0)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -62,7 +67,7 @@ pub(crate) fn trellis_optimize_ctx(
         return;
     }
     let n = scan.len();
-    let lambda = trellis_lambda_aom(dc_q, ac_q);
+    let lambda = scaled_trellis_lambda(dc_q, ac_q, lambda0);
     let log2w = w.trailing_zeros() as usize;
     let stride = w;
     // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
@@ -456,7 +461,7 @@ pub(crate) fn trellis_optimize(
         return; // trellis disabled
     }
     let n = scan.len();
-    let lambda = trellis_lambda_aom(dc_q, ac_q);
+    let lambda = scaled_trellis_lambda(dc_q, ac_q, lambda0);
     let (dc_q2, ac_q2) = (dc_q * dc_q, ac_q * ac_q);
 
     let Some(eob_idx) = scan[..n].iter().rposition(|&rc| cf[rc as usize] != 0) else {
@@ -542,8 +547,16 @@ pub(crate) fn trellis_optimize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av1_coder::Cdfs;
+    use crate::coder::Cdfs;
     use crate::tables::SCAN_16X16;
+
+    #[test]
+    fn requested_lambda_scales_trellis_rd_cost() {
+        let base = scaled_trellis_lambda(200.0, 220.0, TRELLIS_LAMBDA0);
+        let reduced = scaled_trellis_lambda(200.0, 220.0, TRELLIS_LAMBDA0 * 0.25);
+        assert_eq!(base, trellis_lambda_aom(200.0, 220.0));
+        assert!((reduced - base * 0.25).abs() <= f32::EPSILON * base);
+    }
 
     fn random_block(rng: &mut impl FnMut() -> u64) -> ([f32; 256], [i32; 256]) {
         let (mut tf, mut cf) = ([0.0f32; 256], [0i32; 256]);

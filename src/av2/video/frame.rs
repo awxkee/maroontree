@@ -110,6 +110,10 @@ pub(crate) struct VideoInterFrameSpec<'a> {
     pub(crate) order_hint: u64,
     pub(crate) tiles: (usize, usize, usize),
     pub(crate) reference_slot: usize,
+    /// Rank-1 reference DPB slot. When set the header lists two references and
+    /// every inter block codes a single_ref rank bit (the tile coders key off
+    /// the encoder's matching `second_ref` state).
+    pub(crate) second_reference_slot: Option<usize>,
     pub(crate) refresh_slot: usize,
 }
 
@@ -124,6 +128,7 @@ pub(crate) fn video_inter_frame(
         order_hint,
         tiles,
         reference_slot,
+        second_reference_slot,
         refresh_slot,
     } = spec;
     let has_chroma = cfg.layout.has_chroma();
@@ -140,8 +145,14 @@ pub(crate) fn video_inter_frame(
     b.write_bits(7, 3); // primary_ref_frame = PRIMARY_REF_NONE (reset CDFs)
     b.write_bits(1u32 << refresh_slot, 8);
     b.write_bit(1); // explicit_ref_frame_map
-    b.write_bits(1, 3); // num_total_refs = 1 (no per-block ref symbol)
-    b.write_bits(reference_slot as u32, 3); // decoder DPB slot
+    // num_total_refs: rank order, best-scored slot first. With one reference no
+    // per-block ref symbol exists; with two, read_single_ref codes one bit.
+    let num_total_refs = 1 + u32::from(second_reference_slot.is_some());
+    b.write_bits(num_total_refs, 3);
+    b.write_bits(reference_slot as u32, 3); // rank-0 decoder DPB slot
+    if let Some(second) = second_reference_slot {
+        b.write_bits(second as u32, 3); // rank-1 decoder DPB slot
+    }
     // allow_ref_frame_mvs is omitted because the sequence disables it.
     // Inter tiles do not use IBC; lossless still selects SCC so palette syntax in
     // the reused tile payload remains valid.

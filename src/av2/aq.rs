@@ -115,122 +115,6 @@ fn sb_subblock_variances(
     filled
 }
 
-/// The representative variance of a superblock for Variance Boost: the value at the
-/// requested `octile` (1..=8) of the 64 sorted 8x8 variances. Octile 1 = the most
-/// low-variance-biased pick (boost readily), octile 8 = only the maximum (boost only
-/// when the whole SB is low-variance).
-fn sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
-    subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Octile o in 1..=8 maps to sorted index o*8 - 1 (o=1 -> 7, o=4 -> 31 (median-ish),
-    // o=6 -> 47 (SVT-AV1-PSY default), o=8 -> 63 (max)).
-    let o = octile.clamp(1, 8) as usize;
-    let idx = (o * 8 - 1).min(63);
-    subvars[idx]
-}
-
-fn variance_boost_delta(picked_var: f32, ref_log: f32, strength: f32, boost_only: bool) -> i32 {
-    // Work in log-variance: compresses the huge dynamic range of variance and matches
-    // the reference (which is a mean of log-variances).
-    let v_log = (1.0 + picked_var).ln();
-    // Low-variance threshold (curve 0): ln(1 + 256).
-    const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
-    const MAX_BOOST: f32 = 18.0; // max qindex *reduction* for the flattest SBs
-    const MAX_CUT: f32 = 10.0; // max qindex *increase* for the busiest SBs
-    // qindex per unit log-variance for each side.
-    const BOOST_SLOPE: f32 = 5.0;
-    const CUT_SLOPE: f32 = 3.0;
-
-    if v_log < LOW_LOG {
-        // Low contrast: boost (negative delta). Deeper below threshold => stronger.
-        let d = ((LOW_LOG - v_log) * BOOST_SLOPE * strength).min(MAX_BOOST);
-        -(d.fast_round() as i32)
-    } else if boost_only {
-        0
-    } else {
-        // Higher contrast: coarsen relative to the tile reference, capped. Using the
-        // reference (not the threshold) keeps well-textured frames near zero-mean.
-        let over = (v_log - ref_log.max(LOW_LOG)).max(0.0);
-        let d = (over * CUT_SLOPE * strength).min(MAX_CUT);
-        d.fast_round() as i32
-    }
-}
-
-/// Mean luma and a two-scale, noise-suppressed mid-band energy for the SB. `mid_energy`
-/// is the geometric mean of the full-resolution mean `|Laplacian|` and the mean
-/// `|Laplacian|` of a 2× box-downsample. Structured detail (edges, rock texture) survives
-/// the downsample and scores on BOTH scales; isolated one-pixel sensor noise averages
-/// away at the coarse scale, so the geometric mean discounts it — unlike raw variance,
-/// which would strongly over-protect dark noise.
-fn dark_structure_stats(
-    yp: &[f32],
-    pw: usize,
-    sb_y: usize,
-    sb_x: usize,
-    width: usize,
-    height: usize,
-) -> (f32, f32) {
-    let h = height.saturating_sub(sb_y).min(64);
-    let w = width.saturating_sub(sb_x).min(64);
-    if h == 0 || w == 0 {
-        return (0.0, 0.0);
-    }
-    let mut buf = [[0f32; 64]; 64];
-    let mut sum = 0f32;
-    for (r, row) in buf.iter_mut().enumerate().take(h) {
-        let base = (sb_y + r) * pw + sb_x;
-        for c in 0..w {
-            let v = yp[base + c];
-            row[c] = v;
-            sum += v;
-        }
-    }
-    let mean = sum / (h * w) as f32;
-    if h < 3 || w < 3 {
-        return (mean, 0.0);
-    }
-    // Full-resolution |Laplacian| (interior 3×3).
-    let mut lap_full = 0f32;
-    let mut nf = 0u32;
-    for r in 1..h - 1 {
-        for c in 1..w - 1 {
-            let l = 4.0 * buf[r][c] - buf[r - 1][c] - buf[r + 1][c] - buf[r][c - 1] - buf[r][c + 1];
-            lap_full += l.abs();
-            nf += 1;
-        }
-    }
-    let lap_full = lap_full / nf as f32;
-    // 2× box downsample, then |Laplacian| at the coarse scale.
-    let (hh, ww) = (h / 2, w / 2);
-    if hh < 3 || ww < 3 {
-        return (mean, 0.0);
-    }
-    let mut half = [[0f32; 32]; 32];
-    for r in 0..hh {
-        for c in 0..ww {
-            half[r][c] = 0.25
-                * (buf[2 * r][2 * c]
-                    + buf[2 * r][2 * c + 1]
-                    + buf[2 * r + 1][2 * c]
-                    + buf[2 * r + 1][2 * c + 1]);
-        }
-    }
-    let mut lap_half = 0f32;
-    let mut nh = 0u32;
-    for r in 1..hh - 1 {
-        for c in 1..ww - 1 {
-            let l = 4.0 * half[r][c]
-                - half[r - 1][c]
-                - half[r + 1][c]
-                - half[r][c - 1]
-                - half[r][c + 1];
-            lap_half += l.abs();
-            nh += 1;
-        }
-    }
-    let lap_half = lap_half / nh as f32;
-    (mean, (lap_full * lap_half).sqrt())
-}
-
 /// Mean activity over all superblocks of a (padded) luma plane — the per-tile
 /// reference used to center the AQ deltas so they are zero-mean.
 pub(crate) fn tile_ref_activity(
@@ -291,42 +175,9 @@ pub(crate) struct AqCell {
     pub(crate) resid_scale_before: f32,
 }
 
-/// Dark-structured-detail protection. An INDEPENDENT AQ signal (combined with the
-/// flat-region variance boost by `max`) that gives extra qindex reduction to dark
-/// superblocks carrying real structure — rock texture, boundaries — that raw variance
-/// would coarsen and quantize to extinction at low quality. Gated to `base_q >= min_q`
-/// (the low-quality range where qstep changes fastest), and driven by a two-scale
-/// noise-suppressed energy rather than raw variance (which would over-protect noise).
-#[derive(Clone, Copy, Debug)]
-pub struct DarkAq {
-    pub enabled: bool,
-    /// Only active at base_q >= this (qstep-extinction range, roughly q<=45 in 8-bit).
-    pub min_q: i32,
-    pub mean_floor: f32,
-    pub dark_ref: f32,
-    pub gamma: f32,
-    pub max_weight: f32,
-    /// qindex units per unit of `log1p(mid_energy * dark_weight)`.
-    pub scale: f32,
-    /// Cap on the extra boost (qindex reduction).
-    pub max_qidx: i32,
-}
-
-impl Default for DarkAq {
-    fn default() -> Self {
-        DarkAq {
-            enabled: false,
-            min_q: 150,
-            mean_floor: 16.0,
-            dark_ref: 56.0,
-            gamma: 1.2,
-            // `darkness = max_weight - 1` is the effective multiplier for the darkest SBs.
-            max_weight: 4.5,
-            scale: 4.0,
-            max_qidx: 16,
-        }
-    }
-}
+// The dark-structured-detail protection config lives in the shared AQ module (used by
+// both the AV1 and AV2 paths); re-exported here so `av2::DarkAq` (public API) resolves.
+pub use crate::aq_common::DarkAq;
 
 pub(crate) struct AqState {
     present: bool,
@@ -404,7 +255,9 @@ impl AqState {
     }
 
     /// Extra qindex reduction (>= 0) for a dark, structured SB. 0 when disabled, out of
-    /// the gated quality range, or the SB carries no cross-scale structure.
+    /// the gated quality range, or the SB carries no cross-scale structure. Delegates to
+    /// the shared implementation; the AV2 luma plane is native-depth `f32`, passed at
+    /// `scale = 1.0` (no bit-depth normalization).
     fn dark_protection(
         &self,
         yp: &[f32],
@@ -414,28 +267,17 @@ impl AqState {
         width: usize,
         height: usize,
     ) -> i32 {
-        let d = &self.dark;
-        if !d.enabled || self.base_q < d.min_q {
-            return 0;
-        }
-        let (mean, mid_energy) = dark_structure_stats(yp, pw, sb_y, sb_x, width, height);
-        if mid_energy <= 0.0 {
-            return 0;
-        }
-        // Darker SBs get a heavier weight; `dark_weight` is 1.0 at/above `dark_ref` and
-        // rises toward `max_weight` as the SB darkens. Subtracting 1 makes the protection
-        // vanish for bright/mid SBs (so it doesn't just boost all texture) and scale with
-        // how far below the reference the SB sits.
-        let dark_weight = (((d.mean_floor + d.dark_ref) / (d.mean_floor + mean)).powf(d.gamma))
-            .clamp(1.0, d.max_weight);
-        let darkness = dark_weight - 1.0;
-        if darkness <= 0.0 {
-            return 0;
-        }
-        let dark_structure = (mid_energy * darkness).ln_1p();
-        ((dark_structure * d.scale).min(d.max_qidx as f32))
-            .max(0.0)
-            .fast_round() as i32
+        crate::aq_common::dark_protection(
+            &self.dark,
+            self.base_q,
+            yp,
+            pw,
+            sb_y,
+            sb_x,
+            width,
+            height,
+            1.0,
+        )
     }
 
     /// The SB's target qindex: the flat-region variance boost combined with the
@@ -457,9 +299,13 @@ impl AqState {
         if filled == 0 {
             return self.base_q;
         }
-        let picked = sb_octile_variance(&mut subvars, self.vb_octile);
-        let vb_delta =
-            variance_boost_delta(picked, self.ref_act, self.vb_strength, self.vb_boost_only);
+        let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.vb_octile);
+        let vb_delta = crate::aq_common::variance_boost_delta(
+            picked,
+            self.ref_act,
+            self.vb_strength,
+            self.vb_boost_only,
+        );
         let dark = self.dark_protection(yp, pw, sb_y, sb_x, width, height);
         let flat_boost = (-vb_delta).max(0);
         let protection = flat_boost.max(dark);

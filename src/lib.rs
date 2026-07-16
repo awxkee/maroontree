@@ -28,8 +28,12 @@
  */
 #![allow(clippy::manual_clamp, clippy::excessive_precision)]
 
-mod av1_coder;
-mod av1_coefs;
+mod aq_common;
+mod chroma_rect;
+mod coder;
+mod coefs;
+mod dispatch;
+mod partition_rd;
 mod skip_tables;
 mod tile;
 mod wht;
@@ -61,6 +65,7 @@ mod obu;
 mod odec;
 mod par;
 mod pixel;
+mod qm_tables;
 mod quant;
 mod rangecoder;
 mod rd_sse;
