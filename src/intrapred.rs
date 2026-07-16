@@ -57,12 +57,107 @@ pub(crate) const D203_PRED: usize = 7;
 /// `txtp_from_uvmode`, so it defaults to `DCT_DCT` — i.e. CfL needs no ADST.
 pub(crate) const CFL_PRED: usize = 13;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterIntraMode {
+    Dc = 0,
+    Vertical = 1,
+    Horizontal = 2,
+    D157 = 3,
+    Paeth = 4,
+}
+
+pub(crate) static FILTER_INTRA_MODES: [FilterIntraMode; 5] = [
+    FilterIntraMode::Dc,
+    FilterIntraMode::Vertical,
+    FilterIntraMode::Horizontal,
+    FilterIntraMode::D157,
+    FilterIntraMode::Paeth,
+];
+
 const EDGE_ORIGIN: usize = 2;
 const EDGE_CAPACITY: usize = 132;
 
 #[derive(Clone)]
 struct IntraEdge {
     samples: [i32; EDGE_CAPACITY],
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_intra_predict(
+    mode: FilterIntraMode,
+    recon: &[i32],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    width: usize,
+    height: usize,
+    out: &mut [i32],
+    bit_depth: u8,
+) {
+    debug_assert_eq!(width & 3, 0);
+    debug_assert_eq!(height & 1, 0);
+    debug_assert!(width <= 32 && height <= 32);
+    debug_assert_eq!(out.len(), width * height);
+
+    let base = 1i32 << (bit_depth - 1);
+    let have_top = oy > 0;
+    let have_left = ox > 0;
+    let corner = match (have_top, have_left) {
+        (true, true) => recon[(oy - 1) * stride + ox - 1],
+        (true, false) => recon[(oy - 1) * stride + ox],
+        (false, true) => recon[oy * stride + ox - 1],
+        (false, false) => base,
+    };
+    let mut buf = [[0i32; 33]; 33];
+    buf[0][0] = corner;
+    for x in 0..width {
+        buf[0][x + 1] = if have_top {
+            recon[(oy - 1) * stride + ox + x]
+        } else if have_left {
+            recon[oy * stride + ox - 1]
+        } else {
+            base - 1
+        };
+    }
+    for y in 0..height {
+        buf[y + 1][0] = if have_left {
+            recon[(oy + y) * stride + ox - 1]
+        } else if have_top {
+            recon[(oy - 1) * stride + ox]
+        } else {
+            base + 1
+        };
+    }
+
+    let taps = &crate::tables::INTRA_FILTER_TAPS[mode as usize];
+    let max_sample = (1 << bit_depth) - 1;
+    for r in (1..=height).step_by(2) {
+        for c in (1..=width).step_by(4) {
+            let p = [
+                buf[r - 1][c - 1],
+                buf[r - 1][c],
+                buf[r - 1][c + 1],
+                buf[r - 1][c + 2],
+                buf[r - 1][c + 3],
+                buf[r][c - 1],
+                buf[r + 1][c - 1],
+            ];
+            for (k, filter) in taps.iter().enumerate() {
+                let sum = filter
+                    .iter()
+                    .zip(p)
+                    .map(|(&tap, sample)| tap as i32 * sample)
+                    .sum::<i32>();
+                let value =
+                    ((sum + 8) >> crate::tables::INTRA_FILTER_SCALE_BITS).clamp(0, max_sample);
+                buf[r + (k >> 2)][c + (k & 3)] = value;
+            }
+        }
+    }
+    for y in 0..height {
+        out[y * width..(y + 1) * width].copy_from_slice(&buf[y + 1][1..width + 1]);
+    }
 }
 
 impl IntraEdge {
@@ -1229,6 +1324,70 @@ pub(crate) fn dc_pred_16x32(recon: &[i32], stride: usize, ox: usize, oy: usize, 
 #[cfg(test)]
 mod intra_edge_tests {
     use super::*;
+
+    #[test]
+    fn filter_intra_constant_edges_stay_constant() {
+        let sizes = [
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+            (8, 16),
+            (16, 8),
+            (16, 16),
+            (16, 32),
+            (32, 16),
+            (32, 32),
+            (4, 16),
+            (16, 4),
+            (8, 32),
+            (32, 8),
+        ];
+        for bd in [8u8, 10, 12] {
+            let value = 37 << (bd - 8);
+            let recon = vec![value; 40 * 40];
+            for &(w, h) in &sizes {
+                for mode in FILTER_INTRA_MODES {
+                    let mut out = vec![0; w * h];
+                    filter_intra_predict(mode, &recon, 40, 1, 1, w, h, &mut out, bd);
+                    assert!(out.iter().all(|&v| v == value), "{mode:?} {w}x{h} bd={bd}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_intra_handles_missing_edges_and_clips() {
+        for bd in [8u8, 10, 12] {
+            let max = (1 << bd) - 1;
+            let recon = vec![max; 32 * 32];
+            for &(ox, oy) in &[(0, 0), (1, 0), (0, 1), (1, 1)] {
+                for mode in FILTER_INTRA_MODES {
+                    let mut out = [0; 64];
+                    filter_intra_predict(mode, &recon, 32, ox, oy, 8, 8, &mut out, bd);
+                    assert!(out.iter().all(|&v| (0..=max).contains(&v)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_intra_is_recursive_across_groups() {
+        let mut recon = vec![128; 16 * 16];
+        for x in 0..8 {
+            recon[x] = 16 + x as i32 * 20;
+        }
+        for y in 0..8 {
+            recon[y * 16] = 240 - y as i32 * 18;
+        }
+        let mut a = [0; 64];
+        let mut b = [0; 64];
+        filter_intra_predict(FilterIntraMode::D157, &recon, 16, 1, 1, 8, 8, &mut a, 8);
+        recon[0] ^= 63;
+        filter_intra_predict(FilterIntraMode::D157, &recon, 16, 1, 1, 8, 8, &mut b, 8);
+        assert_ne!(a[..8], b[..8]);
+        assert_ne!(a[32..], b[32..]);
+    }
 
     #[test]
     fn strength_thresholds_match_av1() {

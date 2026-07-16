@@ -65,6 +65,7 @@ impl PixelLayout<'_> {
                 bit_depth,
                 full_range,
                 true,
+                true,
             ),
             Self::Yuv444 { color } => {
                 let profile = if bit_depth == 12 { 2 } else { 1 };
@@ -74,6 +75,7 @@ impl PixelLayout<'_> {
                     profile,
                     bit_depth,
                     color,
+                    true,
                     true,
                 )
             }
@@ -86,6 +88,7 @@ impl PixelLayout<'_> {
                 1,
                 0,
                 true,
+                true,
             ),
             Self::Yuv420 { color } => {
                 let profile = if bit_depth == 12 { 2 } else { 0 };
@@ -97,6 +100,7 @@ impl PixelLayout<'_> {
                     color,
                     1,
                     1,
+                    true,
                     true,
                 )
             }
@@ -336,6 +340,7 @@ pub(crate) fn encode_lossless_monochrome(
         height as u32,
         bit_depth,
         full_range,
+        false,
         false,
     ));
     bytes.extend_from_slice(&encode_lossless_mono_frame_obus(

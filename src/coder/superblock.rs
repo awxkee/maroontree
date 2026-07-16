@@ -28,6 +28,28 @@
  */
 
 impl<'a> LossyTile<'a> {
+    fn emit_filter_intra(
+        &mut self,
+        y_mode: usize,
+        width: usize,
+        height: usize,
+        choice: Option<FilterIntraMode>,
+    ) {
+        if !filter_intra_allowed(y_mode, width, height) {
+            debug_assert!(choice.is_none());
+            return;
+        }
+        let bsize = av1_block_size_index(width, height);
+        self.enc.encode_symbol(
+            usize::from(choice.is_some()),
+            &mut self.cdfs.filter_intra[bsize],
+        );
+        if let Some(mode) = choice {
+            self.enc
+                .encode_symbol(mode as usize, &mut self.cdfs.filter_intra_mode);
+        }
+    }
+
     #[inline]
     fn luma_filter_type(&self, px: usize, py: usize) -> bool {
         let (bx4, by4) = (px / 4, py / 4);

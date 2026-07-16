@@ -69,6 +69,11 @@ pub static VERT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub(crate) static TUNE_SSIMULACRA2: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+#[inline]
+fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
+    candidate_sse <= best_sse
+}
+
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Part16 {
@@ -209,6 +214,8 @@ pub(crate) struct Cdfs {
     pub(crate) kf_y: Vec<Vec<u16>>,               // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
     pub(crate) uv_mode: Vec<Vec<u16>>,            // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
     pub(crate) angle_delta: Vec<Vec<u16>>,        // angle_delta[8 directional modes]
+    pub(crate) filter_intra: Vec<Vec<u16>>,       // use_filter_intra [BLOCK_SIZES_ALL]
+    pub(crate) filter_intra_mode: Vec<u16>,       // five filter-intra predictors
     pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
     pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
     pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
@@ -354,6 +361,11 @@ impl Cdfs {
                 v
             },
             angle_delta: ANGLE_DELTA_CDF.iter().map(|r| icdf(r)).collect(),
+            filter_intra: FILTER_INTRA_CDF
+                .iter()
+                .map(|&threshold| icdf(&[threshold]))
+                .collect(),
+            filter_intra_mode: icdf(&FILTER_INTRA_MODE_CDF),
             cfl_sign: icdf(&CFL_SIGN_CDF),
             cfl_alpha: CFL_ALPHA_CDF.iter().map(|r| icdf(r)).collect(),
             uv_mode: {
@@ -731,6 +743,51 @@ fn asym_adst_enabled() -> bool {
 
 fn angle_delta_enabled() -> bool {
     true
+}
+
+#[inline]
+fn av1_block_size_index(width: usize, height: usize) -> usize {
+    match (width, height) {
+        (4, 4) => 0,
+        (4, 8) => 1,
+        (8, 4) => 2,
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (32, 64) => 10,
+        (64, 32) => 11,
+        (64, 64) => 12,
+        (64, 128) => 13,
+        (128, 64) => 14,
+        (128, 128) => 15,
+        (4, 16) => 16,
+        (16, 4) => 17,
+        (8, 32) => 18,
+        (32, 8) => 19,
+        (16, 64) => 20,
+        (64, 16) => 21,
+        _ => panic!("unsupported AV1 block size {width}x{height}"),
+    }
+}
+
+#[inline]
+fn filter_intra_allowed(y_mode: usize, width: usize, height: usize) -> bool {
+    y_mode == DC_PRED && width.max(height) <= 32
+}
+
+#[inline]
+fn filter_intra_tx_mode(choice: Option<FilterIntraMode>, y_mode: usize) -> usize {
+    match choice {
+        Some(FilterIntraMode::Vertical) => V_PRED,
+        Some(FilterIntraMode::Horizontal) => H_PRED,
+        Some(FilterIntraMode::D157) => D157_PRED,
+        Some(FilterIntraMode::Dc | FilterIntraMode::Paeth) => DC_PRED,
+        None => y_mode,
+    }
 }
 
 const DIRECTIONAL_RDO_TOP_K: usize = 3;
@@ -2886,6 +2943,13 @@ mod aq_tests {
         let mut pred = src;
         pred[5] += 3;
         assert!(satd_sad_proxy(&src, 4, &pred, 4, 4, 4) > 0);
+    }
+
+    #[test]
+    fn filter_intra_never_trades_reconstruction_for_rate() {
+        assert!(filter_intra_sse_allowed(99, 100));
+        assert!(filter_intra_sse_allowed(100, 100));
+        assert!(!filter_intra_sse_allowed(101, 100));
     }
 
     /// Dark protection over a full 64×64 SB of the given i32 plane, with the AV1

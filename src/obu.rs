@@ -494,6 +494,7 @@ pub(crate) fn sequence_header_cicp(
     profile: u32,
     bit_depth: u8,
     color: Option<&crate::color::Cicp>,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     seq_header_ss(
@@ -504,6 +505,7 @@ pub(crate) fn sequence_header_cicp(
         color,
         0,
         0,
+        enable_filter_intra,
         enable_intra_edge_filter,
     )
 }
@@ -519,6 +521,7 @@ pub(crate) fn sequence_header_cicp_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     seq_header_ss(
@@ -529,6 +532,7 @@ pub(crate) fn sequence_header_cicp_ss(
         color,
         ss_x,
         ss_y,
+        enable_filter_intra,
         enable_intra_edge_filter,
     )
 }
@@ -544,6 +548,7 @@ pub(crate) fn sequence_header_mono(
     height: u32,
     bit_depth: u8,
     full_range: bool,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     let profile: u32 = if bit_depth == 12 { 2 } else { 0 };
@@ -561,7 +566,7 @@ pub(crate) fn sequence_header_mono(
     w.f(height - 1, hbits); // max_frame_height_minus_1
 
     w.flag(false); // use_128x128_superblock
-    w.flag(false); // enable_filter_intra
+    w.flag(enable_filter_intra);
     w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
@@ -604,6 +609,7 @@ fn seq_header_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     use crate::color::MatrixCoefficients;
@@ -622,7 +628,7 @@ fn seq_header_ss(
     w.f(height - 1, hbits); // max_frame_height_minus_1
 
     w.flag(false); // use_128x128_superblock
-    w.flag(false); // enable_filter_intra
+    w.flag(enable_filter_intra);
     w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)

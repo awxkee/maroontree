@@ -377,6 +377,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 8, 16);
+            self.emit_filter_intra(DC_PRED, 8, 16, None);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 2].fill(sv);
             self.l_skip[by4..by4 + 4].fill(sv);
@@ -522,6 +523,7 @@ impl<'a> LossyTile<'a> {
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
         self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
+        self.emit_filter_intra(DC_PRED, lw, lh, None);
         let sv = block_skip as u8;
         let (aw, ah) = (lw / 4, lh / 4);
         self.a_skip[bx4..bx4 + aw].fill(sv);
@@ -643,7 +645,8 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
-            self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 8, 16);
+            self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 16, 8);
+            self.emit_filter_intra(DC_PRED, 16, 8, None);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 4].fill(sv);
             self.l_skip[by4..by4 + 2].fill(sv);
@@ -765,6 +768,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 16, 8);
+            self.emit_filter_intra(DC_PRED, 16, 8, None);
             // footprint update: skip/mode over 4 wide x 2 tall units.
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 4].fill(sv);
@@ -841,6 +845,7 @@ impl<'a> LossyTile<'a> {
         let mut best_eff = f32::INFINITY;
         let mut best_dct_sse = 0i64;
         let mut best_dct_bits = 0f32;
+        let mut best_filter_intra = None;
         let mut ltf = [0f32; 256]; // winner transform coeffs (f32, for winner-only RDOQ)
         let modes = if self.speed.reduced_modes() {
             fast_nd_modes()
@@ -899,7 +904,12 @@ impl<'a> LossyTile<'a> {
             }
             let sse = blk_sse16(&idct_dequant_16x16(&cf, &self.quant));
             let bits = block_rate_bits(&cf, &SCAN_16X16);
-            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m));
+            let filter_bits = if m == DC_PRED {
+                cdf_cost(&self.cdfs.filter_intra[av1_block_size_index(16, 16)], 0)
+            } else {
+                0.0
+            };
+            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m) + filter_bits);
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -908,6 +918,68 @@ impl<'a> LossyTile<'a> {
                 ltf = tf;
                 best_dct_sse = sse;
                 best_dct_bits = bits;
+                best_filter_intra = None;
+            }
+        }
+        if self.speed == Speed::Slow {
+            let bsize = av1_block_size_index(16, 16);
+            for filter_mode in FILTER_INTRA_MODES {
+                let mut pred = [0i32; 256];
+                filter_intra_predict(
+                    filter_mode,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    16,
+                    16,
+                    &mut pred,
+                    self.bd,
+                );
+                let mut resid = [0i32; 256];
+                crate::rd_sse::residual_pred(
+                    &mut resid,
+                    &pred,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    16,
+                    16,
+                );
+                let (mut cf, tf) = forward_dct_quant_16x16_t(&resid, &self.quant);
+                trellis_optimize_ctx(
+                    &mut cf,
+                    &tf,
+                    dcq,
+                    acq,
+                    &SCAN_16X16,
+                    lam,
+                    16,
+                    &self.cdfs,
+                    2,
+                    0,
+                    &self.cdfs.eob_bin_256_l,
+                    dcs16,
+                );
+                let rr = idct_dequant_16x16(&cf, &self.quant);
+                let sse =
+                    sse_recon::<256, 16>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
+                let bits = block_rate_bits(&cf, &SCAN_16X16);
+                let syntax_bits = mode_signal_bits(DC_PRED)
+                    + cdf_cost(&self.cdfs.filter_intra[bsize], 1)
+                    + cdf_cost(&self.cdfs.filter_intra_mode, filter_mode as usize);
+                let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
+                if filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff {
+                    best_eff = cost;
+                    best_mode = DC_PRED;
+                    lpred_arr = pred;
+                    lcf = cf;
+                    ltf = tf;
+                    best_dct_sse = sse;
+                    best_dct_bits = bits;
+                    best_filter_intra = Some(filter_mode);
+                }
             }
         }
         // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
@@ -1114,14 +1186,17 @@ impl<'a> LossyTile<'a> {
         if self.ss420 {
             self.code_block16_420(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
+                best_filter_intra,
             );
         } else if self.ss422 {
             self.code_block16_422(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
+                best_filter_intra,
             );
         } else {
             self.code_block16_444(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
+                best_filter_intra,
             );
         }
     }

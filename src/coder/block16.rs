@@ -121,6 +121,7 @@ impl<'a> LossyTile<'a> {
         cfl: Option<[i32; 2]>,
         txtp16: u8,
         angle_delta: i32,
+        filter_intra: Option<FilterIntraMode>,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (bx4, by4) = (px / 4, py / 4);
@@ -137,6 +138,7 @@ impl<'a> LossyTile<'a> {
             );
         }
         self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 16, 16);
+        self.emit_filter_intra(y_mode, 16, 16, filter_intra);
         let sv = block_skip as u8;
         let mv = y_mode as u8;
         self.a_skip[bx4..bx4 + 4].fill(sv);
@@ -155,7 +157,7 @@ impl<'a> LossyTile<'a> {
                 false,
                 sk,
                 ds,
-                y_mode,
+                filter_intra_tx_mode(filter_intra, y_mode),
                 match txtp16 {
                     1 => ADST_ADST_TX16_IDX,
                     2 => ADST_DCT_TX16_IDX,
@@ -201,6 +203,7 @@ impl<'a> LossyTile<'a> {
         luma_zero: bool,
         txtp16: u8,
         angle_delta: i32,
+        filter_intra: Option<FilterIntraMode>,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (bx4, by4) = (px / 4, py / 4);
@@ -471,6 +474,7 @@ impl<'a> LossyTile<'a> {
             cfl_opt,
             txtp16,
             angle_delta,
+            filter_intra,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -533,6 +537,7 @@ impl<'a> LossyTile<'a> {
         luma_zero: bool,
         txtp16: u8,
         angle_delta: i32,
+        filter_intra: Option<FilterIntraMode>,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (cx, cy) = (px / 2, py / 2);
@@ -695,6 +700,7 @@ impl<'a> LossyTile<'a> {
             None,
             txtp16,
             angle_delta,
+            filter_intra,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -742,6 +748,7 @@ impl<'a> LossyTile<'a> {
         luma_zero: bool,
         txtp16: u8,
         angle_delta: i32,
+        filter_intra: Option<FilterIntraMode>,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let cx = px / 2;
@@ -877,6 +884,7 @@ impl<'a> LossyTile<'a> {
             if use_cfl { Some(cfl_alpha_uv) } else { None },
             txtp16,
             angle_delta,
+            filter_intra,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -1164,6 +1172,7 @@ impl<'a> LossyTile<'a> {
                     self.emit_uv_mode(best_mode, DC_PRED, None, bx, by, 4, 4);
                 }
             }
+            self.emit_filter_intra(best_mode, 4, 4, None);
 
             // --- residual: luma 4x4, then chroma U/V 4x4 (if has_chroma) ---
             let lres_ctx = if block_skip {

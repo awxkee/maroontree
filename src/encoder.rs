@@ -752,6 +752,7 @@ pub fn encode_lossless_obu<T: Pixel>(
         img.bit_depth.bits(),
         color,
         false,
+        false,
     ));
     bytes.extend_from_slice(&crate::coder::encode_lossless_frame_obus(
         img.bit_depth.bits(),

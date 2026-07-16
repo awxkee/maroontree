@@ -58,6 +58,7 @@ impl<'a> LossyTile<'a> {
         let mut best_eff = f32::INFINITY;
         let mut best_dct_sse = 0i64;
         let mut best_dct_bits = 0f32;
+        let mut best_filter_intra = None;
         let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
         let mut ltf = [0f32; 64]; // winner transform coeffs (f32, for winner-only RDOQ)
         let modes = if self.speed.reduced_modes() {
@@ -145,7 +146,12 @@ impl<'a> LossyTile<'a> {
             }
             let sse = blk_sse(&idct_dequant_8x8(&cf, &self.quant));
             let bits = block_rate_bits(&cf, &SCAN_8X8);
-            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m));
+            let filter_bits = if m == DC_PRED {
+                cdf_cost(&self.cdfs.filter_intra[av1_block_size_index(8, 8)], 0)
+            } else {
+                0.0
+            };
+            let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m) + filter_bits);
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -154,6 +160,77 @@ impl<'a> LossyTile<'a> {
                 ltf = tf;
                 best_dct_sse = sse;
                 best_dct_bits = bits;
+                best_filter_intra = None;
+            }
+        }
+        if self.speed == Speed::Slow {
+            let bsize = av1_block_size_index(8, 8);
+            for filter_mode in FILTER_INTRA_MODES {
+                let mut pred = [0i32; 64];
+                filter_intra_predict(
+                    filter_mode,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    8,
+                    8,
+                    &mut pred,
+                    self.bd,
+                );
+                let mut resid = [0i32; 64];
+                crate::rd_sse::residual_pred(
+                    &mut resid,
+                    &pred,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    8,
+                    8,
+                );
+                let (mut cf, tf) = forward_dct_quant_8x8_t(&resid, &self.quant);
+                if self.speed.per_candidate_rdoq() {
+                    trellis_optimize_ctx(
+                        &mut cf,
+                        &tf,
+                        dcq,
+                        acq,
+                        &SCAN_8X8,
+                        lam,
+                        8,
+                        &self.cdfs,
+                        1,
+                        0,
+                        &self.cdfs.eob_bin_64_l,
+                        dc_sgn,
+                    );
+                }
+                let rr = idct_dequant_8x8(&cf, &self.quant);
+                let sse = sse_recon::<64, 8>(
+                    &pred,
+                    &rr,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    self.bd,
+                );
+                let bits = block_rate_bits(&cf, &SCAN_8X8);
+                let syntax_bits = mode_signal_bits(DC_PRED)
+                    + cdf_cost(&self.cdfs.filter_intra[bsize], 1)
+                    + cdf_cost(&self.cdfs.filter_intra_mode, filter_mode as usize);
+                let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
+                if filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff {
+                    best_eff = cost;
+                    best_mode = DC_PRED;
+                    lpred_arr = pred;
+                    lcf = cf;
+                    ltf = tf;
+                    best_dct_sse = sse;
+                    best_dct_bits = bits;
+                    best_filter_intra = Some(filter_mode);
+                }
             }
         }
         // Angle-delta winner refinement: if the winning luma mode is one of the
@@ -1197,6 +1274,7 @@ impl<'a> LossyTile<'a> {
                 8,
             );
         }
+        self.emit_filter_intra(best_mode, 8, 8, best_filter_intra);
         let sv = block_skip as u8;
         self.a_skip[bx4] = sv;
         self.a_skip[bx4 + 1] = sv;
@@ -1221,7 +1299,7 @@ impl<'a> LossyTile<'a> {
                 false,
                 sk,
                 ds,
-                best_mode,
+                filter_intra_tx_mode(best_filter_intra, best_mode),
                 if best_is_idtx {
                     0
                 } else if best_is_adst {
