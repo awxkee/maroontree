@@ -104,6 +104,10 @@ pub(crate) fn inverse_recenter(r: u32, v: u32) -> u32 {
 pub(crate) struct SymbolTrace {
     ops: Vec<u64>, // fl:[24..41) fh:[8..24) nms:[0..8)
     marks: Vec<u32>,
+    /// Per superblock, the op offset of the AV1 `read_cdef()` point — right
+    /// after the skip flag of the SB's first non-skip block — or `u32::MAX`
+    /// when the SB is all-skip (no `cdef_idx` is signaled there).
+    cdef_points: Vec<u32>,
 }
 
 impl SymbolTrace {
@@ -116,6 +120,17 @@ impl SymbolTrace {
 
     pub(crate) fn mark(&mut self) {
         self.marks.push(self.ops.len() as u32);
+        self.cdef_points.push(u32::MAX);
+    }
+
+    /// Record the current superblock's `read_cdef()` insertion point (first
+    /// non-skip block). At most one per SB; later calls are ignored.
+    pub(crate) fn cdef_mark(&mut self) {
+        if let Some(p) = self.cdef_points.last_mut()
+            && *p == u32::MAX
+        {
+            *p = self.ops.len() as u32;
+        }
     }
 
     pub(crate) fn sb_count(&self) -> usize {
@@ -130,6 +145,23 @@ impl SymbolTrace {
             .get(i + 1)
             .map_or(self.ops.len(), |&m| m as usize);
         &self.ops[a..b]
+    }
+
+    /// Ops of superblock `i` split at its `read_cdef()` point: `(pre, Some(post))`
+    /// when the SB carries a `cdef_idx`, `(all, None)` when it is all-skip.
+    pub(crate) fn sb_ops_split(&self, i: usize) -> (&[u64], Option<&[u64]>) {
+        let a = self.marks[i] as usize;
+        let b = self
+            .marks
+            .get(i + 1)
+            .map_or(self.ops.len(), |&m| m as usize);
+        let p = self.cdef_points[i] as usize;
+        if p == u32::MAX as usize {
+            (&self.ops[a..b], None)
+        } else {
+            debug_assert!(a <= p && p <= b);
+            (&self.ops[a..p], Some(&self.ops[p..b]))
+        }
     }
 }
 
@@ -167,6 +199,14 @@ impl OdEcEncoder {
     pub(crate) fn trace_mark(&mut self) {
         if let Some(t) = self.trace.as_mut() {
             t.mark();
+        }
+    }
+
+    /// Record the current SB's `read_cdef()` insertion point (no-op without an
+    /// active trace; at most one per SB).
+    pub(crate) fn trace_cdef_mark(&mut self) {
+        if let Some(t) = self.trace.as_mut() {
+            t.cdef_mark();
         }
     }
 

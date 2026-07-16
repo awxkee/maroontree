@@ -1,5 +1,7 @@
 // Minimal Y4M -> AV2 IVF encoder (Phase-A gate). Build: --features video.
 // usage: y4m2ivf <in.y4m> <out.ivf> [qindex]
+// Kept for manual testing via the commented-out call in main.rs.
+#![allow(dead_code)]
 use std::io::{Read, Write};
 
 use maroontree::BitDepth;
@@ -82,11 +84,30 @@ pub(crate) fn convert(inp: String, outp: String, q: u8) {
         });
     }
 
-    let cfg = Av2Encoder::new(q).with_tiles(4, 4).with_threads(12);
+    // No tiling for typical (<=1080p) clips: tiny tiles add per-tile overhead,
+    // disable per-block multi-reference, and break prediction across tile edges.
+    // Only tile large frames, where the threading win outweighs the overhead.
+    let cfg = if w * h > 1920 * 1080 {
+        Av2Encoder::new(q).with_tiles(2, 2).with_threads(12)
+    } else {
+        Av2Encoder::new(q).with_threads(12)
+    };
     let color = Cicp::srgb_ycbcr();
-    let ki: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Default to a ~2-second GOP so P-frames (inter prediction) are used. The old
+    // default of 0 meant ALL-INTRA — every frame a keyframe — which is ~30x larger
+    // on typical content. Pass an explicit 0 as arg 5 to force all-intra.
+    let default_ki = (2 * fn_ as u64 / fd.max(1) as u64).max(1);
+    let ki: u64 = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_ki);
     let ivf = encode_ivf(cfg, chroma, 0, &frames, &color, fn_, fd, ki).expect("encode");
     let mut out = std::fs::File::create(outp.clone()).expect("create");
     out.write_all(&ivf).unwrap();
-    eprintln!("wrote {} frames -> {}", frames.len(), outp);
+    eprintln!(
+        "wrote {} frames ({} bytes, key_interval={ki}) -> {}",
+        frames.len(),
+        ivf.len(),
+        outp
+    );
 }

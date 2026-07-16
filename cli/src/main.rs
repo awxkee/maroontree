@@ -114,6 +114,7 @@ struct Args {
     apply_icc: bool,
     verbose: bool,
     speed: EncodingEffort,
+    qmatrix: Option<Qmatrix>,
 }
 
 fn usage() -> ! {
@@ -136,6 +137,7 @@ Options:
       --no-exif                         Strip EXIF metadata from output
       --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
+      --qm <auto|0-15>                  Enable AV1 quantization matrices
   -s, --speed                           Encoding effort (default = slow)
   -v, --verbose                         Print timing and file stats
   -h, --help                            Print this help"
@@ -159,6 +161,12 @@ enum EncodingEffort {
     Slow,
     Medium,
     Fast,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Qmatrix {
+    Auto,
+    Level(u8),
 }
 
 impl EncodingEffort {
@@ -187,6 +195,7 @@ fn parse_args() -> Args {
     let mut apply_icc = false;
     let mut verbose = false;
     let mut speed = EncodingEffort::Slow;
+    let mut qmatrix = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -197,6 +206,22 @@ fn parse_args() -> Args {
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
             "--apply-icc" => apply_icc = true,
+            "--qm" => {
+                let value = args.next().unwrap_or_default();
+                qmatrix = Some(if value == "auto" {
+                    Qmatrix::Auto
+                } else {
+                    let level = value.parse::<u8>().unwrap_or_else(|_| {
+                        die(format!(
+                            "invalid qmatrix level '{value}'; expected auto or 0-15"
+                        ))
+                    });
+                    if level > 15 {
+                        die("qmatrix level must be 0-15");
+                    }
+                    Qmatrix::Level(level)
+                });
+            }
             "-e" | "--encoder" => match args.next().unwrap_or_default().as_str() {
                 "av1" => encoder = Encoder::Av1,
                 "av2" => encoder = Encoder::Av2,
@@ -298,6 +323,7 @@ fn parse_args() -> Args {
         apply_icc,
         verbose,
         speed,
+        qmatrix,
     }
 }
 

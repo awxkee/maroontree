@@ -221,6 +221,15 @@ pub struct Av2VideoEncoder {
     preset: VideoPreset,
     nominal_q: u8,
     cq_max_delta: u8,
+    /// Caps how many DPB references the per-frame search considers, overriding the
+    /// preset's `reference_count`. `1` forces single-reference prediction (no
+    /// second reference is listed, no per-block ref bit). `None` uses the preset.
+    reference_limit: Option<usize>,
+    /// Minimum fraction of superblocks that must clearly prefer the second
+    /// reference before it is listed (per-block `single_ref`-bit overhead only
+    /// pays off on occlusion/reveal content). `0.0` always lists it when a second
+    /// candidate exists; a large value disables it. Default 0.06.
+    second_reference_threshold: f32,
 }
 
 impl Av2VideoEncoder {
@@ -264,7 +273,23 @@ impl Av2VideoEncoder {
             preset: VideoPreset::Slow,
             nominal_q,
             cq_max_delta: 0,
+            reference_limit: None,
+            second_reference_threshold: 0.06,
         }
+    }
+
+    /// Cap the number of DPB references the search considers (`>= 1`), overriding
+    /// the preset. `1` disables per-block multi-reference prediction; higher values
+    /// are clamped to the preset's `reference_count`.
+    pub fn set_reference_limit(&mut self, n: usize) {
+        self.reference_limit = Some(n.max(1));
+    }
+
+    /// Fraction of superblocks that must prefer the second reference before it is
+    /// listed. `0.0` always lists it when available (max multi-ref); higher values
+    /// reserve it for stronger occlusion/reveal content. See the field docs.
+    pub fn set_second_reference_threshold(&mut self, threshold: f32) {
+        self.second_reference_threshold = threshold;
     }
 
     /// Worker budget used by per-frame tile and wavefront work.
@@ -415,9 +440,13 @@ impl Av2VideoEncoder {
         } else {
             self.since_key + 1
         };
-        let reference_limit = self.preset.config().reference_count as usize;
+        let preset_refs = self.preset.config().reference_count as usize;
+        let reference_limit = self
+            .reference_limit
+            .map_or(preset_refs, |n| n.min(preset_refs));
         let latest_slot = self.state.references.latest_slot();
-        let mut reference_choice = None;
+        let mut reference_candidates: Vec<((u64, usize), usize, crate::av2::video::mv::Mv)> =
+            Vec::new();
         if matches!(ftype, FrameType::Inter) {
             for slot in self.state.references.populated_slots(reference_limit) {
                 let reference = self
@@ -443,17 +472,44 @@ impl Av2VideoEncoder {
                     };
                     // 4:2:0 contains four luma samples for each U and V sample.
                     let score = score.saturating_mul(4).saturating_add(chroma_score);
-                    let rank = (score, usize::from(slot != latest_slot));
-                    if reference_choice
-                        .as_ref()
-                        .is_none_or(|(best_rank, _, _)| rank < *best_rank)
-                    {
-                        reference_choice = Some((rank, slot, seed));
-                    }
+                    reference_candidates.push((
+                        (score, usize::from(slot != latest_slot)),
+                        slot,
+                        seed,
+                    ));
                 }
             }
         }
+        reference_candidates.sort_by_key(|&(rank, _, _)| rank);
+        let reference_choice = reference_candidates.first().copied();
         let reference_slot = reference_choice.map(|(_, slot, _)| slot);
+        // Rank-1 reference: the next-best scored slot. Listing it taxes every inter
+        // block one `single_ref` bit, so it only pays off on content where a second
+        // reference is genuinely the better predictor for a chunk of the frame
+        // (occlusion / reveal / periodic motion). On smooth content the recent frame
+        // wins everywhere and the tax is pure overhead — so gate on a cheap per-SB
+        // estimate of how much of the frame prefers the second reference. Lossless
+        // (`nominal_q == 0`) never lists it.
+        let second_reference_slot = reference_candidates
+            .get(1)
+            .filter(|_| self.nominal_q != 0)
+            .filter(|&&(_, second_slot, _)| {
+                let (Some(r0), Some(r1)) = (
+                    reference_slot.and_then(|s| self.state.references.slot(s)),
+                    self.state.references.slot(second_slot),
+                ) else {
+                    return false;
+                };
+                analysis.second_reference_preferred_fraction(
+                    &r0.planes[0],
+                    r0.strides[0],
+                    &r1.planes[0],
+                    r1.strides[0],
+                    img.width,
+                    img.height,
+                ) >= self.second_reference_threshold
+            })
+            .map(|&(_, slot, _)| slot);
         let motion_seed = reference_choice
             .map(|(_, _, seed)| seed)
             .unwrap_or(crate::av2::video::mv::Mv::ZERO);
@@ -491,8 +547,21 @@ impl Av2VideoEncoder {
             {
                 *self.cfg.last_ref.lock().unwrap() = std::sync::Arc::clone(&r.planes);
             }
+            *self.cfg.second_ref.lock().unwrap() = second_reference_slot
+                .and_then(|slot| self.state.references.slot(slot))
+                .map(|r| std::sync::Arc::clone(&r.planes))
+                .unwrap_or_default();
+            // Order-hint distances scale the cross-rank derived MV predictor.
+            let dist_of = |slot: Option<usize>| -> i32 {
+                slot.and_then(|slot| self.state.references.slot(slot))
+                    .map(|r| (self.state.order_hint.saturating_sub(r.order_hint)).max(1) as i32)
+                    .unwrap_or(1)
+            };
+            *self.cfg.ref_dists.lock().unwrap() =
+                [dist_of(reference_slot), dist_of(second_reference_slot)];
         } else {
             *self.cfg.last_ref.lock().unwrap() = std::sync::Arc::new(Vec::new());
+            *self.cfg.second_ref.lock().unwrap() = std::sync::Arc::new(Vec::new());
         }
         self.cfg
             .capture_recon
@@ -520,6 +589,7 @@ impl Av2VideoEncoder {
             !self.seq_emitted,
             chroma_strides,
             reference_slot.unwrap_or(0),
+            second_reference_slot,
             refresh_slot,
         )?;
         // Commit temporal state only after coding and serialization succeed.
@@ -1474,6 +1544,793 @@ mod tests {
             &decoded[3 * expected.len()..4 * expected.len()],
             expected,
             "LAST3 reconstruction differs from AVM"
+        );
+    }
+
+    fn noise_64(seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..64 * 64)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// 64x64 block translated down-right by (dx, dy); revealed edges fill 128.
+    fn shifted_64(block: &[u8], dx: usize, dy: usize) -> Vec<u8> {
+        let mut out = vec![128u8; 64 * 64];
+        for y in 0..64 - dy {
+            for x in 0..64 - dx {
+                out[(y + dy) * 64 + (x + dx)] = block[y * 64 + x];
+            }
+        }
+        out
+    }
+
+    /// 128x64 4:2:0 image from two 64x64 luma blocks; flat chroma.
+    fn two_sb_420(left: &[u8], right: &[u8]) -> PlanarImage<u8> {
+        let (w, h) = (128usize, 64usize);
+        let mut luma = vec![0u8; w * h];
+        for row in 0..h {
+            luma[row * w..row * w + 64].copy_from_slice(&left[row * 64..row * 64 + 64]);
+            luma[row * w + 64..row * w + 128].copy_from_slice(&right[row * 64..row * 64 + 64]);
+        }
+        PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                luma,
+                vec![96; (w / 2) * (h / 2)],
+                vec![160; (w / 2) * (h / 2)],
+                Vec::new(),
+            ],
+        }
+    }
+
+    fn decode_with_avmdec(stream: Vec<u8>, tag: &str) -> Option<Vec<u8>> {
+        let decoder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("avmdec");
+        if !decoder.is_file() {
+            return None;
+        }
+        let tag = format!("{tag}-{}", std::process::id());
+        let input = std::env::temp_dir().join(format!("{tag}.obu"));
+        let output = std::env::temp_dir().join(format!("{tag}.yuv"));
+        std::fs::write(&input, stream).unwrap();
+        let result = std::process::Command::new(decoder)
+            .arg("--codec=av2")
+            .arg("--rawvideo")
+            .arg("--output-bit-depth=8")
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .unwrap();
+        let decoded = std::fs::read(&output).unwrap_or_default();
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+        assert!(
+            result.status.success(),
+            "avmdec rejected stream: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Some(decoded)
+    }
+
+    fn last_recon_bytes(enc: &Av2VideoEncoder) -> Vec<u8> {
+        let reference = enc.state.references.last().unwrap();
+        let mut bytes = Vec::new();
+        for (plane, stride, plane_width, plane_height) in [
+            (
+                &reference.planes[0],
+                reference.strides[0],
+                128usize,
+                64usize,
+            ),
+            (&reference.planes[1], reference.strides[1], 64usize, 32usize),
+            (&reference.planes[2], reference.strides[2], 64usize, 32usize),
+        ] {
+            for row in plane.chunks_exact(stride).take(plane_height) {
+                bytes.extend(row[..plane_width].iter().map(|&value| value as u8));
+            }
+        }
+        bytes
+    }
+
+    /// Two static regions that each match a DIFFERENT reference frame: the
+    /// left SB tracks the previous frame, the right SB returns to the key
+    /// frame's content. Both zero-motion, so per-SB GLOBALMV skip must pick a
+    /// different reference rank per SB and the stream must still match AVM.
+    #[test]
+    fn per_sb_skip_reference_rank_selection_is_byte_exact() {
+        let left_key = noise_64(0x11);
+        let left_new = noise_64(0x22);
+        let right_key = noise_64(0x33);
+        let right_mid = noise_64(0x44);
+
+        let cfg = Av2Encoder::new(100)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_chroma_split(false) // whole-64 fast path (rank selection lives there)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+
+        let first = enc
+            .push_frame(&two_sb_420(&left_key, &right_key), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let second = enc
+            .push_frame(&two_sb_420(&left_new, &right_mid), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let rank1_before = crate::av2::y420::core_skip_rank1_count();
+        let third = enc
+            .push_frame(&two_sb_420(&left_new, &right_key), &Cicp::srgb_ycbcr())
+            .unwrap();
+        assert!(
+            crate::av2::y420::core_skip_rank1_count() > rank1_before,
+            "third frame should skip at least one SB from the rank-1 reference"
+        );
+
+        let expected = last_recon_bytes(&enc);
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-per-sb-ref-rank") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "per-SB rank-selected reconstruction differs from AVM"
+        );
+    }
+
+    /// Two moving regions that each track a DIFFERENT reference: the left SB
+    /// continues the previous frame's pattern, the right SB continues the key
+    /// frame's. The right SB's DRL[0] must then come from the cross-rank
+    /// derived (distance-scaled) candidate — the decoder derives it
+    /// independently, so any mismatch breaks byte-exactness.
+    #[test]
+    fn cross_rank_derived_mv_prediction_is_byte_exact() {
+        let left_key = noise_64(0x51);
+        let left_mid = noise_64(0x61); // new content after the key frame
+        let right_key = noise_64(0x77);
+        let right_mid = noise_64(0x99);
+
+        let cfg = Av2Encoder::new(100)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_chroma_split(false) // whole-64 fast path (rank selection lives there)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+        // NEWMV multi-ref win is motion-based; the (zero-motion) production gate does
+        // not detect it, so force the second reference to exercise the derived-MV path.
+        enc.set_second_reference_threshold(0.0);
+
+        let first = enc
+            .push_frame(&two_sb_420(&left_key, &right_key), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let second = enc
+            .push_frame(&two_sb_420(&left_mid, &right_mid), &Cicp::srgb_ycbcr())
+            .unwrap();
+        // Left continues frame 2's content (translated); right returns to the
+        // key frame's content (translated) — different reference per SB, both
+        // with nonzero motion.
+        let rank1_before = crate::av2::y420::core_newmv_rank1_count();
+        let third = enc
+            .push_frame(
+                &two_sb_420(&shifted_64(&left_mid, 4, 0), &shifted_64(&right_key, 2, 2)),
+                &Cicp::srgb_ycbcr(),
+            )
+            .unwrap();
+        assert!(
+            crate::av2::y420::core_newmv_rank1_count() > rank1_before,
+            "third frame should code at least one NEWMV SB on the rank-1 reference"
+        );
+
+        let expected = last_recon_bytes(&enc);
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-derived-mv") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "cross-rank derived-MV reconstruction differs from AVM"
+        );
+    }
+
+    /// Same divergent-reference occlusion scenario as the core-path test, but
+    /// through the PARTITION walk (chroma_split, the default). Flat per-SB blocks
+    /// keep each superblock a whole-64 leaf so the rank-selecting GLOBALMV-skip
+    /// branch fires; the right SB reverts to the key frame (rank 1), the left SB
+    /// tracks the previous frame (rank 0). Proves the partition-walk rank bit and
+    /// the same-rank mode contexts stay byte-exact with AVM.
+    #[test]
+    fn partition_walk_per_sb_skip_rank_is_byte_exact() {
+        let solid = |v: u8| vec![v; 64 * 64];
+        let cfg = Av2Encoder::new(100)
+            .with_chroma_split(true) // route through the partition walk (default)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+
+        let first = enc
+            .push_frame(&two_sb_420(&solid(90), &solid(150)), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let second = enc
+            .push_frame(&two_sb_420(&solid(200), &solid(60)), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let rank1_before = crate::av2::y420::partition_skip_rank1_count();
+        // Left SB stays at frame 2's value (rank 0); right SB returns to the key
+        // frame's value (rank 1) — different reference per SB, both zero motion.
+        let third = enc
+            .push_frame(&two_sb_420(&solid(200), &solid(150)), &Cicp::srgb_ycbcr())
+            .unwrap();
+        assert!(
+            crate::av2::y420::partition_skip_rank1_count() > rank1_before,
+            "the partition walk did not commit a rank-1 GLOBALMV skip"
+        );
+
+        let expected = last_recon_bytes(&enc);
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-partition-rank") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "partition-walk rank-selected reconstruction differs from AVM"
+        );
+    }
+
+    /// Build a `n`-superblock-wide (n*64 x 64) 4:2:0 image from per-SB solid luma
+    /// values; flat chroma. Each SB stays a whole-64 leaf.
+    fn n_sb_420(vals: &[u8]) -> PlanarImage<u8> {
+        let n = vals.len();
+        let (w, h) = (n * 64, 64usize);
+        let mut luma = vec![0u8; w * h];
+        for (i, &v) in vals.iter().enumerate() {
+            for row in 0..h {
+                luma[row * w + i * 64..row * w + i * 64 + 64].fill(v);
+            }
+        }
+        PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                luma,
+                vec![96; (w / 2) * (h / 2)],
+                vec![160; (w / 2) * (h / 2)],
+                Vec::new(),
+            ],
+        }
+    }
+
+    /// Build a `cols`x`rows`-superblock grid ((cols*64)x(rows*64)) 4:2:0 image
+    /// from a row-major grid of per-SB solid luma values; flat chroma.
+    fn grid_sb_420(cols: usize, rows: usize, vals: &[u8]) -> PlanarImage<u8> {
+        let (w, h) = (cols * 64, rows * 64);
+        let mut luma = vec![0u8; w * h];
+        for r in 0..rows {
+            for c in 0..cols {
+                let v = vals[r * cols + c];
+                for y in 0..64 {
+                    let base = (r * 64 + y) * w + c * 64;
+                    luma[base..base + 64].fill(v);
+                }
+            }
+        }
+        PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                luma,
+                vec![96; (w / 2) * (h / 2)],
+                vec![160; (w / 2) * (h / 2)],
+                Vec::new(),
+            ],
+        }
+    }
+
+    /// `full`*64 + `edge`-px wide, 64 tall, per-region solid luma. The final
+    /// region is a partial (non-64) edge column, so the frame is not 64-aligned.
+    fn edge_row_420(full_vals: &[u8], edge_val: u8, edge: usize) -> PlanarImage<u8> {
+        let full = full_vals.len();
+        let w = full * 64 + edge;
+        let h = 64usize;
+        let mut luma = vec![0u8; w * h];
+        for y in 0..h {
+            for (c, &v) in full_vals.iter().enumerate() {
+                luma[y * w + c * 64..y * w + c * 64 + 64].fill(v);
+            }
+            luma[y * w + full * 64..y * w + w].fill(edge_val);
+        }
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [luma, vec![96; cw * ch], vec![160; cw * ch], Vec::new()],
+        }
+    }
+
+    /// NON-64-aligned reproducer (480x64 = 7 full SBs + 32px right edge). Interior
+    /// SBs 4-6 revert to the key (rank 1) beside the rank-0 edge column. Isolates
+    /// the multi-ref edge desync (aligned crops of the same shape are byte-exact).
+    #[test]
+    fn partition_edge_rank1_is_byte_exact() {
+        let cfg = Av2Encoder::new(100)
+            .with_chroma_split(true)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+        // key ramp of solids + edge; frame2 all-different; frame3 keeps cols 0-3 +
+        // edge at frame2 (rank 0), cols 4-6 back to key (rank 1).
+        let key = [40u8, 90, 150, 210, 60, 120, 180];
+        let f2 = [200u8, 30, 220, 80, 240, 50, 160];
+        let f3 = [200u8, 30, 220, 80, 60, 120, 180];
+        let first = enc
+            .push_frame(&edge_row_420(&key, 100, 32), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let second = enc
+            .push_frame(&edge_row_420(&f2, 130, 32), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let rank1_before = crate::av2::y420::partition_skip_rank1_count();
+        let third = enc
+            .push_frame(&edge_row_420(&f3, 130, 32), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let saw_rank1 = crate::av2::y420::partition_skip_rank1_count() > rank1_before;
+        let (w, h) = (480usize, 64usize);
+        let expected = {
+            let reference = enc.state.references.last().unwrap();
+            let mut bytes = Vec::new();
+            for (plane, stride, pw, ph) in [
+                (&reference.planes[0], reference.strides[0], w, h),
+                (
+                    &reference.planes[1],
+                    reference.strides[1],
+                    w.div_ceil(2),
+                    h / 2,
+                ),
+                (
+                    &reference.planes[2],
+                    reference.strides[2],
+                    w.div_ceil(2),
+                    h / 2,
+                ),
+            ] {
+                for row in plane.chunks_exact(stride).take(ph) {
+                    bytes.extend(row[..pw].iter().map(|&v| v as u8));
+                }
+            }
+            bytes
+        };
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-edge-rank1") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "edge rank-1 reconstruction differs from AVM (saw_rank1={saw_rank1})"
+        );
+    }
+
+    /// Rank-1 skip with a rank-1 ABOVE neighbor (multi-row), which the real clip
+    /// hits and the single-row test does not: a 2-row-tall column reverts to the
+    /// key (rank 1) while the rest tracks frame 2 (rank 0). Must stay byte-exact.
+    #[test]
+    fn partition_rank1_above_neighbor_is_byte_exact() {
+        let cfg = Av2Encoder::new(100)
+            .with_chroma_split(true)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+        // 3 cols x 2 rows. Frame 3: column 2 (both rows) returns to the key
+        // (rank 1); columns 0-1 track frame 2 (rank 0). So SB (1,2) sits below the
+        // rank-1 SB (0,2).
+        let key = [40u8, 90, 150, 100, 170, 210];
+        let f2 = [200u8, 30, 120, 60, 220, 80];
+        let f3 = [200u8, 30, 150, 60, 220, 210]; // col 2 = key, else frame 2
+        let first = enc
+            .push_frame(&grid_sb_420(3, 2, &key), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let second = enc
+            .push_frame(&grid_sb_420(3, 2, &f2), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let rank1_before = crate::av2::y420::partition_skip_rank1_count();
+        let third = enc
+            .push_frame(&grid_sb_420(3, 2, &f3), &Cicp::srgb_ycbcr())
+            .unwrap();
+        assert!(
+            crate::av2::y420::partition_skip_rank1_count() >= rank1_before + 2,
+            "expected rank-1 skips stacked across two rows"
+        );
+        let (w, h) = (192usize, 128usize);
+        let expected = {
+            let reference = enc.state.references.last().unwrap();
+            let mut bytes = Vec::new();
+            for (plane, stride, pw, ph) in [
+                (&reference.planes[0], reference.strides[0], w, h),
+                (&reference.planes[1], reference.strides[1], w / 2, h / 2),
+                (&reference.planes[2], reference.strides[2], w / 2, h / 2),
+            ] {
+                for row in plane.chunks_exact(stride).take(ph) {
+                    bytes.extend(row[..pw].iter().map(|&v| v as u8));
+                }
+            }
+            bytes
+        };
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-rank1-above") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "rank-1 above-neighbor reconstruction differs from AVM"
+        );
+    }
+
+    /// Reproducer for dense contiguous rank-1 skips (what real video hits and the
+    /// isolated single-SB test does not): SBs 1..=3 all revert to the key frame
+    /// (rank 1) while SB 0 stays at frame 2 (rank 0), so a whole row of rank-1
+    /// skips sits beside a rank-0 block. Must stay byte-exact with AVM.
+    #[test]
+    fn partition_contiguous_rank1_skips_are_byte_exact() {
+        let cfg = Av2Encoder::new(100)
+            .with_chroma_split(true)
+            .with_deblock(true)
+            .with_cdef(false)
+            .with_aq(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(30);
+        // Frame 2 changes every SB; frame 3 keeps SBs 0..=3 at frame-2 values
+        // (rank 0, the better overall reference) and returns SBs 4..=5 to the key
+        // (rank 1) — a contiguous pair of rank-1 skips beside rank-0 blocks.
+        let first = enc
+            .push_frame(
+                &n_sb_420(&[40, 90, 150, 210, 100, 170]),
+                &Cicp::srgb_ycbcr(),
+            )
+            .unwrap();
+        let second = enc
+            .push_frame(&n_sb_420(&[200, 30, 120, 60, 220, 80]), &Cicp::srgb_ycbcr())
+            .unwrap();
+        let rank1_before = crate::av2::y420::partition_skip_rank1_count();
+        let third = enc
+            .push_frame(
+                &n_sb_420(&[200, 30, 120, 60, 100, 170]),
+                &Cicp::srgb_ycbcr(),
+            )
+            .unwrap();
+        assert!(
+            crate::av2::y420::partition_skip_rank1_count() >= rank1_before + 2,
+            "expected at least 2 contiguous rank-1 skips"
+        );
+        let expected = {
+            let reference = enc.state.references.last().unwrap();
+            let mut bytes = Vec::new();
+            for (plane, stride, pw, ph) in [
+                (
+                    &reference.planes[0],
+                    reference.strides[0],
+                    384usize,
+                    64usize,
+                ),
+                (
+                    &reference.planes[1],
+                    reference.strides[1],
+                    192usize,
+                    32usize,
+                ),
+                (
+                    &reference.planes[2],
+                    reference.strides[2],
+                    192usize,
+                    32usize,
+                ),
+            ] {
+                for r in plane.chunks_exact(stride).take(ph) {
+                    bytes.extend(r[..pw].iter().map(|&v| v as u8));
+                }
+            }
+            bytes
+        };
+        let mut stream = first.data;
+        stream.extend(second.data);
+        stream.extend(third.data);
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-contig-rank1") else {
+            return;
+        };
+        assert_eq!(
+            &decoded[2 * expected.len()..3 * expected.len()],
+            expected,
+            "contiguous rank-1 reconstruction differs from AVM"
+        );
+    }
+
+    /// Minimal Y4M (8-bit 4:2:0) parser: returns (width, height, first `max`
+    /// frames). None if the fixture is absent.
+    fn read_y4m_frames(
+        path: &std::path::Path,
+        max: usize,
+    ) -> Option<(usize, usize, Vec<PlanarImage<u8>>)> {
+        let bytes = std::fs::read(path).ok()?;
+        let nl = bytes.iter().position(|&b| b == b'\n')?;
+        let header = std::str::from_utf8(&bytes[..nl]).ok()?;
+        let (mut w, mut h) = (0usize, 0usize);
+        for tok in header.split(' ') {
+            match tok.as_bytes().first() {
+                Some(b'W') => w = tok[1..].parse().ok()?,
+                Some(b'H') => h = tok[1..].parse().ok()?,
+                _ => {}
+            }
+        }
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (ysz, csz) = (w * h, cw * ch);
+        let mut pos = nl + 1;
+        let mut frames = Vec::new();
+        while frames.len() < max && pos < bytes.len() {
+            // Each frame is "FRAME\n" then raw planes.
+            let fnl = bytes[pos..].iter().position(|&b| b == b'\n')? + pos;
+            if !bytes[pos..fnl].starts_with(b"FRAME") {
+                break;
+            }
+            pos = fnl + 1;
+            if pos + ysz + 2 * csz > bytes.len() {
+                break;
+            }
+            let y = bytes[pos..pos + ysz].to_vec();
+            let u = bytes[pos + ysz..pos + ysz + csz].to_vec();
+            let v = bytes[pos + ysz + csz..pos + ysz + 2 * csz].to_vec();
+            pos += ysz + 2 * csz;
+            frames.push(PlanarImage {
+                width: w,
+                height: h,
+                bit_depth: BitDepth::Eight,
+                planes: [y, u, v, Vec::new()],
+            });
+        }
+        Some((w, h, frames))
+    }
+
+    // Benchmark harness hook: encode the real clip to an IVF file at MT_ENC_Q,
+    // MT_ENC_FRAMES frames, MT_ENC_KI key interval, written to MT_ENC_OUT.
+    // Drives external comparisons (x264/x265/VMAF). `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn encode_ivf_for_benchmark() {
+        let (Ok(q), Ok(out)) = (std::env::var("MT_ENC_Q"), std::env::var("MT_ENC_OUT")) else {
+            return;
+        };
+        let q: u8 = q.parse().unwrap();
+        let n: usize = std::env::var("MT_ENC_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(192);
+        let ki: u64 = std::env::var("MT_ENC_KI")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/file_example_MP4_480_1_5MG.y4m");
+        let Some((_w, _h, frames)) = read_y4m_frames(&fixture, n) else {
+            return;
+        };
+        let cfg = Av2Encoder::new(q).with_deblock(true).with_cdef(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(ki);
+        let mut stream = Vec::new();
+        for img in &frames {
+            stream.extend(enc.push_frame(img, &Cicp::srgb_ycbcr()).unwrap().data);
+        }
+        eprintln!(
+            "BENCH q={q} ki={ki} frames={} bytes={}",
+            frames.len(),
+            stream.len()
+        );
+        std::fs::write(out, stream).unwrap();
+    }
+
+    // Ad-hoc multi-ref compression-win measurement on the real clip; prints sizes
+    // Diagnostic: per-frame byte breakdown on the real clip. `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn diagnose_frame_sizes() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/file_example_MP4_480_1_5MG.y4m");
+        let Some((_w, _h, frames)) = read_y4m_frames(&fixture, 48) else {
+            return;
+        };
+        // Compare all-intra (what the app does with key_interval=0) vs inter frames.
+        let encode_total = |ki: u64| -> usize {
+            let cfg = Av2Encoder::new(120).with_deblock(true).with_cdef(false);
+            let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+            enc.set_preset(VideoPreset::Reference);
+            enc.set_key_interval(ki);
+            frames
+                .iter()
+                .map(|f| enc.push_frame(f, &Cicp::srgb_ycbcr()).unwrap().data.len())
+                .sum()
+        };
+        let all_intra = encode_total(0);
+        let with_inter = encode_total(48);
+        eprintln!(
+            "DIAG all-intra(ki=0)={}B  with-inter(ki=48)={}B  → {:.1}x smaller with P-frames",
+            all_intra,
+            with_inter,
+            all_intra as f64 / with_inter.max(1) as f64,
+        );
+
+        let cfg = Av2Encoder::new(120).with_deblock(true).with_cdef(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(48); // one key, rest inter
+        let mut key = 0usize;
+        let mut inter: Vec<usize> = Vec::new();
+        for (i, img) in frames.iter().enumerate() {
+            let pkt = enc.push_frame(img, &Cicp::srgb_ycbcr()).unwrap();
+            if i == 0 {
+                key = pkt.data.len();
+            } else {
+                inter.push(pkt.data.len());
+            }
+        }
+        let total: usize = key + inter.iter().sum::<usize>();
+        let mean_inter = inter.iter().sum::<usize>() as f64 / inter.len().max(1) as f64;
+        let min_inter = *inter.iter().min().unwrap_or(&0);
+        let max_inter = *inter.iter().max().unwrap_or(&0);
+        eprintln!(
+            "DIAG {} frames: KEY={}B  inter mean={:.0}B min={}B max={}B  total={}B ({:.0}B/frame)",
+            frames.len(),
+            key,
+            mean_inter,
+            min_inter,
+            max_inter,
+            total,
+            total as f64 / frames.len() as f64,
+        );
+        // Source temporal change: mean per-pixel luma SAD frame N vs N-1, and N vs 0.
+        let luma = |f: &PlanarImage<u8>| f.planes[0].clone();
+        let sad = |a: &[u8], b: &[u8]| {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs())
+                .sum::<u32>() as f64
+                / a.len() as f64
+        };
+        let consec: Vec<f64> = (1..frames.len())
+            .map(|i| sad(&luma(&frames[i]), &luma(&frames[i - 1])))
+            .collect();
+        let vs0: Vec<f64> = (1..frames.len().min(6))
+            .map(|i| sad(&luma(&frames[i]), &luma(&frames[0])))
+            .collect();
+        let mean_consec = consec.iter().sum::<f64>() / consec.len().max(1) as f64;
+        eprintln!(
+            "DIAG source motion: mean consecutive luma SAD/px={:.2} (max={:.2})  vs-frame0 SAD/px (frames 1..5)={:?}",
+            mean_consec,
+            consec.iter().cloned().fold(0.0, f64::max),
+            vs0.iter()
+                .map(|v| (v * 100.0).round() / 100.0)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // (ignored so it doesn't run in the normal suite — `cargo test -- --ignored`).
+    #[test]
+    #[ignore]
+    fn measure_multiref_compression_win() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/file_example_MP4_480_1_5MG.y4m");
+        let Some((_w, _h, frames)) = read_y4m_frames(&fixture, 16) else {
+            return;
+        };
+        let encode = |limit: usize| -> usize {
+            let cfg = Av2Encoder::new(120).with_deblock(true).with_cdef(false);
+            let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+            enc.set_preset(VideoPreset::Reference);
+            enc.set_key_interval(4);
+            enc.set_reference_limit(limit);
+            frames
+                .iter()
+                .map(|img| enc.push_frame(img, &Cicp::srgb_ycbcr()).unwrap().data.len())
+                .sum()
+        };
+        let single = encode(1);
+        let multi = encode(3);
+        eprintln!(
+            "multi-ref win: single={single}B multi={multi}B delta={:.2}%",
+            100.0 * (single as f64 - multi as f64) / single as f64
+        );
+    }
+
+    /// End-to-end real-video validation: encode the first frames of a real 4:2:0
+    /// clip UNTILED (so multi-reference is active) with a short key interval, then
+    /// decode the whole stream with avmdec. Exercises multi-ref ref-bit emission
+    /// across real content — edges (480x270 is non-64-aligned), every partition
+    /// size, deblock, and genuine motion — which the synthetic 2-3 frame tests
+    /// cannot. Skips cleanly when the fixture or decoder is absent.
+    #[test]
+    fn real_video_multiref_stream_decodes_with_avmdec() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/file_example_MP4_480_1_5MG.y4m");
+        let Some((w, h, frames)) = read_y4m_frames(&fixture, 16) else {
+            return;
+        };
+        if frames.len() < 12 {
+            return;
+        }
+        assert!(
+            w % 64 != 0 || h % 64 != 0,
+            "fixture must exercise native partial-edge superblocks"
+        );
+        let cfg = Av2Encoder::new(120).with_deblock(true).with_cdef(false);
+        let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+        enc.set_preset(VideoPreset::Reference);
+        enc.set_key_interval(4); // frequent keys → DPB fills → num_refs=2 on later inters
+        // This clip is smooth, so the production gate would (correctly) not list a
+        // second reference. Force it on to validate the non-aligned edge multi-ref
+        // paths stay byte-exact on real content.
+        enc.set_second_reference_threshold(0.0);
+        let mut stream = Vec::new();
+        let mut saw_two_refs = false;
+        let rank1_before = crate::av2::y420::partition_skip_rank1_count();
+        for img in &frames {
+            let pkt = enc.push_frame(img, &Cicp::srgb_ycbcr()).unwrap();
+            stream.extend(pkt.data);
+            if enc.state.references.slot(1).is_some() {
+                saw_two_refs = true;
+            }
+        }
+        assert!(
+            saw_two_refs,
+            "the clip never populated a second DPB slot; multi-ref path not exercised"
+        );
+        assert!(
+            crate::av2::y420::partition_skip_rank1_count() > rank1_before,
+            "the non-aligned clip never committed a rank-1 edge-path skip"
+        );
+        let Some(decoded) = decode_with_avmdec(stream, "mt-video-real-multiref") else {
+            return;
+        };
+        // avmdec asserts success (no corrupt frame) inside decode_with_avmdec;
+        // require the full frame set decoded.
+        let frame_bytes = w * h + 2 * (w.div_ceil(2) * h.div_ceil(2));
+        assert!(
+            decoded.len() >= frame_bytes * frames.len(),
+            "avmdec produced fewer frames than encoded: {} < {}",
+            decoded.len(),
+            frame_bytes * frames.len()
         );
     }
 }

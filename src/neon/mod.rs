@@ -41,6 +41,6 @@ pub(crate) use idct::{
     iadst_dequant_16x16_neon, iadstdct_dequant_16x16_neon, idct_dequant_8x8_neon,
     idct_dequant_16x16_neon, idct_dequant_32x32_neon, idctadst_dequant_16x16_neon,
 };
-pub(crate) use rd::{residual_dc_neon, residual_pred_neon, sse_recon_dc_neon, sse_recon_neon};
+pub(crate) use rd::{residual_dc_neon, residual_pred_neon, sse_recon_neon};
 pub(crate) use trellis::{trellis_dist_current_zero_scan_neon, trellis_round_down_scan_neon};
 pub(crate) use wht::fwht_raw_neon;

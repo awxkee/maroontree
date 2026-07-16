@@ -164,6 +164,65 @@ impl FrameAnalysis {
         Some((distortion.saturating_add(motion_penalty), seed))
     }
 
+    /// Fraction of 64x64 luma superblocks for which a candidate second reference
+    /// is clearly a better zero-motion predictor than the primary reference — i.e.
+    /// occlusion / reveal / periodic-motion regions where the older frame matches
+    /// and the recent one does not. Listing a second reference taxes every inter
+    /// block one `single_ref` bit, so the encoder only lists it when this fraction
+    /// is high enough to offset that overhead. Both planes are the internal f32
+    /// recon scale; `stride0`/`stride1` skip coded padding.
+    pub(crate) fn second_reference_preferred_fraction(
+        &self,
+        primary: &[f32],
+        stride0: usize,
+        second: &[f32],
+        stride1: usize,
+        width: usize,
+        height: usize,
+    ) -> f32 {
+        if width == 0 || height == 0 {
+            return 0.0;
+        }
+        let sb_sad = |plane: &[f32], stride: usize, x0: usize, y0: usize, w: usize, h: usize| {
+            let mut sad = 0.0f32;
+            for dy in 0..h {
+                let cur = &self.luma[(y0 + dy) * width + x0..];
+                let refr = &plane[(y0 + dy) * stride + x0..];
+                for dx in 0..w {
+                    sad += (cur[dx] - refr[dx]).abs();
+                }
+            }
+            sad
+        };
+        let mut total = 0usize;
+        let mut preferred = 0usize;
+        let mut y = 0;
+        while y < height {
+            let mut x = 0;
+            let h = 64.min(height - y);
+            while x < width {
+                let w = 64.min(width - x);
+                let s0 = sb_sad(primary, stride0, x, y, w, h);
+                let s1 = sb_sad(second, stride1, x, y, w, h);
+                total += 1;
+                // Second ref genuinely better: at least ~20% lower SAD AND the
+                // primary is not already a near-perfect match (so the win would
+                // actually change the block's coded cost, not just its reference).
+                let px = (w * h) as f32;
+                if s1 * 1.2 < s0 && s0 > 2.0 * px {
+                    preferred += 1;
+                }
+                x += 64;
+            }
+            y += 64;
+        }
+        if total == 0 {
+            0.0
+        } else {
+            preferred as f32 / total as f32
+        }
+    }
+
     /// Chroma contribution for 4:2:0 reference ranking. Chroma inherits the
     /// luma motion (halved in sample space); block-level coding may still make
     /// its own residual decisions after the frame reference is selected.
@@ -537,6 +596,7 @@ impl FrameEmit {
         emit_sequence_header: bool,
         chroma_strides: [usize; 3],
         reference_slot: usize,
+        second_reference_slot: Option<usize>,
         refresh_slot: usize,
     ) -> Result<EmittedFrame, crate::EncodeError> {
         let (cw, ch) = still.coded_dims();
@@ -560,6 +620,7 @@ impl FrameEmit {
                     order_hint,
                     tiles: grid,
                     reference_slot,
+                    second_reference_slot,
                     refresh_slot,
                 },
             )?,

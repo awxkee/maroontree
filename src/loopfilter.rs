@@ -251,18 +251,24 @@ fn chroma_cls(dim4: u8) -> u8 {
 }
 
 /// Filter one plane in place. `bw4`/`bh4` give the block width/height (in 4-sample
-/// units) covering each 4x4 unit of THIS plane; block edges are where a unit's
-/// origin (derived from its size by alignment) begins. Frame edges (col 0 /
-/// row 0) are not filtered. `is_luma` selects width tables (luma 4/8/16 vs
-/// chroma 4/6). Processing order matches dav1d: per 64-px superblock row, all
-/// vertical edges then all horizontal edges.
+/// units) covering each 4x4 unit of THIS plane. `vedge4`/`hedge4`, when present,
+/// explicitly mark block starts; this is required for asymmetric partitions
+/// whose origins cannot be inferred from global size alignment. Empty edge maps
+/// retain the alignment-derived path used by chroma. Frame edges (col 0 / row 0)
+/// are not filtered. `is_luma` selects width tables (luma 4/8/16 vs chroma 4/6).
+/// Processing order matches dav1d: per 64-px superblock row, all vertical edges
+/// then all horizontal edges.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_plane(
     px: &mut [i32],
     w: usize,
     h: usize,
+    vis_w: usize,
+    vis_h: usize,
     bw4: &[u8],
     bh4: &[u8],
+    vedge4: &[bool],
+    hedge4: &[bool],
     nc4: usize, // number of 4x4 cols in this plane's grid (== ceil(w/4))
     level: i32,
     is_luma: bool,
@@ -273,8 +279,11 @@ pub(crate) fn filter_plane(
         return;
     }
     let (e, i_lim, h_thresh) = limits(level);
-    let w4 = w.div_ceil(4);
-    let h4 = h.div_ceil(4);
+    // Edge coverage is clipped to the VISIBLE frame (dav1d `f->w4`/`f->h4`):
+    // the mult-8 coded padding is reconstructed but never deblocked, so edges
+    // at or inside the padding stay unfiltered on both sides.
+    let w4 = vis_w.div_ceil(4);
+    let h4 = vis_h.div_ceil(4);
     let cls = |d: u8| if is_luma { luma_cls(d) } else { chroma_cls(d) };
 
     // Process per superblock row (top to bottom): vertical edges, then horizontal.
@@ -289,7 +298,11 @@ pub(crate) fn filter_plane(
                 let cur = bw4[idx];
                 let left = bw4[idx - 1];
                 // a vertical edge exists at c4 iff the current block starts here
-                if c4 % (cur as usize) != 0 {
+                if if vedge4.is_empty() {
+                    c4 % (cur as usize) != 0
+                } else {
+                    !vedge4[idx]
+                } {
                     continue;
                 }
                 let wcls = cls(cur).min(cls(left));
@@ -318,7 +331,11 @@ pub(crate) fn filter_plane(
                 let idx = r4 * nc4 + c4;
                 let cur = bh4[idx];
                 let top = bh4[(r4 - 1) * nc4 + c4];
-                if r4 % (cur as usize) != 0 {
+                if if hedge4.is_empty() {
+                    r4 % (cur as usize) != 0
+                } else {
+                    !hedge4[idx]
+                } {
                     continue;
                 }
                 let wcls = cls(cur).min(cls(top));
@@ -338,5 +355,44 @@ pub(crate) fn filter_plane(
         }
 
         sb_top = sb_bot;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_plane;
+
+    #[test]
+    fn explicit_vertical_edge_handles_asymmetric_block_origin() {
+        let (w, h) = (32usize, 4usize);
+        let mut px = vec![0i32; w * h];
+        for row in px.chunks_mut(w) {
+            row[..12].fill(100);
+            row[12..].fill(110);
+        }
+        let bw4 = vec![2u8; w / 4];
+        let bh4 = vec![1u8; w / 4];
+        let mut vedge4 = vec![false; w / 4];
+        vedge4[3] = true; // x=12 is not globally aligned to an 8px-wide block.
+
+        let before = px.clone();
+        filter_plane(
+            &mut px,
+            w,
+            h,
+            w,
+            h,
+            &bw4,
+            &bh4,
+            &vedge4,
+            &[],
+            w / 4,
+            32,
+            true,
+            16,
+            8,
+        );
+
+        assert_ne!(px, before, "the explicitly recorded edge must be filtered");
     }
 }

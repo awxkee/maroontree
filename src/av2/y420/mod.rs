@@ -40,3 +40,18 @@ pub(crate) use partition::{
     INTER_SKIP_RECT_COUNT,
 };
 mod tiles;
+
+/// Whole-64 blocks committed on reference rank 1 (two-reference frames).
+#[cfg(test)]
+pub(crate) fn core_skip_rank1_count() -> usize {
+    core::CORE_SKIP_RANK1_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(test)]
+pub(crate) fn core_newmv_rank1_count() -> usize {
+    core::CORE_NEWMV_RANK1_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Whole-64 GLOBALMV-skip blocks committed on rank 1 in the partition walk.
+#[cfg(test)]
+pub(crate) fn partition_skip_rank1_count() -> usize {
+    partition::PARTITION_SKIP_RANK1_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}

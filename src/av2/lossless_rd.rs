@@ -27,8 +27,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::av2::coder::{Coeff, LosslessDpcmMode};
+use crate::av2::coder::{Coeff, LosslessDpcmMode, encode_luma_tu4};
+use crate::av2::entropy::RangeEncoder;
 use crate::av2::helpers::{dc_pred, rect_rows};
+use crate::av2::intrapred::{self, IntraRefSpec, build_refs};
 use crate::av2::lossless::LumaPalette;
 use crate::av2::lossless::levels_to_coeffs_4x4;
 use crate::av2::wht::fwht4x4;
@@ -169,47 +171,128 @@ pub(crate) struct LosslessBlockRd {
     pub(crate) x: usize,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    pub(crate) frame_width: usize,
+    pub(crate) frame_height: usize,
     pub(crate) neutral: f32,
+    pub(crate) qc: usize,
+    pub(crate) y_ctx: usize,
 }
 
-fn dc_tu_coeffs(src: &[f32], pw: usize, y0: usize, x0: usize, neutral: f32) -> Vec<Coeff> {
-    let pred = dc_pred(src, pw, y0, x0, 4, neutral);
+fn luma_candidate_bits(tus: &[Vec<Coeff>], mode_idx: usize, y_ctx: usize, qc: usize) -> i32 {
+    let mut enc = RangeEncoder::new();
+    enc.qc = qc;
+    enc.encode_bool(16384, 0); // use_dpcm_y = false
+    enc.sym_y_set(0);
+    enc.sym_y_idx0(y_ctx, mode_idx, 7);
+    for coeffs in tus {
+        encode_luma_tu4(&mut enc, coeffs, 16384, 0);
+    }
+    (enc.finish().len() as i32) * 8
+}
+
+#[derive(Clone, Copy)]
+struct LosslessTuSpec {
+    refs: IntraRefSpec,
+    mode: usize,
+}
+
+fn tu_coeffs_for_mode(src: &[f32], spec: &LosslessTuSpec) -> Vec<Coeff> {
+    let LosslessTuSpec { refs, mode } = *spec;
+    let IntraRefSpec {
+        stride: pw,
+        y: y0,
+        x: x0,
+        neutral,
+        ..
+    } = refs;
+    let pred: [f32; 16] = if mode == 0 {
+        [dc_pred(src, pw, y0, x0, 4, neutral); 16]
+    } else {
+        let (above, left, corner) = build_refs(src, &refs);
+        debug_assert_eq!(mode, 4);
+        let values = intrapred::paeth(4, &above, &left, corner);
+        let mut out = [0f32; 16];
+        out.copy_from_slice(&values);
+        out
+    };
     let mut resid = [0i32; 16];
-    for (dst_row, src_row) in resid
+    for ((dst_row, src_row), pred_row) in resid
         .as_chunks_mut::<4>()
         .0
         .iter_mut()
         .zip(rect_rows(src, pw, y0, x0, 4, 4))
+        .zip(pred.as_chunks::<4>().0)
     {
-        for (dst, &sample) in dst_row.iter_mut().zip(src_row) {
-            *dst = (sample - pred) as i32;
+        for ((dst, &sample), &prediction) in dst_row.iter_mut().zip(src_row).zip(pred_row) {
+            *dst = (sample - prediction) as i32;
         }
     }
     levels_to_coeffs_4x4(&fwht4x4(&resid))
 }
 
-/// Build the verified lossless DC/WHT representation. The experimental
-/// Smooth/Paeth and DPCM searches formed non-normative residuals for coding blocks
-/// larger than one transform and could therefore create decoder-visible stripes.
+/// Select between the verified lossless DC and Paeth paths. Paeth uses only the
+/// immediate top, left, and top-left references, so it is independent of AVM's
+/// coded-neighbor map. Smooth modes additionally consume top-right/bottom-left
+/// extensions whose availability changes across coding-block, SB, tile, and
+/// cropped-frame boundaries; they must remain excluded until that map is modeled.
+/// Cropped transforms use DC because their out-of-frame residual fill is special.
 pub(crate) fn best_luma_block(src: &[f32], pw: usize, rd: LosslessBlockRd) -> LumaBlockCand {
     let LosslessBlockRd {
         y: by0,
         x: bx0,
         rows,
         cols,
+        frame_width,
+        frame_height,
         neutral,
+        qc,
+        y_ctx,
     } = rd;
-    let mut tus = Vec::with_capacity(rows * cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            tus.push(dc_tu_coeffs(src, pw, by0 + r * 4, bx0 + c * 4, neutral));
+    let mut best = LumaBlockCand {
+        mode_idx: 0,
+        tus: Vec::new(),
+        dpcm: None,
+    };
+    let mut best_bits = i32::MAX;
+    let fully_visible = bx0 + cols * 4 <= frame_width && by0 + rows * 4 <= frame_height;
+    let modes: &[usize] = if fully_visible { &[0, 4] } else { &[0] };
+    for &mode in modes {
+        let mut tus = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let (y, x) = (by0 + row * 4, bx0 + col * 4);
+                tus.push(tu_coeffs_for_mode(
+                    src,
+                    &LosslessTuSpec {
+                        refs: IntraRefSpec {
+                            stride: pw,
+                            y,
+                            x,
+                            block_size: 4,
+                            have_above: y > 0,
+                            have_left: x > 0,
+                            top_right: 0,
+                            bottom_left: 0,
+                            neutral,
+                            available_above: 4,
+                            available_left: 4,
+                        },
+                        mode,
+                    },
+                ));
+            }
+        }
+        let bits = luma_candidate_bits(&tus, mode, y_ctx, qc);
+        if bits < best_bits {
+            best_bits = bits;
+            best = LumaBlockCand {
+                mode_idx: mode,
+                tus,
+                dpcm: None,
+            };
         }
     }
-    LumaBlockCand {
-        mode_idx: 0,
-        tus,
-        dpcm: None,
-    }
+    best
 }
 
 pub(crate) struct ChromaBlockCand {

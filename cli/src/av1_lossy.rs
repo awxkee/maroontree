@@ -27,7 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::av1_lossless::encode_av1_lossless;
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{
+    Args, Chroma, Depth, Qmatrix, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+};
 use maroontree::{
     BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, encode_gray8, encode_gray10,
     encode_gray12, encode_rgb8, encode_rgb10, encode_rgb12, encode_rgba8_with_alpha,
@@ -58,6 +60,11 @@ pub(crate) fn encode_av1(
         .with_cicp(Cicp::srgb_ycbcr())
         .with_threads(args.threads)
         .with_speed(args.speed.to_maroontreee());
+    cfg = match args.qmatrix {
+        Some(Qmatrix::Auto) => cfg.with_quantization_matrices(true),
+        Some(Qmatrix::Level(level)) => cfg.with_qmatrix_level(level),
+        None => cfg,
+    };
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());

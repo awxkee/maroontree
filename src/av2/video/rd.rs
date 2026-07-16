@@ -67,6 +67,7 @@ pub(crate) fn inter_syntax_bits(
 ) -> f32 {
     let mut bits = enc.estimate_intra_inter_bits(1)
         + enc.estimate_skip_txfm_bits(skip_ctx, usize::from(skip_txfm))
+        + enc.estimate_single_ref_bits(enc.ref_rank)
         + enc.estimate_inter_mode_bits(mode_ctx, mode);
     if mode != 1 {
         bits += enc.estimate_drl_bits(mode_ctx, 0);

@@ -30,6 +30,62 @@
 use crate::dct::{
     dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32, dct32x32_t,
 };
+use crate::qm_tables::AV1_IQM;
+
+pub(crate) const QM_FLAT_LEVEL: u8 = 15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QmLevels {
+    pub y: u8,
+    pub u: u8,
+    pub v: u8,
+}
+
+impl QmLevels {
+    pub(crate) const FLAT: Self = Self {
+        y: QM_FLAT_LEVEL,
+        u: QM_FLAT_LEVEL,
+        v: QM_FLAT_LEVEL,
+    };
+
+    pub(crate) fn uniform(level: u8) -> Self {
+        let level = level.min(QM_FLAT_LEVEL);
+        Self {
+            y: level,
+            u: level,
+            v: level,
+        }
+    }
+}
+
+#[inline]
+fn qm_offset(w: usize, h: usize) -> usize {
+    match (w, h) {
+        (4, 4) => 0,
+        (8, 8) => 16,
+        (16, 16) => 80,
+        (32, 32) => 336,
+        (4, 8) => 1360,
+        (8, 4) => 1392,
+        (8, 16) => 1424,
+        (16, 8) => 1552,
+        (16, 32) => 1680,
+        (32, 16) => 2192,
+        _ => panic!("unsupported AV1 QM transform size {w}x{h}"),
+    }
+}
+
+#[inline]
+pub(crate) fn qm_weight(level: u8, chroma: bool, rc: usize, w: usize, h: usize) -> u8 {
+    if level >= QM_FLAT_LEVEL {
+        return 32;
+    }
+    // Coefficients are stored x-major (`rc = x*h + y`), while the normative
+    // matrix is row-major (`y*w + x`).
+    let x = rc / h;
+    let y = rc % h;
+    AV1_IQM[level as usize][chroma as usize][qm_offset(w, h) + y * w + x]
+}
 
 /// DC dequant value `dav1d_dq_tbl[bd][q][0]` for bit_depth 8/10/12.
 pub(crate) fn dc_q(base_q_idx: u8, bd: u8) -> u16 {
@@ -92,6 +148,32 @@ pub(crate) trait Dct {
     fn q_mult_dc(&self) -> i32;
     /// Forward-quantisation multiplier for AC, `round(65536 / ac_q)`.
     fn q_mult_ac(&self) -> i32;
+    fn qm_level(&self) -> u8;
+    fn qm_chroma(&self) -> bool;
+
+    #[inline]
+    fn has_qmatrix(&self) -> bool {
+        self.qm_level() < QM_FLAT_LEVEL
+    }
+
+    #[inline]
+    fn dequant_step(&self, rc: usize, w: usize, h: usize) -> i32 {
+        let base = if rc == 0 { self.dc_q() } else { self.ac_q() };
+        if !self.has_qmatrix() {
+            return base;
+        }
+        let weight = qm_weight(self.qm_level(), self.qm_chroma(), rc, w, h) as i32;
+        (base * weight + 16) >> 5
+    }
+
+    #[inline]
+    fn forward_qm_weight(&self, rc: usize, w: usize, h: usize) -> i32 {
+        if !self.has_qmatrix() {
+            return 32;
+        }
+        let iwt = qm_weight(self.qm_level(), self.qm_chroma(), rc, w, h) as i32;
+        (1024 + iwt / 2) / iwt
+    }
 }
 
 /// Precomputed dequant coefficients + inverse-transform clips for one
@@ -107,10 +189,17 @@ pub(crate) struct Quant {
     cmin: i32,
     cmax: i32,
     cf_max: i32,
+    qm_level: u8,
+    qm_chroma: bool,
 }
 
 impl Quant {
+    #[allow(dead_code)]
     pub(crate) fn new(base_q_idx: u8, bd: u8) -> Self {
+        Self::new_with_qm(base_q_idx, bd, QM_FLAT_LEVEL)
+    }
+
+    pub(crate) fn new_with_qm(base_q_idx: u8, bd: u8, qm_level: u8) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
         let dc = dc_q(base_q_idx, bd) as i32;
         let ac = ac_q(base_q_idx, bd) as i32;
@@ -124,11 +213,13 @@ impl Quant {
             cmin,
             cmax,
             cf_max,
+            qm_level: qm_level.min(QM_FLAT_LEVEL),
+            qm_chroma: false,
         }
     }
 
     pub(crate) fn new_chroma(base_q_idx: u8, bd: u8) -> Self {
-        Self::new_chroma_with_delta(base_q_idx, chroma_dc_delta(base_q_idx), bd)
+        Self::new_chroma_with_delta_qm(base_q_idx, chroma_dc_delta(base_q_idx), bd, QM_FLAT_LEVEL)
     }
 
     /// As [`Self::new_chroma`] but with an explicit chroma-DC qindex delta. Under
@@ -138,7 +229,17 @@ impl Quant {
     /// forms the chroma-DC qindex as `CurrentQIndex + DeltaQUDc`, so the encoder
     /// must apply that same frame-level delta to the AQ-adjusted qindex rather
     /// than recomputing it from the local qindex.
+    #[allow(dead_code)]
     pub(crate) fn new_chroma_with_delta(base_q_idx: u8, dc_delta: i32, bd: u8) -> Self {
+        Self::new_chroma_with_delta_qm(base_q_idx, dc_delta, bd, QM_FLAT_LEVEL)
+    }
+
+    pub(crate) fn new_chroma_with_delta_qm(
+        base_q_idx: u8,
+        dc_delta: i32,
+        bd: u8,
+        qm_level: u8,
+    ) -> Self {
         let dc_idx = (base_q_idx as i32 + dc_delta).clamp(0, 255) as u8;
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
         let dc = dc_q(dc_idx, bd) as i32;
@@ -153,6 +254,8 @@ impl Quant {
             cmin,
             cmax,
             cf_max,
+            qm_level: qm_level.min(QM_FLAT_LEVEL),
+            qm_chroma: true,
         }
     }
 }
@@ -177,6 +280,14 @@ impl Dct for Quant {
     #[inline]
     fn q_mult_ac(&self) -> i32 {
         self.q_mult_ac
+    }
+    #[inline]
+    fn qm_level(&self) -> u8 {
+        self.qm_level
+    }
+    #[inline]
+    fn qm_chroma(&self) -> bool {
+        self.qm_chroma
     }
 }
 
@@ -239,4 +350,44 @@ pub(crate) fn forward_dct_quant_4x4_t(
     q: &impl Dct,
 ) -> ([i32; 16], [f32; 16]) {
     dct4x4_t(residual, q)
+}
+
+#[cfg(test)]
+mod qm_tests {
+    use super::*;
+
+    #[test]
+    fn flat_level_preserves_scalar_quantizers() {
+        let q = Quant::new_with_qm(128, 8, 15);
+        for rc in 0..64 {
+            assert_eq!(
+                q.dequant_step(rc, 8, 8),
+                if rc == 0 { q.dc_q() } else { q.ac_q() }
+            );
+            assert_eq!(q.forward_qm_weight(rc, 8, 8), 32);
+        }
+    }
+
+    #[test]
+    fn normative_level_zero_4x4_weights_match_av1() {
+        let expected = [
+            32, 43, 73, 97, 43, 67, 94, 110, 73, 94, 137, 150, 97, 110, 150, 200,
+        ];
+        for y in 0..4 {
+            for x in 0..4 {
+                let rc = x * 4 + y;
+                assert_eq!(qm_weight(0, false, rc, 4, 4), expected[y * 4 + x]);
+            }
+        }
+    }
+
+    #[test]
+    fn forward_and_inverse_matrix_weights_are_reciprocals() {
+        let q = Quant::new_with_qm(128, 8, 10);
+        for rc in 0..256 {
+            let inverse = qm_weight(10, false, rc, 16, 16) as i32;
+            let forward = q.forward_qm_weight(rc, 16, 16);
+            assert!((forward * inverse - 1024).abs() <= inverse / 2);
+        }
+    }
 }

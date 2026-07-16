@@ -32,12 +32,10 @@ use std::sync::OnceLock;
 type ResidualPredFn = fn(&mut [i32], &[i32], &[i32], usize, usize, usize, usize, usize);
 type ResidualDcFn = fn(&mut [i32], &[i32], usize, usize, usize, usize, usize, i32);
 type SseReconFn = fn(&[i32], &[i32], &[i32], usize, usize, usize, usize, usize, i32) -> i64;
-type SseReconDcFn = fn(i32, &[i32], &[i32], usize, usize, usize, usize, usize, i32) -> i64;
 
 static RESIDUAL_PRED: OnceLock<ResidualPredFn> = OnceLock::new();
 static RESIDUAL_DC: OnceLock<ResidualDcFn> = OnceLock::new();
 static SSE_RECON: OnceLock<SseReconFn> = OnceLock::new();
-static SSE_RECON_DC: OnceLock<SseReconDcFn> = OnceLock::new();
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 fn residual_pred_neon_wrap(
@@ -125,37 +123,6 @@ fn sse_recon_avx2_wrap(
     unsafe { crate::avx::sse_recon_avx2(pred, resid, src, stride, px, py, w, h, maxv) }
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-#[allow(clippy::too_many_arguments)]
-fn sse_recon_dc_neon_wrap(
-    dc: i32,
-    resid: &[i32],
-    src: &[i32],
-    stride: usize,
-    px: usize,
-    py: usize,
-    w: usize,
-    h: usize,
-    maxv: i32,
-) -> i64 {
-    unsafe { crate::neon::sse_recon_dc_neon(dc, resid, src, stride, px, py, w, h, maxv) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn sse_recon_dc_avx2_wrap(
-    dc: i32,
-    resid: &[i32],
-    src: &[i32],
-    stride: usize,
-    px: usize,
-    py: usize,
-    w: usize,
-    h: usize,
-    maxv: i32,
-) -> i64 {
-    unsafe { crate::avx::sse_recon_dc_avx2(dc, resid, src, stride, px, py, w, h, maxv) }
-}
-
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_pred(
@@ -228,27 +195,6 @@ pub(crate) fn sse_recon(
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sse_recon_dc(
-    dc: i32,
-    resid: &[i32],
-    src: &[i32],
-    stride: usize,
-    px: usize,
-    py: usize,
-    w: usize,
-    h: usize,
-    bd: u8,
-) -> i64 {
-    debug_assert!(resid.len() >= w * h);
-    debug_assert!(px + w <= stride);
-    debug_assert!((py + h - 1) * stride + px + w <= src.len());
-    let maxv = (1i32 << bd) - 1;
-    let f = *SSE_RECON_DC.get_or_init(resolve_sse_recon_dc);
-    f(dc, &resid[..w * h], src, stride, px, py, w, h, maxv)
-}
-
-#[inline]
 fn resolve_residual_pred() -> ResidualPredFn {
     let mut _f: ResidualPredFn = residual_pred_scalar;
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -291,22 +237,6 @@ fn resolve_sse_recon() -> SseReconFn {
     {
         if std::is_x86_feature_detected!("avx2") {
             _f = sse_recon_avx2_wrap;
-        }
-    }
-    _f
-}
-
-#[inline]
-fn resolve_sse_recon_dc() -> SseReconDcFn {
-    let mut _f: SseReconDcFn = sse_recon_dc_scalar;
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        _f = sse_recon_dc_neon_wrap;
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            _f = sse_recon_dc_avx2_wrap;
         }
     }
     _f
@@ -377,30 +307,6 @@ pub(crate) fn sse_recon_scalar(
         let srow = &src[(py + ry) * stride + px..][..w];
         for (&s, (&p, &e)) in srow.iter().zip(pred_row.iter().zip(resid_row.iter())) {
             let r = (p + e).clamp(0, maxv);
-            let d = (s - r) as i64;
-            sse += d * d;
-        }
-    }
-    sse
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sse_recon_dc_scalar(
-    dc: i32,
-    resid: &[i32],
-    src: &[i32],
-    stride: usize,
-    px: usize,
-    py: usize,
-    w: usize,
-    h: usize,
-    maxv: i32,
-) -> i64 {
-    let mut sse = 0i64;
-    for (ry, resid_row) in resid.chunks_exact(w).take(h).enumerate() {
-        let srow = &src[(py + ry) * stride + px..][..w];
-        for (&s, &e) in srow.iter().zip(resid_row.iter()) {
-            let r = (dc + e).clamp(0, maxv);
             let d = (s - r) as i64;
             sse += d * d;
         }

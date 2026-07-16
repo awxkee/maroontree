@@ -3,9 +3,9 @@ members = ["app", "cli"]
 
 [package]
 name = "maroontree"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
-description = "AV1 image & AV2 video & image encoder"
+description = "AV1 image & AV2 video and image encoder"
 readme = "README.md"
 keywords = ["avif", "av1", "av2", "encoder", "image"]
 license = "BSD-3-Clause OR Apache-2.0"

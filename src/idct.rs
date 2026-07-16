@@ -26,19 +26,18 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::quant::Dct;
+use crate::quant::{Dct, QM_FLAT_LEVEL, qm_weight};
 use std::sync::OnceLock;
 
 pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 512];
     for rc in 0..512 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 32, 16);
         let mag = (((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) >> 1) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -66,14 +65,13 @@ pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &impl Dct) -> [i32; 512
 
 pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 512];
     for rc in 0..512 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 16, 32);
         let mag = (((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) >> 1) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -103,19 +101,15 @@ pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512
     tmp
 }
 
-/// 16x8 (wide) inverse: width 16, height 8. The mirror of `idct_dequant_8x16`,
-/// for luma PARTITION_H sub-blocks. `levels` are in 16(w)x8(h) raster
-/// (rc = row*16 + col). Returns 128 reconstructed residuals in the same raster.
 pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 128];
     for rc in 0..128 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 16, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -148,14 +142,13 @@ pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
 
 pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 128];
     for rc in 0..128 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 8, 16);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -188,14 +181,13 @@ pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
 /// 8x4 inverse: coeff layout `[fx*4+fy]` (8 wide x 4 tall). Transpose of 4x8.
 pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 8, 4);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -226,14 +218,13 @@ pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
 
 pub(crate) fn idct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -345,13 +336,11 @@ pub(crate) fn inv_adst8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
 pub(crate) type IdctDequantFn<const N: usize> =
     unsafe fn(&[i32; N], dequant: &IdctDequant) -> [i32; N];
 
-/// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
-/// inverse transform (TX_8X8 DCT_DCT, 8-bit, shift=1), so the encoder's
-/// reconstruction is bit-identical to the decoder's. This eliminates DC-pred
-/// drift across blocks (the float inverse accumulated error on smooth content).
 pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 8, 8);
+    if q.has_qmatrix() {
+        return idct_dequant_8x8_scalar(levels, &dequant);
+    }
     static DEQUANT_8X8: OnceLock<IdctDequantFn<64>> = OnceLock::new();
     let f = DEQUANT_8X8.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -370,15 +359,6 @@ pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
         }
         idct_dequant_8x8_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -390,6 +370,40 @@ pub(crate) struct IdctDequant {
     pub(crate) cmin: i32,
     pub(crate) cmax: i32,
     pub(crate) cf_max: i32,
+    pub(crate) qm_level: u8,
+    pub(crate) qm_chroma: bool,
+    pub(crate) tx_w: usize,
+    pub(crate) tx_h: usize,
+}
+
+impl IdctDequant {
+    #[inline]
+    fn new(q: &impl Dct, tx_w: usize, tx_h: usize) -> Self {
+        let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+        Self {
+            dc_q: q.dc_q(),
+            ac_q: q.ac_q(),
+            rmin,
+            rmax,
+            cmin,
+            cmax,
+            cf_max,
+            qm_level: q.qm_level(),
+            qm_chroma: q.qm_chroma(),
+            tx_w,
+            tx_h,
+        }
+    }
+
+    #[inline]
+    fn step(&self, rc: usize) -> i32 {
+        let base = if rc == 0 { self.dc_q } else { self.ac_q };
+        if self.qm_level == QM_FLAT_LEVEL {
+            return base;
+        }
+        let weight = qm_weight(self.qm_level, self.qm_chroma, rc, self.tx_w, self.tx_h) as i32;
+        (base * weight + 16) >> 5
+    }
 }
 
 #[allow(unused)]
@@ -401,14 +415,13 @@ pub(crate) fn idct_dequant_8x8_scalar(levels: &[i32; 64], dequant: &IdctDequant)
         dequant.cmax,
         dequant.cf_max,
     );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = dequant.step(rc);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -445,14 +458,13 @@ pub(crate) fn idct_dequant_8x8_scalar(levels: &[i32; 64], dequant: &IdctDequant)
 /// (cols) inverse ADST. Matches the `adstdct8x8` forward.
 pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 8, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -478,18 +490,15 @@ pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64
     tmp
 }
 
-/// Inverse DCT_ADST 8x8 (decoder): horizontal (rows) inverse ADST, then vertical
-/// (cols) inverse DCT. Matches the `dctadst8x8` forward.
 pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 8, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -517,14 +526,13 @@ pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64
 
 pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 8, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -550,14 +558,6 @@ pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     tmp
 }
 
-/// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
-/// inverse for TX_8X8 **IDTX** (identity in both dimensions). Same per-size
-/// orchestration as `idct_dequant_8x8` (dequant, transpose, row pass,
-/// `(t+1)>>1` clip, col pass, `(t+8)>>4`); the 1-D kernel is dav1d's
-/// `inv_identity8_1d` which multiplies each lane by 2 with no internal clamp
-/// (`dav1d_inv_identity8_1d_c`). Because the shifts and clip ranges are per
-/// transform-size (not per type), this is bit-identical to dav1d's TX_8X8 IDTX
-/// inverse. Net gain dequant->residual is 1/8 (x2 row, (t+1)>>1; x2 col, (t+8)>>4).
 pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
@@ -595,11 +595,6 @@ pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 6
     tmp
 }
 
-/// dav1d-exact integer inverse 16-point DCT (`dav1d_inv_dct16_1d_c`, tx64=0
-/// branch of `inv_dct16_1d_internal_c` in src/itx_1d.c). Operates in place on
-/// `c[0], c[s], .., c[15*s]`. Even positions are handled by `inv_dct8_1d`; the
-/// odd-position stages use the AV1 rotation constants verbatim. Stage-named
-/// locals avoid the in-place variable reuse of the C source.
 pub(crate) fn inv_dct16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     let clip = |x: i32| x.clamp(min, max);
     inv_dct8_1d(c, 2 * s, min, max); // even positions c[0],c[2s],..,c[14s]
@@ -664,8 +659,10 @@ pub(crate) fn inv_dct16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
 }
 
 pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 16, 16);
+    if q.has_qmatrix() {
+        return idct_dequant_16x16_scalar(levels, &dequant);
+    }
     static DEQUANT_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
     let f = DEQUANT_16X16.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -684,15 +681,6 @@ pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256
         }
         idct_dequant_16x16_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -704,14 +692,13 @@ pub(crate) fn idct_dequant_16x16_scalar(levels: &[i32; 256], dequant: &IdctDequa
         dequant.cmax,
         dequant.cf_max,
     );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 256];
     for rc in 0..256 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = dequant.step(rc);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -851,14 +838,13 @@ fn inv16x16_dequant_scalar(
         dequant.cmax,
         dequant.cf_max,
     );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 256];
     for rc in 0..256 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = dequant.step(rc);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -884,11 +870,11 @@ fn inv16x16_dequant_scalar(
     tmp
 }
 
-/// TX_16X16 ADST_DCT reconstruction (dav1d-exact): horizontal inverse DCT,
-/// vertical inverse ADST. Matches the `adstdct16x16` forward path.
 pub(crate) fn iadstdct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 16, 16);
+    if q.has_qmatrix() {
+        return iadstdct_dequant_16x16_scalar(levels, &dequant);
+    }
     static DEQUANT_IADSTDCT_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
     let f = DEQUANT_IADSTDCT_16X16.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -907,15 +893,6 @@ pub(crate) fn iadstdct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32;
         }
         iadstdct_dequant_16x16_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -929,8 +906,10 @@ pub(crate) fn iadstdct_dequant_16x16_scalar(
 /// TX_16X16 DCT_ADST reconstruction (dav1d-exact): horizontal inverse ADST,
 /// vertical inverse DCT. Matches the `dctadst16x16` forward path.
 pub(crate) fn idctadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 16, 16);
+    if q.has_qmatrix() {
+        return idctadst_dequant_16x16_scalar(levels, &dequant);
+    }
     static DEQUANT_IDCTADST_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
     let f = DEQUANT_IDCTADST_16X16.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -949,15 +928,6 @@ pub(crate) fn idctadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32;
         }
         idctadst_dequant_16x16_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -970,8 +940,10 @@ pub(crate) fn idctadst_dequant_16x16_scalar(
 
 /// TX_16X16 ADST_ADST reconstruction (dav1d-exact).
 pub(crate) fn iadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 16, 16);
+    if q.has_qmatrix() {
+        return iadst_dequant_16x16_scalar(levels, &dequant);
+    }
     static DEQUANT_IADST_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
     let f = DEQUANT_IADST_16X16.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -990,15 +962,6 @@ pub(crate) fn iadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 25
         }
         iadst_dequant_16x16_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -1006,11 +969,6 @@ pub(crate) fn iadst_dequant_16x16_scalar(levels: &[i32; 256], dequant: &IdctDequ
     inv16x16_dequant_scalar(levels, dequant, inv_adst16_1d, inv_adst16_1d)
 }
 
-/// dav1d-exact integer inverse 32-point DCT (`inv_dct32_1d_internal_c`, tx64=0).
-/// Even positions are handled by `inv_dct16_1d`; the 16 odd-position inputs go
-/// through the AV1 rotation/butterfly stages verbatim. Mutable locals are
-/// reassigned in the exact order of the C source so the sequential semantics
-/// match.
 pub(crate) fn inv_dct32_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     let clip = |x: i32| x.clamp(min, max);
     inv_dct16_1d(c, 2 * s, min, max); // even positions c[0],c[2s],..,c[30s]
@@ -1163,8 +1121,10 @@ pub(crate) fn inv_dct32_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
 }
 
 pub(crate) fn idct_dequant_32x32(levels: &[i32; 1024], q: &impl Dct) -> [i32; 1024] {
-    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let dequant = IdctDequant::new(q, 32, 32);
+    if q.has_qmatrix() {
+        return idct_dequant_32x32_scalar(levels, &dequant);
+    }
     static DEQUANT_32X32: OnceLock<IdctDequantFn<1024>> = OnceLock::new();
     let f = DEQUANT_32X32.get_or_init(|| {
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -1183,15 +1143,6 @@ pub(crate) fn idct_dequant_32x32(levels: &[i32; 1024], q: &impl Dct) -> [i32; 10
         }
         idct_dequant_32x32_scalar
     });
-    let dequant = IdctDequant {
-        dc_q,
-        ac_q,
-        rmax,
-        rmin,
-        cmin,
-        cmax,
-        cf_max,
-    };
     unsafe { f(levels, &dequant) }
 }
 
@@ -1206,14 +1157,13 @@ pub(crate) fn idct_dequant_32x32_scalar(
         dequant.cmax,
         dequant.cf_max,
     );
-    let (dc_q, ac_q) = (dequant.dc_q, dequant.ac_q);
     let mut coeff = [0i32; 1024];
     for rc in 0..1024 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = dequant.step(rc);
         // mask to 24 bits, then dq_shift = 1, then clamp to cf_max
         let mag = (((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) >> 1) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
@@ -1242,10 +1192,9 @@ pub(crate) fn idct_dequant_32x32_scalar(
 
 pub(crate) fn idct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 4);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         let coeff = if lvl < 0 { -mag } else { mag };
@@ -1270,12 +1219,6 @@ pub(crate) fn idct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     tmp
 }
 
-/// dav1d-exact integer inverse ADST-4 (`inv_adst4_1d_internal_c`, in-place),
-/// over a stride-`s` lane. Transcribed verbatim from dav1d `src/itx_1d.c`.
-/// Note: unlike ADST8, the 4-point kernel performs NO min/max clipping inside
-/// the pass (the params are accepted for signature parity but unused), matching
-/// dav1d. The `(C - 4096)` constant form with the trailing `+ inX` terms is the
-/// decoder's exact arithmetic and is required for byte-exact reconstruction.
 pub(crate) fn inv_adst4_1d(c: &mut [i32], s: usize, _min: i32, _max: i32) {
     let in0 = c[0];
     let in1 = c[s];
@@ -1306,17 +1249,11 @@ pub(crate) fn inv_adst4_1d(c: &mut [i32], s: usize, _min: i32, _max: i32) {
     c[3 * s] = o3;
 }
 
-/// Reconstruct a 4x4 residual from quantized levels using the AV1 inverse
-/// ADST_ADST (used for directional chroma modes whose `Mode_To_Txfm` is
-/// ADST_ADST). Same per-size orchestration as `idct_dequant_4x4`: dequant +
-/// transpose, row ADST pass (shift 0), clamp to col range, column ADST pass,
-/// `(t+8)>>4`. For TX_4X4 dav1d uses shift=0 (no inter-pass `(t+1)>>1`).
 pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 4);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         let coeff = if lvl < 0 { -mag } else { mag };
@@ -1338,16 +1275,11 @@ pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     tmp
 }
 
-/// Inverse ADST_DCT 4x4 (AV1 `ADST_DCT`): the decoder applies inv_dct on rows
-/// (first) and inv_adst on columns (second), mirroring `iadstdct_dequant_8x8`
-/// with 4-point kernels and the 4x4 orchestration (shift=0, no inter-pass
-/// `(t+1)>>1`). Pairs with the `adstdct4x4` forward.
 pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 4);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         let coeff = if lvl < 0 { -mag } else { mag };
@@ -1373,10 +1305,9 @@ pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16
 /// columns (second). Pairs with the `dctadst4x4` forward.
 pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 4);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         let coeff = if lvl < 0 { -mag } else { mag };
@@ -1398,19 +1329,15 @@ pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16
     tmp
 }
 
-/// Inverse ADST_DCT 4x8 (AV1 `ADST_DCT`): inv_dct on rows (width-4, first),
-/// inv_adst on columns (height-8, second). Mirrors `iadst_dequant_4x8` with the
-/// row kernel swapped to DCT. Pairs with the `adstdct4x8` forward.
 pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -1436,18 +1363,15 @@ pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32
     tmp
 }
 
-/// Inverse DCT_ADST 4x8 (AV1 `DCT_ADST`): inv_adst on rows (width-4, first),
-/// inv_dct on columns (height-8, second). Pairs with the `dctadst4x8` forward.
 pub(crate) fn idctadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -1558,21 +1482,15 @@ mod adst4_tests {
     }
 }
 
-/// Reconstruct a 4x8 residual from quantized levels using the AV1 inverse
-/// ADST_ADST (4:2:2 directional chroma; `Mode_To_Txfm` ADST_ADST). Mirrors
-/// `idct_dequant_4x8` exactly (rect2 `(c*181+128)>>8` prescale, width-4 row
-/// pass, clamp, height-8 col pass, `(t+8)>>4`) with ADST kernels in both
-/// dimensions. For TX_4X8 dav1d uses shift=0.
 pub(crate) fn iadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
-    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
         let lvl = levels[rc];
         if lvl == 0 {
             continue;
         }
-        let q = if rc == 0 { dc_q } else { ac_q };
+        let q = q.dequant_step(rc, 4, 8);
         let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
         let mag = mag.min(cf_max + (lvl < 0) as i32);
         coeff[rc] = if lvl < 0 { -mag } else { mag };
@@ -1615,6 +1533,10 @@ mod avx2_itx_tests {
             cmin: -(1 << 15),
             cmax: (1 << 15) - 1,
             cf_max: (1 << 22) - 1,
+            qm_level: QM_FLAT_LEVEL,
+            qm_chroma: false,
+            tx_w: 32,
+            tx_h: 32,
         }
     }
 
@@ -1680,6 +1602,10 @@ mod neon_itx_tests {
             cmin: -(1 << 15),
             cmax: (1 << 15) - 1,
             cf_max: (1 << 22) - 1,
+            qm_level: QM_FLAT_LEVEL,
+            qm_chroma: false,
+            tx_w: 32,
+            tx_h: 32,
         }
     }
 

@@ -221,6 +221,13 @@ pub(crate) fn cdef_filter_block(
     let sec_damping = damping.max(1);
     // pri_taps row selected by (pri >> coeff_shift) & 1 (spec).
     let pri_taps = CDEF_PRI_TAPS[((pri >> coeff_shift) & 1) as usize];
+    // libaom/AVM dispatch (`cdef_filter_16_{0..3}` / `cdef_filter_block_internal`):
+    // a zero (variance-adjusted) primary strength disables the primary tap loop
+    // entirely, a zero secondary strength the secondary loop, and the min/max
+    // output clamp runs ONLY when both are enabled (`clipping_required`).
+    let enable_pri = pri != 0;
+    let enable_sec = sec != 0;
+    let clipping = enable_pri && enable_sec;
     let maxv = (1i32 << bd) - 1;
     let rows = src.len() / stride;
     for i in 0..bh {
@@ -232,7 +239,8 @@ pub(crate) fn cdef_filter_block(
             }
             let centre = src[cy * stride + cx];
             if centre == CDEF_VERY_LARGE {
-                dst[(cy - dst_y0) * stride + cx] = centre;
+                // Out-of-frame centre (marked snapshot): the decoder has no such
+                // pixel, so leave `dst` untouched.
                 continue;
             }
             let mut sum = 0i32;
@@ -240,43 +248,50 @@ pub(crate) fn cdef_filter_block(
             let mut max = centre;
             for k in 0..2usize {
                 // Primary taps: along `dir`, both +/- offsets.
-                let (pdr, pdc) = CDEF_DIRECTIONS[dir][k];
-                for &sgn in &[1i32, -1] {
-                    let p = sample(src, stride, cx as i32 + sgn * pdc, cy as i32 + sgn * pdr);
-                    if p != CDEF_VERY_LARGE {
-                        sum += pri_taps[k] * constrain_spec(p - centre, pri, pri_damping);
-                        if p > max {
-                            max = p;
-                        }
-                        if p < min {
-                            min = p;
+                if enable_pri {
+                    let (pdr, pdc) = CDEF_DIRECTIONS[dir][k];
+                    for &sgn in &[1i32, -1] {
+                        let p = sample(src, stride, cx as i32 + sgn * pdc, cy as i32 + sgn * pdr);
+                        if p != CDEF_VERY_LARGE {
+                            sum += pri_taps[k] * constrain_spec(p - centre, pri, pri_damping);
+                            if clipping {
+                                if p > max {
+                                    max = p;
+                                }
+                                if p < min {
+                                    min = p;
+                                }
+                            }
                         }
                     }
                 }
                 // Secondary taps: directions (dir+2)&7 and (dir+6)&7, both +/-.
-                for &doff in &[2usize, 6] {
-                    let sd = (dir + doff) & 7;
-                    let (sdr, sdc) = CDEF_DIRECTIONS[sd][k];
-                    for &sgn in &[1i32, -1] {
-                        let p = sample(src, stride, cx as i32 + sgn * sdc, cy as i32 + sgn * sdr);
-                        if p != CDEF_VERY_LARGE {
-                            sum += CDEF_SEC_TAPS[k] * constrain_spec(p - centre, sec, sec_damping);
-                            if p > max {
-                                max = p;
-                            }
-                            if p < min {
-                                min = p;
+                if enable_sec {
+                    for &doff in &[2usize, 6] {
+                        let sd = (dir + doff) & 7;
+                        let (sdr, sdc) = CDEF_DIRECTIONS[sd][k];
+                        for &sgn in &[1i32, -1] {
+                            let p =
+                                sample(src, stride, cx as i32 + sgn * sdc, cy as i32 + sgn * sdr);
+                            if p != CDEF_VERY_LARGE {
+                                sum +=
+                                    CDEF_SEC_TAPS[k] * constrain_spec(p - centre, sec, sec_damping);
+                                if clipping {
+                                    if p > max {
+                                        max = p;
+                                    }
+                                    if p < min {
+                                        min = p;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
             let mut out = centre + ((8 + sum - (sum < 0) as i32) >> 4);
-            if out < min {
-                out = min;
-            }
-            if out > max {
-                out = max;
+            if clipping {
+                out = out.clamp(min, max);
             }
             dst[(cy - dst_y0) * stride + cx] = out.clamp(0, maxv);
         }
@@ -302,3 +317,59 @@ fn sample(plane: &[i32], stride: usize, x: i32, y: i32) -> i32 {
 pub(crate) static PRI_CANDIDATES: [i32; 4] = [0, 1, 2, 4];
 /// Candidate secondary strengths (spec values 0,1,2,4).
 pub(crate) static SEC_CANDIDATES: [i32; 3] = [0, 1, 2];
+
+/// SSE over one (possibly edge-clipped) 8x8 block of a plane.
+pub(crate) fn block_sse_8x8(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, y: usize) -> i64 {
+    let mut s = 0i64;
+    let yh = (y + 8).min(h);
+    let xw = (x + 8).min(w);
+    for yy in y..yh {
+        for xx in x..xw {
+            let d = (a[yy * w + xx] - b[yy * w + xx]) as i64;
+            s += d * d;
+        }
+    }
+    s
+}
+
+/// libaom's perceptual CDEF distortion for one 8x8 block (`dist_8x8_16bit`): the
+/// SSE weighted by `0.5 * (svar + dvar + c1) / sqrt(c2 + svar*dvar)`, where `svar`
+/// / `dvar` are the (x64) source / reconstructed variances. The weight up-weights
+/// error in flat blocks (where ringing is visible) and down-weights it in
+/// high-variance textured blocks (masking) — so filtering, which cuts a block's
+/// variance, raises its weight and only wins where the SSE drop is real ringing.
+/// `dst` is the candidate (filtered/unfiltered) recon, `src` the source. Partial
+/// edge blocks fall back to plain SSE (the ×64 variance calibration needs a full
+/// 8x8). This is an encoder-side decision metric, not part of the bitstream.
+pub(crate) fn cdef_dist_8x8(
+    src: &[i32],
+    dst: &[i32],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    coeff_shift: u32,
+) -> i64 {
+    if x + 8 > w || y + 8 > h {
+        return block_sse_8x8(dst, src, w, h, x, y);
+    }
+    let (mut ss, mut sd, mut ss2, mut sd2, mut ssd) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    for yy in y..y + 8 {
+        for xx in x..x + 8 {
+            let s = src[yy * w + xx] as i64;
+            let d = dst[yy * w + xx] as i64;
+            ss += s;
+            sd += d;
+            ss2 += s * s;
+            sd2 += d * d;
+            ssd += s * d;
+        }
+    }
+    let svar = ss2 - ((ss * ss + 32) >> 6);
+    let dvar = sd2 - ((sd * sd + 32) >> 6);
+    let sse = (sd2 + ss2 - 2 * ssd) as f64;
+    let c1 = (400i64 << (2 * coeff_shift)) as f64;
+    let c2 = (20000i64 << (4 * coeff_shift)) as f64;
+    let w = 0.5 * (svar as f64 + dvar as f64 + c1) / (c2 + svar as f64 * dvar as f64).sqrt();
+    (0.5 + sse * w) as i64
+}

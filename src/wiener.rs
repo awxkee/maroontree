@@ -152,17 +152,6 @@ pub(crate) fn wiener_filter_rect(
     }
 }
 
-pub(crate) fn wiener_stripes(h: usize) -> Vec<(usize, usize)> {
-    let mut v = Vec::new();
-    let mut ytop = 0usize;
-    while ytop < h {
-        let ybot = (ytop + if ytop == 0 { 56 } else { 64 }).min(h);
-        v.push((ytop, ybot));
-        ytop = ybot;
-    }
-    v
-}
-
 pub(crate) fn wiener_filter_plane(
     dst: &mut [i32],
     src: &[i32],
