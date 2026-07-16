@@ -18,7 +18,7 @@ jixel = "0.2.4"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
 garnetash = "0.1.0"
-tealdust = { path = "../../tealdust" }
+tealdust = "0.1.4"
 
 [features]
 default = ["heic", "vvc"]
