@@ -47,18 +47,13 @@ fn mul_q16(data: i32, coeff: i32) -> i32 {
     (((data as i64) * (coeff as i64)) >> 16) as i32
 }
 
-/// Quantize a transform coefficient: `round(data * coeff / 65536)` with
-/// magnitude-symmetric round-to-nearest. Unlike a bare `>> 16` (truncation
-/// toward -inf), this keeps the reconstruction error zero-mean, so per-
-/// coefficient error does not accumulate at the block's top-left corner (where
-/// every DCT basis function is positive and in phase) into a dark dot.
 #[inline(always)]
 fn quant_q16(data: i32, coeff: i32) -> i32 {
     let prod = (data as i64) * (coeff as i64);
     let mag = prod.unsigned_abs();
-    if mag < 65536 {
+    if mag < 32768 {
         return 0;
-    } // dead-zone: |coeff/step| < 1.0 -> zero (preserves compression)
+    } // dead-zone == round-to-nearest half-step; trellis (RDOQ) makes the R-D call
     let lvl = ((mag + 32768) >> 16) as i32; // round-to-nearest for kept coefficients (de-biases the corner)
     if prod >= 0 { lvl } else { -lvl }
 }
@@ -79,7 +74,9 @@ fn apply_qmatrix<const N: usize>(
     for rc in 0..N {
         let target = quantized.1[rc] * quant.forward_qm_weight(rc, w, h) as f32 / 32.0;
         quantized.1[rc] = target;
-        quantized.0[rc] = if target.abs() < 1.0 {
+        // Round-to-nearest half-step dead-zone (matches `quant_q16`); the trellis
+        // makes the actual R-D keep/drop decision on the surviving levels.
+        quantized.0[rc] = if target.abs() < 0.5 {
             0
         } else {
             target.fast_round() as i32

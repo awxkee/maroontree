@@ -81,7 +81,7 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     let mq = |a: i32, b: i32| {
         let prod = (a as i64) * (b as i64);
         let mag = prod.unsigned_abs();
-        if mag < 65536 {
+        if mag < 32768 {
             return 0;
         }
         let lvl = ((mag + 32768) >> 16) as i32;
@@ -99,7 +99,7 @@ fn quant_prod_i64(prod: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let sign = _mm256_cmpgt_epi64(zero, prod);
     let mag = _mm256_sub_epi64(_mm256_xor_si256(prod, sign), sign);
-    let active = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(65535));
+    let active = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(32767));
     let lvl = _mm256_srli_epi64::<16>(_mm256_add_epi64(mag, _mm256_set1_epi64x(32768)));
     let neg = _mm256_sub_epi64(zero, lvl);
     let signed = _mm256_blendv_epi8(lvl, neg, sign);

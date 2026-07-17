@@ -478,7 +478,7 @@ impl VarianceBoost {
         VarianceBoost {
             enabled: true,
             octile: 6,
-            strength: 0.6,
+            strength: 1.0,
             boost_only: true,
             dark: DarkAq::on(),
             qm: QmLevels::FLAT,

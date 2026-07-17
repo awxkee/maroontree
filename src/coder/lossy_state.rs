@@ -1133,8 +1133,9 @@ impl<'a> LossyTile<'a> {
                 base_q
             } else {
                 let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.aq.vb_octile);
+                let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
                 let vb_delta = crate::aq_common::variance_boost_delta(
-                    picked,
+                    picked * var_scale,
                     self.aq.ref_act,
                     self.aq.vb_strength,
                     self.aq.vb_boost_only,

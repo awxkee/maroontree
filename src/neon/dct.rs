@@ -459,9 +459,6 @@ fn mul_q16_vec(data: int32x4_t, coeff: int32x4_t) -> int32x4_t {
     )
 }
 
-/// Scalar quantize a flat coefficient array in place: `level[i] = mul_q16(coeff[i], q)`,
-/// with `q = dc_q` at index 0 (DC) and `ac_q` elsewhere. Mirrors the scalar
-/// quantizer exactly so the NEON in-place result matches `dct*_scalar`.
 #[inline]
 fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut [i32; N]) {
     // Round-to-nearest (magnitude-symmetric) so the quant error is zero-mean,
@@ -470,7 +467,7 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     let mq = |a: i32, b: i32| {
         let prod = (a as i64) * (b as i64);
         let mag = prod.unsigned_abs();
-        if mag < 65536 {
+        if mag < 32768 {
             return 0;
         }
         let lvl = ((mag + 32768) >> 16) as i32;
@@ -487,7 +484,7 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
 fn quant_q16_half_i64(prod: int64x2_t) -> int32x2_t {
     let zero64 = vdupq_n_s64(0);
     let mag = vabsq_s64(prod);
-    let active = vcgtq_s64(mag, vdupq_n_s64(65535));
+    let active = vcgtq_s64(mag, vdupq_n_s64(32767));
     let lvl = vshrq_n_s64::<16>(vaddq_s64(mag, vdupq_n_s64(32768)));
     let neg = vnegq_s64(lvl);
     let signed = vbslq_s64(vcltq_s64(prod, zero64), neg, lvl);
