@@ -38,6 +38,13 @@ const ENABLE_DENSE_INTER_16: bool = true;
 #[cfg(test)]
 pub(crate) static INTER_SKIP_32_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Total coded leaves and intra-coded leaves on the current frame (mode-mix diag).
+#[cfg(test)]
+pub(crate) static TOTAL_LEAF_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static INTRA_LEAF_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Whole-64 GLOBALMV-skip blocks committed on reference rank 1 (partition walk).
 #[cfg(test)]
 pub(crate) static PARTITION_SKIP_RANK1_COUNT: std::sync::atomic::AtomicUsize =
@@ -1259,6 +1266,8 @@ impl Av2Encoder {
                 } => (*bw_mi, *bh_mi, part_cdf.unwrap_or(12276), *mi_row, *mi_col),
             };
             tx_leaves.push((lmr, lmc, bw_mi, bh_mi));
+            #[cfg(test)]
+            TOTAL_LEAF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let sb_y = lmr * 4;
             let sb_x = lmc * 4;
             // Snapshot the four AVM line-buffer probes before the default-rank
@@ -2613,15 +2622,16 @@ impl Av2Encoder {
                 let syntax_rate = crate::av2::video::rd::inter_syntax_bits(
                     enc, skip_ctx, mode_ctx, false, 1, None,
                 );
-                let inter_cost = crate::av2::video::rd::rd_cost(
-                    sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                    syntax_rate,
-                    sb_qstep as u32,
-                );
+                let _ = sse; // Gate on the CODED residual RD below, not the uncoded
+                // zero-motion SSE. The old `inter_cost = sse*W + syntax` gate rejected
+                // predictable blocks to expensive intra at high quality: the SSE term
+                // is not rdmult-scaled, so it dwarfs the fixed rdmult-scaled intra_bound
+                // as qstep shrinks. Code the residual, then compare its real RD to intra.
                 let intra_bound =
                     crate::av2::video::rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, sb_qstep as u32);
-                if inter_cost < intra_bound {
+                {
                     let bd = self.bit_depth as i32;
+                    let mut coeff_bits = 0.0f32;
                     static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
                     let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
                     let mut resid = [0f32; 1024];
@@ -2650,8 +2660,9 @@ impl Av2Encoder {
                             }
                         }
                         let lev = bases.luma.project(&resid[..], 0.0);
-                        let rb = itx422::reconstruct_luma(&pblk, &lev, sb_qstep, &tables::SCAN, bd);
+                        let rb = reconstruct_luma(&pblk, &lev, sb_qstep, &tables::SCAN, bd);
                         put_block(recy, pw, y0, x0, 32, &rb);
+                        coeff_bits += coeff_rate_f32(&lev);
                         tus[i] = levels_to_coeffs(&lev);
                     }
                     // Chroma residual: source-LAST for U/V 32x32 (420).
@@ -2704,99 +2715,149 @@ impl Av2Encoder {
                             dst_row.copy_from_slice(src_row);
                         }
                         uv_coeffs[pi] = levels_to_coeffs(&lev);
+                        coeff_bits += coeff_rate_f32(&lev);
                         uv_lev[pi] = lev;
                     }
-                    let up = row > 0;
-                    let lf = col > 0;
-                    let ia = inter_above[col] == 1;
-                    let il = inter_left == 1;
-                    enc.intra_inter_ctx = if up && lf {
-                        let n_intra = (!il as u8) + (!ia as u8);
-                        if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up {
-                        if ia { 0 } else { 3 }
-                    } else if lf {
-                        if il { 0 } else { 3 }
-                    } else {
-                        0
-                    };
-                    let sa = skip_above[col];
-                    let sl = skip_left;
-                    let skip_ctx = if up && lf {
-                        (sl + sa) as usize
-                    } else if up {
-                        (2 * sa) as usize
-                    } else if lf {
-                        (2 * sl) as usize
-                    } else {
-                        0
-                    };
-                    let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
-                    let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                    // Rank-0 block: count only rank-0 inter neighbors (excludes a
-                    // whole-64 rank-1 skip neighbor). No-op when no rank-1 exists.
-                    let left_match = lmc > 0
-                        && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
-                            || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
-                    let above_match = lmr > 0
-                        && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
-                            || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
-                    let any_newmv = (lmc > 0
-                        && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
-                            || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
-                        || (lmr > 0
-                            && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
-                                || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
-                    let mode_ctx = usize::from(left_match)
-                        + usize::from(above_match)
-                        + 2 * usize::from(any_newmv);
-                    // Residual blocks do carry delta-Q. Commit only now, after
-                    // the skip decision, so encoder and decoder qindex state stay
-                    // synchronized across preceding skip_txfm=1 superblocks.
-                    let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
-                    enc.delta_q_pending = enc.delta_q_present;
-                    let (luma_skip, luma_dc) =
-                        sb_tu_contexts(&tus, sb_y, sb_x, above, left, enc.qc, tmc, tmr);
-                    let u_present = uv_coeffs[0].iter().any(|&(_, level)| level != 0);
-                    let v_present = uv_coeffs[1].iter().any(|&(_, level)| level != 0);
-                    coder::emit_inter_residual_block(
-                        enc,
-                        pc,
-                        skip_ctx,
-                        mode_ctx,
-                        &tus,
-                        &luma_skip,
-                        &luma_dc,
-                        &uv_coeffs[0],
-                        &uv_coeffs[1],
-                        (6 + ua + ul) as usize,
-                        (6 * i32::from(u_present) + va + vl) as usize,
+                    // Real RD of the coded residual: reconstruction distortion (now
+                    // the quantization error, not the full prediction error) plus the
+                    // mode syntax and coefficient bits. Choose it over intra only when
+                    // it is actually cheaper — a dense residual on hard content still
+                    // loses to intra, but a cheap residual on predictable content
+                    // (the common case) now wins instead of falling back to intra.
+                    let mut coded_sse = rect_sse_f32(
+                        &PlaneRect {
+                            plane: yp,
+                            stride: pw,
+                            y: sb_y,
+                            x: sb_x,
+                        },
+                        &PlaneRect {
+                            plane: recy,
+                            stride: pw,
+                            y: sb_y,
+                            x: sb_x,
+                        },
+                        64,
+                        64,
                     );
-                    skip_above[col] = 0; // has coeffs
-                    skip_left = 0;
-                    inter_above[col] = 1;
-                    newmv_above[col] = 0;
-                    newmv_left = 0;
-                    mv_above[col] = Some(Mv::ZERO);
-                    mv_left = Some(Mv::ZERO);
-                    for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                        inter_mi_above[c] = 1;
-                        skip_mi_above[c] = 0;
-                        newmv_mi_above[c] = 0;
-                        mv_mi_above[c] = Some(Mv::ZERO);
-                        u_above[c] = i32::from(u_present);
-                        v_above[c] = i32::from(v_present);
+                    for (src_c, rec_c) in [(&up, &*recu), (&vp, &*recv)] {
+                        coded_sse += rect_sse_f32(
+                            &PlaneRect {
+                                plane: src_c,
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                            },
+                            &PlaneRect {
+                                plane: rec_c,
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                            },
+                            32,
+                            32,
+                        );
                     }
-                    for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                        inter_mi_left[r] = 1;
-                        skip_mi_left[r] = 0;
-                        newmv_mi_left[r] = 0;
-                        mv_mi_left[r] = Some(Mv::ZERO);
-                        u_left[r] = i32::from(u_present);
-                        v_left[r] = i32::from(v_present);
-                    }
-                    inter_left = 1;
-                    continue;
+                    let residual_cost = crate::av2::video::rd::rd_cost(
+                        coded_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                        syntax_rate + coeff_bits,
+                        sb_qstep as u32,
+                    );
+                    if residual_cost < intra_bound {
+                        let up = row > 0;
+                        let lf = col > 0;
+                        let ia = inter_above[col] == 1;
+                        let il = inter_left == 1;
+                        enc.intra_inter_ctx = if up && lf {
+                            let n_intra = (!il as u8) + (!ia as u8);
+                            if n_intra == 2 { 3 } else { n_intra as usize }
+                        } else if up {
+                            if ia { 0 } else { 3 }
+                        } else if lf {
+                            if il { 0 } else { 3 }
+                        } else {
+                            0
+                        };
+                        let sa = skip_above[col];
+                        let sl = skip_left;
+                        let skip_ctx = if up && lf {
+                            (sl + sa) as usize
+                        } else if up {
+                            (2 * sa) as usize
+                        } else if lf {
+                            (2 * sl) as usize
+                        } else {
+                            0
+                        };
+                        let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
+                        let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
+                        // Rank-0 block: count only rank-0 inter neighbors (excludes a
+                        // whole-64 rank-1 skip neighbor). No-op when no rank-1 exists.
+                        let left_match = lmc > 0
+                            && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
+                                || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
+                        let above_match = lmr > 0
+                            && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
+                        let any_newmv = (lmc > 0
+                            && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
+                                || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
+                            || (lmr > 0
+                                && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                    || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
+                        let mode_ctx = usize::from(left_match)
+                            + usize::from(above_match)
+                            + 2 * usize::from(any_newmv);
+                        // Residual blocks do carry delta-Q. Commit only now, after
+                        // the skip decision, so encoder and decoder qindex state stay
+                        // synchronized across preceding skip_txfm=1 superblocks.
+                        let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
+                        enc.delta_q_pending = enc.delta_q_present;
+                        let (luma_skip, luma_dc) =
+                            sb_tu_contexts(&tus, sb_y, sb_x, above, left, enc.qc, tmc, tmr);
+                        let u_present = uv_coeffs[0].iter().any(|&(_, level)| level != 0);
+                        let v_present = uv_coeffs[1].iter().any(|&(_, level)| level != 0);
+                        coder::emit_inter_residual_block(
+                            enc,
+                            pc,
+                            skip_ctx,
+                            mode_ctx,
+                            &tus,
+                            &luma_skip,
+                            &luma_dc,
+                            &uv_coeffs[0],
+                            &uv_coeffs[1],
+                            (6 + ua + ul) as usize,
+                            (6 * i32::from(u_present) + va + vl) as usize,
+                        );
+                        skip_above[col] = 0; // has coeffs
+                        skip_left = 0;
+                        inter_above[col] = 1;
+                        newmv_above[col] = 0;
+                        newmv_left = 0;
+                        mv_above[col] = Some(Mv::ZERO);
+                        mv_left = Some(Mv::ZERO);
+                        for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                            inter_mi_above[c] = 1;
+                            skip_mi_above[c] = 0;
+                            newmv_mi_above[c] = 0;
+                            mv_mi_above[c] = Some(Mv::ZERO);
+                            u_above[c] = i32::from(u_present);
+                            v_above[c] = i32::from(v_present);
+                        }
+                        for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                            inter_mi_left[r] = 1;
+                            skip_mi_left[r] = 0;
+                            newmv_mi_left[r] = 0;
+                            mv_mi_left[r] = Some(Mv::ZERO);
+                            u_left[r] = i32::from(u_present);
+                            v_left[r] = i32::from(v_present);
+                        }
+                        inter_left = 1;
+                        #[cfg(test)]
+                        INTER_RESIDUAL_64_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    } // end `if residual_cost < intra_bound`
                 }
             }
             // NEWMV residual: search LAST for motion; if a nonzero MV's MC
@@ -3250,6 +3311,8 @@ impl Av2Encoder {
                     }
                 }
             }
+            #[cfg(test)]
+            INTRA_LEAF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             skip_above[col] = 0;
             skip_left = 0;
             inter_above[col] = 0;

@@ -250,10 +250,7 @@ impl Cdfs {
     /// Mostly the frame-initial CDFs, except symbols whose default prior sits
     /// far from its adapted steady state on real content: there a frozen
     /// default systematically mis-prices the choice for the whole frame
-    /// (adaptive coding self-corrects; a frozen estimate cannot). Overridden:
-    /// `filter_intra` — the default heavily favors one outcome, which starved
-    /// filter-intra on content where it wins (+12.8% on grayscale q40); a
-    /// flat 1-bit prior keeps the decision content-driven.
+    /// (adaptive coding self-corrects; a frozen estimate cannot).
     pub(crate) fn decision_snapshot(qctx: usize) -> Box<Self> {
         let mut c = Self::new(qctx);
         for e in c.filter_intra.iter_mut() {
