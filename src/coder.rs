@@ -67,7 +67,7 @@ pub static HORZ_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub static VERT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub(crate) static TUNE_SSIMULACRA2: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
 
 #[inline]
 fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
@@ -218,6 +218,7 @@ pub(crate) struct Cdfs {
     pub(crate) filter_intra_mode: Vec<u16>,       // five filter-intra predictors
     pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
     pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
+    pub(crate) txsz: [Vec<Vec<u16>>; 3],          // intra tx_depth [t_dim.max-1][3 ctx]
     pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
     pub(crate) txtp4: Vec<Vec<u16>>,              // intra txtp TX_4X4 luma, per intra mode [13]
     pub(crate) txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
@@ -359,6 +360,11 @@ impl Cdfs {
         Cdfs {
             skip: SKIP_CDF.iter().map(|&v| icdf(&[v])).collect(),
             part_bl8: PART_BL8_CDF.iter().map(|r| icdf(r)).collect(),
+            txsz: [
+                TXSZ_CAT0_CDF.iter().map(|r| icdf(r)).collect(),
+                TXSZ_CAT1_CDF.iter().map(|r| icdf(r)).collect(),
+                TXSZ_CAT2_CDF.iter().map(|r| icdf(r)).collect(),
+            ],
             part_split: PART_SPLIT_CDF
                 .iter()
                 .map(|lvl| lvl.iter().map(|r| icdf(r)).collect())
@@ -680,14 +686,19 @@ struct LossyTile<'a> {
     recon: [Vec<i32>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
     l_coef: [Vec<u8>; 3], // len h/4, absolute by4
-    a_part: Vec<u8>,      // len w/8, absolute x8
-    l_part: Vec<u8>,      // len h/8, absolute y8
-    a_skip: Vec<u8>,      // block skip flag per 4x4 col, absolute bx4
-    l_skip: Vec<u8>,      // block skip flag per 4x4 row, absolute by4
-    a_mode: Vec<u8>,      // luma intra mode per 4x4 col (for kf y-mode context)
-    l_mode: Vec<u8>,      // luma intra mode per 4x4 row
-    a_uv_mode: Vec<u8>,   // chroma intra mode above each luma 4x4 column
-    l_uv_mode: Vec<u8>,   // chroma intra mode left of each luma 4x4 row
+    /// Per-4x4-column coded-TX log2-width (dav1d `a->tx_intra`), -1 at tile
+    /// start; feeds the `tx_depth` symbol context (`get_tx_ctx`).
+    a_tx: Vec<i8>,
+    /// Per-4x4-row coded-TX log2-height (dav1d `l->tx_intra`).
+    l_tx: Vec<i8>,
+    a_part: Vec<u8>,    // len w/8, absolute x8
+    l_part: Vec<u8>,    // len h/8, absolute y8
+    a_skip: Vec<u8>,    // block skip flag per 4x4 col, absolute bx4
+    l_skip: Vec<u8>,    // block skip flag per 4x4 row, absolute by4
+    a_mode: Vec<u8>,    // luma intra mode per 4x4 col (for kf y-mode context)
+    l_mode: Vec<u8>,    // luma intra mode per 4x4 row
+    a_uv_mode: Vec<u8>, // chroma intra mode above each luma 4x4 column
+    l_uv_mode: Vec<u8>, // chroma intra mode left of each luma 4x4 row
     blk4: Vec<u8>, // luma block WIDTH (in 4-sample units) per 4x4 luma unit; for the deblock filter (vertical edges)
     blk4h: Vec<u8>, // luma block HEIGHT (in 4-sample units) per 4x4 luma unit; for the deblock filter (horizontal edges)
     blk4v: Vec<bool>, // true where a luma block starts at this 4x4 column

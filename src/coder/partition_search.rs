@@ -378,6 +378,7 @@ impl<'a> LossyTile<'a> {
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 8, 16);
             self.emit_filter_intra(DC_PRED, 8, 16, None);
+            self.code_tx_depth(px, py, 8, 16, 0);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 2].fill(sv);
             self.l_skip[by4..by4 + 4].fill(sv);
@@ -520,6 +521,7 @@ impl<'a> LossyTile<'a> {
         self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
         self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
         self.emit_filter_intra(DC_PRED, lw, lh, None);
+        self.code_tx_depth(px, py, lw, lh, 0);
         let sv = block_skip as u8;
         let (aw, ah) = (lw / 4, lh / 4);
         self.a_skip[bx4..bx4 + aw].fill(sv);
@@ -639,6 +641,7 @@ impl<'a> LossyTile<'a> {
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 16, 8);
             self.emit_filter_intra(DC_PRED, 16, 8, None);
+            self.code_tx_depth(px, py, 16, 8, 0);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 4].fill(sv);
             self.l_skip[by4..by4 + 2].fill(sv);
@@ -757,6 +760,7 @@ impl<'a> LossyTile<'a> {
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 16, 8);
             self.emit_filter_intra(DC_PRED, 16, 8, None);
+            self.code_tx_depth(px, py, 16, 8, 0);
             // footprint update: skip/mode over 4 wide x 2 tall units.
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 4].fill(sv);
@@ -806,6 +810,188 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
+    }
+
+    /// Trial-code a 16x16 luma block as four TX_8X8 (`tx_depth = 1`), raster
+    /// order, DCT only. Per the spec, intra prediction runs per TRANSFORM
+    /// block: each 8x8 predicts from the running reconstruction (including the
+    /// previous quadrants of this block), which is exactly what lets a smooth
+    /// gradient ride the four sub-TX DCs instead of dying in one 16x16 AC
+    /// (DC-granularity banding). Temporarily writes candidate recon into
+    /// `self.recon[0]` for the sequential prediction and restores it before
+    /// returning. Returns (packed quadrant-major coefficients, 16x16 recon
+    /// row-major, summed SSE, summed proxy coefficient bits).
+    ///
+    /// Per-quadrant edge availability mirrors dav1d's per-TX edge flags for a
+    /// 16x16 block: q(0,0) sees the block's outer edges; q(1,0)'s top-right is
+    /// the block's `have_tr`; q(0,1)'s top-right is inside the block (always
+    /// coded) and its bottom-left is the block's `have_bl`; q(1,1) has neither.
+    #[allow(clippy::too_many_arguments)]
+    fn split16_luma_try(
+        &mut self,
+        px: usize,
+        py: usize,
+        mode: usize,
+        delta: i32,
+        have_tr: bool,
+        have_bl: bool,
+        lam: f32,
+    ) -> ([i32; 256], [i32; 256], i64, f32) {
+        let mut saved = [0i32; 256];
+        for ry in 0..16 {
+            saved[ry * 16..ry * 16 + 16]
+                .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..16]);
+        }
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let block_ftype = self.luma_filter_type(px, py);
+        let maxv = (1i32 << self.bd) - 1;
+        let mut cf4 = [0i32; 256];
+        let mut rec = [0i32; 256];
+        let mut sse_sum = 0i64;
+        let mut bits_sum = 0f32;
+        let quads = [(0usize, 0usize), (8, 0), (0, 8), (8, 8)];
+        for (qi, &(sx, sy)) in quads.iter().enumerate() {
+            let (bx, by) = (px + sx, py + sy);
+            let (tr, bl) = match (sx, sy) {
+                (0, 0) => (py > 0, px > 0),
+                (8, 0) => (have_tr, false),
+                (0, 8) => (true, have_bl),
+                _ => (false, false),
+            };
+            let mut pred = [0i32; 64];
+            if mode == DC_PRED && delta == 0 {
+                let d = dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                pred = [d; 64];
+            } else {
+                intra_predict_nd_ad(
+                    mode,
+                    delta,
+                    &self.recon[0],
+                    self.w,
+                    bx,
+                    by,
+                    8,
+                    8,
+                    tr,
+                    bl,
+                    self.w,
+                    self.h,
+                    block_ftype,
+                    &mut pred,
+                    self.bd,
+                );
+            }
+            let mut resid = [0i32; 64];
+            crate::rd_sse::residual_pred(&mut resid, &pred, &self.src[0], self.w, bx, by, 8, 8);
+            let (mut cf, tf) = forward_dct_quant_8x8_t(&resid, &self.quant);
+            trellis_optimize_ctx(
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_8X8,
+                lam,
+                8,
+                self.dcdf(),
+                1,
+                0,
+                &self.dcdf().eob_bin_64_l,
+                0,
+            );
+            let rr = idct_dequant_8x8(&cf, &self.quant);
+            sse_sum += sse_recon::<64, 8>(&pred, &rr, &self.src[0], self.w, bx, by, self.bd);
+            bits_sum += block_rate_bits(&cf, &SCAN_8X8);
+            // Write the quadrant's candidate recon so later quadrants predict
+            // from it (restored below).
+            for ry in 0..8 {
+                let rrow = &mut self.recon[0][(by + ry) * self.w + bx..];
+                for rx in 0..8 {
+                    let v = (pred[ry * 8 + rx] + rr[ry * 8 + rx]).clamp(0, maxv);
+                    rrow[rx] = v;
+                    rec[(sy + ry) * 16 + (sx + rx)] = v;
+                }
+            }
+            cf4[qi * 64..qi * 64 + 64].copy_from_slice(&cf);
+        }
+        for ry in 0..16 {
+            self.recon[0][(py + ry) * self.w + px..][..16]
+                .copy_from_slice(&saved[ry * 16..ry * 16 + 16]);
+        }
+        (cf4, rec, sse_sum, bits_sum)
+    }
+
+    /// Reconstruct a TX-split 16x16 luma block from its (packed quadrant-major)
+    /// committed coefficients — the exact reconstruction the decoder performs
+    /// (per-quadrant prediction from the running recon, DCT sub-TX). Used by
+    /// the 4:4:4 CfL evaluation, which needs the decoder-side luma before the
+    /// block is emitted. Restores `self.recon` before returning.
+    #[allow(clippy::too_many_arguments)]
+    fn split16_luma_recon_from_cf(
+        &mut self,
+        px: usize,
+        py: usize,
+        mode: usize,
+        delta: i32,
+        have_tr: bool,
+        have_bl: bool,
+        lcf: &[i32; 256],
+    ) -> [i32; 256] {
+        let mut saved = [0i32; 256];
+        for ry in 0..16 {
+            saved[ry * 16..ry * 16 + 16]
+                .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..16]);
+        }
+        let maxv = (1i32 << self.bd) - 1;
+        let block_ftype = self.luma_filter_type(px, py);
+        let mut rec = [0i32; 256];
+        for (qi, &(sx, sy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+            let (bx, by) = (px + sx, py + sy);
+            let (tr, bl) = match (sx, sy) {
+                (0, 0) => (py > 0, px > 0),
+                (8, 0) => (have_tr, false),
+                (0, 8) => (true, have_bl),
+                _ => (false, false),
+            };
+            let mut pred = [0i32; 64];
+            if mode == DC_PRED {
+                let d = dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                pred = [d; 64];
+            } else {
+                intra_predict_nd_ad(
+                    mode,
+                    delta,
+                    &self.recon[0],
+                    self.w,
+                    bx,
+                    by,
+                    8,
+                    8,
+                    tr,
+                    bl,
+                    self.w,
+                    self.h,
+                    block_ftype,
+                    &mut pred,
+                    self.bd,
+                );
+            }
+            let mut cfq = [0i32; 64];
+            cfq.copy_from_slice(&lcf[qi * 64..qi * 64 + 64]);
+            let rr = idct_dequant_8x8(&cfq, &self.quant);
+            for ry in 0..8 {
+                let rrow = &mut self.recon[0][(by + ry) * self.w + bx..];
+                for rx in 0..8 {
+                    let v = (pred[ry * 8 + rx] + rr[ry * 8 + rx]).clamp(0, maxv);
+                    rrow[rx] = v;
+                    rec[(sy + ry) * 16 + (sx + rx)] = v;
+                }
+            }
+        }
+        for ry in 0..16 {
+            self.recon[0][(py + ry) * self.w + px..][..16]
+                .copy_from_slice(&saved[ry * 16..ry * 16 + 16]);
+        }
+        rec
     }
 
     fn code_block16(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) {
@@ -1179,6 +1365,51 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
+        // TX split (tx_depth = 1): trial-code the winner mode as four TX_8X8
+        // with per-sub-TX prediction. On smooth gradients the 16x16's low-freq
+        // AC steps round to zero at the forward quantizer and the block bands;
+        // the four sub-TX (whose predictions run from 8 px away and whose DCs
+        // always survive) carry the ramp. Plain R-D decides — detail blocks
+        // keep the single TX_16X16 when its rate saving is genuine.
+        // `best_delta == 0`: our angle-delta predictor reuses the BASE angle's
+        // edge filter/upsample setup (see `intra_predict_nd_ad`); at 16x16
+        // (w+h=32, never upsampled) that is exact, but at 8x8 the delta-adjusted
+        // angle can cross the upsample/filter-strength thresholds and diverge
+        // from the decoder. Split therefore only offers itself for delta-0
+        // winners (banding lives in DC/SMOOTH gradients anyway).
+        if rl.is_none() && best_filter_intra.is_none() && best_delta == 0 {
+            // Final (distortion, rate) of the whole-TX_16X16 winner, from its
+            // committed coefficients (the sub-search locals are scope-bound).
+            let rr16 = match txtp16 {
+                1 => iadst_dequant_16x16(&lcf, &self.quant),
+                2 => iadstdct_dequant_16x16(&lcf, &self.quant),
+                3 => idctadst_dequant_16x16(&lcf, &self.quant),
+                _ => idct_dequant_16x16(&lcf, &self.quant),
+            };
+            let none_sse =
+                sse_recon::<256, 16>(&lpred_arr, &rr16, &self.src[0], self.w, px, py, self.bd);
+            let none_bits = block_rate_bits(&lcf, &SCAN_16X16);
+            let (cf4, _rec, sse_s, bits_s) =
+                self.split16_luma_try(px, py, best_mode, best_delta, have_tr, have_bl, lam);
+            // Signaling delta: tx_depth=1 instead of 0 (~1.5 bits) plus four
+            // TX_8X8 txtp symbols (DCT, ~2 bits each) instead of one TX_16X16
+            // txtp (~2 bits): net ~7.5 extra proxy bits.
+            const SPLIT16_SIGNAL_BITS: f32 = 7.5;
+            // On banding-risk regions plain SSE undervalues the split (the harm
+            // is ±1-level band STRUCTURE, largely invisible to SSE): take the
+            // split whenever its distortion is not meaningfully worse. On all
+            // other content the plain R-D decides.
+            let take = if self.banding_risk(px, py, 16) {
+                sse_s <= none_sse + (none_sse >> 2)
+            } else {
+                rd_cost_i64(sse_s, mlam, bits_s + SPLIT16_SIGNAL_BITS)
+                    < rd_cost_i64(none_sse, mlam, none_bits)
+            };
+            if take {
+                txtp16 = 4;
+                lcf = cf4;
+            }
+        }
         // Pure-emit replay: install the recorded winner and its captured
         // post-trellis coefficients (every luma sub-search above was skipped).
         if let Some(r) = rl {
@@ -1192,35 +1423,50 @@ impl<'a> LossyTile<'a> {
                 TxSel::Adst => 1,
                 TxSel::AdstDct => 2,
                 TxSel::DctAdst => 3,
+                TxSel::SplitDct => 4,
                 _ => 0,
             };
         }
         if let Some(cf) = rl_cf {
             lcf.copy_from_slice(&cf);
         }
+        if txtp16 == 4 {
+            // The in-loop deblock filter operates on TRANSFORM edges: re-record
+            // the 16x16 as a grid of four 8x8 TXs so the filter masks (blk4/
+            // blk4h and the edge-start flags) match the decoder's, which
+            // filters the interior sub-TX boundaries too.
+            self.record_blk(x8, y8, 2);
+            self.record_blk(x8 + 1, y8, 2);
+            self.record_blk(x8, y8 + 1, 2);
+            self.record_blk(x8 + 1, y8 + 1, 2);
+        }
         self.push_luma_sel(LumaSel {
             mode: best_mode as u8,
             delta: best_delta as i8,
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
-            // No IDTX sub-search at 16x16; txtp16 covers DCT/ADST/asym only.
-            tx: TxSel::from_flags(txtp16 == 1, false, txtp16 == 2, txtp16 == 3),
+            // No IDTX sub-search at 16x16; txtp16 covers DCT/ADST/asym/split.
+            tx: if txtp16 == 4 {
+                TxSel::SplitDct
+            } else {
+                TxSel::from_flags(txtp16 == 1, false, txtp16 == 2, txtp16 == 3)
+            },
         });
         self.push_luma_cf(&lcf);
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
             self.code_block16_420(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
-                best_filter_intra,
+                best_filter_intra, have_tr, have_bl,
             );
         } else if self.ss422 {
             self.code_block16_422(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
-                best_filter_intra,
+                best_filter_intra, have_tr, have_bl,
             );
         } else {
             self.code_block16_444(
                 x8, y8, &lcf, &lpred_arr, best_mode, luma_zero, txtp16, best_delta,
-                best_filter_intra,
+                best_filter_intra, have_tr, have_bl,
             );
         }
     }

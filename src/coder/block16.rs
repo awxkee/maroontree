@@ -118,6 +118,8 @@ impl<'a> LossyTile<'a> {
         txtp16: u8,
         angle_delta: i32,
         filter_intra: Option<FilterIntraMode>,
+        have_tr: bool,
+        have_bl: bool,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (bx4, by4) = (px / 4, py / 4);
@@ -135,12 +137,94 @@ impl<'a> LossyTile<'a> {
         }
         self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 16, 16);
         self.emit_filter_intra(y_mode, 16, 16, filter_intra);
+        self.code_tx_depth(px, py, 16, 16, (txtp16 == 4) as usize);
+        // Intra-edge smooth-filter flag: dav1d derives it ONCE at the block
+        // origin from the NEIGHBOR modes, before the per-TX loop — capture it
+        // before the a_mode/l_mode fills below overwrite the neighbor state.
+        let block_ftype = self.luma_filter_type(px, py);
         let sv = block_skip as u8;
         let mv = y_mode as u8;
         self.a_skip[bx4..bx4 + 4].fill(sv);
         self.l_skip[by4..by4 + 4].fill(sv);
         self.a_mode[bx4..bx4 + 4].fill(mv);
         self.l_mode[by4..by4 + 4].fill(mv);
+        if txtp16 == 4 {
+            // tx_depth = 1: four TX_8X8 in raster order, DCT sub-transforms,
+            // coefficients packed quadrant-major in `lcf`. Per the spec, intra
+            // prediction runs per TRANSFORM block: each quadrant predicts from
+            // the running reconstruction (including earlier quadrants), with
+            // per-quadrant edge availability mirroring dav1d's per-TX flags.
+            let maxv = (1i32 << self.bd) - 1;
+            for (qi, &(sx, sy)) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+                let (bx, by) = (px + sx, py + sy);
+                let (qbx4, qby4) = (bx / 4, by / 4);
+                let mut cfq = [0i32; 64];
+                cfq.copy_from_slice(&lcf[qi * 64..qi * 64 + 64]);
+                let res_ctx = if block_skip {
+                    0x40
+                } else {
+                    let sk = self.skip_ctx_split(qbx4, qby4, 2, 2);
+                    let ds = self.dc_sign_ctx(0, qbx4, qby4);
+                    encode_tx8_coeffs_adapt(
+                        &mut self.enc,
+                        &mut self.cdfs,
+                        &cfq,
+                        false,
+                        sk,
+                        ds,
+                        filter_intra_tx_mode(None, y_mode),
+                        1, // DCT_DCT in the TX_8X8 intra set
+                    )
+                };
+                self.a_coef[0][qbx4] = res_ctx;
+                self.a_coef[0][qbx4 + 1] = res_ctx;
+                self.l_coef[0][qby4] = res_ctx;
+                self.l_coef[0][qby4 + 1] = res_ctx;
+                if self.sb_mode != SbMode::Replay {
+                    let (tr, bl) = match (sx, sy) {
+                        (0, 0) => (py > 0, px > 0),
+                        (8, 0) => (have_tr, false),
+                        (0, 8) => (true, have_bl),
+                        _ => (false, false),
+                    };
+                    let mut pred = [0i32; 64];
+                    if y_mode == DC_PRED {
+                        let d = dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                        pred = [d; 64];
+                    } else {
+                        intra_predict_nd_ad(
+                            y_mode,
+                            angle_delta,
+                            &self.recon[0],
+                            self.w,
+                            bx,
+                            by,
+                            8,
+                            8,
+                            tr,
+                            bl,
+                            self.w,
+                            self.h,
+                            block_ftype,
+                            &mut pred,
+                            self.bd,
+                        );
+                    }
+                    let rr = if block_skip {
+                        [0i32; 64]
+                    } else {
+                        idct_dequant_8x8(&cfq, &self.quant)
+                    };
+                    for ry in 0..8 {
+                        let drow = &mut self.recon[0][(by + ry) * self.w + bx..];
+                        for rx in 0..8 {
+                            drow[rx] = (pred[ry * 8 + rx] + rr[ry * 8 + rx]).clamp(0, maxv);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let lres_ctx = if block_skip {
             0x40
         } else {
@@ -203,6 +287,8 @@ impl<'a> LossyTile<'a> {
         txtp16: u8,
         angle_delta: i32,
         filter_intra: Option<FilterIntraMode>,
+        have_tr: bool,
+        have_bl: bool,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (bx4, by4) = (px / 4, py / 4);
@@ -219,12 +305,7 @@ impl<'a> LossyTile<'a> {
             let pred = dc_pred_16x16(&self.recon[plane], self.w, px, py, self.bd as i32);
             cpred[ci] = pred;
             let mut resid = [0i32; 256];
-            for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-                let srow = &self.src[plane][(py + ry) * self.w + px..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-                    *dv = s - pred;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.w, px, py, 16, 16, pred);
             let (q, qt) = forward_dct_quant_16x16_t(&resid, &self.cquant);
             ccf[ci] = q;
             trellis_optimize(
@@ -246,14 +327,29 @@ impl<'a> LossyTile<'a> {
         let mut cpred16 = [[0i32; 256]; 2];
         let mut cfl_opt: Option<[i32; 2]> = None;
         if ru.is_none() {
-            let lrr_cfl = match txtp16 {
-                1 => iadst_dequant_16x16(lcf, &self.quant),
-                2 => iadstdct_dequant_16x16(lcf, &self.quant),
-                3 => idctadst_dequant_16x16(lcf, &self.quant),
-                _ => idct_dequant_16x16(lcf, &self.quant),
-            };
+            // Luma reconstruction as the decoder will see it — with TX split the
+            // block reconstructs per sub-TX (sequential per-quadrant prediction),
+            // so `lpred + inverse(lcf)` no longer applies.
             let mut luma_rec = [0i32; 256];
-            recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, (1 << self.bd) - 1);
+            if txtp16 == 4 {
+                luma_rec = self.split16_luma_recon_from_cf(
+                    px,
+                    py,
+                    y_mode,
+                    angle_delta,
+                    have_tr,
+                    have_bl,
+                    lcf,
+                );
+            } else {
+                let lrr_cfl = match txtp16 {
+                    1 => iadst_dequant_16x16(lcf, &self.quant),
+                    2 => iadstdct_dequant_16x16(lcf, &self.quant),
+                    3 => idctadst_dequant_16x16(lcf, &self.quant),
+                    _ => idct_dequant_16x16(lcf, &self.quant),
+                };
+                recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, (1 << self.bd) - 1);
+            }
             let mut ac = [0i32; 256];
             cfl_ac_444(&luma_rec, 16, 16, &mut ac);
             let (dcq, acq, lam) = (
@@ -279,11 +375,11 @@ impl<'a> LossyTile<'a> {
                 let a = cfl_best_alpha(&ac, &src, dc, 256, self.bd);
                 cfl_a[ci] = a;
                 let mut cpr = [0i32; 256];
-                let mut resid = [0i32; 256];
                 for i in 0..256 {
                     cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
-                    resid[i] = src[i] - cpr[i];
                 }
+                let mut resid = [0i32; 256];
+                crate::rd_sse::residual_pred(&mut resid, &cpr, &src, 16, 0, 0, 16, 16);
                 let (mut q, qt) = forward_dct_quant_16x16_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X16, lam);
                 let rr = idct_dequant_16x16(&q, &self.cquant);
@@ -422,13 +518,16 @@ impl<'a> LossyTile<'a> {
                         self.bd,
                     );
                     let mut resid = [0i32; 256];
-                    for (ry, drow) in resid.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-                        let srow = &self.src[plane][(py + ry) * self.w + px..];
-                        let prow = &cand_pred[ci][ry * 16..];
-                        for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
-                            *dv = s - p;
-                        }
-                    }
+                    crate::rd_sse::residual_pred(
+                        &mut resid,
+                        &cand_pred[ci],
+                        &self.src[plane],
+                        self.w,
+                        px,
+                        py,
+                        16,
+                        16,
+                    );
                     let (mut q, qt) = fwd_chroma_16x16(tx, &resid, &self.cquant);
                     trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X16, lam);
                     let mean_resid = resid.iter().sum::<i32>() / 256;
@@ -501,6 +600,8 @@ impl<'a> LossyTile<'a> {
             txtp16,
             angle_delta,
             filter_intra,
+            have_tr,
+            have_bl,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -563,6 +664,8 @@ impl<'a> LossyTile<'a> {
         txtp16: u8,
         angle_delta: i32,
         filter_intra: Option<FilterIntraMode>,
+        have_tr: bool,
+        have_bl: bool,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let (cx, cy) = (px / 2, py / 2);
@@ -586,12 +689,7 @@ impl<'a> LossyTile<'a> {
             let dc = dc_pred_8x8(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             dc_preds[ci] = dc;
             let mut resid = [0i32; 64];
-            for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for (dv, &s) in drow.iter_mut().zip(srow.iter()) {
-                    *dv = s - dc;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, 8, 8, dc);
             let (q, qt) = forward_dct_quant_8x8_t(&resid, &self.cquant);
             ccf_dc[ci] = q;
             trellis_optimize(&mut ccf_dc[ci], &qt, dcq, acq, &SCAN_8X8, lam);
@@ -688,13 +786,16 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
                 let mut resid = [0i32; 64];
-                for (ry, drow) in resid.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    let prow = &cand_pred[ci][ry * 8..];
-                    for (dv, (&s, &p)) in drow.iter_mut().zip(srow.iter().zip(prow.iter())) {
-                        *dv = s - p;
-                    }
-                }
+                crate::rd_sse::residual_pred(
+                    &mut resid,
+                    &cand_pred[ci],
+                    &self.src[plane],
+                    self.cw,
+                    cx,
+                    cy,
+                    8,
+                    8,
+                );
                 let (mut q, qt) = fwd_chroma_8x8(tx, &resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X8, lam);
                 let mean_resid = resid.iter().sum::<i32>() / 64;
@@ -752,6 +853,8 @@ impl<'a> LossyTile<'a> {
             txtp16,
             angle_delta,
             filter_intra,
+            have_tr,
+            have_bl,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -795,6 +898,8 @@ impl<'a> LossyTile<'a> {
         txtp16: u8,
         angle_delta: i32,
         filter_intra: Option<FilterIntraMode>,
+        have_tr: bool,
+        have_bl: bool,
     ) {
         let (px, py) = (x8 * 8, y8 * 8);
         let cx = px / 2;
@@ -826,21 +931,12 @@ impl<'a> LossyTile<'a> {
             let pred = dc_pred_8x16(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
             let mut src = [0i32; 128];
-            let mut resid = [0i32; 128];
-            for (ry, (drow, srow_dst)) in resid
-                .as_chunks_mut::<8>()
-                .0
-                .iter_mut()
-                .zip(src.as_chunks_mut::<8>().0.iter_mut())
-                .enumerate()
-            {
-                let srow = &self.src[plane][(py + ry) * self.cw + cx..];
-                for ((dv, sd), &s) in drow.iter_mut().zip(srow_dst.iter_mut()).zip(srow.iter()) {
-                    *dv = s - pred;
-                    *sd = s;
-                }
+            for (ry, srow_dst) in src.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                srow_dst.copy_from_slice(&self.src[plane][(py + ry) * self.cw + cx..][..8]);
             }
             src_planes[ci] = src;
+            let mut resid = [0i32; 128];
+            crate::rd_sse::residual_dc(&mut resid, &src, 8, 0, 0, 8, 16, pred);
             let (mut q, qt) = forward_dct_quant_8x16_t(&resid, &self.cquant);
             trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X16, lam);
             let rr = idct_dequant_8x16(&q, &self.cquant);
@@ -877,11 +973,11 @@ impl<'a> LossyTile<'a> {
                 let a = cfl_best_alpha(&ac, &src, dc, 128, self.bd);
                 cfl_a[ci] = a;
                 let mut cpr = [0i32; 128];
-                let mut resid = [0i32; 128];
                 for i in 0..128 {
                     cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
-                    resid[i] = src[i] - cpr[i];
                 }
+                let mut resid = [0i32; 128];
+                crate::rd_sse::residual_pred(&mut resid, &cpr, &src, 8, 0, 0, 8, 16);
                 let (mut q, qt) = forward_dct_quant_8x16_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_8X16, lam);
                 let rr = idct_dequant_8x16(&q, &self.cquant);
@@ -948,6 +1044,8 @@ impl<'a> LossyTile<'a> {
             txtp16,
             angle_delta,
             filter_intra,
+            have_tr,
+            have_bl,
         );
         for ci in 0..2 {
             let plane = ci + 1;
@@ -1068,12 +1166,7 @@ impl<'a> LossyTile<'a> {
                     );
                 }
                 let mut resid = [0i32; 16];
-                for ry in 0..4 {
-                    let srow = &self.src[0][(by + ry) * self.w + bx..];
-                    for rx in 0..4 {
-                        resid[ry * 4 + rx] = srow[rx] - pred[ry * 4 + rx];
-                    }
-                }
+                crate::rd_sse::residual_pred(&mut resid, &pred, &self.src[0], self.w, bx, by, 4, 4);
                 let (mut cf, tf) = forward_dct_quant_4x4_t(&resid, &self.quant);
                 trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_4X4, lam);
                 let rr = idct_dequant_4x4(&cf, &self.quant);
@@ -1138,9 +1231,7 @@ impl<'a> LossyTile<'a> {
                     }
                     src_planes[ci] = src;
                     let mut cres = [0i32; 16];
-                    for (dst, &src) in cres[..16].iter_mut().zip(src[..16].iter()) {
-                        *dst = src - dc;
-                    }
+                    crate::rd_sse::residual_dc(&mut cres, &src, 4, 0, 0, 4, 4, dc);
                     let (mut q, qt) = forward_dct_quant_4x4_t(&cres, &self.cquant);
                     trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
                     let rr = idct_dequant_4x4(&q, &self.cquant);
@@ -1171,11 +1262,11 @@ impl<'a> LossyTile<'a> {
                         let a = cfl_best_alpha(&ac, &src, dc, 16, self.bd);
                         cfl_a[ci] = a;
                         let mut cpr = [0i32; 16];
-                        let mut resid = [0i32; 16];
                         for i in 0..16 {
                             cpr[i] = cfl_pred_pixel(dc, ac[i], a, self.bd);
-                            resid[i] = src[i] - cpr[i];
                         }
+                        let mut resid = [0i32; 16];
+                        crate::rd_sse::residual_pred(&mut resid, &cpr, &src, 4, 0, 0, 4, 4);
                         let (mut q, qt) = forward_dct_quant_4x4_t(&resid, &self.cquant);
                         trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
                         let rr = idct_dequant_4x4(&q, &self.cquant);
@@ -1273,6 +1364,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             self.emit_filter_intra(best_mode, 4, 4, None);
+            self.tx_ctx_update4(bx, by);
 
             // --- residual: luma 4x4, then chroma U/V 4x4 (if has_chroma) ---
             let lres_ctx = if block_skip {

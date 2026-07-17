@@ -2164,10 +2164,10 @@ mod tests {
             let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
             enc.set_preset(VideoPreset::Reference);
             enc.set_key_interval(30);
-            for i in 0..fset.len().min(5) {
+            for (i, frame) in fset.iter().enumerate().take(5) {
                 crate::av2::y420::TOTAL_LEAF_COUNT.store(0, Relaxed);
                 crate::av2::y420::INTRA_LEAF_COUNT.store(0, Relaxed);
-                let pkt = enc.push_frame(&fset[i], &Cicp::srgb_ycbcr()).unwrap();
+                let pkt = enc.push_frame(frame, &Cicp::srgb_ycbcr()).unwrap();
                 if i == 0 {
                     continue;
                 }
@@ -2184,11 +2184,11 @@ mod tests {
             let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
             enc.set_preset(VideoPreset::Reference);
             enc.set_key_interval(30);
-            for i in 0..frames.len() {
+            for (i, frame) in frames.iter().enumerate() {
                 crate::av2::y420::TOTAL_LEAF_COUNT.store(0, Relaxed);
                 crate::av2::y420::INTRA_LEAF_COUNT.store(0, Relaxed);
                 crate::av2::y420::INTER_RESIDUAL_64_COUNT.store(0, Relaxed);
-                let pkt = enc.push_frame(&frames[i], &Cicp::srgb_ycbcr()).unwrap();
+                let pkt = enc.push_frame(frame, &Cicp::srgb_ycbcr()).unwrap();
                 if i == 0 {
                     continue;
                 }

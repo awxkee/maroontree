@@ -465,7 +465,11 @@ fn frame_header_lossy_impl(
     let num_planes = if mono { 1 } else { 3 };
     write_lr_params(&mut w, lr, num_planes);
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
-    w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
+    // TX_MODE_SELECT: every intra luma block > BLOCK_4X4 codes a `tx_depth`
+    // symbol (see `code_tx_depth`), enabling per-block transform splitting —
+    // the tool that prevents gradient banding in large blocks (a 32x32 block
+    // can carry a smooth ramp in its sub-TX DCs instead of one flat band).
+    w.flag(true); // tx_mode_select = 1 => TX_MODE_SELECT
     // FrameIsIntra => reference/skip-mode/global-motion skipped
     w.flag(false); // reduced_tx_set = 0
     // film_grain_params_present = 0 (seq) => none

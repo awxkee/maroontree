@@ -430,9 +430,9 @@ pub(crate) fn cfl_pred_pixel(dc: i32, ac: i32, alpha: i32, bd: u8) -> i32 {
 pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8) -> i32 {
     let mut num: i64 = 0;
     let mut den: i64 = 0;
-    for i in 0..n {
-        num += (src[i] - dc) as i64 * ac[i] as i64;
-        den += ac[i] as i64 * ac[i] as i64;
+    for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
+        num += (src - dc) as i64 * ac as i64;
+        den += ac as i64 * ac as i64;
     }
     if den == 0 {
         return 0;
@@ -445,8 +445,8 @@ pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8)
             continue;
         }
         let mut e: i64 = 0;
-        for i in 0..n {
-            let d = (src[i] - cfl_pred_pixel(dc, ac[i], cand, bd)) as i64;
+        for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
+            let d = (src - cfl_pred_pixel(dc, ac, cand, bd)) as i64;
             e += d * d;
         }
         if e < best_e {

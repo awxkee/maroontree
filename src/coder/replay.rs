@@ -50,6 +50,9 @@ enum TxSel {
     AdstDct,
     DctAdst,
     Idtx,
+    /// 16x16 luma coded as four TX_8X8 (`tx_depth = 1`), DCT sub-transforms;
+    /// the coefficient record carries the four 8x8s packed quadrant-major.
+    SplitDct,
 }
 
 impl TxSel {

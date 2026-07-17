@@ -53,6 +53,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -106,6 +108,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], Vec::new(), Vec::new()],
             a_coef: [vec![0x40; w / 4], Vec::new(), Vec::new()],
             l_coef: [vec![0x40; h / 4], Vec::new(), Vec::new()],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -158,6 +162,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -210,6 +216,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; ch / 4], vec![0x40; ch / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -254,6 +262,31 @@ impl<'a> LossyTile<'a> {
             let cl = (l[by4] != 0x40 || l[by4 + 1] != 0x40) as usize;
             7 + ca + cl
         }
+    }
+
+    /// Luma `txb_skip` context for a transform SMALLER than its block (the
+    /// dav1d `get_skip_ctx` table path — the `tx == block` case is ctx 0, see
+    /// [`Self::skip_ctx`]): OR the per-4x4 coef bytes across the TX span,
+    /// strip the dc-sign marker bits, and index `dav1d_skip_ctx`.
+    fn skip_ctx_split(&self, bx4: usize, by4: usize, tw4: usize, th4: usize) -> usize {
+        const SKIP_CTX_TBL: [[u8; 5]; 5] = [
+            [1, 2, 2, 2, 3],
+            [2, 4, 4, 4, 5],
+            [2, 4, 4, 4, 5],
+            [2, 4, 4, 4, 5],
+            [3, 5, 5, 5, 6],
+        ];
+        let a = &self.a_coef[0];
+        let l = &self.l_coef[0];
+        let mut la = 0u8;
+        for i in 0..tw4 {
+            la |= a[bx4 + i];
+        }
+        let mut ll = 0u8;
+        for i in 0..th4 {
+            ll |= l[by4 + i];
+        }
+        SKIP_CTX_TBL[((la & 0x3f) as usize).min(4)][((ll & 0x3f) as usize).min(4)] as usize
     }
 
     fn dc_sign_ctx(&self, plane: usize, bx4: usize, by4: usize) -> usize {
@@ -669,6 +702,51 @@ impl<'a> LossyTile<'a> {
     /// (px, py). libaom's partition search uses exactly these per-candidate
     /// variance features (`block_var`, `horz_block_var[2]`, `sub_block_var[4]`)
     /// to steer and prune the decision before paying for full R-D.
+    /// Mean of a luma source region (native depth).
+    fn luma_mean(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
+        let mut sum = 0i64;
+        for ry in 0..h {
+            let row = &self.src[0][(py + ry) * self.w + px..];
+            for &s in &row[..w] {
+                sum += s as i64;
+            }
+        }
+        sum as f32 / (w * h) as f32
+    }
+
+    /// Banding-risk test for a `dim`x`dim` luma region: a smooth gentle
+    /// gradient (variance in a low band, 8-bit-normalized) whose quadrant
+    /// means still differ by at least one level step. Such a region's
+    /// low-frequency AC dies at the forward quantizer inside one large
+    /// transform (reconstructing as a flat band), while sub-transform DCs can
+    /// carry the ramp — the condition under which the TX-split decision gets a
+    /// perceptual bias (plain SSE undervalues banding by design).
+    fn banding_risk(&self, px: usize, py: usize, dim: usize) -> bool {
+        // High quality only: at coarse quantizers the sub-TX DCs quantize as
+        // coarsely as the big block's (no banding win) and the extra rate of
+        // four coded DCs is comparatively expensive.
+        if self.base_q_idx >= 100 {
+            return false;
+        }
+        let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
+        let pix_scale = 1.0 / (1u32 << (self.bd - 8)) as f32;
+        let var = self.luma_variance(px, py, dim, dim) * var_scale;
+        if !(3.0..100.0).contains(&var) {
+            return false;
+        }
+        let hd = dim / 2;
+        let m = [
+            self.luma_mean(px, py, hd, hd),
+            self.luma_mean(px + hd, py, hd, hd),
+            self.luma_mean(px, py + hd, hd, hd),
+            self.luma_mean(px + hd, py + hd, hd, hd),
+        ];
+        let (lo, hi) = m
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        (hi - lo) * pix_scale >= 1.0
+    }
+
     fn luma_variance(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
         let mut sum = 0i64;
         let mut sqsum = 0i64;
@@ -1244,6 +1322,51 @@ impl<'a> LossyTile<'a> {
             self.bd,
             self.cquant.qm_level(),
         );
+    }
+
+    /// Emit the intra `tx_depth` symbol (spec `read_tx_size`) for a `w`x`h`-px
+    /// luma block at pixel (px, py), choosing `depth` size-halvings from the
+    /// block's max rect TX, then update the per-4x4 TX context rows with the
+    /// CHOSEN TX dims. Mirrors dav1d decode.c (intra `b->tx` read — coded for
+    /// every intra luma block > BLOCK_4X4, including skip blocks) + env.h
+    /// `get_tx_ctx`: cdf `txsz[t_dim.max - 1][ctx]`, `min(max, 2) + 1` symbols.
+    /// BLOCK_4X4 codes no symbol; callers use [`Self::tx_ctx_update4`].
+    fn code_tx_depth(&mut self, px: usize, py: usize, w: usize, h: usize, depth: usize) {
+        let l2 = |d: usize| -> i8 {
+            match d {
+                4 => 0,
+                8 => 1,
+                16 => 2,
+                _ => 3,
+            }
+        };
+        let (max_lw, max_lh) = (l2(w), l2(h));
+        let cat = max_lw.max(max_lh) as usize - 1; // t_dim.max - 1 (max == max(lw, lh))
+        let (bx4, by4) = (px / 4, py / 4);
+        let ctx =
+            (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
+        self.enc.encode_symbol(depth, &mut self.cdfs.txsz[cat][ctx]);
+        // Chosen TX dims: each depth step goes to `t_dim.sub` — the square of
+        // the smaller dim for rects, then square halvings (floor TX_4X4).
+        let (mut lw, mut lh) = (max_lw, max_lh);
+        for _ in 0..depth {
+            if lw != lh {
+                let m = lw.min(lh);
+                lw = m;
+                lh = m;
+            } else {
+                lw = (lw - 1).max(0);
+                lh = lw;
+            }
+        }
+        self.a_tx[bx4..bx4 + (w / 4).max(1)].fill(lw);
+        self.l_tx[by4..by4 + (h / 4).max(1)].fill(lh);
+    }
+
+    /// TX context update for a BLOCK_4X4 (no `tx_depth` symbol; TX is 4x4).
+    fn tx_ctx_update4(&mut self, px: usize, py: usize) {
+        self.a_tx[px / 4] = 0;
+        self.l_tx[py / 4] = 0;
     }
 
     /// Emit a block's skip flag, then the `read_cdef()` / `read_delta_qindex()`

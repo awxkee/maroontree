@@ -406,6 +406,16 @@ pub(crate) static PART_BL8_CDF: [[u16; 3]; 4] = [
     [9896, 18783, 25853],
 ];
 
+// dav1d `txsz` defaults (raw CDF args; apply icdf() at load): the intra
+// `tx_depth` symbol of spec `read_tx_size`, indexed [t_dim.max - 1][ctx].
+// Category 0 (max TX 8x8-class: TX_8X8/RTX_8X4/RTX_4X8) is a 2-symbol CDF
+// (depth 0 or 1); categories 1 (16x16-class) and 2 (32x32-class) are 3-symbol
+// (depth 0, 1 or 2). ctx in 0..=2 from the above/left coded TX dims
+// (dav1d env.h `get_tx_ctx`).
+pub(crate) static TXSZ_CAT0_CDF: [[u16; 1]; 3] = [[19968], [19968], [24320]];
+pub(crate) static TXSZ_CAT1_CDF: [[u16; 2]; 3] = [[12272, 30172], [12272, 30172], [18677, 30848]];
+pub(crate) static TXSZ_CAT2_CDF: [[u16; 2]; 3] = [[12986, 15180], [12986, 15180], [24302, 25602]];
+
 // dav1d 1.4.1 txtp_intra1[TX_4X4] (raw CDF6 args; apply icdf() at load).
 // Verified: txtp_intra1[TX_8X8] sibling == existing TXTP_INTRA1_TX8.
 pub(crate) static TXTP_INTRA1_TX4: [[u16; 6]; 13] = [
