@@ -112,8 +112,8 @@ impl<'a> LossyTile<'a> {
     fn dc_sign_ctx_32(&self, plane: usize, bx4: usize, by4: usize) -> usize {
         let a = &self.a_coef[plane];
         let l = &self.l_coef[plane];
-        let suma: i32 = (0..8).map(|k| (a[bx4 + k] >> 6) as i32).sum();
-        let suml: i32 = (0..8).map(|k| (l[by4 + k] >> 6) as i32).sum();
+        let suma: i32 = a[bx4..bx4 + 8].iter().map(|&x| (x >> 6) as i32).sum();
+        let suml: i32 = l[by4..by4 + 8].iter().map(|&x| (x >> 6) as i32).sum();
         let s = suma + suml - 16;
         (s != 0) as usize + (s > 0) as usize
     }
@@ -126,8 +126,8 @@ impl<'a> LossyTile<'a> {
         } else {
             let a = &self.a_coef[plane];
             let l = &self.l_coef[plane];
-            let ca = (0..8).any(|k| a[bx4 + k] != 0x40) as usize;
-            let cl = (0..8).any(|k| l[by4 + k] != 0x40) as usize;
+            let ca = a[bx4..bx4 + 8].iter().any(|&x| x != 0x40) as usize;
+            let cl = l[by4..by4 + 8].iter().any(|&x| x != 0x40) as usize;
             7 + ca + cl
         }
     }
@@ -139,7 +139,8 @@ impl<'a> LossyTile<'a> {
     fn rd_cost_rect32(&self, px: usize, py: usize, vert: bool, prdo: f32) -> f32 {
         let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
         let lam = trellis_lambda();
-        let (lam, mlam) = (lam * prdo, self.mlam() * prdo);
+        let mlam = self.mlam();
+        let (lam, mlam) = (lam * prdo, mlam * prdo);
         let (lw, lh) = if vert { (16usize, 32usize) } else { (32, 16) };
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS);
         for half in 0..2 {
@@ -242,8 +243,9 @@ impl<'a> LossyTile<'a> {
 
     fn rd_cost_none32(&self, px: usize, py: usize, prdo: f32) -> f32 {
         let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
-        let lam = trellis_lambda() * prdo;
-        let mlam = self.mlam() * prdo;
+        let lam = trellis_lambda();
+        let mlam = self.mlam();
+        let (lam, mlam) = (lam * prdo, mlam * prdo);
         let dc = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
         let mut resid = [0i32; 1024];
         for ry in 0..32 {
@@ -264,8 +266,9 @@ impl<'a> LossyTile<'a> {
 
     fn rd_cost_split32(&self, px: usize, py: usize, prdo: f32) -> f32 {
         let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
-        let lam = trellis_lambda() * prdo;
-        let mlam = self.mlam() * prdo;
+        let lam = trellis_lambda();
+        let mlam = self.mlam();
+        let (lam, mlam) = (lam * prdo, mlam * prdo);
         let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * 4.0f32);
         for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
             let dc = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
@@ -336,11 +339,8 @@ impl<'a> LossyTile<'a> {
     fn code_block32(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) {
         self.record_blk(x8, y8, 8);
         let (px, py) = (x8 * 8, y8 * 8);
-        let (dcq, acq, lam) = (
-            self.quant.dc_q() as f32,
-            self.quant.ac_q() as f32,
-            trellis_lambda(),
-        );
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let lam = trellis_lambda();
         let mlam = self.mlam();
         let prdo = self.perceptual_rd_scale(px, py, 32);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
@@ -435,8 +435,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 0.0
             };
-            let bits =
-                block_rate_bits(&cf, &SCAN_32X32) + mode_signal_bits(m) + filter_bits;
+            let bits = block_rate_bits(&cf, &SCAN_32X32) + mode_signal_bits(m) + filter_bits;
             let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best_eff {
                 best_eff = cost;
@@ -490,15 +489,7 @@ impl<'a> LossyTile<'a> {
                     self.dc_sign_ctx_32(0, px / 4, py / 4),
                 );
                 let rr = idct_dequant_32x32(&cf, &self.quant);
-                let sse = sse_recon::<1024, 32>(
-                    &pred,
-                    &rr,
-                    &self.src[0],
-                    self.w,
-                    px,
-                    py,
-                    self.bd,
-                );
+                let sse = sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                 let bits = block_rate_bits(&cf, &SCAN_32X32);
                 let syntax_bits = mode_signal_bits(DC_PRED)
                     + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
@@ -529,15 +520,7 @@ impl<'a> LossyTile<'a> {
             ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
             let ds = self.dc_sign_ctx_32(0, px / 4, py / 4);
             let wrr = idct_dequant_32x32(&lcf, &self.quant);
-            let wsse = sse_recon::<1024, 32>(
-                &lpred,
-                &wrr,
-                &self.src[0],
-                self.w,
-                px,
-                py,
-                self.bd,
-            );
+            let wsse = sse_recon::<1024, 32>(&lpred, &wrr, &self.src[0], self.w, px, py, self.bd);
             let wbits = block_rate_bits(&lcf, &SCAN_32X32);
             let mut best_ad_cost = rd_cost_i64(wsse, mlam, wbits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
@@ -584,15 +567,7 @@ impl<'a> LossyTile<'a> {
                     );
                 }
                 let rr = idct_dequant_32x32(&cf, &self.quant);
-                let sse = sse_recon::<1024, 32>(
-                    &pred,
-                    &rr,
-                    &self.src[0],
-                    self.w,
-                    px,
-                    py,
-                    self.bd,
-                );
+                let sse = sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                 let bits = block_rate_bits(&cf, &SCAN_32X32);
                 let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if rl.is_some() || cost < best_ad_cost {
@@ -645,15 +620,36 @@ impl<'a> LossyTile<'a> {
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
             self.code_block32_420(
-                x8, y8, &lcf, &lpred, best_mode, luma_zero, best_delta, best_filter_intra,
+                x8,
+                y8,
+                &lcf,
+                &lpred,
+                best_mode,
+                luma_zero,
+                best_delta,
+                best_filter_intra,
             );
         } else if self.ss422 {
             self.code_block32_422(
-                x8, y8, &lcf, &lpred, best_mode, luma_zero, best_delta, best_filter_intra,
+                x8,
+                y8,
+                &lcf,
+                &lpred,
+                best_mode,
+                luma_zero,
+                best_delta,
+                best_filter_intra,
             );
         } else {
             self.code_block32_444(
-                x8, y8, &lcf, &lpred, best_mode, luma_zero, best_delta, best_filter_intra,
+                x8,
+                y8,
+                &lcf,
+                &lpred,
+                best_mode,
+                luma_zero,
+                best_delta,
+                best_filter_intra,
             );
         }
     }
@@ -725,9 +721,7 @@ impl<'a> LossyTile<'a> {
             .enumerate()
         {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-            for ((dv, &p), &rv) in drow.iter_mut().zip(prow.iter()).zip(rrow.iter()) {
-                *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(drow, prow, rrow, (1 << self.bd) - 1);
         }
     }
 
@@ -857,9 +851,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..lh {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for cx2 in 0..lw {
-                    drow[cx2] = (lpred + lrr[ry * lw + cx2]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..lw], lpred, &lrr[ry * lw..], maxval);
             }
             if has_chroma {
                 let (caw, cah) = ((cw / 4).max(1), (ch / 4).max(1));
@@ -879,9 +871,7 @@ impl<'a> LossyTile<'a> {
                     };
                     for ry in 0..ch {
                         let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                        for c in 0..cw {
-                            drow[c] = (cpred[ci] + rr[ry * cw + c]).clamp(0, maxval);
-                        }
+                        recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
                     }
                 }
             }
@@ -1031,9 +1021,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..lh {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for cx2 in 0..lw {
-                    drow[cx2] = (lpred + lrr[ry * lw + cx2]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..lw], lpred, &lrr[ry * lw..], maxval);
             }
             let (caw, cah) = (cw / 4, ch / 4);
             for ci in 0..2 {
@@ -1052,9 +1040,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..ch {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                    for c in 0..cw {
-                        drow[c] = (cpred[ci] + rr[ry * cw + c]).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
                 }
             }
         }
@@ -1174,9 +1160,7 @@ impl<'a> LossyTile<'a> {
         if ru.is_none() {
             let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
             let mut luma_rec = [0i32; 1024];
-            for i in 0..1024 {
-                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, (1 << self.bd) - 1);
             let mut ac = [0i32; 1024];
             cfl_ac_444(&luma_rec, 32, 32, &mut ac);
             for ci in 0..2 {
@@ -1288,8 +1272,15 @@ impl<'a> LossyTile<'a> {
                 } else {
                     [pred_dc[ci]; 1024]
                 };
-                let sse =
-                    sse_recon::<1024, 32>(&cur_pred, &rr, &self.src[plane], self.w, px, py, self.bd);
+                let sse = sse_recon::<1024, 32>(
+                    &cur_pred,
+                    &rr,
+                    &self.src[plane],
+                    self.w,
+                    px,
+                    py,
+                    self.bd,
+                );
                 cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&cf_use[ci], &SCAN_32X32));
             }
 
@@ -1444,26 +1435,15 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_32x32(&final_cf[ci], &self.cquant)
             };
+            let max = (1 << self.bd) - 1;
             for (ry, rrow) in crr.as_chunks::<32>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                 if chosen_uv_32 != DC_PRED {
-                    let prow = &sv_preds32[ci][ry * 32..];
-                    for (j, (dv, &rv)) in drow[..32].iter_mut().zip(rrow.iter()).enumerate() {
-                        *dv = (prow[j] + rv).clamp(0, (1 << self.bd) - 1);
-                    }
+                    recon_add_pred(&mut drow[..32], &sv_preds32[ci][ry * 32..], rrow, max);
+                } else if use_cfl {
+                    recon_add_pred(&mut drow[..32], &cfl_pred[ci][ry * 32..], rrow, max);
                 } else {
-                    let base = if use_cfl {
-                        cfl_pred[ci][ry * 32..][0]
-                    } else {
-                        pred_dc[ci]
-                    };
-                    for (dv, (&cp, &rv)) in drow[..32]
-                        .iter_mut()
-                        .zip(cfl_pred[ci][ry * 32..].iter().zip(rrow.iter()))
-                    {
-                        let b = if use_cfl { cp } else { base };
-                        *dv = (b + rv).clamp(0, (1 << self.bd) - 1);
-                    }
+                    recon_add_dc(&mut drow[..32], pred_dc[ci], rrow, max);
                 }
             }
         }
@@ -1703,19 +1683,9 @@ impl<'a> LossyTile<'a> {
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_sv {
-                    let prow = &sv_preds[ci][ry * 16..];
-                    for ((dv, &rv), &prow) in drow[..16]
-                        .iter_mut()
-                        .zip(rrow[..16].iter())
-                        .zip(prow[..16].iter())
-                    {
-                        *dv = (prow + rv).clamp(0, maxval);
-                    }
+                    recon_add_pred(&mut drow[..16], &sv_preds[ci][ry * 16..], rrow, maxval);
                 } else {
-                    let dc = dc_preds[ci];
-                    for (dv, &rv) in drow[..16].iter_mut().zip(rrow.iter()) {
-                        *dv = (dc + rv).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..16], dc_preds[ci], rrow, maxval);
                 }
             }
         }
@@ -1797,9 +1767,7 @@ impl<'a> LossyTile<'a> {
         if ru.is_none() {
             let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
             let mut luma_rec = [0i32; 1024];
-            for i in 0..1024 {
-                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, maxv);
-            }
+            recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, maxv);
             let mut ac = [0i32; 512];
             cfl_ac_sub(&luma_rec, 32, 16, 32, true, false, &mut ac);
             let mut cfl_ccf = [[0i32; 512]; 2];
@@ -1863,7 +1831,11 @@ impl<'a> LossyTile<'a> {
             for ci in 0..2 {
                 let cur_ccf = if use_cfl { ccf[ci] } else { dc_ccf[ci] };
                 let rr = idct_dequant_16x32(&cur_ccf, &self.cquant);
-                let cur_pred = if use_cfl { cpred_px[ci] } else { [cpred[ci]; 512] };
+                let cur_pred = if use_cfl {
+                    cpred_px[ci]
+                } else {
+                    [cpred[ci]; 512]
+                };
                 let sse = crate::rd_sse::sse_recon(
                     &cur_pred,
                     &rr,
@@ -1951,8 +1923,17 @@ impl<'a> LossyTile<'a> {
                     }
                     cand_ccf[ci] = q;
                     let rr = idct_dequant_16x32(&q, &self.cquant);
-                    let sse =
-                        crate::rd_sse::sse_recon(&cand_pred[ci], &rr, &src, 16, 0, 0, 16, 32, self.bd);
+                    let sse = crate::rd_sse::sse_recon(
+                        &cand_pred[ci],
+                        &rr,
+                        &src,
+                        16,
+                        0,
+                        0,
+                        16,
+                        32,
+                        self.bd,
+                    );
                     cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X32));
                 }
                 if ru.is_some() || cand_total < best_total {
@@ -2025,10 +2006,7 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
-                let prow = &cpred_px[ci][ry * 16..];
-                for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                    *dv = (p + rv).clamp(0, maxv);
-                }
+                recon_add_pred(drow, &cpred_px[ci][ry * 16..], rrow, maxv);
             }
         }
     }

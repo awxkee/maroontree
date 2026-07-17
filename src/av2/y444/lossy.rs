@@ -4808,7 +4808,7 @@ impl Av2Encoder {
         // core instead derives the decision from its own reconstruction.
         cdef_pre: Option<&crate::av2::cdef_est::CdefDecision>,
         // Staged-threading decision record. `Off` = search+emit inline (today's
-        // behaviour); `Capture` also logs each SB winner; `Replay` reuses logged
+        // behavior); `Capture` also logs each SB winner; `Replay` reuses logged
         // winners (re-searching only not-yet-converted `Fallback` SBs).
         mut decide_mode: crate::av2::replay::DecideMode<'_>,
     ) -> RangeEncoder {

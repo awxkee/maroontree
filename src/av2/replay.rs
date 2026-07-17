@@ -176,7 +176,7 @@ pub(crate) enum Sb420 {
 
 /// How a single walk leaf treats its luma mode/tx search. Passed per `Op::Leaf`
 /// to the converted leaf methods (`(8,8)` split-32 + `(4,4)` tx16): `Off` =
-/// search + emit inline (today's behaviour); `Capture` = search, emit, and push
+/// search + emit inline (today's behavior); `Capture` = search, emit, and push
 /// the winner into the SB's accumulator; `Replay` = restore the captured recon +
 /// reuse the captured coeffs/mode, skipping the search entirely (pure emit).
 pub(crate) enum LeafWalk<'a> {
@@ -399,7 +399,7 @@ impl<'a> DecisionCursor<'a> {
 
 /// How `encode_444_core` treats per-SB decisions.
 pub(crate) enum DecideMode<'a> {
-    /// Search every SB and emit inline (today's behaviour; byte-identical).
+    /// Search every SB and emit inline (today's behavior; byte-identical).
     Off,
     /// Search every SB, emit inline, and log each winner into the record.
     Capture(&'a mut DecisionRecord),

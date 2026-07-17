@@ -128,7 +128,7 @@ impl Av2Encoder {
         tx_leaves: &mut Vec<(usize, usize, usize, usize)>,
         sb_qidx: &mut [u16],
         // Staged replay: `Capture` logs each walk leaf's luma winner; `Replay` reuses
-        // it (skips the leaf mode/tx searches). `Off` = today's inline behaviour.
+        // it (skips the leaf mode/tx searches). `Off` = today's inline behavior.
         mut decide_mode: crate::av2::replay::DecideMode<'_>,
     ) {
         let LumaPlanes { rec: recy, src: yp } = luma;

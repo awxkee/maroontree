@@ -40,11 +40,8 @@ impl<'a> LossyTile<'a> {
         // and keep the one minimizing pixel SSE + lambda * estimated bits. The
         // chosen prediction is per-pixel; reconstruction uses the same array so
         // the decoder (which re-derives the identical prediction) stays bit-exact.
-        let (dcq, acq, lam) = (
-            self.quant.dc_q() as f32,
-            self.quant.ac_q() as f32,
-            trellis_lambda(),
-        );
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let lam = trellis_lambda();
         let mlam = self.mlam();
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
@@ -580,9 +577,7 @@ impl<'a> LossyTile<'a> {
                 idct_dequant_8x8(&lcf, &self.quant)
             };
             let mut luma_rec = [0i32; 64];
-            for i in 0..64 {
-                luma_rec[i] = (lpred_arr[i] + lrr_cfl[i]).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, (1 << self.bd) - 1);
             let mut ac = [0i32; 64];
             cfl_ac_444(&luma_rec, 8, 8, &mut ac);
             let mut cfl_ccf = [[0i32; 64]; 2];
@@ -914,9 +909,7 @@ impl<'a> LossyTile<'a> {
                 idct_dequant_8x8(&lcf, &self.quant)
             };
             let mut luma_rec = [0i32; 64];
-            for i in 0..64 {
-                luma_rec[i] = (lpred_arr[i] + lrr[i]).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.bd) - 1);
             let mut ac = [0i32; 16];
             cfl_ac_sub(&luma_rec, 8, 4, 4, true, true, &mut ac);
             let mut cfl_ccf = [[0i32; 16]; 2];
@@ -1091,9 +1084,7 @@ impl<'a> LossyTile<'a> {
                 idct_dequant_8x8(&lcf, &self.quant)
             };
             let mut luma_rec = [0i32; 64];
-            for i in 0..64 {
-                luma_rec[i] = (lpred_arr[i] + lrr[i]).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.bd) - 1);
             let mut ac = [0i32; 32];
             cfl_ac_sub(&luma_rec, 8, 4, 8, true, false, &mut ac);
             let mut cfl_ccf = [[0i32; 32]; 2];
@@ -1410,9 +1401,7 @@ impl<'a> LossyTile<'a> {
                 .enumerate()
             {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for ((dv, &p), &rv) in drow.iter_mut().zip(prow.iter()).zip(rrow.iter()) {
-                    *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                }
+                recon_add_pred(drow, prow, rrow, (1 << self.bd) - 1);
             }
         }
 
@@ -1442,33 +1431,17 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_4x4(&ccf44[ci], &self.cquant)
                 };
+                let max = (1 << self.bd) - 1;
                 for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                     if use_cfl {
-                        let prow = &cpred420[ci][ry * 4..];
-                        for ((dv, &rv), &p) in
-                            drow[..4].iter_mut().zip(rrow.iter()).zip(prow.iter())
-                        {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(&mut drow[..4], &cpred420[ci][ry * 4..], rrow, max);
                     } else if chosen_uv_block == SMOOTH_V_PRED {
-                        let prow = &sv_preds_420[ci][ry * 4..];
-                        for ((dv, &rv), &prow) in
-                            drow[..4].iter_mut().zip(rrow.iter()).zip(prow.iter())
-                        {
-                            *dv = (prow + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(&mut drow[..4], &sv_preds_420[ci][ry * 4..], rrow, max);
                     } else if paeth420 {
-                        let prow = &paeth_pred420[ci][ry * 4..];
-                        for ((dv, &rv), &p) in
-                            drow[..4].iter_mut().zip(rrow.iter()).zip(prow.iter())
-                        {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(&mut drow[..4], &paeth_pred420[ci][ry * 4..], rrow, max);
                     } else {
-                        for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                            *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             } else if self.ss422 {
@@ -1495,22 +1468,15 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_4x8(&ccf48[ci], &self.cquant)
                 };
+                let max = (1 << self.bd) - 1;
                 for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
                     if use_cfl {
-                        let prow = &cpred422[ci][ry * 4..];
-                        for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(drow, &cpred422[ci][ry * 4..], rrow, max);
                     } else if paeth422 {
-                        let prow = &paeth_pred422[ci][ry * 4..];
-                        for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(drow, &paeth_pred422[ci][ry * 4..], rrow, max);
                     } else {
-                        for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                            *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             } else {
@@ -1546,25 +1512,18 @@ impl<'a> LossyTile<'a> {
                 } else {
                     idct_dequant_8x8(&ccf8[ci], &self.cquant)
                 };
+                let max = (1 << self.bd) - 1;
                 for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                     if use_cfl {
-                        let prow = &cpred444[ci][ry * 8..];
-                        for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(drow, &cpred444[ci][ry * 8..], rrow, max);
                     } else if paeth {
-                        let prow = &paeth_pred444[ci][ry * 8..];
-                        for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                            *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_pred(drow, &paeth_pred444[ci][ry * 8..], rrow, max);
                     } else {
                         // Plain DC chroma: use the scalar predictor directly so the
                         // reconstruction never depends on the CfL evaluation block
                         // having populated `cpred444`.
-                        for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                            *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
-                        }
+                        recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             }

@@ -399,9 +399,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..16 {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for cx in 0..8 {
-                    drow[cx] = (lpred + lrr[ry * 8 + cx]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..8], lpred, &lrr[ry * 8..], maxval);
             }
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -421,9 +419,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..16 {
                     let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
-                    for cx in 0..8 {
-                        drow[cx] = (cpred[ci] + rr[ry * 8 + cx]).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..8], cpred[ci], &rr[ry * 8..], maxval);
                 }
             }
         }
@@ -552,9 +548,7 @@ impl<'a> LossyTile<'a> {
         };
         for ry in 0..lh {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-            for cx2 in 0..lw {
-                drow[cx2] = (lpred + lrr[ry * lw + cx2]).clamp(0, maxval);
-            }
+            recon_add_dc(&mut drow[..lw], lpred, &lrr[ry * lw..], maxval);
         }
         let (caw, cah) = (cw / 4, (ch / 4).max(1));
         for ci in 0..2 {
@@ -582,9 +576,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..ch {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                for c in 0..cw {
-                    drow[c] = (cpred[ci] + rr[ry * cw + c]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
             }
         }
     }
@@ -668,9 +660,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..8 {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for cx2 in 0..16 {
-                    drow[cx2] = (lpred + lrr[ry * 16 + cx2]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..16], lpred, &lrr[ry * 16..], maxval);
             }
             for ci in 0..2 {
                 let plane = ci + 1;
@@ -699,9 +689,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..8 {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                    for c in 0..8 {
-                        drow[c] = (cpred[ci] + rr[ry * 8 + c]).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..8], cpred[ci], &rr[ry * 8..], maxval);
                 }
             }
         }
@@ -793,9 +781,7 @@ impl<'a> LossyTile<'a> {
             };
             for ry in 0..8 {
                 let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-                for cx in 0..16 {
-                    drow[cx] = (lpred + lrr[ry * 16 + cx]).clamp(0, maxval);
-                }
+                recon_add_dc(&mut drow[..16], lpred, &lrr[ry * 16..], maxval);
             }
             // --- chroma coeffs + reconstruct (4:4:4, both planes RTX_16X8) ---
             for ci in 0..2 {
@@ -816,9 +802,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..8 {
                     let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
-                    for cx in 0..16 {
-                        drow[cx] = (cpred[ci] + rr[ry * 16 + cx]).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..16], cpred[ci], &rr[ry * 16..], maxval);
                 }
             }
         }
@@ -829,13 +813,10 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         // luma 16x16 (identical for all subsampling modes)
         // Luma 16x16: same non-directional intra mode search as the 8x8 path.
-        let (dcq, acq, lam) = (
-            self.quant.dc_q() as f32,
-            self.quant.ac_q() as f32,
-            trellis_lambda(),
-        );
-        let dcs16 = self.dc_sign_ctx_16(0, px / 4, py / 4);
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let lam = trellis_lambda();
         let mlam = self.mlam();
+        let dcs16 = self.dc_sign_ctx_16(0, px / 4, py / 4);
         let prdo = self.perceptual_rd_scale(px, py, 16);
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         let mut best_mode = DC_PRED;

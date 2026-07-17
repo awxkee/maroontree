@@ -185,7 +185,7 @@ impl Av2Encoder {
         height: usize,
         cdef_pre: Option<&cdef_est::CdefDecision>,
         // Staged replay: `Capture` logs the whole-64 luma mode-search winner;
-        // `Replay` reuses it (skips `encode_luma_sb`). `Off` = today's behaviour.
+        // `Replay` reuses it (skips `encode_luma_sb`). `Off` = today's behavior.
         mut decide_mode: replay::DecideMode<'_>,
     ) -> RangeEncoder {
         let Core422Planes {

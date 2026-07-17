@@ -250,7 +250,7 @@ fn eob_sym(enc: &mut RangeEncoder, tbl: EobCdf, s: usize, nsyms: usize) {
 #[inline]
 fn eob_sym_esc(enc: &mut RangeEncoder, tbl: EobCdf, s: usize, nsyms: usize) {
     // The escape extension adds a trailing zero; update_cdf is called on
-    // the base cdf (not the escape sentinel), matching AVM behaviour.
+    // the base cdf (not the escape sentinel), matching AVM behavior.
     eob_sym(enc, tbl, s, nsyms);
 }
 

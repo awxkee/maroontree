@@ -31,7 +31,7 @@
 /// parameter) so the `decode_sb` recursion needs no signature changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum SbMode {
-    /// Fused decide+emit (historical behaviour).
+    /// Fused decide+emit (historical behavior).
     #[default]
     Off,
     /// Run every search, push each winner onto the record. Emitted bytes are

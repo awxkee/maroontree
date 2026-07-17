@@ -709,7 +709,7 @@ struct LossyTile<'a> {
     /// serial emit keeps full CDF adaptivity.
     dec_cdfs: Box<Cdfs>,
     /// `MT_AV1_LIVE_DECIDE_CDF=1`: route decision-side rate estimates back to
-    /// the live adaptive `cdfs` (pre-wavefront historical behaviour). A/B and
+    /// the live adaptive `cdfs` (pre-wavefront historical behavior). A/B and
     /// regression-hunting escape hatch only — incompatible with the wavefront.
     dec_live: bool,
     /// Decision capture/replay mode (see `coder/replay.rs`). `Off` in

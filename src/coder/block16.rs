@@ -187,9 +187,7 @@ impl<'a> LossyTile<'a> {
             .enumerate()
         {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-            for ((dv, &p), &rv) in drow.iter_mut().zip(prow.iter()).zip(rrow.iter()) {
-                *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(drow, prow, rrow, (1 << self.bd) - 1);
         }
     }
 
@@ -255,9 +253,7 @@ impl<'a> LossyTile<'a> {
                 _ => idct_dequant_16x16(lcf, &self.quant),
             };
             let mut luma_rec = [0i32; 256];
-            for i in 0..256 {
-                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, (1 << self.bd) - 1);
-            }
+            recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, (1 << self.bd) - 1);
             let mut ac = [0i32; 256];
             cfl_ac_444(&luma_rec, 16, 16, &mut ac);
             let (dcq, acq, lam) = (
@@ -539,21 +535,17 @@ impl<'a> LossyTile<'a> {
             } else {
                 idct_dequant_16x16(&ccf[ci], &self.cquant)
             };
+            let max = (1 << self.bd) - 1;
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.w + px..];
                 if cfl_opt.is_some() || chosen_uv_16 != DC_PRED {
                     // CfL and every non-DC mode store their per-pixel prediction in
                     // `cpred16`.
-                    let prow = &cpred16[ci][ry * 16..];
-                    for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                        *dv = (p + rv).clamp(0, (1 << self.bd) - 1);
-                    }
+                    recon_add_pred(drow, &cpred16[ci][ry * 16..], rrow, max);
                 } else {
                     // Plain DC chroma: use the scalar predictor directly so recon
                     // never depends on the CfL block having populated `cpred16`.
-                    for (dv, &rv) in drow.iter_mut().zip(rrow.iter()) {
-                        *dv = (cpred[ci] + rv).clamp(0, (1 << self.bd) - 1);
-                    }
+                    recon_add_dc(drow, cpred[ci], rrow, max);
                 }
             }
         }
@@ -779,17 +771,9 @@ impl<'a> LossyTile<'a> {
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
                 if use_nondc {
-                    let prow = &sv_preds[ci][ry * 8..];
-                    for ((dv, &rv), &prow) in
-                        drow[..8].iter_mut().zip(rrow.iter()).zip(prow[..8].iter())
-                    {
-                        *dv = (prow + rv).clamp(0, maxval);
-                    }
+                    recon_add_pred(&mut drow[..8], &sv_preds[ci][ry * 8..], rrow, maxval);
                 } else {
-                    let dc = dc_preds[ci];
-                    for (dv, &rv) in drow[..8].iter_mut().zip(rrow.iter()) {
-                        *dv = (dc + rv).clamp(0, maxval);
-                    }
+                    recon_add_dc(&mut drow[..8], dc_preds[ci], rrow, maxval);
                 }
             }
         }
@@ -880,9 +864,7 @@ impl<'a> LossyTile<'a> {
                 _ => idct_dequant_16x16(lcf, &self.quant),
             };
             let mut luma_rec = [0i32; 256];
-            for i in 0..256 {
-                luma_rec[i] = (lpred[i] + lrr_cfl[i]).clamp(0, maxv);
-            }
+            recon_add_pred(&mut luma_rec, lpred, &lrr_cfl, maxv);
             let mut ac = [0i32; 128];
             cfl_ac_sub(&luma_rec, 16, 8, 16, true, false, &mut ac);
             let mut cfl_ccf = [[0i32; 128]; 2];
@@ -989,10 +971,7 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.recon[plane][(py + ry) * self.cw + cx..];
-                let prow = &cpred_px[ci][ry * 8..];
-                for ((dv, &rv), &p) in drow.iter_mut().zip(rrow.iter()).zip(prow.iter()) {
-                    *dv = (p + rv).clamp(0, maxv);
-                }
+                recon_add_pred(drow, &cpred_px[ci][ry * 8..], rrow, maxv);
             }
         }
     }
@@ -1183,13 +1162,7 @@ impl<'a> LossyTile<'a> {
                 if cfl_eligible {
                     let lrr_cfl = idct_dequant_4x4(&lcf, &self.quant);
                     let mut luma_rec = [0i32; 16];
-                    for ((dst, &lpred), &lrr_cfl) in luma_rec
-                        .iter_mut()
-                        .zip(lpred[..16].iter())
-                        .zip(lrr_cfl[..16].iter())
-                    {
-                        *dst = (lpred + lrr_cfl).clamp(0, maxv);
-                    }
+                    recon_add_pred(&mut luma_rec, &lpred, &lrr_cfl, maxv);
                     let mut ac = [0i32; 16];
                     cfl_ac_444(&luma_rec, 4, 4, &mut ac);
                     for ci in 0..2 {
@@ -1328,9 +1301,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..4 {
                     let drow = &mut self.recon[0][(by + ry) * self.w + bx..];
-                    for rx in 0..4 {
-                        drow[rx] = (lpred[ry * 4 + rx] + lrr[ry * 4 + rx]).clamp(0, maxv);
-                    }
+                    recon_add_pred(&mut drow[..4], &lpred[ry * 4..], &lrr[ry * 4..], maxv);
                 }
             }
 
@@ -1356,14 +1327,12 @@ impl<'a> LossyTile<'a> {
                     } else {
                         idct_dequant_4x4(&ccf[ci], &self.cquant)
                     };
+                    // When the block is skipped (no residual) the prediction is
+                    // exactly the chroma reconstruction. For a skipped CfL block,
+                    // cpred_px already holds the CfL prediction.
                     for ry in 0..4 {
                         let drow = &mut self.recon[plane][(chy + ry) * cstride + chx..];
-                        for rx in 0..4 {
-                            // When the block is skipped (no residual) the prediction
-                            // is exactly the chroma reconstruction. For a skipped CfL
-                            // block, cpred_px already holds the CfL prediction.
-                            drow[rx] = (cpred_px[ci][ry * 4 + rx] + rr[ry * 4 + rx]).clamp(0, maxv);
-                        }
+                        recon_add_pred(&mut drow[..4], &cpred_px[ci][ry * 4..], &rr[ry * 4..], maxv);
                     }
                 }
             }

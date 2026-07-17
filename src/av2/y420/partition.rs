@@ -457,7 +457,7 @@ impl Av2Encoder {
         sb_qidx: &mut [u16],
         // Staged replay: `Capture` logs each walk SB's per-leaf luma + chroma
         // winners; `Replay` reuses them (skips the leaf mode/tx + CfL/MHCCP
-        // searches); `Off` = today's inline behaviour. Only the whole-64 `(16,16)`
+        // searches); `Off` = today's inline behavior. Only the whole-64 `(16,16)`
         // intra leaf is captured so far — every other shape (and any inter-coded
         // SB) records `Fallback` and is re-searched byte-identically on replay.
         mut decide_mode: replay::DecideMode<'_>,

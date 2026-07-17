@@ -58,7 +58,7 @@ pub(crate) fn coef_rate_bits(level: u32) -> f32 {
 }
 
 /// `lambda0` for the trellis quantizer (R-D tradeoff, in `ac_q^2` units so the
-/// behaviour is q-adaptive). Calibrated so the per-coefficient round-down and
+/// behavior is q-adaptive). Calibrated so the per-coefficient round-down and
 /// EOB-trim land on the R-D frontier: meaningfully smaller streams for a
 /// negligible PSNR cost, beating the naive "raise q" baseline.
 pub(crate) const TRELLIS_LAMBDA0: f32 = 0.05;
@@ -92,7 +92,7 @@ pub(crate) fn trellis_lambda() -> f32 {
 //   // SSIMULACRA2 / IQ tuning weight (good-quality, non-realtime):
 //   weight  = clamp(((255 - qindex) * 3) / 4, 0, 72) + 128   // 128..200
 //   rdmult *= weight / 128
-//   // bit-depth normalisation: 8-bit none, 10-bit >>4, 12-bit >>8
+//   // bit-depth normalization: 8-bit none, 10-bit >>4, 12-bit >>8
 //
 // libaom's integer RDCOST is
 //   RDCOST(rdmult, R, D) = ((rdmult * R + (1<<9)) >> 10) + (D << 4)
