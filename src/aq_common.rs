@@ -159,9 +159,9 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
     let mut sum = 0f32;
     for (r, row) in buf.iter_mut().enumerate().take(h) {
         let base = (sb_y + r) * pw + sb_x;
-        for c in 0..w {
-            let v = yp[base + c].to_f32() * scale;
-            row[c] = v;
+        for (yp, dst) in yp[base..base + w].iter().zip(row.iter_mut()) {
+            let v = yp.to_f32() * scale;
+            *dst = v;
             sum += v;
         }
     }
