@@ -852,9 +852,20 @@ impl<'a> LossyTile<'a> {
         } else {
             nd_modes()
         };
-        let directional_top =
-            self.rank_luma_directionals::<256>(modes, px, py, 16, 16, have_tr, have_bl);
+        // Pure-emit replay: the recorded winner + its captured coefficients
+        // replace every sub-search below — no candidate is evaluated at all
+        // (see code_block in block8.rs for the pattern).
+        let rl = self.luma_sel_replay();
+        let rl_cf = self.luma_cf_replay();
+        let directional_top = if rl.is_none() {
+            self.rank_luma_directionals::<256>(modes, px, py, 16, 16, have_tr, have_bl)
+        } else {
+            DirectionalTopK::new()
+        };
         for &m in modes {
+            if rl.is_some() {
+                break;
+            }
             if is_directional_mode(m) && !directional_top.contains(m) {
                 continue;
             }
@@ -895,17 +906,17 @@ impl<'a> LossyTile<'a> {
                     &SCAN_16X16,
                     lam,
                     16,
-                    &self.cdfs,
+                    self.dcdf(),
                     2,
                     0,
-                    &self.cdfs.eob_bin_256_l,
+                    &self.dcdf().eob_bin_256_l,
                     dcs16,
                 );
             }
             let sse = blk_sse16(&idct_dequant_16x16(&cf, &self.quant));
             let bits = block_rate_bits(&cf, &SCAN_16X16);
             let filter_bits = if m == DC_PRED {
-                cdf_cost(&self.cdfs.filter_intra[av1_block_size_index(16, 16)], 0)
+                cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(16, 16)], 0)
             } else {
                 0.0
             };
@@ -921,7 +932,7 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra = None;
             }
         }
-        if self.speed == Speed::Slow {
+        if rl.is_none() && self.speed == Speed::Slow {
             let bsize = av1_block_size_index(16, 16);
             for filter_mode in FILTER_INTRA_MODES {
                 let mut pred = [0i32; 256];
@@ -956,10 +967,10 @@ impl<'a> LossyTile<'a> {
                     &SCAN_16X16,
                     lam,
                     16,
-                    &self.cdfs,
+                    self.dcdf(),
                     2,
                     0,
-                    &self.cdfs.eob_bin_256_l,
+                    &self.dcdf().eob_bin_256_l,
                     dcs16,
                 );
                 let rr = idct_dequant_16x16(&cf, &self.quant);
@@ -967,10 +978,11 @@ impl<'a> LossyTile<'a> {
                     sse_recon::<256, 16>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                 let bits = block_rate_bits(&cf, &SCAN_16X16);
                 let syntax_bits = mode_signal_bits(DC_PRED)
-                    + cdf_cost(&self.cdfs.filter_intra[bsize], 1)
-                    + cdf_cost(&self.cdfs.filter_intra_mode, filter_mode as usize);
+                    + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
+                    + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
-                if filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff {
+                if rl.is_some() || (filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff)
+                {
                     best_eff = cost;
                     best_mode = DC_PRED;
                     lpred_arr = pred;
@@ -984,14 +996,15 @@ impl<'a> LossyTile<'a> {
         }
         // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
         let mut best_delta: i32 = 0;
-        if angle_delta_enabled()
+        if rl.is_none()
+            && angle_delta_enabled()
             && self.speed.try_angle_deltas()
             && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
             && best_mode != V_PRED
             && best_mode != H_PRED
         {
             let mut ad_cdf = [0u16; 7];
-            ad_cdf.copy_from_slice(&self.cdfs.angle_delta[best_mode - V_PRED]);
+            ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
             let mut best_ad_cost =
                 rd_cost_i64(best_dct_sse, mlam, best_dct_bits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
@@ -1034,10 +1047,10 @@ impl<'a> LossyTile<'a> {
                         &SCAN_16X16,
                         lam,
                         16,
-                        &self.cdfs,
+                        self.dcdf(),
                         2,
                         0,
-                        &self.cdfs.eob_bin_256_l,
+                        &self.dcdf().eob_bin_256_l,
                         dcs16,
                     );
                 }
@@ -1045,7 +1058,7 @@ impl<'a> LossyTile<'a> {
                 let sse = sse_recon::<256, 16>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
                 let bits = block_rate_bits(&cf, &SCAN_16X16);
                 let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
-                if cost < best_ad_cost {
+                if rl.is_some() || cost < best_ad_cost {
                     best_ad_cost = cost;
                     best_delta = d;
                     lpred_arr = pred;
@@ -1058,7 +1071,7 @@ impl<'a> LossyTile<'a> {
         }
         // Fast path: run RDOQ once, on the winning mode only (libaom
         // winner-mode coeff opt). The decision above used un-trellised costs.
-        if !self.speed.per_candidate_rdoq() {
+        if rl.is_none() && !self.speed.per_candidate_rdoq() {
             trellis_optimize_ctx(
                 &mut lcf,
                 &ltf,
@@ -1067,16 +1080,16 @@ impl<'a> LossyTile<'a> {
                 &SCAN_16X16,
                 lam,
                 16,
-                &self.cdfs,
+                self.dcdf(),
                 2,
                 0,
-                &self.cdfs.eob_bin_256_l,
+                &self.dcdf().eob_bin_256_l,
                 dcs16,
             );
         }
         // Winner-only ADST_ADST refinement. Full and Medium try it; only Fast
         // prunes the transform-type search to DCT_DCT (libaom-style).
-        if self.speed.try_adst() {
+        if rl.is_none() && self.speed.try_adst() {
             let mut resid = [0i32; 256];
             crate::rd_sse::residual_pred(
                 &mut resid,
@@ -1097,10 +1110,10 @@ impl<'a> LossyTile<'a> {
                 &SCAN_16X16,
                 lam,
                 16,
-                &self.cdfs,
+                self.dcdf(),
                 2,
                 0,
-                &self.cdfs.eob_bin_256_l,
+                &self.dcdf().eob_bin_256_l,
                 dcs16,
             );
             let rr = iadst_dequant_16x16(&acf, &self.quant);
@@ -1113,8 +1126,10 @@ impl<'a> LossyTile<'a> {
             // for a trivial rate gain. Requiring SSE-non-worsening keeps the
             // genuine high-quality ADST wins (where it lowers SSE) and blocks the
             // low-quality "trade quality for bits" pathology.
-            if asse <= best_dct_sse + (best_dct_sse >> 5)
-                && rd_cost_i64(asse, mlam, abits) < rd_cost_i64(best_dct_sse, mlam, best_dct_bits)
+            if rl.is_some()
+                || (asse <= best_dct_sse + (best_dct_sse >> 5)
+                    && rd_cost_i64(asse, mlam, abits)
+                        < rd_cost_i64(best_dct_sse, mlam, best_dct_bits))
             {
                 lcf = acf;
                 txtp16 = 1;
@@ -1122,7 +1137,7 @@ impl<'a> LossyTile<'a> {
         }
         // Asymmetric-ADST refinement (ADST_DCT / DCT_ADST) for TX_16X16, same
         // rationale as the 8x8 path. Competes with the running tx winner.
-        if self.speed.try_adst() && asym_adst_enabled() {
+        if rl.is_none() && self.speed.try_adst() && asym_adst_enabled() {
             let mut best_txtp16_sse = if txtp16 == 1 { i64::MAX } else { best_dct_sse };
             let mut best_txtp16_bits = best_dct_bits;
             if txtp16 == 1 {
@@ -1157,10 +1172,10 @@ impl<'a> LossyTile<'a> {
                     &SCAN_16X16,
                     lam,
                     16,
-                    &self.cdfs,
+                    self.dcdf(),
                     2,
                     0,
-                    &self.cdfs.eob_bin_256_l,
+                    &self.dcdf().eob_bin_256_l,
                     dcs16,
                 );
                 let rr = if inv_dctadst {
@@ -1171,9 +1186,10 @@ impl<'a> LossyTile<'a> {
                 let asse =
                     sse_recon::<256, 16>(&lpred_arr, &rr, &self.src[0], self.w, px, py, self.bd);
                 let abits = block_rate_bits(&acf, &SCAN_16X16);
-                if asse <= best_dct_sse + (best_dct_sse >> 5)
-                    && rd_cost_i64(asse, mlam, abits)
-                        < rd_cost_i64(best_txtp16_sse, mlam, best_txtp16_bits)
+                if rl.is_some()
+                    || (asse <= best_dct_sse + (best_dct_sse >> 5)
+                        && rd_cost_i64(asse, mlam, abits)
+                            < rd_cost_i64(best_txtp16_sse, mlam, best_txtp16_bits))
                 {
                     lcf = acf;
                     txtp16 = if inv_dctadst { 3 } else { 2 };
@@ -1182,6 +1198,33 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
+        // Pure-emit replay: install the recorded winner and its captured
+        // post-trellis coefficients (every luma sub-search above was skipped).
+        if let Some(r) = rl {
+            best_mode = r.mode as usize;
+            best_delta = r.delta as i32;
+            best_filter_intra = FILTER_INTRA_MODES
+                .iter()
+                .copied()
+                .find(|&f| f as u8 == r.filter);
+            txtp16 = match r.tx {
+                TxSel::Adst => 1,
+                TxSel::AdstDct => 2,
+                TxSel::DctAdst => 3,
+                _ => 0,
+            };
+        }
+        if let Some(cf) = rl_cf {
+            lcf.copy_from_slice(&cf);
+        }
+        self.push_luma_sel(LumaSel {
+            mode: best_mode as u8,
+            delta: best_delta as i8,
+            filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
+            // No IDTX sub-search at 16x16; txtp16 covers DCT/ADST/asym only.
+            tx: TxSel::from_flags(txtp16 == 1, false, txtp16 == 2, txtp16 == 3),
+        });
+        self.push_luma_cf(&lcf);
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
             self.code_block16_420(

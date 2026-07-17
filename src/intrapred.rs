@@ -974,7 +974,7 @@ pub(crate) fn nd_modes() -> &'static [usize] {
 /// (their wins over SMOOTH are rare and small). Mirrors libaom's intra-mode
 /// pruning at higher `--cpu-used`.
 pub(crate) fn fast_nd_modes() -> &'static [usize] {
-    const FAST: [usize; 3] = [DC_PRED, SMOOTH_PRED, PAETH_PRED];
+    static FAST: [usize; 3] = [DC_PRED, SMOOTH_PRED, PAETH_PRED];
     &FAST
 }
 
@@ -1374,8 +1374,8 @@ mod intra_edge_tests {
     #[test]
     fn filter_intra_is_recursive_across_groups() {
         let mut recon = vec![128; 16 * 16];
-        for x in 0..8 {
-            recon[x] = 16 + x as i32 * 20;
+        for (x, r) in recon.iter_mut().enumerate().take(8) {
+            *r = 16 + x as i32 * 20;
         }
         for y in 0..8 {
             recon[y * 16] = 240 - y as i32 * 18;

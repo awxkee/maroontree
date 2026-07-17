@@ -246,6 +246,22 @@ pub(crate) struct Cdfs {
 }
 
 impl Cdfs {
+    /// Frozen snapshot used for DECISION-side rate estimates (`dec_cdfs`).
+    /// Mostly the frame-initial CDFs, except symbols whose default prior sits
+    /// far from its adapted steady state on real content: there a frozen
+    /// default systematically mis-prices the choice for the whole frame
+    /// (adaptive coding self-corrects; a frozen estimate cannot). Overridden:
+    /// `filter_intra` — the default heavily favors one outcome, which starved
+    /// filter-intra on content where it wins (+12.8% on grayscale q40); a
+    /// flat 1-bit prior keeps the decision content-driven.
+    pub(crate) fn decision_snapshot(qctx: usize) -> Box<Self> {
+        let mut c = Self::new(qctx);
+        for e in c.filter_intra.iter_mut() {
+            *e = icdf(&[16384]);
+        }
+        Box::new(c)
+    }
+
     pub(crate) fn new(qctx: usize) -> Self {
         use crate::coef_q as Q;
         let rows = |t: &[[u16; 3]]| t.iter().map(|r| icdf(r)).collect::<Vec<_>>();
@@ -643,6 +659,15 @@ impl AqCtx {
     }
 }
 
+/// One superblock's precomputed AQ state: the post-clamp qindex the SB codes
+/// with and the signaled `reducedDeltaQIndex` step count that got it there.
+/// Produced in raster order by `precompute_aq_grid`; indexed `row * cols + col`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AqCell {
+    newq: u8,
+    steps: i32,
+}
+
 /// Whole-frame lossy encoder state.
 struct LossyTile<'a> {
     bd: u8,
@@ -676,6 +701,24 @@ struct LossyTile<'a> {
     cdef_point_marked: bool,
     enc: OdEcEncoder,
     cdfs: Cdfs,
+    /// Frozen frame-initial CDF snapshot used by every DECISION-side rate
+    /// estimate (RDOQ trellis, filter-intra / angle-delta mode costs). The
+    /// adaptive `cdfs` above is emit-only. Keeping decisions off the adaptive
+    /// chain makes them independent of SB coding order, which is what allows
+    /// the SB-wavefront to decide superblocks out of raster order while the
+    /// serial emit keeps full CDF adaptivity.
+    dec_cdfs: Box<Cdfs>,
+    /// `MT_AV1_LIVE_DECIDE_CDF=1`: route decision-side rate estimates back to
+    /// the live adaptive `cdfs` (pre-wavefront historical behaviour). A/B and
+    /// regression-hunting escape hatch only — incompatible with the wavefront.
+    dec_live: bool,
+    /// Decision capture/replay mode (see `coder/replay.rs`). `Off` in
+    /// production until the wavefront lands.
+    sb_mode: SbMode,
+    /// Captured (or replayed-from) RD decisions, call-order aligned.
+    rec: DecisionRecord,
+    /// Replay read positions into `rec`.
+    cur: RecordCursor,
     /// RDO effort: [`Speed::Slow`] (default) or [`Speed::Fast`] (winner-only
     /// RDOQ, DCT-only transform choice, reduced intra mode set).
     speed: Speed,
@@ -707,6 +750,7 @@ struct LossyTile<'a> {
 // Keep the state type and shared imports in this module while splitting its
 // implementation by coding responsibility. `include!` preserves private field
 // access without widening the encoder's internal API.
+include!("coder/replay.rs");
 include!("coder/lossy_state.rs");
 include!("coder/partition_search.rs");
 include!("coder/block16.rs");
@@ -1175,10 +1219,345 @@ struct TileOut {
     blk4t: Vec<bool>, // per-4x4 actual luma horizontal-edge map
 }
 
+/// Parallel SB-wavefront CAPTURE pass over one tile: decide every superblock's
+/// RD choices out of raster order (schedule `d = 2r + c`, so top, left AND
+/// above-right neighbours are always finished) and return the raster-merged
+/// [`DecisionRecord`]. The caller then runs a serial [`SbMode::Replay`] emit,
+/// which regenerates the byte-identical bitstream with full CDF adaptivity.
+///
+/// Safety of the parallelism rests on three PROVEN properties (env gates):
+/// - decisions read recon only inside the halo bands (`MT_AV1_HALO_CHECK`);
+/// - every ctx-array read stays inside the SB's exact own column/row segment
+///   (`MT_AV1_CTX_CHECK`, zero margin — margins would NOT be wavefront-safe
+///   for `l_*`: their neighbouring rows have a different last-writer under
+///   diagonal order than under raster order);
+/// - decisions never read the adaptive CDFs or encoder state (frozen
+///   `dec_cdfs`, Phase 1) — so each worker captures into a sink encoder.
+///
+/// Shared state is written disjointly: each cell writes only its own SB block
+/// of the `done` recon planes and its own segments of the ctx handoff arrays
+/// (top→bottom handoff for `a_*`, left→right for `l_*`), exactly mirroring
+/// what the serial raster loop would have left there for that reader.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // `p` indexes recon planes AND their writers in lockstep
+fn wavefront_capture(
+    nthreads: usize,
+    base_q_idx: u8,
+    bd: u8,
+    full_w: usize,
+    full_h: usize,
+    sub_x: usize,
+    sub_y: usize,
+    mono: bool,
+    tsrc: &[Vec<i32>; 3],
+    r: &TileRect,
+    speed: Speed,
+    aq: bool,
+    vb: &VarianceBoost,
+    tx: std::sync::mpsc::Sender<(usize, DecisionRecord)>,
+) {
+    use crate::av2::helpers::{PlaneWriter, par_wavefront_pool_with};
+    const HB: usize = 4; // halo band thickness (AV1 intra needs 1 px; generous)
+    let sb_rows = r.th.div_ceil(64);
+    let sb_cols = r.tw.div_ceil(64);
+    // `mk_tile` runs once per worker.  Computing this inside it made every
+    // worker rescan the complete source tile when AQ/variance boost was on.
+    // The reference activity is immutable and identical for all workers.
+    let ref_act = aq.then(|| tile_ref_activity(&tsrc[0], r.tw, r.tw, r.th));
+    let mk_tile = || {
+        let mut t = if mono {
+            LossyTile::new_mono(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm)
+        } else {
+            match (sub_x, sub_y) {
+                (0, 0) => LossyTile::new(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
+                (1, 0) => LossyTile::new_422(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
+                _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
+            }
+        }
+        .with_speed(speed);
+        t.frame_x0 = r.x0;
+        t.frame_y0 = r.y0;
+        t.frame_w = full_w;
+        t.frame_h = full_h;
+        if let Some(ref_act) = ref_act {
+            t.enable_aq(base_q_idx, ref_act, vb);
+        }
+        t.sb_mode = SbMode::Capture;
+        t.enc.sink = true;
+        t
+    };
+    // Prototype: geometry, frame-initial ctx array contents, and the AQ grid
+    // (identical to the serial pass's — bit-exact by `aq_grid_matches_serial`).
+    let proto = mk_tile();
+    let aq_grid = proto.precompute_aq_grid();
+    let mut done = [
+        vec![0i32; proto.recon[0].len()],
+        vec![0i32; proto.recon[1].len()],
+        vec![0i32; proto.recon[2].len()],
+    ];
+    // Ctx handoff arrays, frame-initial (clones of a fresh tile's arrays).
+    let mut h_arrs: Vec<Vec<u8>> = vec![
+        proto.a_coef[0].clone(),
+        proto.a_coef[1].clone(),
+        proto.a_coef[2].clone(),
+        proto.l_coef[0].clone(),
+        proto.l_coef[1].clone(),
+        proto.l_coef[2].clone(),
+        proto.a_part.clone(),
+        proto.l_part.clone(),
+        proto.a_skip.clone(),
+        proto.l_skip.clone(),
+        proto.a_mode.clone(),
+        proto.l_mode.clone(),
+        proto.a_uv_mode.clone(),
+        proto.l_uv_mode.clone(),
+    ];
+    let (ss422, ss420) = (proto.ss422, proto.ss420);
+    let cw = proto.cw;
+    drop(proto);
+    // Disjoint-write views. Plane p stride: luma w, chroma cw.
+    let dws: Vec<PlaneWriter<i32>> = {
+        let mut it = done.iter_mut();
+        let l = it.next().unwrap();
+        let u = it.next().unwrap();
+        let v = it.next().unwrap();
+        vec![
+            PlaneWriter::new(l, r.tw),
+            PlaneWriter::new(u, cw.max(1)),
+            PlaneWriter::new(v, cw.max(1)),
+        ]
+    };
+    let hws: Vec<PlaneWriter<u8>> = h_arrs
+        .iter_mut()
+        .map(|a| {
+            let stride = a.len().max(1);
+            PlaneWriter::new(a, stride)
+        })
+        .collect();
+    par_wavefront_pool_with(
+        nthreads,
+        sb_rows,
+        sb_cols,
+        /* needs_above_right= */ true,
+        mk_tile,
+        |t: &mut LossyTile, row: usize, col: usize| {
+            let (sb_x, sb_y) = (col * 64, row * 64);
+            // Per-plane geometry: (subsample x shift, subsample y shift).
+            let shift = |p: usize| -> (usize, usize) {
+                if p == 0 {
+                    (0, 0)
+                } else {
+                    (((ss420 || ss422) as usize), (ss420 as usize))
+                }
+            };
+            // --- copy-in: recon halo bands from the finished-SB planes ---
+            for p in 0..3 {
+                if t.recon[p].is_empty() {
+                    continue;
+                }
+                let (sx, sy) = shift(p);
+                let pw = if p == 0 { t.w } else { t.cw };
+                let ph = t.recon[p].len() / pw;
+                let (bx, by) = (sb_x >> sx, sb_y >> sy);
+                let (bw, bh) = (64usize >> sx, 64usize >> sy);
+                let x0 = bx.saturating_sub(HB);
+                let x1 = (bx + 2 * bw).min(pw);
+                let y0 = by.saturating_sub(HB);
+                // SAFETY: halo regions belong to earlier diagonals (finished,
+                // not being written); regions are in-plane.
+                unsafe {
+                    if by > y0 {
+                        dws[p].copy_region_to(&mut t.recon[p], y0, x0, by - y0, x1 - x0);
+                    }
+                    if bx > x0 {
+                        let yh = (by + bh).min(ph) - by;
+                        dws[p].copy_region_to(&mut t.recon[p], by, x0, yh, bx - x0);
+                    }
+                }
+            }
+            // --- copy-in: exact own ctx segments from the handoff arrays ---
+            let cx = sb_x >> ((ss420 || ss422) as usize);
+            let cy = sb_y >> (ss420 as usize);
+            let segs: [(usize, usize); 14] = [
+                (sb_x / 4, 16), // a_coef[0] (luma 4x4 cols, 16 per SB)
+                (cx / 4, 16 >> ((ss420 || ss422) as usize)),
+                (cx / 4, 16 >> ((ss420 || ss422) as usize)),
+                (sb_y / 4, 16), // l_coef[0]
+                (cy / 4, 16 >> (ss420 as usize)),
+                (cy / 4, 16 >> (ss420 as usize)),
+                (sb_x / 8, 8),  // a_part
+                (sb_y / 8, 8),  // l_part
+                (sb_x / 4, 16), // a_skip
+                (sb_y / 4, 16), // l_skip
+                (sb_x / 4, 16), // a_mode
+                (sb_y / 4, 16), // l_mode
+                (sb_x / 4, 16), // a_uv_mode
+                (sb_y / 4, 16), // l_uv_mode
+            ];
+            let arr_of = |t: &mut LossyTile<'_>, i: usize| -> *mut Vec<u8> {
+                match i {
+                    0 => &mut t.a_coef[0],
+                    1 => &mut t.a_coef[1],
+                    2 => &mut t.a_coef[2],
+                    3 => &mut t.l_coef[0],
+                    4 => &mut t.l_coef[1],
+                    5 => &mut t.l_coef[2],
+                    6 => &mut t.a_part,
+                    7 => &mut t.l_part,
+                    8 => &mut t.a_skip,
+                    9 => &mut t.l_skip,
+                    10 => &mut t.a_mode,
+                    11 => &mut t.l_mode,
+                    12 => &mut t.a_uv_mode,
+                    _ => &mut t.l_uv_mode,
+                }
+            };
+            for (i, &(s, n)) in segs.iter().enumerate() {
+                // SAFETY: arr_of returns a field pointer used immediately,
+                // no aliasing (one array at a time).
+                let arr = unsafe { &mut *arr_of(t, i) };
+                if arr.is_empty() {
+                    continue;
+                }
+                let e = (s + n).min(arr.len());
+                if e > s {
+                    // SAFETY: the segment was last written by a finished cell
+                    // (above SB for a_*, left SB for l_*) or is frame-initial.
+                    unsafe { hws[i].copy_region_to(&mut arr[..], 0, s, 1, e - s) };
+                }
+            }
+            // --- per-cell resets ---
+            let mut enc = OdEcEncoder::new();
+            enc.sink = true;
+            t.enc = enc;
+            t.rec = DecisionRecord::default();
+            t.cur = RecordCursor::default();
+            t.cdef_point_marked = false;
+            if !aq_grid.is_empty() {
+                t.aq_begin_sb_cell(&aq_grid[row * sb_cols + col]);
+            }
+            t.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+            // --- write-out: own recon block into the finished planes, and
+            // into the cell record (streamed to the pure-emit replay) ---
+            let mut blk = [0i32; 64 * 64];
+            let mut cell_recon: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for p in 0..3 {
+                if t.recon[p].is_empty() {
+                    continue;
+                }
+                let (sx, sy) = shift(p);
+                let pw = if p == 0 { t.w } else { t.cw };
+                let ph = t.recon[p].len() / pw;
+                let (bx, by) = (sb_x >> sx, sb_y >> sy);
+                let (bw, bh) = (64usize >> sx, 64usize >> sy);
+                let w2 = (bx + bw).min(pw) - bx;
+                let h2 = (by + bh).min(ph) - by;
+                for row2 in 0..h2 {
+                    blk[row2 * w2..row2 * w2 + w2]
+                        .copy_from_slice(&t.recon[p][(by + row2) * pw + bx..][..w2]);
+                }
+                // SAFETY: own SB block — no other concurrent writer.
+                unsafe { dws[p].write_block(by, bx, h2, w2, &blk[..h2 * w2]) };
+                cell_recon[p] = blk[..h2 * w2].to_vec();
+            }
+            t.rec.recon.push(cell_recon);
+            // --- write-out: own ctx segments into the handoff arrays ---
+            for (i, &(s, n)) in segs.iter().enumerate() {
+                let arr = unsafe { &mut *arr_of(t, i) };
+                if arr.is_empty() {
+                    continue;
+                }
+                let e = (s + n).min(arr.len());
+                if e > s {
+                    // SAFETY: own exact segment — disjoint from every
+                    // concurrent cell's segment.
+                    unsafe { hws[i].write_block(0, s, 1, e - s, &arr[s..e]) };
+                }
+            }
+            // --- zero-invariant: reset the dirtied recon regions ---
+            for p in 0..3 {
+                if t.recon[p].is_empty() {
+                    continue;
+                }
+                let (sx, sy) = shift(p);
+                let pw = if p == 0 { t.w } else { t.cw };
+                let ph = t.recon[p].len() / pw;
+                let (bx, by) = (sb_x >> sx, sb_y >> sy);
+                let (bw, bh) = (64usize >> sx, 64usize >> sy);
+                let x0 = bx.saturating_sub(HB);
+                let x1 = (bx + 2 * bw).min(pw);
+                for row2 in by.saturating_sub(HB)..(by + bh).min(ph) {
+                    t.recon[p][row2 * pw + x0..row2 * pw + x1].fill(0);
+                }
+            }
+            let rec = std::mem::take(&mut t.rec);
+            tx.send((row * sb_cols + col, rec))
+                .expect("wavefront replay receiver dropped");
+        },
+    );
+}
+
+/// Copy a superblock's packed per-plane recon blocks INTO the tile's planes
+/// (pure-emit replay install). Geometry mirrors `blocks_geom_extract`.
+#[allow(clippy::needless_range_loop)] // `p` indexes tile planes AND blocks in lockstep
+fn blocks_geom_apply(tile: &mut LossyTile, sb_x: usize, sb_y: usize, blocks: &[Vec<i32>; 3]) {
+    for p in 0..3 {
+        if tile.recon[p].is_empty() || blocks[p].is_empty() {
+            continue;
+        }
+        let sx = if p == 0 {
+            0
+        } else {
+            (tile.ss420 || tile.ss422) as usize
+        };
+        let sy = if p == 0 { 0 } else { tile.ss420 as usize };
+        let pw = if p == 0 { tile.w } else { tile.cw };
+        let ph = tile.recon[p].len() / pw;
+        let (bx, by) = (sb_x >> sx, sb_y >> sy);
+        let (bw, bh) = (64usize >> sx, 64usize >> sy);
+        let w2 = (bx + bw).min(pw) - bx;
+        let h2 = (by + bh).min(ph) - by;
+        debug_assert_eq!(blocks[p].len(), w2 * h2);
+        for row2 in 0..h2 {
+            tile.recon[p][(by + row2) * pw + bx..][..w2]
+                .copy_from_slice(&blocks[p][row2 * w2..row2 * w2 + w2]);
+        }
+    }
+}
+
+/// Extract a superblock's per-plane recon blocks OUT of the tile's planes
+/// (capture side of the pure-emit record).
+#[allow(clippy::needless_range_loop)] // `p` indexes tile planes AND out blocks in lockstep
+fn blocks_geom_extract(tile: &LossyTile, sb_x: usize, sb_y: usize, out: &mut [Vec<i32>; 3]) {
+    for p in 0..3 {
+        if tile.recon[p].is_empty() {
+            continue;
+        }
+        let sx = if p == 0 {
+            0
+        } else {
+            (tile.ss420 || tile.ss422) as usize
+        };
+        let sy = if p == 0 { 0 } else { tile.ss420 as usize };
+        let pw = if p == 0 { tile.w } else { tile.cw };
+        let ph = tile.recon[p].len() / pw;
+        let (bx, by) = (sb_x >> sx, sb_y >> sy);
+        let (bw, bh) = (64usize >> sx, 64usize >> sy);
+        let w2 = (bx + bw).min(pw) - bx;
+        let h2 = (by + bh).min(ph) - by;
+        let mut v = Vec::with_capacity(w2 * h2);
+        for row2 in 0..h2 {
+            v.extend_from_slice(&tile.recon[p][(by + row2) * pw + bx..][..w2]);
+        }
+        out[p] = v;
+    }
+}
+
 /// Encode a single tile as an independent sub-frame. Pure function of its inputs
 /// (no shared mutable state), so it is safe to run on any thread. When `mono`,
 /// only the luma plane is coded (`src[1]`/`src[2]` ignored, chroma recon empty).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)] // halo gate: `p` indexes recon planes AND `done` in lockstep
 fn encode_one_tile(
     base_q_idx: u8,
     bd: u8,
@@ -1194,6 +1573,7 @@ fn encode_one_tile(
     aq: bool,
     vb: &VarianceBoost,
     record: bool,
+    wf_threads: usize,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -1208,68 +1588,179 @@ fn encode_one_tile(
             crop_plane(&src[2], cw8, r.cx0, r.cy0, r.ctw, r.cth),
         ]
     };
-    let mut tile = if mono {
-        LossyTile::new_mono(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm)
+    // One full decide+emit pass over the tile in the given decision mode.
+    // `Capture` fills a fresh record; `Replay` consumes `rec_in` (skipping the
+    // partition searches). Returns the coded tile plus the record so the
+    // decouple check below can chain Capture -> Replay.
+    let run = |sb_mode: SbMode,
+               rec_in: DecisionRecord,
+               stream_rx: Option<&std::sync::mpsc::Receiver<(usize, DecisionRecord)>>|
+     -> (TileOut, DecisionRecord) {
+        let mut tile = if mono {
+            LossyTile::new_mono(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm)
+        } else {
+            match (sub_x, sub_y) {
+                (0, 0) => LossyTile::new(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
+                (1, 0) => LossyTile::new_422(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
+                _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
+            }
+        }
+        .with_speed(speed);
+        tile.sb_mode = sb_mode;
+        tile.rec = rec_in;
+        // Loop restoration is frame-relative: record this tile's frame-absolute luma
+        // origin and the full frame luma size so `read_lr` is computed in frame
+        // coordinates regardless of tiling.
+        tile.frame_x0 = r.x0;
+        tile.frame_y0 = r.y0;
+        tile.frame_w = full_w;
+        tile.frame_h = full_h;
+        if aq {
+            // Center the per-SB deltas on this tile's mean activity so the average
+            // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
+            let ref_act = tile_ref_activity(&tile.src[0], tile.w, tile.w, tile.h);
+            tile.enable_aq(base_q_idx, ref_act, vb);
+        }
+        if record {
+            tile.enc.begin_trace();
+        }
+        // The whole per-SB AQ qindex sequence is a pure function of the source, so
+        // it is precomputed up front (bit-exact vs the serial accumulator — see
+        // `aq_grid_matches_serial`). This is what lets the wavefront decide SBs out
+        // of raster order later: each SB reads its cell instead of advancing shared
+        // state. Empty when AQ is off.
+        let aq_grid = tile.precompute_aq_grid();
+        let sb_count = r.tw.div_ceil(64) * r.th.div_ceil(64);
+        let mut pending: Vec<Option<DecisionRecord>> = vec![None; sb_count];
+        let mut streamed_rec = DecisionRecord::default();
+        let mut sb_i = 0usize;
+        for sb_y in (0..r.th).step_by(64) {
+            for sb_x in (0..r.tw).step_by(64) {
+                if let Some(rx) = stream_rx {
+                    while pending[sb_i].is_none() {
+                        let (i, rec) = rx.recv().expect("wavefront capture stopped early");
+                        assert!(i < pending.len(), "wavefront cell index out of range");
+                        assert!(pending[i].is_none(), "duplicate wavefront cell");
+                        pending[i] = Some(rec);
+                    }
+                    tile.rec = pending[sb_i].take().unwrap();
+                    tile.cur = RecordCursor::default();
+                }
+                // Pure-emit replay: install this SB's captured recon blocks
+                // up front. Converted leaves skip prediction/recon entirely;
+                // unconverted (DC) leaves read correct neighbours and rewrite
+                // identical pixels.
+                if sb_mode == SbMode::Replay {
+                    let idx = if stream_rx.is_some() { 0 } else { sb_i };
+                    if idx < tile.rec.recon.len() {
+                        let blocks = std::mem::take(&mut tile.rec.recon[idx]);
+                        blocks_geom_apply(&mut tile, sb_x, sb_y, &blocks);
+                        tile.rec.recon[idx] = blocks;
+                    }
+                }
+                // The mark sits exactly where a replay would interleave the LR
+                // symbols owed by this superblock (`emit_lr_sb` is a no-op here).
+                tile.enc.trace_mark();
+                tile.cdef_point_marked = false;
+                tile.emit_lr_sb(sb_x, sb_y);
+                if !aq_grid.is_empty() {
+                    tile.aq_begin_sb_cell(&aq_grid[sb_i]);
+                }
+                tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+                if sb_mode == SbMode::Capture {
+                    let mut cell_recon: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                    blocks_geom_extract(&tile, sb_x, sb_y, &mut cell_recon);
+                    tile.rec.recon.push(cell_recon);
+                }
+                if stream_rx.is_some() {
+                    debug_assert_eq!(tile.cur.parts, tile.rec.parts.len());
+                    debug_assert_eq!(tile.cur.luma, tile.rec.luma.len());
+                    debug_assert_eq!(tile.cur.uv, tile.rec.uv.len());
+                    let cell = std::mem::take(&mut tile.rec);
+                    streamed_rec.parts.extend(cell.parts);
+                    streamed_rec.luma.extend(cell.luma);
+                    streamed_rec.uv.extend(cell.uv);
+                }
+                sb_i += 1;
+            }
+        }
+        // NOTE: the in-loop deblocking filter is deliberately NOT applied here.
+        // In AV1 the deblocking filter is a frame-level post-filter that operates
+        // ACROSS tile boundaries (only entropy coding and prediction are
+        // tile-independent). Applying it per tile leaves the inter-tile edges
+        // unfiltered, diverging from the decoder at every tile boundary. The filter
+        // is instead applied once on the stitched frame in `encode_lossy_tilegroup`.
+        // Intra prediction already used the unfiltered recon during `decode_sb`, so
+        // deferring the filter does not change any coding decision.
+        let skip8 = std::mem::take(&mut tile.skip8);
+        let blk4 = std::mem::take(&mut tile.blk4);
+        let blk4h = std::mem::take(&mut tile.blk4h);
+        let blk4v = std::mem::take(&mut tile.blk4v);
+        let blk4t = std::mem::take(&mut tile.blk4t);
+        let trace = tile.enc.take_trace();
+        let payload = tile.enc.done();
+        let rec = if stream_rx.is_some() {
+            streamed_rec
+        } else {
+            std::mem::take(&mut tile.rec)
+        };
+        (
+            TileOut {
+                payload,
+                trace,
+                recon: std::mem::take(&mut tile.recon),
+                skip8,
+                blk4,
+                blk4h,
+                blk4v,
+                blk4t,
+            },
+            rec,
+        )
+    };
+    let (out, _) = if wf_threads > 1 {
+        // Pipeline the serial adaptive-CDF replay behind parallel capture.
+        // One worker owns replay while the remaining budget decides later SBs;
+        // records may arrive out of order but are consumed in raster order.
+        let ((out, rec), _capture_elapsed, _replay_elapsed) = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // The replay lane is PURE EMIT (captured coeffs + recon blocks)
+            // and spends its life recv()-blocked on capture — so capture gets
+            // the FULL budget; the +1 oversubscription is absorbed by the
+            // replay thread's blocking waits.
+            let capture_threads = wf_threads;
+            let tsrc_ref = &tsrc;
+            let capture = scope.spawn(move || {
+                let start = std::time::Instant::now();
+                wavefront_capture(
+                    capture_threads,
+                    base_q_idx,
+                    bd,
+                    full_w,
+                    full_h,
+                    sub_x,
+                    sub_y,
+                    mono,
+                    tsrc_ref,
+                    r,
+                    speed,
+                    aq,
+                    vb,
+                    tx,
+                );
+                start.elapsed()
+            });
+            let replay_start = std::time::Instant::now();
+            let replay = run(SbMode::Replay, DecisionRecord::default(), Some(&rx));
+            let replay_elapsed = replay_start.elapsed();
+            let capture_elapsed = capture.join().expect("wavefront capture panicked");
+            (replay, capture_elapsed, replay_elapsed)
+        });
+        (out, rec)
     } else {
-        match (sub_x, sub_y) {
-            (0, 0) => LossyTile::new(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
-            (1, 0) => LossyTile::new_422(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
-            _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
-        }
-    }
-    .with_speed(speed);
-    // Loop restoration is frame-relative: record this tile's frame-absolute luma
-    // origin and the full frame luma size so `read_lr` is computed in frame
-    // coordinates regardless of tiling.
-    tile.frame_x0 = r.x0;
-    tile.frame_y0 = r.y0;
-    tile.frame_w = full_w;
-    tile.frame_h = full_h;
-    if aq {
-        // Center the per-SB deltas on this tile's mean activity so the average
-        // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
-        let ref_act = tile_ref_activity(&tile.src[0], tile.w, tile.w, tile.h);
-        tile.enable_aq(base_q_idx, ref_act, vb);
-    }
-    if record {
-        tile.enc.begin_trace();
-    }
-    for sb_y in (0..r.th).step_by(64) {
-        for sb_x in (0..r.tw).step_by(64) {
-            // The mark sits exactly where a replay would interleave the LR
-            // symbols owed by this superblock (`emit_lr_sb` is a no-op here).
-            tile.enc.trace_mark();
-            tile.cdef_point_marked = false;
-            tile.emit_lr_sb(sb_x, sb_y);
-            tile.aq_begin_sb(sb_x, sb_y);
-            tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-        }
-    }
-    // NOTE: the in-loop deblocking filter is deliberately NOT applied here.
-    // In AV1 the deblocking filter is a frame-level post-filter that operates
-    // ACROSS tile boundaries (only entropy coding and prediction are
-    // tile-independent). Applying it per tile leaves the inter-tile edges
-    // unfiltered, diverging from the decoder at every tile boundary. The filter
-    // is instead applied once on the stitched frame in `encode_lossy_tilegroup`.
-    // Intra prediction already used the unfiltered recon during `decode_sb`, so
-    // deferring the filter does not change any coding decision.
-    let skip8 = tile.skip8;
-    let blk4 = tile.blk4;
-    let blk4h = tile.blk4h;
-    let blk4v = tile.blk4v;
-    let blk4t = tile.blk4t;
-    let trace = tile.enc.take_trace();
-    let payload = tile.enc.done();
-    TileOut {
-        payload,
-        trace,
-        recon: tile.recon,
-        skip8,
-        blk4,
-        blk4h,
-        blk4v,
-        blk4t,
-    }
+        run(SbMode::Off, DecisionRecord::default(), None)
+    };
+    out
 }
 
 /// Per-64x64-unit CDEF replay context: the frame-level on/off grid plus its
@@ -1351,6 +1842,21 @@ pub(crate) fn resolve_threads(threads: usize) -> usize {
     }
 }
 
+/// Whether a single-tile AV1 wavefront is mathematically too narrow to feed
+/// the requested worker count. Replay owns one lane; capture is bounded by
+/// both total work and the left/above/above-right dependency chain.
+fn wavefront_should_use_tiles(sb_cols: usize, sb_rows: usize, threads: usize) -> bool {
+    if threads <= 1 || sb_cols == 0 || sb_rows == 0 {
+        return false;
+    }
+    let cells = sb_cols * sb_rows;
+    let wave_work_floor = cells.div_ceil(threads - 1);
+    let wave_dependency_floor = sb_cols + 2 * sb_rows.saturating_sub(1);
+    let wave_floor = wave_work_floor.max(wave_dependency_floor);
+    let tile_floor = cells.div_ceil(threads);
+    wave_floor * 100 > tile_floor * 135
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossy_tilegroup(
     base_q_idx: u8,
@@ -1382,7 +1888,16 @@ pub(crate) fn encode_lossy_tilegroup(
     // `threads == 1` -> target 1 -> spec-minimum tiling (single tile for small
     // frames, byte-identical to the untiled output).
     let want = pool.width();
-    let plan = plan_tiling(sb_cols, sb_rows, want);
+    // Prefer minimal tiling + SB wavefront when the dependency graph can feed
+    // the requested worker count.  Otherwise use ordinary parallel tiles: a
+    // narrow WPP graph cannot manufacture parallelism, and forcing it was up
+    // to 2-3x slower on small/medium images.
+    // Leave a 35% margin in favour of WPP's compression advantage.  Fall back
+    // only when its mathematical lower bound is already clearly worse.
+    let multitile =
+        want > 1 && wavefront_should_use_tiles(sb_cols as usize, sb_rows as usize, want);
+    let tile_target = if multitile { want } else { 1 };
+    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -1414,15 +1929,45 @@ pub(crate) fn encode_lossy_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
 
+    // SB-wavefront: parallelize WITHIN each tile — parallel decision capture
+    // (d = 2r+c wavefront) + serial replay emit, byte-identical per tile.
+    // Tiles are then encoded SEQUENTIALLY with the full thread budget inside
+    // each (wavefront capture spawns its own scoped workers; nesting it under
+    // the tile pool would oversubscribe — same no-nesting rule as the AV2
+    // wavefront). Wide frames get mandatory column tiles (MAX_TILE_WIDTH), so
+    // per-tile is the only shape that covers them.
+    let wf_threads = if want > 1 && !multitile { want } else { 0 };
+
     // Recording the symbol trace lets a winning Wiener unit or a per-unit CDEF
     // grid be signaled by a cheap replay instead of a second full encode of
     // every tile.
     let record = (wiener_on || cdef_on) && base_q_idx != 0;
-    let mut outs: Vec<TileOut> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_tile(
-            base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb, record,
-        )
-    });
+    let mut outs: Vec<TileOut> = if wf_threads > 1 && n < want {
+        // Split the budget: `outer` tiles in flight × `inner`-wide wavefront
+        // inside each (outer*inner == want, no oversubscription — the inner
+        // scoped workers replace their outer worker's idle time during the
+        // serial replay of other tiles). Single-tile frames get the full
+        // budget inside the one tile.
+        // Capture/replay pipelining needs at least three lanes per tile: one
+        // replay lane and two decision lanes.  If there are already at least
+        // as many geometry-stable tiles as workers, the branch below simply
+        // runs those tiles directly without an unnecessary inner wavefront.
+        let outer = n.min((wf_threads / 3).max(1));
+        let inner = (wf_threads / outer).max(2);
+        pool.map_indexed(outer, n, |i| {
+            encode_one_tile(
+                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
+                record, inner,
+            )
+        })
+    } else {
+        pool.map_indexed(nthreads, n, |i| {
+            encode_one_tile(
+                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
+                record, 0,
+            )
+        })
+    };
 
     let mut payloads: Vec<Vec<u8>> = outs
         .iter_mut()
@@ -1576,23 +2121,6 @@ pub(crate) fn encode_lossy_tilegroup(
         });
     }
     let lr = lr_unit.map(|_| crate::obu::LrParams { luma_wiener: true });
-
-    // Conformance oracle: dump the final (deblock+CDEF) reconstruction so an
-    // external decode (avifdec --raw y4m) can be byte-compared against it.
-    // Planes are raw little-endian u16 at padded dims, Y then U then V.
-    // Only meaningful with Wiener off (LR is not applied to this recon).
-    if let Ok(path) = std::env::var("MT_AV1_DUMP_RECON") {
-        let mut buf: Vec<u8> = Vec::new();
-        for (pl, plane) in recon.iter().enumerate() {
-            if mono && pl > 0 {
-                break;
-            }
-            for &v in plane {
-                buf.extend_from_slice(&(v as u16).to_le_bytes());
-            }
-        }
-        let _ = std::fs::write(path, buf);
-    }
 
     let tilegroup = assemble_tilegroup(payloads);
     (tilegroup, plan, cdef_decision.map(|d| d.params), lr)
@@ -1776,19 +2304,13 @@ fn frame_cdef(
         return None;
     }
 
-    // Decision knobs, env-overridable while the RD recipe is being tuned:
-    //   MT_CDEF_GATE   directional-variance gate threshold (0 disables)
-    //   MT_CDEF_METRIC "sse" for plain SSE, default perceptual cdef_dist
-    //   MT_CDEF_MARGIN per-mille distortion margin a unit must clear to filter
-    let env_i64 = |k: &str, d: i64| -> i64 {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
-    let gate_thresh = env_i64("MT_CDEF_GATE", UNIT_DIR_VAR_THRESH_DEFAULT);
-    let perceptual = std::env::var("MT_CDEF_METRIC").map_or(true, |v| v != "sse");
-    let margin = env_i64("MT_CDEF_MARGIN", MARGIN_DEFAULT);
+    // Decision knobs:
+    //   gate_thresh  directional-variance gate threshold (0 disables)
+    //   perceptual   plain SSE vs perceptual cdef_dist
+    //   margin       per-mille distortion margin a unit must clear to filter
+    let gate_thresh = UNIT_DIR_VAR_THRESH_DEFAULT;
+    let perceptual = true;
+    let margin = MARGIN_DEFAULT;
 
     // Directional-variance gate for the GLOBAL (filter-everything) option only:
     // that mode has no per-unit off-switch, so it is offered solely when most
@@ -2102,7 +2624,7 @@ fn frame_cdef(
     let per_entry_bits = if mono { 6.0f32 } else { 12.0f32 };
     let mut best_bits: Option<u8> = None;
     let mut best_cost = cost_off;
-    let max_bits = env_i64("MT_CDEF_MAX_BITS", 3).clamp(0, 3) as u8;
+    let max_bits = 3u8;
     for b in 0..=max_bits {
         let nb = 1usize << b;
         let total = if b == 0 {
@@ -2133,41 +2655,6 @@ fn frame_cdef(
         }
     }
 
-    if std::env::var_os("MT_AV1_CDEF_DEBUG").is_some() {
-        let named: Vec<String> = entries
-            .iter()
-            .map(|&p| format!("y{:?}c{:?}", cands[p / nc], c_cands[p % nc]))
-            .collect();
-        eprintln!(
-            "CDEF q={base_q_idx} bits={best_bits:?} n_sig={n_sig}/{n_units} off={cost_off:.0} \
-             prefix={prefix_tot:?} lambda={lambda:.2} entries=[{}]",
-            named.join(" ")
-        );
-    }
-    // Debug oracle: dump the pre-CDEF (deblocked) luma plane + per-8x8 dirs/vars
-    // so an external harness can simulate filter variants against a decode.
-    if let Ok(path) = std::env::var("MT_AV1_DUMP_PRECDEF") {
-        let mut buf: Vec<u8> = Vec::new();
-        for &v in &recon[0] {
-            buf.extend_from_slice(&(v as u16).to_le_bytes());
-        }
-        for i in 0..nbx * nby {
-            buf.extend_from_slice(&(ldirs[i] as u16).to_le_bytes());
-            buf.extend_from_slice(&(lvars[i] as u32).to_le_bytes());
-        }
-        for &sk in lskip.iter().take(nbx * nby) {
-            buf.push(sk as u8);
-        }
-        let _ = std::fs::write(path, buf);
-    }
-
-    // Test hook: force a specific cdef_bits to exercise wider index literals.
-    if let Ok(v) = std::env::var("MT_CDEF_FORCE_BITS")
-        && let Ok(b) = v.parse::<u8>()
-        && b <= 3
-    {
-        best_bits = Some(b);
-    }
     let bits = best_bits?;
     let nb = 1usize << bits;
     let global_set = [global_entry];
@@ -2784,7 +3271,11 @@ fn encode_lossless_tilegroup(
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let want = pool.width();
-    let plan = plan_tiling(sb_cols, sb_rows, want);
+    // Thread-count-invariant: minimal tiling (lossless has no wavefront, so
+    // minimal tiling trades tile parallelism for smaller, thread-invariant
+    // output; lossless coding is search-free, so the serial cost is modest).
+    let tile_target = 1;
+    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -2857,7 +3348,11 @@ fn encode_lossless_mono_tilegroup(
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let want = pool.width();
-    let plan = plan_tiling(sb_cols, sb_rows, want);
+    // Thread-count-invariant: minimal tiling (lossless has no wavefront, so
+    // minimal tiling trades tile parallelism for smaller, thread-invariant
+    // output; lossless coding is search-free, so the serial cost is modest).
+    let tile_target = 1;
+    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -2950,6 +3445,78 @@ mod aq_tests {
         assert!(filter_intra_sse_allowed(99, 100));
         assert!(filter_intra_sse_allowed(100, 100));
         assert!(!filter_intra_sse_allowed(101, 100));
+    }
+
+    #[test]
+    fn wavefront_falls_back_only_when_the_sb_graph_is_too_narrow() {
+        assert!(wavefront_should_use_tiles(24, 14, 12));
+        assert!(!wavefront_should_use_tiles(26, 17, 8));
+        assert!(!wavefront_should_use_tiles(110, 73, 12));
+        assert!(!wavefront_should_use_tiles(24, 14, 1));
+    }
+
+    /// `precompute_aq_grid` must reproduce the serial `aq_begin_sb` accumulator
+    /// walk bit-exactly — every cell's qindex, signaled steps, and the resulting
+    /// quantizer state — on a padded (non-64-aligned) frame with mixed
+    /// dark/flat/textured content, with and without Variance Boost, so the
+    /// wavefront can consume cells out of raster order.
+    #[test]
+    fn aq_grid_matches_serial() {
+        // 200x136 luma: 4x3 SB grid with 8px right / bottom partial SBs.
+        let (w, h) = (200usize, 136usize);
+        let mut y = vec![0i32; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                // dark gradient + texture patches + flat bands
+                let base = ((r * 255) / h) as i32 / 3;
+                let tex = if (r / 32 + c / 32) % 3 == 0 {
+                    (((r * 7 + c * 13) % 53) as i32) - 26
+                } else {
+                    0
+                };
+                y[r * w + c] = (base + tex).clamp(0, 255);
+            }
+        }
+        let src = [y, vec![128; w * h], vec![128; w * h]];
+        for vb_enabled in [false, true] {
+            for base_q in [60u8, 140, 220] {
+                let mk = || {
+                    let mut t = LossyTile::new(base_q, 8, w, h, &src, QmLevels::FLAT);
+                    let ref_act = tile_ref_activity(&t.src[0], t.w, t.w, t.h);
+                    let vb = VarianceBoost {
+                        enabled: vb_enabled,
+                        octile: 6,
+                        strength: 1.0,
+                        boost_only: false,
+                        dark: DarkAq::on(),
+                        qm: QmLevels::FLAT,
+                    };
+                    t.enable_aq(base_q, ref_act, &vb);
+                    t
+                };
+                let mut serial = mk();
+                let grid_tile = mk();
+                let grid = grid_tile.precompute_aq_grid();
+                let (rows, cols) = (h.div_ceil(64), w.div_ceil(64));
+                assert_eq!(grid.len(), rows * cols);
+                let mut i = 0;
+                for sb_y in (0..h).step_by(64) {
+                    for sb_x in (0..w).step_by(64) {
+                        serial.aq_begin_sb(sb_x, sb_y);
+                        let cell = grid[i];
+                        assert_eq!(
+                            cell.newq as i32, serial.aq.cur_qidx,
+                            "qidx sb {i} vb {vb_enabled} q {base_q}"
+                        );
+                        assert_eq!(
+                            cell.steps, serial.aq.pending,
+                            "steps sb {i} vb {vb_enabled} q {base_q}"
+                        );
+                        i += 1;
+                    }
+                }
+            }
+        }
     }
 
     /// Dark protection over a full 64×64 SB of the given i32 plane, with the AV1

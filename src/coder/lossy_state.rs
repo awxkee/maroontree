@@ -28,6 +28,16 @@
  */
 
 impl<'a> LossyTile<'a> {
+    /// CDFs used by DECISION-side rate estimates (RDOQ trellis, filter-intra /
+    /// angle-delta costs): the frozen [`Cdfs::decision_snapshot`], so decisions
+    /// are independent of SB coding order (SB-wavefront prerequisite). The
+    /// `MT_AV1_LIVE_DECIDE_CDF=1` escape hatch restores the historical
+    /// adaptive-cost behavior for A/B comparisons only.
+    #[inline]
+    fn dcdf(&self) -> &Cdfs {
+        if self.dec_live { &self.cdfs } else { &self.dec_cdfs }
+    }
+
     fn new(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<i32>; 3], qm: QmLevels) -> Self {
         LossyTile {
             bd,
@@ -59,6 +69,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -107,6 +122,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -154,6 +174,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -201,6 +226,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -1061,10 +1091,11 @@ impl<'a> LossyTile<'a> {
         );
     }
 
-    fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
-        if !self.aq.enabled {
-            return;
-        }
+    /// The AQ target qindex for the superblock at `(sb_x, sb_y)` — a pure
+    /// function of the SOURCE pixels and frame-level AQ constants (no running
+    /// state), which is what makes the whole per-SB qindex sequence
+    /// precomputable by [`precompute_aq_grid`] before any coding starts.
+    fn aq_sb_target(&self, sb_x: usize, sb_y: usize) -> i32 {
         let base_q = self.aq.base_q as i32;
         // Dark-structured-detail protection: an extra qindex reduction for dark SBs
         // carrying real cross-scale structure. Independent of the Variance Boost, it
@@ -1083,7 +1114,7 @@ impl<'a> LossyTile<'a> {
             self.h,
             dark_scale,
         );
-        let target = if self.aq.vb_enabled {
+        if self.aq.vb_enabled {
             // Variance Boost: pick the representative 8x8 variance at the configured
             // octile and map it to a qindex delta off the frame base. ref_act (the
             // tile mean whole-SB log-variance) anchors the coarse side, matching
@@ -1132,7 +1163,20 @@ impl<'a> LossyTile<'a> {
                 vb_delta
             };
             (base_q + delta).clamp(1, 255)
-        };
+        }
+    }
+
+    /// Serial reference for the per-SB AQ state advance: compute the target,
+    /// quantize it against the running `cur_qidx` accumulator, and retarget the
+    /// quantizers. Kept as the bit-exactness oracle for [`precompute_aq_grid`]
+    /// (see the `aq_grid_matches_serial` unit test); the SB loop itself
+    /// consumes precomputed [`AqCell`]s via [`aq_begin_sb_cell`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
+        if !self.aq.enabled {
+            return;
+        }
+        let target = self.aq_sb_target(sb_x, sb_y);
         let step = 1i32 << self.aq.res_log2;
         let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
             .fast_round()
@@ -1140,8 +1184,52 @@ impl<'a> LossyTile<'a> {
         // The decoder applies Clip3(1,255, cur + steps*step); mirror it exactly so
         // both sides agree on the new qindex even when the clamp bites.
         let newq = (self.aq.cur_qidx + steps * step).clamp(1, 255);
+        self.aq_begin_sb_cell(&AqCell {
+            newq: newq as u8,
+            steps,
+        });
+    }
+
+    /// Precompute the whole tile's per-SB AQ sequence: a cheap serial raster
+    /// pass mirroring `aq_begin_sb`'s accumulator bit-exactly (the ONLY running
+    /// state is `cur_qidx`). The wavefront decides SBs out of raster order, so
+    /// it reads `grid[row * sb_cols + col]` instead of advancing the
+    /// accumulator; the serial emit uses `.steps` for the `read_delta_qindex`
+    /// token. Empty when AQ is off.
+    fn precompute_aq_grid(&self) -> Vec<AqCell> {
+        if !self.aq.enabled {
+            return Vec::new();
+        }
+        let rows = self.h.div_ceil(64);
+        let cols = self.w.div_ceil(64);
+        let mut grid = Vec::with_capacity(rows * cols);
+        let step = 1i32 << self.aq.res_log2;
+        let mut cur = self.aq.cur_qidx;
+        for r in 0..rows {
+            for c in 0..cols {
+                let target = self.aq_sb_target(c * 64, r * 64);
+                let steps = (((target - cur) as f32) / step as f32)
+                    .fast_round()
+                    .clamp(-(AQ_MAX_STEPS as f32), AQ_MAX_STEPS as f32)
+                    as i32;
+                let newq = (cur + steps * step).clamp(1, 255);
+                cur = newq;
+                grid.push(AqCell {
+                    newq: newq as u8,
+                    steps,
+                });
+            }
+        }
+        grid
+    }
+
+    /// Apply one precomputed [`AqCell`] at the start of a superblock: advance
+    /// the accumulator to the cell's qindex, arm the delta-q token, and
+    /// retarget the quantizers.
+    fn aq_begin_sb_cell(&mut self, cell: &AqCell) {
+        let newq = cell.newq as i32;
         self.aq.cur_qidx = newq;
-        self.aq.pending = steps;
+        self.aq.pending = cell.steps;
         self.aq.read_deltas = true;
         self.quant = Quant::new_with_qm(newq as u8, self.bd, self.quant.qm_level());
         // The chroma-DC delta is a frame-level constant (DeltaQUDc, derived from

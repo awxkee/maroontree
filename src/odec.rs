@@ -171,6 +171,12 @@ pub(crate) struct OdEcEncoder {
     cnt: i16,
     precarry: Vec<u16>,
     trace: Option<Box<SymbolTrace>>,
+    /// Discard mode for wavefront capture workers: `store` becomes a no-op
+    /// (no range coding, no output growth). Decisions never read encoder
+    /// state, so a sink capture records the identical `DecisionRecord` while
+    /// skipping all entropy-coding work. Bytes from a sink encoder are
+    /// meaningless — never call `done()` expecting output.
+    pub(crate) sink: bool,
 }
 
 impl Default for OdEcEncoder {
@@ -187,6 +193,7 @@ impl OdEcEncoder {
             cnt: -9,
             precarry: Vec::new(),
             trace: None,
+            sink: false,
         }
     }
 
@@ -240,6 +247,9 @@ impl OdEcEncoder {
 
     #[inline]
     fn store(&mut self, fl: u32, fh: u32, nms: u32) {
+        if self.sink {
+            return;
+        }
         if let Some(t) = self.trace.as_mut() {
             t.push(fl, fh, nms);
         }

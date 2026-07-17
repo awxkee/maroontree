@@ -359,9 +359,20 @@ impl<'a> LossyTile<'a> {
         } else {
             nd_modes()
         };
-        let directional_top =
-            self.rank_luma_directionals::<1024>(modes, px, py, 32, 32, have_tr, have_bl);
+        // Pure-emit replay: the recorded winner + its captured coefficients
+        // replace every sub-search below — no candidate is evaluated at all
+        // (see code_block in block8.rs for the pattern).
+        let rl = self.luma_sel_replay();
+        let rl_cf = self.luma_cf_replay();
+        let directional_top = if rl.is_none() {
+            self.rank_luma_directionals::<1024>(modes, px, py, 32, 32, have_tr, have_bl)
+        } else {
+            DirectionalTopK::new()
+        };
         for &m in modes {
+            if rl.is_some() {
+                break;
+            }
             if is_directional_mode(m) && !directional_top.contains(m) {
                 continue;
             }
@@ -410,31 +421,17 @@ impl<'a> LossyTile<'a> {
                     &SCAN_32X32,
                     lam,
                     32,
-                    &self.cdfs,
+                    self.dcdf(),
                     3,
                     0,
-                    &self.cdfs.eob_bin_1024_l,
+                    &self.dcdf().eob_bin_1024_l,
                     self.dc_sign_ctx_32(0, px / 4, py / 4),
                 );
             }
             let rr = idct_dequant_32x32(&cf, &self.quant);
-            let mut sse = 0i64;
-            for (ry, (prow, rrow)) in pred
-                .as_chunks::<32>()
-                .0
-                .iter()
-                .zip(rr.as_chunks::<32>().0.iter())
-                .enumerate()
-            {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                for ((&p, &rv), &s) in prow.iter().zip(rrow.iter()).zip(srow.iter()) {
-                    let r = (p + rv).clamp(0, (1 << self.bd) - 1);
-                    let d = s - r;
-                    sse += (d * d) as i64;
-                }
-            }
+            let sse = sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
             let filter_bits = if m == DC_PRED {
-                cdf_cost(&self.cdfs.filter_intra[av1_block_size_index(32, 32)], 0)
+                cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(32, 32)], 0)
             } else {
                 0.0
             };
@@ -451,7 +448,7 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra = None;
             }
         }
-        if self.speed == Speed::Slow {
+        if rl.is_none() && self.speed == Speed::Slow {
             let bsize = av1_block_size_index(32, 32);
             for filter_mode in FILTER_INTRA_MODES {
                 let mut pred = [0i32; 1024];
@@ -486,10 +483,10 @@ impl<'a> LossyTile<'a> {
                     &SCAN_32X32,
                     lam,
                     32,
-                    &self.cdfs,
+                    self.dcdf(),
                     3,
                     0,
-                    &self.cdfs.eob_bin_1024_l,
+                    &self.dcdf().eob_bin_1024_l,
                     self.dc_sign_ctx_32(0, px / 4, py / 4),
                 );
                 let rr = idct_dequant_32x32(&cf, &self.quant);
@@ -504,10 +501,11 @@ impl<'a> LossyTile<'a> {
                 );
                 let bits = block_rate_bits(&cf, &SCAN_32X32);
                 let syntax_bits = mode_signal_bits(DC_PRED)
-                    + cdf_cost(&self.cdfs.filter_intra[bsize], 1)
-                    + cdf_cost(&self.cdfs.filter_intra_mode, filter_mode as usize);
+                    + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
+                    + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
-                if filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff {
+                if rl.is_some() || (filter_intra_sse_allowed(sse, best_dct_sse) && cost < best_eff)
+                {
                     best_eff = cost;
                     best_mode = DC_PRED;
                     lpred = pred;
@@ -520,25 +518,26 @@ impl<'a> LossyTile<'a> {
         }
         // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
         let mut best_delta: i32 = 0;
-        if angle_delta_enabled()
+        if rl.is_none()
+            && angle_delta_enabled()
             && self.speed.try_angle_deltas()
             && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
             && best_mode != V_PRED
             && best_mode != H_PRED
         {
             let mut ad_cdf = [0u16; 7];
-            ad_cdf.copy_from_slice(&self.cdfs.angle_delta[best_mode - V_PRED]);
+            ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
             let ds = self.dc_sign_ctx_32(0, px / 4, py / 4);
             let wrr = idct_dequant_32x32(&lcf, &self.quant);
-            let mut wsse = 0i64;
-            for ry in 0..32 {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                for rx in 0..32 {
-                    let r = (lpred[ry * 32 + rx] + wrr[ry * 32 + rx]).clamp(0, (1 << self.bd) - 1);
-                    let dd = srow[rx] - r;
-                    wsse += (dd * dd) as i64;
-                }
-            }
+            let wsse = sse_recon::<1024, 32>(
+                &lpred,
+                &wrr,
+                &self.src[0],
+                self.w,
+                px,
+                py,
+                self.bd,
+            );
             let wbits = block_rate_bits(&lcf, &SCAN_32X32);
             let mut best_ad_cost = rd_cost_i64(wsse, mlam, wbits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
@@ -577,27 +576,26 @@ impl<'a> LossyTile<'a> {
                         &SCAN_32X32,
                         lam,
                         32,
-                        &self.cdfs,
+                        self.dcdf(),
                         3,
                         0,
-                        &self.cdfs.eob_bin_1024_l,
+                        &self.dcdf().eob_bin_1024_l,
                         ds,
                     );
                 }
                 let rr = idct_dequant_32x32(&cf, &self.quant);
-                let mut sse = 0i64;
-                for ry in 0..32 {
-                    let srow = &self.src[0][(py + ry) * self.w + px..];
-                    for rx in 0..32 {
-                        let r =
-                            (pred[ry * 32 + rx] + rr[ry * 32 + rx]).clamp(0, (1 << self.bd) - 1);
-                        let dd = srow[rx] - r;
-                        sse += (dd * dd) as i64;
-                    }
-                }
+                let sse = sse_recon::<1024, 32>(
+                    &pred,
+                    &rr,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    self.bd,
+                );
                 let bits = block_rate_bits(&cf, &SCAN_32X32);
                 let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
-                if cost < best_ad_cost {
+                if rl.is_some() || cost < best_ad_cost {
                     best_ad_cost = cost;
                     best_delta = d;
                     lpred = pred;
@@ -607,7 +605,7 @@ impl<'a> LossyTile<'a> {
             }
         }
         // Fast path: winner-only RDOQ (libaom winner-mode coeff opt).
-        if !self.speed.per_candidate_rdoq() {
+        if rl.is_none() && !self.speed.per_candidate_rdoq() {
             trellis_optimize_ctx(
                 &mut lcf,
                 &ltf,
@@ -616,13 +614,34 @@ impl<'a> LossyTile<'a> {
                 &SCAN_32X32,
                 lam,
                 32,
-                &self.cdfs,
+                self.dcdf(),
                 3,
                 0,
-                &self.cdfs.eob_bin_1024_l,
+                &self.dcdf().eob_bin_1024_l,
                 self.dc_sign_ctx_32(0, px / 4, py / 4),
             );
         }
+        // Pure-emit replay: install the recorded winner and its captured
+        // post-trellis coefficients (every luma sub-search above was skipped).
+        if let Some(r) = rl {
+            best_mode = r.mode as usize;
+            best_delta = r.delta as i32;
+            best_filter_intra = FILTER_INTRA_MODES
+                .iter()
+                .copied()
+                .find(|&f| f as u8 == r.filter);
+        }
+        if let Some(cf) = rl_cf {
+            lcf.copy_from_slice(&cf);
+        }
+        self.push_luma_sel(LumaSel {
+            mode: best_mode as u8,
+            delta: best_delta as i8,
+            filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
+            // TX_32X32 luma is always DCT_DCT; no tx sub-search at this size.
+            tx: TxSel::from_flags(false, false, false, false),
+        });
+        self.push_luma_cf(&lcf);
         let luma_zero = lcf.iter().all(|&c| c == 0);
         if self.ss420 {
             self.code_block32_420(
@@ -688,6 +707,11 @@ impl<'a> LossyTile<'a> {
         };
         self.a_coef[0][bx4..bx4 + 8].fill(lres);
         self.l_coef[0][by4..by4 + 8].fill(lres);
+        // Pure-emit replay: recon is preinstalled from the record; the write
+        // below would need the prediction the caller no longer computes.
+        if self.sb_mode == SbMode::Replay {
+            return;
+        }
         let lrr = if block_skip {
             [0i32; 1024]
         } else {
@@ -1112,10 +1136,15 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f32,
             trellis_lambda(),
         );
-        // plain-DC chroma
+        // Chroma winner (popped here, pushed before the emit below; exactly one
+        // per code_block32 call — this helper is its only chroma path).
+        let ru = self.uv_sel_replay();
+        let ru_cf = self.uv_cf_replay();
+        // plain-DC chroma (skipped in pure-emit replay: the captured winner
+        // coeffs install below and the recon is preinstalled).
         let mut ccf = [[0i32; 1024]; 2];
         let mut cdc = [0i32; 2];
-        for ci in 0..2 {
+        for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
             let plane = ci + 1;
             let dc = dc_pred_32x32(&self.recon[plane], self.w, px, py, self.bd as i32);
             cdc[ci] = dc;
@@ -1140,7 +1169,9 @@ impl<'a> LossyTile<'a> {
         let mut cfl_a = [0i32; 2];
         let (mut dc_cost, mut cfl_cost) = ([0f32; 2], [0f32; 2]);
         let mlam = self.mlam();
-        {
+        // Pure-emit replay never evaluates CfL; the use_cfl decision below
+        // replays from the record and the winner state installs after this.
+        if ru.is_none() {
             let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
             let mut luma_rec = [0i32; 1024];
             for i in 0..1024 {
@@ -1156,11 +1187,7 @@ impl<'a> LossyTile<'a> {
                     drow.copy_from_slice(&self.src[plane][(py + ry) * self.w + px..][..32]);
                 }
                 let dcrr = idct_dequant_32x32(&ccf[ci], &self.cquant);
-                let mut s = 0i64;
-                for i in 0..1024 {
-                    let d = src[i] - (dc + dcrr[i]).clamp(0, (1 << self.bd) - 1);
-                    s += (d * d) as i64;
-                }
+                let s = sse_recon::<1024, 32>(&[dc; 1024], &dcrr, &src, 32, 0, 0, self.bd);
                 dc_cost[ci] = rd_cost_i64(s, mlam, block_rate_bits(&ccf[ci], &SCAN_32X32));
                 let a = cfl_best_alpha(&ac, &src, dc, 1024, self.bd);
                 cfl_a[ci] = a;
@@ -1173,14 +1200,27 @@ impl<'a> LossyTile<'a> {
                 let (mut q, qt) = forward_dct_quant_32x32_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_32X32, lam);
                 let rr = idct_dequant_32x32(&q, &self.cquant);
-                let mut s2 = 0i64;
-                for i in 0..1024 {
-                    let d = src[i] - (cpr[i] + rr[i]).clamp(0, (1 << self.bd) - 1);
-                    s2 += (d * d) as i64;
-                }
+                let s2 = sse_recon::<1024, 32>(&cpr, &rr, &src, 32, 0, 0, self.bd);
                 cfl_ccf[ci] = q;
                 cfl_pred[ci] = cpr;
                 cfl_cost[ci] = rd_cost_i64(s2, mlam, block_rate_bits(&q, &SCAN_32X32));
+            }
+        }
+        // Pure-emit replay: install the captured winner state before the
+        // cf_use/cfl_opt bindings below read it (CfL coeffs+alphas go to
+        // cfl_ccf/cfl_a, DC/directional coeffs to ccf).
+        if let Some(r) = ru
+            && let Some((cf, al)) = ru_cf.as_ref()
+        {
+            if r.uv == CFL_PRED as u8 {
+                cfl_a = *al;
+                for (dst, src) in cfl_ccf.iter_mut().zip(cf.iter()) {
+                    dst.copy_from_slice(src);
+                }
+            } else {
+                for (dst, src) in ccf.iter_mut().zip(cf.iter()) {
+                    dst.copy_from_slice(src);
+                }
             }
         }
         // CfL signaling costs extra (sign + per-plane alpha); only use it when
@@ -1190,9 +1230,12 @@ impl<'a> LossyTile<'a> {
             + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
         // Gate CfL on low quality: at high quality DC prediction is accurate and CfL
         // alpha varying block-to-block creates visible color stripes at boundaries.
-        let use_cfl = acq > 300.0
-            && (cfl_a[0] != 0 || cfl_a[1] != 0)
-            && cfl_cost[0] + cfl_cost[1] + rate_cost(mlam, cfl_sig) < dc_cost[0] + dc_cost[1];
+        let use_cfl = ru.map_or(
+            acq > 300.0
+                && (cfl_a[0] != 0 || cfl_a[1] != 0)
+                && cfl_cost[0] + cfl_cost[1] + rate_cost(mlam, cfl_sig) < dc_cost[0] + dc_cost[1],
+            |r| r.uv == CFL_PRED as u8,
+        );
         #[allow(unused_mut)] // cfl_opt mutated in 'sv block when SMOOTH_V wins
         let (cf_use, pred_dc, mut cfl_opt): (
             &[[i32; 1024]; 2],
@@ -1213,11 +1256,19 @@ impl<'a> LossyTile<'a> {
         let mut cf_use_owned: [[i32; 1024]; 2];
         let mut sv_preds32 = [[0i32; 1024]; 2];
         let (final_cf, chosen_uv_32) = 'sv: {
+            // Pure-emit replay: the captured coefficients were installed above
+            // (into cfl_ccf for CfL, ccf otherwise); no search runs at all.
+            if let Some(r) = ru {
+                if r.uv == DC_PRED as u8 || r.uv == CFL_PRED as u8 {
+                    break 'sv (cf_use, DC_PRED);
+                }
+                cfl_opt = None;
+                break 'sv (cf_use, r.uv as usize);
+            }
             let dcq2 = self.cquant.dc_q() as f32;
             let acq2 = self.cquant.ac_q() as f32;
             let lam2 = trellis_lambda();
             let mlam = self.mlam_c();
-            let maxv = (1 << self.bd) - 1;
             // R-D of the current winner (DC or CfL), residual already in `cf_use`.
             let mut cur_total = 0f32;
             if use_cfl {
@@ -1232,19 +1283,13 @@ impl<'a> LossyTile<'a> {
             for ci in 0..2 {
                 let plane = ci + 1;
                 let rr = idct_dequant_32x32(&cf_use[ci], &self.cquant);
-                let mut sse = 0i64;
-                for (ry, rrow) in rr.as_chunks::<32>().0.iter().enumerate() {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    for (j, (&s, &r)) in srow[..32].iter().zip(rrow.iter()).enumerate() {
-                        let p = if use_cfl {
-                            cfl_pred[ci][ry * 32 + j]
-                        } else {
-                            pred_dc[ci]
-                        };
-                        let d = s - (p + r).clamp(0, maxv);
-                        sse += (d * d) as i64;
-                    }
-                }
+                let cur_pred = if use_cfl {
+                    cfl_pred[ci]
+                } else {
+                    [pred_dc[ci]; 1024]
+                };
+                let sse =
+                    sse_recon::<1024, 32>(&cur_pred, &rr, &self.src[plane], self.w, px, py, self.bd);
                 cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&cf_use[ci], &SCAN_32X32));
             }
 
@@ -1263,18 +1308,25 @@ impl<'a> LossyTile<'a> {
                 D113_PRED,
                 D157_PRED,
             ];
-            let directional_top =
-                self.rank_chroma_directionals::<1024>(candidates, px, py, px, py, 32, 32);
+            let directional_top = if ru.is_none() {
+                self.rank_chroma_directionals::<1024>(candidates, px, py, px, py, 32, 32)
+            } else {
+                DirectionalTopK::new()
+            };
             for &cand in candidates {
+                if ru.is_some_and(|r| cand as u8 != r.uv) {
+                    continue;
+                }
                 // V/H are cheap enough for every tier; Fast skips diagonal angles.
-                if cand != V_PRED
+                if ru.is_none()
+                    && cand != V_PRED
                     && cand != H_PRED
                     && (V_PRED..=VERT_LEFT_PRED).contains(&cand)
                     && !self.speed.chroma_angle_directional()
                 {
                     continue;
                 }
-                if is_directional_mode(cand) && !directional_top.contains(cand) {
+                if ru.is_none() && is_directional_mode(cand) && !directional_top.contains(cand) {
                     continue;
                 }
                 let mut cand_ccf = [[0i32; 1024]; 2];
@@ -1322,18 +1374,18 @@ impl<'a> LossyTile<'a> {
                     }
                     cand_ccf[ci] = q;
                     let rr = idct_dequant_32x32(&q, &self.cquant);
-                    let mut sse = 0i64;
-                    for (ry, rrow) in rr.as_chunks::<32>().0.iter().enumerate() {
-                        let srow = &self.src[plane][(py + ry) * self.w + px..];
-                        let prow = &cand_pred[ci][ry * 32..];
-                        for ((&s, &p), &r) in srow[..32].iter().zip(prow.iter()).zip(rrow.iter()) {
-                            let d = s - (p + r).clamp(0, maxv);
-                            sse += (d * d) as i64;
-                        }
-                    }
+                    let sse = sse_recon::<1024, 32>(
+                        &cand_pred[ci],
+                        &rr,
+                        &self.src[plane],
+                        self.w,
+                        px,
+                        py,
+                        self.bd,
+                    );
                     cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_32X32));
                 }
-                if cand_total < best_total {
+                if ru.is_some() || cand_total < best_total {
                     best_total = cand_total;
                     best_mode = cand;
                     best_ccf = cand_ccf;
@@ -1348,6 +1400,17 @@ impl<'a> LossyTile<'a> {
             }
             (cf_use, DC_PRED)
         };
+        // Capture the final chroma winner (CfL folded in as CFL_PRED).
+        self.push_uv_sel(UvSel {
+            uv: if chosen_uv_32 != DC_PRED {
+                chosen_uv_32 as u8
+            } else if cfl_opt.is_some() {
+                CFL_PRED as u8
+            } else {
+                DC_PRED as u8
+            },
+        });
+        self.push_uv_cf(&final_cf[0], &final_cf[1], cfl_opt.unwrap_or([0, 0]));
         let block_skip =
             luma_zero && final_cf[0].iter().all(|&c| c == 0) && final_cf[1].iter().all(|&c| c == 0);
         self.code_header_luma32(
@@ -1373,6 +1436,9 @@ impl<'a> LossyTile<'a> {
             };
             self.a_coef[plane][bx4..bx4 + 8].fill(cres);
             self.l_coef[plane][by4..by4 + 8].fill(cres);
+            if self.sb_mode == SbMode::Replay {
+                continue; // recon preinstalled
+            }
             let crr = if block_skip {
                 [0i32; 1024]
             } else {
@@ -1423,10 +1489,16 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f32,
             trellis_lambda(),
         );
+        // Chroma winner (popped here, pushed before the emit below; exactly one
+        // per code_block32 call — this helper is its only chroma path).
+        let ru = self.uv_sel_replay();
+        let ru_cf = self.uv_cf_replay();
         let maxval = (1 << self.bd) - 1;
+        // DC path (skipped in pure-emit replay: block_skip below reads the
+        // FINAL coeffs, installed from the record).
         let mut ccf_dc = [[0i32; 256]; 2];
         let mut dc_preds = [0i32; 2];
-        for ci in 0..2 {
+        for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
             let plane = ci + 1;
             let dc = dc_pred_16x16(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             dc_preds[ci] = dc;
@@ -1454,18 +1526,19 @@ impl<'a> LossyTile<'a> {
         let mlam = self.mlam();
         let mut rr_dc = [[0i32; 256]; 2];
         let mut dc_total = 0f32;
-        for ci in 0..2 {
+        for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
             let plane = ci + 1;
             rr_dc[ci] = idct_dequant_16x16(&ccf_dc[ci], &self.cquant);
             let dc = dc_preds[ci];
-            let mut sse = 0i64;
-            for (ry, rrow) in rr_dc[ci].as_chunks::<16>().0.iter().enumerate() {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for (&s, &r) in srow[..16].iter().zip(rrow.iter()) {
-                    let d = s - (dc + r).clamp(0, maxval);
-                    sse += (d * d) as i64;
-                }
-            }
+            let sse = sse_recon::<256, 16>(
+                &[dc; 256],
+                &rr_dc[ci],
+                &self.src[plane],
+                self.cw,
+                cx,
+                cy,
+                self.bd,
+            );
             dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf_dc[ci], &SCAN_16X16));
         }
         // Directional / smooth chroma modes (PAETH/SMOOTH/SMOOTH_V/SMOOTH_H), each
@@ -1486,9 +1559,16 @@ impl<'a> LossyTile<'a> {
             D113_PRED,
             D157_PRED,
         ];
-        let directional_top =
-            self.rank_chroma_directionals::<256>(candidates, px, py, cx, cy, 16, 16);
+        let directional_top = if ru.is_none() {
+            self.rank_chroma_directionals::<256>(candidates, px, py, cx, cy, 16, 16)
+        } else {
+            DirectionalTopK::new()
+        };
         for &cand in candidates {
+            // Pure-emit replay: no candidate runs; the winner installs below.
+            if ru.is_some() {
+                break;
+            }
             // V/H are cheap enough for every tier; Fast skips diagonal angles.
             if cand != V_PRED
                 && cand != H_PRED
@@ -1544,18 +1624,18 @@ impl<'a> LossyTile<'a> {
                 }
                 cand_ccf[ci] = q;
                 cand_rr[ci] = inv_chroma_16x16(tx, &q, &self.cquant);
-                let mut sse = 0i64;
-                for (ry, rrow) in cand_rr[ci].as_chunks::<16>().0.iter().enumerate() {
-                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    let prow = &cand_pred[ci][ry * 16..];
-                    for ((&s, &p), &r) in srow[..16].iter().zip(prow.iter()).zip(rrow.iter()) {
-                        let d = s - (p + r).clamp(0, maxval);
-                        sse += (d * d) as i64;
-                    }
-                }
+                let sse = sse_recon::<256, 16>(
+                    &cand_pred[ci],
+                    &cand_rr[ci],
+                    &self.src[plane],
+                    self.cw,
+                    cx,
+                    cy,
+                    self.bd,
+                );
                 cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X16));
             }
-            if cand_total < best_total {
+            if ru.is_some() || cand_total < best_total {
                 best_total = cand_total;
                 chosen_uv = cand;
                 best_ccf = cand_ccf;
@@ -1563,8 +1643,21 @@ impl<'a> LossyTile<'a> {
                 sv_preds = cand_pred;
             }
         }
+        // Pure-emit replay: install the captured chroma winner (mode + coeffs).
+        if let Some(r) = ru
+            && let Some((cf, _al)) = ru_cf.as_ref()
+        {
+            chosen_uv = r.uv as usize;
+            for (dst, src) in best_ccf.iter_mut().zip(cf.iter()) {
+                dst.copy_from_slice(src);
+            }
+        }
         let use_sv = chosen_uv != DC_PRED;
         let (ccf, rr_cache) = (best_ccf, best_rr);
+        self.push_uv_sel(UvSel {
+            uv: chosen_uv as u8,
+        });
+        self.push_uv_cf(&ccf[0], &ccf[1], [0, 0]);
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma32(
@@ -1599,6 +1692,9 @@ impl<'a> LossyTile<'a> {
             };
             self.a_coef[plane][bx4c..bx4c + 4].fill(res_ctx);
             self.l_coef[plane][by4c..by4c + 4].fill(res_ctx);
+            if self.sb_mode == SbMode::Replay {
+                continue; // recon preinstalled
+            }
             let rr = if block_skip {
                 [0i32; 256]
             } else {
@@ -1642,6 +1738,10 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         let cx = px / 2;
         let (bx4c, by4c) = (cx / 4, py / 4);
+        // Chroma winner (popped here, pushed before the emit below; exactly one
+        // per code_block32 call — this helper is its only chroma path).
+        let ru = self.uv_sel_replay();
+        let ru_cf = self.uv_cf_replay();
         let maxv = (1 << self.bd) - 1;
         let (dcq, acq, lam) = (
             self.cquant.dc_q() as f32,
@@ -1656,7 +1756,9 @@ impl<'a> LossyTile<'a> {
         let mut dc_ccf = [[0i32; 512]; 2];
         let mut dc_sse = [0i64; 2];
         let mut dc_bits = [0f32; 2];
-        for ci in 0..2 {
+        // DC option (skipped in pure-emit replay: the captured winner installs
+        // below and block_skip reads the FINAL coeffs, matching Off).
+        for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
             let plane = ci + 1;
             let pred = dc_pred_16x32(&self.recon[plane], self.cw, cx, py, self.bd as i32);
             cpred[ci] = pred;
@@ -1679,14 +1781,9 @@ impl<'a> LossyTile<'a> {
             let (mut q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
             trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X32, lam);
             let rr = idct_dequant_16x32(&q, &self.cquant);
-            let mut sse = 0i64;
-            for i in 0..512 {
-                let r = (pred + rr[i]).clamp(0, maxv);
-                let d = src[i] - r;
-                sse += (d * d) as i64;
-            }
             dc_ccf[ci] = q;
-            dc_sse[ci] = sse;
+            dc_sse[ci] =
+                crate::rd_sse::sse_recon(&[pred; 512], &rr, &src, 16, 0, 0, 16, 32, self.bd);
             dc_bits[ci] = block_rate_bits(&q, &SCAN_16X32);
         }
 
@@ -1695,7 +1792,9 @@ impl<'a> LossyTile<'a> {
         // always DCT_DCT here, so the AC reference inverts with idct_dequant_32x32.
         let mut use_cfl = false;
         let mut cfl_alpha_uv = [0i32; 2];
-        {
+        // Pure-emit replay never evaluates CfL; the captured winner installs
+        // below.
+        if ru.is_none() {
             let lrr_cfl = idct_dequant_32x32(lcf, &self.quant);
             let mut luma_rec = [0i32; 1024];
             for i in 0..1024 {
@@ -1721,14 +1820,8 @@ impl<'a> LossyTile<'a> {
                 let (mut q, qt) = forward_dct_quant_16x32_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, dcq, acq, &SCAN_16X32, lam);
                 let rr = idct_dequant_16x32(&q, &self.cquant);
-                let mut sse = 0i64;
-                for i in 0..512 {
-                    let r = (cpr[i] + rr[i]).clamp(0, maxv);
-                    let d = src[i] - r;
-                    sse += (d * d) as i64;
-                }
                 cfl_ccf[ci] = q;
-                cfl_sse[ci] = sse;
+                cfl_sse[ci] = crate::rd_sse::sse_recon(&cpr, &rr, &src, 16, 0, 0, 16, 32, self.bd);
                 cfl_bits[ci] = block_rate_bits(&q, &SCAN_16X32);
                 cpred_px[ci] = cpr;
             }
@@ -1741,7 +1834,7 @@ impl<'a> LossyTile<'a> {
                 mlam,
                 cfl_bits[0] + cfl_bits[1] + sig,
             );
-            if cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0) {
+            if ru.is_some() || (cfl_total < dc_total && (cfl_a[0] != 0 || cfl_a[1] != 0)) {
                 use_cfl = true;
                 cfl_alpha_uv = cfl_a;
                 ccf[..2].copy_from_slice(&cfl_ccf[..2]);
@@ -1753,7 +1846,9 @@ impl<'a> LossyTile<'a> {
         // always the plain 16x32 DCT and only the prediction changes (PAETH/SMOOTH/
         // SMOOTH_V/SMOOTH_H). Searched against the DC/CfL winner on the R-D metric.
         let mut chosen_uv = if use_cfl { CFL_PRED } else { DC_PRED };
-        {
+        // Pure-emit replay never runs the directional search; the captured
+        // winner installs below.
+        if ru.is_none() {
             // R-D of the current winner (DC or CfL), from the committed ccf/cpred.
             let mut best_total = 0f32;
             if use_cfl {
@@ -1768,12 +1863,18 @@ impl<'a> LossyTile<'a> {
             for ci in 0..2 {
                 let cur_ccf = if use_cfl { ccf[ci] } else { dc_ccf[ci] };
                 let rr = idct_dequant_16x32(&cur_ccf, &self.cquant);
-                let mut sse = 0i64;
-                for i in 0..512 {
-                    let p = if use_cfl { cpred_px[ci][i] } else { cpred[ci] };
-                    let d = src_planes[ci][i] - (p + rr[i]).clamp(0, maxv);
-                    sse += (d * d) as i64;
-                }
+                let cur_pred = if use_cfl { cpred_px[ci] } else { [cpred[ci]; 512] };
+                let sse = crate::rd_sse::sse_recon(
+                    &cur_pred,
+                    &rr,
+                    &src_planes[ci],
+                    16,
+                    0,
+                    0,
+                    16,
+                    32,
+                    self.bd,
+                );
                 best_total += rd_cost_i64(sse, mlam, block_rate_bits(&cur_ccf, &SCAN_16X32));
             }
             let candidates = &[
@@ -1787,18 +1888,25 @@ impl<'a> LossyTile<'a> {
                 D113_PRED,
                 D157_PRED,
             ];
-            let directional_top =
-                self.rank_chroma_directionals::<512>(candidates, px, py, cx, py, 16, 32);
+            let directional_top = if ru.is_none() {
+                self.rank_chroma_directionals::<512>(candidates, px, py, cx, py, 16, 32)
+            } else {
+                DirectionalTopK::new()
+            };
             for &cand in candidates {
+                if ru.is_some_and(|r| cand as u8 != r.uv) {
+                    continue;
+                }
                 // V/H are cheap enough for every tier; Fast skips diagonal angles.
-                if cand != V_PRED
+                if ru.is_none()
+                    && cand != V_PRED
                     && cand != H_PRED
                     && (V_PRED..=VERT_LEFT_PRED).contains(&cand)
                     && !self.speed.chroma_angle_directional()
                 {
                     continue;
                 }
-                if is_directional_mode(cand) && !directional_top.contains(cand) {
+                if ru.is_none() && is_directional_mode(cand) && !directional_top.contains(cand) {
                     continue;
                 }
                 let mut cand_ccf = [[0i32; 512]; 2];
@@ -1843,15 +1951,11 @@ impl<'a> LossyTile<'a> {
                     }
                     cand_ccf[ci] = q;
                     let rr = idct_dequant_16x32(&q, &self.cquant);
-                    let mut sse = 0i64;
-                    for i in 0..512 {
-                        let r = (cand_pred[ci][i] + rr[i]).clamp(0, maxv);
-                        let d = src[i] - r;
-                        sse += (d * d) as i64;
-                    }
+                    let sse =
+                        crate::rd_sse::sse_recon(&cand_pred[ci], &rr, &src, 16, 0, 0, 16, 32, self.bd);
                     cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X32));
                 }
-                if cand_total < best_total {
+                if ru.is_some() || cand_total < best_total {
                     best_total = cand_total;
                     chosen_uv = cand;
                     use_cfl = false;
@@ -1860,12 +1964,32 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        if chosen_uv == DC_PRED {
+        if ru.is_none() && chosen_uv == DC_PRED {
             for ci in 0..2 {
                 ccf[ci] = dc_ccf[ci];
                 cpred_px[ci] = [cpred[ci]; 512];
             }
         }
+        // Pure-emit replay: install the captured chroma winner (mode, coeffs,
+        // CfL alphas; recon is preinstalled from the record).
+        if let Some(r) = ru
+            && let Some((cf, al)) = ru_cf.as_ref()
+        {
+            chosen_uv = r.uv as usize;
+            use_cfl = r.uv == CFL_PRED as u8;
+            cfl_alpha_uv = *al;
+            for (dst, src) in ccf.iter_mut().zip(cf.iter()) {
+                dst.copy_from_slice(src);
+            }
+        }
+        self.push_uv_sel(UvSel {
+            uv: chosen_uv as u8,
+        });
+        self.push_uv_cf(
+            &ccf[0],
+            &ccf[1],
+            if use_cfl { cfl_alpha_uv } else { [0, 0] },
+        );
         let block_skip =
             luma_zero && ccf[0].iter().all(|&c| c == 0) && ccf[1].iter().all(|&c| c == 0);
         self.code_header_luma32(
@@ -1891,6 +2015,9 @@ impl<'a> LossyTile<'a> {
             };
             self.a_coef[plane][bx4c..bx4c + 4].fill(res_ctx);
             self.l_coef[plane][by4c..by4c + 8].fill(res_ctx);
+            if self.sb_mode == SbMode::Replay {
+                continue; // recon preinstalled
+            }
             let rr = if block_skip {
                 [0i32; 512]
             } else {
