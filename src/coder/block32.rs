@@ -669,6 +669,7 @@ impl<'a> LossyTile<'a> {
         self.push_luma_sel(LumaSel {
             mode: best_mode as u8,
             delta: best_delta as i8,
+            palette: 0,
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             // `SplitDct` marks the tx_depth=1 grid of four TX_16X16
             // (coefficients packed quadrant-major); otherwise DCT_DCT.
@@ -761,6 +762,7 @@ impl<'a> LossyTile<'a> {
             );
         }
         self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 32, 32);
+        self.emit_palette_mode_info(px, py, 32, 32, y_mode, !self.mono, None);
         self.emit_filter_intra(y_mode, 32, 32, filter_intra);
         self.code_tx_depth(px, py, 32, 32, tx_split as usize);
         // Derived ONCE at the block origin (dav1d), before a_mode/l_mode are filled.
@@ -941,6 +943,7 @@ impl<'a> LossyTile<'a> {
             if has_chroma {
                 self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
             }
+            self.emit_palette_mode_info(px, py, lw, lh, DC_PRED, has_chroma, None);
             self.emit_filter_intra(DC_PRED, lw, lh, None);
             self.code_tx_depth(px, py, lw, lh, 0);
             let sv = block_skip as u8;
@@ -1102,6 +1105,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
+            self.emit_palette_mode_info(px, py, lw, lh, DC_PRED, !self.mono, None);
             self.emit_filter_intra(DC_PRED, lw, lh, None);
             self.code_tx_depth(px, py, lw, lh, 0);
             let sv = block_skip as u8;

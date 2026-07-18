@@ -31,6 +31,7 @@ use crate::cdf_tables as C;
 use crate::coefs::encode_coefs;
 use crate::cost::coef_rate_bits;
 use crate::intrapred::INTRA_MODE_CTX;
+use crate::intrapred::palette_pred;
 use crate::msac_enc::Writer;
 use crate::skip_tables::SKIP_CTX;
 use crate::tables::*;
@@ -83,6 +84,84 @@ static SM4: [i32; 4] = [255, 149, 85, 64];
 /// PAETH(12). Directional modes are omitted (their small 4x4 reach and the
 /// edge-array machinery add little for lossless photographic content).
 static LL_MODES: [usize; 7] = [0, 1, 2, 9, 10, 11, 12];
+
+#[derive(Clone)]
+struct LumaPalette {
+    colors: Vec<i32>,
+    map: Vec<u8>,
+    packed_map: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+/// Build an exact AV1 luma palette for a complete 8..64-pixel coding block.
+/// Lossless palette prediction is only selected when every source sample is
+/// represented exactly; the residual is consequently all zero.
+fn exact_luma_palette(
+    plane: &[i16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+) -> Option<LumaPalette> {
+    if width < 8 || height < 8 || width > 64 || height > 64 {
+        return None;
+    }
+    let max = (1i32 << bit_depth) - 1;
+    let mut colors = Vec::with_capacity(8);
+    for y in 0..height {
+        for &sample in &plane[(py + y) * stride + px..][..width] {
+            let sample = i32::from(sample);
+            if !(0..=max).contains(&sample) {
+                return None;
+            }
+            if !colors.contains(&sample) {
+                if colors.len() == 8 {
+                    return None;
+                }
+                colors.push(sample);
+            }
+        }
+    }
+    if colors.len() < 2 {
+        return None;
+    }
+    colors.sort_unstable();
+
+    let mut map = Vec::with_capacity(width * height);
+    let mut packed_map = vec![0u8; width.div_ceil(2) * height];
+    let packed_stride = width.div_ceil(2);
+    for y in 0..height {
+        for x in 0..width {
+            let sample = i32::from(plane[(py + y) * stride + px + x]);
+            let index = colors.binary_search(&sample).unwrap() as u8;
+            map.push(index);
+            let packed = &mut packed_map[y * packed_stride + x / 2];
+            if x & 1 == 0 {
+                *packed |= index;
+            } else {
+                *packed |= index << 4;
+            }
+        }
+    }
+    Some(LumaPalette {
+        colors,
+        map,
+        packed_map,
+        width,
+        height,
+    })
+}
+
+fn palette_estimated_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
+    let pixels = palette.width * palette.height;
+    let map_bits = (palette.colors.len() as f32).log2() * pixels as f32;
+    let color_bits = (palette.colors.len() * bit_depth as usize) as f32;
+    let zero_txb_bits = (pixels / 16) as f32;
+    4.0 + color_bits + map_bits + zero_txb_bits
+}
 
 /// Build the 4x4 intra reference edges (top[4], left[4], corner) from the
 /// source plane, matching dav1d's neighbor construction (recon == src in
@@ -263,9 +342,24 @@ fn encode_plane_block(
     base: i32,
     a: &mut [u8],
     l: &mut [u8],
+    palette: Option<&LumaPalette>,
 ) {
     let mut pred = [0i32; 16];
     let mut resid = [0i32; 16];
+    let palette_predicted = palette.map(|palette| {
+        debug_assert_eq!(palette.width, n_tx * 4);
+        debug_assert_eq!(palette.height, n_tx * 4);
+        let mut out = vec![0i32; palette.width * palette.height];
+        palette_pred(
+            &mut out,
+            palette.width,
+            &palette.colors,
+            &palette.packed_map,
+            palette.width,
+            palette.height,
+        );
+        out
+    });
     for ty in 0..n_tx {
         for tx in 0..n_tx {
             let ox = bx + tx * 4;
@@ -283,7 +377,14 @@ fn encode_plane_block(
             let s = t - 2;
             let dc_sign_ctx = ((s != 0) as usize) + ((s > 0) as usize);
 
-            predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+            if let Some(block_pred) = palette_predicted.as_ref() {
+                for row in 0..4 {
+                    let src = &block_pred[(ty * 4 + row) * n_tx * 4 + tx * 4..][..4];
+                    pred[row * 4..row * 4 + 4].copy_from_slice(src);
+                }
+            } else {
+                predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+            }
             for (ry, (rrow, prow)) in resid
                 .as_chunks_mut::<4>()
                 .0
@@ -352,6 +453,7 @@ fn plane_leaf_bits(
 }
 
 /// Best luma + best uv mode for a leaf, with total residual+overhead bits.
+#[allow(clippy::too_many_arguments)]
 fn best_leaf(
     planes: [&[i16]; 3],
     stride: usize,
@@ -359,7 +461,10 @@ fn best_leaf(
     py: usize,
     n_tx: usize,
     base: i32,
-) -> (f32, usize, usize) {
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
+) -> (f32, usize, usize, Option<LumaPalette>) {
     let mut y_mode = 0usize;
     let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
@@ -379,14 +484,25 @@ fn best_leaf(
             uv_mode = m;
         }
     }
+    let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
+        .then(|| exact_luma_palette(planes[0], stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
+        .flatten();
+    if let Some(palette) = palette.as_ref() {
+        yb = palette_estimated_bits(palette, bit_depth);
+        y_mode = 0;
+    }
     let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     let ovh = 7.0 + ang(y_mode) + ang(uv_mode); // skip + y_mode + uv_mode (+ angle_deltas)
-    (yb + ub + ovh, y_mode, uv_mode)
+    (yb + ub + ovh, y_mode, uv_mode, palette)
 }
 
 /// Adaptive partition plan for a fully-in-frame square block.
 enum Plan {
-    Leaf(usize, usize), // (y_mode, uv_mode)
+    Leaf {
+        y_mode: usize,
+        uv_mode: usize,
+        palette: Option<LumaPalette>,
+    },
     Split(Box<[Plan; 4]>),
 }
 
@@ -395,6 +511,7 @@ const PART_SPLIT_BITS: f32 = 1.5;
 
 /// Decide none-vs-split by estimated bits; returns the plan and its cost. Min
 /// leaf is 8x8 (sz8 == 1).
+#[allow(clippy::too_many_arguments)]
 fn plan_full(
     planes: [&[i16]; 3],
     stride: usize,
@@ -402,11 +519,31 @@ fn plan_full(
     py: usize,
     sz8: usize,
     base: i32,
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym, uv) = best_leaf(planes, stride, px, py, sz8 * 2, base);
+    let (bits_leaf, ym, uv, palette) = best_leaf(
+        planes,
+        stride,
+        px,
+        py,
+        sz8 * 2,
+        base,
+        bit_depth,
+        visible_w,
+        visible_h,
+    );
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {
-        return (none, Plan::Leaf(ym, uv));
+        return (
+            none,
+            Plan::Leaf {
+                y_mode: ym,
+                uv_mode: uv,
+                palette,
+            },
+        );
     }
     let hh = sz8 / 2;
     let mut split = PART_SPLIT_BITS;
@@ -420,12 +557,21 @@ fn plan_full(
     .into_iter()
     .enumerate()
     {
-        let (b, p) = plan_full(planes, stride, cx, cy, hh, base);
+        let (b, p) = plan_full(
+            planes, stride, cx, cy, hh, base, bit_depth, visible_w, visible_h,
+        );
         split += b;
         kids[i] = Some(p);
     }
     if none <= split {
-        (none, Plan::Leaf(ym, uv))
+        (
+            none,
+            Plan::Leaf {
+                y_mode: ym,
+                uv_mode: uv,
+                palette,
+            },
+        )
     } else {
         (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
     }
@@ -435,13 +581,213 @@ fn plan_full(
 struct LlState {
     w: usize,
     h: usize,
+    visible_w: usize,
+    visible_h: usize,
     base: i32,
+    bit_depth: u8,
     a_coef: [Vec<u8>; 3],
     l_coef: [Vec<u8>; 3],
     a_part: Vec<u8>,
     l_part: Vec<u8>,
     a_mode: Vec<u8>, // luma y_mode per 8px unit (for kf_y context)
     l_mode: Vec<u8>,
+    a_palette: Vec<Vec<i32>>,
+    l_palette: Vec<Vec<i32>>,
+}
+
+fn write_raw_symbol(wr: &mut Writer, symbol: usize, raw: &[u16]) {
+    let mut cdf = Vec::with_capacity(raw.len() + 1);
+    cdf.extend(raw.iter().map(|&v| 32768 - v));
+    cdf.push(0);
+    wr.symbol(symbol as u32, &cdf);
+}
+
+fn write_uniform(wr: &mut Writer, n: usize, value: usize) {
+    debug_assert!(n > 0 && value < n);
+    let bits = usize::BITS - (n - 1).leading_zeros();
+    let cutoff = (1usize << bits) - n;
+    if value < cutoff {
+        wr.literal((bits - 1) as u8, value as u32);
+    } else {
+        let value = value - cutoff;
+        wr.literal((bits - 1) as u8, (cutoff + (value >> 1)) as u32);
+        wr.bit((value & 1) as u16);
+    }
+}
+
+fn palette_bsize_ctx(size: usize) -> usize {
+    debug_assert!(matches!(size, 8 | 16 | 32 | 64));
+    2 * (size.trailing_zeros() as usize - 3)
+}
+
+fn palette_y_mode_raw(bsize_ctx: usize, mode_ctx: usize) -> u16 {
+    static RAW: [[u16; 3]; 7] = [
+        [31676, 3419, 1261],
+        [31912, 2859, 980],
+        [31823, 3400, 781],
+        [32030, 3561, 904],
+        [32309, 7337, 1462],
+        [32265, 4015, 1521],
+        [32450, 7946, 129],
+    ];
+    RAW[bsize_ctx][mode_ctx]
+}
+
+fn palette_y_size_raw(bsize_ctx: usize) -> &'static [u16; 6] {
+    const RAW: [[u16; 6]; 7] = [
+        [7952, 13000, 18149, 21478, 25527, 29241],
+        [7139, 11421, 16195, 19544, 23666, 28073],
+        [7788, 12741, 17325, 20500, 24315, 28530],
+        [8271, 14064, 18246, 21564, 25071, 28533],
+        [12725, 19180, 21863, 24839, 27535, 30120],
+        [9711, 14888, 16923, 21052, 25661, 27875],
+        [14940, 20797, 21678, 24186, 27033, 28999],
+    ];
+    &RAW[bsize_ctx]
+}
+
+fn palette_y_color_raw(size: usize, ctx: usize) -> &'static [u16] {
+    match (size, ctx) {
+        (2, 0) => &[28710],
+        (2, 1) => &[16384],
+        (2, 2) => &[10553],
+        (2, 3) => &[27036],
+        (2, 4) => &[31603],
+        (3, 0) => &[27877, 30490],
+        (3, 1) => &[11532, 25697],
+        (3, 2) => &[6544, 30234],
+        (3, 3) => &[23018, 28072],
+        (3, 4) => &[31915, 32385],
+        (4, 0) => &[25572, 28046, 30045],
+        (4, 1) => &[9478, 21590, 27256],
+        (4, 2) => &[7248, 26837, 29824],
+        (4, 3) => &[19167, 24486, 28349],
+        (4, 4) => &[31400, 31825, 32250],
+        (5, 0) => &[24779, 26955, 28576, 30282],
+        (5, 1) => &[8669, 20364, 24073, 28093],
+        (5, 2) => &[4255, 27565, 29377, 31067],
+        (5, 3) => &[19864, 23674, 26716, 29530],
+        (5, 4) => &[31646, 31893, 32147, 32426],
+        (6, 0) => &[23132, 25407, 26970, 28435, 30073],
+        (6, 1) => &[7443, 17242, 20717, 24762, 27982],
+        (6, 2) => &[6300, 24862, 26944, 28784, 30671],
+        (6, 3) => &[18916, 22895, 25267, 27435, 29652],
+        (6, 4) => &[31270, 31550, 31808, 32059, 32353],
+        (7, 0) => &[23105, 25199, 26464, 27684, 28931, 30318],
+        (7, 1) => &[6950, 15447, 18952, 22681, 25567, 28563],
+        (7, 2) => &[7560, 23474, 25490, 27203, 28921, 30708],
+        (7, 3) => &[18544, 22373, 24457, 26195, 28119, 30045],
+        (7, 4) => &[31198, 31451, 31670, 31882, 32123, 32391],
+        (8, 0) => &[21689, 23883, 25163, 26352, 27506, 28827, 30195],
+        (8, 1) => &[6892, 15385, 17840, 21606, 24287, 26753, 29204],
+        (8, 2) => &[5651, 23182, 25042, 26518, 27982, 29392, 30900],
+        (8, 3) => &[19349, 22578, 24418, 25994, 27524, 29031, 30448],
+        (8, 4) => &[31028, 31270, 31504, 31705, 31927, 32153, 32392],
+        _ => unreachable!("palette size/context {size}/{ctx}"),
+    }
+}
+
+fn palette_cache(above: &[i32], left: &[i32], allow_above: bool) -> Vec<i32> {
+    let mut cache = Vec::with_capacity(16);
+    if allow_above {
+        cache.extend_from_slice(above);
+    }
+    cache.extend_from_slice(left);
+    cache.sort_unstable();
+    cache.dedup();
+    cache
+}
+
+fn ceil_log2(value: u32) -> u8 {
+    if value <= 1 {
+        0
+    } else {
+        (32 - (value - 1).leading_zeros()) as u8
+    }
+}
+
+fn write_palette_colors(wr: &mut Writer, colors: &[i32], cache: &[i32], bit_depth: u8) {
+    let mut in_cache = 0usize;
+    for &cached in cache {
+        if in_cache == colors.len() {
+            break;
+        }
+        let found = colors.binary_search(&cached).is_ok();
+        wr.bit(found as u16);
+        in_cache += usize::from(found);
+    }
+    let out: Vec<u32> = colors
+        .iter()
+        .filter(|color| cache.binary_search(color).is_err())
+        .map(|&color| color as u32)
+        .collect();
+    if out.is_empty() {
+        return;
+    }
+    wr.literal(bit_depth, out[0]);
+    if out.len() == 1 {
+        return;
+    }
+    let max_delta = out.windows(2).map(|v| v[1] - v[0]).max().unwrap();
+    let min_bits = bit_depth - 3;
+    let mut bits = ceil_log2(max_delta).max(min_bits);
+    wr.literal(2, u32::from(bits - min_bits));
+    let mut range = (1u32 << bit_depth) - out[0] - 1;
+    for pair in out.windows(2) {
+        let delta = pair[1] - pair[0];
+        wr.literal(bits, delta - 1);
+        range -= delta;
+        bits = bits.min(ceil_log2(range));
+    }
+}
+
+fn palette_color_ctx(map: &[u8], stride: usize, y: usize, x: usize, size: usize) -> (usize, usize) {
+    let current = map[y * stride + x] as usize;
+    let mut scores = [0u8; 8];
+    if x > 0 {
+        scores[map[y * stride + x - 1] as usize] += 2;
+    }
+    if y > 0 {
+        scores[map[(y - 1) * stride + x] as usize] += 2;
+    }
+    if x > 0 && y > 0 {
+        scores[map[(y - 1) * stride + x - 1] as usize] += 1;
+    }
+    let mut ranked: Vec<usize> = (0..size).filter(|&i| scores[i] != 0).collect();
+    ranked.sort_by_key(|&i| (std::cmp::Reverse(scores[i]), i));
+    let ctx = if x == 0 || y == 0 {
+        0
+    } else {
+        const MULT: [usize; 3] = [1, 2, 2];
+        let hash: usize = ranked
+            .iter()
+            .zip(MULT)
+            .map(|(&color, mult)| scores[color] as usize * mult)
+            .sum();
+        9 - hash
+    };
+    let mut order = ranked;
+    for color in 0..size {
+        if !order.contains(&color) {
+            order.push(color);
+        }
+    }
+    let symbol = order.iter().position(|&color| color == current).unwrap();
+    (ctx, symbol)
+}
+
+fn write_palette_map(wr: &mut Writer, palette: &LumaPalette) {
+    let size = palette.colors.len();
+    write_uniform(wr, size, palette.map[0] as usize);
+    for diagonal in 1..palette.width + palette.height - 1 {
+        let first_x = diagonal.min(palette.width - 1);
+        let last_x = diagonal.saturating_sub(palette.height - 1);
+        for x in (last_x..=first_x).rev() {
+            let y = diagonal - x;
+            let (ctx, symbol) = palette_color_ctx(&palette.map, palette.width, y, x, size);
+            write_raw_symbol(wr, symbol, palette_y_color_raw(size, ctx));
+        }
+    }
 }
 
 /// Code a square lossless leaf of `size`×`size` px at `(px, py)`: block mode
@@ -458,6 +804,7 @@ fn code_leaf(
     size: usize,
     y_mode: usize,
     uv_mode: usize,
+    palette: Option<&LumaPalette>,
 ) {
     let n_tx = size / 4;
     wr.symbol(0, &C::BLK_SKIP); // skip = 0
@@ -475,12 +822,43 @@ fn code_leaf(
     if (1..=8).contains(&uv_mode) {
         wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[uv_mode - 1]));
     }
+    let bsize_ctx = palette_bsize_ctx(size);
+    let mode_ctx =
+        usize::from(!st.a_palette[x8].is_empty()) + usize::from(!st.l_palette[y8].is_empty());
+    if y_mode == 0 {
+        write_raw_symbol(
+            wr,
+            usize::from(palette.is_some()),
+            &[palette_y_mode_raw(bsize_ctx, mode_ctx)],
+        );
+        if let Some(palette) = palette {
+            write_raw_symbol(wr, palette.colors.len() - 2, palette_y_size_raw(bsize_ctx));
+            let cache = palette_cache(&st.a_palette[x8], &st.l_palette[y8], !py.is_multiple_of(64));
+            write_palette_colors(wr, &palette.colors, &cache, st.bit_depth);
+        }
+    }
+    if uv_mode == 0 {
+        // No chroma palette is selected. The context is one when luma uses a
+        // palette and zero otherwise.
+        let raw = if palette.is_some() { 21488 } else { 32461 };
+        write_raw_symbol(wr, 0, &[raw]);
+    }
+    if let Some(palette) = palette {
+        write_palette_map(wr, palette);
+    }
     let u8sz = size / 8;
     for u in x8..x8 + u8sz {
         st.a_mode[u] = y_mode as u8;
     }
     for u in y8..y8 + u8sz {
         st.l_mode[u] = y_mode as u8;
+    }
+    let stored_palette = palette.map_or_else(Vec::new, |p| p.colors.clone());
+    for slot in &mut st.a_palette[x8..x8 + u8sz] {
+        slot.clone_from(&stored_palette);
+    }
+    for slot in &mut st.l_palette[y8..y8 + u8sz] {
+        slot.clone_from(&stored_palette);
     }
     let modes = [y_mode, uv_mode, uv_mode];
     for plane in 0..3 {
@@ -496,6 +874,7 @@ fn code_leaf(
             st.base,
             &mut st.a_coef[plane],
             &mut st.l_coef[plane],
+            if plane == 0 { palette } else { None },
         );
     }
 }
@@ -559,9 +938,23 @@ fn encode_plan(
 ) {
     let (px, py) = (x8 * 8, y8 * 8);
     match plan {
-        Plan::Leaf(ym, uv) => {
+        Plan::Leaf {
+            y_mode,
+            uv_mode,
+            palette,
+        } => {
             wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
-            code_leaf(wr, planes, st, px, py, sz8 * 8, *ym, *uv);
+            code_leaf(
+                wr,
+                planes,
+                st,
+                px,
+                py,
+                sz8 * 8,
+                *y_mode,
+                *uv_mode,
+                palette.as_ref(),
+            );
             let pb = part_byte(sz8);
             for u in x8..x8 + sz8 {
                 st.a_part[u] = pb;
@@ -598,7 +991,17 @@ fn decode_sb_ll(
 
     if full {
         // fully-in-frame: plan adaptively and encode
-        let (_bits, plan) = plan_full(planes, st.w, px, py, sz8, st.base);
+        let (_bits, plan) = plan_full(
+            planes,
+            st.w,
+            px,
+            py,
+            sz8,
+            st.base,
+            st.bit_depth,
+            st.visible_w,
+            st.visible_h,
+        );
         encode_plan(wr, planes, st, bl, x8, y8, sz8, &plan);
         return;
     }
@@ -606,8 +1009,18 @@ fn decode_sb_ll(
         // 8x8 leaf (in-frame for multiple-of-8 dims): mode-search and code
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym, uv) = best_leaf(planes, st.w, px, py, 2, st.base);
-        code_leaf(wr, planes, st, px, py, 8, ym, uv);
+        let (_b, ym, uv, palette) = best_leaf(
+            planes,
+            st.w,
+            px,
+            py,
+            2,
+            st.base,
+            st.bit_depth,
+            st.visible_w,
+            st.visible_h,
+        );
+        code_leaf(wr, planes, st, px, py, 8, ym, uv, palette.as_ref());
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -639,7 +1052,14 @@ fn decode_sb_ll(
 /// crossing the frame boundary are split down to 8×8 leaves using AV1's
 /// frame-edge partition logic. `planes[0]`=G, `[1]`=B, `[2]`=R, each a `w*h`
 /// raster.
-pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 3]) -> Vec<u8> {
+pub fn encode_tile_lossless(
+    w: usize,
+    h: usize,
+    visible_w: usize,
+    visible_h: usize,
+    bit_depth: u8,
+    planes: [&[i16]; 3],
+) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
         "width/height must be multiples of 8"
@@ -648,13 +1068,18 @@ pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 
     let mut st = LlState {
         w,
         h,
+        visible_w,
+        visible_h,
         base: 1i32 << (bit_depth - 1),
+        bit_depth,
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
         l_part: vec![0; h / 8],
         a_mode: vec![0; w / 8],
         l_mode: vec![0; h / 8],
+        a_palette: vec![Vec::new(); w / 8],
+        l_palette: vec![Vec::new(); h / 8],
     };
     for sb_y in (0..h).step_by(64) {
         for sb_x in (0..w).step_by(64) {
@@ -676,6 +1101,7 @@ pub fn encode_tile_lossless(w: usize, h: usize, bit_depth: u8, planes: [&[i16]; 
 // `uv_mode` slot in `Plan::Leaf` is carried as a `0` placeholder and ignored.
 
 /// Best luma mode for a mono leaf, with total residual+overhead bits (no uv).
+#[allow(clippy::too_many_arguments)]
 fn best_leaf_mono(
     luma: &[i16],
     stride: usize,
@@ -683,7 +1109,10 @@ fn best_leaf_mono(
     py: usize,
     n_tx: usize,
     base: i32,
-) -> (f32, usize) {
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
+) -> (f32, usize, Option<LumaPalette>) {
     let mut y_mode = 0usize;
     let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
@@ -693,13 +1122,21 @@ fn best_leaf_mono(
             y_mode = m;
         }
     }
+    let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
+        .then(|| exact_luma_palette(luma, stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
+        .flatten();
+    if let Some(palette) = palette.as_ref() {
+        yb = palette_estimated_bits(palette, bit_depth);
+        y_mode = 0;
+    }
     let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
     let ovh = 4.0 + ang(y_mode);
-    (yb + ovh, y_mode)
+    (yb + ovh, y_mode, palette)
 }
 
 /// Mono partition plan for a fully-in-frame square block (luma only).
+#[allow(clippy::too_many_arguments)]
 fn plan_full_mono(
     luma: &[i16],
     stride: usize,
@@ -707,11 +1144,31 @@ fn plan_full_mono(
     py: usize,
     sz8: usize,
     base: i32,
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym) = best_leaf_mono(luma, stride, px, py, sz8 * 2, base);
+    let (bits_leaf, ym, palette) = best_leaf_mono(
+        luma,
+        stride,
+        px,
+        py,
+        sz8 * 2,
+        base,
+        bit_depth,
+        visible_w,
+        visible_h,
+    );
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {
-        return (none, Plan::Leaf(ym, 0));
+        return (
+            none,
+            Plan::Leaf {
+                y_mode: ym,
+                uv_mode: 0,
+                palette,
+            },
+        );
     }
     let hh = sz8 / 2;
     let mut split = PART_SPLIT_BITS;
@@ -725,12 +1182,21 @@ fn plan_full_mono(
     .into_iter()
     .enumerate()
     {
-        let (b, p) = plan_full_mono(luma, stride, cx, cy, hh, base);
+        let (b, p) = plan_full_mono(
+            luma, stride, cx, cy, hh, base, bit_depth, visible_w, visible_h,
+        );
         split += b;
         kids[i] = Some(p);
     }
     if none <= split {
-        (none, Plan::Leaf(ym, 0))
+        (
+            none,
+            Plan::Leaf {
+                y_mode: ym,
+                uv_mode: 0,
+                palette,
+            },
+        )
     } else {
         (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
     }
@@ -738,6 +1204,7 @@ fn plan_full_mono(
 
 /// Code a mono lossless leaf: block skip + kf_y mode (+ angle_delta) then the
 /// luma `(size/4)²` `TX_4X4` WHT. No uv_mode symbol, no chroma blocks.
+#[allow(clippy::too_many_arguments)]
 fn code_leaf_mono(
     wr: &mut Writer,
     luma: &[i16],
@@ -746,6 +1213,7 @@ fn code_leaf_mono(
     py: usize,
     size: usize,
     y_mode: usize,
+    palette: Option<&LumaPalette>,
 ) {
     let n_tx = size / 4;
     wr.symbol(0, &C::BLK_SKIP); // skip = 0
@@ -758,6 +1226,22 @@ fn code_leaf_mono(
     if (1..=8).contains(&y_mode) {
         wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
     }
+    let bsize_ctx = palette_bsize_ctx(size);
+    let mode_ctx =
+        usize::from(!st.a_palette[x8].is_empty()) + usize::from(!st.l_palette[y8].is_empty());
+    if y_mode == 0 {
+        write_raw_symbol(
+            wr,
+            usize::from(palette.is_some()),
+            &[palette_y_mode_raw(bsize_ctx, mode_ctx)],
+        );
+        if let Some(palette) = palette {
+            write_raw_symbol(wr, palette.colors.len() - 2, palette_y_size_raw(bsize_ctx));
+            let cache = palette_cache(&st.a_palette[x8], &st.l_palette[y8], !py.is_multiple_of(64));
+            write_palette_colors(wr, &palette.colors, &cache, st.bit_depth);
+            write_palette_map(wr, palette);
+        }
+    }
     // (mono: HasChroma == false ⇒ no uv_mode symbol, no chroma residual)
     let u8sz = size / 8;
     for u in x8..x8 + u8sz {
@@ -765,6 +1249,13 @@ fn code_leaf_mono(
     }
     for u in y8..y8 + u8sz {
         st.l_mode[u] = y_mode as u8;
+    }
+    let stored_palette = palette.map_or_else(Vec::new, |p| p.colors.clone());
+    for slot in &mut st.a_palette[x8..x8 + u8sz] {
+        slot.clone_from(&stored_palette);
+    }
+    for slot in &mut st.l_palette[y8..y8 + u8sz] {
+        slot.clone_from(&stored_palette);
     }
     encode_plane_block(
         wr,
@@ -778,6 +1269,7 @@ fn code_leaf_mono(
         st.base,
         &mut st.a_coef[0],
         &mut st.l_coef[0],
+        palette,
     );
 }
 
@@ -794,9 +1286,11 @@ fn encode_plan_mono(
 ) {
     let (px, py) = (x8 * 8, y8 * 8);
     match plan {
-        Plan::Leaf(ym, _uv) => {
+        Plan::Leaf {
+            y_mode, palette, ..
+        } => {
             wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
-            code_leaf_mono(wr, luma, st, px, py, sz8 * 8, *ym);
+            code_leaf_mono(wr, luma, st, px, py, sz8 * 8, *y_mode, palette.as_ref());
             let pb = part_byte(sz8);
             for u in x8..x8 + sz8 {
                 st.a_part[u] = pb;
@@ -830,15 +1324,35 @@ fn decode_sb_ll_mono(
     let full = px + size <= st.w && py + size <= st.h;
 
     if full {
-        let (_bits, plan) = plan_full_mono(luma, st.w, px, py, sz8, st.base);
+        let (_bits, plan) = plan_full_mono(
+            luma,
+            st.w,
+            px,
+            py,
+            sz8,
+            st.base,
+            st.bit_depth,
+            st.visible_w,
+            st.visible_h,
+        );
         encode_plan_mono(wr, luma, st, bl, x8, y8, sz8, &plan);
         return;
     }
     if sz8 == 1 {
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym) = best_leaf_mono(luma, st.w, px, py, 2, st.base);
-        code_leaf_mono(wr, luma, st, px, py, 8, ym);
+        let (_b, ym, palette) = best_leaf_mono(
+            luma,
+            st.w,
+            px,
+            py,
+            2,
+            st.base,
+            st.bit_depth,
+            st.visible_w,
+            st.visible_h,
+        );
+        code_leaf_mono(wr, luma, st, px, py, 8, ym, palette.as_ref());
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -865,7 +1379,14 @@ fn decode_sb_ll_mono(
 /// Encode a **monochrome** lossless AV1 tile (single luma plane), width/height
 /// multiples of 8. Structure mirrors [`encode_tile_lossless`] but for a 1-plane
 /// (`mono_chrome = 1`) frame: only the luma plane is coded.
-pub fn encode_tile_lossless_mono(w: usize, h: usize, bit_depth: u8, luma: &[i16]) -> Vec<u8> {
+pub fn encode_tile_lossless_mono(
+    w: usize,
+    h: usize,
+    visible_w: usize,
+    visible_h: usize,
+    bit_depth: u8,
+    luma: &[i16],
+) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
         "width/height must be multiples of 8"
@@ -874,13 +1395,18 @@ pub fn encode_tile_lossless_mono(w: usize, h: usize, bit_depth: u8, luma: &[i16]
     let mut st = LlState {
         w,
         h,
+        visible_w,
+        visible_h,
         base: 1i32 << (bit_depth - 1),
+        bit_depth,
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
         l_part: vec![0; h / 8],
         a_mode: vec![0; w / 8],
         l_mode: vec![0; h / 8],
+        a_palette: vec![Vec::new(); w / 8],
+        l_palette: vec![Vec::new(); h / 8],
     };
     for sb_y in (0..h).step_by(64) {
         for sb_x in (0..w).step_by(64) {
@@ -893,6 +1419,227 @@ pub fn encode_tile_lossless_mono(w: usize, h: usize, bit_depth: u8, luma: &[i16]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BitDepth;
+    use crate::encoder::{
+        PlanarImage, encode_lossless_gray_obu, encode_lossless_obu, encode_lossy_gray_obu,
+    };
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn dav1d() -> Option<PathBuf> {
+        std::env::var_os("DAV1D").map(PathBuf::from).or_else(|| {
+            let path = PathBuf::from("/opt/homebrew/bin/dav1d");
+            path.is_file().then_some(path)
+        })
+    }
+
+    fn decode_obu(decoder: &Path, obu: &[u8], tag: &str) -> Vec<u8> {
+        let stem = format!("maroontree-av1-palette-{}-{tag}", std::process::id());
+        let input = std::env::temp_dir().join(format!("{stem}.obu"));
+        let output = std::env::temp_dir().join(format!("{stem}.yuv"));
+        std::fs::write(&input, obu).unwrap();
+        let result = Command::new(decoder)
+            .args(["--demuxer", "section5", "--muxer", "yuv", "-q", "-o"])
+            .arg(&output)
+            .arg("-i")
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "dav1d rejected {tag}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let decoded = std::fs::read(&output).unwrap();
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+        decoded
+    }
+
+    #[test]
+    fn exact_palette_wins_lossless_rdo_for_all_normative_sizes() {
+        let (w, h) = (64usize, 64usize);
+        for size in 2..=8usize {
+            let luma: Vec<i16> = (0..w * h)
+                .map(|i| {
+                    let x = i % w;
+                    let y = i / w;
+                    (7 + (((x / 4) + (y / 4)) % size) * 29) as i16
+                })
+                .collect();
+            let (_, mode, palette) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
+            assert_eq!(mode, 0);
+            assert_eq!(palette.unwrap().colors.len(), size);
+        }
+    }
+
+    #[test]
+    fn lossy_palette_predictor_codes_quantized_residual_and_decodes() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (8usize, 8usize);
+        // Two noisy color clusters: an exact palette is impossible, but the
+        // palette predictor is much closer than spatial DC and the remaining
+        // error must travel through the ordinary lossy TX/quant path.
+        let pixels: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let base = if ((i % w) + (i / w)) & 1 == 0 {
+                    28
+                } else {
+                    220
+                };
+                (base + (i % 17) as i32 - 8) as u8
+            })
+            .collect();
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        crate::coder::LOSSY_PALETTE_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::coder::LOSSY_PALETTE_RESIDUAL_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let obu = encode_lossy_gray_obu(
+            &image,
+            BitDepth::Eight,
+            64,
+            true,
+            1,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+        )
+        .unwrap();
+        let decoded = decode_obu(&decoder, &obu, "lossy-residual");
+        assert_eq!(decoded.len(), w * h);
+        let max_error = decoded
+            .iter()
+            .zip(&pixels)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        assert!(max_error < 64, "palette residual max error was {max_error}");
+        assert!(crate::coder::LOSSY_PALETTE_EMITTED.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            crate::coder::LOSSY_PALETTE_RESIDUAL_EMITTED.load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+
+        for n in 2..=8usize {
+            let exact: Vec<u8> = (0..w * h)
+                .map(|i| 7 + (((i * 37 + (i / w) * 11 + 3) % n) * 31) as u8)
+                .collect();
+            let exact_image = PlanarImage::from_luma(w, h, BitDepth::Eight, &exact).unwrap();
+            let exact_obu = encode_lossy_gray_obu(
+                &exact_image,
+                BitDepth::Eight,
+                64,
+                true,
+                1,
+                crate::Speed::Slow,
+                false,
+                crate::coder::VarianceBoost::off(),
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(decode_obu(&decoder, &exact_obu, "lossy-exact"), exact);
+        }
+
+        // Cross a 64-pixel superblock-row boundary with adjacent palette
+        // blocks. The above palette must not enter the color cache at y=64.
+        let (mw, mh) = (64usize, 128usize);
+        let many: Vec<u8> = (0..mw * mh)
+            .map(|i| {
+                let x = i % mw;
+                let y = i / mw;
+                let block = (x / 8) + (y / 8) * 8;
+                let n = 2 + block % 7;
+                7 + ((((x * 37 + y * 11 + block * 3) % n) * 31) as u8)
+            })
+            .collect();
+        let many_image = PlanarImage::from_luma(mw, mh, BitDepth::Eight, &many).unwrap();
+        let many_obu = encode_lossy_gray_obu(
+            &many_image,
+            BitDepth::Eight,
+            64,
+            true,
+            1,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+        )
+        .unwrap();
+        let many_decoded = decode_obu(&decoder, &many_obu, "lossy-many");
+        let many_max_error = many_decoded
+            .iter()
+            .zip(&many)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        assert!(
+            many_max_error < 64,
+            "multi-palette boundary max error was {many_max_error}"
+        );
+    }
+
+    #[test]
+    fn palette_streams_are_bit_exact_with_dav1d() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // Two superblock rows exercise the normative color-cache reset at y=64.
+        let (w, h) = (128usize, 128usize);
+        for size in 2..=8usize {
+            let pixels: Vec<u8> = (0..w * h)
+                .map(|i| {
+                    let x = i % w;
+                    let y = i / w;
+                    7 + (((x / 4) + (y / 4)) % size) as u8 * 29
+                })
+                .collect();
+            let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+            let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+            assert_eq!(decode_obu(&decoder, &obu, &format!("{size}-color")), pixels);
+        }
+
+        let (w, h) = (70usize, 59usize);
+        let cropped: Vec<u8> = (0..w * h)
+            .map(|i| 19 + (((i % w) / 3 + (i / w) / 5) & 1) as u8 * 173)
+            .collect();
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &cropped).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        assert_eq!(decode_obu(&decoder, &obu, "cropped"), cropped);
+
+        let (w, h) = (64usize, 64usize);
+        let highbd: Vec<u16> = (0..w * h)
+            .map(|i| 11 + ((((i % w) / 4 + (i / w) / 4) % 8) as u16 * 137))
+            .collect();
+        let image = PlanarImage::from_luma(w, h, BitDepth::Ten, &highbd).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        let raw = decode_obu(&decoder, &obu, "10-bit");
+        let decoded: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        assert_eq!(decoded, highbd);
+
+        let y: Vec<u8> = (0..w * h)
+            .map(|i| 23 + ((((i % w) / 4 + (i / w) / 4) & 1) as u8 * 181))
+            .collect();
+        let u = vec![79u8; w * h];
+        let v = vec![167u8; w * h];
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [y.clone(), u.clone(), v.clone(), Vec::new()],
+        };
+        let obu = encode_lossless_obu(&image, None, 1).unwrap();
+        assert_eq!(decode_obu(&decoder, &obu, "444"), [y, u, v].concat());
+    }
 
     #[test]
     fn mono_lossless_deterministic_nonempty() {
@@ -903,14 +1650,14 @@ mod tests {
                 y[j * w + i] = (((i * 5 + j * 3) % 47) as i16) - 8;
             }
         }
-        let a = encode_tile_lossless_mono(w, h, 8, &y);
-        let b = encode_tile_lossless_mono(w, h, 8, &y);
+        let a = encode_tile_lossless_mono(w, h, w, h, 8, &y);
+        let b = encode_tile_lossless_mono(w, h, w, h, 8, &y);
         assert!(!a.is_empty(), "mono lossless output must be non-empty");
         assert_eq!(a, b, "mono lossless must be deterministic");
         // A mono leaf omits the uv_mode symbol + 2 chroma planes, so for the same
         // luma it must be strictly smaller than the 4:4:4 tile carrying that luma
         // in all three planes.
-        let c444 = encode_tile_lossless(w, h, 8, [&y, &y, &y]);
+        let c444 = encode_tile_lossless(w, h, w, h, 8, [&y, &y, &y]);
         assert!(
             a.len() < c444.len(),
             "mono ({}) must be smaller than 4:4:4 ({})",
@@ -932,9 +1679,9 @@ mod tests {
                     y[j * w + i] = (((i * 17 + j * 11) as i32) % (maxv + 1)) as i16;
                 }
             }
-            let p = encode_tile_lossless_mono(w, h, bd, &y);
+            let p = encode_tile_lossless_mono(w, h, w, h, bd, &y);
             assert!(!p.is_empty());
-            assert_eq!(p, encode_tile_lossless_mono(w, h, bd, &y));
+            assert_eq!(p, encode_tile_lossless_mono(w, h, w, h, bd, &y));
         }
     }
 }

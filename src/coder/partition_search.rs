@@ -427,6 +427,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, cfl_opt, px, py, 8, 16);
+            self.emit_palette_mode_info(px, py, 8, 16, DC_PRED, !self.mono, None);
             self.emit_filter_intra(DC_PRED, 8, 16, None);
             self.code_tx_depth(px, py, 8, 16, 0);
             let sv = block_skip as u8;
@@ -566,6 +567,7 @@ impl<'a> LossyTile<'a> {
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
         self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
+        self.emit_palette_mode_info(px, py, lw, lh, DC_PRED, !self.mono, None);
         self.emit_filter_intra(DC_PRED, lw, lh, None);
         self.code_tx_depth(px, py, lw, lh, 0);
         let sv = block_skip as u8;
@@ -676,6 +678,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, 16, 8);
+            self.emit_palette_mode_info(px, py, 16, 8, DC_PRED, !self.mono, None);
             self.emit_filter_intra(DC_PRED, 16, 8, None);
             self.code_tx_depth(px, py, 16, 8, 0);
             let sv = block_skip as u8;
@@ -842,6 +845,7 @@ impl<'a> LossyTile<'a> {
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
             self.emit_uv_mode(DC_PRED, DC_PRED, cfl_opt, px, py, 16, 8);
+            self.emit_palette_mode_info(px, py, 16, 8, DC_PRED, !self.mono, None);
             self.emit_filter_intra(DC_PRED, 16, 8, None);
             self.code_tx_depth(px, py, 16, 8, 0);
             // footprint update: skip/mode over 4 wide x 2 tall units.
@@ -1532,6 +1536,7 @@ impl<'a> LossyTile<'a> {
         self.push_luma_sel(LumaSel {
             mode: best_mode as u8,
             delta: best_delta as i8,
+            palette: 0,
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             // No IDTX sub-search at 16x16; txtp16 covers DCT/ADST/asym/split.
             tx: if txtp16 == 4 {

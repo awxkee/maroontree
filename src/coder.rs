@@ -52,6 +52,13 @@ use crate::quant::QmLevels;
 #[cfg(test)]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) static LOSSY_PALETTE_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOSSY_PALETTE_RESIDUAL_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(not(test))]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -205,28 +212,32 @@ fn inv_chroma_4x8(tx: ChromaTx, levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
 }
 
 pub(crate) struct Cdfs {
-    pub(crate) skip: Vec<Vec<u16>>,               // block skip [3 ctx]
-    pub(crate) part_bl8: Vec<Vec<u16>>,           // PARTITION_NONE @ 8x8 [4 ctx]
-    pub(crate) part_split: Vec<Vec<Vec<u16>>>,    // SPLIT [bl-1=0..3][4 ctx]
-    pub(crate) kf_y: Vec<Vec<u16>>,               // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
-    pub(crate) uv_mode: Vec<Vec<u16>>,            // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
-    pub(crate) angle_delta: Vec<Vec<u16>>,        // angle_delta[8 directional modes]
-    pub(crate) filter_intra: Vec<Vec<u16>>,       // use_filter_intra [BLOCK_SIZES_ALL]
-    pub(crate) filter_intra_mode: Vec<u16>,       // five filter-intra predictors
-    pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
-    pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
-    pub(crate) txsz: [Vec<Vec<u16>>; 4],          // intra tx_depth [t_dim.max-1][3 ctx]
-    pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
-    pub(crate) txtp4: Vec<Vec<u16>>,              // intra txtp TX_4X4 luma, per intra mode [13]
-    pub(crate) txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
-    pub(crate) txb_skip: [Vec<Vec<u16>>; 4],      // [class][13 ctx] (class 3 = TX_32X32)
+    pub(crate) skip: Vec<Vec<u16>>,                 // block skip [3 ctx]
+    pub(crate) part_bl8: Vec<Vec<u16>>,             // PARTITION_NONE @ 8x8 [4 ctx]
+    pub(crate) part_split: Vec<Vec<Vec<u16>>>,      // SPLIT [bl-1=0..3][4 ctx]
+    pub(crate) kf_y: Vec<Vec<u16>>, // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
+    pub(crate) uv_mode: Vec<Vec<u16>>, // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
+    pub(crate) angle_delta: Vec<Vec<u16>>, // angle_delta[8 directional modes]
+    pub(crate) filter_intra: Vec<Vec<u16>>, // use_filter_intra [BLOCK_SIZES_ALL]
+    pub(crate) filter_intra_mode: Vec<u16>, // five filter-intra predictors
+    pub(crate) palette_y_mode: Vec<Vec<Vec<u16>>>, // [7 bsize ctx][3 neighbor ctx]
+    pub(crate) palette_y_size: Vec<Vec<u16>>, // [7 bsize ctx], sizes 2..8
+    pub(crate) palette_uv_mode: [Vec<u16>; 2], // luma palette absent/present
+    pub(crate) palette_y_color: Vec<Vec<Vec<u16>>>, // [size-2][5 map ctx]
+    pub(crate) cfl_sign: Vec<u16>,  // cfl joint-sign (8 symbols)
+    pub(crate) cfl_alpha: Vec<Vec<u16>>, // cfl alpha magnitude [6 ctx]
+    pub(crate) txsz: [Vec<Vec<u16>>; 4], // intra tx_depth [t_dim.max-1][3 ctx]
+    pub(crate) txtp: Vec<Vec<u16>>, // intra txtp TX_8X8 luma, per intra mode [13]
+    pub(crate) txtp4: Vec<Vec<u16>>, // intra txtp TX_4X4 luma, per intra mode [13]
+    pub(crate) txtp16: Vec<Vec<u16>>, // intra txtp TX_16X16 luma, per intra mode [13]
+    pub(crate) txb_skip: [Vec<Vec<u16>>; 4], // [class][13 ctx] (class 3 = TX_32X32)
     pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
-    pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][21 ctx]
+    pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][21 ctx]
     pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][4 ctx]
-    pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4],   // [class][plane][11 bins], each a 2-sym CDF
-    pub(crate) dc_sign: [Vec<Vec<u16>>; 2],       // [plane][3 ctx]
-    pub(crate) eob_bin_16_c: Vec<u16>,            // chroma, 4x4
-    pub(crate) eob_bin_16_l: Vec<u16>,            // luma, 4x4
+    pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][11 bins], each a 2-sym CDF
+    pub(crate) dc_sign: [Vec<Vec<u16>>; 2], // [plane][3 ctx]
+    pub(crate) eob_bin_16_c: Vec<u16>, // chroma, 4x4
+    pub(crate) eob_bin_16_l: Vec<u16>, // luma, 4x4
     pub(crate) eob_bin_32_c: Vec<u16>,
     pub(crate) eob_bin_32_l: Vec<u16>,
     pub(crate) eob_bin_64_l: Vec<u16>,   // luma, 8x8
@@ -383,6 +394,10 @@ impl Cdfs {
                 .map(|&threshold| icdf(&[threshold]))
                 .collect(),
             filter_intra_mode: icdf(&FILTER_INTRA_MODE_CDF),
+            palette_y_mode: palette_y_mode_cdfs(),
+            palette_y_size: palette_y_size_cdfs(),
+            palette_uv_mode: [icdf(&[32461]), icdf(&[21488])],
+            palette_y_color: palette_y_color_cdfs(),
             cfl_sign: icdf(&CFL_SIGN_CDF),
             cfl_alpha: CFL_ALPHA_CDF.iter().map(|r| icdf(r)).collect(),
             uv_mode: {
@@ -689,14 +704,16 @@ struct LossyTile<'a> {
     a_tx: Vec<i8>,
     /// Per-4x4-row coded-TX log2-height (dav1d `l->tx_intra`).
     l_tx: Vec<i8>,
-    a_part: Vec<u8>,    // len w/8, absolute x8
-    l_part: Vec<u8>,    // len h/8, absolute y8
-    a_skip: Vec<u8>,    // block skip flag per 4x4 col, absolute bx4
-    l_skip: Vec<u8>,    // block skip flag per 4x4 row, absolute by4
-    a_mode: Vec<u8>,    // luma intra mode per 4x4 col (for kf y-mode context)
-    l_mode: Vec<u8>,    // luma intra mode per 4x4 row
-    a_uv_mode: Vec<u8>, // chroma intra mode above each luma 4x4 column
-    l_uv_mode: Vec<u8>, // chroma intra mode left of each luma 4x4 row
+    a_part: Vec<u8>,          // len w/8, absolute x8
+    l_part: Vec<u8>,          // len h/8, absolute y8
+    a_skip: Vec<u8>,          // block skip flag per 4x4 col, absolute bx4
+    l_skip: Vec<u8>,          // block skip flag per 4x4 row, absolute by4
+    a_mode: Vec<u8>,          // luma intra mode per 4x4 col (for kf y-mode context)
+    l_mode: Vec<u8>,          // luma intra mode per 4x4 row
+    a_uv_mode: Vec<u8>,       // chroma intra mode above each luma 4x4 column
+    l_uv_mode: Vec<u8>,       // chroma intra mode left of each luma 4x4 row
+    a_palette: Vec<Vec<i32>>, // luma palette colors above each 4x4 column
+    l_palette: Vec<Vec<i32>>, // luma palette colors left of each 4x4 row
     blk4: Vec<u8>, // luma block WIDTH (in 4-sample units) per 4x4 luma unit; for the deblock filter (vertical edges)
     blk4h: Vec<u8>, // luma block HEIGHT (in 4-sample units) per 4x4 luma unit; for the deblock filter (horizontal edges)
     blk4v: Vec<bool>, // true where a luma block starts at this 4x4 column
@@ -758,6 +775,7 @@ struct LossyTile<'a> {
 // access without widening the encoder's internal API.
 include!("coder/replay.rs");
 include!("coder/lossy_state.rs");
+include!("coder/palette.rs");
 include!("coder/partition_search.rs");
 include!("coder/block16.rs");
 include!("coder/block8.rs");
@@ -3262,17 +3280,21 @@ pub(crate) fn encode_lossless_frame_obus(
     bd: u8,
     w8: usize,
     h8: usize,
+    visible_w: usize,
+    visible_h: usize,
     src: &[Vec<i16>; 3],
     threads: usize,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, src, &pool);
+    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, visible_w, visible_h, src, &pool);
     assemble_lossless_frame_obus(&plan, &tilegroup)
 }
 
 fn encode_one_lossless_tile(
     bd: u8,
     full_w: usize,
+    visible_w: usize,
+    visible_h: usize,
     src: &[Vec<i16>; 3],
     r: &(usize, usize, usize, usize),
 ) -> Vec<u8> {
@@ -3280,13 +3302,17 @@ fn encode_one_lossless_tile(
     let p0 = crop_plane(&src[0], full_w, x0, y0, tw, th);
     let p1 = crop_plane(&src[1], full_w, x0, y0, tw, th);
     let p2 = crop_plane(&src[2], full_w, x0, y0, tw, th);
-    crate::tile::encode_tile_lossless(tw, th, bd, [&p0, &p1, &p2])
+    let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
+    let tile_visible_h = visible_h.saturating_sub(y0).min(th);
+    crate::tile::encode_tile_lossless(tw, th, tile_visible_w, tile_visible_h, bd, [&p0, &p1, &p2])
 }
 
 fn encode_lossless_tilegroup(
     bd: u8,
     w8: usize,
     h8: usize,
+    visible_w: usize,
+    visible_h: usize,
     src: &[Vec<i16>; 3],
     pool: &Pool,
 ) -> (Vec<u8>, Tiling) {
@@ -3317,7 +3343,7 @@ fn encode_lossless_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile(bd, w8, src, &rects[i])
+        encode_one_lossless_tile(bd, w8, visible_w, visible_h, src, &rects[i])
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3348,12 +3374,16 @@ fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
 fn encode_one_lossless_tile_mono(
     bd: u8,
     full_w: usize,
+    visible_w: usize,
+    visible_h: usize,
     luma: &[i16],
     r: &(usize, usize, usize, usize),
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
-    crate::tile::encode_tile_lossless_mono(tw, th, bd, &p0)
+    let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
+    let tile_visible_h = visible_h.saturating_sub(y0).min(th);
+    crate::tile::encode_tile_lossless_mono(tw, th, tile_visible_w, tile_visible_h, bd, &p0)
 }
 
 /// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res
@@ -3364,6 +3394,8 @@ fn encode_lossless_mono_tilegroup(
     bd: u8,
     w8: usize,
     h8: usize,
+    visible_w: usize,
+    visible_h: usize,
     luma: &[i16],
     pool: &Pool,
 ) -> (Vec<u8>, Tiling) {
@@ -3393,7 +3425,7 @@ fn encode_lossless_mono_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile_mono(bd, w8, luma, &rects[i])
+        encode_one_lossless_tile_mono(bd, w8, visible_w, visible_h, luma, &rects[i])
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3428,11 +3460,14 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     bd: u8,
     w8: usize,
     h8: usize,
+    visible_w: usize,
+    visible_h: usize,
     luma: &[i16],
     threads: usize,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) = encode_lossless_mono_tilegroup(bd, w8, h8, luma, &pool);
+    let (tilegroup, plan) =
+        encode_lossless_mono_tilegroup(bd, w8, h8, visible_w, visible_h, luma, &pool);
     assemble_lossless_mono_frame_obus(&plan, &tilegroup)
 }
 

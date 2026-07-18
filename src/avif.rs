@@ -239,6 +239,11 @@ impl EncodeConfig {
         self
     }
 
+    pub fn without_cicp(mut self) -> Self {
+        self.color_encoding = None;
+        self
+    }
+
     pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
         self.icc = Some(icc);
         self

@@ -174,10 +174,12 @@ fn frame_header_lossless_impl(
     // (reduced_still_picture_header => frame_type=KEY_FRAME, show_frame=1,
     //  error_resilient_mode=1, frame_size_override=0, etc., none coded)
     w.flag(true); // disable_cdf_update = 1 (encoder is non-adaptive; decoder must not adapt)
-    w.flag(false); // allow_screen_content_tools (seq force = SELECT)
-    // (allow_screen_content_tools=0 => no force_integer_mv; FrameIsIntra)
+    // The lossless tile writer evaluates AV1 palette mode for every eligible
+    // block, so screen-content tools must be enabled even when no block wins.
+    w.flag(true); // allow_screen_content_tools (seq force = SELECT)
+    w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    // (allow_intrabc not coded since screen content tools off)
+    w.flag(false); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     for &b in cols_incr {
         w.flag(b);
@@ -387,8 +389,10 @@ fn frame_header_lossy_impl(
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
     w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive image path, 1 = static isolated APIs)
-    w.flag(false); // allow_screen_content_tools
+    w.flag(true); // allow_screen_content_tools (lossy luma palette enabled)
+    w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
+    w.flag(false); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     // increment_tile_cols_log2 / increment_tile_rows_log2: walk from the
     // decoder's derived minimum up to the chosen TileColsLog2 / TileRowsLog2.

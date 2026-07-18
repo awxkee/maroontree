@@ -780,6 +780,52 @@ pub(crate) fn paeth_pred(
     }
 }
 
+/// AV1 palette predictor.
+///
+/// `indices` contains two palette indices per byte: the low nibble selects the
+/// even pixel and the high nibble selects the odd pixel.  AV1 palettes contain
+/// at most eight entries, so only the low three bits of either nibble are used.
+/// Index rows are tightly packed with a stride of `bw.div_ceil(2)`, while the
+/// destination may have a larger, caller-provided stride.
+pub(crate) fn palette_pred(
+    dst: &mut [i32],
+    dst_stride: usize,
+    palette: &[i32],
+    indices: &[u8],
+    bw: usize,
+    bh: usize,
+) {
+    assert!((2..=8).contains(&palette.len()));
+    assert!(dst_stride >= bw);
+
+    let index_stride = bw.div_ceil(2);
+    assert!(indices.len() >= index_stride * bh);
+    let dst_len = if bh == 0 {
+        0
+    } else {
+        (bh - 1) * dst_stride + bw
+    };
+    assert!(dst.len() >= dst_len);
+
+    for y in 0..bh {
+        let dst_row = &mut dst[y * dst_stride..y * dst_stride + bw];
+        let index_row = &indices[y * index_stride..(y + 1) * index_stride];
+        let (pairs, remainder) = dst_row.as_chunks_mut::<2>();
+        for (pair, &packed) in pairs.iter_mut().zip(index_row) {
+            let lo = (packed & 7) as usize;
+            let hi = ((packed >> 4) & 7) as usize;
+            assert!(lo < palette.len() && hi < palette.len());
+            pair[0] = palette[lo];
+            pair[1] = palette[hi];
+        }
+        if let Some(last) = remainder.first_mut() {
+            let index = (index_row[bw / 2] & 7) as usize;
+            assert!(index < palette.len());
+            *last = palette[index];
+        }
+    }
+}
+
 /// AV1 SMOOTH predictor (4-tap vertical+horizontal weighted blend), bit-exact to
 /// dav1d `ipred_smooth_c`. Dispatches to a NEON+MAC kernel on aarch64, scalar
 /// elsewhere. `top`/`left` hold the prepared edges; output is row-major `bw*bh`.
@@ -1061,6 +1107,32 @@ pub(crate) fn dc_pred_16x32(recon: &[i32], stride: usize, ox: usize, oy: usize, 
 #[cfg(test)]
 mod intra_edge_tests {
     use super::*;
+
+    #[test]
+    fn palette_predicts_packed_indices_into_strided_destination() {
+        let palette = [3, 17, 42, 99, 255, 511, 777, 1023];
+        let indices = [0x10, 0x32, 0x04, 0x76, 0x54, 0x03];
+        let mut dst = [-1; 16];
+
+        palette_pred(&mut dst, 8, &palette, &indices, 5, 2);
+
+        assert_eq!(&dst[..5], &[3, 17, 42, 99, 255]);
+        assert_eq!(&dst[8..13], &[777, 1023, 255, 511, 99]);
+        assert_eq!(&dst[5..8], &[-1; 3]);
+        assert_eq!(&dst[13..], &[-1; 3]);
+    }
+
+    #[test]
+    fn palette_accepts_all_normative_sizes() {
+        for size in 2..=8 {
+            let palette: Vec<i32> = (0..size as i32).map(|v| v * 100).collect();
+            let last = (size - 1) as u8;
+            let indices = [last | (last << 4)];
+            let mut dst = [0; 2];
+            palette_pred(&mut dst, 2, &palette, &indices, 2, 1);
+            assert_eq!(dst, [palette[size - 1]; 2]);
+        }
+    }
 
     #[test]
     fn filter_intra_constant_edges_stay_constant() {

@@ -28,10 +28,7 @@
  */
 mod y4m2ivf;
 
-use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_rgb8,
-};
+use maroontree::{av2_map_quality, encode_lossless, encode_rgb8, Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed, TxPart};
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
@@ -56,7 +53,9 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    let img = image::open("./assets/Screenshot 2026-07-18 at 16.09.09.png")
+        .unwrap()
+        .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -66,12 +65,12 @@ fn main() {
     .unwrap();
     for _i in 0..15 {
         let instant = Instant::now();
-        let out = encode_rgb8(
+        let out = encode_lossless(
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(67)
                 .with_cicp(Cicp::srgb_ycbcr())
-                .with_chroma(ChromaFormat::Yuv420)
+                .with_chroma(ChromaFormat::Yuv444)
                 .with_speed(Speed::Fast)
                 .with_threads(12)
                 .with_variance_boost(true),

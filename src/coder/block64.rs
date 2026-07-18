@@ -363,6 +363,7 @@ impl<'a> LossyTile<'a> {
         self.push_luma_sel(LumaSel {
             mode: y_mode as u8,
             delta: 0,
+            palette: 0,
             filter: NO_FILTER,
             tx: TxSel::SplitDct,
         });
@@ -392,6 +393,7 @@ impl<'a> LossyTile<'a> {
         self.enc
             .encode_symbol(DC_PRED, &mut self.cdfs.uv_mode[y_mode]);
         self.commit_uv_mode(px, py, 64, 64, DC_PRED);
+        self.emit_palette_mode_info(px, py, 64, 64, y_mode, !self.mono, None);
         // filter_intra is disallowed for max(w,h) > 32, so no symbol here.
         self.code_tx_depth(px, py, 64, 64, 1);
         let sv = block_skip as u8;

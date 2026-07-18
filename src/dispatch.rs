@@ -347,6 +347,8 @@ pub(crate) fn encode_lossless_monochrome(
         bit_depth,
         padded_width,
         padded_height,
+        width,
+        height,
         &padded,
         threads,
     ));

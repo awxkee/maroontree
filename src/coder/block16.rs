@@ -136,6 +136,7 @@ impl<'a> LossyTile<'a> {
             );
         }
         self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 16, 16);
+        self.emit_palette_mode_info(px, py, 16, 16, y_mode, !self.mono, None);
         self.emit_filter_intra(y_mode, 16, 16, filter_intra);
         self.code_tx_depth(px, py, 16, 16, (txtp16 == 4) as usize);
         // Intra-edge smooth-filter flag: dav1d derives it ONCE at the block
@@ -1190,6 +1191,7 @@ impl<'a> LossyTile<'a> {
             self.push_luma_sel(LumaSel {
                 mode: best_mode as u8,
                 delta: 0,
+                palette: 0,
                 filter: NO_FILTER,
                 tx: TxSel::Dct,
             });
@@ -1363,6 +1365,7 @@ impl<'a> LossyTile<'a> {
                     self.emit_uv_mode(best_mode, DC_PRED, None, bx, by, 4, 4);
                 }
             }
+            self.emit_palette_mode_info(bx, by, 4, 4, best_mode, has_chroma, None);
             self.emit_filter_intra(best_mode, 4, 4, None);
             self.tx_ctx_update4(bx, by);
 

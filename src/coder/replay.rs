@@ -83,6 +83,8 @@ const NO_FILTER: u8 = 0xff;
 struct LumaSel {
     mode: u8,
     delta: i8,
+    /// Selected luma palette size, or zero for ordinary intra prediction.
+    palette: u8,
     /// Winning `FilterIntraMode as u8`, or [`NO_FILTER`].
     filter: u8,
     tx: TxSel,

@@ -56,6 +56,7 @@ impl<'a> LossyTile<'a> {
         let mut best_dct_sse = 0i64;
         let mut best_dct_bits = 0f32;
         let mut best_filter_intra = None;
+        let mut best_palette: Option<LossyLumaPalette> = None;
         let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
         let mut ltf = [0f32; 64]; // winner transform coeffs (f32, for winner-only RDOQ)
         let modes = if self.speed.reduced_modes() {
@@ -145,6 +146,76 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra = None;
             }
         }
+        if rl.is_none() {
+            for n in 2..=8 {
+                let Some(palette) = lossy_luma_palette(&self.src[0], self.w, px, py, n) else {
+                    continue;
+                };
+                let mut pred = [0i32; 64];
+                palette_pred(
+                    &mut pred,
+                    8,
+                    &palette.colors,
+                    &palette.packed_map,
+                    8,
+                    8,
+                );
+                let mut resid = [0i32; 64];
+                crate::rd_sse::residual_pred(
+                    &mut resid,
+                    &pred,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    8,
+                    8,
+                );
+                let (mut cf, tf) = forward_dct_quant_8x8_t(&resid, &self.quant);
+                if self.speed.per_candidate_rdoq() {
+                    trellis_optimize_ctx(
+                        &mut cf,
+                        &tf,
+                        dcq,
+                        acq,
+                        &SCAN_8X8,
+                        lam,
+                        8,
+                        self.dcdf(),
+                        1,
+                        0,
+                        &self.dcdf().eob_bin_64_l,
+                        dc_sgn,
+                    );
+                }
+                let rr = idct_dequant_8x8(&cf, &self.quant);
+                let sse = sse_recon::<64, 8>(
+                    &pred,
+                    &rr,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    self.bd,
+                );
+                let coeff_bits = block_rate_bits(&cf, &SCAN_8X8);
+                let bits = coeff_bits
+                    + mode_signal_bits(DC_PRED)
+                    + palette_signal_bits(&palette, self.bd);
+                let cost = rd_cost_i64(sse, mlam, bits);
+                if cost < best_eff {
+                    best_eff = cost;
+                    best_mode = DC_PRED;
+                    best_filter_intra = None;
+                    best_palette = Some(palette);
+                    lpred_arr = pred;
+                    lcf = cf;
+                    ltf = tf;
+                    best_dct_sse = sse;
+                    best_dct_bits = coeff_bits;
+                }
+            }
+        }
         if rl.is_none() && self.speed == Speed::Slow {
             let bsize = av1_block_size_index(8, 8);
             for filter_mode in FILTER_INTRA_MODES {
@@ -213,6 +284,7 @@ impl<'a> LossyTile<'a> {
                     best_dct_sse = sse;
                     best_dct_bits = bits;
                     best_filter_intra = Some(filter_mode);
+                    best_palette = None;
                 }
             }
         }
@@ -341,7 +413,10 @@ impl<'a> LossyTile<'a> {
         // it grows away from the reference edge in one direction (wants ADST
         // there) and is flat across it (wants DCT). ADST_DCT = vertical ADST,
         // DCT_ADST = horizontal ADST. Each competes with the running tx winner.
-        if rl.is_none() && self.speed.try_adst() && asym_adst_enabled() {
+        if rl.is_none()
+            && self.speed.try_adst()
+            && asym_adst_enabled()
+        {
             for (fwd_t, inv_is_dctadst) in [(false, false), (true, true)] {
                 let mut resid = [0i32; 64];
                 crate::rd_sse::residual_pred(
@@ -443,6 +518,11 @@ impl<'a> LossyTile<'a> {
             best_is_idtx = r.tx == TxSel::Idtx;
             best_is_adstdct = r.tx == TxSel::AdstDct;
             best_is_dctadst = r.tx == TxSel::DctAdst;
+            best_palette = if r.palette == 0 {
+                None
+            } else {
+                lossy_luma_palette(&self.src[0], self.w, px, py, r.palette as usize)
+            };
         }
         if let Some(cf) = rl_cf {
             lcf.copy_from_slice(&cf);
@@ -450,6 +530,7 @@ impl<'a> LossyTile<'a> {
         self.push_luma_sel(LumaSel {
             mode: best_mode as u8,
             delta: best_delta as i8,
+            palette: best_palette.as_ref().map_or(0, |p| p.colors.len() as u8),
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             tx: TxSel::from_flags(
                 best_is_adst,
@@ -747,8 +828,17 @@ impl<'a> LossyTile<'a> {
                 ccf8[ci].iter().all(|&c| c == 0)
             }
         };
-        let block_skip =
-            lcf.iter().all(|&c| c == 0) && (self.mono || (chroma_zero(0) && chroma_zero(1)));
+        // Palette color indices are carried with the transform-token payload;
+        // an intra skip block has no such payload, so palette blocks must code
+        // `skip_txfm = 0` even when every quantized residual is zero.
+        let block_skip = best_palette.is_none()
+            && lcf.iter().all(|&c| c == 0)
+            && (self.mono || (chroma_zero(0) && chroma_zero(1)));
+        #[cfg(test)]
+        if best_palette.is_some() && lcf.iter().any(|&c| c != 0) && !self.enc.sink {
+            LOSSY_PALETTE_RESIDUAL_EMITTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // block-level mode info: skip (ctx = above_skip + left_skip), y/uv = DC
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
@@ -1320,7 +1410,13 @@ impl<'a> LossyTile<'a> {
                 8,
             );
         }
-        self.emit_filter_intra(best_mode, 8, 8, best_filter_intra);
+        self.emit_palette_mode_info(px, py, 8, 8, best_mode, !self.mono, best_palette.as_ref());
+        if best_palette.is_none() {
+            self.emit_filter_intra(best_mode, 8, 8, best_filter_intra);
+        }
+        if let Some(palette) = best_palette.as_ref() {
+            self.emit_palette_map(palette);
+        }
         self.code_tx_depth(px, py, 8, 8, 0);
         let sv = block_skip as u8;
         self.a_skip[bx4] = sv;
