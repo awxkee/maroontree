@@ -26,8 +26,23 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::aq_common::f_fmlaf;
 
 impl<'a> LossyTile<'a> {
+    /// CDFs used by DECISION-side rate estimates (RDOQ trellis, filter-intra /
+    /// angle-delta costs): the frozen [`Cdfs::decision_snapshot`], so decisions
+    /// are independent of SB coding order (SB-wavefront prerequisite). The
+    /// `MT_AV1_LIVE_DECIDE_CDF=1` escape hatch restores the historical
+    /// adaptive-cost behavior for A/B comparisons only.
+    #[inline]
+    fn dcdf(&self) -> &Cdfs {
+        if self.dec_live {
+            &self.cdfs
+        } else {
+            &self.dec_cdfs
+        }
+    }
+
     fn new(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<i32>; 3], qm: QmLevels) -> Self {
         LossyTile {
             bd,
@@ -43,6 +58,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -51,6 +68,8 @@ impl<'a> LossyTile<'a> {
             l_mode: vec![0; h / 4],
             a_uv_mode: vec![0; w / 4],
             l_uv_mode: vec![0; h / 4],
+            a_palette: vec![Vec::new(); w / 4],
+            l_palette: vec![Vec::new(); h / 4],
             blk4: vec![0; (w / 4) * (h / 4)],
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
@@ -59,6 +78,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -91,6 +115,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], Vec::new(), Vec::new()],
             a_coef: [vec![0x40; w / 4], Vec::new(), Vec::new()],
             l_coef: [vec![0x40; h / 4], Vec::new(), Vec::new()],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -99,6 +125,8 @@ impl<'a> LossyTile<'a> {
             l_mode: vec![0; h / 4],
             a_uv_mode: Vec::new(),
             l_uv_mode: Vec::new(),
+            a_palette: vec![Vec::new(); w / 4],
+            l_palette: vec![Vec::new(); h / 4],
             blk4: vec![0; (w / 4) * (h / 4)],
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
@@ -107,6 +135,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -138,6 +171,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -146,6 +181,8 @@ impl<'a> LossyTile<'a> {
             l_mode: vec![0; h / 4],
             a_uv_mode: vec![0; w / 4],
             l_uv_mode: vec![0; h / 4],
+            a_palette: vec![Vec::new(); w / 4],
+            l_palette: vec![Vec::new(); h / 4],
             blk4: vec![0; (w / 4) * (h / 4)],
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
@@ -154,6 +191,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -185,6 +227,8 @@ impl<'a> LossyTile<'a> {
             recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
             l_coef: [vec![0x40; h / 4], vec![0x40; ch / 4], vec![0x40; ch / 4]],
+            a_tx: vec![-1i8; w / 4],
+            l_tx: vec![-1i8; h / 4],
             a_part: vec![0; w / 8],
             l_part: vec![0; h / 8],
             a_skip: vec![0; w / 4],
@@ -193,6 +237,8 @@ impl<'a> LossyTile<'a> {
             l_mode: vec![0; h / 4],
             a_uv_mode: vec![0; w / 4],
             l_uv_mode: vec![0; h / 4],
+            a_palette: vec![Vec::new(); w / 4],
+            l_palette: vec![Vec::new(); h / 4],
             blk4: vec![0; (w / 4) * (h / 4)],
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
@@ -201,6 +247,11 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
+            dec_live: false,
+            sb_mode: SbMode::Off,
+            rec: DecisionRecord::default(),
+            cur: RecordCursor::default(),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -224,6 +275,31 @@ impl<'a> LossyTile<'a> {
             let cl = (l[by4] != 0x40 || l[by4 + 1] != 0x40) as usize;
             7 + ca + cl
         }
+    }
+
+    /// Luma `txb_skip` context for a transform SMALLER than its block (the
+    /// dav1d `get_skip_ctx` table path — the `tx == block` case is ctx 0, see
+    /// [`Self::skip_ctx`]): OR the per-4x4 coef bytes across the TX span,
+    /// strip the dc-sign marker bits, and index `dav1d_skip_ctx`.
+    fn skip_ctx_split(&self, bx4: usize, by4: usize, tw4: usize, th4: usize) -> usize {
+        const SKIP_CTX_TBL: [[u8; 5]; 5] = [
+            [1, 2, 2, 2, 3],
+            [2, 4, 4, 4, 5],
+            [2, 4, 4, 4, 5],
+            [2, 4, 4, 4, 5],
+            [3, 5, 5, 5, 6],
+        ];
+        let a = &self.a_coef[0];
+        let l = &self.l_coef[0];
+        let mut la = 0u8;
+        for i in 0..tw4 {
+            la |= a[bx4 + i];
+        }
+        let mut ll = 0u8;
+        for i in 0..th4 {
+            ll |= l[by4 + i];
+        }
+        SKIP_CTX_TBL[((la & 0x3f) as usize).min(4)][((ll & 0x3f) as usize).min(4)] as usize
     }
 
     fn dc_sign_ctx(&self, plane: usize, bx4: usize, by4: usize) -> usize {
@@ -456,42 +532,6 @@ impl<'a> LossyTile<'a> {
         (s != 0) as usize + (s > 0) as usize
     }
 
-    /// Decide whether to code the 16x16 region at (`x8`,`y8`) as a single
-    /// TX_16X16 (PARTITION_NONE) vs splitting into four 8x8. This is a pure R-D
-    /// proxy — the decoder follows whatever partition we signal, so the choice
-    /// affects compression only, never correctness. Proxy: compare the summed
-    /// absolute quantized luma levels of the one 16x16 transform (plus a small
-    /// per-block overhead) against the four 8x8 transforms (each with its own
-    /// overhead). Smooth regions compact into the 16x16 and win decisively.
-    /// Peak-to-peak luma range of the `dim`x`dim` source block at 8-unit origin
-    /// `(x8,y8)`. Smooth low-contrast blocks (small range) ring into visible
-    /// low-frequency banding under large transforms, so the partitioner uses it
-    /// to keep such blocks on small (8x8) transforms.
-    fn block_luma_range(&self, x8: usize, y8: usize, dim: usize) -> i32 {
-        let (px, py) = (x8 * 8, y8 * 8);
-        let mut lo = i32::MAX;
-        let mut hi = i32::MIN;
-        for ry in 0..dim {
-            let base = (py + ry) * self.w + px;
-            for &s in &self.src[0][base..base + dim] {
-                if s < lo {
-                    lo = s;
-                }
-                if s > hi {
-                    hi = s;
-                }
-            }
-        }
-        hi - lo
-    }
-
-    /// R-D proxy for coding an 8x8 luma region as one TX_8X8 (PARTITION_NONE)
-    /// vs splitting into four BLOCK_4X4. Runs the real non-directional mode
-    /// search (SSE + lambda*bits) for both options so the decision reflects
-    /// 4x4's per-quadrant mode diversity, not just a DC estimate. Returns
-    /// `true` to keep the 8x8 whole. Split is offered only for 4:2:0/4:4:4.
-    /// Mode-search lambda: libaom KF rdmult q-shape (`cost::mode_lambda_q`) times
-    /// the SSIMULACRA2 rdmult weight, AQ-correct via the active `self.quant`.
     #[inline]
     fn mlam(&self) -> f32 {
         mode_lambda_q(self.quant.dc_q() as f32) * self.tune_weight()
@@ -506,8 +546,7 @@ impl<'a> LossyTile<'a> {
     /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
     #[inline]
     fn tune_weight(&self) -> f32 {
-        let tune = TUNE_SSIMULACRA2.load(std::sync::atomic::Ordering::Relaxed);
-        mode_lambda_weight(self.base_q_idx, tune)
+        mode_lambda_weight(self.base_q_idx)
     }
 
     fn prefer_8x8_none(&self, x8: usize, y8: usize) -> bool {
@@ -639,6 +678,51 @@ impl<'a> LossyTile<'a> {
     /// (px, py). libaom's partition search uses exactly these per-candidate
     /// variance features (`block_var`, `horz_block_var[2]`, `sub_block_var[4]`)
     /// to steer and prune the decision before paying for full R-D.
+    /// Mean of a luma source region (native depth).
+    fn luma_mean(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
+        let mut sum = 0i64;
+        for ry in 0..h {
+            let row = &self.src[0][(py + ry) * self.w + px..];
+            for &s in &row[..w] {
+                sum += s as i64;
+            }
+        }
+        sum as f32 / (w * h) as f32
+    }
+
+    /// Banding-risk test for a `dim`x`dim` luma region: a smooth gentle
+    /// gradient (variance in a low band, 8-bit-normalized) whose quadrant
+    /// means still differ by at least one level step. Such a region's
+    /// low-frequency AC dies at the forward quantizer inside one large
+    /// transform (reconstructing as a flat band), while sub-transform DCs can
+    /// carry the ramp — the condition under which the TX-split decision gets a
+    /// perceptual bias (plain SSE undervalues banding by design).
+    fn banding_risk(&self, px: usize, py: usize, dim: usize) -> bool {
+        // High quality only: at coarse quantizers the sub-TX DCs quantize as
+        // coarsely as the big block's (no banding win) and the extra rate of
+        // four coded DCs is comparatively expensive.
+        if self.base_q_idx >= 100 {
+            return false;
+        }
+        let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
+        let pix_scale = 1.0 / (1u32 << (self.bd - 8)) as f32;
+        let var = self.luma_variance(px, py, dim, dim) * var_scale;
+        if !(3.0..100.0).contains(&var) {
+            return false;
+        }
+        let hd = dim / 2;
+        let m = [
+            self.luma_mean(px, py, hd, hd),
+            self.luma_mean(px + hd, py, hd, hd),
+            self.luma_mean(px, py + hd, hd, hd),
+            self.luma_mean(px + hd, py + hd, hd, hd),
+        ];
+        let (lo, hi) = m
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        (hi - lo) * pix_scale >= 1.0
+    }
+
     fn luma_variance(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
         let mut sum = 0i64;
         let mut sqsum = 0i64;
@@ -686,12 +770,7 @@ impl<'a> LossyTile<'a> {
         for plane in 1..=2 {
             let dc = pred(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             let mut resid = [0i32; N];
-            for ry in 0..ch {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for x in 0..cw {
-                    resid[ry * cw + x] = srow[x] - dc;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, cw, ch, dc);
             let (mut cf, tf) = fwd(&resid, &self.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = inv(&cf, &self.cquant);
@@ -1023,25 +1102,6 @@ impl<'a> LossyTile<'a> {
         };
     }
 
-    /// Begin a superblock at luma pixel `(sb_x, sb_y)`: pick the SB's quantizer
-    /// from its local activity, retarget `self.quant`/`self.cquant`, and arm the
-    /// `read_delta_qindex` token that the SB's first coded block will emit. No-op
-    /// when AQ is disabled, so the non-AQ path is byte-identical.
-    /// Emit `read_lr` for one 64x64 luma restoration unit at the start of a
-    /// superblock (spec 5.11.57/58). With `LoopRestorationSize = 64` there is
-    /// exactly one unit per SB whose top-left is the SB origin. When `self.wiener`
-    /// is `None` nothing is emitted (RESTORE_NONE planes have no LR syntax).
-    /// Emit `read_lr` for the restoration units that start in the superblock at
-    /// **tile-local** pixel `(sb_x, sb_y)` (spec 5.11.57). Loop-restoration units
-    /// are frame-relative, so the superblock position and unit counts are
-    /// computed in frame coordinates (`frame_x0/y0`, `frame_w/h`). With
-    /// `LoopRestorationSize = 64` most superblocks contain exactly one luma unit;
-    /// small partial edge superblocks merge into the previous unit (the unit
-    /// count uses `(frame+unit/2)/unit`) and emit zero units. Because units are
-    /// >= the 64x64 superblock size and aligned to the frame grid, each unit's
-    /// > top-left superblock lies in exactly one tile, so every unit is signaled
-    /// > exactly once across all tiles — no tile-boundary special-casing needed.
-    /// > Emits nothing when `self.wiener` is `None`.
     fn emit_lr_sb(&mut self, sb_x: usize, sb_y: usize) {
         let Some(unit) = self.wiener else {
             return;
@@ -1061,10 +1121,11 @@ impl<'a> LossyTile<'a> {
         );
     }
 
-    fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
-        if !self.aq.enabled {
-            return;
-        }
+    /// The AQ target qindex for the superblock at `(sb_x, sb_y)` — a pure
+    /// function of the SOURCE pixels and frame-level AQ constants (no running
+    /// state), which is what makes the whole per-SB qindex sequence
+    /// precomputable by [`precompute_aq_grid`] before any coding starts.
+    fn aq_sb_target(&self, sb_x: usize, sb_y: usize) -> i32 {
         let base_q = self.aq.base_q as i32;
         // Dark-structured-detail protection: an extra qindex reduction for dark SBs
         // carrying real cross-scale structure. Independent of the Variance Boost, it
@@ -1083,7 +1144,7 @@ impl<'a> LossyTile<'a> {
             self.h,
             dark_scale,
         );
-        let target = if self.aq.vb_enabled {
+        if self.aq.vb_enabled {
             // Variance Boost: pick the representative 8x8 variance at the configured
             // octile and map it to a qindex delta off the frame base. ref_act (the
             // tile mean whole-SB log-variance) anchors the coarse side, matching
@@ -1102,8 +1163,9 @@ impl<'a> LossyTile<'a> {
                 base_q
             } else {
                 let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.aq.vb_octile);
+                let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
                 let vb_delta = crate::aq_common::variance_boost_delta(
-                    picked,
+                    picked * var_scale,
                     self.aq.ref_act,
                     self.aq.vb_strength,
                     self.aq.vb_boost_only,
@@ -1132,7 +1194,20 @@ impl<'a> LossyTile<'a> {
                 vb_delta
             };
             (base_q + delta).clamp(1, 255)
-        };
+        }
+    }
+
+    /// Serial reference for the per-SB AQ state advance: compute the target,
+    /// quantize it against the running `cur_qidx` accumulator, and retarget the
+    /// quantizers. Kept as the bit-exactness oracle for [`precompute_aq_grid`]
+    /// (see the `aq_grid_matches_serial` unit test); the SB loop itself
+    /// consumes precomputed [`AqCell`]s via [`aq_begin_sb_cell`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
+        if !self.aq.enabled {
+            return;
+        }
+        let target = self.aq_sb_target(sb_x, sb_y);
         let step = 1i32 << self.aq.res_log2;
         let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
             .fast_round()
@@ -1140,8 +1215,52 @@ impl<'a> LossyTile<'a> {
         // The decoder applies Clip3(1,255, cur + steps*step); mirror it exactly so
         // both sides agree on the new qindex even when the clamp bites.
         let newq = (self.aq.cur_qidx + steps * step).clamp(1, 255);
+        self.aq_begin_sb_cell(&AqCell {
+            newq: newq as u8,
+            steps,
+        });
+    }
+
+    /// Precompute the whole tile's per-SB AQ sequence: a cheap serial raster
+    /// pass mirroring `aq_begin_sb`'s accumulator bit-exactly (the ONLY running
+    /// state is `cur_qidx`). The wavefront decides SBs out of raster order, so
+    /// it reads `grid[row * sb_cols + col]` instead of advancing the
+    /// accumulator; the serial emit uses `.steps` for the `read_delta_qindex`
+    /// token. Empty when AQ is off.
+    fn precompute_aq_grid(&self) -> Vec<AqCell> {
+        if !self.aq.enabled {
+            return Vec::new();
+        }
+        let rows = self.h.div_ceil(64);
+        let cols = self.w.div_ceil(64);
+        let mut grid = Vec::with_capacity(rows * cols);
+        let step = 1i32 << self.aq.res_log2;
+        let mut cur = self.aq.cur_qidx;
+        for r in 0..rows {
+            for c in 0..cols {
+                let target = self.aq_sb_target(c * 64, r * 64);
+                let steps = (((target - cur) as f32) / step as f32)
+                    .fast_round()
+                    .clamp(-(AQ_MAX_STEPS as f32), AQ_MAX_STEPS as f32)
+                    as i32;
+                let newq = (cur + steps * step).clamp(1, 255);
+                cur = newq;
+                grid.push(AqCell {
+                    newq: newq as u8,
+                    steps,
+                });
+            }
+        }
+        grid
+    }
+
+    /// Apply one precomputed [`AqCell`] at the start of a superblock: advance
+    /// the accumulator to the cell's qindex, arm the delta-q token, and
+    /// retarget the quantizers.
+    fn aq_begin_sb_cell(&mut self, cell: &AqCell) {
+        let newq = cell.newq as i32;
         self.aq.cur_qidx = newq;
-        self.aq.pending = steps;
+        self.aq.pending = cell.steps;
         self.aq.read_deltas = true;
         self.quant = Quant::new_with_qm(newq as u8, self.bd, self.quant.qm_level());
         // The chroma-DC delta is a frame-level constant (DeltaQUDc, derived from
@@ -1157,6 +1276,51 @@ impl<'a> LossyTile<'a> {
         );
     }
 
+    /// Emit the intra `tx_depth` symbol (spec `read_tx_size`) for a `w`x`h`-px
+    /// luma block at pixel (px, py), choosing `depth` size-halvings from the
+    /// block's max rect TX, then update the per-4x4 TX context rows with the
+    /// CHOSEN TX dims. Mirrors dav1d decode.c (intra `b->tx` read — coded for
+    /// every intra luma block > BLOCK_4X4, including skip blocks) + env.h
+    /// `get_tx_ctx`: cdf `txsz[t_dim.max - 1][ctx]`, `min(max, 2) + 1` symbols.
+    /// BLOCK_4X4 codes no symbol; callers use [`Self::tx_ctx_update4`].
+    fn code_tx_depth(&mut self, px: usize, py: usize, w: usize, h: usize, depth: usize) {
+        let l2 = |d: usize| -> i8 {
+            match d {
+                4 => 0,
+                8 => 1,
+                16 => 2,
+                32 => 3,
+                _ => 4,
+            }
+        };
+        let (max_lw, max_lh) = (l2(w), l2(h));
+        let cat = max_lw.max(max_lh) as usize - 1; // t_dim.max - 1 (max == max(lw, lh))
+        let (bx4, by4) = (px / 4, py / 4);
+        let ctx = (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
+        self.enc.encode_symbol(depth, &mut self.cdfs.txsz[cat][ctx]);
+        // Chosen TX dims: each depth step goes to `t_dim.sub` — the square of
+        // the smaller dim for rects, then square halvings (floor TX_4X4).
+        let (mut lw, mut lh) = (max_lw, max_lh);
+        for _ in 0..depth {
+            if lw != lh {
+                let m = lw.min(lh);
+                lw = m;
+                lh = m;
+            } else {
+                lw = (lw - 1).max(0);
+                lh = lw;
+            }
+        }
+        self.a_tx[bx4..bx4 + (w / 4).max(1)].fill(lw);
+        self.l_tx[by4..by4 + (h / 4).max(1)].fill(lh);
+    }
+
+    /// TX context update for a BLOCK_4X4 (no `tx_depth` symbol; TX is 4x4).
+    fn tx_ctx_update4(&mut self, px: usize, py: usize) {
+        self.a_tx[px / 4] = 0;
+        self.l_tx[py / 4] = 0;
+    }
+
     /// Emit a block's skip flag, then the `read_cdef()` / `read_delta_qindex()`
     /// per-SB tokens in spec `intra_frame_mode_info()` order. `read_cdef()`
     /// itself emits nothing here (cdef_bits is decided frame-level after the
@@ -1167,6 +1331,23 @@ impl<'a> LossyTile<'a> {
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
         if !block_skip && !self.cdef_point_marked {
+            self.cdef_point_marked = true;
+            self.enc.trace_cdef_mark();
+        }
+        self.code_delta_q_if_armed();
+    }
+
+    /// Whole-superblock counterpart of [`Self::code_skip_and_sb_tokens`]. AV1's
+    /// `read_delta_qindex()` returns immediately when `MiSize == sbSize && skip`,
+    /// so a skipped 64x64 block in a 64x64-superblock frame must not carry the
+    /// otherwise-per-SB delta-Q symbol.
+    fn code_skip_and_sb_tokens_64(&mut self, block_skip: bool, sctx: usize) {
+        self.enc
+            .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        if block_skip {
+            return;
+        }
+        if !self.cdef_point_marked {
             self.cdef_point_marked = true;
             self.enc.trace_cdef_mark();
         }
@@ -1231,8 +1412,73 @@ impl<'a> LossyTile<'a> {
         let n = (bw * bh) as f32;
         let mean = sum as f32 / n;
         let var = (sum2 as f32 / n - mean * mean).max(0.0);
-        let act = (1.0 + var).ln();
+        let act = dirty_log1pf(var);
         let c = prdo_clamp();
-        (k * (act - refa)).exp().clamp(1.0 / c, c)
+        let exponent = (k * (act - refa)).clamp(-std::f32::consts::LN_2, std::f32::consts::LN_2);
+        dirty_exp2f(exponent * std::f32::consts::LOG2_E).clamp(1.0 / c, c)
+    }
+}
+
+const EXP2_TABLE_SIZE: usize = 64;
+
+#[repr(align(64))]
+struct Exp2Table([u32; EXP2_TABLE_SIZE]);
+
+// 2^((i - 32) / 64), rounded to f32.
+#[rustfmt::skip]
+static EXP2F_TABLE: Exp2Table = Exp2Table([
+    0x3F3504F3, 0x3F36FD92, 0x3F38FBAF, 0x3F3AFF5B, 0x3F3D08A4, 0x3F3F179A, 0x3F412C4D, 0x3F4346CD,
+    0x3F45672A, 0x3F478D75, 0x3F49B9BE, 0x3F4BEC15, 0x3F4E248C, 0x3F506334, 0x3F52A81E, 0x3F54F35B,
+    0x3F5744FD, 0x3F599D16, 0x3F5BFBB8, 0x3F5E60F5, 0x3F60CCDF, 0x3F633F89, 0x3F65B907, 0x3F68396A,
+    0x3F6AC0C7, 0x3F6D4F30, 0x3F6FE4BA, 0x3F728177, 0x3F75257D, 0x3F77D0DF, 0x3F7A83B3, 0x3F7D3E0C,
+    0x3F800000, 0x3F8164D2, 0x3F82CD87, 0x3F843A29, 0x3F85AAC3, 0x3F871F62, 0x3F88980F, 0x3F8A14D5,
+    0x3F8B95C2, 0x3F8D1ADF, 0x3F8EA43A, 0x3F9031DC, 0x3F91C3D3, 0x3F935A2B, 0x3F94F4F0, 0x3F96942D,
+    0x3F9837F0, 0x3F99E046, 0x3F9B8D3A, 0x3F9D3EDA, 0x3F9EF532, 0x3FA0B051, 0x3FA27043, 0x3FA43516,
+    0x3FA5FED7, 0x3FA7CD94, 0x3FA9A15B, 0x3FAB7A3A, 0x3FAD583F, 0x3FAF3B79, 0x3FB123F6, 0x3FB311C4,
+]);
+
+#[inline(always)]
+pub(crate) fn dirty_exp2f(d: f32) -> f32 {
+    let redux = f32::from_bits(0x4b400000) / EXP2_TABLE_SIZE as f32;
+
+    let ui = (d + redux).to_bits();
+    let mut i0 = ui.wrapping_add(EXP2_TABLE_SIZE as u32 / 2);
+    let k = i0 / EXP2_TABLE_SIZE as u32;
+    i0 &= EXP2_TABLE_SIZE as u32 - 1;
+    let uf = f32::from_bits(ui) - redux;
+
+    let z0 = f32::from_bits(EXP2F_TABLE.0[i0 as usize]);
+    let f = d - uf;
+
+    // Sollya: fpminimax(2^x, 2, [|single...|], [-1/128; 1/128], relative);
+    let mut u = 0.24022668600082397;
+    u = f_fmlaf(u, f, 0.693149745464325);
+    u *= f;
+
+    let i2 = f32::from_bits(k.wrapping_add(0x7f) << 23);
+    f_fmlaf(u, z0, z0) * i2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perceptual_exp2_matches_system_exp() {
+        const SAMPLES: usize = 65_536;
+        let lo = -std::f32::consts::LN_2;
+        let hi = std::f32::consts::LN_2;
+        let mut max_relative_error = 0.0f32;
+        for i in 0..=SAMPLES {
+            let x = lo + (hi - lo) * (i as f32 / SAMPLES as f32);
+            let expected = x.exp();
+            let relative_error =
+                ((dirty_exp2f(x * std::f32::consts::LOG2_E) - expected) / expected).abs();
+            max_relative_error = max_relative_error.max(relative_error);
+        }
+        assert!(
+            max_relative_error <= 3.0e-7,
+            "maximum relative error {max_relative_error:e} exceeded the bound"
+        );
     }
 }

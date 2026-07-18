@@ -28,6 +28,28 @@
  */
 
 impl<'a> LossyTile<'a> {
+    fn emit_filter_intra(
+        &mut self,
+        y_mode: usize,
+        width: usize,
+        height: usize,
+        choice: Option<FilterIntraMode>,
+    ) {
+        if !filter_intra_allowed(y_mode, width, height) {
+            debug_assert!(choice.is_none());
+            return;
+        }
+        let bsize = av1_block_size_index(width, height);
+        self.enc.encode_symbol(
+            usize::from(choice.is_some()),
+            &mut self.cdfs.filter_intra[bsize],
+        );
+        if let Some(mode) = choice {
+            self.enc
+                .encode_symbol(mode as usize, &mut self.cdfs.filter_intra_mode);
+        }
+    }
+
     #[inline]
     fn luma_filter_type(&self, px: usize, py: usize) -> bool {
         let (bx4, by4) = (px / 4, py / 4);
@@ -231,19 +253,25 @@ impl<'a> LossyTile<'a> {
             // emit PARTITION_NONE, then the block. When the split scaffold is
             // forced (test-only), emit PARTITION_SPLIT and code four BLOCK_4X4.
             let ctx = get_partition_ctx(&self.a_part, &self.l_part, 4, x8, y8);
-            let split_eligible = !self.ss422 && !self.mono;
-            let want_split = split_eligible
-                && (FORCE_SPLIT4.load(std::sync::atomic::Ordering::Relaxed)
-                    || (SPLIT4_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-                        && !self.prefer_8x8_none(x8, y8)));
-            if want_split {
+            let r8 = self.part_decision(|t| {
+                let split_eligible = !t.ss422 && !t.mono;
+                let want_split = split_eligible
+                    && (FORCE_SPLIT4.load(std::sync::atomic::Ordering::Relaxed)
+                        || (SPLIT4_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                            && !t.prefer_8x8_none(x8, y8)));
+                if want_split {
+                    Part16::Split
+                } else {
+                    t.choose_rect8(x8, y8)
+                }
+            });
+            if r8 == Part16::Split {
                 self.enc.encode_symbol(3, &mut self.cdfs.part_bl8[ctx]); // SPLIT
                 self.code_block_split4_dc(x8, y8);
                 self.a_part[x8] = 0x1f;
                 self.l_part[y8] = 0x1f;
                 return;
             }
-            let r8 = self.choose_rect8(x8, y8);
             if r8 == Part16::Horz {
                 self.enc.encode_symbol(1, &mut self.cdfs.part_bl8[ctx]);
                 self.code_block8_rect(x8, y8, false);
@@ -273,8 +301,7 @@ impl<'a> LossyTile<'a> {
             let full_h = (x8 + 4) * 8 <= self.w;
             let full_v = (y8 + 4) * 8 <= self.h;
             if full_h && full_v {
-                let prefer_none = self.prefer_32x32(x8, y8);
-                let choice = self.choose_rect32(x8, y8, prefer_none);
+                let choice = self.part_decision(|t| t.choose_rect32(x8, y8));
                 let have_tr = thr && y8 > 0 && (x8 * 8 + 32) < self.w;
                 let have_bl = lhb && x8 > 0 && (y8 * 8 + 32) < self.h;
                 match choice {
@@ -320,15 +347,17 @@ impl<'a> LossyTile<'a> {
             let have_v = (y8 + 1) * 8 < self.h;
             if have_h && have_v {
                 // FORCE_HORZ (test) overrides the RD decision for 4:4:4.
-                let forced_horz = !self.ss420
-                    && !self.ss422
-                    && !self.mono
-                    && FORCE_HORZ.load(std::sync::atomic::Ordering::Relaxed);
-                let choice = if forced_horz {
-                    Part16::Horz
-                } else {
-                    self.partition_choice_16(x8, y8)
-                };
+                let choice = self.part_decision(|t| {
+                    let forced_horz = !t.ss420
+                        && !t.ss422
+                        && !t.mono
+                        && FORCE_HORZ.load(std::sync::atomic::Ordering::Relaxed);
+                    if forced_horz {
+                        Part16::Horz
+                    } else {
+                        t.partition_choice_16(x8, y8)
+                    }
+                });
                 match choice {
                     Part16::Horz => {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
@@ -430,6 +459,28 @@ impl<'a> LossyTile<'a> {
                     }
                     Part16::Split => { /* fall through to the SPLIT path below */ }
                 }
+            }
+        }
+        // BL_64X64 whole-superblock PARTITION_NONE (all chroma formats; 4:0:0
+        // has no whole-64 chroma path and keeps splitting), when the full 64x64
+        // is in-frame. Compared against SPLIT by real R-D in `choose_64`.
+        if sz8 == 8
+            && !self.mono
+            && BLOCK64_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && (x8 + 8) * 8 <= self.w
+            && (y8 + 8) * 8 <= self.h
+        {
+            let choice = self.part_decision(|t| t.choose_64(x8, y8));
+            if choice == Part16::None {
+                let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+                self.enc
+                    .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]);
+                let have_tr = thr && y8 > 0 && (x8 * 8 + 64) < self.w;
+                let have_bl = lhb && x8 > 0 && (y8 * 8 + 64) < self.h;
+                self.code_block64(x8, y8, have_tr, have_bl);
+                self.a_part[x8..x8 + 8].fill(0x10);
+                self.l_part[y8..y8 + 8].fill(0x10);
+                return;
             }
         }
         let hh = sz8 / 2;

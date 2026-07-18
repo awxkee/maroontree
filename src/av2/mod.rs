@@ -50,7 +50,7 @@ mod directional;
 mod entropy;
 mod fdct;
 mod headers;
-mod helpers;
+pub(crate) mod helpers;
 mod intrapred;
 pub(crate) mod itx;
 pub mod itx422;

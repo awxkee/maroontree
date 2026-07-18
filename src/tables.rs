@@ -36,6 +36,70 @@ pub(crate) fn icdf(args: &[u16]) -> Vec<u16> {
 
 pub(crate) static SKIP_CDF: [u16; 3] = [31671, 16515, 4576];
 
+pub(crate) static FILTER_INTRA_MODE_CDF: [u16; 4] = [8949, 12776, 17211, 29558];
+
+pub(crate) static FILTER_INTRA_CDF: [u16; 22] = [
+    4621, 6743, 5893, 7866, 12551, 9394, 12408, 14301, 12756, 22343, 16384, 16384, 16384, 16384,
+    16384, 16384, 12770, 10368, 20229, 18101, 16384, 16384,
+];
+
+pub(crate) const INTRA_FILTER_SCALE_BITS: u32 = 4;
+
+/// AV1 section 9 filter-intra taps. The eighth coefficient is padding in the
+/// reference table and is omitted here.
+pub(crate) static INTRA_FILTER_TAPS: [[[i8; 7]; 8]; 5] = [
+    [
+        [-6, 10, 0, 0, 0, 12, 0],
+        [-5, 2, 10, 0, 0, 9, 0],
+        [-3, 1, 1, 10, 0, 7, 0],
+        [-3, 1, 1, 2, 10, 5, 0],
+        [-4, 6, 0, 0, 0, 2, 12],
+        [-3, 2, 6, 0, 0, 2, 9],
+        [-3, 2, 2, 6, 0, 2, 7],
+        [-3, 1, 2, 2, 6, 3, 5],
+    ],
+    [
+        [-10, 16, 0, 0, 0, 10, 0],
+        [-6, 0, 16, 0, 0, 6, 0],
+        [-4, 0, 0, 16, 0, 4, 0],
+        [-2, 0, 0, 0, 16, 2, 0],
+        [-10, 16, 0, 0, 0, 0, 10],
+        [-6, 0, 16, 0, 0, 0, 6],
+        [-4, 0, 0, 16, 0, 0, 4],
+        [-2, 0, 0, 0, 16, 0, 2],
+    ],
+    [
+        [-8, 8, 0, 0, 0, 16, 0],
+        [-8, 0, 8, 0, 0, 16, 0],
+        [-8, 0, 0, 8, 0, 16, 0],
+        [-8, 0, 0, 0, 8, 16, 0],
+        [-4, 4, 0, 0, 0, 0, 16],
+        [-4, 0, 4, 0, 0, 0, 16],
+        [-4, 0, 0, 4, 0, 0, 16],
+        [-4, 0, 0, 0, 4, 0, 16],
+    ],
+    [
+        [-2, 8, 0, 0, 0, 10, 0],
+        [-1, 3, 8, 0, 0, 6, 0],
+        [-1, 2, 3, 8, 0, 4, 0],
+        [0, 1, 2, 3, 8, 2, 0],
+        [-1, 4, 0, 0, 0, 3, 10],
+        [-1, 3, 4, 0, 0, 4, 6],
+        [-1, 2, 3, 4, 0, 4, 4],
+        [-1, 2, 2, 3, 4, 3, 3],
+    ],
+    [
+        [-12, 14, 0, 0, 0, 14, 0],
+        [-10, 0, 14, 0, 0, 12, 0],
+        [-9, 0, 0, 14, 0, 11, 0],
+        [-8, 0, 0, 0, 14, 10, 0],
+        [-10, 12, 0, 0, 0, 0, 14],
+        [-9, 1, 12, 0, 0, 0, 12],
+        [-8, 0, 0, 12, 0, 1, 11],
+        [-7, 0, 0, 1, 12, 1, 9],
+    ],
+];
+
 /// `default_kf_y_mode_cdf[KF_MODE_CONTEXTS][KF_MODE_CONTEXTS]` (libaom), the
 /// keyframe luma intra-mode CDFs indexed by `[above_ctx][left_ctx]` (each ctx is
 /// `INTRA_MODE_CTX[neighbor_mode]`). `[0][0]` equals the former single
@@ -279,7 +343,6 @@ pub(crate) static SCAN_8X16: [u32; 128] = crate::coef_q::SCAN_8X16;
 pub(crate) static SCAN_16X8: [u32; 128] = crate::coef_q::SCAN_16X8;
 pub(crate) static SCAN_16X32: [u32; 512] = crate::coef_q::SCAN_16X32;
 pub(crate) static SCAN_32X16: [u32; 512] = crate::coef_q::SCAN_32X16;
-pub(crate) const OVERHEAD_16: u32 = 8;
 pub(crate) static SCAN_8X8: [u32; 64] = [
     0, 8, 1, 2, 9, 16, 24, 17, 10, 3, 4, 11, 18, 25, 32, 40, 33, 26, 19, 12, 5, 6, 13, 20, 27, 34,
     41, 48, 56, 49, 42, 35, 28, 21, 14, 7, 15, 22, 29, 36, 43, 50, 57, 58, 51, 44, 37, 30, 23, 31,
@@ -341,6 +404,20 @@ pub(crate) static PART_BL8_CDF: [[u16; 3]; 4] = [
     [12522, 23679, 28629],
     [9896, 18783, 25853],
 ];
+
+// dav1d `txsz` defaults (raw CDF args; apply icdf() at load): the intra
+// `tx_depth` symbol of spec `read_tx_size`, indexed [t_dim.max - 1][ctx].
+// Category 0 (max TX 8x8-class: TX_8X8/RTX_8X4/RTX_4X8) is a 2-symbol CDF
+// (depth 0 or 1); categories 1 (16x16-class) and 2 (32x32-class) are 3-symbol
+// (depth 0, 1 or 2). ctx in 0..=2 from the above/left coded TX dims
+// (dav1d env.h `get_tx_ctx`).
+pub(crate) static TXSZ_CAT0_CDF: [[u16; 1]; 3] = [[19968], [19968], [24320]];
+pub(crate) static TXSZ_CAT1_CDF: [[u16; 2]; 3] = [[12272, 30172], [12272, 30172], [18677, 30848]];
+pub(crate) static TXSZ_CAT2_CDF: [[u16; 2]; 3] = [[12986, 15180], [12986, 15180], [24302, 25602]];
+// Category 3 (max TX 64x64-class): 3-symbol CDF (depth 0/1/2 -> TX_64X64 /
+// TX_32X32 / TX_16X16). libaom `default_tx_size_cdf[3]` (av1/common/token_cdfs
+// family). Enables intra BLOCK_64X64 with a signaled tx_depth.
+pub(crate) static TXSZ_CAT3_CDF: [[u16; 2]; 3] = [[5782, 11475], [5782, 11475], [16803, 22759]];
 
 // dav1d 1.4.1 txtp_intra1[TX_4X4] (raw CDF6 args; apply icdf() at load).
 // Verified: txtp_intra1[TX_8X8] sibling == existing TXTP_INTRA1_TX8.

@@ -2123,6 +2123,86 @@ mod tests {
         Some((w, h, frames))
     }
 
+    // Diagnostic: inter-vs-intra leaf mode mix on a high-quality inter frame.
+    #[test]
+    #[ignore]
+    fn diagnose_inter_mode_mix() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/file_example_MP4_480_1_5MG.y4m");
+        let Some((_w, _h, frames)) = read_y4m_frames(&fixture, 8) else {
+            return;
+        };
+        // Crop to 64-aligned 256x256 to test whether the constant intra blocks are
+        // the partial edge SBs (which the whole-64-only inter residual can't code).
+        let aligned: Vec<PlanarImage<u8>> = frames
+            .iter()
+            .map(|f| {
+                let crop = |p: &[u8], stride: usize, w: usize, h: usize| {
+                    let mut o = vec![0u8; w * h];
+                    for y in 0..h {
+                        o[y * w..y * w + w].copy_from_slice(&p[y * stride..y * stride + w]);
+                    }
+                    o
+                };
+                PlanarImage {
+                    width: 256,
+                    height: 256,
+                    bit_depth: BitDepth::Eight,
+                    planes: [
+                        crop(&f.planes[0], 480, 256, 256),
+                        crop(&f.planes[1], 240, 128, 128),
+                        crop(&f.planes[2], 240, 128, 128),
+                        Vec::new(),
+                    ],
+                }
+            })
+            .collect();
+        for (label, fset) in [("full480x270", &frames), ("crop256x256", &aligned)] {
+            let q = 60u8;
+            let cfg = Av2Encoder::new(q).with_deblock(true).with_cdef(false);
+            let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+            enc.set_preset(VideoPreset::Reference);
+            enc.set_key_interval(30);
+            for (i, frame) in fset.iter().enumerate().take(5) {
+                crate::av2::y420::TOTAL_LEAF_COUNT.store(0, Relaxed);
+                crate::av2::y420::INTRA_LEAF_COUNT.store(0, Relaxed);
+                let pkt = enc.push_frame(frame, &Cicp::srgb_ycbcr()).unwrap();
+                if i == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "EDGE {label} frame{i} bytes={} leaves={} intra={}",
+                    pkt.data.len(),
+                    crate::av2::y420::TOTAL_LEAF_COUNT.load(Relaxed),
+                    crate::av2::y420::INTRA_LEAF_COUNT.load(Relaxed),
+                );
+            }
+        }
+        for q in [60u8, 120] {
+            let cfg = Av2Encoder::new(q).with_deblock(true).with_cdef(false);
+            let mut enc = Av2VideoEncoder::new(cfg, ChromaFormat::Yuv420, 1);
+            enc.set_preset(VideoPreset::Reference);
+            enc.set_key_interval(30);
+            for (i, frame) in frames.iter().enumerate() {
+                crate::av2::y420::TOTAL_LEAF_COUNT.store(0, Relaxed);
+                crate::av2::y420::INTRA_LEAF_COUNT.store(0, Relaxed);
+                crate::av2::y420::INTER_RESIDUAL_64_COUNT.store(0, Relaxed);
+                let pkt = enc.push_frame(frame, &Cicp::srgb_ycbcr()).unwrap();
+                if i == 0 {
+                    continue;
+                }
+                let total = crate::av2::y420::TOTAL_LEAF_COUNT.load(Relaxed);
+                let intra = crate::av2::y420::INTRA_LEAF_COUNT.load(Relaxed);
+                eprintln!(
+                    "MIX q={q} frame{i} bytes={} leaves={total} intra={intra} res64={}",
+                    pkt.data.len(),
+                    crate::av2::y420::INTER_RESIDUAL_64_COUNT.load(Relaxed),
+                );
+            }
+        }
+    }
+
     // Benchmark harness hook: encode the real clip to an IVF file at MT_ENC_Q,
     // MT_ENC_FRAMES frames, MT_ENC_KI key interval, written to MT_ENC_OUT.
     // Drives external comparisons (x264/x265/VMAF). `cargo test -- --ignored`.

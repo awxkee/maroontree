@@ -35,8 +35,22 @@ const INTER_BORDER_420: usize = 72;
 const ENABLE_DENSE_INTER_32: bool = true;
 const ENABLE_DENSE_INTER_16: bool = true;
 
+/// Compile each expensive leaf geometry as its own optimization unit. The
+/// boundary is once per coded leaf, outside transform and prediction kernels.
+#[inline(never)]
+fn outline_leaf_420<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 #[cfg(test)]
 pub(crate) static INTER_SKIP_32_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Total coded leaves and intra-coded leaves on the current frame (mode-mix diag).
+#[cfg(test)]
+pub(crate) static TOTAL_LEAF_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static INTRA_LEAF_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Whole-64 GLOBALMV-skip blocks committed on reference rank 1 (partition walk).
 #[cfg(test)]
@@ -205,6 +219,70 @@ struct WholeSbInterScratch<'a> {
     convolve_tmp: &'a mut Vec<i32>,
     luma_coeffs: &'a mut [Vec<Coeff>; 4],
     chroma_coeffs: &'a mut [Vec<Coeff>; 2],
+}
+
+struct InterLeafSearch420<'a> {
+    enc: &'a mut RangeEncoder,
+    source_y: &'a [f32],
+    source_u: &'a [f32],
+    source_v: &'a [f32],
+    luma_reference: &'a (Vec<f32>, usize, usize),
+    chroma_references: &'a [(Vec<f32>, usize); 2],
+    me_scratch: &'a mut me::MeScratch<f32>,
+    prediction_scratch: &'a mut InterPredScratch420,
+    source_stride: usize,
+    chroma_stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    reference_luma_stride: usize,
+    block_x: usize,
+    block_y: usize,
+    block_width: usize,
+    block_height: usize,
+    predictor_mv: Mv,
+    frame_mv_seed: Mv,
+    skip_ctx: usize,
+    mode_ctx: usize,
+    qstep: i32,
+}
+
+#[derive(Clone, Copy)]
+struct InterLeafCandidate420 {
+    mv: Mv,
+    mode: usize,
+    mvd: Option<Mv>,
+    rd_cost: f32,
+}
+
+struct DenseInterResidualInput420<'a> {
+    enc: &'a RangeEncoder,
+    source_y: &'a [f32],
+    source_u: &'a [f32],
+    source_v: &'a [f32],
+    prediction_y: &'a [f32],
+    prediction_u: &'a [f32],
+    prediction_v: &'a [f32],
+    source_stride: usize,
+    chroma_stride: usize,
+    block_x: usize,
+    block_y: usize,
+    block_size: usize,
+    residual_scale: f32,
+    qstep: i32,
+    skip_ctx: usize,
+    mode_ctx: usize,
+    inter_mode: usize,
+    mvd: Option<Mv>,
+}
+
+struct DenseInterResidual420 {
+    rd_cost: f32,
+    y_coeffs: Vec<Coeff>,
+    u_coeffs: Vec<Coeff>,
+    v_coeffs: Vec<Coeff>,
+    y_recon: [f32; 32 * 32],
+    u_recon: Vec<f32>,
+    v_recon: Vec<f32>,
 }
 
 impl InterPredScratch420 {
@@ -431,6 +509,439 @@ thread_local! {
 }
 
 impl Av2Encoder {
+    /// Search the live DRL/NEWMV candidates and materialize the selected luma
+    /// and chroma predictors in reusable scratch. Keeping motion estimation,
+    /// mode comparison, MC and combined-plane distortion out of the partition
+    /// state machine gives them an independent optimization unit.
+    #[inline(never)]
+    fn search_inter_leaf_420(
+        &self,
+        search: InterLeafSearch420<'_>,
+    ) -> Option<InterLeafCandidate420> {
+        let InterLeafSearch420 {
+            enc,
+            source_y,
+            source_u,
+            source_v,
+            luma_reference,
+            chroma_references,
+            me_scratch,
+            prediction_scratch,
+            source_stride,
+            chroma_stride,
+            reference_x,
+            reference_y,
+            reference_luma_stride,
+            block_x,
+            block_y,
+            block_width,
+            block_height,
+            predictor_mv,
+            frame_mv_seed,
+            skip_ctx,
+            mode_ctx,
+            qstep,
+        } = search;
+        let (reference, reference_stride, reference_height) = luma_reference;
+        let mut predictors = me::MeCandidates::new();
+        for candidate in [predictor_mv, Mv::ZERO, frame_mv_seed] {
+            predictors.push_unique(candidate);
+        }
+        let (mv, _) = me::search(
+            &me::MePlanes {
+                current: &source_y[block_y * source_stride + block_x..],
+                current_stride: source_stride,
+                reference,
+                reference_stride: *reference_stride,
+            },
+            predictors.as_slice(),
+            &me::MeSearchSpec {
+                origin_x: (reference_x + block_x + INTER_BORDER_420) as isize,
+                origin_y: (reference_y + block_y + INTER_BORDER_420) as isize,
+                width: block_width,
+                height: block_height,
+                reference_mv: predictor_mv,
+                lambda_mv: (qstep as u32).max(1),
+                max_dx: self.video_search_range,
+                max_dy: self.video_search_range,
+                predictor_gate_sad_per_pixel: self.video_predictor_gate,
+                integer_satd_radius: self.video_integer_satd_radius,
+                bit_depth: self.bit_depth,
+                frame_width: *reference_stride,
+                frame_height: *reference_height + 2 * INTER_BORDER_420,
+            },
+            me_scratch,
+        );
+        let mut mv = mc::clamp_umv(
+            mv,
+            (reference_x + block_x) as i32,
+            (reference_y + block_y) as i32,
+            block_width as i32,
+            block_height as i32,
+            reference_luma_stride as i32,
+            *reference_height as i32,
+        );
+        if mv == Mv::ZERO {
+            return None;
+        }
+
+        let chroma_width = block_width / 2;
+        let chroma_height = block_height / 2;
+        let (pred_y, pred_u, pred_v, convolve_tmp) =
+            prediction_scratch.planes(block_width * block_height, chroma_width * chroma_height);
+        let motion_block = |mv| mc::MotionBlock {
+            origin_x: (reference_x + block_x + INTER_BORDER_420) as isize,
+            origin_y: (reference_y + block_y + INTER_BORDER_420) as isize,
+            mv,
+            width: block_width,
+            height: block_height,
+            bit_depth: self.bit_depth,
+        };
+        mc::predict_with_tmp(
+            pred_y,
+            block_width,
+            reference,
+            *reference_stride,
+            &motion_block(mv),
+            convolve_tmp,
+        );
+
+        let searched_mv = mv;
+        let searched_luma_sse = rect_sse_f32(
+            &PlaneRect {
+                plane: source_y,
+                stride: source_stride,
+                y: block_y,
+                x: block_x,
+            },
+            &PlaneRect {
+                plane: pred_y,
+                stride: block_width,
+                y: 0,
+                x: 0,
+            },
+            block_width,
+            block_height,
+        );
+        let (searched_mode, searched_mvd_row, searched_mvd_col) =
+            inter_mode_qtr_mvd(searched_mv, predictor_mv);
+        let searched_mvd = Mv {
+            row: searched_mvd_row,
+            col: searched_mvd_col,
+        };
+        let bounded_predictor = mc::clamp_umv(
+            predictor_mv,
+            (reference_x + block_x) as i32,
+            (reference_y + block_y) as i32,
+            block_width as i32,
+            block_height as i32,
+            reference_luma_stride as i32,
+            *reference_height as i32,
+        );
+        if predictor_mv != Mv::ZERO
+            && predictor_mv != searched_mv
+            && bounded_predictor == predictor_mv
+        {
+            mc::predict_with_tmp(
+                pred_y,
+                block_width,
+                reference,
+                *reference_stride,
+                &motion_block(predictor_mv),
+                convolve_tmp,
+            );
+            let near_sse = rect_sse_f32(
+                &PlaneRect {
+                    plane: source_y,
+                    stride: source_stride,
+                    y: block_y,
+                    x: block_x,
+                },
+                &PlaneRect {
+                    plane: pred_y,
+                    stride: block_width,
+                    y: 0,
+                    x: 0,
+                },
+                block_width,
+                block_height,
+            );
+            debug_assert_eq!(searched_mode, 2);
+            if crate::av2::video::rd::prefer_nearmv(
+                enc,
+                crate::av2::video::rd::NearMvRdSpec {
+                    skip_ctx,
+                    mode_ctx,
+                    skip_txfm: true,
+                    near_distortion: near_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                    new_distortion: searched_luma_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                    new_mvd: searched_mvd,
+                    qstep: qstep as u32,
+                },
+            ) {
+                mv = predictor_mv;
+            } else {
+                mc::predict_with_tmp(
+                    pred_y,
+                    block_width,
+                    reference,
+                    *reference_stride,
+                    &motion_block(searched_mv),
+                    convolve_tmp,
+                );
+            }
+        }
+
+        let chroma_x = block_x / 2;
+        let chroma_y = block_y / 2;
+        let chroma_mv = Mv {
+            row: mv.row / 2,
+            col: mv.col / 2,
+        };
+        for (prediction, (reference, stride)) in [(&mut *pred_u), (&mut *pred_v)]
+            .into_iter()
+            .zip(chroma_references)
+        {
+            mc::predict_with_tmp(
+                prediction,
+                chroma_width,
+                reference,
+                *stride,
+                &mc::MotionBlock {
+                    origin_x: (reference_x / 2 + chroma_x + INTER_BORDER_420 / 2) as isize,
+                    origin_y: (reference_y / 2 + chroma_y + INTER_BORDER_420 / 2) as isize,
+                    mv: chroma_mv,
+                    width: chroma_width,
+                    height: chroma_height,
+                    bit_depth: self.bit_depth,
+                },
+                convolve_tmp,
+            );
+        }
+        let mut distortion = rect_sse_f32(
+            &PlaneRect {
+                plane: source_y,
+                stride: source_stride,
+                y: block_y,
+                x: block_x,
+            },
+            &PlaneRect {
+                plane: pred_y,
+                stride: block_width,
+                y: 0,
+                x: 0,
+            },
+            block_width,
+            block_height,
+        );
+        for (source, prediction) in [(source_u, &*pred_u), (source_v, &*pred_v)] {
+            distortion += rect_sse_f32(
+                &PlaneRect {
+                    plane: source,
+                    stride: chroma_stride,
+                    y: chroma_y,
+                    x: chroma_x,
+                },
+                &PlaneRect {
+                    plane: prediction,
+                    stride: chroma_width,
+                    y: 0,
+                    x: 0,
+                },
+                chroma_width,
+                chroma_height,
+            );
+        }
+        let (mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, predictor_mv);
+        let mvd = (mode == 2).then_some(Mv {
+            row: mvd_row,
+            col: mvd_col,
+        });
+        let rate =
+            crate::av2::video::rd::inter_syntax_bits(enc, skip_ctx, mode_ctx, true, mode, mvd);
+        Some(InterLeafCandidate420 {
+            mv,
+            mode,
+            mvd,
+            rd_cost: crate::av2::video::rd::rd_cost(
+                distortion * crate::av2::video::rd::SS2_INTER_DIST_W,
+                rate,
+                qstep as u32,
+            ),
+        })
+    }
+
+    /// Quantize and reconstruct a square dense-inter candidate. The partition
+    /// walker only decides whether to commit the returned candidate and updates
+    /// entropy-neighbour state; transform and predictor mechanics stay here.
+    #[inline(never)]
+    fn evaluate_dense_inter_residual_420(
+        &self,
+        input: DenseInterResidualInput420<'_>,
+    ) -> DenseInterResidual420 {
+        let DenseInterResidualInput420 {
+            enc,
+            source_y,
+            source_u,
+            source_v,
+            prediction_y,
+            prediction_u,
+            prediction_v,
+            source_stride,
+            chroma_stride,
+            block_x,
+            block_y,
+            block_size,
+            residual_scale,
+            qstep,
+            skip_ctx,
+            mode_ctx,
+            inter_mode,
+            mvd,
+        } = input;
+        debug_assert!(matches!(block_size, 16 | 32));
+        let chroma_size = block_size / 2;
+        let chroma_x = block_x / 2;
+        let chroma_y = block_y / 2;
+        let bd = self.bit_depth as i32;
+
+        let mut y_residual = [0.0f32; 32 * 32];
+        let y_len = block_size * block_size;
+        crate::av2::metrics::scaled_residual_f32(
+            &mut y_residual[..y_len],
+            &source_y[block_y * source_stride + block_x..],
+            prediction_y,
+            crate::av2::metrics::ResidualSpec {
+                src_stride: source_stride,
+                pred_stride: block_size,
+                width: block_size,
+                height: block_size,
+                scale: residual_scale,
+            },
+        );
+        let y_levels = if block_size == 32 {
+            self.bases.luma.project(&y_residual[..y_len], 0.0)
+        } else {
+            self.bases
+                .luma16x16
+                .project_scan(&y_residual[..y_len], 0.0, &SCAN16)
+        };
+        let mut y_recon = [0.0f32; 32 * 32];
+        if block_size == 32 {
+            y_recon = reconstruct_luma(prediction_y, &y_levels, qstep, &tables::SCAN, bd);
+        } else {
+            y_recon[..y_len].copy_from_slice(&itx422::reconstruct_luma16(
+                prediction_y,
+                &y_levels,
+                qstep,
+                &SCAN16,
+                bd,
+            ));
+        }
+
+        let mut chroma_levels = [Vec::new(), Vec::new()];
+        let mut chroma_recon = [Vec::new(), Vec::new()];
+        for (plane, (source, prediction)) in [(source_u, prediction_u), (source_v, prediction_v)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut residual = [0.0f32; 16 * 16];
+            let mut prediction_i = [0i32; 16 * 16];
+            let chroma_len = chroma_size * chroma_size;
+            crate::av2::metrics::f32_prediction_and_scaled_residual_i32(
+                &mut prediction_i[..chroma_len],
+                &mut residual[..chroma_len],
+                &source[chroma_y * chroma_stride + chroma_x..],
+                prediction,
+                crate::av2::metrics::ResidualSpec {
+                    src_stride: chroma_stride,
+                    pred_stride: chroma_size,
+                    width: chroma_size,
+                    height: chroma_size,
+                    scale: residual_scale,
+                },
+            );
+            let levels = if chroma_size == 16 {
+                self.bases
+                    .luma16x16
+                    .project_scan(&residual[..chroma_len], 0.0, &SCAN16)
+            } else {
+                self.bases
+                    .c8x8
+                    .project_scan(&residual[..chroma_len], 0.0, &SCAN8X8)
+            };
+            let scan = if chroma_size == 16 {
+                &SCAN16[..]
+            } else {
+                &SCAN8X8[..]
+            };
+            chroma_recon[plane] = itx422::reconstruct_chroma_cfl(
+                &prediction_i[..chroma_len],
+                &levels,
+                qstep,
+                scan,
+                chroma_size,
+                chroma_size,
+                bd,
+            );
+            chroma_levels[plane] = levels;
+        }
+
+        let mut distortion = rect_sse_f32(
+            &PlaneRect {
+                plane: source_y,
+                stride: source_stride,
+                y: block_y,
+                x: block_x,
+            },
+            &PlaneRect {
+                plane: &y_recon,
+                stride: block_size,
+                y: 0,
+                x: 0,
+            },
+            block_size,
+            block_size,
+        );
+        for (source, reconstruction) in [(source_u, &chroma_recon[0]), (source_v, &chroma_recon[1])]
+        {
+            distortion += rect_sse_f32(
+                &PlaneRect {
+                    plane: source,
+                    stride: chroma_stride,
+                    y: chroma_y,
+                    x: chroma_x,
+                },
+                &PlaneRect {
+                    plane: reconstruction,
+                    stride: chroma_size,
+                    y: 0,
+                    x: 0,
+                },
+                chroma_size,
+                chroma_size,
+            );
+        }
+        let rate = crate::av2::video::rd::inter_syntax_bits(
+            enc, skip_ctx, mode_ctx, false, inter_mode, mvd,
+        ) + coeff_rate_f32(&y_levels)
+            + coeff_rate_f32(&chroma_levels[0])
+            + coeff_rate_f32(&chroma_levels[1]);
+        DenseInterResidual420 {
+            rd_cost: crate::av2::video::rd::rd_cost(
+                distortion * crate::av2::video::rd::SS2_INTER_DIST_W,
+                rate,
+                qstep as u32,
+            ),
+            y_coeffs: levels_to_coeffs(&y_levels),
+            u_coeffs: levels_to_coeffs(&chroma_levels[0]),
+            v_coeffs: levels_to_coeffs(&chroma_levels[1]),
+            y_recon,
+            u_recon: std::mem::take(&mut chroma_recon[0]),
+            v_recon: std::mem::take(&mut chroma_recon[1]),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_yuv420_partition(
         &self,
@@ -457,7 +968,7 @@ impl Av2Encoder {
         sb_qidx: &mut [u16],
         // Staged replay: `Capture` logs each walk SB's per-leaf luma + chroma
         // winners; `Replay` reuses them (skips the leaf mode/tx + CfL/MHCCP
-        // searches); `Off` = today's inline behaviour. Only the whole-64 `(16,16)`
+        // searches); `Off` = today's inline behavior. Only the whole-64 `(16,16)`
         // intra leaf is captured so far — every other shape (and any inter-coded
         // SB) records `Fallback` and is re-searched byte-identically on replay.
         mut decide_mode: replay::DecideMode<'_>,
@@ -1259,6 +1770,8 @@ impl Av2Encoder {
                 } => (*bw_mi, *bh_mi, part_cdf.unwrap_or(12276), *mi_row, *mi_col),
             };
             tx_leaves.push((lmr, lmc, bw_mi, bh_mi));
+            #[cfg(test)]
+            TOTAL_LEAF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let sb_y = lmr * 4;
             let sb_x = lmc * 4;
             // Snapshot the four AVM line-buffer probes before the default-rank
@@ -1384,1519 +1897,14 @@ impl Av2Encoder {
             // leaves. Chroma uses the same zero motion at half resolution.
             let block_w = bw_mi * 4;
             let block_h = bh_mi * 4;
-            if has_last
-                && (bw_mi != 16 || bh_mi != 16)
-                && sb_x + block_w <= width
-                && sb_y + block_h <= height
-            {
-                let chroma_w = block_w / 2;
-                let chroma_h = block_h / 2;
-                let mut sse = rect_sse_f32(
-                    &PlaneRect {
-                        plane: yp,
-                        stride: pw,
-                        y: sb_y,
-                        x: sb_x,
-                    },
-                    &PlaneRect {
-                        plane: &last_ref[0],
-                        stride: ref_ls,
-                        y: ref_y0 + sb_y,
-                        x: ref_x0 + sb_x,
-                    },
-                    block_w,
-                    block_h,
-                );
-                let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
-                for (src, reference) in [(&up, &last_ref[1]), (&vp, &last_ref[2])] {
-                    sse += rect_sse_f32(
-                        &PlaneRect {
-                            plane: src,
-                            stride: pcw,
-                            y: cy,
-                            x: cx,
-                        },
-                        &PlaneRect {
-                            plane: reference,
-                            stride: ref_cs,
-                            y: rcy,
-                            x: rcx,
-                        },
-                        chroma_w,
-                        chroma_h,
-                    );
-                }
-
-                let ar = (lmc + bw_mi - 1).min(skip_mi_above.len() - 1);
-                let bl = (lmr + bh_mi - 1).min(skip_mi_left.len() - 1);
-                let neighbors = [
-                    (lmc > 0).then_some((skip_mi_left[bl], inter_mi_left[bl], newmv_mi_left[bl])),
-                    (lmr > 0).then_some((
-                        skip_mi_above[ar],
-                        inter_mi_above[ar],
-                        newmv_mi_above[ar],
-                    )),
-                    (lmc > 0).then_some((
-                        skip_mi_left[lmr],
-                        inter_mi_left[lmr],
-                        newmv_mi_left[lmr],
-                    )),
-                    (lmr > 0).then_some((
-                        skip_mi_above[lmc],
-                        inter_mi_above[lmc],
-                        newmv_mi_above[lmc],
-                    )),
-                ];
-                let mut chosen = [(0u8, 0u8, 0u8); 2];
-                let mut count = 0;
-                for neighbor in neighbors.into_iter().flatten() {
-                    chosen[count] = neighbor;
-                    count += 1;
-                    if count == 2 {
-                        break;
-                    }
-                }
-                let skip_ctx = chosen[..count].iter().map(|n| n.0 as usize).sum();
-                // av2_find_mode_ctx collapses both probes on an axis to one
-                // row/column match; skip_txfm instead sums the two selected
-                // line-buffer entries above.
-                // This block predicts from rank 0, so AVM's same-reference mode ctx
-                // counts only rank-0 inter neighbors (a rank-1 neighbor, from a
-                // whole-64 skip that chose the second reference, is excluded). The
-                // rank filter is a no-op when no rank-1 block exists.
-                let left_match = lmc > 0
-                    && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
-                        || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
-                let above_match = lmr > 0
-                    && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
-                        || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
-                let nearest_match = usize::from(left_match) + usize::from(above_match);
-                let any_newmv = (lmc > 0
-                    && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
-                        || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
-                    || (lmr > 0
-                        && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
-                            || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
-                let mode_ctx = nearest_match + 2 * usize::from(any_newmv);
-                let rate = crate::av2::video::rd::inter_syntax_bits(
-                    enc, skip_ctx, mode_ctx, true, 1, None,
-                );
-                let cost = crate::av2::video::rd::rd_cost(
-                    sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                    rate,
-                    sb_qstep as u32,
-                );
-                let intra_bound = crate::av2::video::rd::rd_cost(
-                    0.0,
-                    2.0 * (block_w * block_h) as f32,
-                    sb_qstep as u32,
-                );
-                if cost < intra_bound {
-                    #[cfg(test)]
-                    if block_w == 32 && block_h == 32 {
-                        INTER_SKIP_32_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    } else if block_w != block_h {
-                        INTER_SKIP_RECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if !aq_committed {
-                        if use_grid {
-                            enc.delta_q_signaled = cell.sig;
-                        } else {
-                            let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
-                        }
-                        aq_committed = true;
-                    }
-                    crate::av2::coder::emit_inter_skip_leaf(enc, pc, skip_ctx, mode_ctx, false);
-                    skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
-                    for (dst, src) in
-                        rect_rows_mut(recy, pw, sb_y, sb_x, block_w, block_h).zip(rect_rows(
-                            &last_ref[0],
-                            ref_ls,
-                            ref_y0 + sb_y,
-                            ref_x0 + sb_x,
-                            block_w,
-                            block_h,
-                        ))
-                    {
-                        dst.copy_from_slice(src);
-                    }
-                    let dst_rows = rect_rows_mut(recu, pcw, cy, cx, chroma_w, chroma_h)
-                        .zip(rect_rows_mut(recv, pcw, cy, cx, chroma_w, chroma_h));
-                    let src_rows =
-                        rect_rows(&last_ref[1], ref_cs, rcy, rcx, chroma_w, chroma_h).zip(
-                            rect_rows(&last_ref[2], ref_cs, rcy, rcx, chroma_w, chroma_h),
-                        );
-                    for ((du, dv), (su, sv)) in dst_rows.zip(src_rows) {
-                        du.copy_from_slice(su);
-                        dv.copy_from_slice(sv);
-                    }
-                    for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                        inter_mi_above[c] = 1;
-                        skip_mi_above[c] = 1;
-                        newmv_mi_above[c] = 0;
-                        mv_mi_above[c] = Some(Mv::ZERO);
-                        above[c] = 0x40;
-                        u_above[c] = 0;
-                        v_above[c] = 0;
-                    }
-                    for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                        inter_mi_left[r] = 1;
-                        skip_mi_left[r] = 1;
-                        newmv_mi_left[r] = 0;
-                        mv_mi_left[r] = Some(Mv::ZERO);
-                        left[r] = 0x40;
-                        u_left[r] = 0;
-                        v_left[r] = 0;
-                    }
-                    skip_above[col] = 1;
-                    skip_left = 1;
-                    inter_above[col] = 1;
-                    inter_left = 1;
-                    newmv_above[col] = 0;
-                    newmv_left = 0;
-                    mv_above[col] = Some(Mv::ZERO);
-                    mv_left = Some(Mv::ZERO);
-                    continue;
-                }
-
-                // Mirror the adjacent spatial scan used for DRL[0]: bottom-left
-                // edge, above-right edge, immediate left, immediate above. A
-                // block spanning an edge appears twice but carries the same MV.
-                // Search both the square dense-inter leaves and the rectangular
-                // leaves already produced by the partition walker. Rectangles
-                // initially compete as motion-only skip blocks; residual coding
-                // remains on the bit-exact square TX paths below.
-                let motion_leaf = (block_w == block_h && matches!(block_w, 16 | 32))
-                    || (block_w != block_h
-                        && matches!(block_w, 16 | 32 | 64)
-                        && matches!(block_h, 16 | 32 | 64));
-                if motion_leaf {
-                    // DRL[0] scans same-reference (rank-0) neighbors only: AVM's
-                    // setup_ref_mv_list gates spatial candidates on ref==rf, so a
-                    // rank-1 neighbor (a whole-64 skip that chose the second
-                    // reference, always zero motion) is skipped. Its AVM "derived"
-                    // contribution would be the zero MV projected — i.e. zero — which
-                    // is exactly the ZERO fallback, so no explicit derived term is
-                    // needed. No-op when no rank-1 block exists.
-                    let pred_mv = [
-                        (lmc > 0 && bl_ref_rank == 0)
-                            .then_some(mv_mi_left[bl])
-                            .flatten(),
-                        (lmr > 0 && ar_ref_rank == 0)
-                            .then_some(mv_mi_above[ar])
-                            .flatten(),
-                        (lmc > 0 && left_ref_rank == 0)
-                            .then_some(mv_mi_left[lmr])
-                            .flatten(),
-                        (lmr > 0 && above_ref_rank == 0)
-                            .then_some(mv_mi_above[lmc])
-                            .flatten(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .next()
-                    .unwrap_or(Mv::ZERO);
-                    let (bref, bstride, refh) = inter_luma.expect("LAST luma prepared for inter");
-                    let mut predictors = me::MeCandidates::new();
-                    for candidate in [pred_mv, Mv::ZERO, frame_mv_seed] {
-                        predictors.push_unique(candidate);
-                    }
-                    let (mv, _) = me::search(
-                        &me::MePlanes {
-                            current: &yp[sb_y * pw + sb_x..],
-                            current_stride: pw,
-                            reference: bref,
-                            reference_stride: *bstride,
-                        },
-                        predictors.as_slice(),
-                        &me::MeSearchSpec {
-                            origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                            origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                            width: block_w,
-                            height: block_h,
-                            reference_mv: pred_mv,
-                            lambda_mv: (sb_qstep as u32).max(1),
-                            max_dx: self.video_search_range,
-                            max_dy: self.video_search_range,
-                            predictor_gate_sad_per_pixel: self.video_predictor_gate,
-                            integer_satd_radius: self.video_integer_satd_radius,
-                            bit_depth: self.bit_depth,
-                            frame_width: *bstride,
-                            frame_height: *refh + 2 * INTER_BORDER_420,
-                        },
-                        me_scratch,
-                    );
-                    let mut mv = mc::clamp_umv(
-                        mv,
-                        (ref_x0 + sb_x) as i32,
-                        (ref_y0 + sb_y) as i32,
-                        block_w as i32,
-                        block_h as i32,
-                        ref_ls as i32,
-                        *refh as i32,
-                    );
-                    if mv != Mv::ZERO {
-                        let chroma_w = block_w / 2;
-                        let chroma_h = block_h / 2;
-                        let (pred_y, pred_u, pred_v, convolve_tmp) =
-                            inter_pred_scratch.planes(block_w * block_h, chroma_w * chroma_h);
-                        mc::predict_with_tmp(
-                            pred_y,
-                            block_w,
-                            bref,
-                            *bstride,
-                            &mc::MotionBlock {
-                                origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                                origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                                mv,
-                                width: block_w,
-                                height: block_h,
-                                bit_depth: self.bit_depth,
-                            },
-                            convolve_tmp,
-                        );
-                        // ME uses a deliberately inexpensive MV-rate proxy. Before
-                        // committing to NEWMV, compare it with the live DRL[0]
-                        // NEARMV using the tile CDFs and the actual emitted MVD
-                        // shell. Reuse the leaf prediction plane for both candidates;
-                        // if NEWMV wins, restore its prediction once.
-                        let searched_mv = mv;
-                        let searched_luma_sse = rect_sse_f32(
-                            &PlaneRect {
-                                plane: yp,
-                                stride: pw,
-                                y: sb_y,
-                                x: sb_x,
-                            },
-                            &PlaneRect {
-                                plane: pred_y,
-                                stride: block_w,
-                                y: 0,
-                                x: 0,
-                            },
-                            block_w,
-                            block_h,
-                        );
-                        let (searched_mode, searched_mvd_row, searched_mvd_col) =
-                            inter_mode_qtr_mvd(searched_mv, pred_mv);
-                        let searched_mvd = Mv {
-                            row: searched_mvd_row,
-                            col: searched_mvd_col,
-                        };
-                        let bounded_pred_mv = mc::clamp_umv(
-                            pred_mv,
-                            (ref_x0 + sb_x) as i32,
-                            (ref_y0 + sb_y) as i32,
-                            block_w as i32,
-                            block_h as i32,
-                            ref_ls as i32,
-                            *refh as i32,
-                        );
-                        if pred_mv != Mv::ZERO
-                            && pred_mv != searched_mv
-                            && bounded_pred_mv == pred_mv
-                        {
-                            mc::predict_with_tmp(
-                                pred_y,
-                                block_w,
-                                bref,
-                                *bstride,
-                                &mc::MotionBlock {
-                                    origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                                    origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                                    mv: pred_mv,
-                                    width: block_w,
-                                    height: block_h,
-                                    bit_depth: self.bit_depth,
-                                },
-                                convolve_tmp,
-                            );
-                            let near_sse = rect_sse_f32(
-                                &PlaneRect {
-                                    plane: yp,
-                                    stride: pw,
-                                    y: sb_y,
-                                    x: sb_x,
-                                },
-                                &PlaneRect {
-                                    plane: pred_y,
-                                    stride: block_w,
-                                    y: 0,
-                                    x: 0,
-                                },
-                                block_w,
-                                block_h,
-                            );
-                            debug_assert_eq!(searched_mode, 2);
-                            if crate::av2::video::rd::prefer_nearmv(
-                                enc,
-                                crate::av2::video::rd::NearMvRdSpec {
-                                    skip_ctx,
-                                    mode_ctx,
-                                    skip_txfm: true,
-                                    near_distortion: near_sse
-                                        * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                    new_distortion: searched_luma_sse
-                                        * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                    new_mvd: searched_mvd,
-                                    qstep: sb_qstep as u32,
-                                },
-                            ) {
-                                mv = pred_mv;
-                            } else {
-                                mc::predict_with_tmp(
-                                    pred_y,
-                                    block_w,
-                                    bref,
-                                    *bstride,
-                                    &mc::MotionBlock {
-                                        origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                                        origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                                        mv: searched_mv,
-                                        width: block_w,
-                                        height: block_h,
-                                        bit_depth: self.bit_depth,
-                                    },
-                                    convolve_tmp,
-                                );
-                            }
-                        }
-                        let cmv = Mv {
-                            row: mv.row / 2,
-                            col: mv.col / 2,
-                        };
-                        let chroma_refs = inter_chroma.expect("LAST chroma prepared for inter");
-                        for (pred, (cref, cstride)) in [(&mut *pred_u), (&mut *pred_v)]
-                            .into_iter()
-                            .zip(chroma_refs)
-                        {
-                            mc::predict_with_tmp(
-                                pred,
-                                chroma_w,
-                                cref,
-                                *cstride,
-                                &mc::MotionBlock {
-                                    origin_x: (ref_x0 / 2 + cx + INTER_BORDER_420 / 2) as isize,
-                                    origin_y: (ref_y0 / 2 + cy + INTER_BORDER_420 / 2) as isize,
-                                    mv: cmv,
-                                    width: chroma_w,
-                                    height: chroma_h,
-                                    bit_depth: self.bit_depth,
-                                },
-                                convolve_tmp,
-                            );
-                        }
-                        let mut motion_sse = rect_sse_f32(
-                            &PlaneRect {
-                                plane: yp,
-                                stride: pw,
-                                y: sb_y,
-                                x: sb_x,
-                            },
-                            &PlaneRect {
-                                plane: pred_y,
-                                stride: block_w,
-                                y: 0,
-                                x: 0,
-                            },
-                            block_w,
-                            block_h,
-                        );
-                        for (src, pred) in [(up, &*pred_u), (vp, &*pred_v)] {
-                            motion_sse += rect_sse_f32(
-                                &PlaneRect {
-                                    plane: src,
-                                    stride: pcw,
-                                    y: cy,
-                                    x: cx,
-                                },
-                                &PlaneRect {
-                                    plane: pred,
-                                    stride: chroma_w,
-                                    y: 0,
-                                    x: 0,
-                                },
-                                chroma_w,
-                                chroma_h,
-                            );
-                        }
-                        let (inter_mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, pred_mv);
-                        let scaled_mvd = (inter_mode == 2).then_some(Mv {
-                            row: mvd_row,
-                            col: mvd_col,
-                        });
-                        let rate = crate::av2::video::rd::inter_syntax_bits(
-                            enc, skip_ctx, mode_ctx, true, inter_mode, scaled_mvd,
-                        );
-                        let motion_cost = crate::av2::video::rd::rd_cost(
-                            motion_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                            rate,
-                            sb_qstep as u32,
-                        );
-                        // A moving 32x32 leaf should not be forced to choose
-                        // between perfect prediction and intra. Quantize the
-                        // dense inter residual, reconstruct it exactly as the
-                        // decoder will, and let it compete against both skip
-                        // and the existing intra bound.
-                        if block_w == 32 && block_h == 32 && ENABLE_DENSE_INTER_32 {
-                            let bd = self.bit_depth as i32;
-                            let mut y_resid = [0.0f32; 32 * 32];
-                            crate::av2::metrics::scaled_residual_f32(
-                                &mut y_resid,
-                                &yp[sb_y * pw + sb_x..],
-                                pred_y,
-                                crate::av2::metrics::ResidualSpec {
-                                    src_stride: pw,
-                                    pred_stride: 32,
-                                    width: 32,
-                                    height: 32,
-                                    scale: sb_scale,
-                                },
-                            );
-                            let y_levels = bases.luma.project(&y_resid, 0.0);
-                            let y_recon =
-                                reconstruct_luma(pred_y, &y_levels, sb_qstep, &tables::SCAN, bd);
-
-                            let mut chroma_levels = [Vec::new(), Vec::new()];
-                            let mut chroma_recon = [Vec::new(), Vec::new()];
-                            for (pi, (src, prediction)) in
-                                [(up, &*pred_u), (vp, &*pred_v)].into_iter().enumerate()
-                            {
-                                let mut residual = [0.0f32; 16 * 16];
-                                let mut prediction_i = [0i32; 16 * 16];
-                                crate::av2::metrics::scaled_residual_f32(
-                                    &mut residual,
-                                    &src[cy * pcw + cx..],
-                                    prediction,
-                                    crate::av2::metrics::ResidualSpec {
-                                        src_stride: pcw,
-                                        pred_stride: 16,
-                                        width: 16,
-                                        height: 16,
-                                        scale: sb_scale,
-                                    },
-                                );
-                                for (pred_i, &pred) in prediction_i.iter_mut().zip(prediction) {
-                                    *pred_i = (pred + 0.5) as i32;
-                                }
-                                let levels = bases.luma16x16.project_scan(&residual, 0.0, &SCAN16);
-                                chroma_recon[pi] = itx422::reconstruct_chroma_cfl(
-                                    &prediction_i,
-                                    &levels,
-                                    sb_qstep,
-                                    &SCAN16,
-                                    16,
-                                    16,
-                                    bd,
-                                );
-                                chroma_levels[pi] = levels;
-                            }
-
-                            let mut residual_sse = rect_sse_f32(
-                                &PlaneRect {
-                                    plane: yp,
-                                    stride: pw,
-                                    y: sb_y,
-                                    x: sb_x,
-                                },
-                                &PlaneRect {
-                                    plane: &y_recon,
-                                    stride: 32,
-                                    y: 0,
-                                    x: 0,
-                                },
-                                32,
-                                32,
-                            );
-                            for (src, reconstruction) in
-                                [(up, &chroma_recon[0]), (vp, &chroma_recon[1])]
-                            {
-                                residual_sse += rect_sse_f32(
-                                    &PlaneRect {
-                                        plane: src,
-                                        stride: pcw,
-                                        y: cy,
-                                        x: cx,
-                                    },
-                                    &PlaneRect {
-                                        plane: reconstruction,
-                                        stride: 16,
-                                        y: 0,
-                                        x: 0,
-                                    },
-                                    16,
-                                    16,
-                                );
-                            }
-                            let residual_rate = crate::av2::video::rd::inter_syntax_bits(
-                                enc, skip_ctx, mode_ctx, false, inter_mode, scaled_mvd,
-                            ) + coeff_rate_f32(&y_levels)
-                                + coeff_rate_f32(&chroma_levels[0])
-                                + coeff_rate_f32(&chroma_levels[1]);
-                            let residual_cost = crate::av2::video::rd::rd_cost(
-                                residual_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                residual_rate,
-                                sb_qstep as u32,
-                            );
-                            // The current TX32 token path is differential-tested for
-                            // DC-only inter residuals. Keep AC-heavy blocks on the
-                            // established intra/skip paths until dense AC token coding
-                            // passes the same AVM reconstruction gate.
-                            if residual_cost < motion_cost && residual_cost < intra_bound {
-                                if !aq_committed {
-                                    if use_grid {
-                                        enc.delta_q_signaled = cell.sig;
-                                    } else {
-                                        let _ = aqs.per_sb(
-                                            enc,
-                                            yp,
-                                            pw,
-                                            row * 64,
-                                            col * 64,
-                                            width,
-                                            height,
-                                        );
-                                    }
-                                    aq_committed = true;
-                                    enc.delta_q_pending = enc.delta_q_present;
-                                }
-
-                                let y_coeffs = levels_to_coeffs(&y_levels);
-                                let u_coeffs = levels_to_coeffs(&chroma_levels[0]);
-                                let v_coeffs = levels_to_coeffs(&chroma_levels[1]);
-                                let (y_skip_cdf, y_dc_sign_ctx) = sb_tu_contexts_rect(
-                                    &y_coeffs,
-                                    above,
-                                    left,
-                                    &TxbContextSpec {
-                                        sb_y,
-                                        sb_x,
-                                        qc: enc.qc,
-                                        mi_cols: tmc,
-                                        mi_rows: tmr,
-                                        block_eq_tx: true,
-                                    },
-                                    8,
-                                    8,
-                                );
-                                let u_present = u_coeffs.iter().any(|&(_, level)| level != 0);
-                                let v_present = v_coeffs.iter().any(|&(_, level)| level != 0);
-                                let u_skip_cdf =
-                                    INTER_SKIP_TX16_QC[enc.qc][(6 + ua + ul) as usize] as u32;
-                                let v_skip_ctx = (6 * i32::from(u_present) + va + vl) as u32;
-                                crate::av2::coder::emit_inter_residual_leaf_32(
-                                    enc,
-                                    pc,
-                                    skip_ctx,
-                                    mode_ctx,
-                                    mode_ctx,
-                                    inter_mode,
-                                    mvd_row,
-                                    mvd_col,
-                                    &y_coeffs,
-                                    y_skip_cdf,
-                                    y_dc_sign_ctx,
-                                    &u_coeffs,
-                                    &v_coeffs,
-                                    u_skip_cdf,
-                                    v_skip_ctx,
-                                );
-                                put_block_rect(recy, pw, sb_y, sb_x, 32, 32, &y_recon);
-                                put_block_rect(recu, pcw, cy, cx, 16, 16, &chroma_recon[0]);
-                                put_block_rect(recv, pcw, cy, cx, 16, 16, &chroma_recon[1]);
-                                #[cfg(test)]
-                                {
-                                    INTER_RESIDUAL_32_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if y_coeffs.iter().any(|&(scan, _)| scan > 900) {
-                                        INTER_RESIDUAL_32_HIGH_EOB_COUNT
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                                    inter_mi_above[c] = 1;
-                                    skip_mi_above[c] = 0;
-                                    newmv_mi_above[c] = (inter_mode == 2) as u8;
-                                    mv_mi_above[c] = Some(mv);
-                                    u_above[c] = i32::from(u_present);
-                                    v_above[c] = i32::from(v_present);
-                                }
-                                for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                                    inter_mi_left[r] = 1;
-                                    skip_mi_left[r] = 0;
-                                    newmv_mi_left[r] = (inter_mode == 2) as u8;
-                                    mv_mi_left[r] = Some(mv);
-                                    u_left[r] = i32::from(u_present);
-                                    v_left[r] = i32::from(v_present);
-                                }
-                                skip_above[col] = 0;
-                                skip_left = 0;
-                                inter_above[col] = 1;
-                                inter_left = 1;
-                                newmv_above[col] = (inter_mode == 2) as u8;
-                                newmv_left = (inter_mode == 2) as u8;
-                                mv_above[col] = Some(mv);
-                                mv_left = Some(mv);
-                                for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
-                                    for c in (lmc & 15)..((lmc & 15) + bw_mi).min(16) {
-                                        enc.sb_coded[r * 16 + c] = 1;
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        if block_w == 16 && block_h == 16 && ENABLE_DENSE_INTER_16 {
-                            let bd = self.bit_depth as i32;
-                            let mut y_resid = [0.0f32; 16 * 16];
-                            crate::av2::metrics::scaled_residual_f32(
-                                &mut y_resid,
-                                &yp[sb_y * pw + sb_x..],
-                                pred_y,
-                                crate::av2::metrics::ResidualSpec {
-                                    src_stride: pw,
-                                    pred_stride: 16,
-                                    width: 16,
-                                    height: 16,
-                                    scale: sb_scale,
-                                },
-                            );
-                            let y_levels = bases.luma16x16.project_scan(&y_resid, 0.0, &SCAN16);
-                            let y_recon = itx422::reconstruct_luma16(
-                                pred_y, &y_levels, sb_qstep, &SCAN16, bd,
-                            );
-                            let mut residual_sse = rect_sse_f32(
-                                &PlaneRect {
-                                    plane: yp,
-                                    stride: pw,
-                                    y: sb_y,
-                                    x: sb_x,
-                                },
-                                &PlaneRect {
-                                    plane: &y_recon,
-                                    stride: 16,
-                                    y: 0,
-                                    x: 0,
-                                },
-                                16,
-                                16,
-                            );
-                            let mut chroma_levels = [Vec::new(), Vec::new()];
-                            let mut chroma_recon = [Vec::new(), Vec::new()];
-                            for (pi, (src, prediction)) in
-                                [(up, &*pred_u), (vp, &*pred_v)].into_iter().enumerate()
-                            {
-                                let mut residual = [0.0f32; 8 * 8];
-                                let mut prediction_i = [0i32; 8 * 8];
-                                crate::av2::metrics::scaled_residual_f32(
-                                    &mut residual,
-                                    &src[cy * pcw + cx..],
-                                    prediction,
-                                    crate::av2::metrics::ResidualSpec {
-                                        src_stride: pcw,
-                                        pred_stride: 8,
-                                        width: 8,
-                                        height: 8,
-                                        scale: sb_scale,
-                                    },
-                                );
-                                for (pred_i, &pred) in prediction_i.iter_mut().zip(prediction) {
-                                    *pred_i = (pred + 0.5) as i32;
-                                }
-                                let levels = bases.c8x8.project_scan(&residual, 0.0, &SCAN8X8);
-                                chroma_recon[pi] = itx422::reconstruct_chroma_cfl(
-                                    &prediction_i,
-                                    &levels,
-                                    sb_qstep,
-                                    &SCAN8X8,
-                                    8,
-                                    8,
-                                    bd,
-                                );
-                                chroma_levels[pi] = levels;
-                            }
-                            for (src, reconstruction) in
-                                [(up, &chroma_recon[0]), (vp, &chroma_recon[1])]
-                            {
-                                residual_sse += rect_sse_f32(
-                                    &PlaneRect {
-                                        plane: src,
-                                        stride: pcw,
-                                        y: cy,
-                                        x: cx,
-                                    },
-                                    &PlaneRect {
-                                        plane: reconstruction,
-                                        stride: 8,
-                                        y: 0,
-                                        x: 0,
-                                    },
-                                    8,
-                                    8,
-                                );
-                            }
-                            let residual_rate = crate::av2::video::rd::inter_syntax_bits(
-                                enc, skip_ctx, mode_ctx, false, inter_mode, scaled_mvd,
-                            ) + coeff_rate_f32(&y_levels)
-                                + coeff_rate_f32(&chroma_levels[0])
-                                + coeff_rate_f32(&chroma_levels[1]);
-                            let residual_cost = crate::av2::video::rd::rd_cost(
-                                residual_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                residual_rate,
-                                sb_qstep as u32,
-                            );
-                            if residual_cost < motion_cost && residual_cost < intra_bound {
-                                if !aq_committed {
-                                    if use_grid {
-                                        enc.delta_q_signaled = cell.sig;
-                                    } else {
-                                        let _ = aqs.per_sb(
-                                            enc,
-                                            yp,
-                                            pw,
-                                            row * 64,
-                                            col * 64,
-                                            width,
-                                            height,
-                                        );
-                                    }
-                                    aq_committed = true;
-                                    enc.delta_q_pending = enc.delta_q_present;
-                                }
-
-                                let y_coeffs = levels_to_coeffs(&y_levels);
-                                let u_coeffs = levels_to_coeffs(&chroma_levels[0]);
-                                let v_coeffs = levels_to_coeffs(&chroma_levels[1]);
-                                let u_present = u_coeffs.iter().any(|&(_, level)| level != 0);
-                                let v_present = v_coeffs.iter().any(|&(_, level)| level != 0);
-                                let (intra_skip_cdf, y_dc_sign_ctx) = sb_tu_contexts_rect(
-                                    &y_coeffs,
-                                    above,
-                                    left,
-                                    &TxbContextSpec {
-                                        sb_y,
-                                        sb_x,
-                                        qc: enc.qc,
-                                        mi_cols: tmc,
-                                        mi_rows: tmr,
-                                        block_eq_tx: true,
-                                    },
-                                    4,
-                                    4,
-                                );
-                                let y_skip_ctx = SKIP_TX16_QC[enc.qc]
-                                    .iter()
-                                    .position(|&cdf| u32::from(cdf) == intra_skip_cdf)
-                                    .expect("TX16 skip context must resolve");
-                                let y_skip_cdf = INTER_SKIP_TX16_QC[enc.qc][y_skip_ctx] as u32;
-                                crate::av2::coder::emit_inter_residual_leaf_16(
-                                    enc,
-                                    pc,
-                                    skip_ctx,
-                                    mode_ctx,
-                                    mode_ctx,
-                                    inter_mode,
-                                    mvd_row,
-                                    mvd_col,
-                                    &y_coeffs,
-                                    y_skip_cdf,
-                                    y_dc_sign_ctx,
-                                    &u_coeffs,
-                                    &v_coeffs,
-                                    (6 + ua + ul) as usize,
-                                    (6 * usize::from(u_present) as i32 + va + vl) as usize,
-                                );
-                                put_block_rect(recy, pw, sb_y, sb_x, 16, 16, &y_recon);
-                                put_block_rect(recu, pcw, cy, cx, 8, 8, &chroma_recon[0]);
-                                put_block_rect(recv, pcw, cy, cx, 8, 8, &chroma_recon[1]);
-                                #[cfg(test)]
-                                {
-                                    INTER_RESIDUAL_16_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if y_coeffs.iter().any(|&(scan, _)| scan > 220) {
-                                        INTER_RESIDUAL_16_HIGH_EOB_COUNT
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    if u_present && v_present {
-                                        INTER_RESIDUAL_16_CHROMA_COUNT
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                                    inter_mi_above[c] = 1;
-                                    skip_mi_above[c] = 0;
-                                    newmv_mi_above[c] = (inter_mode == 2) as u8;
-                                    mv_mi_above[c] = Some(mv);
-                                    u_above[c] = i32::from(u_present);
-                                    v_above[c] = i32::from(v_present);
-                                }
-                                for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                                    inter_mi_left[r] = 1;
-                                    skip_mi_left[r] = 0;
-                                    newmv_mi_left[r] = (inter_mode == 2) as u8;
-                                    mv_mi_left[r] = Some(mv);
-                                    u_left[r] = i32::from(u_present);
-                                    v_left[r] = i32::from(v_present);
-                                }
-                                skip_above[col] = 0;
-                                skip_left = 0;
-                                inter_above[col] = 1;
-                                inter_left = 1;
-                                newmv_above[col] = (inter_mode == 2) as u8;
-                                newmv_left = (inter_mode == 2) as u8;
-                                mv_above[col] = Some(mv);
-                                mv_left = Some(mv);
-                                for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
-                                    for c in (lmc & 15)..((lmc & 15) + bw_mi).min(16) {
-                                        enc.sb_coded[r * 16 + c] = 1;
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        if motion_cost < intra_bound {
-                            #[cfg(test)]
-                            if block_w != block_h {
-                                INTER_MOTION_SKIP_RECT_COUNT
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            #[cfg(test)]
-                            if block_w == 16 {
-                                if inter_mode == 2 {
-                                    INTER_NEWMV_SKIP_16_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    INTER_NEARMV_SKIP_16_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            #[cfg(test)]
-                            if block_w == 32 {
-                                if inter_mode == 2 {
-                                    INTER_NEWMV_SKIP_32_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    INTER_NEARMV_SKIP_32_COUNT
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            if !aq_committed {
-                                if use_grid {
-                                    enc.delta_q_signaled = cell.sig;
-                                } else {
-                                    let _ =
-                                        aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
-                                }
-                                aq_committed = true;
-                            }
-                            enc.cur_bw4 = bw_mi;
-                            enc.cur_bh4 = bh_mi;
-                            crate::av2::coder::emit_inter_mode_leaf(
-                                enc, pc, skip_ctx, mode_ctx, mode_ctx, inter_mode, mvd_row,
-                                mvd_col, false,
-                            );
-                            skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
-                            put_block_rect(recy, pw, sb_y, sb_x, block_w, block_h, pred_y);
-                            for (dst, pred) in [(&mut *recu, &*pred_u), (&mut *recv, &*pred_v)] {
-                                put_block_rect(dst, pcw, cy, cx, chroma_w, chroma_h, pred);
-                            }
-                            for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                                inter_mi_above[c] = 1;
-                                skip_mi_above[c] = 1;
-                                newmv_mi_above[c] = (inter_mode == 2) as u8;
-                                mv_mi_above[c] = Some(mv);
-                                above[c] = 0x40;
-                                u_above[c] = 0;
-                                v_above[c] = 0;
-                            }
-                            for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                                inter_mi_left[r] = 1;
-                                skip_mi_left[r] = 1;
-                                newmv_mi_left[r] = (inter_mode == 2) as u8;
-                                mv_mi_left[r] = Some(mv);
-                                left[r] = 0x40;
-                                u_left[r] = 0;
-                                v_left[r] = 0;
-                            }
-                            skip_above[col] = 1;
-                            skip_left = 1;
-                            inter_above[col] = 1;
-                            inter_left = 1;
-                            newmv_above[col] = (inter_mode == 2) as u8;
-                            newmv_left = (inter_mode == 2) as u8;
-                            mv_above[col] = Some(mv);
-                            mv_left = Some(mv);
-                            continue;
-                        }
-                    }
-                }
-            }
-            // GLOBALMV zero-motion skip: static 64x64 block copies LAST (no residual).
-            if has_last && bw_mi == 16 && bh_mi == 16 {
-                let bw = 64.min(width - sb_x);
-                let bh = 64.min(height - sb_y);
-                if bw == 64 && bh == 64 {
-                    let (cy, cx) = (sb_y / 2, sb_x / 2);
-                    let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
-                    // Full-SB SSE (luma + chroma) against a candidate reference at
-                    // zero motion, so chroma-only changes aren't wrongly skipped.
-                    let full_sse = |refp: &[Vec<f32>]| -> f32 {
-                        let mut sse = rect_sse_f32(
-                            &PlaneRect {
-                                plane: yp,
-                                stride: pw,
-                                y: sb_y,
-                                x: sb_x,
-                            },
-                            &PlaneRect {
-                                plane: &refp[0],
-                                stride: ref_ls,
-                                y: ref_y0 + sb_y,
-                                x: ref_x0 + sb_x,
-                            },
-                            64,
-                            64,
-                        );
-                        for (src_c, ref_c) in [(&up, &refp[1]), (&vp, &refp[2])] {
-                            sse += rect_sse_f32(
-                                &PlaneRect {
-                                    plane: src_c,
-                                    stride: pcw,
-                                    y: cy,
-                                    x: cx,
-                                },
-                                &PlaneRect {
-                                    plane: ref_c,
-                                    stride: ref_cs,
-                                    y: rcy,
-                                    x: rcx,
-                                },
-                                32,
-                                32,
-                            );
-                        }
-                        sse
-                    };
-                    let up_n = row > 0;
-                    let lf_n = col > 0;
-                    let ia = inter_above[col] == 1;
-                    let il = inter_left == 1;
-                    enc.intra_inter_ctx = if up_n && lf_n {
-                        let n_intra = (!il as u8) + (!ia as u8);
-                        if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up_n {
-                        if ia { 0 } else { 3 }
-                    } else if lf_n {
-                        if il { 0 } else { 3 }
-                    } else {
-                        0
-                    };
-                    let sa = skip_above[col];
-                    let sl = skip_left;
-                    let skip_ctx = if up_n && lf_n {
-                        (sl + sa) as usize
-                    } else if up_n {
-                        (2 * sa) as usize
-                    } else if lf_n {
-                        (2 * sl) as usize
-                    } else {
-                        0
-                    };
-                    // RD skip mode context: single reference keeps the legacy
-                    // mi-granular formula verbatim (byte-exact). Two references use
-                    // the same-rank SB-granular ctx (AVM av2_find_mode_ctx counts
-                    // only neighbors predicting from this rank), which reduces to the
-                    // legacy value when every neighbor is rank 0.
-                    let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
-                    let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                    let legacy_mode_ctx = {
-                        let left_match =
-                            lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
-                        let above_match =
-                            lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
-                        let any_newmv = (lmc > 0
-                            && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
-                            || (lmr > 0 && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
-                        usize::from(left_match)
-                            + usize::from(above_match)
-                            + 2 * usize::from(any_newmv)
-                    };
-                    // The context that goes into the bitstream (SB-granular, same-rank).
-                    // Uses the neighbor ranks captured before the per-leaf reset.
-                    let emit_mode_ctx = |rank: u8| -> usize {
-                        let am = ia && sb_above_rank == rank;
-                        let lm = il && sb_left_rank == rank;
-                        (am as usize + lm as usize)
-                            + if (am && newmv_above[col] != 0) || (lm && newmv_left != 0) {
-                                2
-                            } else {
-                                0
-                            }
-                    };
-                    let intra_bound =
-                        crate::av2::video::rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, sb_qstep as u32);
-                    // Pick the RD-best listed reference at zero motion. Rank 0's RD
-                    // uses the legacy mi-granular ctx so single-reference decisions are
-                    // byte-identical; the emitted ctx is always the decoder-matching
-                    // SB-granular value.
-                    let mut skip_choice: Option<(f32, u8, usize)> = None;
-                    for rank in 0..if has_second { 2u8 } else { 1u8 } {
-                        let refp: &[Vec<f32>] = if rank == 0 { last_ref } else { second_ref };
-                        let sse = full_sse(refp);
-                        let rd_ctx = if rank == 0 {
-                            legacy_mode_ctx
-                        } else {
-                            emit_mode_ctx(rank)
-                        };
-                        enc.ref_rank = rank as usize;
-                        let rate = crate::av2::video::rd::inter_syntax_bits(
-                            enc, skip_ctx, rd_ctx, true, 1, None,
-                        );
-                        let cost = crate::av2::video::rd::rd_cost(
-                            sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                            rate,
-                            sb_qstep as u32,
-                        );
-                        if skip_choice.is_none_or(|(best, _, _)| cost < best) {
-                            skip_choice = Some((cost, rank, emit_mode_ctx(rank)));
-                        }
-                    }
-                    let (skip_cost, skip_rank, mode_ctx) =
-                        skip_choice.expect("rank 0 always evaluated");
-                    // The RD loop left `ref_rank` at the last evaluated rank. Reset
-                    // it so the fall-through GLOBALMV-residual / NEWMV branches (which
-                    // always predict rank 0) don't emit a stale rank-1 ref bit.
-                    enc.ref_rank = 0;
-                    if skip_cost < intra_bound {
-                        let refp: &[Vec<f32>] = if skip_rank == 0 { last_ref } else { second_ref };
-                        enc.ref_rank = skip_rank as usize;
-                        crate::av2::coder::emit_inter_skip_block(enc, pc, skip_ctx, mode_ctx);
-                        skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
-                        for (dst_row, src_row) in rect_rows_mut(recy, pw, sb_y, sb_x, 64, 64).zip(
-                            rect_rows(&refp[0], ref_ls, ref_y0 + sb_y, ref_x0 + sb_x, 64, 64),
-                        ) {
-                            dst_row.copy_from_slice(src_row);
-                        }
-                        let dst_rows = rect_rows_mut(recu, pcw, cy, cx, 32, 32)
-                            .zip(rect_rows_mut(recv, pcw, cy, cx, 32, 32));
-                        let src_rows = rect_rows(&refp[1], ref_cs, rcy, rcx, 32, 32)
-                            .zip(rect_rows(&refp[2], ref_cs, rcy, rcx, 32, 32));
-                        for ((dst_u, dst_v), (src_u, src_v)) in dst_rows.zip(src_rows) {
-                            dst_u.copy_from_slice(src_u);
-                            dst_v.copy_from_slice(src_v);
-                        }
-                        #[cfg(test)]
-                        if skip_rank == 1 {
-                            PARTITION_SKIP_RANK1_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        skip_above[col] = 1;
-                        skip_left = 1;
-                        inter_above[col] = 1;
-                        newmv_above[col] = 0;
-                        newmv_left = 0;
-                        mv_above[col] = Some(Mv::ZERO);
-                        mv_left = Some(Mv::ZERO);
-                        ref_above[col] = skip_rank;
-                        ref_left = skip_rank;
-                        for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                            inter_mi_above[c] = 1;
-                            skip_mi_above[c] = 1;
-                            newmv_mi_above[c] = 0;
-                            mv_mi_above[c] = Some(Mv::ZERO);
-                            ref_mi_above[c] = skip_rank;
-                        }
-                        for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                            inter_mi_left[r] = 1;
-                            skip_mi_left[r] = 1;
-                            newmv_mi_left[r] = 0;
-                            mv_mi_left[r] = Some(Mv::ZERO);
-                            ref_mi_left[r] = skip_rank;
-                        }
-                        // Skip block has no residual: reset coeff context (AVM av2_reset_entropy_context).
-                        for c in lmc..(lmc + bw_mi).min(above.len()) {
-                            above[c] = 0x40;
-                        }
-                        for r in lmr..(lmr + bh_mi).min(left.len()) {
-                            left[r] = 0x40;
-                        }
-                        for c in lmc..(lmc + bw_mi).min(u_above.len()) {
-                            u_above[c] = 0;
-                            v_above[c] = 0;
-                        }
-                        for r in lmr..(lmr + bh_mi).min(u_left.len()) {
-                            u_left[r] = 0;
-                            v_left[r] = 0;
-                        }
-                        inter_left = 1;
-                        continue;
-                    }
-                }
-            }
-            // GLOBALMV residual: LAST close but not exact -> code source-LAST
-            // residual (DCT_DCT, 4 luma TUs), reconstruct = LAST + inv-DCT.
-            if has_last
-                && bw_mi == 16
-                && bh_mi == 16
-                && 64.min(width - sb_x) == 64
-                && 64.min(height - sb_y) == 64
-            {
-                let ly = &last_ref[0];
-                let mut sse = rect_sse_f32(
-                    &PlaneRect {
-                        plane: yp,
-                        stride: pw,
-                        y: sb_y,
-                        x: sb_x,
-                    },
-                    &PlaneRect {
-                        plane: ly,
-                        stride: ref_ls,
-                        y: ref_y0 + sb_y,
-                        x: ref_x0 + sb_x,
-                    },
-                    64,
-                    64,
-                );
-                let (cy0, cx0) = (sb_y / 2, sb_x / 2);
-                let (rcy0, rcx0) = (ref_y0 / 2 + cy0, ref_x0 / 2 + cx0);
-                for (src_c, ref_c) in [(&up, &last_ref[1]), (&vp, &last_ref[2])] {
-                    sse += rect_sse_f32(
-                        &PlaneRect {
-                            plane: src_c,
-                            stride: pcw,
-                            y: cy0,
-                            x: cx0,
-                        },
-                        &PlaneRect {
-                            plane: ref_c,
-                            stride: ref_cs,
-                            y: rcy0,
-                            x: rcx0,
-                        },
-                        32,
-                        32,
-                    );
-                }
-                let upn = row > 0;
-                let lfn = col > 0;
-                let ia = inter_above[col] == 1;
-                let il = inter_left == 1;
-                enc.intra_inter_ctx = if upn && lfn {
-                    let n_intra = (!il as u8) + (!ia as u8);
-                    if n_intra == 2 { 3 } else { n_intra as usize }
-                } else if upn {
-                    if ia { 0 } else { 3 }
-                } else if lfn {
-                    if il { 0 } else { 3 }
-                } else {
-                    0
-                };
-                let sa = skip_above[col];
-                let sl = skip_left;
-                let skip_ctx = if upn && lfn {
-                    (sl + sa) as usize
-                } else if upn {
-                    (2 * sa) as usize
-                } else if lfn {
-                    (2 * sl) as usize
-                } else {
-                    0
-                };
-                let am0 = inter_above[col] == 1 && sb_above_rank == 0;
-                let lm0 = inter_left == 1 && sb_left_rank == 0;
-                let mode_ctx = (am0 as usize + lm0 as usize)
-                    + if (am0 && newmv_above[col] != 0) || (lm0 && newmv_left != 0) {
-                        2
-                    } else {
-                        0
-                    };
-                let syntax_rate = crate::av2::video::rd::inter_syntax_bits(
-                    enc, skip_ctx, mode_ctx, false, 1, None,
-                );
-                let inter_cost = crate::av2::video::rd::rd_cost(
-                    sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                    syntax_rate,
-                    sb_qstep as u32,
-                );
-                let intra_bound =
-                    crate::av2::video::rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, sb_qstep as u32);
-                if inter_cost < intra_bound {
-                    let bd = self.bit_depth as i32;
-                    static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
-                    let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                    let mut resid = [0f32; 1024];
-                    for (i, &(ty, tx)) in POS.iter().enumerate() {
-                        let (y0, x0) = (sb_y + ty, sb_x + tx);
-                        let mut pblk = [0f32; 1024];
-                        let dst_rows = pblk
-                            .as_chunks_mut::<32>()
-                            .0
-                            .iter_mut()
-                            .zip(resid.as_chunks_mut::<32>().0.iter_mut());
-                        let src_rows = rect_rows(yp, pw, y0, x0, 32, 32).zip(rect_rows(
-                            ly,
-                            ref_ls,
-                            ref_y0 + y0,
-                            ref_x0 + x0,
-                            32,
-                            32,
-                        ));
-                        for ((pred_row, resid_row), (src_row, ref_row)) in dst_rows.zip(src_rows) {
-                            pred_row.copy_from_slice(ref_row);
-                            for ((resid, &src), &reference) in
-                                resid_row.iter_mut().zip(src_row).zip(ref_row)
-                            {
-                                *resid = (src - reference) * sb_scale;
-                            }
-                        }
-                        let lev = bases.luma.project(&resid[..], 0.0);
-                        let rb = itx422::reconstruct_luma(&pblk, &lev, sb_qstep, &tables::SCAN, bd);
-                        put_block(recy, pw, y0, x0, 32, &rb);
-                        tus[i] = levels_to_coeffs(&lev);
-                    }
-                    // Chroma residual: source-LAST for U/V 32x32 (420).
-                    let (cy, cx) = (sb_y / 2, sb_x / 2);
-                    let mut uv_lev: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
-                    let mut uv_coeffs: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
-                    for (pi, (src_c, ref_c, rec_c)) in [
-                        (&up, &last_ref[1], &mut *recu),
-                        (&vp, &last_ref[2], &mut *recv),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let mut cres = [0f32; 1024];
-                        let mut cpred = [0i32; 1024];
-                        let dst_rows = cpred
-                            .as_chunks_mut::<32>()
-                            .0
-                            .iter_mut()
-                            .zip(cres.as_chunks_mut::<32>().0.iter_mut());
-                        let src_rows = rect_rows(src_c, pcw, cy, cx, 32, 32).zip(rect_rows(
-                            ref_c,
-                            ref_cs,
-                            ref_y0 / 2 + cy,
-                            ref_x0 / 2 + cx,
-                            32,
-                            32,
-                        ));
-                        for ((pred_row, resid_row), (src_row, ref_row)) in dst_rows.zip(src_rows) {
-                            for (((pred, resid), &src), &reference) in
-                                pred_row.iter_mut().zip(resid_row).zip(src_row).zip(ref_row)
-                            {
-                                *pred = (reference + 0.5) as i32;
-                                *resid = (src - reference) * sb_scale;
-                            }
-                        }
-                        let lev = bases.chroma420.project(&cres[..], 0.0);
-                        let rb = itx422::reconstruct_chroma_cfl(
-                            &cpred,
-                            &lev,
-                            sb_qstep,
-                            &tables::SCAN,
-                            32,
-                            32,
-                            bd,
-                        );
-                        for (dst_row, src_row) in rect_rows_mut(rec_c, pcw, cy, cx, 32, 32)
-                            .zip(rb.as_chunks::<32>().0.iter())
-                        {
-                            dst_row.copy_from_slice(src_row);
-                        }
-                        uv_coeffs[pi] = levels_to_coeffs(&lev);
-                        uv_lev[pi] = lev;
-                    }
-                    let up = row > 0;
-                    let lf = col > 0;
-                    let ia = inter_above[col] == 1;
-                    let il = inter_left == 1;
-                    enc.intra_inter_ctx = if up && lf {
-                        let n_intra = (!il as u8) + (!ia as u8);
-                        if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up {
-                        if ia { 0 } else { 3 }
-                    } else if lf {
-                        if il { 0 } else { 3 }
-                    } else {
-                        0
-                    };
-                    let sa = skip_above[col];
-                    let sl = skip_left;
-                    let skip_ctx = if up && lf {
-                        (sl + sa) as usize
-                    } else if up {
-                        (2 * sa) as usize
-                    } else if lf {
-                        (2 * sl) as usize
-                    } else {
-                        0
-                    };
-                    let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
-                    let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
-                    // Rank-0 block: count only rank-0 inter neighbors (excludes a
-                    // whole-64 rank-1 skip neighbor). No-op when no rank-1 exists.
-                    let left_match = lmc > 0
-                        && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
-                            || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
-                    let above_match = lmr > 0
-                        && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
-                            || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
-                    let any_newmv = (lmc > 0
-                        && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
-                            || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
-                        || (lmr > 0
-                            && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
-                                || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
-                    let mode_ctx = usize::from(left_match)
-                        + usize::from(above_match)
-                        + 2 * usize::from(any_newmv);
-                    // Residual blocks do carry delta-Q. Commit only now, after
-                    // the skip decision, so encoder and decoder qindex state stay
-                    // synchronized across preceding skip_txfm=1 superblocks.
-                    let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
-                    enc.delta_q_pending = enc.delta_q_present;
-                    let (luma_skip, luma_dc) =
-                        sb_tu_contexts(&tus, sb_y, sb_x, above, left, enc.qc, tmc, tmr);
-                    let u_present = uv_coeffs[0].iter().any(|&(_, level)| level != 0);
-                    let v_present = uv_coeffs[1].iter().any(|&(_, level)| level != 0);
-                    coder::emit_inter_residual_block(
-                        enc,
-                        pc,
-                        skip_ctx,
-                        mode_ctx,
-                        &tus,
-                        &luma_skip,
-                        &luma_dc,
-                        &uv_coeffs[0],
-                        &uv_coeffs[1],
-                        (6 + ua + ul) as usize,
-                        (6 * i32::from(u_present) + va + vl) as usize,
-                    );
-                    skip_above[col] = 0; // has coeffs
-                    skip_left = 0;
-                    inter_above[col] = 1;
-                    newmv_above[col] = 0;
-                    newmv_left = 0;
-                    mv_above[col] = Some(Mv::ZERO);
-                    mv_left = Some(Mv::ZERO);
-                    for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                        inter_mi_above[c] = 1;
-                        skip_mi_above[c] = 0;
-                        newmv_mi_above[c] = 0;
-                        mv_mi_above[c] = Some(Mv::ZERO);
-                        u_above[c] = i32::from(u_present);
-                        v_above[c] = i32::from(v_present);
-                    }
-                    for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                        inter_mi_left[r] = 1;
-                        skip_mi_left[r] = 0;
-                        newmv_mi_left[r] = 0;
-                        mv_mi_left[r] = Some(Mv::ZERO);
-                        u_left[r] = i32::from(u_present);
-                        v_left[r] = i32::from(v_present);
-                    }
-                    inter_left = 1;
-                    continue;
-                }
-            }
-            // NEWMV residual: search LAST for motion; if a nonzero MV's MC
-            // residual beats the intra estimate, code NEWMV + residual.
-            if has_last
-                && bw_mi == 16
-                && bh_mi == 16
-                && 64.min(width - sb_x) == 64
-                && 64.min(height - sb_y) == 64
-            {
-                use crate::av2::video::{mc, me};
-                let bd = self.bit_depth as i32;
-                // Keep the DPB/reconstruction f32 representation through ME/MC.
-                // The reference is the whole frame at `ref_ls`, so cross-tile
-                // motion resolves against real neighboring content.
-                let (bref, bstride, refh) = inter_luma.expect("LAST luma prepared for inter");
-                // Match the decoder's DRL[0] spatial candidate and seed ME
-                // from all available spatial MVs. The predictor used for the
-                // search-rate proxy must be the same one later subtracted from
-                // the selected absolute MV before entropy coding.
-                let above_mv = if row > 0 { mv_above[col] } else { None };
-                let above_right_mv = if row > 0 && col + 1 < sb_cols {
-                    mv_above[col + 1]
-                } else {
-                    None
-                };
-                // DRL[0] scans same-reference (rank-0) neighbors only. A rank-1
-                // neighbor (whole-64 skip on the second reference, zero motion) is
-                // excluded; its AVM derived contribution is the zero MV projected
-                // = zero = the drl0_mv fallback. `ref_above[col]`/`ref_left` were
-                // reset for this leaf, so use the captured neighbor ranks; the
-                // above-right column (col+1) is untouched this row.
-                let left_r0 = if sb_left_rank == 0 { mv_left } else { None };
-                let above_r0 = if sb_above_rank == 0 { above_mv } else { None };
-                let above_right_r0 = if row > 0 && col + 1 < sb_cols && ref_above[col + 1] == 0 {
-                    above_right_mv
-                } else {
-                    None
-                };
-                let pred_mv = drl0_mv(left_r0, above_r0, above_right_r0);
-                let mut preds = me::MeCandidates::new();
-                if frame_mv_seed != Mv::ZERO {
-                    preds.push_unique(frame_mv_seed);
-                }
-                for candidate in [mv_left, above_mv, above_right_mv].into_iter().flatten() {
-                    preds.push_unique(candidate);
-                }
-                let lambda_mv = (sb_qstep as u32).max(1);
-                let (mv, _) = me::search(
-                    &me::MePlanes {
-                        current: &yp[sb_y * pw + sb_x..],
-                        current_stride: pw,
-                        reference: bref,
-                        reference_stride: *bstride,
-                    },
-                    preds.as_slice(),
-                    &me::MeSearchSpec {
-                        origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                        origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                        width: 64,
-                        height: 64,
-                        reference_mv: pred_mv,
-                        lambda_mv,
-                        max_dx: self.video_search_range,
-                        max_dy: self.video_search_range,
-                        predictor_gate_sad_per_pixel: self.video_predictor_gate,
-                        integer_satd_radius: self.video_integer_satd_radius,
-                        bit_depth: self.bit_depth,
-                        frame_width: *bstride,
-                        frame_height: *refh + 2 * INTER_BORDER_420,
-                    },
-                    me_scratch,
-                );
-                let mut mv = mc::clamp_umv(
-                    mv,
-                    (ref_x0 + sb_x) as i32,
-                    (ref_y0 + sb_y) as i32,
-                    64,
-                    64,
-                    ref_ls as i32,
-                    *refh as i32,
-                );
-                if (mv.row != 0 || mv.col != 0) && (mv.row.abs() / 2 + mv.col.abs() / 2) <= 30 {
-                    let scratch = inter_pred_scratch.whole_sb();
-                    mc::predict_with_tmp(
-                        scratch.y,
-                        64,
-                        bref,
-                        *bstride,
-                        &mc::MotionBlock {
-                            origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                            origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                            mv,
-                            width: 64,
-                            height: 64,
-                            bit_depth: self.bit_depth,
-                        },
-                        scratch.convolve_tmp,
-                    );
-                    // Residual SSE (luma) to gate against intra.
+            let subblock_inter = outline_leaf_420(|| {
+                if has_last
+                    && (bw_mi != 16 || bh_mi != 16)
+                    && sb_x + block_w <= width
+                    && sb_y + block_h <= height
+                {
+                    let chroma_w = block_w / 2;
+                    let chroma_h = block_h / 2;
                     let mut sse = rect_sse_f32(
                         &PlaneRect {
                             plane: yp,
@@ -2905,14 +1913,871 @@ impl Av2Encoder {
                             x: sb_x,
                         },
                         &PlaneRect {
-                            plane: scratch.y,
-                            stride: 64,
-                            y: 0,
-                            x: 0,
+                            plane: &last_ref[0],
+                            stride: ref_ls,
+                            y: ref_y0 + sb_y,
+                            x: ref_x0 + sb_x,
+                        },
+                        block_w,
+                        block_h,
+                    );
+                    let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
+                    for (src, reference) in [(&up, &last_ref[1]), (&vp, &last_ref[2])] {
+                        sse += rect_sse_f32(
+                            &PlaneRect {
+                                plane: src,
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                            },
+                            &PlaneRect {
+                                plane: reference,
+                                stride: ref_cs,
+                                y: rcy,
+                                x: rcx,
+                            },
+                            chroma_w,
+                            chroma_h,
+                        );
+                    }
+
+                    let ar = (lmc + bw_mi - 1).min(skip_mi_above.len() - 1);
+                    let bl = (lmr + bh_mi - 1).min(skip_mi_left.len() - 1);
+                    let neighbors = [
+                        (lmc > 0).then_some((
+                            skip_mi_left[bl],
+                            inter_mi_left[bl],
+                            newmv_mi_left[bl],
+                        )),
+                        (lmr > 0).then_some((
+                            skip_mi_above[ar],
+                            inter_mi_above[ar],
+                            newmv_mi_above[ar],
+                        )),
+                        (lmc > 0).then_some((
+                            skip_mi_left[lmr],
+                            inter_mi_left[lmr],
+                            newmv_mi_left[lmr],
+                        )),
+                        (lmr > 0).then_some((
+                            skip_mi_above[lmc],
+                            inter_mi_above[lmc],
+                            newmv_mi_above[lmc],
+                        )),
+                    ];
+                    let mut chosen = [(0u8, 0u8, 0u8); 2];
+                    let mut count = 0;
+                    for neighbor in neighbors.into_iter().flatten() {
+                        chosen[count] = neighbor;
+                        count += 1;
+                        if count == 2 {
+                            break;
+                        }
+                    }
+                    let skip_ctx = chosen[..count].iter().map(|n| n.0 as usize).sum();
+                    // av2_find_mode_ctx collapses both probes on an axis to one
+                    // row/column match; skip_txfm instead sums the two selected
+                    // line-buffer entries above.
+                    // This block predicts from rank 0, so AVM's same-reference mode ctx
+                    // counts only rank-0 inter neighbors (a rank-1 neighbor, from a
+                    // whole-64 skip that chose the second reference, is excluded). The
+                    // rank filter is a no-op when no rank-1 block exists.
+                    let left_match = lmc > 0
+                        && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
+                            || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
+                    let above_match = lmr > 0
+                        && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
+                            || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
+                    let nearest_match = usize::from(left_match) + usize::from(above_match);
+                    let any_newmv = (lmc > 0
+                        && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
+                            || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
+                        || (lmr > 0
+                            && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
+                    let mode_ctx = nearest_match + 2 * usize::from(any_newmv);
+                    let rate = crate::av2::video::rd::inter_syntax_bits(
+                        enc, skip_ctx, mode_ctx, true, 1, None,
+                    );
+                    let cost = crate::av2::video::rd::rd_cost(
+                        sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                        rate,
+                        sb_qstep as u32,
+                    );
+                    let intra_bound = crate::av2::video::rd::rd_cost(
+                        0.0,
+                        2.0 * (block_w * block_h) as f32,
+                        sb_qstep as u32,
+                    );
+                    if cost < intra_bound {
+                        #[cfg(test)]
+                        if block_w == 32 && block_h == 32 {
+                            INTER_SKIP_32_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else if block_w != block_h {
+                            INTER_SKIP_RECT_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if !aq_committed {
+                            if use_grid {
+                                enc.delta_q_signaled = cell.sig;
+                            } else {
+                                let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
+                            }
+                            aq_committed = true;
+                        }
+                        crate::av2::coder::emit_inter_skip_leaf(enc, pc, skip_ctx, mode_ctx, false);
+                        skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
+                        for (dst, src) in
+                            rect_rows_mut(recy, pw, sb_y, sb_x, block_w, block_h).zip(rect_rows(
+                                &last_ref[0],
+                                ref_ls,
+                                ref_y0 + sb_y,
+                                ref_x0 + sb_x,
+                                block_w,
+                                block_h,
+                            ))
+                        {
+                            dst.copy_from_slice(src);
+                        }
+                        let dst_rows = rect_rows_mut(recu, pcw, cy, cx, chroma_w, chroma_h)
+                            .zip(rect_rows_mut(recv, pcw, cy, cx, chroma_w, chroma_h));
+                        let src_rows =
+                            rect_rows(&last_ref[1], ref_cs, rcy, rcx, chroma_w, chroma_h).zip(
+                                rect_rows(&last_ref[2], ref_cs, rcy, rcx, chroma_w, chroma_h),
+                            );
+                        for ((du, dv), (su, sv)) in dst_rows.zip(src_rows) {
+                            du.copy_from_slice(su);
+                            dv.copy_from_slice(sv);
+                        }
+                        for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                            inter_mi_above[c] = 1;
+                            skip_mi_above[c] = 1;
+                            newmv_mi_above[c] = 0;
+                            mv_mi_above[c] = Some(Mv::ZERO);
+                            above[c] = 0x40;
+                            u_above[c] = 0;
+                            v_above[c] = 0;
+                        }
+                        for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                            inter_mi_left[r] = 1;
+                            skip_mi_left[r] = 1;
+                            newmv_mi_left[r] = 0;
+                            mv_mi_left[r] = Some(Mv::ZERO);
+                            left[r] = 0x40;
+                            u_left[r] = 0;
+                            v_left[r] = 0;
+                        }
+                        skip_above[col] = 1;
+                        skip_left = 1;
+                        inter_above[col] = 1;
+                        inter_left = 1;
+                        newmv_above[col] = 0;
+                        newmv_left = 0;
+                        mv_above[col] = Some(Mv::ZERO);
+                        mv_left = Some(Mv::ZERO);
+                        return true;
+                    }
+
+                    // Mirror the adjacent spatial scan used for DRL[0]: bottom-left
+                    // edge, above-right edge, immediate left, immediate above. A
+                    // block spanning an edge appears twice but carries the same MV.
+                    // Search both the square dense-inter leaves and the rectangular
+                    // leaves already produced by the partition walker. Rectangles
+                    // initially compete as motion-only skip blocks; residual coding
+                    // remains on the bit-exact square TX paths below.
+                    let motion_leaf = (block_w == block_h && matches!(block_w, 16 | 32))
+                        || (block_w != block_h
+                            && matches!(block_w, 16 | 32 | 64)
+                            && matches!(block_h, 16 | 32 | 64));
+                    if motion_leaf {
+                        // DRL[0] scans same-reference (rank-0) neighbors only: AVM's
+                        // setup_ref_mv_list gates spatial candidates on ref==rf, so a
+                        // rank-1 neighbor (a whole-64 skip that chose the second
+                        // reference, always zero motion) is skipped. Its AVM "derived"
+                        // contribution would be the zero MV projected — i.e. zero — which
+                        // is exactly the ZERO fallback, so no explicit derived term is
+                        // needed. No-op when no rank-1 block exists.
+                        let pred_mv = [
+                            (lmc > 0 && bl_ref_rank == 0)
+                                .then_some(mv_mi_left[bl])
+                                .flatten(),
+                            (lmr > 0 && ar_ref_rank == 0)
+                                .then_some(mv_mi_above[ar])
+                                .flatten(),
+                            (lmc > 0 && left_ref_rank == 0)
+                                .then_some(mv_mi_left[lmr])
+                                .flatten(),
+                            (lmr > 0 && above_ref_rank == 0)
+                                .then_some(mv_mi_above[lmc])
+                                .flatten(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .next()
+                        .unwrap_or(Mv::ZERO);
+                        if let Some(candidate) = self.search_inter_leaf_420(InterLeafSearch420 {
+                            enc,
+                            source_y: yp,
+                            source_u: up,
+                            source_v: vp,
+                            luma_reference: inter_luma.expect("LAST luma prepared for inter"),
+                            chroma_references: inter_chroma
+                                .expect("LAST chroma prepared for inter"),
+                            me_scratch,
+                            prediction_scratch: inter_pred_scratch,
+                            source_stride: pw,
+                            chroma_stride: pcw,
+                            reference_x: ref_x0,
+                            reference_y: ref_y0,
+                            reference_luma_stride: ref_ls,
+                            block_x: sb_x,
+                            block_y: sb_y,
+                            block_width: block_w,
+                            block_height: block_h,
+                            predictor_mv: pred_mv,
+                            frame_mv_seed,
+                            skip_ctx,
+                            mode_ctx,
+                            qstep: sb_qstep,
+                        }) {
+                            let InterLeafCandidate420 {
+                                mv,
+                                mode: inter_mode,
+                                mvd: scaled_mvd,
+                                rd_cost: motion_cost,
+                            } = candidate;
+                            let (mvd_row, mvd_col) =
+                                scaled_mvd.map(|mvd| (mvd.row, mvd.col)).unwrap_or((0, 0));
+                            let (pred_y, pred_u, pred_v, _) =
+                                inter_pred_scratch.planes(block_w * block_h, chroma_w * chroma_h);
+                            // between perfect prediction and intra. Quantize the
+                            // dense inter residual, reconstruct it exactly as the
+                            // decoder will, and let it compete against both skip
+                            // and the existing intra bound.
+                            if block_w == 32 && block_h == 32 && ENABLE_DENSE_INTER_32 {
+                                let DenseInterResidual420 {
+                                    rd_cost: residual_cost,
+                                    y_coeffs,
+                                    u_coeffs,
+                                    v_coeffs,
+                                    y_recon,
+                                    u_recon,
+                                    v_recon,
+                                } = self.evaluate_dense_inter_residual_420(
+                                    DenseInterResidualInput420 {
+                                        enc,
+                                        source_y: yp,
+                                        source_u: up,
+                                        source_v: vp,
+                                        prediction_y: pred_y,
+                                        prediction_u: pred_u,
+                                        prediction_v: pred_v,
+                                        source_stride: pw,
+                                        chroma_stride: pcw,
+                                        block_x: sb_x,
+                                        block_y: sb_y,
+                                        block_size: 32,
+                                        residual_scale: sb_scale,
+                                        qstep: sb_qstep,
+                                        skip_ctx,
+                                        mode_ctx,
+                                        inter_mode,
+                                        mvd: scaled_mvd,
+                                    },
+                                );
+                                // DC-only inter residuals. Keep AC-heavy blocks on the
+                                // established intra/skip paths until dense AC token coding
+                                // passes the same AVM reconstruction gate.
+                                if residual_cost < motion_cost && residual_cost < intra_bound {
+                                    if !aq_committed {
+                                        if use_grid {
+                                            enc.delta_q_signaled = cell.sig;
+                                        } else {
+                                            let _ = aqs.per_sb(
+                                                enc,
+                                                yp,
+                                                pw,
+                                                row * 64,
+                                                col * 64,
+                                                width,
+                                                height,
+                                            );
+                                        }
+                                        aq_committed = true;
+                                        enc.delta_q_pending = enc.delta_q_present;
+                                    }
+
+                                    let (y_skip_cdf, y_dc_sign_ctx) = sb_tu_contexts_rect(
+                                        &y_coeffs,
+                                        above,
+                                        left,
+                                        &TxbContextSpec {
+                                            sb_y,
+                                            sb_x,
+                                            qc: enc.qc,
+                                            mi_cols: tmc,
+                                            mi_rows: tmr,
+                                            block_eq_tx: true,
+                                        },
+                                        8,
+                                        8,
+                                    );
+                                    let u_present = u_coeffs.iter().any(|&(_, level)| level != 0);
+                                    let v_present = v_coeffs.iter().any(|&(_, level)| level != 0);
+                                    let u_skip_cdf =
+                                        INTER_SKIP_TX16_QC[enc.qc][(6 + ua + ul) as usize] as u32;
+                                    let v_skip_ctx = (6 * i32::from(u_present) + va + vl) as u32;
+                                    crate::av2::coder::emit_inter_residual_leaf_32(
+                                        enc,
+                                        pc,
+                                        skip_ctx,
+                                        mode_ctx,
+                                        mode_ctx,
+                                        inter_mode,
+                                        mvd_row,
+                                        mvd_col,
+                                        &y_coeffs,
+                                        y_skip_cdf,
+                                        y_dc_sign_ctx,
+                                        &u_coeffs,
+                                        &v_coeffs,
+                                        u_skip_cdf,
+                                        v_skip_ctx,
+                                    );
+                                    put_block_rect(recy, pw, sb_y, sb_x, 32, 32, &y_recon);
+                                    put_block_rect(recu, pcw, cy, cx, 16, 16, &u_recon);
+                                    put_block_rect(recv, pcw, cy, cx, 16, 16, &v_recon);
+                                    #[cfg(test)]
+                                    {
+                                        INTER_RESIDUAL_32_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if y_coeffs.iter().any(|&(scan, _)| scan > 900) {
+                                            INTER_RESIDUAL_32_HIGH_EOB_COUNT
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                        inter_mi_above[c] = 1;
+                                        skip_mi_above[c] = 0;
+                                        newmv_mi_above[c] = (inter_mode == 2) as u8;
+                                        mv_mi_above[c] = Some(mv);
+                                        u_above[c] = i32::from(u_present);
+                                        v_above[c] = i32::from(v_present);
+                                    }
+                                    for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                        inter_mi_left[r] = 1;
+                                        skip_mi_left[r] = 0;
+                                        newmv_mi_left[r] = (inter_mode == 2) as u8;
+                                        mv_mi_left[r] = Some(mv);
+                                        u_left[r] = i32::from(u_present);
+                                        v_left[r] = i32::from(v_present);
+                                    }
+                                    skip_above[col] = 0;
+                                    skip_left = 0;
+                                    inter_above[col] = 1;
+                                    inter_left = 1;
+                                    newmv_above[col] = (inter_mode == 2) as u8;
+                                    newmv_left = (inter_mode == 2) as u8;
+                                    mv_above[col] = Some(mv);
+                                    mv_left = Some(mv);
+                                    for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
+                                        for c in (lmc & 15)..((lmc & 15) + bw_mi).min(16) {
+                                            enc.sb_coded[r * 16 + c] = 1;
+                                        }
+                                    }
+                                    return true;
+                                }
+                            }
+                            if block_w == 16 && block_h == 16 && ENABLE_DENSE_INTER_16 {
+                                let DenseInterResidual420 {
+                                    rd_cost: residual_cost,
+                                    y_coeffs,
+                                    u_coeffs,
+                                    v_coeffs,
+                                    y_recon,
+                                    u_recon,
+                                    v_recon,
+                                } = self.evaluate_dense_inter_residual_420(
+                                    DenseInterResidualInput420 {
+                                        enc,
+                                        source_y: yp,
+                                        source_u: up,
+                                        source_v: vp,
+                                        prediction_y: pred_y,
+                                        prediction_u: pred_u,
+                                        prediction_v: pred_v,
+                                        source_stride: pw,
+                                        chroma_stride: pcw,
+                                        block_x: sb_x,
+                                        block_y: sb_y,
+                                        block_size: 16,
+                                        residual_scale: sb_scale,
+                                        qstep: sb_qstep,
+                                        skip_ctx,
+                                        mode_ctx,
+                                        inter_mode,
+                                        mvd: scaled_mvd,
+                                    },
+                                );
+                                if residual_cost < motion_cost && residual_cost < intra_bound {
+                                    if !aq_committed {
+                                        if use_grid {
+                                            enc.delta_q_signaled = cell.sig;
+                                        } else {
+                                            let _ = aqs.per_sb(
+                                                enc,
+                                                yp,
+                                                pw,
+                                                row * 64,
+                                                col * 64,
+                                                width,
+                                                height,
+                                            );
+                                        }
+                                        aq_committed = true;
+                                        enc.delta_q_pending = enc.delta_q_present;
+                                    }
+
+                                    let u_present = u_coeffs.iter().any(|&(_, level)| level != 0);
+                                    let v_present = v_coeffs.iter().any(|&(_, level)| level != 0);
+                                    let (intra_skip_cdf, y_dc_sign_ctx) = sb_tu_contexts_rect(
+                                        &y_coeffs,
+                                        above,
+                                        left,
+                                        &TxbContextSpec {
+                                            sb_y,
+                                            sb_x,
+                                            qc: enc.qc,
+                                            mi_cols: tmc,
+                                            mi_rows: tmr,
+                                            block_eq_tx: true,
+                                        },
+                                        4,
+                                        4,
+                                    );
+                                    let y_skip_ctx = SKIP_TX16_QC[enc.qc]
+                                        .iter()
+                                        .position(|&cdf| u32::from(cdf) == intra_skip_cdf)
+                                        .expect("TX16 skip context must resolve");
+                                    let y_skip_cdf = INTER_SKIP_TX16_QC[enc.qc][y_skip_ctx] as u32;
+                                    crate::av2::coder::emit_inter_residual_leaf_16(
+                                        enc,
+                                        pc,
+                                        skip_ctx,
+                                        mode_ctx,
+                                        mode_ctx,
+                                        inter_mode,
+                                        mvd_row,
+                                        mvd_col,
+                                        &y_coeffs,
+                                        y_skip_cdf,
+                                        y_dc_sign_ctx,
+                                        &u_coeffs,
+                                        &v_coeffs,
+                                        (6 + ua + ul) as usize,
+                                        (6 * usize::from(u_present) as i32 + va + vl) as usize,
+                                    );
+                                    put_block_rect(recy, pw, sb_y, sb_x, 16, 16, &y_recon);
+                                    put_block_rect(recu, pcw, cy, cx, 8, 8, &u_recon);
+                                    put_block_rect(recv, pcw, cy, cx, 8, 8, &v_recon);
+                                    #[cfg(test)]
+                                    {
+                                        INTER_RESIDUAL_16_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if y_coeffs.iter().any(|&(scan, _)| scan > 220) {
+                                            INTER_RESIDUAL_16_HIGH_EOB_COUNT
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        if u_present && v_present {
+                                            INTER_RESIDUAL_16_CHROMA_COUNT
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                        inter_mi_above[c] = 1;
+                                        skip_mi_above[c] = 0;
+                                        newmv_mi_above[c] = (inter_mode == 2) as u8;
+                                        mv_mi_above[c] = Some(mv);
+                                        u_above[c] = i32::from(u_present);
+                                        v_above[c] = i32::from(v_present);
+                                    }
+                                    for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                        inter_mi_left[r] = 1;
+                                        skip_mi_left[r] = 0;
+                                        newmv_mi_left[r] = (inter_mode == 2) as u8;
+                                        mv_mi_left[r] = Some(mv);
+                                        u_left[r] = i32::from(u_present);
+                                        v_left[r] = i32::from(v_present);
+                                    }
+                                    skip_above[col] = 0;
+                                    skip_left = 0;
+                                    inter_above[col] = 1;
+                                    inter_left = 1;
+                                    newmv_above[col] = (inter_mode == 2) as u8;
+                                    newmv_left = (inter_mode == 2) as u8;
+                                    mv_above[col] = Some(mv);
+                                    mv_left = Some(mv);
+                                    for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
+                                        for c in (lmc & 15)..((lmc & 15) + bw_mi).min(16) {
+                                            enc.sb_coded[r * 16 + c] = 1;
+                                        }
+                                    }
+                                    return true;
+                                }
+                            }
+                            if motion_cost < intra_bound {
+                                #[cfg(test)]
+                                if block_w != block_h {
+                                    INTER_MOTION_SKIP_RECT_COUNT
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                #[cfg(test)]
+                                if block_w == 16 {
+                                    if inter_mode == 2 {
+                                        INTER_NEWMV_SKIP_16_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        INTER_NEARMV_SKIP_16_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                #[cfg(test)]
+                                if block_w == 32 {
+                                    if inter_mode == 2 {
+                                        INTER_NEWMV_SKIP_32_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        INTER_NEARMV_SKIP_32_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                if !aq_committed {
+                                    if use_grid {
+                                        enc.delta_q_signaled = cell.sig;
+                                    } else {
+                                        let _ = aqs.per_sb(
+                                            enc,
+                                            yp,
+                                            pw,
+                                            row * 64,
+                                            col * 64,
+                                            width,
+                                            height,
+                                        );
+                                    }
+                                    aq_committed = true;
+                                }
+                                enc.cur_bw4 = bw_mi;
+                                enc.cur_bh4 = bh_mi;
+                                crate::av2::coder::emit_inter_mode_leaf(
+                                    enc, pc, skip_ctx, mode_ctx, mode_ctx, inter_mode, mvd_row,
+                                    mvd_col, false,
+                                );
+                                skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
+                                put_block_rect(recy, pw, sb_y, sb_x, block_w, block_h, pred_y);
+                                for (dst, pred) in [(&mut *recu, &*pred_u), (&mut *recv, &*pred_v)]
+                                {
+                                    put_block_rect(dst, pcw, cy, cx, chroma_w, chroma_h, pred);
+                                }
+                                for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                    inter_mi_above[c] = 1;
+                                    skip_mi_above[c] = 1;
+                                    newmv_mi_above[c] = (inter_mode == 2) as u8;
+                                    mv_mi_above[c] = Some(mv);
+                                    above[c] = 0x40;
+                                    u_above[c] = 0;
+                                    v_above[c] = 0;
+                                }
+                                for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                    inter_mi_left[r] = 1;
+                                    skip_mi_left[r] = 1;
+                                    newmv_mi_left[r] = (inter_mode == 2) as u8;
+                                    mv_mi_left[r] = Some(mv);
+                                    left[r] = 0x40;
+                                    u_left[r] = 0;
+                                    v_left[r] = 0;
+                                }
+                                skip_above[col] = 1;
+                                skip_left = 1;
+                                inter_above[col] = 1;
+                                inter_left = 1;
+                                newmv_above[col] = (inter_mode == 2) as u8;
+                                newmv_left = (inter_mode == 2) as u8;
+                                mv_above[col] = Some(mv);
+                                mv_left = Some(mv);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            });
+            if subblock_inter {
+                continue;
+            }
+            // GLOBALMV zero-motion skip: static 64x64 block copies LAST (no residual).
+            let whole_skip = outline_leaf_420(|| {
+                if has_last && bw_mi == 16 && bh_mi == 16 {
+                    let bw = 64.min(width - sb_x);
+                    let bh = 64.min(height - sb_y);
+                    if bw == 64 && bh == 64 {
+                        let (cy, cx) = (sb_y / 2, sb_x / 2);
+                        let (rcy, rcx) = (ref_y0 / 2 + cy, ref_x0 / 2 + cx);
+                        // Full-SB SSE (luma + chroma) against a candidate reference at
+                        // zero motion, so chroma-only changes aren't wrongly skipped.
+                        let full_sse = |refp: &[Vec<f32>]| -> f32 {
+                            let mut sse = rect_sse_f32(
+                                &PlaneRect {
+                                    plane: yp,
+                                    stride: pw,
+                                    y: sb_y,
+                                    x: sb_x,
+                                },
+                                &PlaneRect {
+                                    plane: &refp[0],
+                                    stride: ref_ls,
+                                    y: ref_y0 + sb_y,
+                                    x: ref_x0 + sb_x,
+                                },
+                                64,
+                                64,
+                            );
+                            for (src_c, ref_c) in [(&up, &refp[1]), (&vp, &refp[2])] {
+                                sse += rect_sse_f32(
+                                    &PlaneRect {
+                                        plane: src_c,
+                                        stride: pcw,
+                                        y: cy,
+                                        x: cx,
+                                    },
+                                    &PlaneRect {
+                                        plane: ref_c,
+                                        stride: ref_cs,
+                                        y: rcy,
+                                        x: rcx,
+                                    },
+                                    32,
+                                    32,
+                                );
+                            }
+                            sse
+                        };
+                        let up_n = row > 0;
+                        let lf_n = col > 0;
+                        let ia = inter_above[col] == 1;
+                        let il = inter_left == 1;
+                        enc.intra_inter_ctx = if up_n && lf_n {
+                            let n_intra = (!il as u8) + (!ia as u8);
+                            if n_intra == 2 { 3 } else { n_intra as usize }
+                        } else if up_n {
+                            if ia { 0 } else { 3 }
+                        } else if lf_n {
+                            if il { 0 } else { 3 }
+                        } else {
+                            0
+                        };
+                        let sa = skip_above[col];
+                        let sl = skip_left;
+                        let skip_ctx = if up_n && lf_n {
+                            (sl + sa) as usize
+                        } else if up_n {
+                            (2 * sa) as usize
+                        } else if lf_n {
+                            (2 * sl) as usize
+                        } else {
+                            0
+                        };
+                        // RD skip mode context: single reference keeps the legacy
+                        // mi-granular formula verbatim (byte-exact). Two references use
+                        // the same-rank SB-granular ctx (AVM av2_find_mode_ctx counts
+                        // only neighbors predicting from this rank), which reduces to the
+                        // legacy value when every neighbor is rank 0.
+                        let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
+                        let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
+                        let legacy_mode_ctx = {
+                            let left_match =
+                                lmc > 0 && (inter_mi_left[bl] != 0 || inter_mi_left[lmr] != 0);
+                            let above_match =
+                                lmr > 0 && (inter_mi_above[ar] != 0 || inter_mi_above[lmc] != 0);
+                            let any_newmv = (lmc > 0
+                                && (newmv_mi_left[bl] != 0 || newmv_mi_left[lmr] != 0))
+                                || (lmr > 0
+                                    && (newmv_mi_above[ar] != 0 || newmv_mi_above[lmc] != 0));
+                            usize::from(left_match)
+                                + usize::from(above_match)
+                                + 2 * usize::from(any_newmv)
+                        };
+                        // The context that goes into the bitstream (SB-granular, same-rank).
+                        // Uses the neighbor ranks captured before the per-leaf reset.
+                        let emit_mode_ctx = |rank: u8| -> usize {
+                            let am = ia && sb_above_rank == rank;
+                            let lm = il && sb_left_rank == rank;
+                            (am as usize + lm as usize)
+                                + if (am && newmv_above[col] != 0) || (lm && newmv_left != 0) {
+                                    2
+                                } else {
+                                    0
+                                }
+                        };
+                        let intra_bound =
+                            crate::av2::video::rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, sb_qstep as u32);
+                        // Pick the RD-best listed reference at zero motion. Rank 0's RD
+                        // uses the legacy mi-granular ctx so single-reference decisions are
+                        // byte-identical; the emitted ctx is always the decoder-matching
+                        // SB-granular value.
+                        let mut skip_choice: Option<(f32, u8, usize)> = None;
+                        for rank in 0..if has_second { 2u8 } else { 1u8 } {
+                            let refp: &[Vec<f32>] = if rank == 0 { last_ref } else { second_ref };
+                            let sse = full_sse(refp);
+                            let rd_ctx = if rank == 0 {
+                                legacy_mode_ctx
+                            } else {
+                                emit_mode_ctx(rank)
+                            };
+                            enc.ref_rank = rank as usize;
+                            let rate = crate::av2::video::rd::inter_syntax_bits(
+                                enc, skip_ctx, rd_ctx, true, 1, None,
+                            );
+                            let cost = crate::av2::video::rd::rd_cost(
+                                sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                                rate,
+                                sb_qstep as u32,
+                            );
+                            if skip_choice.is_none_or(|(best, _, _)| cost < best) {
+                                skip_choice = Some((cost, rank, emit_mode_ctx(rank)));
+                            }
+                        }
+                        let (skip_cost, skip_rank, mode_ctx) =
+                            skip_choice.expect("rank 0 always evaluated");
+                        // The RD loop left `ref_rank` at the last evaluated rank. Reset
+                        // it so the fall-through GLOBALMV-residual / NEWMV branches (which
+                        // always predict rank 0) don't emit a stale rank-1 ref bit.
+                        enc.ref_rank = 0;
+                        if skip_cost < intra_bound {
+                            let refp: &[Vec<f32>] =
+                                if skip_rank == 0 { last_ref } else { second_ref };
+                            enc.ref_rank = skip_rank as usize;
+                            crate::av2::coder::emit_inter_skip_block(enc, pc, skip_ctx, mode_ctx);
+                            skip_leaves.push((lmr, lmc, bw_mi, bh_mi));
+                            for (dst_row, src_row) in rect_rows_mut(recy, pw, sb_y, sb_x, 64, 64)
+                                .zip(rect_rows(
+                                    &refp[0],
+                                    ref_ls,
+                                    ref_y0 + sb_y,
+                                    ref_x0 + sb_x,
+                                    64,
+                                    64,
+                                ))
+                            {
+                                dst_row.copy_from_slice(src_row);
+                            }
+                            let dst_rows = rect_rows_mut(recu, pcw, cy, cx, 32, 32)
+                                .zip(rect_rows_mut(recv, pcw, cy, cx, 32, 32));
+                            let src_rows = rect_rows(&refp[1], ref_cs, rcy, rcx, 32, 32)
+                                .zip(rect_rows(&refp[2], ref_cs, rcy, rcx, 32, 32));
+                            for ((dst_u, dst_v), (src_u, src_v)) in dst_rows.zip(src_rows) {
+                                dst_u.copy_from_slice(src_u);
+                                dst_v.copy_from_slice(src_v);
+                            }
+                            #[cfg(test)]
+                            if skip_rank == 1 {
+                                PARTITION_SKIP_RANK1_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            skip_above[col] = 1;
+                            skip_left = 1;
+                            inter_above[col] = 1;
+                            newmv_above[col] = 0;
+                            newmv_left = 0;
+                            mv_above[col] = Some(Mv::ZERO);
+                            mv_left = Some(Mv::ZERO);
+                            ref_above[col] = skip_rank;
+                            ref_left = skip_rank;
+                            for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                inter_mi_above[c] = 1;
+                                skip_mi_above[c] = 1;
+                                newmv_mi_above[c] = 0;
+                                mv_mi_above[c] = Some(Mv::ZERO);
+                                ref_mi_above[c] = skip_rank;
+                            }
+                            for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                inter_mi_left[r] = 1;
+                                skip_mi_left[r] = 1;
+                                newmv_mi_left[r] = 0;
+                                mv_mi_left[r] = Some(Mv::ZERO);
+                                ref_mi_left[r] = skip_rank;
+                            }
+                            // Skip block has no residual: reset coeff context (AVM av2_reset_entropy_context).
+                            for c in lmc..(lmc + bw_mi).min(above.len()) {
+                                above[c] = 0x40;
+                            }
+                            for r in lmr..(lmr + bh_mi).min(left.len()) {
+                                left[r] = 0x40;
+                            }
+                            for c in lmc..(lmc + bw_mi).min(u_above.len()) {
+                                u_above[c] = 0;
+                                v_above[c] = 0;
+                            }
+                            for r in lmr..(lmr + bh_mi).min(u_left.len()) {
+                                u_left[r] = 0;
+                                v_left[r] = 0;
+                            }
+                            inter_left = 1;
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+            if whole_skip {
+                continue;
+            }
+            // GLOBALMV residual: LAST close but not exact -> code source-LAST
+            // residual (DCT_DCT, 4 luma TUs), reconstruct = LAST + inv-DCT.
+            let global_residual = outline_leaf_420(|| {
+                if has_last
+                    && bw_mi == 16
+                    && bh_mi == 16
+                    && 64.min(width - sb_x) == 64
+                    && 64.min(height - sb_y) == 64
+                {
+                    let ly = &last_ref[0];
+                    let mut sse = rect_sse_f32(
+                        &PlaneRect {
+                            plane: yp,
+                            stride: pw,
+                            y: sb_y,
+                            x: sb_x,
+                        },
+                        &PlaneRect {
+                            plane: ly,
+                            stride: ref_ls,
+                            y: ref_y0 + sb_y,
+                            x: ref_x0 + sb_x,
                         },
                         64,
                         64,
                     );
+                    let (cy0, cx0) = (sb_y / 2, sb_x / 2);
+                    let (rcy0, rcx0) = (ref_y0 / 2 + cy0, ref_x0 / 2 + cx0);
+                    for (src_c, ref_c) in [(&up, &last_ref[1]), (&vp, &last_ref[2])] {
+                        sse += rect_sse_f32(
+                            &PlaneRect {
+                                plane: src_c,
+                                stride: pcw,
+                                y: cy0,
+                                x: cx0,
+                            },
+                            &PlaneRect {
+                                plane: ref_c,
+                                stride: ref_cs,
+                                y: rcy0,
+                                x: rcx0,
+                            },
+                            32,
+                            32,
+                        );
+                    }
                     let upn = row > 0;
                     let lfn = col > 0;
                     let ia = inter_above[col] == 1;
@@ -2946,8 +2811,313 @@ impl Av2Encoder {
                         } else {
                             0
                         };
-                    let bounded_pred_mv = mc::clamp_umv(
-                        pred_mv,
+                    let syntax_rate = crate::av2::video::rd::inter_syntax_bits(
+                        enc, skip_ctx, mode_ctx, false, 1, None,
+                    );
+                    let _ = sse; // Gate on the CODED residual RD below, not the uncoded
+                    // zero-motion SSE. The old `inter_cost = sse*W + syntax` gate rejected
+                    // predictable blocks to expensive intra at high quality: the SSE term
+                    // is not rdmult-scaled, so it dwarfs the fixed rdmult-scaled intra_bound
+                    // as qstep shrinks. Code the residual, then compare its real RD to intra.
+                    let intra_bound =
+                        crate::av2::video::rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, sb_qstep as u32);
+                    {
+                        let bd = self.bit_depth as i32;
+                        let mut coeff_bits = 0.0f32;
+                        static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
+                        let mut tus: [Vec<Coeff>; 4] =
+                            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                        let mut resid = [0f32; 1024];
+                        for (i, &(ty, tx)) in POS.iter().enumerate() {
+                            let (y0, x0) = (sb_y + ty, sb_x + tx);
+                            let mut pblk = [0f32; 1024];
+                            crate::av2::metrics::copy_f32_prediction_and_scaled_residual(
+                                &mut pblk,
+                                &mut resid,
+                                &yp[y0 * pw + x0..],
+                                &ly[(ref_y0 + y0) * ref_ls + ref_x0 + x0..],
+                                crate::av2::metrics::ResidualSpec {
+                                    src_stride: pw,
+                                    pred_stride: ref_ls,
+                                    width: 32,
+                                    height: 32,
+                                    scale: sb_scale,
+                                },
+                            );
+                            let lev = bases.luma.project(&resid[..], 0.0);
+                            let rb = reconstruct_luma(&pblk, &lev, sb_qstep, &tables::SCAN, bd);
+                            put_block(recy, pw, y0, x0, 32, &rb);
+                            coeff_bits += coeff_rate_f32(&lev);
+                            tus[i] = levels_to_coeffs(&lev);
+                        }
+                        // Chroma residual: source-LAST for U/V 32x32 (420).
+                        let (cy, cx) = (sb_y / 2, sb_x / 2);
+                        let mut uv_lev: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+                        let mut uv_coeffs: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
+                        for (pi, (src_c, ref_c, rec_c)) in [
+                            (&up, &last_ref[1], &mut *recu),
+                            (&vp, &last_ref[2], &mut *recv),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let mut cres = [0f32; 1024];
+                            let mut cpred = [0i32; 1024];
+                            crate::av2::metrics::f32_prediction_and_scaled_residual_i32(
+                                &mut cpred,
+                                &mut cres,
+                                &src_c[cy * pcw + cx..],
+                                &ref_c[(ref_y0 / 2 + cy) * ref_cs + ref_x0 / 2 + cx..],
+                                crate::av2::metrics::ResidualSpec {
+                                    src_stride: pcw,
+                                    pred_stride: ref_cs,
+                                    width: 32,
+                                    height: 32,
+                                    scale: sb_scale,
+                                },
+                            );
+                            let lev = bases.chroma420.project(&cres[..], 0.0);
+                            let rb = itx422::reconstruct_chroma_cfl(
+                                &cpred,
+                                &lev,
+                                sb_qstep,
+                                &tables::SCAN,
+                                32,
+                                32,
+                                bd,
+                            );
+                            for (dst_row, src_row) in rect_rows_mut(rec_c, pcw, cy, cx, 32, 32)
+                                .zip(rb.as_chunks::<32>().0.iter())
+                            {
+                                dst_row.copy_from_slice(src_row);
+                            }
+                            uv_coeffs[pi] = levels_to_coeffs(&lev);
+                            coeff_bits += coeff_rate_f32(&lev);
+                            uv_lev[pi] = lev;
+                        }
+                        // Real RD of the coded residual: reconstruction distortion (now
+                        // the quantization error, not the full prediction error) plus the
+                        // mode syntax and coefficient bits. Choose it over intra only when
+                        // it is actually cheaper — a dense residual on hard content still
+                        // loses to intra, but a cheap residual on predictable content
+                        // (the common case) now wins instead of falling back to intra.
+                        let mut coded_sse = rect_sse_f32(
+                            &PlaneRect {
+                                plane: yp,
+                                stride: pw,
+                                y: sb_y,
+                                x: sb_x,
+                            },
+                            &PlaneRect {
+                                plane: recy,
+                                stride: pw,
+                                y: sb_y,
+                                x: sb_x,
+                            },
+                            64,
+                            64,
+                        );
+                        for (src_c, rec_c) in [(&up, &*recu), (&vp, &*recv)] {
+                            coded_sse += rect_sse_f32(
+                                &PlaneRect {
+                                    plane: src_c,
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                },
+                                &PlaneRect {
+                                    plane: rec_c,
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                },
+                                32,
+                                32,
+                            );
+                        }
+                        let residual_cost = crate::av2::video::rd::rd_cost(
+                            coded_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                            syntax_rate + coeff_bits,
+                            sb_qstep as u32,
+                        );
+                        if residual_cost < intra_bound {
+                            let up = row > 0;
+                            let lf = col > 0;
+                            let ia = inter_above[col] == 1;
+                            let il = inter_left == 1;
+                            enc.intra_inter_ctx = if up && lf {
+                                let n_intra = (!il as u8) + (!ia as u8);
+                                if n_intra == 2 { 3 } else { n_intra as usize }
+                            } else if up {
+                                if ia { 0 } else { 3 }
+                            } else if lf {
+                                if il { 0 } else { 3 }
+                            } else {
+                                0
+                            };
+                            let sa = skip_above[col];
+                            let sl = skip_left;
+                            let skip_ctx = if up && lf {
+                                (sl + sa) as usize
+                            } else if up {
+                                (2 * sa) as usize
+                            } else if lf {
+                                (2 * sl) as usize
+                            } else {
+                                0
+                            };
+                            let ar = (lmc + bw_mi - 1).min(inter_mi_above.len() - 1);
+                            let bl = (lmr + bh_mi - 1).min(inter_mi_left.len() - 1);
+                            // Rank-0 block: count only rank-0 inter neighbors (excludes a
+                            // whole-64 rank-1 skip neighbor). No-op when no rank-1 exists.
+                            let left_match = lmc > 0
+                                && ((inter_mi_left[bl] != 0 && bl_ref_rank == 0)
+                                    || (inter_mi_left[lmr] != 0 && left_ref_rank == 0));
+                            let above_match = lmr > 0
+                                && ((inter_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                    || (inter_mi_above[lmc] != 0 && above_ref_rank == 0));
+                            let any_newmv = (lmc > 0
+                                && ((newmv_mi_left[bl] != 0 && bl_ref_rank == 0)
+                                    || (newmv_mi_left[lmr] != 0 && left_ref_rank == 0)))
+                                || (lmr > 0
+                                    && ((newmv_mi_above[ar] != 0 && ar_ref_rank == 0)
+                                        || (newmv_mi_above[lmc] != 0 && above_ref_rank == 0)));
+                            let mode_ctx = usize::from(left_match)
+                                + usize::from(above_match)
+                                + 2 * usize::from(any_newmv);
+                            // Residual blocks do carry delta-Q. Commit only now, after
+                            // the skip decision, so encoder and decoder qindex state stay
+                            // synchronized across preceding skip_txfm=1 superblocks.
+                            let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
+                            enc.delta_q_pending = enc.delta_q_present;
+                            let (luma_skip, luma_dc) =
+                                sb_tu_contexts(&tus, sb_y, sb_x, above, left, enc.qc, tmc, tmr);
+                            let u_present = uv_coeffs[0].iter().any(|&(_, level)| level != 0);
+                            let v_present = uv_coeffs[1].iter().any(|&(_, level)| level != 0);
+                            coder::emit_inter_residual_block(
+                                enc,
+                                pc,
+                                skip_ctx,
+                                mode_ctx,
+                                &tus,
+                                &luma_skip,
+                                &luma_dc,
+                                &uv_coeffs[0],
+                                &uv_coeffs[1],
+                                (6 + ua + ul) as usize,
+                                (6 * i32::from(u_present) + va + vl) as usize,
+                            );
+                            skip_above[col] = 0; // has coeffs
+                            skip_left = 0;
+                            inter_above[col] = 1;
+                            newmv_above[col] = 0;
+                            newmv_left = 0;
+                            mv_above[col] = Some(Mv::ZERO);
+                            mv_left = Some(Mv::ZERO);
+                            for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                inter_mi_above[c] = 1;
+                                skip_mi_above[c] = 0;
+                                newmv_mi_above[c] = 0;
+                                mv_mi_above[c] = Some(Mv::ZERO);
+                                u_above[c] = i32::from(u_present);
+                                v_above[c] = i32::from(v_present);
+                            }
+                            for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                inter_mi_left[r] = 1;
+                                skip_mi_left[r] = 0;
+                                newmv_mi_left[r] = 0;
+                                mv_mi_left[r] = Some(Mv::ZERO);
+                                u_left[r] = i32::from(u_present);
+                                v_left[r] = i32::from(v_present);
+                            }
+                            inter_left = 1;
+                            #[cfg(test)]
+                            INTER_RESIDUAL_64_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return true;
+                        } // end `if residual_cost < intra_bound`
+                    }
+                }
+                false
+            });
+            if global_residual {
+                continue;
+            }
+            // NEWMV residual: search LAST for motion; if a nonzero MV's MC
+            // residual beats the intra estimate, code NEWMV + residual.
+            let newmv_residual = outline_leaf_420(|| {
+                if has_last
+                    && bw_mi == 16
+                    && bh_mi == 16
+                    && 64.min(width - sb_x) == 64
+                    && 64.min(height - sb_y) == 64
+                {
+                    use crate::av2::video::{mc, me};
+                    let bd = self.bit_depth as i32;
+                    // Keep the DPB/reconstruction f32 representation through ME/MC.
+                    // The reference is the whole frame at `ref_ls`, so cross-tile
+                    // motion resolves against real neighboring content.
+                    let (bref, bstride, refh) = inter_luma.expect("LAST luma prepared for inter");
+                    // Match the decoder's DRL[0] spatial candidate and seed ME
+                    // from all available spatial MVs. The predictor used for the
+                    // search-rate proxy must be the same one later subtracted from
+                    // the selected absolute MV before entropy coding.
+                    let above_mv = if row > 0 { mv_above[col] } else { None };
+                    let above_right_mv = if row > 0 && col + 1 < sb_cols {
+                        mv_above[col + 1]
+                    } else {
+                        None
+                    };
+                    // DRL[0] scans same-reference (rank-0) neighbors only. A rank-1
+                    // neighbor (whole-64 skip on the second reference, zero motion) is
+                    // excluded; its AVM derived contribution is the zero MV projected
+                    // = zero = the drl0_mv fallback. `ref_above[col]`/`ref_left` were
+                    // reset for this leaf, so use the captured neighbor ranks; the
+                    // above-right column (col+1) is untouched this row.
+                    let left_r0 = if sb_left_rank == 0 { mv_left } else { None };
+                    let above_r0 = if sb_above_rank == 0 { above_mv } else { None };
+                    let above_right_r0 = if row > 0 && col + 1 < sb_cols && ref_above[col + 1] == 0
+                    {
+                        above_right_mv
+                    } else {
+                        None
+                    };
+                    let pred_mv = drl0_mv(left_r0, above_r0, above_right_r0);
+                    let mut preds = me::MeCandidates::new();
+                    if frame_mv_seed != Mv::ZERO {
+                        preds.push_unique(frame_mv_seed);
+                    }
+                    for candidate in [mv_left, above_mv, above_right_mv].into_iter().flatten() {
+                        preds.push_unique(candidate);
+                    }
+                    let lambda_mv = (sb_qstep as u32).max(1);
+                    let (mv, _) = me::search(
+                        &me::MePlanes {
+                            current: &yp[sb_y * pw + sb_x..],
+                            current_stride: pw,
+                            reference: bref,
+                            reference_stride: *bstride,
+                        },
+                        preds.as_slice(),
+                        &me::MeSearchSpec {
+                            origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
+                            origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
+                            width: 64,
+                            height: 64,
+                            reference_mv: pred_mv,
+                            lambda_mv,
+                            max_dx: self.video_search_range,
+                            max_dy: self.video_search_range,
+                            predictor_gate_sad_per_pixel: self.video_predictor_gate,
+                            integer_satd_radius: self.video_integer_satd_radius,
+                            bit_depth: self.bit_depth,
+                            frame_width: *bstride,
+                            frame_height: *refh + 2 * INTER_BORDER_420,
+                        },
+                        me_scratch,
+                    );
+                    let mut mv = mc::clamp_umv(
+                        mv,
                         (ref_x0 + sb_x) as i32,
                         (ref_y0 + sb_y) as i32,
                         64,
@@ -2955,9 +3125,8 @@ impl Av2Encoder {
                         ref_ls as i32,
                         *refh as i32,
                     );
-                    if pred_mv != Mv::ZERO && pred_mv != mv && bounded_pred_mv == pred_mv {
-                        let searched_mv = mv;
-                        let searched_sse = sse;
+                    if (mv.row != 0 || mv.col != 0) && (mv.row.abs() / 2 + mv.col.abs() / 2) <= 30 {
+                        let scratch = inter_pred_scratch.whole_sb();
                         mc::predict_with_tmp(
                             scratch.y,
                             64,
@@ -2966,14 +3135,15 @@ impl Av2Encoder {
                             &mc::MotionBlock {
                                 origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
                                 origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                                mv: pred_mv,
+                                mv,
                                 width: 64,
                                 height: 64,
                                 bit_depth: self.bit_depth,
                             },
                             scratch.convolve_tmp,
                         );
-                        let near_sse = rect_sse_f32(
+                        // Residual SSE (luma) to gate against intra.
+                        let mut sse = rect_sse_f32(
                             &PlaneRect {
                                 plane: yp,
                                 stride: pw,
@@ -2989,167 +3159,6 @@ impl Av2Encoder {
                             64,
                             64,
                         );
-                        let searched_delta = searched_mv.diff(pred_mv);
-                        debug_assert_ne!(searched_delta, Mv::ZERO);
-                        if crate::av2::video::rd::prefer_nearmv(
-                            enc,
-                            crate::av2::video::rd::NearMvRdSpec {
-                                skip_ctx,
-                                mode_ctx,
-                                skip_txfm: false,
-                                near_distortion: near_sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                new_distortion: searched_sse
-                                    * crate::av2::video::rd::SS2_INTER_DIST_W,
-                                new_mvd: Mv {
-                                    row: searched_delta.row / 2,
-                                    col: searched_delta.col / 2,
-                                },
-                                qstep: sb_qstep as u32,
-                            },
-                        ) {
-                            mv = pred_mv;
-                            sse = near_sse;
-                        } else {
-                            mc::predict_with_tmp(
-                                scratch.y,
-                                64,
-                                bref,
-                                *bstride,
-                                &mc::MotionBlock {
-                                    origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
-                                    origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
-                                    mv: searched_mv,
-                                    width: 64,
-                                    height: 64,
-                                    bit_depth: self.bit_depth,
-                                },
-                                scratch.convolve_tmp,
-                            );
-                        }
-                    }
-                    let (candidate_mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, pred_mv);
-                    let mvd = (candidate_mode == 2).then_some(Mv {
-                        row: mvd_row,
-                        col: mvd_col,
-                    });
-                    let syntax_rate = crate::av2::video::rd::inter_syntax_bits(
-                        enc,
-                        skip_ctx,
-                        mode_ctx,
-                        false,
-                        candidate_mode,
-                        mvd,
-                    );
-                    let inter_cost = crate::av2::video::rd::rd_cost(
-                        sse * crate::av2::video::rd::SS2_INTER_DIST_W,
-                        syntax_rate,
-                        sb_qstep as u32,
-                    );
-                    let intra_bound =
-                        crate::av2::video::rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, sb_qstep as u32);
-                    if inter_cost < intra_bound {
-                        #[cfg(test)]
-                        INTER_RESIDUAL_64_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
-                        for (i, &(ty, tx)) in POS.iter().enumerate() {
-                            let (y0, x0) = (sb_y + ty, sb_x + tx);
-                            crate::av2::metrics::scaled_residual_f32(
-                                scratch.residual,
-                                &yp[y0 * pw + x0..],
-                                &scratch.y[ty * 64 + tx..],
-                                crate::av2::metrics::ResidualSpec {
-                                    src_stride: pw,
-                                    pred_stride: 64,
-                                    width: 32,
-                                    height: 32,
-                                    scale: sb_scale,
-                                },
-                            );
-                            for (dst, prediction) in scratch
-                                .tx_pred
-                                .as_chunks_mut::<32>()
-                                .0
-                                .iter_mut()
-                                .zip(rect_rows(scratch.y, 64, ty, tx, 32, 32))
-                            {
-                                dst.copy_from_slice(prediction);
-                            }
-                            let lev = bases.luma.project(scratch.residual, 0.0);
-                            let rb = reconstruct_luma(
-                                scratch.tx_pred,
-                                &lev,
-                                sb_qstep,
-                                &tables::SCAN,
-                                bd,
-                            );
-                            put_block(recy, pw, y0, x0, 32, &rb);
-                            refill_coeffs(&mut scratch.luma_coeffs[i], &lev);
-                        }
-                        // Chroma MC (420: half-res MV) + residual.
-                        let (cy, cx) = (sb_y / 2, sb_x / 2);
-                        // 4:2:0 chroma sees half the luma displacement.
-                        let cmv = Mv {
-                            row: mv.row / 2,
-                            col: mv.col / 2,
-                        };
-                        let cbrd = INTER_BORDER_420 / 2;
-                        let chroma_refs = inter_chroma.expect("LAST chroma prepared for inter");
-                        for (pi, (src_c, rec_c, mc_pred)) in [
-                            (up, &mut *recu, &mut *scratch.u),
-                            (vp, &mut *recv, &mut *scratch.v),
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        {
-                            let (bcref, bcstride) = &chroma_refs[pi];
-                            mc::predict_with_tmp(
-                                mc_pred,
-                                32,
-                                bcref,
-                                *bcstride,
-                                &mc::MotionBlock {
-                                    origin_x: (ref_x0 / 2 + cx + cbrd) as isize,
-                                    origin_y: (ref_y0 / 2 + cy + cbrd) as isize,
-                                    mv: cmv,
-                                    width: 32,
-                                    height: 32,
-                                    bit_depth: self.bit_depth,
-                                },
-                                scratch.convolve_tmp,
-                            );
-                            crate::av2::metrics::scaled_residual_f32(
-                                scratch.residual,
-                                &src_c[cy * pcw + cx..],
-                                mc_pred,
-                                crate::av2::metrics::ResidualSpec {
-                                    src_stride: pcw,
-                                    pred_stride: 32,
-                                    width: 32,
-                                    height: 32,
-                                    scale: sb_scale,
-                                },
-                            );
-                            for (pred, &reference) in scratch.chroma_pred.iter_mut().zip(&*mc_pred)
-                            {
-                                *pred = reference as i32;
-                            }
-                            let lev = bases.chroma420.project(scratch.residual, 0.0);
-                            let rb = itx422::reconstruct_chroma_cfl(
-                                scratch.chroma_pred,
-                                &lev,
-                                sb_qstep,
-                                &tables::SCAN,
-                                32,
-                                32,
-                                bd,
-                            );
-                            for (dst_row, src_row) in rect_rows_mut(rec_c, pcw, cy, cx, 32, 32)
-                                .zip(rb.as_chunks::<32>().0.iter())
-                            {
-                                dst_row.copy_from_slice(src_row);
-                            }
-                            refill_coeffs(&mut scratch.chroma_coeffs[pi], &lev);
-                        }
                         let upn = row > 0;
                         let lfn = col > 0;
                         let ia = inter_above[col] == 1;
@@ -3183,73 +3192,319 @@ impl Av2Encoder {
                             } else {
                                 0
                             };
-                        let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
-                        enc.delta_q_pending = enc.delta_q_present;
-                        let drl_ctx = mode_ctx;
-                        let (inter_mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, pred_mv);
-                        let (tu_skip_cdfs, tu_dc_sign) = crate::av2::helpers::sb_tu_contexts(
-                            scratch.luma_coeffs,
-                            sb_y,
-                            sb_x,
-                            above,
-                            left,
-                            enc.qc,
-                            tmc,
-                            tmr,
+                        let bounded_pred_mv = mc::clamp_umv(
+                            pred_mv,
+                            (ref_x0 + sb_x) as i32,
+                            (ref_y0 + sb_y) as i32,
+                            64,
+                            64,
+                            ref_ls as i32,
+                            *refh as i32,
                         );
-                        let u_present = scratch.chroma_coeffs[0]
-                            .iter()
-                            .any(|&(_, level)| level != 0);
-                        let v_present = scratch.chroma_coeffs[1]
-                            .iter()
-                            .any(|&(_, level)| level != 0);
-                        crate::av2::coder::emit_inter_newmv_residual_block(
+                        if pred_mv != Mv::ZERO && pred_mv != mv && bounded_pred_mv == pred_mv {
+                            let searched_mv = mv;
+                            let searched_sse = sse;
+                            mc::predict_with_tmp(
+                                scratch.y,
+                                64,
+                                bref,
+                                *bstride,
+                                &mc::MotionBlock {
+                                    origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
+                                    origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
+                                    mv: pred_mv,
+                                    width: 64,
+                                    height: 64,
+                                    bit_depth: self.bit_depth,
+                                },
+                                scratch.convolve_tmp,
+                            );
+                            let near_sse = rect_sse_f32(
+                                &PlaneRect {
+                                    plane: yp,
+                                    stride: pw,
+                                    y: sb_y,
+                                    x: sb_x,
+                                },
+                                &PlaneRect {
+                                    plane: scratch.y,
+                                    stride: 64,
+                                    y: 0,
+                                    x: 0,
+                                },
+                                64,
+                                64,
+                            );
+                            let searched_delta = searched_mv.diff(pred_mv);
+                            debug_assert_ne!(searched_delta, Mv::ZERO);
+                            if crate::av2::video::rd::prefer_nearmv(
+                                enc,
+                                crate::av2::video::rd::NearMvRdSpec {
+                                    skip_ctx,
+                                    mode_ctx,
+                                    skip_txfm: false,
+                                    near_distortion: near_sse
+                                        * crate::av2::video::rd::SS2_INTER_DIST_W,
+                                    new_distortion: searched_sse
+                                        * crate::av2::video::rd::SS2_INTER_DIST_W,
+                                    new_mvd: Mv {
+                                        row: searched_delta.row / 2,
+                                        col: searched_delta.col / 2,
+                                    },
+                                    qstep: sb_qstep as u32,
+                                },
+                            ) {
+                                mv = pred_mv;
+                                sse = near_sse;
+                            } else {
+                                mc::predict_with_tmp(
+                                    scratch.y,
+                                    64,
+                                    bref,
+                                    *bstride,
+                                    &mc::MotionBlock {
+                                        origin_x: (ref_x0 + sb_x + INTER_BORDER_420) as isize,
+                                        origin_y: (ref_y0 + sb_y + INTER_BORDER_420) as isize,
+                                        mv: searched_mv,
+                                        width: 64,
+                                        height: 64,
+                                        bit_depth: self.bit_depth,
+                                    },
+                                    scratch.convolve_tmp,
+                                );
+                            }
+                        }
+                        let (candidate_mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, pred_mv);
+                        let mvd = (candidate_mode == 2).then_some(Mv {
+                            row: mvd_row,
+                            col: mvd_col,
+                        });
+                        let syntax_rate = crate::av2::video::rd::inter_syntax_bits(
                             enc,
-                            &InterResidualSpec {
-                                part_cdf: pc,
-                                skip_ctx,
-                                mode_ctx,
-                                drl_ctx,
-                                mode: inter_mode,
-                                scaled_row: mvd_row,
-                                scaled_col: mvd_col,
-                                luma_tus: scratch.luma_coeffs,
-                                luma_skip_cdfs: &tu_skip_cdfs,
-                                luma_dc_sign_ctxs: &tu_dc_sign,
-                            },
-                            &scratch.chroma_coeffs[0],
-                            &scratch.chroma_coeffs[1],
-                            (6 + ua + ul) as usize,
-                            (6 * i32::from(u_present) + va + vl) as usize,
+                            skip_ctx,
+                            mode_ctx,
+                            false,
+                            candidate_mode,
+                            mvd,
                         );
-                        skip_above[col] = 0;
-                        skip_left = 0;
-                        inter_above[col] = 1;
-                        newmv_above[col] = (inter_mode == 2) as u8;
-                        newmv_left = (inter_mode == 2) as u8;
-                        mv_above[col] = Some(mv);
-                        mv_left = Some(mv);
-                        for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
-                            inter_mi_above[c] = 1;
-                            skip_mi_above[c] = 0;
-                            newmv_mi_above[c] = (inter_mode == 2) as u8;
-                            mv_mi_above[c] = Some(mv);
-                            u_above[c] = i32::from(u_present);
-                            v_above[c] = i32::from(v_present);
+                        let inter_cost = crate::av2::video::rd::rd_cost(
+                            sse * crate::av2::video::rd::SS2_INTER_DIST_W,
+                            syntax_rate,
+                            sb_qstep as u32,
+                        );
+                        let intra_bound = crate::av2::video::rd::rd_cost(
+                            0.0,
+                            16.0 * 64.0 * 64.0,
+                            sb_qstep as u32,
+                        );
+                        if inter_cost < intra_bound {
+                            #[cfg(test)]
+                            INTER_RESIDUAL_64_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
+                            for (i, &(ty, tx)) in POS.iter().enumerate() {
+                                let (y0, x0) = (sb_y + ty, sb_x + tx);
+                                crate::av2::metrics::scaled_residual_f32(
+                                    scratch.residual,
+                                    &yp[y0 * pw + x0..],
+                                    &scratch.y[ty * 64 + tx..],
+                                    crate::av2::metrics::ResidualSpec {
+                                        src_stride: pw,
+                                        pred_stride: 64,
+                                        width: 32,
+                                        height: 32,
+                                        scale: sb_scale,
+                                    },
+                                );
+                                for (dst, prediction) in scratch
+                                    .tx_pred
+                                    .as_chunks_mut::<32>()
+                                    .0
+                                    .iter_mut()
+                                    .zip(rect_rows(scratch.y, 64, ty, tx, 32, 32))
+                                {
+                                    dst.copy_from_slice(prediction);
+                                }
+                                let lev = bases.luma.project(scratch.residual, 0.0);
+                                let rb = reconstruct_luma(
+                                    scratch.tx_pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN,
+                                    bd,
+                                );
+                                put_block(recy, pw, y0, x0, 32, &rb);
+                                refill_coeffs(&mut scratch.luma_coeffs[i], &lev);
+                            }
+                            // Chroma MC (420: half-res MV) + residual.
+                            let (cy, cx) = (sb_y / 2, sb_x / 2);
+                            // 4:2:0 chroma sees half the luma displacement.
+                            let cmv = Mv {
+                                row: mv.row / 2,
+                                col: mv.col / 2,
+                            };
+                            let cbrd = INTER_BORDER_420 / 2;
+                            let chroma_refs = inter_chroma.expect("LAST chroma prepared for inter");
+                            for (pi, (src_c, rec_c, mc_pred)) in [
+                                (up, &mut *recu, &mut *scratch.u),
+                                (vp, &mut *recv, &mut *scratch.v),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let (bcref, bcstride) = &chroma_refs[pi];
+                                mc::predict_with_tmp(
+                                    mc_pred,
+                                    32,
+                                    bcref,
+                                    *bcstride,
+                                    &mc::MotionBlock {
+                                        origin_x: (ref_x0 / 2 + cx + cbrd) as isize,
+                                        origin_y: (ref_y0 / 2 + cy + cbrd) as isize,
+                                        mv: cmv,
+                                        width: 32,
+                                        height: 32,
+                                        bit_depth: self.bit_depth,
+                                    },
+                                    scratch.convolve_tmp,
+                                );
+                                crate::av2::metrics::f32_prediction_and_scaled_residual_i32(
+                                    scratch.chroma_pred,
+                                    scratch.residual,
+                                    &src_c[cy * pcw + cx..],
+                                    mc_pred,
+                                    crate::av2::metrics::ResidualSpec {
+                                        src_stride: pcw,
+                                        pred_stride: 32,
+                                        width: 32,
+                                        height: 32,
+                                        scale: sb_scale,
+                                    },
+                                );
+                                let lev = bases.chroma420.project(scratch.residual, 0.0);
+                                let rb = itx422::reconstruct_chroma_cfl(
+                                    scratch.chroma_pred,
+                                    &lev,
+                                    sb_qstep,
+                                    &tables::SCAN,
+                                    32,
+                                    32,
+                                    bd,
+                                );
+                                for (dst_row, src_row) in rect_rows_mut(rec_c, pcw, cy, cx, 32, 32)
+                                    .zip(rb.as_chunks::<32>().0.iter())
+                                {
+                                    dst_row.copy_from_slice(src_row);
+                                }
+                                refill_coeffs(&mut scratch.chroma_coeffs[pi], &lev);
+                            }
+                            let upn = row > 0;
+                            let lfn = col > 0;
+                            let ia = inter_above[col] == 1;
+                            let il = inter_left == 1;
+                            enc.intra_inter_ctx = if upn && lfn {
+                                let n_intra = (!il as u8) + (!ia as u8);
+                                if n_intra == 2 { 3 } else { n_intra as usize }
+                            } else if upn {
+                                if ia { 0 } else { 3 }
+                            } else if lfn {
+                                if il { 0 } else { 3 }
+                            } else {
+                                0
+                            };
+                            let sa = skip_above[col];
+                            let sl = skip_left;
+                            let skip_ctx = if upn && lfn {
+                                (sl + sa) as usize
+                            } else if upn {
+                                (2 * sa) as usize
+                            } else if lfn {
+                                (2 * sl) as usize
+                            } else {
+                                0
+                            };
+                            let am0 = inter_above[col] == 1 && sb_above_rank == 0;
+                            let lm0 = inter_left == 1 && sb_left_rank == 0;
+                            let mode_ctx = (am0 as usize + lm0 as usize)
+                                + if (am0 && newmv_above[col] != 0) || (lm0 && newmv_left != 0) {
+                                    2
+                                } else {
+                                    0
+                                };
+                            let _ = aqs.per_sb(enc, yp, pw, row * 64, col * 64, width, height);
+                            enc.delta_q_pending = enc.delta_q_present;
+                            let drl_ctx = mode_ctx;
+                            let (inter_mode, mvd_row, mvd_col) = inter_mode_qtr_mvd(mv, pred_mv);
+                            let (tu_skip_cdfs, tu_dc_sign) = crate::av2::helpers::sb_tu_contexts(
+                                scratch.luma_coeffs,
+                                sb_y,
+                                sb_x,
+                                above,
+                                left,
+                                enc.qc,
+                                tmc,
+                                tmr,
+                            );
+                            let u_present = scratch.chroma_coeffs[0]
+                                .iter()
+                                .any(|&(_, level)| level != 0);
+                            let v_present = scratch.chroma_coeffs[1]
+                                .iter()
+                                .any(|&(_, level)| level != 0);
+                            crate::av2::coder::emit_inter_newmv_residual_block(
+                                enc,
+                                &InterResidualSpec {
+                                    part_cdf: pc,
+                                    skip_ctx,
+                                    mode_ctx,
+                                    drl_ctx,
+                                    mode: inter_mode,
+                                    scaled_row: mvd_row,
+                                    scaled_col: mvd_col,
+                                    luma_tus: scratch.luma_coeffs,
+                                    luma_skip_cdfs: &tu_skip_cdfs,
+                                    luma_dc_sign_ctxs: &tu_dc_sign,
+                                },
+                                &scratch.chroma_coeffs[0],
+                                &scratch.chroma_coeffs[1],
+                                (6 + ua + ul) as usize,
+                                (6 * i32::from(u_present) + va + vl) as usize,
+                            );
+                            skip_above[col] = 0;
+                            skip_left = 0;
+                            inter_above[col] = 1;
+                            newmv_above[col] = (inter_mode == 2) as u8;
+                            newmv_left = (inter_mode == 2) as u8;
+                            mv_above[col] = Some(mv);
+                            mv_left = Some(mv);
+                            for c in lmc..(lmc + bw_mi).min(inter_mi_above.len()) {
+                                inter_mi_above[c] = 1;
+                                skip_mi_above[c] = 0;
+                                newmv_mi_above[c] = (inter_mode == 2) as u8;
+                                mv_mi_above[c] = Some(mv);
+                                u_above[c] = i32::from(u_present);
+                                v_above[c] = i32::from(v_present);
+                            }
+                            for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
+                                inter_mi_left[r] = 1;
+                                skip_mi_left[r] = 0;
+                                newmv_mi_left[r] = (inter_mode == 2) as u8;
+                                mv_mi_left[r] = Some(mv);
+                                u_left[r] = i32::from(u_present);
+                                v_left[r] = i32::from(v_present);
+                            }
+                            inter_left = 1;
+                            return true;
                         }
-                        for r in lmr..(lmr + bh_mi).min(inter_mi_left.len()) {
-                            inter_mi_left[r] = 1;
-                            skip_mi_left[r] = 0;
-                            newmv_mi_left[r] = (inter_mode == 2) as u8;
-                            mv_mi_left[r] = Some(mv);
-                            u_left[r] = i32::from(u_present);
-                            v_left[r] = i32::from(v_present);
-                        }
-                        inter_left = 1;
-                        continue;
                     }
                 }
+                false
+            });
+            if newmv_residual {
+                continue;
             }
+            #[cfg(test)]
+            INTRA_LEAF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             skip_above[col] = 0;
             skip_left = 0;
             inter_above[col] = 0;
@@ -3282,7 +3537,7 @@ impl Av2Encoder {
                 aq_committed = true;
             }
             let (u_present, v_present) = match (bw_mi, bh_mi) {
-                (16, 16) => {
+                (16, 16) => outline_leaf_420(|| {
                     // 64x64 luma → 32x32 chroma (TX_32X32, eob 1024, skip TX32).
                     // Staged decouple: Replay restores the captured luma recon +
                     // reuses the luma winner and CfL choice (skipping the mode
@@ -3432,8 +3687,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (16, 8) => {
+                }),
+                (16, 8) => outline_leaf_420(|| {
                     // 64x32 luma → 32x16 chroma (TX_32X16, eob 512, skip TX32).
                     let (tus2, mode_idx) = encode_luma_leaf32(
                         recy,
@@ -3530,8 +3785,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 16) => {
+                }),
+                (8, 16) => outline_leaf_420(|| {
                     // 32x64 luma → 16x32 chroma (TX_16X32, eob 512, skip TX32).
                     let (tus2, mode_idx) = encode_luma_leaf_v32x64(
                         recy,
@@ -3642,8 +3897,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 8) => {
+                }),
+                (8, 8) => outline_leaf_420(|| {
                     // 32x32 luma → 16x16 chroma (TX_16X16, eob 256, skip TX16).
                     let (tu, mode_idx) = encode_luma_leaf_s32x32(
                         recy,
@@ -3752,8 +4007,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 16) => {
+                }),
+                (4, 16) => outline_leaf_420(|| {
                     // Right-edge 16x64 luma leaf → 4:2:0 chroma 8x32 (TX_8X32,
                     // coeff 8x32, SCAN8X32, eob 256, ctx-2 SKIP_TX16). Reuses the
                     // luma8x32 basis (identical 8x32 geometry).
@@ -3870,8 +4125,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (16, 4) => {
+                }),
+                (16, 4) => outline_leaf_420(|| {
                     // Bottom-edge 64x16 luma leaf → 4:2:0 chroma 32x8 (TX_32X8,
                     // coeff 32x8, SCAN32X8, eob 256, ctx-2 SKIP_TX16). Reuses the
                     // luma32x8 basis.
@@ -3988,8 +4243,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (2, 8) => {
+                }),
+                (2, 8) => outline_leaf_420(|| {
                     // Right-edge 8×32 luma leaf (residue-2 width) → 4:2:0 chroma
                     // 4×16 (TX_4X16, SCAN4X16, eob 64, ctx-1 SKIP_TX8). Luma
                     // TX_8X32 long-side-32 (min=1 short cdf).
@@ -4106,8 +4361,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 2) => {
+                }),
+                (8, 2) => outline_leaf_420(|| {
                     // Bottom-edge 32×8 luma leaf (residue-2 height) → 4:2:0 chroma
                     // 16×4 (TX_16X4, SCAN16X4, eob 64, ctx-1 SKIP_TX8).
                     let pred =
@@ -4223,8 +4478,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 8) => {
+                }),
+                (4, 8) => outline_leaf_420(|| {
                     // Bottom-right 16×32 corner leaf (residue-4 width ×
                     // residue-{6,8} height) → 4:2:0 chroma 8×16 (TX_8X16,
                     // SCAN8X16, eob class 128, ctx-2 SKIP_TX16). Luma TX_16X32
@@ -4342,8 +4597,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 4) => {
+                }),
+                (8, 4) => outline_leaf_420(|| {
                     // Bottom-right 32×16 corner leaf (residue-{6,8} width ×
                     // residue-4 height) → 4:2:0 chroma 16×8 (TX_16X8, SCAN16X8,
                     // eob class 128, ctx-2 SKIP_TX16). Luma TX_32X16 long-side-32.
@@ -4460,8 +4715,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 4) => {
+                }),
+                (4, 4) => outline_leaf_420(|| {
                     // Bottom-right 16×16 corner leaf (residue 4 in both dims):
                     // full-AC TX_16X16 luma with 4-way ADST RD (DCT_DCT /
                     // ADST_ADST / ADST_DCT / DCT_ADST, DC mode) → 4:2:0 chroma
@@ -4636,8 +4891,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (2, 2) => {
+                }),
+                (2, 2) => outline_leaf_420(|| {
                     // Bottom-right 8×8 corner leaf (residue-2 both axes), TX_8X8 ctx-1.
                     // Luma TX_8X8 (szctx=1, do_part_cdf=3148, ext-tx txtp_ext(min=1)
                     // DCT_DCT idx 0); 4:2:0 chroma is one 4×4 (TX_4X4) TU per plane.
@@ -4761,8 +5016,8 @@ impl Av2Encoder {
                     let v_skip = v_ctx as u32;
                     encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
                     (u_nz, vc.iter().any(|&(_, l)| l != 0))
-                }
-                (2, 4) => {
+                }),
+                (2, 4) => outline_leaf_420(|| {
                     // residue-2 width × residue-4 height corner: 8×16 luma
                     // (TX_8X16) + 4×8 chroma per plane (4:2:0).
                     let bd = self.bit_depth as i32;
@@ -4893,8 +5148,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 2) => {
+                }),
+                (4, 2) => outline_leaf_420(|| {
                     // residue-4 width × residue-2 height corner: 16×8 luma
                     // (TX_16X8) + 8×4 chroma per plane (4:2:0).
                     let bd = self.bit_depth as i32;
@@ -5025,7 +5280,7 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
+                }),
                 other => unreachable!("unsupported native 4:2:0 leaf {:?}", other),
             };
             let cfl_used = enc.cfl_signaled as i32;

@@ -34,6 +34,13 @@ use super::chroma::{
 use crate::av2::cfl::{Cfl64Input, ChromaRdSpec, cfl_decide_64, cfl_prediction};
 use crate::av2::video::mc;
 
+/// Outline independent 4:4:4 candidate searches and emit phases. Calls happen
+/// per superblock, keeping the boundary well outside transform inner loops.
+#[inline(never)]
+fn outline_444<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Core444Planes<'a> {
     pub(super) y: &'a [f32],
@@ -2554,10 +2561,10 @@ impl Av2Encoder {
         // winner (one push/pop per whole-64 SB, same order in decide & replay
         // since `choose_luma_64x64_partition` is deterministic). A `Whole64`
         // hit lets the emit run from the record; anything else re-searches.
-        let replay_w: Option<Box<crate::av2::replay::Whole64Decision>> =
-            if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode {
+        let replay_w: Option<Box<replay::Whole64Decision>> =
+            if let replay::DecideMode::Replay(cur) = &mut decide_mode {
                 match cur.next() {
-                    crate::av2::replay::SbDecision::Whole64(d) => Some(d.clone()),
+                    replay::SbDecision::Whole64(d) => Some(d.clone()),
                     _ => None,
                 }
             } else {
@@ -2614,48 +2621,50 @@ impl Av2Encoder {
         // coefficient-heavy partitions in exactly the protected dark blocks.
         let lambda = leaf::part_lambda(sb_qstep, part_lambda_c);
         // ---- SPLIT candidate (existing mode search) ----
-        let (mut tus_s, mut mode_idx, mut adelta, split_bits) = if replay_w.is_some() {
-            // Replay: the SPLIT mode search is skipped; the commit below is fed
-            // the captured winner. Dummy values (overwritten by the inject).
-            (
-                [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-                0usize,
-                0i8,
-                0.0f32,
-            )
-        } else {
-            encode_luma_sb(
-                recy,
-                &LumaSource {
-                    plane: yp,
-                    stride: pw,
-                },
-                &LumaFrameBlock {
-                    frame_width: width,
-                    frame_height: height,
-                    y: sb_y,
-                    x: sb_x,
-                },
-                &LumaQuantSpec {
-                    basis: &bases.luma,
-                    qstep: sb_qstep,
-                    scan: &tables::SCAN,
-                    neutral,
-                    quant_context: qc,
-                    rdoq_lambda,
-                    speed: self.speed,
-                    bit_depth: self.bit_depth as i32,
-                },
-                &LumaSbSearch {
-                    residual_scale: sb_resid_scale,
-                    allow_directional: self.speed.try_directional()
-                        && sb_x + 64 <= width
-                        && sb_y + 64 <= height
-                        && (width.is_multiple_of(64) || sb_x + 128 <= width)
-                        && (height.is_multiple_of(64) || sb_y + 128 <= height),
-                },
-            )
-        };
+        let (mut tus_s, mut mode_idx, mut adelta, split_bits) = outline_444(|| {
+            if replay_w.is_some() {
+                // Replay: the SPLIT mode search is skipped; the commit below is fed
+                // the captured winner. Dummy values (overwritten by the inject).
+                (
+                    [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+                    0usize,
+                    0i8,
+                    0.0f32,
+                )
+            } else {
+                encode_luma_sb(
+                    recy,
+                    &LumaSource {
+                        plane: yp,
+                        stride: pw,
+                    },
+                    &LumaFrameBlock {
+                        frame_width: width,
+                        frame_height: height,
+                        y: sb_y,
+                        x: sb_x,
+                    },
+                    &LumaQuantSpec {
+                        basis: &bases.luma,
+                        qstep: sb_qstep,
+                        scan: &tables::SCAN,
+                        neutral,
+                        quant_context: qc,
+                        rdoq_lambda,
+                        speed: self.speed,
+                        bit_depth: self.bit_depth as i32,
+                    },
+                    &LumaSbSearch {
+                        residual_scale: sb_resid_scale,
+                        allow_directional: self.speed.try_directional()
+                            && sb_x + 64 <= width
+                            && sb_y + 64 <= height
+                            && (width.is_multiple_of(64) || sb_x + 128 <= width)
+                            && (height.is_multiple_of(64) || sb_y + 128 <= height),
+                    },
+                )
+            }
+        });
         let j_s = sse_region(recy) + lambda * split_bits;
         // partition strategy from tuning (was AV2_TXPART env)
         // Rect tx-partition (VERT4/HORZ4) is only safe on FULL interior 64x64
@@ -2699,46 +2708,100 @@ impl Av2Encoder {
         let mut tus_v: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let mut tus_h: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         // ---- VERT4 candidate (4× TX_16X64, strips L→R) ----
-        if want_vert4 {
-            for (i, tus_v) in tus_v[..4].iter_mut().enumerate() {
-                let x0 = sb_x + i * 16;
-                let predv =
-                    dc_pred_rect(recy, pw, sb_y, x0, 16, 64, neutral, self.bit_depth as i32);
-                let lev = bases.luma16x64.project_scan(
-                    &aq::scale_resid(
-                        &get_residual_rect(yp, pw, sb_y, x0, 16, 64, predv),
-                        sb_resid_scale,
-                    ),
-                    0.0,
-                    &SCAN16X32,
-                );
-                let pred_flat = [predv; 1024];
-                put_block_rect(
-                    recy,
-                    pw,
-                    sb_y,
-                    x0,
-                    16,
-                    64,
-                    &itx422::reconstruct_luma_16x64(
-                        &pred_flat,
-                        &lev,
-                        sb_qstep,
+        outline_444(|| {
+            if want_vert4 {
+                for (i, tus_v) in tus_v[..4].iter_mut().enumerate() {
+                    let x0 = sb_x + i * 16;
+                    let predv =
+                        dc_pred_rect(recy, pw, sb_y, x0, 16, 64, neutral, self.bit_depth as i32);
+                    let lev = bases.luma16x64.project_scan(
+                        &aq::scale_resid(
+                            &get_residual_rect(yp, pw, sb_y, x0, 16, 64, predv),
+                            sb_resid_scale,
+                        ),
+                        0.0,
                         &SCAN16X32,
-                        self.bit_depth as i32,
-                    ),
-                );
-                *tus_v = levels_to_coeffs(&lev);
+                    );
+                    let pred_flat = [predv; 1024];
+                    put_block_rect(
+                        recy,
+                        pw,
+                        sb_y,
+                        x0,
+                        16,
+                        64,
+                        &itx422::reconstruct_luma_16x64(
+                            &pred_flat,
+                            &lev,
+                            sb_qstep,
+                            &SCAN16X32,
+                            self.bit_depth as i32,
+                        ),
+                    );
+                    *tus_v = levels_to_coeffs(&lev);
+                }
+                let j_v = sse_region(recy) * self.tune.rect_part_penalty
+                    + lambda * rate_proxy(&tus_v, 4.0);
+                let take = force_vert4 || j_v < best_j;
+                if take {
+                    best = Part::Vert4;
+                    best_j = j_v;
+                    snap_best.copy_from_slice(&{
+                        let mut s = [0f32; 64 * 64];
+                        for (dst_row, src_row) in s
+                            .as_chunks_mut::<64>()
+                            .0
+                            .iter_mut()
+                            .zip(rect_rows(recy, pw, sb_y, sb_x, 64, 64))
+                        {
+                            dst_row.copy_from_slice(src_row);
+                        }
+                        s
+                    });
+                }
+                restore(recy, &snap_split);
             }
-            let j_v =
-                sse_region(recy) * self.tune.rect_part_penalty + lambda * rate_proxy(&tus_v, 4.0);
-            let take = force_vert4 || j_v < best_j;
-            if take {
-                best = Part::Vert4;
-                best_j = j_v;
-                snap_best.copy_from_slice(&{
-                    let mut s = [0f32; 64 * 64];
-                    for (dst_row, src_row) in s
+        });
+        // ---- HORZ4 candidate (4× TX_64X16, strips T→B) ----
+        outline_444(|| {
+            if want_horz4 {
+                for (i, tus_h) in tus_h[..4].iter_mut().enumerate() {
+                    let y0 = sb_y + i * 16;
+                    let predh =
+                        dc_pred_rect(recy, pw, y0, sb_x, 64, 16, neutral, self.bit_depth as i32);
+                    let lev = bases.luma64x16.project_scan(
+                        &aq::scale_resid(
+                            &get_residual_rect(yp, pw, y0, sb_x, 64, 16, predh),
+                            sb_resid_scale,
+                        ),
+                        0.0,
+                        &SCAN32X16,
+                    );
+                    let pred_flat = [predh; 1024];
+                    put_block_rect(
+                        recy,
+                        pw,
+                        y0,
+                        sb_x,
+                        64,
+                        16,
+                        &itx422::reconstruct_luma_64x16(
+                            &pred_flat,
+                            &lev,
+                            sb_qstep,
+                            &SCAN32X16,
+                            self.bit_depth as i32,
+                        ),
+                    );
+                    *tus_h = levels_to_coeffs(&lev);
+                }
+                let j_h = sse_region(recy) * self.tune.rect_part_penalty
+                    + lambda * rate_proxy(&tus_h, 4.0);
+                let take = force_horz4 || j_h < best_j;
+                if take {
+                    best = Part::Horz4;
+                    // best_j no longer read past the last candidate.
+                    for (dst_row, src_row) in snap_best
                         .as_chunks_mut::<64>()
                         .0
                         .iter_mut()
@@ -2746,60 +2809,10 @@ impl Av2Encoder {
                     {
                         dst_row.copy_from_slice(src_row);
                     }
-                    s
-                });
-            }
-            restore(recy, &snap_split);
-        }
-        // ---- HORZ4 candidate (4× TX_64X16, strips T→B) ----
-        if want_horz4 {
-            for (i, tus_h) in tus_h[..4].iter_mut().enumerate() {
-                let y0 = sb_y + i * 16;
-                let predh =
-                    dc_pred_rect(recy, pw, y0, sb_x, 64, 16, neutral, self.bit_depth as i32);
-                let lev = bases.luma64x16.project_scan(
-                    &aq::scale_resid(
-                        &get_residual_rect(yp, pw, y0, sb_x, 64, 16, predh),
-                        sb_resid_scale,
-                    ),
-                    0.0,
-                    &SCAN32X16,
-                );
-                let pred_flat = [predh; 1024];
-                put_block_rect(
-                    recy,
-                    pw,
-                    y0,
-                    sb_x,
-                    64,
-                    16,
-                    &itx422::reconstruct_luma_64x16(
-                        &pred_flat,
-                        &lev,
-                        sb_qstep,
-                        &SCAN32X16,
-                        self.bit_depth as i32,
-                    ),
-                );
-                *tus_h = levels_to_coeffs(&lev);
-            }
-            let j_h =
-                sse_region(recy) * self.tune.rect_part_penalty + lambda * rate_proxy(&tus_h, 4.0);
-            let take = force_horz4 || j_h < best_j;
-            if take {
-                best = Part::Horz4;
-                // best_j no longer read past the last candidate.
-                for (dst_row, src_row) in snap_best
-                    .as_chunks_mut::<64>()
-                    .0
-                    .iter_mut()
-                    .zip(rect_rows(recy, pw, sb_y, sb_x, 64, 64))
-                {
-                    dst_row.copy_from_slice(src_row);
                 }
+                restore(recy, &snap_split);
             }
-            restore(recy, &snap_split);
-        }
+        });
         // ---- commit winner ----
         restore(recy, &snap_best);
         // CfL decision (4:4:4 whole-64 fast path). recy is final here; recu/
@@ -2810,29 +2823,31 @@ impl Av2Encoder {
         let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
         let cfl_l = if fmc > 0 { cfl_left[fmr] } else { 0 };
         enc.cfl_ctx = (cfl_a + cfl_l) as usize;
-        let mut cfl_choice = if enc.cfl && replay_w.is_none() {
-            cfl_decide_64(
-                &Cfl64Input {
-                    reconstructed_luma: recy,
-                    source_u: up,
-                    source_v: vp,
-                    reconstructed_u: recu,
-                    reconstructed_v: recv,
-                    stride: pw,
-                    y: sb_y,
-                    x: sb_x,
-                    neutral,
-                },
-                &ChromaRdSpec {
-                    basis: &bases.chroma444,
-                    qstep: sb_qstep_c,
-                    lambda,
-                    bit_depth: self.bit_depth as i32,
-                },
-            )
-        } else {
-            None
-        };
+        let mut cfl_choice = outline_444(|| {
+            if enc.cfl && replay_w.is_none() {
+                cfl_decide_64(
+                    &Cfl64Input {
+                        reconstructed_luma: recy,
+                        source_u: up,
+                        source_v: vp,
+                        reconstructed_u: recu,
+                        reconstructed_v: recv,
+                        stride: pw,
+                        y: sb_y,
+                        x: sb_x,
+                        neutral,
+                    },
+                    &ChromaRdSpec {
+                        basis: &bases.chroma444,
+                        qstep: sb_qstep_c,
+                        lambda,
+                        bit_depth: self.bit_depth as i32,
+                    },
+                )
+            } else {
+                None
+            }
+        });
         if let Some(ref ch) = cfl_choice {
             enc.cfl_use = true;
             enc.cfl_js = ch.js;
@@ -2848,7 +2863,7 @@ impl Av2Encoder {
         // below, because that encode emits the uv_mode symbol. Decide the
         // winning predictor now (when not CfL), set enc.uv_mode, and reuse
         // the predictor when coding the chroma residual further down.
-        let mut uv444_pred: Option<(Vec<f32>, Vec<f32>)> =
+        let mut uv444_pred: Option<(Vec<f32>, Vec<f32>)> = outline_444(|| {
             if cfl_choice.is_none() && self.tune.chroma_mode_search && replay_w.is_none() {
                 let cand_modes: &[usize] = if self.speed.reduced_modes() {
                     &[0, 1, 4, 5, 6]
@@ -2942,35 +2957,34 @@ impl Av2Encoder {
                 };
                 for &m in &cand_modes {
                     let (pu, pv) = predict_uv(m);
-                    let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5) as i32).collect();
-                    let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5) as i32).collect();
+                    let mut pu_i = vec![0i32; 64 * 64];
+                    let mut pv_i = vec![0i32; 64 * 64];
+                    metrics::prediction_f32_to_i32(&mut pu_i, &pu, 64, 64, 64);
+                    metrics::prediction_f32_to_i32(&mut pv_i, &pv, 64, 64, 64);
                     let mut ru = [0f32; 64 * 64];
                     let mut rv = [0f32; 64 * 64];
-                    let dst_rows = ru
-                        .as_chunks_mut::<64>()
-                        .0
-                        .iter_mut()
-                        .zip(rv.as_chunks_mut::<64>().0.iter_mut());
-                    let src_rows = rect_rows(up, pw, sb_y, sb_x, 64, 64)
-                        .zip(rect_rows(vp, pw, sb_y, sb_x, 64, 64));
-                    let pred_rows = pu
-                        .as_chunks::<64>()
-                        .0
-                        .iter()
-                        .zip(pv.as_chunks::<64>().0.iter());
-                    for (((ru_row, rv_row), (up_row, vp_row)), (pu_row, pv_row)) in
-                        dst_rows.zip(src_rows).zip(pred_rows)
-                    {
-                        for ((dst, &src), &pred) in ru_row.iter_mut().zip(up_row).zip(pu_row) {
-                            *dst = src - pred;
-                        }
-                        for ((dst, &src), &pred) in rv_row.iter_mut().zip(vp_row).zip(pv_row) {
-                            *dst = src - pred;
-                        }
-                    }
+                    let residual_spec = metrics::ResidualSpec {
+                        src_stride: pw,
+                        pred_stride: 64,
+                        width: 64,
+                        height: 64,
+                        scale: sb_resid_scale_c,
+                    };
+                    metrics::scaled_residual_f32(
+                        &mut ru,
+                        &up[sb_y * pw + sb_x..],
+                        &pu,
+                        residual_spec,
+                    );
+                    metrics::scaled_residual_f32(
+                        &mut rv,
+                        &vp[sb_y * pw + sb_x..],
+                        &pv,
+                        residual_spec,
+                    );
                     let lu = chroma422::project_chroma_rdoq(
                         &bases.chroma444,
-                        &aq::scale_resid(&ru, sb_resid_scale_c),
+                        &ru,
                         &tables::SCAN,
                         qc,
                         1024,
@@ -2979,7 +2993,7 @@ impl Av2Encoder {
                     );
                     let lv = chroma422::project_chroma_rdoq(
                         &bases.chroma444,
-                        &aq::scale_resid(&rv, sb_resid_scale_c),
+                        &rv,
                         &tables::SCAN,
                         qc,
                         1024,
@@ -3019,7 +3033,8 @@ impl Av2Encoder {
                 best_pred
             } else {
                 None
-            };
+            }
+        });
         // Staged threading (replay): overwrite the just-searched winner with
         // the captured decision so the commit/emit below runs entirely from the
         // record. (3a: search still ran; injecting cached values here proves the
@@ -3102,7 +3117,7 @@ impl Av2Encoder {
         // Whole-64 chroma is always a single TX_64X64 (no internal TU edges),
         // regardless of the luma SPLIT/VERT4/HORZ4 tiling.
         db_tx_c.push((row * 16, col * 16, 16, 16));
-        match best {
+        outline_444(|| match best {
             Part::Vert4 => {
                 let mut skip_cdfs = [0u32; 4];
                 let mut dc_sign_ctxs = [0usize; 4];
@@ -3188,192 +3203,199 @@ impl Av2Encoder {
                 );
                 midx_grid[row * sb_cols + col] = sb_midx;
             }
-        }
+        });
         let bd = self.bit_depth as i32;
-        let (levu, levv) = if let Some(ref ch) = cfl_choice {
-            // CfL: residual against the per-pixel prediction; reconstruct
-            // with that prediction as the base.
-            let mut ru = [0f32; 64 * 64];
-            let mut rv = [0f32; 64 * 64];
-            cfl_prediction::<64>(pw, up, vp, sb_y, sb_x, &ch, &mut ru, &mut rv);
-            let levu = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(&ru, sb_resid_scale_c),
-                &tables::SCAN,
-                qc,
-                1024,
-                0,
-                self.tune.chroma_rdoq_lambda,
-            );
-            let levv = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(&rv, sb_resid_scale_c),
-                &tables::SCAN,
-                qc,
-                1024,
-                4,
-                self.tune.chroma_rdoq_lambda,
-            );
-            put_block(
-                recu,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma_cfl(
-                    &ch.pred_u,
-                    &levu,
-                    sb_qstep_c,
+        let (levu, levv) = outline_444(|| {
+            if let Some(ref ch) = cfl_choice {
+                // CfL: residual against the per-pixel prediction; reconstruct
+                // with that prediction as the base.
+                let mut ru = [0f32; 64 * 64];
+                let mut rv = [0f32; 64 * 64];
+                cfl_prediction::<64>(pw, up, vp, sb_y, sb_x, &ch, &mut ru, &mut rv);
+                let levu = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &aq::scale_resid(&ru, sb_resid_scale_c),
                     &tables::SCAN,
-                    64,
-                    64,
-                    bd,
-                ),
-            );
-            put_block(
-                recv,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma_cfl(
-                    &ch.pred_v,
-                    &levv,
-                    sb_qstep_c,
+                    qc,
+                    1024,
+                    0,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                let levv = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &aq::scale_resid(&rv, sb_resid_scale_c),
                     &tables::SCAN,
+                    qc,
+                    1024,
+                    4,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                put_block(
+                    recu,
+                    pw,
+                    sb_y,
+                    sb_x,
                     64,
+                    &itx422::reconstruct_chroma_cfl(
+                        &ch.pred_u,
+                        &levu,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                put_block(
+                    recv,
+                    pw,
+                    sb_y,
+                    sb_x,
                     64,
-                    bd,
-                ),
-            );
-            (levu, levv)
-        } else if let Some((pu, pv)) = uv444_pred.as_ref() {
-            // Non-DC chroma intra mode chosen above (enc.uv_mode already
-            // set and emitted by the luma-block encode). Code the residual
-            // against the per-pixel predictor, reconstruct with it as base.
-            let pu_i: Vec<i32> = pu.iter().map(|&p| (p + 0.5) as i32).collect();
-            let pv_i: Vec<i32> = pv.iter().map(|&p| (p + 0.5) as i32).collect();
-            let mut ru = [0f32; 64 * 64];
-            let mut rv = [0f32; 64 * 64];
-            let dst_rows = ru
-                .as_chunks_mut::<64>()
-                .0
-                .iter_mut()
-                .zip(rv.as_chunks_mut::<64>().0.iter_mut());
-            let src_rows =
-                rect_rows(up, pw, sb_y, sb_x, 64, 64).zip(rect_rows(vp, pw, sb_y, sb_x, 64, 64));
-            let pred_rows = pu
-                .as_chunks::<64>()
-                .0
-                .iter()
-                .zip(pv.as_chunks::<64>().0.iter());
-            for (((ru_row, rv_row), (up_row, vp_row)), (pu_row, pv_row)) in
-                dst_rows.zip(src_rows).zip(pred_rows)
-            {
-                for ((dst, &src), &pred) in ru_row.iter_mut().zip(up_row).zip(pu_row) {
-                    *dst = src - pred;
-                }
-                for ((dst, &src), &pred) in rv_row.iter_mut().zip(vp_row).zip(pv_row) {
-                    *dst = src - pred;
-                }
+                    &itx422::reconstruct_chroma_cfl(
+                        &ch.pred_v,
+                        &levv,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                (levu, levv)
+            } else if let Some((pu, pv)) = uv444_pred.as_ref() {
+                // Non-DC chroma intra mode chosen above (enc.uv_mode already
+                // set and emitted by the luma-block encode). Code the residual
+                // against the per-pixel predictor, reconstruct with it as base.
+                let mut pu_i = vec![0i32; 64 * 64];
+                let mut pv_i = vec![0i32; 64 * 64];
+                metrics::prediction_f32_to_i32(&mut pu_i, pu, 64, 64, 64);
+                metrics::prediction_f32_to_i32(&mut pv_i, pv, 64, 64, 64);
+                let mut ru = [0f32; 64 * 64];
+                let mut rv = [0f32; 64 * 64];
+                let residual_spec = metrics::ResidualSpec {
+                    src_stride: pw,
+                    pred_stride: 64,
+                    width: 64,
+                    height: 64,
+                    scale: sb_resid_scale_c,
+                };
+                metrics::scaled_residual_f32(&mut ru, &up[sb_y * pw + sb_x..], pu, residual_spec);
+                metrics::scaled_residual_f32(&mut rv, &vp[sb_y * pw + sb_x..], pv, residual_spec);
+                let levu = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &ru,
+                    &tables::SCAN,
+                    qc,
+                    1024,
+                    0,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                let levv = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &rv,
+                    &tables::SCAN,
+                    qc,
+                    1024,
+                    4,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                put_block(
+                    recu,
+                    pw,
+                    sb_y,
+                    sb_x,
+                    64,
+                    &itx422::reconstruct_chroma_cfl(
+                        &pu_i,
+                        &levu,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                put_block(
+                    recv,
+                    pw,
+                    sb_y,
+                    sb_x,
+                    64,
+                    &itx422::reconstruct_chroma_cfl(
+                        &pv_i,
+                        &levv,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                (levu, levv)
+            } else {
+                // DC (either search disabled, or DC won the search above).
+                let predu = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
+                let levu = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &aq::scale_resid(
+                        &get_residual(up, pw, sb_y, sb_x, 64, predu),
+                        sb_resid_scale_c,
+                    ),
+                    &tables::SCAN,
+                    qc,
+                    1024,
+                    0,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                put_block(
+                    recu,
+                    pw,
+                    sb_y,
+                    sb_x,
+                    64,
+                    &itx422::reconstruct_chroma(
+                        predu,
+                        &levu,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                let predv = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
+                let levv = chroma422::project_chroma_rdoq(
+                    &bases.chroma444,
+                    &aq::scale_resid(
+                        &get_residual(vp, pw, sb_y, sb_x, 64, predv),
+                        sb_resid_scale_c,
+                    ),
+                    &tables::SCAN,
+                    qc,
+                    1024,
+                    4,
+                    self.tune.chroma_rdoq_lambda,
+                );
+                put_block(
+                    recv,
+                    pw,
+                    sb_y,
+                    sb_x,
+                    64,
+                    &itx422::reconstruct_chroma(
+                        predv,
+                        &levv,
+                        sb_qstep_c,
+                        &tables::SCAN,
+                        64,
+                        64,
+                        bd,
+                    ),
+                );
+                (levu, levv)
             }
-            let levu = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(&ru, sb_resid_scale_c),
-                &tables::SCAN,
-                qc,
-                1024,
-                0,
-                self.tune.chroma_rdoq_lambda,
-            );
-            let levv = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(&rv, sb_resid_scale_c),
-                &tables::SCAN,
-                qc,
-                1024,
-                4,
-                self.tune.chroma_rdoq_lambda,
-            );
-            put_block(
-                recu,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma_cfl(
-                    &pu_i,
-                    &levu,
-                    sb_qstep_c,
-                    &tables::SCAN,
-                    64,
-                    64,
-                    bd,
-                ),
-            );
-            put_block(
-                recv,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma_cfl(
-                    &pv_i,
-                    &levv,
-                    sb_qstep_c,
-                    &tables::SCAN,
-                    64,
-                    64,
-                    bd,
-                ),
-            );
-            (levu, levv)
-        } else {
-            // DC (either search disabled, or DC won the search above).
-            let predu = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
-            let levu = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(
-                    &get_residual(up, pw, sb_y, sb_x, 64, predu),
-                    sb_resid_scale_c,
-                ),
-                &tables::SCAN,
-                qc,
-                1024,
-                0,
-                self.tune.chroma_rdoq_lambda,
-            );
-            put_block(
-                recu,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma(predu, &levu, sb_qstep_c, &tables::SCAN, 64, 64, bd),
-            );
-            let predv = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
-            let levv = chroma422::project_chroma_rdoq(
-                &bases.chroma444,
-                &aq::scale_resid(
-                    &get_residual(vp, pw, sb_y, sb_x, 64, predv),
-                    sb_resid_scale_c,
-                ),
-                &tables::SCAN,
-                qc,
-                1024,
-                4,
-                self.tune.chroma_rdoq_lambda,
-            );
-            put_block(
-                recv,
-                pw,
-                sb_y,
-                sb_x,
-                64,
-                &itx422::reconstruct_chroma(predv, &levv, sb_qstep_c, &tables::SCAN, 64, 64, bd),
-            );
-            (levu, levv)
-        };
+        });
         let ucoeffs = levels_to_coeffs(&levu);
         let vcoeffs = levels_to_coeffs(&levv);
         let u_skip = (6 + ua + ul) as u32;
@@ -3540,438 +3562,104 @@ impl Av2Encoder {
         }
         let mut i444_intra_this_sb = false;
         // --- 4:4:4 inter (NEWMV) attempt: whole-64 LAST-ref block ---------
-        if core_has_last && sb_x + 64 <= width && sb_y + 64 <= height {
-            use crate::av2::video::{me, mv::Mv};
-            let bd = self.bit_depth as i32;
-            let (ly, lu, lv) = (&core_last_ref[0], &core_last_ref[1], &core_last_ref[2]);
-            let (nmv_qstep, nmv_scale, nmv_qstep_c, nmv_scale_c) =
-                aqs.per_sb_probe(y, pw, sb_y, sb_x, width, height);
-            // GLOBALMV zero-motion skip: a static full 64x64 block copies LAST
-            // (all three planes at full res) instead of falling back to intra.
-            // RD bound scales q^2 (AVM rdmult); mirrors the 4:2:0 skip branch.
-            {
-                let sse = rect_sse_f32(
-                    &PlaneRect {
-                        plane: y,
-                        stride: pw,
-                        y: sb_y,
-                        x: sb_x,
-                    },
-                    &PlaneRect {
-                        plane: ly,
-                        stride: ref_ls,
-                        y: ref_y0 + sb_y,
-                        x: ref_x0 + sb_x,
-                    },
-                    64,
-                    64,
-                );
-                use crate::av2::video::rd;
-                let skip_dist = sse * rd::SS2_INTER_DIST_W;
-                let intra_bound = rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, qstep_i as u32);
-                if skip_dist < intra_bound {
-                    let up = row > 0;
-                    let lf = col > 0;
-                    let ia = i444_inter_above[col] == 1;
-                    let il = (*i444_inter_left) == 1;
-                    enc.intra_inter_ctx = if up && lf {
-                        let n_intra = (!il as u8) + (!ia as u8);
-                        if n_intra == 2 { 3 } else { n_intra as usize }
-                    } else if up {
-                        if ia { 0 } else { 3 }
-                    } else if lf {
-                        if il { 0 } else { 3 }
-                    } else {
-                        0
-                    };
-                    let sa = i444_skip_above[col];
-                    let sl = *i444_skip_left;
-                    let skip_ctx = if up && lf {
-                        (sl + sa) as usize
-                    } else if up {
-                        (2 * sa) as usize
-                    } else if lf {
-                        (2 * sl) as usize
-                    } else {
-                        0
-                    };
-                    let mode_ctx = (i444_inter_above[col] + (*i444_inter_left)) as usize
-                        + if i444_newmv_above[col] != 0 || (*i444_newmv_left) != 0 {
-                            2
+        let inter_committed = outline_444(|| {
+            if core_has_last && sb_x + 64 <= width && sb_y + 64 <= height {
+                use crate::av2::video::{me, mv::Mv};
+                let bd = self.bit_depth as i32;
+                let (ly, lu, lv) = (&core_last_ref[0], &core_last_ref[1], &core_last_ref[2]);
+                let (nmv_qstep, nmv_scale, nmv_qstep_c, nmv_scale_c) =
+                    aqs.per_sb_probe(y, pw, sb_y, sb_x, width, height);
+                // GLOBALMV zero-motion skip: a static full 64x64 block copies LAST
+                // (all three planes at full res) instead of falling back to intra.
+                // RD bound scales q^2 (AVM rdmult); mirrors the 4:2:0 skip branch.
+                {
+                    let sse = rect_sse_f32(
+                        &PlaneRect {
+                            plane: y,
+                            stride: pw,
+                            y: sb_y,
+                            x: sb_x,
+                        },
+                        &PlaneRect {
+                            plane: ly,
+                            stride: ref_ls,
+                            y: ref_y0 + sb_y,
+                            x: ref_x0 + sb_x,
+                        },
+                        64,
+                        64,
+                    );
+                    use crate::av2::video::rd;
+                    let skip_dist = sse * rd::SS2_INTER_DIST_W;
+                    let intra_bound = rd::rd_cost(0.0, 2.0 * 64.0 * 64.0, qstep_i as u32);
+                    if skip_dist < intra_bound {
+                        let up = row > 0;
+                        let lf = col > 0;
+                        let ia = i444_inter_above[col] == 1;
+                        let il = (*i444_inter_left) == 1;
+                        enc.intra_inter_ctx = if up && lf {
+                            let n_intra = (!il as u8) + (!ia as u8);
+                            if n_intra == 2 { 3 } else { n_intra as usize }
+                        } else if up {
+                            if ia { 0 } else { 3 }
+                        } else if lf {
+                            if il { 0 } else { 3 }
                         } else {
                             0
                         };
-                    coder::emit_inter_skip_block(enc, 12276, skip_ctx, mode_ctx);
-                    // Copy LAST into recon: Y, U, V all full-res, same MV=0.
-                    for (rec, refp) in [
-                        (&mut *recy, &core_last_ref[0]),
-                        (&mut *recu, &core_last_ref[1]),
-                        (&mut *recv, &core_last_ref[2]),
-                    ] {
-                        for (dst_row, src_row) in rect_rows_mut(rec, pw, sb_y, sb_x, 64, 64).zip(
-                            rect_rows(refp, ref_ls, ref_y0 + sb_y, ref_x0 + sb_x, 64, 64),
-                        ) {
-                            dst_row.copy_from_slice(src_row);
-                        }
-                    }
-                    // Update neighbor/entropy grids identically to the NEWMV
-                    // skip case (skip_txfm=1: no residual, cleared contexts).
-                    let (fmr, fmc) = (row * 16, col * 16);
-                    for c in fmc..fmc + 16 {
-                        u_above[c] = 0;
-                        v_above[c] = 0;
-                        cfl_above[c] = 0;
-                    }
-                    for r in fmr..fmr + 16 {
-                        u_left[r] = 0;
-                        v_left[r] = 0;
-                        cfl_left[r] = 0;
-                    }
-                    partition::sb_none_pctx(row, col, above_pctx, left_pctx);
-                    // Clear this SB's luma coeff entropy context (0x40 marker).
-                    {
-                        let cx = sb_x / 4;
-                        let cy = sb_y / 4;
-                        let ae = (cx + 16).min(above.len());
-                        let le = (cy + 16).min(left.len());
-                        for v in above[cx..ae].iter_mut() {
-                            *v = 0x40;
-                        }
-                        for v in left[cy..le].iter_mut() {
-                            *v = 0x40;
-                        }
-                    }
-                    i444_skip_above[col] = 1;
-                    (*i444_skip_left) = 1;
-                    i444_inter_above[col] = 1;
-                    (*i444_inter_left) = 1;
-                    i444_newmv_above[col] = 0;
-                    (*i444_newmv_left) = 0;
-                    i444_mv_above[col] = Some(Mv::ZERO);
-                    (*i444_mv_left) = Some(Mv::ZERO);
-                    return;
-                }
-            }
-            // Frame-scoped buffers built once before the loop; borrow them.
-            let (cur_u, bref, bstride, refh) = {
-                let (c, b, s, h) = inter_luma.as_ref().unwrap();
-                (c.as_slice(), b.as_slice(), *s, *h)
-            };
-            // Spatial MV predictors (zero, left, above, above-right) seed the
-            // search; ref_mv matches the DRL[0] predictor used for MVD coding.
-            let mut preds = me::MeCandidates::new();
-            if frame_mv_seed != Mv::ZERO {
-                preds.push_unique(frame_mv_seed);
-            }
-            for cand in [
-                (*i444_mv_left),
-                if row > 0 { i444_mv_above[col] } else { None },
-                if row > 0 && col + 1 < sb_cols {
-                    i444_mv_above[col + 1]
-                } else {
-                    None
-                },
-            ]
-            .into_iter()
-            .flatten()
-            {
-                preds.push_unique(cand);
-            }
-            let ref_mv = (*i444_mv_left)
-                .or(if row > 0 { i444_mv_above[col] } else { None })
-                .unwrap_or(Mv::ZERO);
-            let (mv, _) = me::search(
-                &me::MePlanes {
-                    current: &cur_u[sb_y * pw + sb_x..],
-                    current_stride: pw,
-                    reference: bref,
-                    reference_stride: bstride,
-                },
-                preds.as_slice(),
-                &me::MeSearchSpec {
-                    origin_x: (ref_x0 + sb_x + BRD) as isize,
-                    origin_y: (ref_y0 + sb_y + BRD) as isize,
-                    width: 64,
-                    height: 64,
-                    reference_mv: ref_mv,
-                    lambda_mv: (nmv_qstep as u32).max(1),
-                    max_dx: self.video_search_range,
-                    max_dy: self.video_search_range,
-                    predictor_gate_sad_per_pixel: self.video_predictor_gate,
-                    integer_satd_radius: self.video_integer_satd_radius,
-                    bit_depth: self.bit_depth,
-                    frame_width: bstride,
-                    frame_height: refh + 2 * BRD,
-                },
-                me_scratch,
-            );
-            let mv = mc::clamp_umv(
-                mv,
-                (ref_x0 + sb_x) as i32,
-                (ref_y0 + sb_y) as i32,
-                64,
-                64,
-                ref_ls as i32,
-                refh as i32,
-            );
-            // Accept zero-motion (static-block skip) and drop the fixed
-            // magnitude clamp; motion found by the search is used directly.
-            {
-                let mut pred_u = [0u16; 64 * 64];
-                mc::predict(
-                    &mut pred_u,
-                    64,
-                    bref,
-                    bstride,
-                    &mc::MotionBlock {
-                        origin_x: (ref_x0 + sb_x + BRD) as isize,
-                        origin_y: (ref_y0 + sb_y + BRD) as isize,
-                        mv,
-                        width: 64,
-                        height: 64,
-                        bit_depth: self.bit_depth,
-                    },
-                );
-                let sse = pixel_sse_f32_u16_block(y, pw, sb_y, sb_x, &pred_u, 64, 64, 64);
-                // Inter vs intra RD bound scales q^2 (AVM rdmult); accepts
-                // zero-motion static blocks now that the MV gate is removed.
-                use crate::av2::video::rd;
-                let inter_dist = sse * rd::SS2_INTER_DIST_W;
-                let intra_bound = rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, nmv_qstep as u32);
-                if inter_dist < intra_bound {
-                    static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
-                    let mut tus: [Vec<Coeff>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-                    for (i, &(ty, tx)) in POS.iter().enumerate() {
-                        let (y0, x0) = (sb_y + ty, sb_x + tx);
-                        let mut pblk = [0f32; 1024];
-                        let mut resid = [0f32; 1024];
-                        let dst_rows = pblk
-                            .as_chunks_mut::<32>()
-                            .0
-                            .iter_mut()
-                            .zip(resid.as_chunks_mut::<32>().0.iter_mut());
-                        let src_rows = rect_rows(y, pw, y0, x0, 32, 32);
-                        let pred_rows = rect_rows(&pred_u, 64, ty, tx, 32, 32);
-                        for (((pred_dst, resid_row), src_row), pred_row) in
-                            dst_rows.zip(src_rows).zip(pred_rows)
-                        {
-                            for (((pred_dst, resid), &src), &pred) in pred_dst
-                                .iter_mut()
-                                .zip(resid_row)
-                                .zip(src_row)
-                                .zip(pred_row)
-                            {
-                                let pred = pred as f32;
-                                *pred_dst = pred;
-                                *resid = (src - pred) * nmv_scale;
-                            }
-                        }
-                        let lev = bases.luma.project(&resid[..], 0.0);
-                        let rb =
-                            itx422::reconstruct_luma(&pblk, &lev, nmv_qstep, &tables::SCAN, bd);
-                        put_block(recy, pw, y0, x0, 32, &rb);
-                        tus[i] = levels_to_coeffs(&lev);
-                    }
-                    let mut uv_coeffs: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
-                    for (pi, (src_c, ref_c, rec_c)) in [(cb, lu, &mut *recu), (cr, lv, &mut *recv)]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let _ = ref_c; // reference now borrowed frame-scoped
-                        let (bcref, bcstride) = {
-                            let (b, s) = &inter_chroma.as_ref().unwrap()[pi];
-                            (b.as_slice(), *s)
-                        };
-                        let mut cpredu = [0u16; 64 * 64];
-                        mc::predict(
-                            &mut cpredu,
-                            64,
-                            bcref,
-                            bcstride,
-                            &mc::MotionBlock {
-                                origin_x: (ref_x0 + sb_x + BRD) as isize,
-                                origin_y: (ref_y0 + sb_y + BRD) as isize,
-                                mv,
-                                width: 64,
-                                height: 64,
-                                bit_depth: self.bit_depth,
-                            },
-                        );
-                        let mut cres = [0f32; 64 * 64];
-                        let mut cpred = [0f32; 64 * 64];
-                        let dst_rows = cpred
-                            .as_chunks_mut::<64>()
-                            .0
-                            .iter_mut()
-                            .zip(cres.as_chunks_mut::<64>().0.iter_mut());
-                        let src_rows = rect_rows(src_c, pw, sb_y, sb_x, 64, 64);
-                        for (((pred_row, resid_row), src_row), ref_row) in dst_rows
-                            .zip(src_rows)
-                            .zip(cpredu.as_chunks::<64>().0.iter())
-                        {
-                            for (((pred, resid), &src), &reference) in
-                                pred_row.iter_mut().zip(resid_row).zip(src_row).zip(ref_row)
-                            {
-                                let reference = reference as f32;
-                                *pred = reference;
-                                *resid = (src - reference) * nmv_scale_c;
-                            }
-                        }
-                        let lev = chroma422::project_chroma_rdoq(
-                            &bases.chroma444,
-                            &cres[..],
-                            &tables::SCAN,
-                            qc,
-                            1024,
-                            pi * 4,
-                            self.tune.chroma_rdoq_lambda,
-                        );
-                        let cpred_i: Vec<i32> = cpred.iter().map(|&p| p as i32).collect();
-                        let rb = itx422::reconstruct_chroma_pred(
-                            &cpred_i,
-                            &lev,
-                            nmv_qstep_c,
-                            &tables::SCAN,
-                            64,
-                            64,
-                            bd,
-                        );
-                        put_block(rec_c, pw, sb_y, sb_x, 64, &rb);
-                        uv_coeffs[pi] = levels_to_coeffs(&lev);
-                    }
-                    let up = row > 0;
-                    let lf = col > 0;
-                    let skip_ctx = if up && lf {
-                        (i444_skip_above[col] + (*i444_skip_left)) as usize
-                    } else if up {
-                        (2 * i444_skip_above[col]) as usize
-                    } else if lf {
-                        (2 * (*i444_skip_left)) as usize
-                    } else {
-                        0
-                    };
-                    let mode_ctx = (i444_inter_above[col] + (*i444_inter_left)) as usize
-                        + if i444_newmv_above[col] != 0 || (*i444_newmv_left) != 0 {
-                            2
+                        let sa = i444_skip_above[col];
+                        let sl = *i444_skip_left;
+                        let skip_ctx = if up && lf {
+                            (sl + sa) as usize
+                        } else if up {
+                            (2 * sa) as usize
+                        } else if lf {
+                            (2 * sl) as usize
                         } else {
                             0
                         };
-                    // DRL[0] predictor (AVM setup_ref_mv_list scan order with
-                    // reorder disabled, single LAST ref, no TMVP): left SB's MV
-                    // first, then above, then above-right; else zero.
-                    let pred_mv = (*i444_mv_left)
-                        .or(if row > 0 { i444_mv_above[col] } else { None })
-                        .or(if row > 0 && col + 1 < sb_cols {
-                            i444_mv_above[col + 1]
-                        } else {
-                            None
-                        })
-                        .unwrap_or(crate::av2::video::mv::Mv::ZERO);
-                    let mvd_row = mv.row - pred_mv.row;
-                    let mvd_col = mv.col - pred_mv.col;
-                    // mv == DRL[0]: signal NEARMV (copies the predictor, no MVD);
-                    // otherwise NEWMV with mvd = mv - DRL[0].
-                    let inter_mode = if mvd_row == 0 && mvd_col == 0 { 0 } else { 2 };
-                    {
-                        enc.delta_q_pending = enc.delta_q_present;
-                        let any_resid = tus.iter().any(|t| !t.is_empty())
-                            || !uv_coeffs[0].is_empty()
-                            || !uv_coeffs[1].is_empty();
-                        let ds_cdf =
-                            partition::sb_none_do_split_cdf(row, col, above_pctx, left_pctx);
-                        // intra_inter ctx for the is_inter flag (see rule below).
-                        {
-                            let up = row > 0;
-                            let lf = col > 0;
-                            let ia = i444_inter_above[col] == 1;
-                            let il = (*i444_inter_left) == 1;
-                            // AVM neighbors for a whole-64 SB resolve to the left SB
-                            // (bottom-left+left) and above SB (above-right+above); a
-                            // lone neighbor is scanned twice.
-                            enc.intra_inter_ctx = if up && lf {
-                                if !il && !ia { 3 } else { (!il || !ia) as usize }
-                            } else if lf {
-                                if il { 0 } else { 3 }
-                            } else if up {
-                                if ia { 0 } else { 3 }
+                        let mode_ctx = (i444_inter_above[col] + (*i444_inter_left)) as usize
+                            + if i444_newmv_above[col] != 0 || (*i444_newmv_left) != 0 {
+                                2
                             } else {
                                 0
                             };
+                        coder::emit_inter_skip_block(enc, 12276, skip_ctx, mode_ctx);
+                        // Copy LAST into recon: Y, U, V all full-res, same MV=0.
+                        for (rec, refp) in [
+                            (&mut *recy, &core_last_ref[0]),
+                            (&mut *recu, &core_last_ref[1]),
+                            (&mut *recv, &core_last_ref[2]),
+                        ] {
+                            for (dst_row, src_row) in rect_rows_mut(rec, pw, sb_y, sb_x, 64, 64)
+                                .zip(rect_rows(
+                                    refp,
+                                    ref_ls,
+                                    ref_y0 + sb_y,
+                                    ref_x0 + sb_x,
+                                    64,
+                                    64,
+                                ))
+                            {
+                                dst_row.copy_from_slice(src_row);
+                            }
                         }
-                        // Chroma skip contexts (TX64): neighbor any-nonzero from the
-                        // chroma entropy grids at this SB's mi origin.
+                        // Update neighbor/entropy grids identically to the NEWMV
+                        // skip case (skip_txfm=1: no residual, cleared contexts).
                         let (fmr, fmc) = (row * 16, col * 16);
-                        let ua = if fmr > 0 {
-                            u_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
-                        } else {
-                            0
-                        };
-                        let ul = if fmc > 0 {
-                            u_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
-                        } else {
-                            0
-                        };
-                        let va = if fmr > 0 {
-                            v_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
-                        } else {
-                            0
-                        };
-                        let vl = if fmc > 0 {
-                            v_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
-                        } else {
-                            0
-                        };
-                        let u_present = uv_coeffs[0].iter().any(|&(_, l)| l != 0);
-                        let v_present = uv_coeffs[1].iter().any(|&(_, l)| l != 0);
-                        if any_resid {
-                            // Commit AQ only for residual blocks: whole-SB skips emit
-                            // no delta_q, so the decoder's qindex must stay unchanged.
-                            let _ = aqs.per_sb(enc, y, pw, sb_y, sb_x, width, height);
-                            let (tu_skip_cdfs, tu_dc_sign) = sb_tu_contexts(
-                                &tus,
-                                sb_y,
-                                sb_x,
-                                above,
-                                left,
-                                enc.qc,
-                                (pw / 4) as i64,
-                                (ph / 4) as i64,
-                            );
-                            let u_skip = (6 + ua + ul) as u32;
-                            let v_skip = (6 * (u_present as i32) + va + vl) as u32;
-                            coder::emit_inter_newmv_residual_block_multi(
-                                enc,
-                                &coder::InterResidualSpec {
-                                    part_cdf: ds_cdf,
-                                    skip_ctx,
-                                    mode_ctx,
-                                    drl_ctx: mode_ctx,
-                                    mode: inter_mode,
-                                    scaled_row: mvd_row / 2,
-                                    scaled_col: mvd_col / 2,
-                                    luma_tus: &tus,
-                                    luma_skip_cdfs: &tu_skip_cdfs,
-                                    luma_dc_sign_ctxs: &tu_dc_sign,
-                                },
-                                &coder::InterChromaTus {
-                                    u_tus: std::slice::from_ref(&uv_coeffs[0]),
-                                    v_tus: std::slice::from_ref(&uv_coeffs[1]),
-                                    u_skip_cdfs: &[u_skip],
-                                    v_skip_cdfs: &[v_skip],
-                                    u_tx64: true,
-                                },
-                            );
-                        } else {
-                            coder::emit_inter_mode_block(
-                                enc,
-                                ds_cdf,
-                                skip_ctx,
-                                mode_ctx,
-                                mode_ctx,
-                                inter_mode,
-                                mvd_row / 2,
-                                mvd_col / 2,
-                            );
+                        for c in fmc..fmc + 16 {
+                            u_above[c] = 0;
+                            v_above[c] = 0;
+                            cfl_above[c] = 0;
+                        }
+                        for r in fmr..fmr + 16 {
+                            u_left[r] = 0;
+                            v_left[r] = 0;
+                            cfl_left[r] = 0;
+                        }
+                        partition::sb_none_pctx(row, col, above_pctx, left_pctx);
+                        // Clear this SB's luma coeff entropy context (0x40 marker).
+                        {
                             let cx = sb_x / 4;
                             let cy = sb_y / 4;
                             let ae = (cx + 16).min(above.len());
@@ -3983,40 +3671,375 @@ impl Av2Encoder {
                                 *v = 0x40;
                             }
                         }
-                        // Update chroma entropy grids with this block's coeff presence.
-                        for c in fmc..fmc + 16 {
-                            u_above[c] = u_present as i32;
-                            v_above[c] = v_present as i32;
-                            cfl_above[c] = 0; // inter blocks are never CfL-coded
-                        }
-                        for r in fmr..fmr + 16 {
-                            u_left[r] = u_present as i32;
-                            v_left[r] = v_present as i32;
-                            cfl_left[r] = 0;
-                        }
-                        partition::sb_none_pctx(row, col, above_pctx, left_pctx);
-                        i444_skip_above[col] = if any_resid { 0 } else { 1 };
-                        (*i444_skip_left) = if any_resid { 0 } else { 1 };
+                        i444_skip_above[col] = 1;
+                        *i444_skip_left = 1;
                         i444_inter_above[col] = 1;
-                        (*i444_inter_left) = 1;
-                        i444_newmv_above[col] = (inter_mode == 2) as u8;
-                        (*i444_newmv_left) = (inter_mode == 2) as u8;
-                        i444_mv_above[col] = Some(mv);
-                        (*i444_mv_left) = Some(mv);
-                        return;
+                        *i444_inter_left = 1;
+                        i444_newmv_above[col] = 0;
+                        *i444_newmv_left = 0;
+                        i444_mv_above[col] = Some(Mv::ZERO);
+                        *i444_mv_left = Some(Mv::ZERO);
+                        return true;
                     }
                 }
+                // Frame-scoped buffers built once before the loop; borrow them.
+                let (cur_u, bref, bstride, refh) = {
+                    let (c, b, s, h) = inter_luma.as_ref().unwrap();
+                    (c.as_slice(), b.as_slice(), *s, *h)
+                };
+                // Spatial MV predictors (zero, left, above, above-right) seed the
+                // search; ref_mv matches the DRL[0] predictor used for MVD coding.
+                let mut preds = me::MeCandidates::new();
+                if frame_mv_seed != Mv::ZERO {
+                    preds.push_unique(frame_mv_seed);
+                }
+                for cand in [
+                    (*i444_mv_left),
+                    if row > 0 { i444_mv_above[col] } else { None },
+                    if row > 0 && col + 1 < sb_cols {
+                        i444_mv_above[col + 1]
+                    } else {
+                        None
+                    },
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    preds.push_unique(cand);
+                }
+                let ref_mv = (*i444_mv_left)
+                    .or(if row > 0 { i444_mv_above[col] } else { None })
+                    .unwrap_or(Mv::ZERO);
+                let (mv, _) = me::search(
+                    &me::MePlanes {
+                        current: &cur_u[sb_y * pw + sb_x..],
+                        current_stride: pw,
+                        reference: bref,
+                        reference_stride: bstride,
+                    },
+                    preds.as_slice(),
+                    &me::MeSearchSpec {
+                        origin_x: (ref_x0 + sb_x + BRD) as isize,
+                        origin_y: (ref_y0 + sb_y + BRD) as isize,
+                        width: 64,
+                        height: 64,
+                        reference_mv: ref_mv,
+                        lambda_mv: (nmv_qstep as u32).max(1),
+                        max_dx: self.video_search_range,
+                        max_dy: self.video_search_range,
+                        predictor_gate_sad_per_pixel: self.video_predictor_gate,
+                        integer_satd_radius: self.video_integer_satd_radius,
+                        bit_depth: self.bit_depth,
+                        frame_width: bstride,
+                        frame_height: refh + 2 * BRD,
+                    },
+                    me_scratch,
+                );
+                let mv = mc::clamp_umv(
+                    mv,
+                    (ref_x0 + sb_x) as i32,
+                    (ref_y0 + sb_y) as i32,
+                    64,
+                    64,
+                    ref_ls as i32,
+                    refh as i32,
+                );
+                // Accept zero-motion (static-block skip) and drop the fixed
+                // magnitude clamp; motion found by the search is used directly.
+                {
+                    let mut pred_u = [0u16; 64 * 64];
+                    mc::predict(
+                        &mut pred_u,
+                        64,
+                        bref,
+                        bstride,
+                        &mc::MotionBlock {
+                            origin_x: (ref_x0 + sb_x + BRD) as isize,
+                            origin_y: (ref_y0 + sb_y + BRD) as isize,
+                            mv,
+                            width: 64,
+                            height: 64,
+                            bit_depth: self.bit_depth,
+                        },
+                    );
+                    let sse = pixel_sse_f32_u16_block(y, pw, sb_y, sb_x, &pred_u, 64, 64, 64);
+                    // Inter vs intra RD bound scales q^2 (AVM rdmult); accepts
+                    // zero-motion static blocks now that the MV gate is removed.
+                    use crate::av2::video::rd;
+                    let inter_dist = sse * rd::SS2_INTER_DIST_W;
+                    let intra_bound = rd::rd_cost(0.0, 16.0 * 64.0 * 64.0, nmv_qstep as u32);
+                    if inter_dist < intra_bound {
+                        static POS: [(usize, usize); 4] = [(0, 0), (0, 32), (32, 0), (32, 32)];
+                        let mut tus: [Vec<Coeff>; 4] =
+                            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                        for (i, &(ty, tx)) in POS.iter().enumerate() {
+                            let (y0, x0) = (sb_y + ty, sb_x + tx);
+                            let mut pblk = [0f32; 1024];
+                            let mut resid = [0f32; 1024];
+                            metrics::u16_prediction_and_scaled_residual_f32(
+                                &mut pblk,
+                                &mut resid,
+                                &y[y0 * pw + x0..],
+                                &pred_u[ty * 64 + tx..],
+                                metrics::ResidualSpec {
+                                    src_stride: pw,
+                                    pred_stride: 64,
+                                    width: 32,
+                                    height: 32,
+                                    scale: nmv_scale,
+                                },
+                            );
+                            let lev = bases.luma.project(&resid[..], 0.0);
+                            let rb = reconstruct_luma(&pblk, &lev, nmv_qstep, &tables::SCAN, bd);
+                            put_block(recy, pw, y0, x0, 32, &rb);
+                            tus[i] = levels_to_coeffs(&lev);
+                        }
+                        let mut uv_coeffs: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
+                        for (pi, (src_c, ref_c, rec_c)) in
+                            [(cb, lu, &mut *recu), (cr, lv, &mut *recv)]
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let _ = ref_c; // reference now borrowed frame-scoped
+                            let (bcref, bcstride) = {
+                                let (b, s) = &inter_chroma.as_ref().unwrap()[pi];
+                                (b.as_slice(), *s)
+                            };
+                            let mut cpredu = [0u16; 64 * 64];
+                            mc::predict(
+                                &mut cpredu,
+                                64,
+                                bcref,
+                                bcstride,
+                                &mc::MotionBlock {
+                                    origin_x: (ref_x0 + sb_x + BRD) as isize,
+                                    origin_y: (ref_y0 + sb_y + BRD) as isize,
+                                    mv,
+                                    width: 64,
+                                    height: 64,
+                                    bit_depth: self.bit_depth,
+                                },
+                            );
+                            let mut cres = [0f32; 64 * 64];
+                            let mut cpred = [0f32; 64 * 64];
+                            metrics::u16_prediction_and_scaled_residual_f32(
+                                &mut cpred,
+                                &mut cres,
+                                &src_c[sb_y * pw + sb_x..],
+                                &cpredu,
+                                metrics::ResidualSpec {
+                                    src_stride: pw,
+                                    pred_stride: 64,
+                                    width: 64,
+                                    height: 64,
+                                    scale: nmv_scale_c,
+                                },
+                            );
+                            let lev = chroma422::project_chroma_rdoq(
+                                &bases.chroma444,
+                                &cres[..],
+                                &tables::SCAN,
+                                qc,
+                                1024,
+                                pi * 4,
+                                self.tune.chroma_rdoq_lambda,
+                            );
+                            let cpred_i: Vec<i32> = cpred.iter().map(|&p| p as i32).collect();
+                            let rb = itx422::reconstruct_chroma_pred(
+                                &cpred_i,
+                                &lev,
+                                nmv_qstep_c,
+                                &tables::SCAN,
+                                64,
+                                64,
+                                bd,
+                            );
+                            put_block(rec_c, pw, sb_y, sb_x, 64, &rb);
+                            uv_coeffs[pi] = levels_to_coeffs(&lev);
+                        }
+                        let up = row > 0;
+                        let lf = col > 0;
+                        let skip_ctx = if up && lf {
+                            (i444_skip_above[col] + (*i444_skip_left)) as usize
+                        } else if up {
+                            (2 * i444_skip_above[col]) as usize
+                        } else if lf {
+                            (2 * (*i444_skip_left)) as usize
+                        } else {
+                            0
+                        };
+                        let mode_ctx = (i444_inter_above[col] + (*i444_inter_left)) as usize
+                            + if i444_newmv_above[col] != 0 || (*i444_newmv_left) != 0 {
+                                2
+                            } else {
+                                0
+                            };
+                        // DRL[0] predictor (AVM setup_ref_mv_list scan order with
+                        // reorder disabled, single LAST ref, no TMVP): left SB's MV
+                        // first, then above, then above-right; else zero.
+                        let pred_mv = (*i444_mv_left)
+                            .or(if row > 0 { i444_mv_above[col] } else { None })
+                            .or(if row > 0 && col + 1 < sb_cols {
+                                i444_mv_above[col + 1]
+                            } else {
+                                None
+                            })
+                            .unwrap_or(crate::av2::video::mv::Mv::ZERO);
+                        let mvd_row = mv.row - pred_mv.row;
+                        let mvd_col = mv.col - pred_mv.col;
+                        // mv == DRL[0]: signal NEARMV (copies the predictor, no MVD);
+                        // otherwise NEWMV with mvd = mv - DRL[0].
+                        let inter_mode = if mvd_row == 0 && mvd_col == 0 { 0 } else { 2 };
+                        {
+                            enc.delta_q_pending = enc.delta_q_present;
+                            let any_resid = tus.iter().any(|t| !t.is_empty())
+                                || !uv_coeffs[0].is_empty()
+                                || !uv_coeffs[1].is_empty();
+                            let ds_cdf =
+                                partition::sb_none_do_split_cdf(row, col, above_pctx, left_pctx);
+                            // intra_inter ctx for the is_inter flag (see rule below).
+                            {
+                                let up = row > 0;
+                                let lf = col > 0;
+                                let ia = i444_inter_above[col] == 1;
+                                let il = (*i444_inter_left) == 1;
+                                // AVM neighbors for a whole-64 SB resolve to the left SB
+                                // (bottom-left+left) and above SB (above-right+above); a
+                                // lone neighbor is scanned twice.
+                                enc.intra_inter_ctx = if up && lf {
+                                    if !il && !ia { 3 } else { (!il || !ia) as usize }
+                                } else if lf {
+                                    if il { 0 } else { 3 }
+                                } else if up {
+                                    if ia { 0 } else { 3 }
+                                } else {
+                                    0
+                                };
+                            }
+                            // Chroma skip contexts (TX64): neighbor any-nonzero from the
+                            // chroma entropy grids at this SB's mi origin.
+                            let (fmr, fmc) = (row * 16, col * 16);
+                            let ua = if fmr > 0 {
+                                u_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
+                            } else {
+                                0
+                            };
+                            let ul = if fmc > 0 {
+                                u_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
+                            } else {
+                                0
+                            };
+                            let va = if fmr > 0 {
+                                v_above[fmc..fmc + 16].iter().any(|&x| x != 0) as i32
+                            } else {
+                                0
+                            };
+                            let vl = if fmc > 0 {
+                                v_left[fmr..fmr + 16].iter().any(|&x| x != 0) as i32
+                            } else {
+                                0
+                            };
+                            let u_present = uv_coeffs[0].iter().any(|&(_, l)| l != 0);
+                            let v_present = uv_coeffs[1].iter().any(|&(_, l)| l != 0);
+                            if any_resid {
+                                // Commit AQ only for residual blocks: whole-SB skips emit
+                                // no delta_q, so the decoder's qindex must stay unchanged.
+                                let _ = aqs.per_sb(enc, y, pw, sb_y, sb_x, width, height);
+                                let (tu_skip_cdfs, tu_dc_sign) = sb_tu_contexts(
+                                    &tus,
+                                    sb_y,
+                                    sb_x,
+                                    above,
+                                    left,
+                                    enc.qc,
+                                    (pw / 4) as i64,
+                                    (ph / 4) as i64,
+                                );
+                                let u_skip = (6 + ua + ul) as u32;
+                                let v_skip = (6 * (u_present as i32) + va + vl) as u32;
+                                coder::emit_inter_newmv_residual_block_multi(
+                                    enc,
+                                    &coder::InterResidualSpec {
+                                        part_cdf: ds_cdf,
+                                        skip_ctx,
+                                        mode_ctx,
+                                        drl_ctx: mode_ctx,
+                                        mode: inter_mode,
+                                        scaled_row: mvd_row / 2,
+                                        scaled_col: mvd_col / 2,
+                                        luma_tus: &tus,
+                                        luma_skip_cdfs: &tu_skip_cdfs,
+                                        luma_dc_sign_ctxs: &tu_dc_sign,
+                                    },
+                                    &coder::InterChromaTus {
+                                        u_tus: std::slice::from_ref(&uv_coeffs[0]),
+                                        v_tus: std::slice::from_ref(&uv_coeffs[1]),
+                                        u_skip_cdfs: &[u_skip],
+                                        v_skip_cdfs: &[v_skip],
+                                        u_tx64: true,
+                                    },
+                                );
+                            } else {
+                                coder::emit_inter_mode_block(
+                                    enc,
+                                    ds_cdf,
+                                    skip_ctx,
+                                    mode_ctx,
+                                    mode_ctx,
+                                    inter_mode,
+                                    mvd_row / 2,
+                                    mvd_col / 2,
+                                );
+                                let cx = sb_x / 4;
+                                let cy = sb_y / 4;
+                                let ae = (cx + 16).min(above.len());
+                                let le = (cy + 16).min(left.len());
+                                for v in above[cx..ae].iter_mut() {
+                                    *v = 0x40;
+                                }
+                                for v in left[cy..le].iter_mut() {
+                                    *v = 0x40;
+                                }
+                            }
+                            // Update chroma entropy grids with this block's coeff presence.
+                            for c in fmc..fmc + 16 {
+                                u_above[c] = u_present as i32;
+                                v_above[c] = v_present as i32;
+                                cfl_above[c] = 0; // inter blocks are never CfL-coded
+                            }
+                            for r in fmr..fmr + 16 {
+                                u_left[r] = u_present as i32;
+                                v_left[r] = v_present as i32;
+                                cfl_left[r] = 0;
+                            }
+                            partition::sb_none_pctx(row, col, above_pctx, left_pctx);
+                            i444_skip_above[col] = if any_resid { 0 } else { 1 };
+                            (*i444_skip_left) = if any_resid { 0 } else { 1 };
+                            i444_inter_above[col] = 1;
+                            (*i444_inter_left) = 1;
+                            i444_newmv_above[col] = (inter_mode == 2) as u8;
+                            (*i444_newmv_left) = (inter_mode == 2) as u8;
+                            i444_mv_above[col] = Some(mv);
+                            (*i444_mv_left) = Some(mv);
+                            return true;
+                        }
+                    }
+                }
+                // NOTE: intra fall-through. The intra leaf reads i444_inter_above[col]
+                // and i444_inter_left as NEIGHBOUR inter-ness for its intra_inter ctx,
+                // so we must NOT clear them here — they are cleared after the SB below.
+                i444_skip_above[col] = 0;
+                (*i444_skip_left) = 0;
+                i444_newmv_above[col] = 0;
+                (*i444_newmv_left) = 0;
+                i444_mv_above[col] = None;
+                (*i444_mv_left) = None;
+                i444_intra_this_sb = true;
             }
-            // NOTE: intra fall-through. The intra leaf reads i444_inter_above[col]
-            // and i444_inter_left as NEIGHBOUR inter-ness for its intra_inter ctx,
-            // so we must NOT clear them here — they are cleared after the SB below.
-            i444_skip_above[col] = 0;
-            (*i444_skip_left) = 0;
-            i444_newmv_above[col] = 0;
-            (*i444_newmv_left) = 0;
-            i444_mv_above[col] = None;
-            (*i444_mv_left) = None;
-            i444_intra_this_sb = true;
+            false
+        });
+        if inter_committed {
+            return;
         }
         // Fast-path SB chroma context at the SB-origin mi (col*16, row*16).
         let (fmr, fmc) = (row * 16, col * 16);
@@ -4808,7 +4831,7 @@ impl Av2Encoder {
         // core instead derives the decision from its own reconstruction.
         cdef_pre: Option<&crate::av2::cdef_est::CdefDecision>,
         // Staged-threading decision record. `Off` = search+emit inline (today's
-        // behaviour); `Capture` also logs each SB winner; `Replay` reuses logged
+        // behavior); `Capture` also logs each SB winner; `Replay` reuses logged
         // winners (re-searching only not-yet-converted `Fallback` SBs).
         mut decide_mode: crate::av2::replay::DecideMode<'_>,
     ) -> RangeEncoder {
@@ -5058,18 +5081,14 @@ impl Av2Encoder {
             let base_q = self.base_q_idx as i32;
             let uv_delta = self.tune.uv_ac_delta_q;
             let nthreads = Self::resolve_threads(self.threads);
-            let wy = crate::av2::helpers::PlaneWriter::new(&mut recy, pw);
-            let wu = crate::av2::helpers::PlaneWriter::new(&mut recu, pw);
-            let wv = crate::av2::helpers::PlaneWriter::new(&mut recv, pw);
+            let wy = helpers::PlaneWriter::new(&mut recy, pw);
+            let wu = helpers::PlaneWriter::new(&mut recu, pw);
+            let wv = helpers::PlaneWriter::new(&mut recv, pw);
             // Persistent-pool WPP wavefront: workers spawn once and loop over the
             // diagonals with a barrier between each, so each worker's thread_local
             // recon scratch is allocated once (not re-allocated per diagonal).
-            let slots: Vec<Option<WfSlot>> = crate::av2::helpers::par_wavefront_pool(
-                nthreads,
-                sb_rows,
-                sb_cols,
-                true,
-                |r, c| {
+            let slots: Vec<Option<WfSlot>> =
+                helpers::par_wavefront_pool(nthreads, sb_rows, sb_cols, true, |r, c| {
                     let sb_y = r * 64;
                     let sb_x = c * 64;
 
@@ -5233,8 +5252,7 @@ impl Av2Encoder {
                             db_tx_c,
                         }
                     })
-                },
-            );
+                });
             // Merge per-SB records in raster order → the Capture record (the serial
             // Replay consumes the exact sequence a serial Capture would have logged).
             if let replay::DecideMode::Capture(rec) = &mut decide_mode {

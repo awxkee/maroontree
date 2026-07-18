@@ -174,10 +174,12 @@ fn frame_header_lossless_impl(
     // (reduced_still_picture_header => frame_type=KEY_FRAME, show_frame=1,
     //  error_resilient_mode=1, frame_size_override=0, etc., none coded)
     w.flag(true); // disable_cdf_update = 1 (encoder is non-adaptive; decoder must not adapt)
-    w.flag(false); // allow_screen_content_tools (seq force = SELECT)
-    // (allow_screen_content_tools=0 => no force_integer_mv; FrameIsIntra)
+    // The lossless tile writer evaluates AV1 palette mode for every eligible
+    // block, so screen-content tools must be enabled even when no block wins.
+    w.flag(true); // allow_screen_content_tools (seq force = SELECT)
+    w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    // (allow_intrabc not coded since screen content tools off)
+    w.flag(false); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     for &b in cols_incr {
         w.flag(b);
@@ -387,8 +389,10 @@ fn frame_header_lossy_impl(
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
     w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive image path, 1 = static isolated APIs)
-    w.flag(false); // allow_screen_content_tools
+    w.flag(true); // allow_screen_content_tools (lossy luma palette enabled)
+    w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
+    w.flag(false); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     // increment_tile_cols_log2 / increment_tile_rows_log2: walk from the
     // decoder's derived minimum up to the chosen TileColsLog2 / TileRowsLog2.
@@ -465,7 +469,11 @@ fn frame_header_lossy_impl(
     let num_planes = if mono { 1 } else { 3 };
     write_lr_params(&mut w, lr, num_planes);
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
-    w.flag(false); // tx_mode_select = 0 => TX_MODE_LARGEST
+    // TX_MODE_SELECT: every intra luma block > BLOCK_4X4 codes a `tx_depth`
+    // symbol (see `code_tx_depth`), enabling per-block transform splitting —
+    // the tool that prevents gradient banding in large blocks (a 32x32 block
+    // can carry a smooth ramp in its sub-TX DCs instead of one flat band).
+    w.flag(true); // tx_mode_select = 1 => TX_MODE_SELECT
     // FrameIsIntra => reference/skip-mode/global-motion skipped
     w.flag(false); // reduced_tx_set = 0
     // film_grain_params_present = 0 (seq) => none
@@ -494,6 +502,7 @@ pub(crate) fn sequence_header_cicp(
     profile: u32,
     bit_depth: u8,
     color: Option<&crate::color::Cicp>,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     seq_header_ss(
@@ -504,6 +513,7 @@ pub(crate) fn sequence_header_cicp(
         color,
         0,
         0,
+        enable_filter_intra,
         enable_intra_edge_filter,
     )
 }
@@ -519,6 +529,7 @@ pub(crate) fn sequence_header_cicp_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     seq_header_ss(
@@ -529,6 +540,7 @@ pub(crate) fn sequence_header_cicp_ss(
         color,
         ss_x,
         ss_y,
+        enable_filter_intra,
         enable_intra_edge_filter,
     )
 }
@@ -544,6 +556,7 @@ pub(crate) fn sequence_header_mono(
     height: u32,
     bit_depth: u8,
     full_range: bool,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     let profile: u32 = if bit_depth == 12 { 2 } else { 0 };
@@ -561,7 +574,7 @@ pub(crate) fn sequence_header_mono(
     w.f(height - 1, hbits); // max_frame_height_minus_1
 
     w.flag(false); // use_128x128_superblock
-    w.flag(false); // enable_filter_intra
+    w.flag(enable_filter_intra);
     w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)
@@ -604,6 +617,7 @@ fn seq_header_ss(
     color: Option<&crate::color::Cicp>,
     ss_x: u32,
     ss_y: u32,
+    enable_filter_intra: bool,
     enable_intra_edge_filter: bool,
 ) -> Vec<u8> {
     use crate::color::MatrixCoefficients;
@@ -622,7 +636,7 @@ fn seq_header_ss(
     w.f(height - 1, hbits); // max_frame_height_minus_1
 
     w.flag(false); // use_128x128_superblock
-    w.flag(false); // enable_filter_intra
+    w.flag(enable_filter_intra);
     w.flag(enable_intra_edge_filter);
     w.flag(false); // enable_superres
     w.flag(true); // enable_cdef = 1 (CDEF in-loop filter)

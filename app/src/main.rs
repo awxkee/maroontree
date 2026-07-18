@@ -30,7 +30,7 @@ mod y4m2ivf;
 
 use maroontree::{
     Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, encode_rgb10,
+    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
 };
 use std::hint::black_box;
 use std::io::Write;
@@ -56,35 +56,35 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/biddhabrot3_small.png")
+    let img = image::open("./assets/Screenshot 2026-07-18 at 16.09.09.png")
         .unwrap()
         .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
-        BitDepth::Ten,
-        &img.iter().map(|&x| (x as u16) << 2).collect::<Vec<u16>>(),
+        BitDepth::Eight,
+        &img,
     )
     .unwrap();
     for _i in 0..15 {
         let instant = Instant::now();
-        let out = encode_rgb10(
+        let out = encode_lossless(
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(67)
-                .with_cicp(Cicp::srgb_ycbcr())
+                .with_cicp(Cicp::identity_rgb())
                 .with_chroma(ChromaFormat::Yuv444)
-                .with_speed(Speed::Slow)
+                .with_speed(Speed::Fast)
                 .with_threads(12)
                 .with_variance_boost(true),
             // .with_cdef(true)
             // .with_wiener(true),
         )
         .unwrap();
-        println!("encoding time {:?}", instant.elapsed());
+        println!("AV1 encoding time {:?}", instant.elapsed());
         std::fs::write("./out.avif", out).unwrap();
     }
-    let img = image::open("./assets/dst_000.png")
+    let img = image::open("./assets/manhattan.png")
         .unwrap()
         // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
@@ -95,7 +95,7 @@ fn main() {
         &img,
     )
     .unwrap();
-    let av2_encoder = Av2Encoder::with_bit_depth(0, 8)
+    let av2_encoder = Av2Encoder::with_bit_depth(av2_map_quality(60), 8)
         .with_tiles(8, 8)
         .with_txpart(TxPart::ThreeWay)
         .with_rdoq_lambda(0.09)
@@ -114,9 +114,9 @@ fn main() {
     for _i in 0..10 {
         let instant = Instant::now();
         let _encoded = av2_encoder
-            .encode_image_444(black_box(&pimg), &Cicp::srgb_ycbcr())
+            .encode_image_420(black_box(&pimg), &Cicp::srgb_ycbcr())
             .unwrap();
-        println!("Av2 Encoded in {}ms", instant.elapsed().as_millis());
+        println!("AV2 Encoded in {}ms", instant.elapsed().as_millis());
     }
     // let out_obu = encoded.view();
     // let path = std::env::args()

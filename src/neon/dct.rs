@@ -459,9 +459,6 @@ fn mul_q16_vec(data: int32x4_t, coeff: int32x4_t) -> int32x4_t {
     )
 }
 
-/// Scalar quantize a flat coefficient array in place: `level[i] = mul_q16(coeff[i], q)`,
-/// with `q = dc_q` at index 0 (DC) and `ac_q` elsewhere. Mirrors the scalar
-/// quantizer exactly so the NEON in-place result matches `dct*_scalar`.
 #[inline]
 fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut [i32; N]) {
     // Round-to-nearest (magnitude-symmetric) so the quant error is zero-mean,
@@ -470,7 +467,7 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
     let mq = |a: i32, b: i32| {
         let prod = (a as i64) * (b as i64);
         let mag = prod.unsigned_abs();
-        if mag < 65536 {
+        if mag < 32768 {
             return 0;
         }
         let lvl = ((mag + 32768) >> 16) as i32;
@@ -487,7 +484,7 @@ fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut
 fn quant_q16_half_i64(prod: int64x2_t) -> int32x2_t {
     let zero64 = vdupq_n_s64(0);
     let mag = vabsq_s64(prod);
-    let active = vcgtq_s64(mag, vdupq_n_s64(65535));
+    let active = vcgtq_s64(mag, vdupq_n_s64(32767));
     let lvl = vshrq_n_s64::<16>(vaddq_s64(mag, vdupq_n_s64(32768)));
     let neg = vnegq_s64(lvl);
     let signed = vbslq_s64(vcltq_s64(prod, zero64), neg, lvl);
@@ -561,34 +558,6 @@ pub(crate) fn dct8x8_neon_quant_t(
         );
     }
     unsafe { (cf.assume_init(), tf.assume_init()) }
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    // Stage 1: vertical DCT-16 in four-column groups. Store a real transposed
-    // scratch: tmp[x * 16 + vertical_frequency].
-    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
-    for x in (0..16usize).step_by(4) {
-        let mut cols = load_n_i32x4::<16>(&input[x..], 16);
-        dct1d_16_v4_i32(&mut cols);
-        store_transposed_cols_i32x4::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
-    }
-    let tmp = unsafe { tmp_u.assume_init() };
-
-    // Stage 2: horizontal DCT-16 in four vertical-frequency lanes.
-    let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for y in (0..16usize).step_by(4) {
-        let mut rows: [I32x4; 16] =
-            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 16 + y) }));
-        dct1d_16_v4_i32(&mut rows);
-        for u in 0..16usize {
-            let n = rows[u].shr::<1>();
-            unsafe {
-                store_i32x4((out.as_mut_ptr() as *mut i32).add(u * 16 + y), n);
-            }
-        }
-    }
-    unsafe { out.assume_init() }
 }
 
 #[inline]
@@ -710,12 +679,6 @@ pub(crate) fn dct16x16_neon_quant_t(
         }
     }
     unsafe { (cf.assume_init(), tf.assume_init()) }
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
-    let coeffs = dct16x16_neon_coeffs(input);
-    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 #[target_feature(enable = "neon")]
@@ -1027,8 +990,8 @@ pub(crate) fn dct32x16_neon_quant_t(
 
 #[cfg(test)]
 mod neon_vs_scalar {
-    use crate::dct::{dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
-    use crate::neon::{dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
+    use crate::dct::{dct8x16_i32_scalar, dct32x32_scalar};
+    use crate::neon::{dct8x16_neon_i32, dct32x32_neon_i32};
 
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
@@ -1066,62 +1029,6 @@ mod neon_vs_scalar {
         (65536, 46341), // DC full-scale, AC √2/2
         (32768, 32768), // both halved
     ];
-
-    fn run_16x16(input: [i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [i32; 256]) {
-        let mut scalar = input;
-        dct16x16_scalar(&mut scalar, dc_q, ac_q);
-        let mut neon = input;
-        unsafe { dct16x16_neon_i32(&mut neon, dc_q, ac_q) };
-        (scalar, neon)
-    }
-
-    #[test]
-    fn test_16x16_zeros() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16([0i32; 256], dc_q, ac_q);
-            assert_eq!(s, n, "16x16 zeros dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_constant() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16([32i32; 256], dc_q, ac_q);
-            assert_eq!(s, n, "16x16 constant dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_ramp() {
-        let mut input = [0i32; 256];
-        fill_ramp(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 ramp dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_alternating() {
-        let mut input = [0i32; 256];
-        fill_alt(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 alternating dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_random_seed1() {
-        let mut input = [0i32; 256];
-        fill_lcg(&mut input, 0x1234_5678);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 rand(12345678) dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    // ── dct32x32 ──────────────────────────────────────────────────────────
 
     fn run_32x32(input: [i32; 1024], dc_q: i32, ac_q: i32) -> ([i32; 1024], [i32; 1024]) {
         let mut scalar = input;

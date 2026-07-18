@@ -78,7 +78,7 @@ pub(crate) fn encode_av1(
 
     Ok(match (effective_depth, gray, alpha) {
         (Depth::D8, true, _) => encode_gray8(
-            &PlanarImage::from_interleaved_rgb(
+            &PlanarImage::from_luma(
                 img.width() as usize,
                 img.height() as usize,
                 BitDepth::Eight,

@@ -60,7 +60,7 @@ pub(crate) fn sb_activity(
     let n = (h * w) as f32;
     let mean = sum / n;
     let var = (sum2 / n - mean * mean).max(0.0);
-    (1.0 + var).ln()
+    dirty_log1pf(var)
 }
 
 fn sb_subblock_variances(
@@ -74,15 +74,14 @@ fn sb_subblock_variances(
 ) -> usize {
     let mut filled = 0usize;
     let mut acc = 0f32;
-    for by in 0..8 {
-        for bx in 0..8 {
+    for (by, row) in out.as_chunks_mut::<8>().0.iter_mut().take(8).enumerate() {
+        for (bx, out) in row.iter_mut().enumerate() {
             let y0 = sb_y + by * 8;
             let x0 = sb_x + bx * 8;
             let h = height.saturating_sub(y0).min(8);
             let w = width.saturating_sub(x0).min(8);
-            let idx = by * 8 + bx;
             if h == 0 || w == 0 {
-                out[idx] = f32::NAN; // mark out-of-frame, patched below
+                *out = f32::NAN; // mark out-of-frame, patched below
                 continue;
             }
             let mut sum = 0f32;
@@ -96,7 +95,7 @@ fn sb_subblock_variances(
             let n = (h * w) as f32;
             let mean = sum / n;
             let var = (sum2 / n - mean * mean).max(0.0);
-            out[idx] = var;
+            *out = var;
             acc += var;
             filled += 1;
         }
@@ -178,6 +177,7 @@ pub(crate) struct AqCell {
 // The dark-structured-detail protection config lives in the shared AQ module (used by
 // both the AV1 and AV2 paths); re-exported here so `av2::DarkAq` (public API) resolves.
 pub use crate::aq_common::DarkAq;
+use crate::aq_common::dirty_log1pf;
 
 pub(crate) struct AqState {
     present: bool,

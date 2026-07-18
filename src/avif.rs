@@ -54,6 +54,7 @@
 //! let avif = encode_yuv8(&y, &cb, &cr, width, height, &cfg)?;
 //! // cb/cr must be ceil(w/2)×ceil(h/2) samples when cfg.chroma == Yuv420
 //! ```
+
 use crate::color::Cicp;
 use crate::encoder::{
     encode_lossy_gray_obu, encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422,
@@ -62,6 +63,7 @@ use crate::encoder::{
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
 use crate::{BitDepth, PlanarImage, encode_lossless_gray_obu, isobmff};
+use std::num::NonZeroUsize;
 
 const MIN_DIM: u32 = 1;
 /// Maximum dimension. AV1 level 6.3 handles frames up to 35 651 584 luma
@@ -74,25 +76,18 @@ const MAX_DIM: u32 = 16_383;
 /// expected by the `encode_yuv*` entry points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ChromaFormat {
-    /// 4:2:0 — chroma halved both horizontally and vertically (AV1 profile 0).
-    /// Standard for photo and internet-video delivery; best compression per bit.
+    /// 4:2:0 — chroma halved both horizontally and vertically
     #[default]
     Yuv420,
-    /// 4:2:2 — chroma halved horizontally only (AV1 profile 2).
+    /// 4:2:2 — chroma halved horizontally only
     Yuv422,
-    /// 4:4:4 — full-resolution chroma (AV1 profile 1 for ≤10-bit; 2 for 12-bit).
-    /// Best color fidelity; preferred for graphics, HDR, and lossless content.
+    /// 4:4:4 — full-resolution chroma
     Yuv444,
-    /// 4:0:0 — luma only; monochrome (AV1 profile 0). Used by the `gray*` entry
-    /// points and automatically selected for the alpha auxiliary image.
+    /// 4:0:0 — luma only; monochrome
     Monochrome,
 }
 
-/// Rate-distortion effort for the encoder's mode search.
-///
-/// Higher effort spends more time per block searching for the smallest stream at
-/// a given quality; faster effort trades a little compression for speed using
-/// libaom-style shortcuts. Currently honoured only by the AV1 lossy path.
+/// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
     /// Exhaustive rate-distortion
@@ -208,7 +203,9 @@ impl Default for EncodeConfig {
             color_encoding: Some(Cicp::srgb_ycbcr()),
             icc: None,
             metadata: Metadata::default(),
-            threads: 1,
+            threads: std::thread::available_parallelism()
+                .unwrap_or(NonZeroUsize::new(1).unwrap())
+                .get(),
             speed: Speed::Slow,
             adaptive_quant: true,
             variance_boost: true,
@@ -239,6 +236,11 @@ impl EncodeConfig {
 
     pub fn with_cicp(mut self, color: Cicp) -> Self {
         self.color_encoding = Some(color);
+        self
+    }
+
+    pub fn without_cicp(mut self) -> Self {
+        self.color_encoding = None;
         self
     }
 

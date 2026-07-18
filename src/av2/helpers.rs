@@ -1620,6 +1620,34 @@ where
     T: Send,
     F: Fn(usize, usize) -> T + Sync,
 {
+    par_wavefront_pool_with(
+        nthreads,
+        rows,
+        cols,
+        needs_above_right,
+        || (),
+        |_, r, c| f(r, c),
+    )
+}
+
+/// [`par_wavefront_pool`] with PER-WORKER STATE: `mk` runs once on each worker
+/// thread (and once for the serial path) to build the worker's private scratch
+/// (e.g. a full encoder tile with its recon planes), and `f` receives it
+/// mutably for every cell that worker executes. Scheduling, barriers and the
+/// disjoint-slot result writes are identical to [`par_wavefront_pool`].
+pub(crate) fn par_wavefront_pool_with<S, T, M, F>(
+    nthreads: usize,
+    rows: usize,
+    cols: usize,
+    needs_above_right: bool,
+    mk: M,
+    f: F,
+) -> Vec<Option<T>>
+where
+    T: Send,
+    M: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, usize) -> T + Sync,
+{
     let n = rows * cols;
     let mut results: Vec<Option<T>> = (0..n).map(|_| None).collect();
     if rows == 0 || cols == 0 {
@@ -1646,9 +1674,10 @@ where
         }
     }
     if nthreads <= 1 {
+        let mut s = mk();
         for cells in &diagonals {
             for &(r, c) in cells {
-                results[r * cols + c] = Some(f(r, c));
+                results[r * cols + c] = Some(f(&mut s, r, c));
             }
         }
         return results;
@@ -1663,39 +1692,93 @@ where
     unsafe impl<T: Send> Sync for ResultsPtr<T> {}
     let base = ResultsPtr(results.as_mut_ptr());
 
-    // Per-diagonal work counter (no reset needed: each diagonal has its own).
-    let counters: Vec<std::sync::atomic::AtomicUsize> = diagonals
-        .iter()
-        .map(|_| std::sync::atomic::AtomicUsize::new(0))
-        .collect();
-    let barrier = std::sync::Barrier::new(nthreads);
-
     let f = &f;
-    let diagonals = &diagonals;
-    let counters = &counters;
-    let barrier = &barrier;
     let base = &base;
-    let worker = || {
-        for (d, cells) in diagonals.iter().enumerate() {
-            loop {
-                let i = counters[d].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= cells.len() {
-                    break;
-                }
-                let (r, c) = cells[i];
-                let v = f(r, c);
-                // SAFETY: slot (r*cols+c) is written by exactly one worker; no
-                // other worker aliases it.
-                unsafe { base.0.add(r * cols + c).write(Some(v)) };
+    let mk = &mk;
+
+    // Dependency-ready scheduler.  The previous implementation put a global
+    // barrier after every d=2r+c diagonal.  That ordering was safe but much
+    // stronger than the codec requires: a cell on the next diagonal can start
+    // as soon as its own left, above and (when requested) above-right cells are
+    // complete.  On a 26x17-SB image, eight workers needed at least 84 barrier
+    // quanta for 442 cells instead of the ideal 56, before counting the serial
+    // replay tail.  Track the exact DAG instead so independent rows pipeline
+    // immediately.
+    struct Ready {
+        queue: std::collections::VecDeque<usize>,
+        deps: Vec<u8>,
+        remaining: usize,
+    }
+    let mut deps = vec![0u8; n];
+    let mut queue = std::collections::VecDeque::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let i = r * cols + c;
+            deps[i] =
+                (c > 0) as u8 + (r > 0) as u8 + (needs_above_right && r > 0 && c + 1 < cols) as u8;
+            if deps[i] == 0 {
+                queue.push_back(i);
             }
-            // Barrier: diagonal `d` fully done (and its recon writes visible)
-            // before any worker starts `d+1`. All `nthreads` threads participate.
-            barrier.wait();
+        }
+    }
+    let ready = std::sync::Mutex::new(Ready {
+        queue,
+        deps,
+        remaining: n,
+    });
+    let wake = std::sync::Condvar::new();
+    let ready = &ready;
+    let wake = &wake;
+    let worker = || {
+        let mut s = mk();
+        loop {
+            let cell = {
+                let mut state = ready.lock().expect("wavefront queue poisoned");
+                loop {
+                    if let Some(i) = state.queue.pop_front() {
+                        break Some(i);
+                    }
+                    if state.remaining == 0 {
+                        break None;
+                    }
+                    state = wake.wait(state).expect("wavefront queue poisoned");
+                }
+            };
+            let Some(i) = cell else { return };
+            let (r, c) = (i / cols, i % cols);
+            let v = f(&mut s, r, c);
+            // SAFETY: slot i is claimed by exactly one worker and is published
+            // before any dependent cell is placed on the ready queue.
+            unsafe { base.0.add(i).write(Some(v)) };
+
+            let mut state = ready.lock().expect("wavefront queue poisoned");
+            state.remaining -= 1;
+            let mut release = |j: usize| {
+                debug_assert!(state.deps[j] > 0);
+                state.deps[j] -= 1;
+                if state.deps[j] == 0 {
+                    state.queue.push_back(j);
+                }
+            };
+            // Exact reverse edges of the dependency set above.
+            if c + 1 < cols {
+                release(i + 1); // right consumes this cell as its left edge
+            }
+            if r + 1 < rows {
+                release(i + cols); // below consumes this cell as its above edge
+                if needs_above_right && c > 0 {
+                    release(i + cols - 1); // below-left consumes above-right
+                }
+            }
+            if state.remaining == 0 || !state.queue.is_empty() {
+                wake.notify_all();
+            }
         }
     };
     std::thread::scope(|scope| {
         // Main thread is one of the `nthreads` workers (mirrors par_map_indexed).
-        for _ in 0..nthreads - 1 {
+        let workers = nthreads.min(n);
+        for _ in 0..workers - 1 {
             scope.spawn(worker);
         }
         worker();
@@ -1713,20 +1796,20 @@ where
 /// Not yet wired into a core (integration also needs the `DecideOnly` mode + the
 /// per-SB decouple); shipped now as the tested companion to [`par_wavefront`].
 #[allow(dead_code)]
-pub(crate) struct PlaneWriter {
-    ptr: *mut f32,
+pub(crate) struct PlaneWriter<T: Copy> {
+    ptr: *mut T,
     len: usize,
     stride: usize,
 }
 
-// SAFETY: the pointer addresses a caller-owned `&mut [f32]` that outlives the
+// SAFETY: the pointer addresses a caller-owned `&mut [T]` that outlives the
 // writer; concurrent use is sound only under the disjoint-block contract above.
-unsafe impl Send for PlaneWriter {}
-unsafe impl Sync for PlaneWriter {}
+unsafe impl<T: Copy + Send> Send for PlaneWriter<T> {}
+unsafe impl<T: Copy + Send + Sync> Sync for PlaneWriter<T> {}
 
 #[allow(dead_code)]
-impl PlaneWriter {
-    pub(crate) fn new(plane: &mut [f32], stride: usize) -> Self {
+impl<T: Copy> PlaneWriter<T> {
+    pub(crate) fn new(plane: &mut [T], stride: usize) -> Self {
         Self {
             ptr: plane.as_mut_ptr(),
             len: plane.len(),
@@ -1739,7 +1822,7 @@ impl PlaneWriter {
     /// # Safety
     /// No other thread may access this `h × w` region concurrently. The region
     /// must lie within the plane.
-    pub(crate) unsafe fn write_block(&self, y: usize, x: usize, h: usize, w: usize, src: &[f32]) {
+    pub(crate) unsafe fn write_block(&self, y: usize, x: usize, h: usize, w: usize, src: &[T]) {
         debug_assert!((y + h - 1) * self.stride + x + w <= self.len);
         for r in 0..h {
             let off = (y + r) * self.stride + x;
@@ -1759,7 +1842,7 @@ impl PlaneWriter {
     /// The region must lie within the plane and `dst.len() == self.len`.
     pub(crate) unsafe fn copy_region_to(
         &self,
-        dst: &mut [f32],
+        dst: &mut [T],
         y: usize,
         x: usize,
         h: usize,

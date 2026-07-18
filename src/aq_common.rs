@@ -58,8 +58,55 @@ pub(crate) fn sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
     subvars[idx]
 }
 
+#[inline(always)]
+pub(crate) fn f_fmlaf(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "fma"
+        ),
+        target_arch = "aarch64"
+    ))]
+    {
+        f32::mul_add(a, b, c)
+    }
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "fma"
+        ),
+        target_arch = "aarch64"
+    )))]
+    {
+        a * b + c
+    }
+}
+
+#[inline]
+pub(crate) fn dirty_log1pf(d: f32) -> f32 {
+    let ix = (1.0 + d).to_bits();
+    let exponent = ix & 0x7f80_0000;
+    let n = (exponent >> 23) as i32 - 0x7f;
+
+    // Replacing the exponent with 127 normalizes 1+d to 1+t without division.
+    // For n=0 use d itself so tiny inputs do not lose precision in (1+d)-1.
+    let mantissa = f32::from_bits((ix & 0x007f_ffff) | 0x3f80_0000);
+    let t = if n == 0 { d } else { mantissa - 1.0 };
+
+    // Direct minimax ln(1+t) ~= t*P(t), t in [0, 1]. See tools/log1p.sollya.
+    let mut p = 0.014539075084030628;
+    p = f_fmlaf(p, t, -0.0675969123840332);
+    p = f_fmlaf(p, t, 0.15056970715522766);
+    p = f_fmlaf(p, t, -0.23573730885982513);
+    p = f_fmlaf(p, t, 0.33125850558280945);
+    p = f_fmlaf(p, t, -0.4998837411403656);
+    p = f_fmlaf(p, t, 0.999998927116394);
+    f_fmlaf(n as f32, std::f32::consts::LN_2, t * p)
+}
+
 /// Variance Boost qindex delta for one superblock. `picked_var` is the octile pick
 /// (see [`sb_octile_variance`]); `ref_log` is the tile mean log-variance.
+#[inline(never)]
 pub(crate) fn variance_boost_delta(
     picked_var: f32,
     ref_log: f32,
@@ -68,7 +115,7 @@ pub(crate) fn variance_boost_delta(
 ) -> i32 {
     // Work in log-variance: compresses the huge dynamic range of variance and matches
     // the reference (which is a mean of log-variances).
-    let v_log = (1.0 + picked_var).ln();
+    let v_log = dirty_log1pf(picked_var);
     // Low-variance threshold (curve 0): ln(1 + 256).
     const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
     const MAX_BOOST: f32 = 18.0; // max qindex *reduction* for the flattest SBs
@@ -141,6 +188,52 @@ impl DarkAq {
     }
 }
 
+#[inline]
+fn laplacian_abs_sum<const STRIDE: usize>(buf: &[[f32; STRIDE]], h: usize, w: usize) -> (f32, u32) {
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for rows in buf[..h].array_windows::<3>() {
+        let [top, middle, bottom] = rows;
+        for ((&up, &down), &[left, center, right]) in top[1..w - 1]
+            .iter()
+            .zip(bottom[1..w - 1].iter())
+            .zip(middle[..w].array_windows::<3>())
+        {
+            let l = 4.0 * center - up - down - left - right;
+            sum += l.abs();
+            n += 1;
+        }
+    }
+    (sum, n)
+}
+
+#[inline]
+fn box_downsample_2x<const SRC_STRIDE: usize, const DST_STRIDE: usize>(
+    src: &[[f32; SRC_STRIDE]],
+    h: usize,
+    w: usize,
+    dst: &mut [[f32; DST_STRIDE]],
+) -> (usize, usize) {
+    let (hh, ww) = (h / 2, w / 2);
+    for (dst_row, rows) in dst[..hh]
+        .iter_mut()
+        .zip(src[..h].array_windows::<2>().step_by(2))
+    {
+        let [top, bottom] = rows;
+        for (out, (&[top_left, top_right], &[bottom_left, bottom_right])) in
+            dst_row[..ww].iter_mut().zip(
+                top[..w]
+                    .array_windows::<2>()
+                    .step_by(2)
+                    .zip(bottom[..w].array_windows::<2>().step_by(2)),
+            )
+        {
+            *out = 0.25 * (top_left + top_right + bottom_left + bottom_right);
+        }
+    }
+    (hh, ww)
+}
+
 pub(crate) fn dark_structure_stats<T: AqLuma>(
     yp: &[T],
     pw: usize,
@@ -159,9 +252,9 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
     let mut sum = 0f32;
     for (r, row) in buf.iter_mut().enumerate().take(h) {
         let base = (sb_y + r) * pw + sb_x;
-        for c in 0..w {
-            let v = yp[base + c].to_f32() * scale;
-            row[c] = v;
+        for (yp, dst) in yp[base..base + w].iter().zip(row.iter_mut()) {
+            let v = yp.to_f32() * scale;
+            *dst = v;
             sum += v;
         }
     }
@@ -170,15 +263,7 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
         return (mean, 0.0);
     }
     // Full-resolution |Laplacian| (interior 3×3).
-    let mut lap_full = 0f32;
-    let mut nf = 0u32;
-    for r in 1..h - 1 {
-        for c in 1..w - 1 {
-            let l = 4.0 * buf[r][c] - buf[r - 1][c] - buf[r + 1][c] - buf[r][c - 1] - buf[r][c + 1];
-            lap_full += l.abs();
-            nf += 1;
-        }
-    }
+    let (lap_full, nf) = laplacian_abs_sum(&buf, h, w);
     let lap_full = lap_full / nf as f32;
     // 2× box downsample, then |Laplacian| at the coarse scale.
     let (hh, ww) = (h / 2, w / 2);
@@ -186,28 +271,11 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
         return (mean, 0.0);
     }
     let mut half = [[0f32; 32]; 32];
-    for r in 0..hh {
-        for c in 0..ww {
-            half[r][c] = 0.25
-                * (buf[2 * r][2 * c]
-                    + buf[2 * r][2 * c + 1]
-                    + buf[2 * r + 1][2 * c]
-                    + buf[2 * r + 1][2 * c + 1]);
-        }
+    let (hh, ww) = box_downsample_2x(&buf, h, w, &mut half);
+    if hh < 3 || ww < 3 {
+        return (mean, 0.0);
     }
-    let mut lap_half = 0f32;
-    let mut nh = 0u32;
-    for r in 1..hh - 1 {
-        for c in 1..ww - 1 {
-            let l = 4.0 * half[r][c]
-                - half[r - 1][c]
-                - half[r + 1][c]
-                - half[r][c - 1]
-                - half[r][c + 1];
-            lap_half += l.abs();
-            nh += 1;
-        }
-    }
+    let (lap_half, nh) = laplacian_abs_sum(&half, hh, ww);
     let lap_half = lap_half / nh as f32;
     (mean, (lap_full * lap_half).sqrt())
 }
@@ -245,7 +313,7 @@ pub(crate) fn dark_protection<T: AqLuma>(
     if darkness <= 0.0 {
         return 0;
     }
-    let dark_structure = (mid_energy * darkness).ln_1p();
+    let dark_structure = dirty_log1pf(mid_energy * darkness);
     (dark_structure * d.scale)
         .min(d.max_qidx as f32)
         .max(0.0)

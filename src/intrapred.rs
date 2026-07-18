@@ -57,12 +57,107 @@ pub(crate) const D203_PRED: usize = 7;
 /// `txtp_from_uvmode`, so it defaults to `DCT_DCT` — i.e. CfL needs no ADST.
 pub(crate) const CFL_PRED: usize = 13;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterIntraMode {
+    Dc = 0,
+    Vertical = 1,
+    Horizontal = 2,
+    D157 = 3,
+    Paeth = 4,
+}
+
+pub(crate) static FILTER_INTRA_MODES: [FilterIntraMode; 5] = [
+    FilterIntraMode::Dc,
+    FilterIntraMode::Vertical,
+    FilterIntraMode::Horizontal,
+    FilterIntraMode::D157,
+    FilterIntraMode::Paeth,
+];
+
 const EDGE_ORIGIN: usize = 2;
 const EDGE_CAPACITY: usize = 132;
 
 #[derive(Clone)]
 struct IntraEdge {
     samples: [i32; EDGE_CAPACITY],
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_intra_predict(
+    mode: FilterIntraMode,
+    recon: &[i32],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    width: usize,
+    height: usize,
+    out: &mut [i32],
+    bit_depth: u8,
+) {
+    debug_assert_eq!(width & 3, 0);
+    debug_assert_eq!(height & 1, 0);
+    debug_assert!(width <= 32 && height <= 32);
+    debug_assert_eq!(out.len(), width * height);
+
+    let base = 1i32 << (bit_depth - 1);
+    let have_top = oy > 0;
+    let have_left = ox > 0;
+    let corner = match (have_top, have_left) {
+        (true, true) => recon[(oy - 1) * stride + ox - 1],
+        (true, false) => recon[(oy - 1) * stride + ox],
+        (false, true) => recon[oy * stride + ox - 1],
+        (false, false) => base,
+    };
+    let mut buf = [[0i32; 33]; 33];
+    buf[0][0] = corner;
+    for x in 0..width {
+        buf[0][x + 1] = if have_top {
+            recon[(oy - 1) * stride + ox + x]
+        } else if have_left {
+            recon[oy * stride + ox - 1]
+        } else {
+            base - 1
+        };
+    }
+    for y in 0..height {
+        buf[y + 1][0] = if have_left {
+            recon[(oy + y) * stride + ox - 1]
+        } else if have_top {
+            recon[(oy - 1) * stride + ox]
+        } else {
+            base + 1
+        };
+    }
+
+    let taps = &crate::tables::INTRA_FILTER_TAPS[mode as usize];
+    let max_sample = (1 << bit_depth) - 1;
+    for r in (1..=height).step_by(2) {
+        for c in (1..=width).step_by(4) {
+            let p = [
+                buf[r - 1][c - 1],
+                buf[r - 1][c],
+                buf[r - 1][c + 1],
+                buf[r - 1][c + 2],
+                buf[r - 1][c + 3],
+                buf[r][c - 1],
+                buf[r + 1][c - 1],
+            ];
+            for (k, filter) in taps.iter().enumerate() {
+                let sum = filter
+                    .iter()
+                    .zip(p)
+                    .map(|(&tap, sample)| tap as i32 * sample)
+                    .sum::<i32>();
+                let value =
+                    ((sum + 8) >> crate::tables::INTRA_FILTER_SCALE_BITS).clamp(0, max_sample);
+                buf[r + (k >> 2)][c + (k & 3)] = value;
+            }
+        }
+    }
+    for y in 0..height {
+        out[y * width..(y + 1) * width].copy_from_slice(&buf[y + 1][1..width + 1]);
+    }
 }
 
 impl IntraEdge {
@@ -256,15 +351,6 @@ pub(crate) fn sm_weights(n: usize) -> &'static [i32] {
     }
 }
 
-/// Build the AV1 intra reference edges from the reconstructed plane and predict
-/// `mode` into `out` (row-major `bw*bh`). Bit-exact with dav1d's non-directional
-/// predictors (`ipred_{paeth,smooth,smooth_v,smooth_h}_c`) and the default-fill
-/// rules of `dav1d_prepare_intra_edges` (single-tile raster order: above/left
-/// availability = not at the frame's top/left edge). `recon`/`stride` is the
-/// reconstructed plane; `(ox, oy)` the block's pixel origin. DC is handled by
-/// the dedicated `dc_pred_*` helpers, not here.
-/// CfL luma-AC for 4:4:4: the reconstructed luma block scaled by 8 with its mean
-/// removed, exactly as dav1d's `cfl_ac` with `ss_hor = ss_ver = 0`.
 pub(crate) fn cfl_ac_444(luma_rec: &[i32], w: usize, h: usize, ac: &mut [i32]) {
     let n = w * h;
     for (ac, luma) in ac[..n].iter_mut().zip(luma_rec[..n].iter()) {
@@ -339,14 +425,14 @@ pub(crate) fn cfl_pred_pixel(dc: i32, ac: i32, alpha: i32, bd: u8) -> i32 {
 
 /// Energy-minimising CfL alpha for one plane, in dav1d alpha units (the predictor
 /// applies `alpha/64` after the <<3 AC scaling). Returns the best of the analytic
-/// optimum and its +/-1 neighbors by pre-quantisation residual energy, clamped to
+/// optimum and its +/-1 neighbors by pre-quantization residual energy, clamped to
 /// the signaled range [-16, 16] (0 means "CfL useless for this plane").
 pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8) -> i32 {
     let mut num: i64 = 0;
     let mut den: i64 = 0;
-    for i in 0..n {
-        num += (src[i] - dc) as i64 * ac[i] as i64;
-        den += ac[i] as i64 * ac[i] as i64;
+    for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
+        num += (src - dc) as i64 * ac as i64;
+        den += ac as i64 * ac as i64;
     }
     if den == 0 {
         return 0;
@@ -359,8 +445,8 @@ pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8)
             continue;
         }
         let mut e: i64 = 0;
-        for i in 0..n {
-            let d = (src[i] - cfl_pred_pixel(dc, ac[i], cand, bd)) as i64;
+        for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
+            let d = (src - cfl_pred_pixel(dc, ac, cand, bd)) as i64;
             e += d * d;
         }
         if e < best_e {
@@ -369,6 +455,18 @@ pub(crate) fn cfl_best_alpha(ac: &[i32], src: &[i32], dc: i32, n: usize, bd: u8)
         }
     }
     best_a
+}
+
+pub(crate) fn recon_add_pred(dst: &mut [i32], pred: &[i32], resid: &[i32], max: i32) {
+    for ((d, &p), &r) in dst.iter_mut().zip(pred).zip(resid) {
+        *d = (p + r).clamp(0, max);
+    }
+}
+
+pub(crate) fn recon_add_dc(dst: &mut [i32], dc: i32, resid: &[i32], max: i32) {
+    for (d, &r) in dst.iter_mut().zip(resid) {
+        *d = (dc + r).clamp(0, max);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,6 +780,52 @@ pub(crate) fn paeth_pred(
     }
 }
 
+/// AV1 palette predictor.
+///
+/// `indices` contains two palette indices per byte: the low nibble selects the
+/// even pixel and the high nibble selects the odd pixel.  AV1 palettes contain
+/// at most eight entries, so only the low three bits of either nibble are used.
+/// Index rows are tightly packed with a stride of `bw.div_ceil(2)`, while the
+/// destination may have a larger, caller-provided stride.
+pub(crate) fn palette_pred(
+    dst: &mut [i32],
+    dst_stride: usize,
+    palette: &[i32],
+    indices: &[u8],
+    bw: usize,
+    bh: usize,
+) {
+    assert!((2..=8).contains(&palette.len()));
+    assert!(dst_stride >= bw);
+
+    let index_stride = bw.div_ceil(2);
+    assert!(indices.len() >= index_stride * bh);
+    let dst_len = if bh == 0 {
+        0
+    } else {
+        (bh - 1) * dst_stride + bw
+    };
+    assert!(dst.len() >= dst_len);
+
+    for y in 0..bh {
+        let dst_row = &mut dst[y * dst_stride..y * dst_stride + bw];
+        let index_row = &indices[y * index_stride..(y + 1) * index_stride];
+        let (pairs, remainder) = dst_row.as_chunks_mut::<2>();
+        for (pair, &packed) in pairs.iter_mut().zip(index_row) {
+            let lo = (packed & 7) as usize;
+            let hi = ((packed >> 4) & 7) as usize;
+            assert!(lo < palette.len() && hi < palette.len());
+            pair[0] = palette[lo];
+            pair[1] = palette[hi];
+        }
+        if let Some(last) = remainder.first_mut() {
+            let index = (index_row[bw / 2] & 7) as usize;
+            assert!(index < palette.len());
+            *last = palette[index];
+        }
+    }
+}
+
 /// AV1 SMOOTH predictor (4-tap vertical+horizontal weighted blend), bit-exact to
 /// dav1d `ipred_smooth_c`. Dispatches to a NEON+MAC kernel on aarch64, scalar
 /// elsewhere. `top`/`left` hold the prepared edges; output is row-major `bw*bh`.
@@ -879,356 +1023,180 @@ pub(crate) fn nd_modes() -> &'static [usize] {
 /// (their wins over SMOOTH are rare and small). Mirrors libaom's intra-mode
 /// pruning at higher `--cpu-used`.
 pub(crate) fn fast_nd_modes() -> &'static [usize] {
-    const FAST: [usize; 3] = [DC_PRED, SMOOTH_PRED, PAETH_PRED];
+    static FAST: [usize; 3] = [DC_PRED, SMOOTH_PRED, PAETH_PRED];
     &FAST
 }
 
-/// 8x8 DC_PRED from a reconstructed plane (stride 64). `(ox, oy)` pixel origin.
+pub(crate) fn dc_pred(
+    recon: &[i32],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    w: usize,
+    h: usize,
+    bd: i32,
+) -> i32 {
+    let above_sum = || recon[(oy - 1) * stride + ox..][..w].iter().sum::<i32>();
+    let left_sum = || {
+        recon[oy * stride + ox - 1..]
+            .iter()
+            .step_by(stride)
+            .take(h)
+            .sum::<i32>()
+    };
+    match (oy > 0, ox > 0) {
+        (true, true) => {
+            let mut s = ((w + h) >> 1) as i32 + above_sum() + left_sum();
+            s >>= (w + h).trailing_zeros();
+            if w != h {
+                let mult: u32 = if w > 2 * h || h > 2 * w {
+                    0x3334
+                } else {
+                    0x5556
+                };
+                s = (((s as u32) * mult) >> 16) as i32;
+            }
+            s
+        }
+        (true, false) => ((w >> 1) as i32 + above_sum()) >> w.trailing_zeros(),
+        (false, true) => ((h >> 1) as i32 + left_sum()) >> h.trailing_zeros(),
+        (false, false) => 1 << (bd - 1),
+    }
+}
+
 pub(crate) fn dc_pred_8x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>()
-                + recon[oy * stride + ox - 1..]
-                    .iter()
-                    .step_by(stride)
-                    .take(8)
-                    .sum::<i32>();
-            (s + 8) >> 4
-        }
-        (true, false) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
-            (s + 4) >> 3
-        }
-        (false, true) => {
-            let mut s = 0i32;
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(8)
-                .sum::<i32>();
-            (s + 4) >> 3
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 8, 8, bd)
 }
 
-/// DC prediction for a 4x4 chroma block (dav1d `dc_gen`, 8-bit). w==h==4 is a
-/// power of two so no reciprocal multiply is needed.
 pub(crate) fn dc_pred_4x4(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 4i32; // (4+4)>>1
-            s += recon[(oy - 1) * stride + ox..][..4].iter().sum::<i32>()
-                + recon[oy * stride + ox - 1..]
-                    .iter()
-                    .step_by(stride)
-                    .take(4)
-                    .sum::<i32>();
-            s >> 3 // ctz(8)
-        }
-        (true, false) => {
-            let mut s = 2i32;
-            s += recon[(oy - 1) * stride + ox..][..4].iter().sum::<i32>();
-            s >> 2
-        }
-        (false, true) => {
-            let mut s = 2i32;
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(4)
-                .sum::<i32>();
-            s >> 2
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 4, 4, bd)
 }
 
-/// DC prediction for a 4-wide x 8-tall chroma block (dav1d `dc_gen`, 8-bit).
-/// w+h = 12 is not a power of two, so the both-edges case uses the reciprocal
-/// multiply (ctz(12)=2 shift, then *0x5556>>16 since 8 is not > 2*4).
-/// DC predictor for an 8-wide x 4-tall block (transpose of 4x8): 8 above + 4 left.
 pub(crate) fn dc_pred_8x4(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 6i32; // (8+4)>>1
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(4)
-                .sum::<i32>();
-            s >>= 2; // ctz(12)
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 4i32; // 8>>1
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
-            s >> 3
-        }
-        (false, true) => {
-            let mut s = 2i32; // 4>>1
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(4)
-                .sum::<i32>();
-            s >> 2
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 8, 4, bd)
 }
 
 pub(crate) fn dc_pred_4x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 6i32; // (4+8)>>1
-            s += recon[(oy - 1) * stride + ox..][..4].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(8)
-                .sum::<i32>();
-            s >>= 2; // ctz(4+8)
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 2i32; // 4>>1
-            s += recon[(oy - 1) * stride + ox..][..4].iter().sum::<i32>();
-            s >> 2 // ctz(4)
-        }
-        (false, true) => {
-            let mut s = 4i32; // 8>>1
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(8)
-                .sum::<i32>();
-            s >> 3 // ctz(8)
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 4, 8, bd)
 }
 
-/// DC predictor for an 8-wide x 16-tall chroma block (4:2:2 `RTX_8X16`). Mirrors
-/// dav1d/AV1 DC_PRED: average of the 8 above + 16 left reconstructed neighbors
-/// (w+h = 24 = 8*3, so `>>3` then the `*0x5556>>16` divide-by-3); single-edge
-/// and no-edge cases fall back to the available average or 128.
 pub(crate) fn dc_pred_8x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 12i32; // (8+16)>>1
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(16)
-                .sum::<i32>();
-            s >>= 3; // ctz(8+16) = ctz(24) = 3
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 4i32; // 8>>1
-            s += recon[(oy - 1) * stride + ox..][..8].iter().sum::<i32>();
-            s >> 3 // ctz(8)
-        }
-        (false, true) => {
-            let mut s = 8i32; // 16>>1
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(16)
-                .sum::<i32>();
-            s >> 4 // ctz(16)
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 8, 16, bd)
 }
 
-/// DC prediction for a 16x8 (wide) block: above 16 samples, left 8 samples.
 pub(crate) fn dc_pred_16x8(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 12i32; // (16+8)>>1
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(8)
-                .sum::<i32>();
-            s >>= 3; // ctz(16+8) = ctz(24) = 3
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 8i32; // 16>>1
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
-            s >> 4 // ctz(16)
-        }
-        (false, true) => {
-            let mut s = 4i32; // 8>>1
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(8)
-                .sum::<i32>();
-            s >> 3 // ctz(8)
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 16, 8, bd)
 }
 
-/// DC prediction for a 16x16 block (mirror of `dc_pred_8x8`).
 pub(crate) fn dc_pred_16x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>()
-                + recon[oy * stride + ox - 1..]
-                    .iter()
-                    .step_by(stride)
-                    .take(16)
-                    .sum::<i32>();
-            (s + 16) >> 5
-        }
-        (true, false) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
-            (s + 8) >> 4
-        }
-        (false, true) => {
-            let mut s = 0i32;
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(16)
-                .sum::<i32>();
-            (s + 8) >> 4
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 16, 16, bd)
 }
 
-/// DC prediction for a 32x32 block (mirror of `dc_pred_16x16`).
 pub(crate) fn dc_pred_32x32(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>()
-                + recon[oy * stride + ox - 1..]
-                    .iter()
-                    .step_by(stride)
-                    .take(32)
-                    .sum::<i32>();
-            (s + 32) >> 6
-        }
-        (true, false) => {
-            let mut s = 0i32;
-            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>();
-            (s + 16) >> 5
-        }
-        (false, true) => {
-            let mut s = 0i32;
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(32)
-                .sum::<i32>();
-            (s + 16) >> 5
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 32, 32, bd)
 }
 
-/// DC predictor for a 16-wide x 32-tall chroma block (4:2:2 `RTX_16X32`).
-/// Mirrors `dc_pred_8x16`: sum 16 above + 32 left = 48 = 16*3 samples.
-/// DC predictor for 32-wide x 16-tall (transpose of 16x32): 32 above + 16 left.
 pub(crate) fn dc_pred_32x16(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 24i32; // (32+16)>>1
-            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(16)
-                .sum::<i32>();
-            s >>= 4; // ctz(48)
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 16i32;
-            s += recon[(oy - 1) * stride + ox..][..32].iter().sum::<i32>();
-            s >> 5
-        }
-        (false, true) => {
-            let mut s = 8i32;
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(16)
-                .sum::<i32>();
-            s >> 4
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 32, 16, bd)
 }
 
 pub(crate) fn dc_pred_16x32(recon: &[i32], stride: usize, ox: usize, oy: usize, bd: i32) -> i32 {
-    let above = oy > 0;
-    let left = ox > 0;
-    match (above, left) {
-        (true, true) => {
-            let mut s = 24i32; // (16+32)>>1
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(32)
-                .sum::<i32>();
-            s >>= 4; // ctz(48) = 4
-            (((s as u32) * 0x5556) >> 16) as i32
-        }
-        (true, false) => {
-            let mut s = 8i32; // 16>>1
-            s += recon[(oy - 1) * stride + ox..][..16].iter().sum::<i32>();
-            s >> 4
-        }
-        (false, true) => {
-            let mut s = 16i32; // 32>>1
-            s += recon[oy * stride + ox - 1..]
-                .iter()
-                .step_by(stride)
-                .take(32)
-                .sum::<i32>();
-            s >> 5
-        }
-        (false, false) => 1 << (bd - 1),
-    }
+    dc_pred(recon, stride, ox, oy, 16, 32, bd)
 }
 
 #[cfg(test)]
 mod intra_edge_tests {
     use super::*;
+
+    #[test]
+    fn palette_predicts_packed_indices_into_strided_destination() {
+        let palette = [3, 17, 42, 99, 255, 511, 777, 1023];
+        let indices = [0x10, 0x32, 0x04, 0x76, 0x54, 0x03];
+        let mut dst = [-1; 16];
+
+        palette_pred(&mut dst, 8, &palette, &indices, 5, 2);
+
+        assert_eq!(&dst[..5], &[3, 17, 42, 99, 255]);
+        assert_eq!(&dst[8..13], &[777, 1023, 255, 511, 99]);
+        assert_eq!(&dst[5..8], &[-1; 3]);
+        assert_eq!(&dst[13..], &[-1; 3]);
+    }
+
+    #[test]
+    fn palette_accepts_all_normative_sizes() {
+        for size in 2..=8 {
+            let palette: Vec<i32> = (0..size as i32).map(|v| v * 100).collect();
+            let last = (size - 1) as u8;
+            let indices = [last | (last << 4)];
+            let mut dst = [0; 2];
+            palette_pred(&mut dst, 2, &palette, &indices, 2, 1);
+            assert_eq!(dst, [palette[size - 1]; 2]);
+        }
+    }
+
+    #[test]
+    fn filter_intra_constant_edges_stay_constant() {
+        let sizes = [
+            (4, 4),
+            (4, 8),
+            (8, 4),
+            (8, 8),
+            (8, 16),
+            (16, 8),
+            (16, 16),
+            (16, 32),
+            (32, 16),
+            (32, 32),
+            (4, 16),
+            (16, 4),
+            (8, 32),
+            (32, 8),
+        ];
+        for bd in [8u8, 10, 12] {
+            let value = 37 << (bd - 8);
+            let recon = vec![value; 40 * 40];
+            for &(w, h) in &sizes {
+                for mode in FILTER_INTRA_MODES {
+                    let mut out = vec![0; w * h];
+                    filter_intra_predict(mode, &recon, 40, 1, 1, w, h, &mut out, bd);
+                    assert!(out.iter().all(|&v| v == value), "{mode:?} {w}x{h} bd={bd}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_intra_handles_missing_edges_and_clips() {
+        for bd in [8u8, 10, 12] {
+            let max = (1 << bd) - 1;
+            let recon = vec![max; 32 * 32];
+            for &(ox, oy) in &[(0, 0), (1, 0), (0, 1), (1, 1)] {
+                for mode in FILTER_INTRA_MODES {
+                    let mut out = [0; 64];
+                    filter_intra_predict(mode, &recon, 32, ox, oy, 8, 8, &mut out, bd);
+                    assert!(out.iter().all(|&v| (0..=max).contains(&v)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_intra_is_recursive_across_groups() {
+        let mut recon = vec![128; 16 * 16];
+        for (x, r) in recon.iter_mut().enumerate().take(8) {
+            *r = 16 + x as i32 * 20;
+        }
+        for y in 0..8 {
+            recon[y * 16] = 240 - y as i32 * 18;
+        }
+        let mut a = [0; 64];
+        let mut b = [0; 64];
+        filter_intra_predict(FilterIntraMode::D157, &recon, 16, 1, 1, 8, 8, &mut a, 8);
+        recon[0] ^= 63;
+        filter_intra_predict(FilterIntraMode::D157, &recon, 16, 1, 1, 8, 8, &mut b, 8);
+        assert_ne!(a[..8], b[..8]);
+        assert_ne!(a[32..], b[32..]);
+    }
 
     #[test]
     fn strength_thresholds_match_av1() {

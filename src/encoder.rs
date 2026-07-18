@@ -723,6 +723,11 @@ pub fn encode_lossless_gray_alpha<T: Pixel>(
     )
 }
 
+/// Use AV1's GBR identity matrix only when the caller supplied no CICP.
+fn lossless_rgb_cicp(color: Option<&Cicp>) -> Cicp {
+    color.copied().unwrap_or_else(Cicp::identity_rgb)
+}
+
 /// Encode a lossless 4:4:4 still with color signaling.
 pub fn encode_lossless_obu<T: Pixel>(
     img: &PlanarImage<T>,
@@ -730,6 +735,7 @@ pub fn encode_lossless_obu<T: Pixel>(
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
+    let effective_color = lossless_rgb_cicp(color);
     let profile: u32 = if img.bit_depth == BitDepth::Twelve {
         2
     } else {
@@ -750,13 +756,16 @@ pub fn encode_lossless_obu<T: Pixel>(
         h as u32,
         profile,
         img.bit_depth.bits(),
-        color,
+        Some(&effective_color),
+        false,
         false,
     ));
     bytes.extend_from_slice(&crate::coder::encode_lossless_frame_obus(
         img.bit_depth.bits(),
         w8,
         h8,
+        w,
+        h,
         &planes_i16,
         threads,
     ));
@@ -772,7 +781,8 @@ pub fn encode_lossless<T: Pixel>(
     if cfg.chroma != ChromaFormat::Yuv444 {
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
-    let obu = encode_lossless_obu(img, cfg.color_encoding.as_ref(), cfg.threads)?;
+    let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
+    let obu = encode_lossless_obu(img, Some(&effective_color), cfg.threads)?;
     let av1c = make_av1c(
         &obu,
         img.bit_depth.bits(),
@@ -787,7 +797,7 @@ pub fn encode_lossless<T: Pixel>(
         img.bit_depth.bits(),
         3,
         &av1c,
-        cfg.color_encoding.as_ref(),
+        Some(&effective_color),
         cfg.icc.as_deref(),
         &cfg.metadata,
     )
@@ -808,7 +818,8 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
 
-    let obu = encode_lossless_obu(&img.packed_3(), cfg.color_encoding.as_ref(), cfg.threads)?;
+    let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
+    let obu = encode_lossless_obu(&img.packed_3(), Some(&effective_color), cfg.threads)?;
 
     let alpha_obu = encode_lossy_gray_obu(
         &img.packed_alpha_4(),
@@ -822,6 +833,8 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         false,
         false,
     )?;
+    let mut effective_cfg = cfg.clone();
+    effective_cfg.color_encoding = Some(effective_color);
     finalize_with_alpha(
         obu,
         alpha_obu,
@@ -829,7 +842,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         img.height as u32,
         img.bit_depth.bits(),
         cfg.chroma,
-        cfg,
+        &effective_cfg,
     )
 }
 
@@ -963,6 +976,67 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
 mod tests {
     use super::*;
     use crate::coder::VarianceBoost;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    #[test]
+    fn lossless_rgb_preserves_explicit_cicp_and_defaults_to_identity() {
+        let explicit = Cicp::srgb_ycbcr();
+        assert_eq!(lossless_rgb_cicp(Some(&explicit)), explicit);
+        assert_eq!(
+            lossless_rgb_cicp(None).matrix,
+            crate::color::MatrixCoefficients::Identity
+        );
+    }
+
+    #[test]
+    fn lossless_rgb_avif_preserves_explicit_or_defaults_identity() {
+        let decoder = std::env::var_os("AVIFDEC").map(PathBuf::from).or_else(|| {
+            let path = PathBuf::from("/opt/homebrew/bin/avifdec");
+            path.is_file().then_some(path)
+        });
+        let Some(decoder) = decoder else {
+            return;
+        };
+        let (w, h) = (8usize, 8usize);
+        let rgb: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                [
+                    ((i * 37) & 255) as u8,
+                    ((i * 71) & 255) as u8,
+                    ((i * 13) & 255) as u8,
+                ]
+            })
+            .collect();
+        let image = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb).unwrap();
+        for (color, expected_matrix) in [(None, 0), (Some(Cicp::srgb_ycbcr()), 6)] {
+            let mut cfg = EncodeConfig::new()
+                .with_chroma(ChromaFormat::Yuv444)
+                .with_threads(1);
+            cfg = match color {
+                Some(cicp) => cfg.with_cicp(cicp),
+                None => cfg.without_cicp(),
+            };
+            let avif = encode_lossless(&image, &cfg).unwrap();
+            let input = std::env::temp_dir().join(format!(
+                "maroontree-lossless-rgb-{}-{expected_matrix}.avif",
+                std::process::id()
+            ));
+            std::fs::write(&input, avif).unwrap();
+            let output = Command::new(&decoder)
+                .arg("--info")
+                .arg(&input)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(input);
+            assert!(output.status.success());
+            let info = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                info.contains(&format!("Matrix Coeffs. : {expected_matrix}")),
+                "lossless RGB signaled the wrong matrix:\n{info}"
+            );
+        }
+    }
 
     /// Non-multiple-of-8 sizes must not panic and must produce a non-empty
     /// stream for both very small and odd dimensions.

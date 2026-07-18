@@ -70,7 +70,6 @@ mod quant;
 mod rangecoder;
 mod rd_sse;
 mod tables;
-mod transform;
 mod trellis;
 mod trellis_dist;
 mod util;

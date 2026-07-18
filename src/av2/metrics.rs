@@ -121,6 +121,111 @@ pub(crate) fn scaled_residual_f32_scalar(
     }
 }
 
+/// Copy an independently-strided f32 predictor into a packed buffer while
+/// generating the corresponding packed, scaled residual.
+pub(crate) fn copy_f32_prediction_and_scaled_residual(
+    prediction_dst: &mut [f32],
+    residual_dst: &mut [f32],
+    src: &[f32],
+    prediction: &[f32],
+    spec: ResidualSpec,
+) {
+    let ResidualSpec {
+        src_stride,
+        pred_stride,
+        width,
+        height,
+        scale,
+    } = spec;
+    debug_assert!(prediction_dst.len() >= width * height);
+    debug_assert!(residual_dst.len() >= width * height);
+    for y in 0..height {
+        let dst = y * width;
+        let src = &src[y * src_stride..][..width];
+        let pred = &prediction[y * pred_stride..][..width];
+        prediction_dst[dst..dst + width].copy_from_slice(pred);
+        for ((residual, &source), &reference) in
+            residual_dst[dst..dst + width].iter_mut().zip(src).zip(pred)
+        {
+            *residual = (source - reference) * scale;
+        }
+    }
+}
+
+/// Convert a packed or strided u16 motion-compensation predictor to packed f32
+/// while generating its scaled residual against a strided source plane.
+pub(crate) fn u16_prediction_and_scaled_residual_f32(
+    prediction_dst: &mut [f32],
+    residual_dst: &mut [f32],
+    src: &[f32],
+    prediction: &[u16],
+    spec: ResidualSpec,
+) {
+    let ResidualSpec {
+        src_stride,
+        pred_stride,
+        width,
+        height,
+        scale,
+    } = spec;
+    debug_assert!(prediction_dst.len() >= width * height);
+    debug_assert!(residual_dst.len() >= width * height);
+    for y in 0..height {
+        let dst = y * width;
+        let src = &src[y * src_stride..][..width];
+        let pred = &prediction[y * pred_stride..][..width];
+        for (((prediction_dst, residual), &source), &reference) in prediction_dst[dst..dst + width]
+            .iter_mut()
+            .zip(&mut residual_dst[dst..dst + width])
+            .zip(src)
+            .zip(pred)
+        {
+            let reference = reference as f32;
+            *prediction_dst = reference;
+            *residual = (source - reference) * scale;
+        }
+    }
+}
+
+/// Convert an f32 predictor to the integer form consumed by chroma inverse
+/// transforms while generating its scaled residual against a strided source.
+pub(crate) fn f32_prediction_and_scaled_residual_i32(
+    prediction_dst: &mut [i32],
+    residual_dst: &mut [f32],
+    src: &[f32],
+    prediction: &[f32],
+    spec: ResidualSpec,
+) {
+    scaled_residual_f32(residual_dst, src, prediction, spec);
+    prediction_f32_to_i32(
+        prediction_dst,
+        prediction,
+        spec.pred_stride,
+        spec.width,
+        spec.height,
+    );
+}
+
+/// Convert a strided f32 prediction rectangle to a packed integer buffer using
+/// the encoder's existing positive-sample rounding convention.
+pub(crate) fn prediction_f32_to_i32(
+    dst: &mut [i32],
+    prediction: &[f32],
+    prediction_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    debug_assert!(dst.len() >= width * height);
+    for y in 0..height {
+        for (dst, &prediction) in dst[y * width..][..width]
+            .iter_mut()
+            .zip(&prediction[y * prediction_stride..][..width])
+        {
+            *dst = (prediction + 0.5) as i32;
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn had4(a: i32, b: i32, c: i32, d: i32) -> [i32; 4] {
     let (e, f, g, h) = (a + c, a - c, b + d, b - d);
@@ -221,6 +326,42 @@ mod tests {
         scaled_residual_f32_scalar(&mut scalar, &src, &pred, spec);
         scaled_residual_f32(&mut dispatched, &src, &pred, spec);
         assert_eq!(dispatched, scalar);
+    }
+
+    #[test]
+    fn prediction_conversion_helpers_match_scalar_reference() {
+        let spec = ResidualSpec {
+            src_stride: 4,
+            pred_stride: 3,
+            width: 2,
+            height: 2,
+            scale: 0.5,
+        };
+        let src = [10.0, 20.0, 0.0, 0.0, 30.0, 40.0, 0.0, 0.0];
+        let prediction_u16 = [8u16, 18, 0, 28, 38, 0];
+        let mut prediction_f32 = [0.0; 4];
+        let mut residual = [0.0; 4];
+        u16_prediction_and_scaled_residual_f32(
+            &mut prediction_f32,
+            &mut residual,
+            &src,
+            &prediction_u16,
+            spec,
+        );
+        assert_eq!(prediction_f32, [8.0, 18.0, 28.0, 38.0]);
+        assert_eq!(residual, [1.0; 4]);
+
+        let prediction = [8.25, 18.75, 0.0, 28.25, 38.75, 0.0];
+        let mut prediction_i32 = [0; 4];
+        f32_prediction_and_scaled_residual_i32(
+            &mut prediction_i32,
+            &mut residual,
+            &src,
+            &prediction,
+            spec,
+        );
+        assert_eq!(prediction_i32, [8, 19, 28, 39]);
+        assert_eq!(residual, [0.875, 0.625, 0.875, 0.625]);
     }
 
     #[test]
