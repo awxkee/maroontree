@@ -25,4 +25,4 @@ neon = []
 avx = []
 
 [profile.release]
-debug = "full"
+debug = "line-tables-only"

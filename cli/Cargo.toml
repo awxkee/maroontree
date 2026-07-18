@@ -17,10 +17,10 @@ hpvca = { version = "0.1.9", optional = true }
 jixel = "0.2.4"
 jxl = "0.4.3"
 bytemuck = "1.25.0"
-garnetash = "0.1.0"
+garnetash = { version = "0.1.0", optional = true }
 tealdust = "0.1.4"
 
 [features]
 default = ["heic", "vvc"]
 heic = ["dep:hpvcd", "dep:fast_transpose", "dep:hpvca"]
-vvc = []
+vvc = ["garnetash"]

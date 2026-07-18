@@ -30,6 +30,13 @@
 use super::super::*;
 use crate::av2::cfl::{cfl_partition_prediction, cfl_prediction};
 
+/// Compile each expensive leaf geometry as its own optimization unit. The
+/// boundary is once per coded leaf, outside transform and prediction kernels.
+#[inline(never)]
+fn outline_leaf_422<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Core422Planes<'a> {
     pub(super) y: &'a [f32],
@@ -792,305 +799,334 @@ impl Av2Encoder {
         };
         let sb_rd_split = full_interior && luma_partition.split64;
         if !needs_partition && !sb_rd_split {
-            // Whole 64×64 luma SB → one 32×64 (TX_32X64) chroma TU per plane.
-            let (fmr, fmc) = (row * 16, col * 16);
-            let (sb_qstep, sb_resid_scale, _, _) = if use_grid {
-                enc.delta_q_signaled = cell.sig;
-                (cell.qs, cell.resid_scale, cell.qs_c, cell.resid_scale_c)
-            } else {
-                aqs.per_sb(enc, yp, pw, sb_y, sb_x, width, height)
-            };
-            db_sb_qidx[row * sb_cols + col] = if use_grid {
-                cell.qidx as u16
-            } else {
-                aqs.current_qidx() as u16
-            };
-            // Match avm get_entropy_context_1d: ANY nonzero along the block's
-            // above/left edge (whole 64-wide SB span), not just the first unit.
-            let any = |g: &[i32], s: usize, n: usize| {
-                g[s..(s + n).min(g.len())].iter().any(|&x| x != 0) as i32
-            };
-            let ua = if fmr > 0 { any(u_above, fmc, 16) } else { 0 };
-            let ul = if fmc > 0 { any(u_left, fmr, 16) } else { 0 };
-            let va = if fmr > 0 { any(v_above, fmc, 16) } else { 0 };
-            let vl = if fmc > 0 { any(v_left, fmr, 16) } else { 0 };
-            // Staged replay: capture/replay the whole-64 luma mode-search winner.
-            let replay_l = if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode {
-                cur.next_luma420()
-            } else {
-                None
-            };
-            let (tus, mode_idx, adelta) = if let Some(l) = replay_l {
-                for r in 0..64 {
-                    let off = (sb_y + r) * pw + sb_x;
-                    recy[off..off + 64].copy_from_slice(&l.recon_y[r * 64..r * 64 + 64]);
-                }
-                (l.tus, l.mode_idx, l.adelta)
-            } else {
-                let (tus, mode_idx, adelta, _) = encode_luma_sb(
-                    recy,
-                    &LumaSource {
-                        plane: yp,
-                        stride: pw,
-                    },
-                    &LumaFrameBlock {
-                        frame_width: width,
-                        frame_height: height,
-                        y: sb_y,
-                        x: sb_x,
-                    },
-                    &LumaQuantSpec {
-                        basis: &bases.luma,
-                        qstep: sb_qstep,
-                        scan: &tables::SCAN,
-                        neutral,
-                        quant_context: qc,
-                        rdoq_lambda: self.tune.rdoq_lambda,
-                        speed: self.speed,
-                        bit_depth: self.bit_depth as i32,
-                    },
-                    &LumaSbSearch {
-                        residual_scale: sb_resid_scale,
-                        allow_directional: {
-                            // Directional intra (Slow tier), whole 64x64 SBs only; partial
-                            // edge SBs use the non-directional path. predict_luma reference
-                            // availability now uses the true MI extent (decoder-matching).
-                            self.speed.try_directional()
-                                && sb_x + 64 <= width
-                                && sb_y + 64 <= height
-                        },
-                    },
-                );
-                if let crate::av2::replay::DecideMode::Capture(rec) = &mut decide_mode {
-                    let mut recon_y = Vec::with_capacity(64 * 64);
+            outline_leaf_422(|| {
+                // Whole 64×64 luma SB → one 32×64 (TX_32X64) chroma TU per plane.
+                let (fmr, fmc) = (row * 16, col * 16);
+                let (sb_qstep, sb_resid_scale, _, _) = if use_grid {
+                    enc.delta_q_signaled = cell.sig;
+                    (cell.qs, cell.resid_scale, cell.qs_c, cell.resid_scale_c)
+                } else {
+                    aqs.per_sb(enc, yp, pw, sb_y, sb_x, width, height)
+                };
+                db_sb_qidx[row * sb_cols + col] = if use_grid {
+                    cell.qidx as u16
+                } else {
+                    aqs.current_qidx() as u16
+                };
+                // Match avm get_entropy_context_1d: ANY nonzero along the block's
+                // above/left edge (whole 64-wide SB span), not just the first unit.
+                let any = |g: &[i32], s: usize, n: usize| {
+                    g[s..(s + n).min(g.len())].iter().any(|&x| x != 0) as i32
+                };
+                let ua = if fmr > 0 { any(u_above, fmc, 16) } else { 0 };
+                let ul = if fmc > 0 { any(u_left, fmr, 16) } else { 0 };
+                let va = if fmr > 0 { any(v_above, fmc, 16) } else { 0 };
+                let vl = if fmc > 0 { any(v_left, fmr, 16) } else { 0 };
+                // Staged replay: capture/replay the whole-64 luma mode-search winner.
+                let replay_l = if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode
+                {
+                    cur.next_luma420()
+                } else {
+                    None
+                };
+                let (tus, mode_idx, adelta) = if let Some(l) = replay_l {
                     for r in 0..64 {
                         let off = (sb_y + r) * pw + sb_x;
-                        recon_y.extend_from_slice(&recy[off..off + 64]);
+                        recy[off..off + 64].copy_from_slice(&l.recon_y[r * 64..r * 64 + 64]);
                     }
-                    rec.push_luma420(crate::av2::replay::Luma420 {
-                        tus: tus.clone(),
-                        mode_idx,
-                        adelta,
-                        recon_y,
-                    });
-                }
-                (tus, mode_idx, adelta)
-            };
-            let (skip_cdfs, dc_sign_ctxs) =
-                sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
-            let (cy, cx) = (sb_y, sb_x / 2);
-            let bd = self.bit_depth as i32;
-            // CfL decision (4:2:2 whole-64 fast path). 32x64 chroma; luma subsampled
-            // horizontally (<<2); neighbor DC via cfl_avg_l(ssx=true, ssy=false).
-            let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
-            let cfl_l = if fmc > 0 { cfl_left[fmr] } else { 0 };
-            enc.cfl_ctx = (cfl_a + cfl_l) as usize;
-            // Staged replay: capture/replay the whole-64 chroma CfL decision so
-            // the emit-only pass skips the `cfl_decide` RD search (pure emit).
-            let replay_cfl = if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode {
-                cur.next_chroma422_whole()
-            } else {
-                None
-            };
-            let cfl_choice = match replay_cfl {
-                Some(c) => c,
-                None => {
-                    let c = if enc.cfl {
-                        let avg_l = cfl::cfl_avg_l(recy, pw, sb_y, sb_x, 32, 64, true, false, bd);
-                        let mut suf = [0f32; 32 * 64];
-                        let mut svf = [0f32; 32 * 64];
-                        for (((suf_row, svf_row), up_row), vp_row) in suf
-                            .as_chunks_mut::<32>()
-                            .0
-                            .iter_mut()
-                            .zip(svf.as_chunks_mut::<32>().0.iter_mut())
-                            .zip(rect_rows(up, pcw, cy, cx, 32, 64))
-                            .zip(rect_rows(vp, pcw, cy, cx, 32, 64))
-                        {
-                            suf_row.copy_from_slice(up_row);
-                            svf_row.copy_from_slice(vp_row);
+                    (l.tus, l.mode_idx, l.adelta)
+                } else {
+                    let (tus, mode_idx, adelta, _) = encode_luma_sb(
+                        recy,
+                        &LumaSource {
+                            plane: yp,
+                            stride: pw,
+                        },
+                        &LumaFrameBlock {
+                            frame_width: width,
+                            frame_height: height,
+                            y: sb_y,
+                            x: sb_x,
+                        },
+                        &LumaQuantSpec {
+                            basis: &bases.luma,
+                            qstep: sb_qstep,
+                            scan: &tables::SCAN,
+                            neutral,
+                            quant_context: qc,
+                            rdoq_lambda: self.tune.rdoq_lambda,
+                            speed: self.speed,
+                            bit_depth: self.bit_depth as i32,
+                        },
+                        &LumaSbSearch {
+                            residual_scale: sb_resid_scale,
+                            allow_directional: {
+                                // Directional intra (Slow tier), whole 64x64 SBs only; partial
+                                // edge SBs use the non-directional path. predict_luma reference
+                                // availability now uses the true MI extent (decoder-matching).
+                                self.speed.try_directional()
+                                    && sb_x + 64 <= width
+                                    && sb_y + 64 <= height
+                            },
+                        },
+                    );
+                    if let crate::av2::replay::DecideMode::Capture(rec) = &mut decide_mode {
+                        let mut recon_y = Vec::with_capacity(64 * 64);
+                        for r in 0..64 {
+                            let off = (sb_y + r) * pw + sb_x;
+                            recon_y.extend_from_slice(&recy[off..off + 64]);
                         }
-                        let dc_u_f =
-                            dc_pred_rect_subsampled(recu, pcw, cy, cx, 32, 64, neutral, bd);
-                        let dc_v_f =
-                            dc_pred_rect_subsampled(recv, pcw, cy, cx, 32, 64, neutral, bd);
-                        cfl::cfl_decide(
-                            &cfl::CflDecisionInput {
-                                reconstructed_luma: recy,
-                                luma_stride: pw,
-                                luma_y: sb_y,
-                                luma_x: sb_x,
-                                source_u: &suf,
-                                source_v: &svf,
-                                dc_u: dc_u_f,
-                                dc_v: dc_v_f,
-                                width: 32,
-                                height: 64,
-                                subsample_x: true,
-                                subsample_y: false,
-                                luma_average_q3: avg_l,
-                            },
-                            &cfl::ChromaRdSpec {
-                                basis: &bases.chroma422,
-                                qstep: qstep_i,
-                                lambda: leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
-                                bit_depth: bd,
-                            },
-                        )
+                        rec.push_luma420(crate::av2::replay::Luma420 {
+                            tus: tus.clone(),
+                            mode_idx,
+                            adelta,
+                            recon_y,
+                        });
+                    }
+                    (tus, mode_idx, adelta)
+                };
+                let (skip_cdfs, dc_sign_ctxs) =
+                    sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
+                let (cy, cx) = (sb_y, sb_x / 2);
+                let bd = self.bit_depth as i32;
+                // CfL decision (4:2:2 whole-64 fast path). 32x64 chroma; luma subsampled
+                // horizontally (<<2); neighbor DC via cfl_avg_l(ssx=true, ssy=false).
+                let cfl_a = if fmr > 0 { cfl_above[fmc] } else { 0 };
+                let cfl_l = if fmc > 0 { cfl_left[fmr] } else { 0 };
+                enc.cfl_ctx = (cfl_a + cfl_l) as usize;
+                // Staged replay: capture/replay the whole-64 chroma CfL decision so
+                // the emit-only pass skips the `cfl_decide` RD search (pure emit).
+                let replay_cfl =
+                    if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode {
+                        cur.next_chroma422_whole()
                     } else {
                         None
                     };
-                    if let replay::DecideMode::Capture(rec) = &mut decide_mode {
-                        rec.push_chroma422_whole(c.clone());
+                let cfl_choice = match replay_cfl {
+                    Some(c) => c,
+                    None => {
+                        let c = if enc.cfl {
+                            let avg_l =
+                                cfl::cfl_avg_l(recy, pw, sb_y, sb_x, 32, 64, true, false, bd);
+                            let mut suf = [0f32; 32 * 64];
+                            let mut svf = [0f32; 32 * 64];
+                            for (((suf_row, svf_row), up_row), vp_row) in suf
+                                .as_chunks_mut::<32>()
+                                .0
+                                .iter_mut()
+                                .zip(svf.as_chunks_mut::<32>().0.iter_mut())
+                                .zip(rect_rows(up, pcw, cy, cx, 32, 64))
+                                .zip(rect_rows(vp, pcw, cy, cx, 32, 64))
+                            {
+                                suf_row.copy_from_slice(up_row);
+                                svf_row.copy_from_slice(vp_row);
+                            }
+                            let dc_u_f =
+                                dc_pred_rect_subsampled(recu, pcw, cy, cx, 32, 64, neutral, bd);
+                            let dc_v_f =
+                                dc_pred_rect_subsampled(recv, pcw, cy, cx, 32, 64, neutral, bd);
+                            cfl::cfl_decide(
+                                &cfl::CflDecisionInput {
+                                    reconstructed_luma: recy,
+                                    luma_stride: pw,
+                                    luma_y: sb_y,
+                                    luma_x: sb_x,
+                                    source_u: &suf,
+                                    source_v: &svf,
+                                    dc_u: dc_u_f,
+                                    dc_v: dc_v_f,
+                                    width: 32,
+                                    height: 64,
+                                    subsample_x: true,
+                                    subsample_y: false,
+                                    luma_average_q3: avg_l,
+                                },
+                                &cfl::ChromaRdSpec {
+                                    basis: &bases.chroma422,
+                                    qstep: qstep_i,
+                                    lambda: leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                    bit_depth: bd,
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        if let replay::DecideMode::Capture(rec) = &mut decide_mode {
+                            rec.push_chroma422_whole(c.clone());
+                        }
+                        c
                     }
-                    c
+                };
+                if let Some(ref ch) = cfl_choice {
+                    enc.cfl_use = true;
+                    enc.cfl_js = ch.js;
+                    enc.cfl_mag_u = ch.mag_u;
+                    enc.cfl_mag_v = ch.mag_v;
+                    enc.cfl_ctx_u = ch.ctx_u;
+                    enc.cfl_ctx_v = ch.ctx_v;
+                } else {
+                    enc.cfl_use = false;
+                    enc.cfl_signaled = false;
                 }
-            };
-            if let Some(ref ch) = cfl_choice {
-                enc.cfl_use = true;
-                enc.cfl_js = ch.js;
-                enc.cfl_mag_u = ch.mag_u;
-                enc.cfl_mag_v = ch.mag_v;
-                enc.cfl_ctx_u = ch.ctx_u;
-                enc.cfl_ctx_v = ch.ctx_v;
-            } else {
-                enc.cfl_use = false;
-                enc.cfl_signaled = false;
-            }
-            enc.delta_q_pending = enc.delta_q_present;
-            let lmidx = if col > 0 {
-                midx_grid[row * sb_cols + col - 1]
-            } else {
-                0xff
-            };
-            let amidx = if row > 0 {
-                midx_grid[(row - 1) * sb_cols + col]
-            } else {
-                0xff
-            };
-            let (_cul, sb_midx) = encode_luma_block_split_dir(
-                enc,
-                &LumaSplitDirSpec {
-                    tus: &tus,
-                    skip_cdfs: &skip_cdfs,
-                    dc_sign_ctxs: &dc_sign_ctxs,
-                    mode_idx,
-                    angle_delta: adelta,
-                    has_chroma: true,
-                    part_cdf: partition::sb_none_do_split_cdf(row, col, above_pctx, left_pctx),
-                    left_midx: lmidx,
-                    above_midx: amidx,
-                },
-            );
-            midx_grid[row * sb_cols + col] = sb_midx;
-            let scan = &tables::SCAN;
-            let (levu, levv) = if let Some(ref ch) = cfl_choice {
-                let mut ru = [0f32; 32 * 64];
-                let mut rv = [0f32; 32 * 64];
-                cfl_prediction::<32>(pcw, up, vp, cy, cx, &ch, &mut ru, &mut rv);
-                let levu =
-                    bases
-                        .chroma422
-                        .project_scan(&aq::scale_resid(&ru, sb_resid_scale), 0.0, scan);
-                let levv =
-                    bases
-                        .chroma422
-                        .project_scan(&aq::scale_resid(&rv, sb_resid_scale), 0.0, scan);
-                put_block_rect(
-                    recu,
-                    pcw,
-                    cy,
-                    cx,
-                    32,
-                    64,
-                    &itx422::reconstruct_chroma_cfl(&ch.pred_u, &levu, sb_qstep, scan, 32, 64, bd),
+                enc.delta_q_pending = enc.delta_q_present;
+                let lmidx = if col > 0 {
+                    midx_grid[row * sb_cols + col - 1]
+                } else {
+                    0xff
+                };
+                let amidx = if row > 0 {
+                    midx_grid[(row - 1) * sb_cols + col]
+                } else {
+                    0xff
+                };
+                let (_cul, sb_midx) = encode_luma_block_split_dir(
+                    enc,
+                    &LumaSplitDirSpec {
+                        tus: &tus,
+                        skip_cdfs: &skip_cdfs,
+                        dc_sign_ctxs: &dc_sign_ctxs,
+                        mode_idx,
+                        angle_delta: adelta,
+                        has_chroma: true,
+                        part_cdf: partition::sb_none_do_split_cdf(row, col, above_pctx, left_pctx),
+                        left_midx: lmidx,
+                        above_midx: amidx,
+                    },
                 );
-                put_block_rect(
-                    recv,
-                    pcw,
-                    cy,
-                    cx,
-                    32,
-                    64,
-                    &itx422::reconstruct_chroma_cfl(&ch.pred_v, &levv, sb_qstep, scan, 32, 64, bd),
+                midx_grid[row * sb_cols + col] = sb_midx;
+                let scan = &tables::SCAN;
+                let (levu, levv) = if let Some(ref ch) = cfl_choice {
+                    let mut ru = [0f32; 32 * 64];
+                    let mut rv = [0f32; 32 * 64];
+                    cfl_prediction::<32>(pcw, up, vp, cy, cx, &ch, &mut ru, &mut rv);
+                    let levu = bases.chroma422.project_scan(
+                        &aq::scale_resid(&ru, sb_resid_scale),
+                        0.0,
+                        scan,
+                    );
+                    let levv = bases.chroma422.project_scan(
+                        &aq::scale_resid(&rv, sb_resid_scale),
+                        0.0,
+                        scan,
+                    );
+                    put_block_rect(
+                        recu,
+                        pcw,
+                        cy,
+                        cx,
+                        32,
+                        64,
+                        &itx422::reconstruct_chroma_cfl(
+                            &ch.pred_u, &levu, sb_qstep, scan, 32, 64, bd,
+                        ),
+                    );
+                    put_block_rect(
+                        recv,
+                        pcw,
+                        cy,
+                        cx,
+                        32,
+                        64,
+                        &itx422::reconstruct_chroma_cfl(
+                            &ch.pred_v, &levv, sb_qstep, scan, 32, 64, bd,
+                        ),
+                    );
+                    (levu, levv)
+                } else {
+                    let predu = dc_pred_rect(recu, pcw, cy, cx, 32, 64, neutral, bd);
+                    let levu = bases.chroma422.project_scan(
+                        &aq::scale_resid(
+                            &get_residual_rect(up, pcw, cy, cx, 32, 64, predu),
+                            sb_resid_scale,
+                        ),
+                        0.0,
+                        scan,
+                    );
+                    put_block_rect(
+                        recu,
+                        pcw,
+                        cy,
+                        cx,
+                        32,
+                        64,
+                        &recon_422_chroma(
+                            predu,
+                            &levu,
+                            sb_qstep,
+                            scan,
+                            32,
+                            64,
+                            &bases.chroma422,
+                            bd,
+                        ),
+                    );
+                    let predv = dc_pred_rect(recv, pcw, cy, cx, 32, 64, neutral, bd);
+                    let levv = bases.chroma422.project_scan(
+                        &aq::scale_resid(
+                            &get_residual_rect(vp, pcw, cy, cx, 32, 64, predv),
+                            sb_resid_scale,
+                        ),
+                        0.0,
+                        scan,
+                    );
+                    put_block_rect(
+                        recv,
+                        pcw,
+                        cy,
+                        cx,
+                        32,
+                        64,
+                        &recon_422_chroma(
+                            predv,
+                            &levv,
+                            sb_qstep,
+                            scan,
+                            32,
+                            64,
+                            &bases.chroma422,
+                            bd,
+                        ),
+                    );
+                    (levu, levv)
+                };
+                let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
+                let u_skip = CHROMA_SKIP_TX64_QC[qc][(6 + ua + ul) as usize] as u32;
+                encode_chroma_block_rect(
+                    enc,
+                    &uc,
+                    u_skip,
+                    true,
+                    &tables::SCAN,
+                    EobCdf::ChrEobBin,
+                    CHROMA_EOB_HI_BIT_QC[qc],
+                    1024,
                 );
-                (levu, levv)
-            } else {
-                let predu = dc_pred_rect(recu, pcw, cy, cx, 32, 64, neutral, bd);
-                let levu = bases.chroma422.project_scan(
-                    &aq::scale_resid(
-                        &get_residual_rect(up, pcw, cy, cx, 32, 64, predu),
-                        sb_resid_scale,
-                    ),
-                    0.0,
-                    scan,
+                let up_ = uc.iter().any(|&(_, l)| l != 0);
+                let v_skip = (6 * (up_ as i32) + va + vl) as u32;
+                encode_chroma_block_rect(
+                    enc,
+                    &vc,
+                    v_skip,
+                    false,
+                    &tables::SCAN,
+                    EobCdf::ChrEobBin,
+                    CHROMA_EOB_HI_BIT_QC[qc],
+                    1024,
                 );
-                put_block_rect(
-                    recu,
-                    pcw,
-                    cy,
-                    cx,
-                    32,
-                    64,
-                    &recon_422_chroma(predu, &levu, sb_qstep, scan, 32, 64, &bases.chroma422, bd),
-                );
-                let predv = dc_pred_rect(recv, pcw, cy, cx, 32, 64, neutral, bd);
-                let levv = bases.chroma422.project_scan(
-                    &aq::scale_resid(
-                        &get_residual_rect(vp, pcw, cy, cx, 32, 64, predv),
-                        sb_resid_scale,
-                    ),
-                    0.0,
-                    scan,
-                );
-                put_block_rect(
-                    recv,
-                    pcw,
-                    cy,
-                    cx,
-                    32,
-                    64,
-                    &recon_422_chroma(predv, &levv, sb_qstep, scan, 32, 64, &bases.chroma422, bd),
-                );
-                (levu, levv)
-            };
-            let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-            let u_skip = CHROMA_SKIP_TX64_QC[qc][(6 + ua + ul) as usize] as u32;
-            encode_chroma_block_rect(
-                enc,
-                &uc,
-                u_skip,
-                true,
-                &tables::SCAN,
-                EobCdf::ChrEobBin,
-                CHROMA_EOB_HI_BIT_QC[qc],
-                1024,
-            );
-            let up_ = uc.iter().any(|&(_, l)| l != 0);
-            let v_skip = (6 * (up_ as i32) + va + vl) as u32;
-            encode_chroma_block_rect(
-                enc,
-                &vc,
-                v_skip,
-                false,
-                &tables::SCAN,
-                EobCdf::ChrEobBin,
-                CHROMA_EOB_HI_BIT_QC[qc],
-                1024,
-            );
-            let v_present = vc.iter().any(|&(_, l)| l != 0);
-            let cfl_used = cfl_choice.is_some() as i32;
-            for c in fmc..fmc + 16 {
-                u_above[c] = up_ as i32;
-                v_above[c] = v_present as i32;
-                cfl_above[c] = cfl_used;
-            }
-            for r in fmr..fmr + 16 {
-                u_left[r] = up_ as i32;
-                v_left[r] = v_present as i32;
-                cfl_left[r] = cfl_used;
-            }
-            partition::sb_none_pctx(row, col, above_pctx, left_pctx);
+                let v_present = vc.iter().any(|&(_, l)| l != 0);
+                let cfl_used = cfl_choice.is_some() as i32;
+                for c in fmc..fmc + 16 {
+                    u_above[c] = up_ as i32;
+                    v_above[c] = v_present as i32;
+                    cfl_above[c] = cfl_used;
+                }
+                for r in fmr..fmr + 16 {
+                    u_left[r] = up_ as i32;
+                    v_left[r] = v_present as i32;
+                    cfl_left[r] = cfl_used;
+                }
+                partition::sb_none_pctx(row, col, above_pctx, left_pctx);
+            });
             return;
         }
 
@@ -1180,7 +1216,7 @@ impl Av2Encoder {
             enc.cfl_signaled = false;
             enc.mhccp_use = false;
             let (u_present, v_present) = match (bw_mi, bh_mi) {
-                (16, 16) => {
+                (16, 16) => outline_leaf_422(|| {
                     let (tus, mode_idx, _, _) = encode_luma_sb(
                         recy,
                         &LumaSource {
@@ -1300,8 +1336,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (16, 8) => {
+                }),
+                (16, 8) => outline_leaf_422(|| {
                     let (tus2, mode_idx) = encode_luma_leaf32(
                         recy,
                         &LumaSource {
@@ -1434,8 +1470,8 @@ impl Av2Encoder {
                                 .map(|(u, v)| (u.as_slice(), v.as_slice())),
                         },
                     )
-                }
-                (8, 16) => {
+                }),
+                (8, 16) => outline_leaf_422(|| {
                     let (tus2, mode_idx) = encode_luma_leaf_v32x64(
                         recy,
                         &LumaSource {
@@ -1512,8 +1548,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 8) => {
+                }),
+                (8, 8) => outline_leaf_422(|| {
                     let (tu, mode_idx) = encode_luma_leaf_s32x32(
                         recy,
                         &LumaSource {
@@ -1621,8 +1657,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 16) => {
+                }),
+                (4, 16) => outline_leaf_422(|| {
                     // Right-edge 16×64 luma leaf → 4:2:2 chroma 8×64 (TX_8X64,
                     // coeff 8×32, SCAN8X32, eob 256, skip class 3).
                     let pred =
@@ -1702,8 +1738,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (16, 4) => {
+                }),
+                (16, 4) => outline_leaf_422(|| {
                     // Bottom-edge 64×16 luma leaf → 4:2:2 chroma 32×16 (TX_32X16,
                     // coeff 32×16, SCAN32X16, eob 512, skip class 3).
                     let pred =
@@ -1816,8 +1852,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 4) => {
+                }),
+                (4, 4) => outline_leaf_422(|| {
                     // Bottom-right 16×16 corner leaf (residue 4 in both dims).
                     // Full-AC native TX_16X16 luma (entropy class 2, eob class 256),
                     // tx_type RD-chosen among DCT_DCT / ADST_ADST / ADST_DCT /
@@ -1996,8 +2032,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (2, 8) => {
+                }),
+                (2, 8) => outline_leaf_422(|| {
                     // Right-edge 8×32 DC-only luma leaf → 4:2:2 chroma 4×32
                     // (TX_4X32, coeff 4×32, SCAN4X32, eob 128 NO-ESCAPE, class 2).
                     let pred =
@@ -2110,8 +2146,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 2) => {
+                }),
+                (8, 2) => outline_leaf_422(|| {
                     // Bottom-edge 32×8 DC-only luma leaf → 4:2:2 chroma 16×8
                     // (TX_16X8, coeff 16×8, SCAN16X8, eob 128 NO-ESCAPE, class 2).
                     let pred =
@@ -2224,8 +2260,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (2, 2) => {
+                }),
+                (2, 2) => outline_leaf_422(|| {
                     // Both-axis residue-2 corner: 8×8 luma (TX_8X8) + 4×8 chroma per
                     // plane (4:2:2: half-width, full-height → TX_4X8).
                     let bd = self.bit_depth as i32;
@@ -2348,8 +2384,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (2, 4) => {
+                }),
+                (2, 4) => outline_leaf_422(|| {
                     // residue-2 W × residue-4 H: 8×16 luma (TX_8X16) + 4×16 chroma
                     // per plane (4:2:2 half-width/full-height → TX_4X16, eob64 ctx1).
                     let bd = self.bit_depth as i32;
@@ -2444,8 +2480,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (4, 2) => {
+                }),
+                (4, 2) => outline_leaf_422(|| {
                     // residue-4 W × residue-2 H: 16×8 luma (TX_16X8) + 8×8 chroma
                     // per plane (4:2:2 half-width/full-height → TX_8X8, eob64 ctx1).
                     let bd = self.bit_depth as i32;
@@ -2577,8 +2613,8 @@ impl Av2Encoder {
                                 .map(|(u, v)| (u.as_slice(), v.as_slice())),
                         },
                     )
-                }
-                (4, 8) => {
+                }),
+                (4, 8) => outline_leaf_422(|| {
                     // residue-4 W × residue-{6,8} H: 16×32 luma (TX_16X32 long-side-32)
                     // + 8×32 chroma per plane (4:2:2 half-width → TX_8X32, eob256 ctx2).
                     let bd = self.bit_depth as i32;
@@ -2683,8 +2719,8 @@ impl Av2Encoder {
                             mode_predictors: None,
                         },
                     )
-                }
-                (8, 4) => {
+                }),
+                (8, 4) => outline_leaf_422(|| {
                     // residue-{6,8} W × residue-4 H: 32×16 luma (TX_32X16 long-side-32)
                     // + 16×16 chroma per plane (4:2:2 half-width → TX_16X16, eob256 ctx2).
                     let bd = self.bit_depth as i32;
@@ -2826,7 +2862,7 @@ impl Av2Encoder {
                                 .map(|(u, v)| (u.as_slice(), v.as_slice())),
                         },
                     )
-                }
+                }),
                 other => unreachable!("unsupported native 4:2:2 leaf {:?}", other),
             };
             let cfl_used = enc.cfl_signaled as i32;

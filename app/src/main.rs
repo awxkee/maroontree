@@ -28,7 +28,10 @@
  */
 mod y4m2ivf;
 
-use maroontree::{av2_map_quality, encode_lossless, encode_rgb8, Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed, TxPart};
+use maroontree::{
+    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
+    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
+};
 use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;

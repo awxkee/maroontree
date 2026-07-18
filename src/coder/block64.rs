@@ -317,6 +317,7 @@ impl<'a> LossyTile<'a> {
             }
         }
         if ru.is_none() {
+            #[allow(clippy::needless_range_loop)]
             for ci in 0..2 {
                 let plane = ci + 1;
                 for (gi, &(gx, gy)) in cgrid.iter().enumerate() {
@@ -420,6 +421,7 @@ impl<'a> LossyTile<'a> {
         // Reconstruction already happened during the compute pass above (the
         // running-recon prediction requires it), so this only emits + updates
         // the neighbor coefficient contexts.
+        #[allow(clippy::needless_range_loop)]
         for ci in 0..2 {
             let plane = ci + 1;
             for (gi, &(gx, gy)) in cgrid.iter().enumerate() {
