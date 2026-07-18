@@ -519,42 +519,6 @@ impl<'a> LossyTile<'a> {
         (s != 0) as usize + (s > 0) as usize
     }
 
-    /// Decide whether to code the 16x16 region at (`x8`,`y8`) as a single
-    /// TX_16X16 (PARTITION_NONE) vs splitting into four 8x8. This is a pure R-D
-    /// proxy — the decoder follows whatever partition we signal, so the choice
-    /// affects compression only, never correctness. Proxy: compare the summed
-    /// absolute quantized luma levels of the one 16x16 transform (plus a small
-    /// per-block overhead) against the four 8x8 transforms (each with its own
-    /// overhead). Smooth regions compact into the 16x16 and win decisively.
-    /// Peak-to-peak luma range of the `dim`x`dim` source block at 8-unit origin
-    /// `(x8,y8)`. Smooth low-contrast blocks (small range) ring into visible
-    /// low-frequency banding under large transforms, so the partitioner uses it
-    /// to keep such blocks on small (8x8) transforms.
-    fn block_luma_range(&self, x8: usize, y8: usize, dim: usize) -> i32 {
-        let (px, py) = (x8 * 8, y8 * 8);
-        let mut lo = i32::MAX;
-        let mut hi = i32::MIN;
-        for ry in 0..dim {
-            let base = (py + ry) * self.w + px;
-            for &s in &self.src[0][base..base + dim] {
-                if s < lo {
-                    lo = s;
-                }
-                if s > hi {
-                    hi = s;
-                }
-            }
-        }
-        hi - lo
-    }
-
-    /// R-D proxy for coding an 8x8 luma region as one TX_8X8 (PARTITION_NONE)
-    /// vs splitting into four BLOCK_4X4. Runs the real non-directional mode
-    /// search (SSE + lambda*bits) for both options so the decision reflects
-    /// 4x4's per-quadrant mode diversity, not just a DC estimate. Returns
-    /// `true` to keep the 8x8 whole. Split is offered only for 4:2:0/4:4:4.
-    /// Mode-search lambda: libaom KF rdmult q-shape (`cost::mode_lambda_q`) times
-    /// the SSIMULACRA2 rdmult weight, AQ-correct via the active `self.quant`.
     #[inline]
     fn mlam(&self) -> f32 {
         mode_lambda_q(self.quant.dc_q() as f32) * self.tune_weight()

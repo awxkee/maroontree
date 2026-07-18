@@ -207,38 +207,6 @@ pub(crate) fn dct1d_16_i32(buf: &mut [i32; 16]) {
     }
 }
 
-/// Shared 2-D integer DCT-8 transform core (no quantization). Output layout is
-/// `out[r*8 + u] = F[row_freq=r][col_freq=u]`, DC at index 0. This is the single
-/// forward transform reused by both the in-place quantizer ([`dct8x8_scalar`])
-/// and the trellis/RDOQ variant ([`dct8x8_t`]).
-#[inline]
-pub(crate) fn dct8x8_coeffs(input: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    // Pass 1: column-wise DCT-8.
-    for x in 0..8usize {
-        let mut col = [0i32; 8];
-        for r in 0..8 {
-            col[r] = input[r * 8 + x];
-        }
-        dct1d_8_i32(&mut col);
-        for r in 0..8 {
-            tmp[r * 8 + x] = col[r];
-        }
-    }
-    // Pass 2: row-wise DCT-8. Store transposed to the pipeline convention
-    // `out[horiz_freq*8 + vert_freq]` (DC at index 0), matching the scan order,
-    // the integer inverse, and the 16x16/32x32 cores.
-    let mut out = [0i32; 64];
-    for r in 0..8usize {
-        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
-        dct1d_8_i32(&mut row);
-        for u in 0..8 {
-            out[u * 8 + r] = row[u];
-        }
-    }
-    out
-}
-
 #[inline]
 fn dct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
     let mut tmp = [0i32; 64];
@@ -428,51 +396,6 @@ pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 
         16,
         16,
     )
-}
-
-#[inline]
-#[allow(unused)]
-pub(crate) fn dct8x8_scalar(input: &mut [i32; 64], dc_q: i32, ac_q: i32) {
-    let coeffs = dct8x8_coeffs(input);
-    for (i, dst) in input.iter_mut().enumerate() {
-        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
-    }
-}
-
-type Dct16x16Fn = fn(&mut [i32; 256], i32, i32);
-static DCT16X16: OnceLock<Dct16x16Fn> = OnceLock::new();
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn dct16x16_neon_i32_wrap(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
-    unsafe { crate::neon::dct16x16_neon_i32(input, dc_q, ac_q) }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn dct16x16_avx2_i32_wrap(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
-    unsafe { crate::avx::dct16x16_avx2_i32(input, dc_q, ac_q) }
-}
-
-#[inline]
-fn resolve_dct16x16() -> Dct16x16Fn {
-    *DCT16X16.get_or_init(|| {
-        let mut _f: Dct16x16Fn = dct16x16_scalar;
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            _f = dct16x16_neon_i32_wrap;
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                _f = dct16x16_avx2_i32_wrap;
-            }
-        }
-        _f
-    })
-}
-
-#[inline]
-pub(crate) fn dct16x16(input: &mut [i32; 256], quant: &impl Dct) {
-    resolve_dct16x16()(input, quant.q_mult_dc(), quant.q_mult_ac());
 }
 
 /// Shared 2-D integer DCT-16 transform core (no quantization). Output layout
@@ -2268,35 +2191,6 @@ mod tests {
                 got[k],
                 (got[k] - exp).abs()
             );
-        }
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon", test))]
-mod neon_consistency {
-    use super::*;
-    use crate::neon::dct16x16_neon_i32;
-    fn next(seed: &mut u64) -> i32 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 33) as i32).rem_euclid(960) - 480
-    }
-
-    #[test]
-    fn neon_matches_scalar_16x16() {
-        let mut seed = 0xD1B5_4A32_D192_ED03u64;
-        for &(dcq, acq) in &[(26i32, 30i32), (52, 58), (210, 240)] {
-            for _ in 0..64 {
-                let mut a = [0i32; 256];
-                for v in a.iter_mut() {
-                    *v = next(&mut seed);
-                }
-                let mut b = a;
-                unsafe { dct16x16_neon_i32(&mut a, dcq, acq) };
-                dct16x16_scalar(&mut b, dcq, acq);
-                assert_eq!(a, b, "NEON 16x16 forward+quant diverges from scalar");
-            }
         }
     }
 }

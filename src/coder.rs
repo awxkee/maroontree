@@ -780,10 +780,6 @@ fn sse_recon<const N: usize, const D: usize>(
     crate::rd_sse::sse_recon(pred, resid, src, stride, px, py, D, D, bd)
 }
 
-fn tx32_policy() -> u32 {
-    2
-}
-
 /// Asymmetric-ADST tx-type search. A/B knob for the ADST_DCT/DCT_ADST trials;
 /// enabled by default.
 fn asym_adst_enabled() -> bool {
@@ -947,13 +943,6 @@ fn prdo_clamp() -> f32 {
     2.0
 }
 
-#[inline]
-fn tx32_smooth_gate() -> i32 {
-    LF_BAND_SMOOTH_RANGE
-}
-
-const LF_BAND_SMOOTH_RANGE: i32 = 32;
-
 /// Extra rate (in bits) attributed to a PARTITION_SPLIT decision over
 /// PARTITION_NONE in the R-D partition search. Splitting signals one partition
 /// symbol at the parent plus four child partition symbols and four sets of
@@ -962,6 +951,14 @@ const LF_BAND_SMOOTH_RANGE: i32 = 32;
 /// syntax. Tuned conservatively — too low over-splits (bloats rate), too high
 /// under-splits (blurs detail).
 const SPLIT_SIGNAL_BITS: f32 = 24.0;
+/// Mild split-favoring bias applied to the 32x32 PARTITION_NONE leg in the real
+/// NONE-vs-SPLIT R-D comparison (`choose_rect32`). The SATD distortion proxy
+/// undervalues the fine detail a single 32x32 loses when it merges four busier
+/// 16x16 blocks, so an unbiased comparison over-merges on textured content and
+/// costs SSIMULACRA2. 1.03 recovers that (best on the textured cityscape/420
+/// case) while keeping the flat-content wins. Distinct from the old
+/// `prefer_32x32` prefilter, which skipped the comparison entirely.
+const NONE32_SPLIT_BIAS: f32 = 1.03;
 const ASYM_PART_SIGNAL_BITS: f32 = SPLIT_SIGNAL_BITS;
 /// Extra uncertainty charge for A partitions whose final rectangular leaf
 /// predicts from siblings that have not yet been reconstructed during the

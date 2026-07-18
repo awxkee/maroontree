@@ -4,6 +4,7 @@
 use crate::intrapred::DC_PRED;
 use crate::tables::{COEFF_BASE_RANGE, EOB_BITW, NUM_BASE_LEVELS};
 
+#[allow(dead_code)]
 pub(crate) fn est_block_bits(cf: &[i32], scan: &[u32]) -> u32 {
     let Some(eob) = scan.iter().rposition(|&rc| cf[rc as usize] != 0) else {
         return 1;

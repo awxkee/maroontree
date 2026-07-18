@@ -15,7 +15,7 @@ categories = ["multimedia::images", "compression", "encoding", "multimedia::vide
 homepage = "https://github.com/awxkee/maroontree"
 repository = "https://github.com/awxkee/maroontree"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
-rust-version = "1.93.0"
+rust-version = "1.94.0"
 
 [dependencies]
 

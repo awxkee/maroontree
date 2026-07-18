@@ -34,8 +34,8 @@ mod wht;
 
 pub(crate) use dct::{
     adst16x16_avx2_quant_t, adstdct16x16_avx2_quant_t, dct8x8_avx2_quant_t, dct8x16_avx2_i32,
-    dct8x16_avx2_quant_t, dct16x16_avx2_i32, dct16x16_avx2_quant_t, dct16x32_avx2_quant_t,
-    dct32x16_avx2_quant_t, dct32x32_avx2_i32, dct32x32_avx2_quant_t, dctadst16x16_avx2_quant_t,
+    dct8x16_avx2_quant_t, dct16x16_avx2_quant_t, dct16x32_avx2_quant_t, dct32x16_avx2_quant_t,
+    dct32x32_avx2_i32, dct32x32_avx2_quant_t, dctadst16x16_avx2_quant_t,
 };
 pub(crate) use idct::{
     iadst_dequant_16x16_avx2, iadstdct_dequant_16x16_avx2, idct_dequant_8x8_avx2,

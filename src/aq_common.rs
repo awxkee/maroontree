@@ -84,7 +84,6 @@ pub(crate) fn f_fmlaf(a: f32, b: f32, c: f32) -> f32 {
 
 #[inline]
 pub(crate) fn dirty_log1pf(d: f32) -> f32 {
-    const LN_2: f32 = 0.6931471805599453;
     let ix = (1.0 + d).to_bits();
     let exponent = ix & 0x7f80_0000;
     let n = (exponent >> 23) as i32 - 0x7f;
@@ -102,7 +101,7 @@ pub(crate) fn dirty_log1pf(d: f32) -> f32 {
     p = f_fmlaf(p, t, 0.33125850558280945);
     p = f_fmlaf(p, t, -0.4998837411403656);
     p = f_fmlaf(p, t, 0.999998927116394);
-    f_fmlaf(n as f32, LN_2, t * p)
+    f_fmlaf(n as f32, std::f32::consts::LN_2, t * p)
 }
 
 /// Variance Boost qindex delta for one superblock. `picked_var` is the octile pick

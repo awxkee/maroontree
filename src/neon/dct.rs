@@ -560,34 +560,6 @@ pub(crate) fn dct8x8_neon_quant_t(
     unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    // Stage 1: vertical DCT-16 in four-column groups. Store a real transposed
-    // scratch: tmp[x * 16 + vertical_frequency].
-    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
-    for x in (0..16usize).step_by(4) {
-        let mut cols = load_n_i32x4::<16>(&input[x..], 16);
-        dct1d_16_v4_i32(&mut cols);
-        store_transposed_cols_i32x4::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
-    }
-    let tmp = unsafe { tmp_u.assume_init() };
-
-    // Stage 2: horizontal DCT-16 in four vertical-frequency lanes.
-    let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for y in (0..16usize).step_by(4) {
-        let mut rows: [I32x4; 16] =
-            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * 16 + y) }));
-        dct1d_16_v4_i32(&mut rows);
-        for u in 0..16usize {
-            let n = rows[u].shr::<1>();
-            unsafe {
-                store_i32x4((out.as_mut_ptr() as *mut i32).add(u * 16 + y), n);
-            }
-        }
-    }
-    unsafe { out.assume_init() }
-}
-
 #[inline]
 #[target_feature(enable = "neon")]
 fn adst1d_16_v4_i32(c: &mut [I32x4; 16]) {
@@ -707,12 +679,6 @@ pub(crate) fn dct16x16_neon_quant_t(
         }
     }
     unsafe { (cf.assume_init(), tf.assume_init()) }
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
-    let coeffs = dct16x16_neon_coeffs(input);
-    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 #[target_feature(enable = "neon")]
@@ -1024,8 +990,8 @@ pub(crate) fn dct32x16_neon_quant_t(
 
 #[cfg(test)]
 mod neon_vs_scalar {
-    use crate::dct::{dct8x16_i32_scalar, dct16x16_scalar, dct32x32_scalar};
-    use crate::neon::{dct8x16_neon_i32, dct16x16_neon_i32, dct32x32_neon_i32};
+    use crate::dct::{dct8x16_i32_scalar, dct32x32_scalar};
+    use crate::neon::{dct8x16_neon_i32, dct32x32_neon_i32};
 
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of
@@ -1063,62 +1029,6 @@ mod neon_vs_scalar {
         (65536, 46341), // DC full-scale, AC √2/2
         (32768, 32768), // both halved
     ];
-
-    fn run_16x16(input: [i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [i32; 256]) {
-        let mut scalar = input;
-        dct16x16_scalar(&mut scalar, dc_q, ac_q);
-        let mut neon = input;
-        unsafe { dct16x16_neon_i32(&mut neon, dc_q, ac_q) };
-        (scalar, neon)
-    }
-
-    #[test]
-    fn test_16x16_zeros() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16([0i32; 256], dc_q, ac_q);
-            assert_eq!(s, n, "16x16 zeros dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_constant() {
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16([32i32; 256], dc_q, ac_q);
-            assert_eq!(s, n, "16x16 constant dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_ramp() {
-        let mut input = [0i32; 256];
-        fill_ramp(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 ramp dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_alternating() {
-        let mut input = [0i32; 256];
-        fill_alt(&mut input);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 alternating dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    #[test]
-    fn test_16x16_random_seed1() {
-        let mut input = [0i32; 256];
-        fill_lcg(&mut input, 0x1234_5678);
-        for &(dc_q, ac_q) in QUANT_PAIRS {
-            let (s, n) = run_16x16(input, dc_q, ac_q);
-            assert_eq!(s, n, "16x16 rand(12345678) dc_q={dc_q} ac_q={ac_q}");
-        }
-    }
-
-    // ── dct32x32 ──────────────────────────────────────────────────────────
 
     fn run_32x32(input: [i32; 1024], dc_q: i32, ac_q: i32) -> ([i32; 1024], [i32; 1024]) {
         let mut scalar = input;

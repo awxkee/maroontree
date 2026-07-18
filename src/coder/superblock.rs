@@ -301,10 +301,7 @@ impl<'a> LossyTile<'a> {
             let full_h = (x8 + 4) * 8 <= self.w;
             let full_v = (y8 + 4) * 8 <= self.h;
             if full_h && full_v {
-                let choice = self.part_decision(|t| {
-                    let prefer_none = t.prefer_32x32(x8, y8);
-                    t.choose_rect32(x8, y8, prefer_none)
-                });
+                let choice = self.part_decision(|t| t.choose_rect32(x8, y8));
                 let have_tr = thr && y8 > 0 && (x8 * 8 + 32) < self.w;
                 let have_bl = lhb && x8 > 0 && (y8 * 8 + 32) < self.h;
                 match choice {

@@ -180,29 +180,37 @@ impl<'a> LossyTile<'a> {
     /// 32x32 shared-partition choice. Keep the established luma preselection
     /// between NONE and SPLIT, then include derived chroma R-D when comparing
     /// that square candidate with HORZ/VERT.
-    fn choose_rect32(&self, x8: usize, y8: usize, prefer_none: bool) -> Part16 {
+    fn choose_rect32(&self, x8: usize, y8: usize) -> Part16 {
         let unpruned_rect32 = self.base_q_idx >= UNPRUNED_RECT32_MIN_QINDEX;
+        let (px, py) = (x8 * 8, y8 * 8);
+        let prdo = self.perceptual_rd_scale(px, py, 32);
+        let block_var = self.luma_variance(px, py, 32, 32);
+        let chroma_none = if self.mono {
+            0.0
+        } else {
+            self.rd_cost_chroma_partition(px, py, 32, Part16::None, prdo)
+        };
+        let chroma_split = if self.mono {
+            0.0
+        } else {
+            self.rd_cost_chroma_partition(px, py, 32, Part16::Split, prdo)
+        };
+        // Small split-favoring bias: the SATD distortion proxy undervalues the
+        // detail a single 32x32 loses when it merges four busier 16x16s, so a
+        // pure comparison over-merges on textured content (SSIMULACRA2 penalizes
+        // it). This is a mild, symmetric thumb (not the old prefilter that
+        // skipped the comparison entirely).
+        let rd_none = (self.rd_cost_none32(px, py, prdo) + chroma_none) * NONE32_SPLIT_BIAS;
+        let rd_split = self.rd_cost_split32(px, py, prdo) + chroma_split;
+        // Rectangular candidates stay pruned at high quality (their DC-only 16x8
+        // sub-blocks lose to the square path's full mode search there).
         if self.mono || (!unpruned_rect32 && self.quant.ac_q() < AC_Q_HORZ_MIN) {
-            return if prefer_none {
+            return if rd_none <= rd_split {
                 Part16::None
             } else {
                 Part16::Split
             };
         }
-        let (px, py) = (x8 * 8, y8 * 8);
-        let prdo = self.perceptual_rd_scale(px, py, 32);
-        let block_var = self.luma_variance(px, py, 32, 32);
-        let base_part = if prefer_none {
-            Part16::None
-        } else {
-            Part16::Split
-        };
-        let rd_base = (if prefer_none {
-            self.rd_cost_none32(px, py, prdo)
-        } else {
-            self.rd_cost_split32(px, py, prdo)
-        } + self.rd_cost_chroma_partition(px, py, 32, base_part, prdo))
-            * if prefer_none { 0.97 } else { 1.03 };
         let horz_on = HORZ_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let vert_on = !self.ss422 && VERT_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let mut rd_h = f32::INFINITY;
@@ -224,7 +232,8 @@ impl<'a> LossyTile<'a> {
             }
         }
         let cands = [
-            (rd_base, base_part),
+            (rd_none, Part16::None),
+            (rd_split, Part16::Split),
             (rd_h, Part16::Horz),
             (rd_v, Part16::Vert),
         ];
@@ -279,31 +288,6 @@ impl<'a> LossyTile<'a> {
                 crate::partition_rd::rd_cost(distortion, mlam, block_rate_bits(&cf, &SCAN_16X16));
         }
         total
-    }
-
-    fn prefer_32x32(&self, _x8: usize, _y8: usize) -> bool {
-        let policy = tx32_policy();
-        if policy == 0 || self.mono {
-            return false;
-        }
-        if policy == 1 && self.block_luma_range(_x8, _y8, 32) < tx32_smooth_gate() {
-            return false;
-        }
-        let (px, py) = (_x8 * 8, _y8 * 8);
-        let lpred = dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
-        let mut r32 = [0i32; 1024];
-        crate::rd_sse::residual_dc(&mut r32, &self.src[0], self.w, px, py, 32, 32, lpred);
-        forward_dct_quant_32x32(&mut r32, &self.quant);
-        let cost32: u32 = est_block_bits(&r32, &SCAN_32X32) + OVERHEAD_16;
-        let mut cost16 = 0u32;
-        for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
-            let pred = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
-            let mut r16 = [0i32; 256];
-            crate::rd_sse::residual_dc(&mut r16, &self.src[0], self.w, px + sx, py + sy, 16, 16, pred);
-            forward_dct_quant_16x16(&mut r16, &self.quant);
-            cost16 += est_block_bits(&r16, &SCAN_16X16) + OVERHEAD_16;
-        }
-        cost32 + (cost16 >> 4) <= cost16
     }
 
     /// Code a 32x32 region (4:4:4 only) as a single TX_32X32 block: DC-pred luma

@@ -28,7 +28,7 @@
  */
 
 use crate::dct::{
-    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16, dct16x16_t, dct16x32_t, dct32x32, dct32x32_t,
+    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16_t, dct16x32_t, dct32x32, dct32x32_t,
 };
 use crate::qm_tables::AV1_IQM;
 
@@ -296,10 +296,6 @@ pub(crate) fn forward_dct_quant_8x8_t(
     q: &impl Dct,
 ) -> ([i32; 64], [f32; 64]) {
     dct8x8_t(residual, q)
-}
-
-pub(crate) fn forward_dct_quant_16x16(residual: &mut [i32; 256], q: &impl Dct) {
-    dct16x16(residual, q)
 }
 
 /// As [`forward_dct_quant_16x16`] but also returns the pre-round real targets.

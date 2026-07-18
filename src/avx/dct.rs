@@ -445,37 +445,6 @@ pub(crate) fn dct8x8_avx2_quant_t(
     unsafe { (cf.assume_init(), tf.assume_init()) }
 }
 
-#[target_feature(enable = "avx2")]
-pub(crate) fn dct16x16_avx2_coeffs(input: &[i32; 256]) -> [i32; 256] {
-    // Stage 1: vertical DCT-16 in 8-column groups. Store a real transposed
-    // scratch: tmp[x * 16 + vertical_frequency]. The second pass can then
-    // use contiguous loads instead of scalar strided reconstruction.
-    let mut tmp_u = MaybeUninit::<[i32; 256]>::uninit();
-    for x in (0..16usize).step_by(8) {
-        let mut cols = load16_i32(&input[x..], 16);
-        dct1d_16_v_i32(&mut cols);
-        store_transposed_cols_i32x8::<16>(tmp_u.as_mut_ptr().cast(), x, &cols);
-    }
-    let tmp = unsafe { tmp_u.assume_init() };
-
-    // Stage 2: horizontal DCT-16 in 8 vertical-frequency lanes.
-    let mut out = MaybeUninit::<[i32; 256]>::uninit();
-    for y in (0..16usize).step_by(8) {
-        let mut rows: [I32x8; 16] =
-            std::array::from_fn(|x| load_i32x8(unsafe { tmp.as_ptr().add(x * 16 + y) }));
-        dct1d_16_v_i32(&mut rows);
-        for u in 0..16usize {
-            unsafe {
-                store_i32x8(
-                    (out.as_mut_ptr() as *mut i32).add(u * 16 + y),
-                    rows[u].shr::<1>(),
-                );
-            }
-        }
-    }
-    unsafe { out.assume_init() }
-}
-
 #[inline]
 #[target_feature(enable = "avx2")]
 fn sar_epi64_12(v: __m256i) -> __m256i {
@@ -612,13 +581,6 @@ pub(crate) fn dct16x16_avx2_quant_t(
     }
     unsafe { (cf.assume_init(), tf.assume_init()) }
 }
-
-#[target_feature(enable = "avx2")]
-pub(crate) fn dct16x16_avx2_i32(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
-    let coeffs = dct16x16_avx2_coeffs(input);
-    quant_flat(&coeffs, dc_q, ac_q, input);
-}
-
 #[target_feature(enable = "avx2")]
 pub(crate) fn dct32x32_avx2_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     // Stage 1: vertical DCT-32 in 8-column groups. Store a true transposed
