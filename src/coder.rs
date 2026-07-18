@@ -3319,10 +3319,7 @@ fn encode_lossless_tilegroup(
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let want = pool.width();
-    // Thread-count-invariant: minimal tiling (lossless has no wavefront, so
-    // minimal tiling trades tile parallelism for smaller, thread-invariant
-    // output; lossless coding is search-free, so the serial cost is modest).
-    let tile_target = 1;
+    let tile_target = want.min((sb_cols as usize) * (sb_rows as usize)).max(1);
     let plan = plan_tiling(sb_cols, sb_rows, tile_target);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
@@ -3402,10 +3399,9 @@ fn encode_lossless_mono_tilegroup(
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
     let want = pool.width();
-    // Thread-count-invariant: minimal tiling (lossless has no wavefront, so
-    // minimal tiling trades tile parallelism for smaller, thread-invariant
-    // output; lossless coding is search-free, so the serial cost is modest).
-    let tile_target = 1;
+    // One tile per worker, spec- and superblock-clamped. See
+    // `encode_lossless_tilegroup` for the full rationale.
+    let tile_target = want.min((sb_cols as usize) * (sb_rows as usize)).max(1);
     let plan = plan_tiling(sb_cols, sb_rows, tile_target);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);

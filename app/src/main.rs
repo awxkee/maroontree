@@ -72,7 +72,7 @@ fn main() {
             &planar_rgb,
             &EncodeConfig::new()
                 .with_quality(67)
-                .with_cicp(Cicp::srgb_ycbcr())
+                .with_cicp(Cicp::identity_rgb())
                 .with_chroma(ChromaFormat::Yuv444)
                 .with_speed(Speed::Fast)
                 .with_threads(12)
