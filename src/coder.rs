@@ -961,6 +961,11 @@ const SPLIT_SIGNAL_BITS: f32 = 24.0;
 /// case) while keeping the flat-content wins. Distinct from the old
 /// `prefer_32x32` prefilter, which skipped the comparison entirely.
 const NONE32_SPLIT_BIAS: f32 = 1.03;
+/// Cost of signalling a non-DC uv_mode for the 4:2:0 4x4 SMOOTH_V chroma trial.
+const SMOOTH_V_UV_SIGNAL_BITS: f32 = 4.0;
+/// Required SSE improvement (in 1/1024) for the 32x32 TX-split to be accepted
+/// on a banding-risk block. See `code_block32`.
+const SPLIT32_SSE_MARGIN: i64 = 64;
 /// Same split-favoring thumb for the 64x64 SB NONE-vs-SPLIT decision (see
 /// `choose_64`). BLOCK_64X64 shares one prediction over a large area, so the
 /// distortion proxy is even coarser than at 32x32; the bias guards detail.

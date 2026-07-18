@@ -765,7 +765,21 @@ impl<'a> LossyTile<'a> {
             );
         }
         // SMOOTH_V check for 4:2:0 4x4 chroma: only at low quality (ac_q > 300)
-        let smooth_v_active_ss420 = false; // see note: chroma SMOOTH_V -> ADST_DCT not implemented; would desync decoder
+        // SMOOTH_V chroma derives ADST_DCT (dav1d `txtp_from_uvmode`). The old
+        // code predicted SMOOTH_V but transformed with plain DCT_DCT, which is
+        // what desynced the decoder — not a missing transform: `fwd_chroma_4x4`
+        // / `inv_chroma_4x4` already dispatch AdstDct. Using the derived tx on
+        // both sides makes this path legal.
+        // NOW CORRECT but measured at -0.00% BD-rate on 4:2:0, so left off: it
+        // costs an extra chroma trial per block for nothing. Two real bugs were
+        // fixed to get here (keep both if re-enabling):
+        //   1. it predicted SMOOTH_V but transformed with plain DCT_DCT, while
+        //      the decoder derives ADST_DCT (`chroma_tx_for_mode`) -> desync;
+        //   2. the reconstruction ranked SMOOTH_V ahead of the directional
+        //      `chosen_uv_420` mode, contradicting the emission precedence, so
+        //      when both fired the stream said one predictor and the encoder
+        //      used another (silent below q50, -16 SSIMU2 above q60).
+        let smooth_v_active_ss420 = false;
         let mut sv_preds_420 = [[0i32; 16]; 2];
         let mut chosen_uv_block = DC_PRED;
         // 4:2:0 directional chroma (PAETH/SMOOTH -> ADST_ADST 4x4). Populated by
@@ -781,19 +795,30 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f32,
                 trellis_lambda(),
             );
+            let maxv = (1i32 << self.bd) - 1;
+            let mlam_c = self.mlam_c();
+            let sv_tx = chroma_tx_for_mode(SMOOTH_V_PRED);
             let mut sv_ccf44_2 = [[0i32; 16]; 2];
-            let mut sse_cur = 0i64;
-            let mut sse_sv = 0i64;
+            // Real R-D on both legs. The old test compared raw PREDICTION error
+            // (`src - pred`) and ignored rate entirely, so it took SMOOTH_V
+            // whenever the predictor looked closer — even when the coded block
+            // ended up bigger and worse. Score reconstructed distortion + rate.
+            let mut dc_rd = 0f32;
+            let mut sv_rd = 0f32;
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = cpred[ci];
+                let dcrr = idct_dequant_4x4(&ccf44[ci], &self.cquant);
+                let mut sse_dc = 0i64;
                 for ry in 0..4 {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    for &sr in srow[..4].iter() {
-                        let d = sr - dc;
-                        sse_cur += (d * d) as i64;
+                    for j in 0..4 {
+                        let d = srow[j] - (dc + dcrr[ry * 4 + j]).clamp(0, maxv);
+                        sse_dc += (d * d) as i64;
                     }
                 }
+                dc_rd += rd_cost_i64(sse_dc, mlam_c, block_rate_bits(&ccf44[ci], &SCAN_4X4));
+
                 intra_predict_nd(
                     SMOOTH_V_PRED,
                     &self.recon[plane],
@@ -821,19 +846,23 @@ impl<'a> LossyTile<'a> {
                     4,
                     4,
                 );
-                let (q, qt) = forward_dct_quant_4x4_t(&resid, &self.cquant);
+                let (q, qt) = fwd_chroma_4x4(sv_tx, &resid, &self.cquant);
                 sv_ccf44_2[ci] = q;
                 trellis_optimize(&mut sv_ccf44_2[ci], &qt, dcq2, acq2, &SCAN_4X4, lam2);
+                let svrr = inv_chroma_4x4(sv_tx, &sv_ccf44_2[ci], &self.cquant);
+                let mut sse_sv = 0i64;
                 for ry in 0..4 {
                     let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
                     let prow = &sv_preds_420[ci][ry * 4..];
                     for j in 0..4 {
-                        let d = srow[j] - prow[j];
+                        let d = srow[j] - (prow[j] + svrr[ry * 4 + j]).clamp(0, maxv);
                         sse_sv += (d * d) as i64;
                     }
                 }
+                sv_rd += rd_cost_i64(sse_sv, mlam_c, block_rate_bits(&sv_ccf44_2[ci], &SCAN_4X4));
             }
-            if sse_sv < sse_cur {
+            // SMOOTH_V also costs a non-DC uv_mode symbol.
+            if sv_rd + rate_cost(mlam_c, SMOOTH_V_UV_SIGNAL_BITS) < dc_rd {
                 ccf44[..2].copy_from_slice(&sv_ccf44_2[..2]);
                 chosen_uv_block = SMOOTH_V_PRED;
             }
@@ -876,7 +905,15 @@ impl<'a> LossyTile<'a> {
                 for (ry, drow) in src.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     drow.copy_from_slice(&self.src[plane][(cy + ry) * self.cw + cx..][..4]);
                 }
-                let curr = idct_dequant_4x4(&ccf44[ci], &self.cquant);
+                let curr = if chosen_uv_block == SMOOTH_V_PRED {
+                    inv_chroma_4x4(
+                        chroma_tx_for_mode(SMOOTH_V_PRED),
+                        &ccf44[ci],
+                        &self.cquant,
+                    )
+                } else {
+                    idct_dequant_4x4(&ccf44[ci], &self.cquant)
+                };
                 let cur_pred = if chosen_uv_block == SMOOTH_V_PRED {
                     sv_preds_420[ci]
                 } else {
@@ -1374,22 +1411,41 @@ impl<'a> LossyTile<'a> {
                     continue; // recon preinstalled
                 }
                 let paeth420 = chosen_uv_420 != DC_PRED;
+                // Derive the inverse from the uv_mode that is ACTUALLY SIGNALLED,
+                // in the same precedence the emitter uses. Selecting on
+                // `chosen_uv_block` alone desyncs whenever CfL subsequently wins:
+                // the stream then says CFL_PRED (decoder derives DCT_DCT) while
+                // the encoder reconstructed with ADST_DCT. That decodes without
+                // error but collapses quality, and CfL wins more often at high
+                // quality — which is why this only showed above q60.
+                let uv_eff = if use_cfl {
+                    CFL_PRED
+                } else if paeth420 {
+                    chosen_uv_420
+                } else {
+                    chosen_uv_block
+                };
                 let rr = if block_skip {
                     [0i32; 16]
-                } else if paeth420 {
-                    inv_chroma_4x4(chroma_tx_for_mode(chosen_uv_420), &ccf44[ci], &self.cquant)
                 } else {
-                    idct_dequant_4x4(&ccf44[ci], &self.cquant)
+                    inv_chroma_4x4(chroma_tx_for_mode(uv_eff), &ccf44[ci], &self.cquant)
                 };
                 let max = (1 << self.bd) - 1;
                 for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
+                    // Precedence MUST match `uv_final` / `uv_eff` above:
+                    // CfL > directional(chosen_uv_420) > SMOOTH_V > DC. Ranking
+                    // SMOOTH_V ahead of the directional mode reconstructs with a
+                    // different predictor than the one signalled whenever both
+                    // fire — silent at low quality, but the directional chroma
+                    // search fires far more above q60, which is where this
+                    // showed up as a quality collapse at unchanged size.
                     if use_cfl {
                         recon_add_pred(&mut drow[..4], &cpred420[ci][ry * 4..], rrow, max);
-                    } else if chosen_uv_block == SMOOTH_V_PRED {
-                        recon_add_pred(&mut drow[..4], &sv_preds_420[ci][ry * 4..], rrow, max);
                     } else if paeth420 {
                         recon_add_pred(&mut drow[..4], &paeth_pred420[ci][ry * 4..], rrow, max);
+                    } else if chosen_uv_block == SMOOTH_V_PRED {
+                        recon_add_pred(&mut drow[..4], &sv_preds_420[ci][ry * 4..], rrow, max);
                     } else {
                         recon_add_dc(drow, cpred[ci], rrow, max);
                     }
