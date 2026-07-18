@@ -414,6 +414,10 @@ pub(crate) static PART_BL8_CDF: [[u16; 3]; 4] = [
 pub(crate) static TXSZ_CAT0_CDF: [[u16; 1]; 3] = [[19968], [19968], [24320]];
 pub(crate) static TXSZ_CAT1_CDF: [[u16; 2]; 3] = [[12272, 30172], [12272, 30172], [18677, 30848]];
 pub(crate) static TXSZ_CAT2_CDF: [[u16; 2]; 3] = [[12986, 15180], [12986, 15180], [24302, 25602]];
+// Category 3 (max TX 64x64-class): 3-symbol CDF (depth 0/1/2 -> TX_64X64 /
+// TX_32X32 / TX_16X16). libaom `default_tx_size_cdf[3]` (av1/common/token_cdfs
+// family). Enables intra BLOCK_64X64 with a signaled tx_depth.
+pub(crate) static TXSZ_CAT3_CDF: [[u16; 2]; 3] = [[5782, 11475], [5782, 11475], [16803, 22759]];
 
 // dav1d 1.4.1 txtp_intra1[TX_4X4] (raw CDF6 args; apply icdf() at load).
 // Verified: txtp_intra1[TX_8X8] sibling == existing TXTP_INTRA1_TX8.

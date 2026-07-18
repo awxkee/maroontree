@@ -215,7 +215,7 @@ pub(crate) struct Cdfs {
     pub(crate) filter_intra_mode: Vec<u16>,       // five filter-intra predictors
     pub(crate) cfl_sign: Vec<u16>,                // cfl joint-sign (8 symbols)
     pub(crate) cfl_alpha: Vec<Vec<u16>>,          // cfl alpha magnitude [6 ctx]
-    pub(crate) txsz: [Vec<Vec<u16>>; 3],          // intra tx_depth [t_dim.max-1][3 ctx]
+    pub(crate) txsz: [Vec<Vec<u16>>; 4],          // intra tx_depth [t_dim.max-1][3 ctx]
     pub(crate) txtp: Vec<Vec<u16>>,               // intra txtp TX_8X8 luma, per intra mode [13]
     pub(crate) txtp4: Vec<Vec<u16>>,              // intra txtp TX_4X4 luma, per intra mode [13]
     pub(crate) txtp16: Vec<Vec<u16>>,             // intra txtp TX_16X16 luma, per intra mode [13]
@@ -361,6 +361,7 @@ impl Cdfs {
                 TXSZ_CAT0_CDF.iter().map(|r| icdf(r)).collect(),
                 TXSZ_CAT1_CDF.iter().map(|r| icdf(r)).collect(),
                 TXSZ_CAT2_CDF.iter().map(|r| icdf(r)).collect(),
+                TXSZ_CAT3_CDF.iter().map(|r| icdf(r)).collect(),
             ],
             part_split: PART_SPLIT_CDF
                 .iter()
@@ -761,6 +762,7 @@ include!("coder/partition_search.rs");
 include!("coder/block16.rs");
 include!("coder/block8.rs");
 include!("coder/block32.rs");
+include!("coder/block64.rs");
 include!("coder/superblock.rs");
 
 /// Sum of squared error between the source and the reconstruction
@@ -959,6 +961,19 @@ const SPLIT_SIGNAL_BITS: f32 = 24.0;
 /// case) while keeping the flat-content wins. Distinct from the old
 /// `prefer_32x32` prefilter, which skipped the comparison entirely.
 const NONE32_SPLIT_BIAS: f32 = 1.03;
+/// Same split-favoring thumb for the 64x64 SB NONE-vs-SPLIT decision (see
+/// `choose_64`). BLOCK_64X64 shares one prediction over a large area, so the
+/// distortion proxy is even coarser than at 32x32; the bias guards detail.
+const NONE64_SPLIT_BIAS: f32 = 1.03;
+/// Extra weight on the 64x64 NONE leg's chroma cost for the subsampling modes
+/// where chroma carries more information (see `choose_64`). Compensates for the
+/// CfL + chroma-mode-search headroom the SPLIT leg's 32x32 children get and a
+/// whole-64 block cannot.
+const CHROMA64_HANDICAP_422: f32 = 1.6;
+const CHROMA64_HANDICAP_444: f32 = 2.2;
+/// Master switch for the whole-superblock BLOCK_64X64 intra path (4:2:0 only).
+pub static BLOCK64_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 const ASYM_PART_SIGNAL_BITS: f32 = SPLIT_SIGNAL_BITS;
 /// Extra uncertainty charge for A partitions whose final rectangular leaf
 /// predicts from siblings that have not yet been reconstructed during the
@@ -3519,6 +3534,36 @@ mod aq_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn skipped_whole_64_does_not_consume_delta_q() {
+        let src = [
+            vec![128i32; 64 * 64],
+            vec![128i32; 32 * 32],
+            vec![128i32; 32 * 32],
+        ];
+        let make_tile = || {
+            let mut tile = LossyTile::new_420(100, 8, 64, 64, &src, QmLevels::FLAT);
+            tile.aq.enabled = true;
+            tile.aq.read_deltas = true;
+            tile.aq.pending = -2;
+            tile
+        };
+
+        let mut skipped = make_tile();
+        skipped.code_skip_and_sb_tokens_64(true, 0);
+        assert!(
+            skipped.aq.read_deltas,
+            "a skipped whole superblock must return before read_delta_qindex"
+        );
+
+        let mut coded = make_tile();
+        coded.code_skip_and_sb_tokens_64(false, 0);
+        assert!(
+            !coded.aq.read_deltas,
+            "a non-skipped whole superblock must consume its delta-Q"
+        );
     }
 
     /// Dark protection over a full 64×64 SB of the given i32 plane, with the AV1

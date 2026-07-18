@@ -757,12 +757,7 @@ impl<'a> LossyTile<'a> {
         for plane in 1..=2 {
             let dc = pred(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
             let mut resid = [0i32; N];
-            for ry in 0..ch {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for x in 0..cw {
-                    resid[ry * cw + x] = srow[x] - dc;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, cw, ch, dc);
             let (mut cf, tf) = fwd(&resid, &self.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = inv(&cf, &self.cquant);
@@ -1094,25 +1089,6 @@ impl<'a> LossyTile<'a> {
         };
     }
 
-    /// Begin a superblock at luma pixel `(sb_x, sb_y)`: pick the SB's quantizer
-    /// from its local activity, retarget `self.quant`/`self.cquant`, and arm the
-    /// `read_delta_qindex` token that the SB's first coded block will emit. No-op
-    /// when AQ is disabled, so the non-AQ path is byte-identical.
-    /// Emit `read_lr` for one 64x64 luma restoration unit at the start of a
-    /// superblock (spec 5.11.57/58). With `LoopRestorationSize = 64` there is
-    /// exactly one unit per SB whose top-left is the SB origin. When `self.wiener`
-    /// is `None` nothing is emitted (RESTORE_NONE planes have no LR syntax).
-    /// Emit `read_lr` for the restoration units that start in the superblock at
-    /// **tile-local** pixel `(sb_x, sb_y)` (spec 5.11.57). Loop-restoration units
-    /// are frame-relative, so the superblock position and unit counts are
-    /// computed in frame coordinates (`frame_x0/y0`, `frame_w/h`). With
-    /// `LoopRestorationSize = 64` most superblocks contain exactly one luma unit;
-    /// small partial edge superblocks merge into the previous unit (the unit
-    /// count uses `(frame+unit/2)/unit`) and emit zero units. Because units are
-    /// >= the 64x64 superblock size and aligned to the frame grid, each unit's
-    /// > top-left superblock lies in exactly one tile, so every unit is signaled
-    /// > exactly once across all tiles — no tile-boundary special-casing needed.
-    /// > Emits nothing when `self.wiener` is `None`.
     fn emit_lr_sb(&mut self, sb_x: usize, sb_y: usize) {
         let Some(unit) = self.wiener else {
             return;
@@ -1300,7 +1276,8 @@ impl<'a> LossyTile<'a> {
                 4 => 0,
                 8 => 1,
                 16 => 2,
-                _ => 3,
+                32 => 3,
+                _ => 4,
             }
         };
         let (max_lw, max_lh) = (l2(w), l2(h));
@@ -1342,6 +1319,23 @@ impl<'a> LossyTile<'a> {
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
         if !block_skip && !self.cdef_point_marked {
+            self.cdef_point_marked = true;
+            self.enc.trace_cdef_mark();
+        }
+        self.code_delta_q_if_armed();
+    }
+
+    /// Whole-superblock counterpart of [`Self::code_skip_and_sb_tokens`]. AV1's
+    /// `read_delta_qindex()` returns immediately when `MiSize == sbSize && skip`,
+    /// so a skipped 64x64 block in a 64x64-superblock frame must not carry the
+    /// otherwise-per-SB delta-Q symbol.
+    fn code_skip_and_sb_tokens_64(&mut self, block_skip: bool, sctx: usize) {
+        self.enc
+            .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        if block_skip {
+            return;
+        }
+        if !self.cdef_point_marked {
             self.cdef_point_marked = true;
             self.enc.trace_cdef_mark();
         }

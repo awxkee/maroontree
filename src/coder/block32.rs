@@ -181,6 +181,12 @@ impl<'a> LossyTile<'a> {
     /// between NONE and SPLIT, then include derived chroma R-D when comparing
     /// that square candidate with HORZ/VERT.
     fn choose_rect32(&self, x8: usize, y8: usize) -> Part16 {
+        // Monochrome has no whole-32 emitter (`code_block32` dispatches to the
+        // 4:4:4 helper, which indexes the absent chroma planes), so 4:0:0 always
+        // splits — as it did before the NONE-vs-SPLIT R-D rework.
+        if self.mono {
+            return Part16::Split;
+        }
         let unpruned_rect32 = self.base_q_idx >= UNPRUNED_RECT32_MIN_QINDEX;
         let (px, py) = (x8 * 8, y8 * 8);
         let prdo = self.perceptual_rd_scale(px, py, 32);
@@ -1133,11 +1139,13 @@ impl<'a> LossyTile<'a> {
         let cfl_sig = 4.0f32
             + if cfl_a[0] != 0 { 4.0f32 } else { 0.0f32 }
             + if cfl_a[1] != 0 { 4.0f32 } else { 0.0f32 };
-        // Gate CfL on low quality: at high quality DC prediction is accurate and CfL
-        // alpha varying block-to-block creates visible color stripes at boundaries.
+        // Let the RD comparison decide DC-vs-CfL across the whole quality range;
+        // the old `acq > 300` gate suppressed CfL exactly where it helps most
+        // (high quality). block8/block16 already dropped it — this path was the
+        // last one still gated, which mattered most at 4:4:4 where chroma is
+        // full resolution and 32x32 blocks are common.
         let use_cfl = ru.map_or(
-            acq > 300.0
-                && (cfl_a[0] != 0 || cfl_a[1] != 0)
+            (cfl_a[0] != 0 || cfl_a[1] != 0)
                 && cfl_cost[0] + cfl_cost[1] + rate_cost(mlam, cfl_sig) < dc_cost[0] + dc_cost[1],
             |r| r.uv == CFL_PRED as u8,
         );

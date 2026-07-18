@@ -461,6 +461,28 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
+        // BL_64X64 whole-superblock PARTITION_NONE (all chroma formats; 4:0:0
+        // has no whole-64 chroma path and keeps splitting), when the full 64x64
+        // is in-frame. Compared against SPLIT by real R-D in `choose_64`.
+        if sz8 == 8
+            && !self.mono
+            && BLOCK64_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && (x8 + 8) * 8 <= self.w
+            && (y8 + 8) * 8 <= self.h
+        {
+            let choice = self.part_decision(|t| t.choose_64(x8, y8));
+            if choice == Part16::None {
+                let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+                self.enc
+                    .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]);
+                let have_tr = thr && y8 > 0 && (x8 * 8 + 64) < self.w;
+                let have_bl = lhb && x8 > 0 && (y8 * 8 + 64) < self.h;
+                self.code_block64(x8, y8, have_tr, have_bl);
+                self.a_part[x8..x8 + 8].fill(0x10);
+                self.l_part[y8..y8 + 8].fill(0x10);
+                return;
+            }
+        }
         let hh = sz8 / 2;
         // content past the horizontal / vertical midpoint of this block?
         let have_h = (x8 + hh) * 8 < self.w;

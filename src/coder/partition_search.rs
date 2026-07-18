@@ -333,12 +333,7 @@ impl<'a> LossyTile<'a> {
             let (bx4, by4) = (px / 4, py / 4);
             let lpred = dc_pred_8x16(&self.recon[0], self.w, px, py, self.bd as i32);
             let mut lresid = [0i32; 128];
-            for ry in 0..16 {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                for cx in 0..8 {
-                    lresid[ry * 8 + cx] = srow[cx] - lpred;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut lresid, &self.src[0], self.w, px, py, 8, 16, lpred);
             let (mut lcf, ltf) = dct8x16_t(&lresid, &self.quant);
             trellis_optimize(&mut lcf, &ltf, dcq, acq, &SCAN_8X16, lam);
             let mean_l = lresid.iter().sum::<i32>() / 128;
@@ -352,12 +347,7 @@ impl<'a> LossyTile<'a> {
                 let dc = dc_pred_8x16(&self.recon[plane], self.w, px, py, self.bd as i32);
                 cpred[ci] = dc;
                 let mut resid = [0i32; 128];
-                for ry in 0..16 {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    for cx in 0..8 {
-                        resid[ry * 8 + cx] = srow[cx] - dc;
-                    }
-                }
+                crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.w, px, py, 8, 16, dc);
                 let (mut q, qt) = dct8x16_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_8X16, lam);
                 let mean_c = resid.iter().sum::<i32>() / 128;
@@ -453,12 +443,7 @@ impl<'a> LossyTile<'a> {
             dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32)
         };
         let mut lresid = [0i32; 128];
-        for ry in 0..lh {
-            let srow = &self.src[0][(py + ry) * self.w + px..];
-            for cx in 0..lw {
-                lresid[ry * lw + cx] = srow[cx] - lpred;
-            }
-        }
+        crate::rd_sse::residual_dc(&mut lresid, &self.src[0], self.w, px, py, lw, lh, lpred);
         let (mut lcf, ltf) = if vert {
             dct8x16_t(&lresid, &self.quant)
         } else {
@@ -485,12 +470,7 @@ impl<'a> LossyTile<'a> {
             };
             cpred[ci] = dc;
             let mut resid = [0i32; 32];
-            for ry in 0..ch {
-                let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                for c in 0..cw {
-                    resid[ry * cw + c] = srow[c] - dc;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, cw, ch, dc);
             let (mut q, qt) = if vert {
                 dct4x8_t(&resid, &self.cquant)
             } else {
@@ -594,12 +574,7 @@ impl<'a> LossyTile<'a> {
             let (bx4, by4) = (px / 4, py / 4);
             let lpred = dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32);
             let mut lresid = [0i32; 128];
-            for ry in 0..8 {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                for cx in 0..16 {
-                    lresid[ry * 16 + cx] = srow[cx] - lpred;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut lresid, &self.src[0], self.w, px, py, 16, 8, lpred);
             let (mut lcf, ltf) = dct16x8_t(&lresid, &self.quant);
             trellis_optimize(&mut lcf, &ltf, dcq, acq, &SCAN_16X8, lam);
             let mean_l = lresid.iter().sum::<i32>() / 128;
@@ -615,12 +590,7 @@ impl<'a> LossyTile<'a> {
                 let dc = dc_pred_8x8(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
                 cpred[ci] = dc;
                 let mut resid = [0i32; 64];
-                for ry in 0..8 {
-                    let srow = &self.src[plane][(cy + ry) * self.cw + cx..];
-                    for c in 0..8 {
-                        resid[ry * 8 + c] = srow[c] - dc;
-                    }
-                }
+                crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, 8, 8, dc);
                 let (mut q, qt) = dct8x8_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_8X8, lam);
                 let mean_c = resid.iter().sum::<i32>() / 64;
@@ -710,12 +680,7 @@ impl<'a> LossyTile<'a> {
             // --- luma 16x8: DC predict, residual, forward, trellis, dc-snap ---
             let lpred = dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32);
             let mut lresid = [0i32; 128];
-            for ry in 0..8 {
-                let srow = &self.src[0][(py + ry) * self.w + px..];
-                for cx in 0..16 {
-                    lresid[ry * 16 + cx] = srow[cx] - lpred;
-                }
-            }
+            crate::rd_sse::residual_dc(&mut lresid, &self.src[0], self.w, px, py, 16, 8, lpred);
             let (mut lcf, ltf) = dct16x8_t(&lresid, &self.quant);
             trellis_optimize(&mut lcf, &ltf, dcq, acq, &SCAN_16X8, lam);
             let mean_l = lresid.iter().sum::<i32>() / 128;
@@ -730,12 +695,7 @@ impl<'a> LossyTile<'a> {
                 let dc = dc_pred_16x8(&self.recon[plane], self.w, px, py, self.bd as i32);
                 cpred[ci] = dc;
                 let mut resid = [0i32; 128];
-                for ry in 0..8 {
-                    let srow = &self.src[plane][(py + ry) * self.w + px..];
-                    for cx in 0..16 {
-                        resid[ry * 16 + cx] = srow[cx] - dc;
-                    }
-                }
+                crate::rd_sse::residual_dc(&mut resid, &self.src[plane], self.w, px, py, 16, 8, dc);
                 let (mut q, qt) = dct16x8_t(&resid, &self.cquant);
                 trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_16X8, lam);
                 let mean_c = resid.iter().sum::<i32>() / 128;

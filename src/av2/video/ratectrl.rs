@@ -33,6 +33,8 @@
 //! This is the analysis half of the "no complexity allocation" gap; the Q
 //! decision that consumes it is a separate, bitstream-affecting step.
 
+use crate::util::FastRound;
+
 /// Per-frame complexity metrics (8-bit luma scale).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameComplexity {
@@ -64,7 +66,9 @@ pub(crate) fn select_cq_qindex(
     let spatial_ratio = (current.spatial_activity + 1.0) / (mean.spatial_activity + 1.0);
     let temporal_ratio = (current.temporal_sad + 1.0) / (mean.temporal_sad + 1.0);
     let score = 3.0 * temporal_ratio.log2() - 2.0 * spatial_ratio.log2();
-    let delta = score.round().clamp(-(max_delta as f32), max_delta as f32) as i32;
+    let delta = score
+        .fast_round()
+        .clamp(-(max_delta as f32), max_delta as f32) as i32;
     (i32::from(nominal_q) + delta).clamp(1, 254) as u8
 }
 
