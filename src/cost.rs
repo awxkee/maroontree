@@ -142,12 +142,8 @@ pub(crate) fn mode_lambda_aom(dc_q: f32, qindex: u8, bd: u8, tune_ssimulacra2: b
 }
 
 #[inline]
-pub(crate) fn mode_lambda_weight(qindex: u8, tune: bool) -> f32 {
-    if tune {
-        aom_ssimulacra2_rdmult_weight(qindex)
-    } else {
-        1.0
-    }
+pub(crate) fn mode_lambda_weight(qindex: u8) -> f32 {
+    aom_ssimulacra2_rdmult_weight(qindex)
 }
 
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in

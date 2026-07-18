@@ -569,8 +569,7 @@ impl<'a> LossyTile<'a> {
     /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
     #[inline]
     fn tune_weight(&self) -> f32 {
-        let tune = TUNE_SSIMULACRA2.load(std::sync::atomic::Ordering::Relaxed);
-        mode_lambda_weight(self.base_q_idx, tune)
+        mode_lambda_weight(self.base_q_idx)
     }
 
     fn prefer_8x8_none(&self, x8: usize, y8: usize) -> bool {
@@ -1443,7 +1442,7 @@ impl<'a> LossyTile<'a> {
         let n = (bw * bh) as f32;
         let mean = sum as f32 / n;
         let var = (sum2 as f32 / n - mean * mean).max(0.0);
-        let act = (1.0 + var).ln();
+        let act = dirty_log1pf(var);
         let c = prdo_clamp();
         (k * (act - refa)).exp().clamp(1.0 / c, c)
     }

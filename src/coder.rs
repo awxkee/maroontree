@@ -66,9 +66,6 @@ pub static HORZ_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 pub static VERT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-pub(crate) static TUNE_SSIMULACRA2: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[inline]
 fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
     candidate_sse <= best_sse
@@ -86,7 +83,7 @@ enum Part16 {
     VertA,
     VertB,
 }
-use crate::aq_common::DarkAq;
+use crate::aq_common::{DarkAq, dirty_log1pf};
 use crate::trellis::{trellis_optimize, trellis_optimize_ctx};
 
 use crate::coeffs::encode_tx16_coeffs_adapt;
@@ -496,6 +493,7 @@ impl VarianceBoost {
 /// `(sb_x, sb_y)`, returned as `ln(1 + variance)` — a perceptually reasonable
 /// "activity" that compresses the huge dynamic range of raw variance. Operates
 /// on the padded `i32` luma plane of stride `pw`.
+#[inline(never)]
 fn sb_activity(
     yp: &[i32],
     pw: usize,
@@ -522,7 +520,7 @@ fn sb_activity(
     let n = (h * w) as f32;
     let mean = sum as f32 / n;
     let var = (sum2 as f32 / n - mean * mean).max(0.0);
-    (1.0 + var).ln()
+    dirty_log1pf(var)
 }
 
 fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
@@ -566,15 +564,14 @@ fn aq_sb_subblock_variances(
 ) -> usize {
     let mut filled = 0usize;
     let mut acc = 0f32;
-    for by in 0..8 {
-        for bx in 0..8 {
+    for (by, row) in out.as_chunks_mut::<8>().0.iter_mut().take(8).enumerate() {
+        for (bx, out) in row.iter_mut().enumerate() {
             let y0 = sb_y + by * 8;
             let x0 = sb_x + bx * 8;
             let h = height.saturating_sub(y0).min(8);
             let w = width.saturating_sub(x0).min(8);
-            let idx = by * 8 + bx;
             if h == 0 || w == 0 {
-                out[idx] = f32::NAN; // out-of-frame, patched below
+                *out = f32::NAN; // out-of-frame, patched below
                 continue;
             }
             let mut sum = 0i64;
@@ -590,7 +587,7 @@ fn aq_sb_subblock_variances(
             let n = (h * w) as f32;
             let mean = sum as f32 / n;
             let var = (sum2 as f32 / n - mean * mean).max(0.0);
-            out[idx] = var;
+            *out = var;
             acc += var;
             filled += 1;
         }
