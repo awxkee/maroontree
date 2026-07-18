@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::aq_common::f_fmlaf;
 
 impl<'a> LossyTile<'a> {
     /// CDFs used by DECISION-side rate estimates (RDOQ trellis, filter-intra /
@@ -35,7 +36,11 @@ impl<'a> LossyTile<'a> {
     /// adaptive-cost behavior for A/B comparisons only.
     #[inline]
     fn dcdf(&self) -> &Cdfs {
-        if self.dec_live { &self.cdfs } else { &self.dec_cdfs }
+        if self.dec_live {
+            &self.cdfs
+        } else {
+            &self.dec_cdfs
+        }
     }
 
     fn new(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<i32>; 3], qm: QmLevels) -> Self {
@@ -1291,8 +1296,7 @@ impl<'a> LossyTile<'a> {
         let (max_lw, max_lh) = (l2(w), l2(h));
         let cat = max_lw.max(max_lh) as usize - 1; // t_dim.max - 1 (max == max(lw, lh))
         let (bx4, by4) = (px / 4, py / 4);
-        let ctx =
-            (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
+        let ctx = (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
         self.enc.encode_symbol(depth, &mut self.cdfs.txsz[cat][ctx]);
         // Chosen TX dims: each depth step goes to `t_dim.sub` — the square of
         // the smaller dim for rects, then square halvings (floor TX_4X4).
@@ -1410,6 +1414,71 @@ impl<'a> LossyTile<'a> {
         let var = (sum2 as f32 / n - mean * mean).max(0.0);
         let act = dirty_log1pf(var);
         let c = prdo_clamp();
-        (k * (act - refa)).exp().clamp(1.0 / c, c)
+        let exponent = (k * (act - refa)).clamp(-std::f32::consts::LN_2, std::f32::consts::LN_2);
+        dirty_exp2f(exponent * std::f32::consts::LOG2_E).clamp(1.0 / c, c)
+    }
+}
+
+const EXP2_TABLE_SIZE: usize = 64;
+
+#[repr(align(64))]
+struct Exp2Table([u32; EXP2_TABLE_SIZE]);
+
+// 2^((i - 32) / 64), rounded to f32.
+#[rustfmt::skip]
+static EXP2F_TABLE: Exp2Table = Exp2Table([
+    0x3F3504F3, 0x3F36FD92, 0x3F38FBAF, 0x3F3AFF5B, 0x3F3D08A4, 0x3F3F179A, 0x3F412C4D, 0x3F4346CD,
+    0x3F45672A, 0x3F478D75, 0x3F49B9BE, 0x3F4BEC15, 0x3F4E248C, 0x3F506334, 0x3F52A81E, 0x3F54F35B,
+    0x3F5744FD, 0x3F599D16, 0x3F5BFBB8, 0x3F5E60F5, 0x3F60CCDF, 0x3F633F89, 0x3F65B907, 0x3F68396A,
+    0x3F6AC0C7, 0x3F6D4F30, 0x3F6FE4BA, 0x3F728177, 0x3F75257D, 0x3F77D0DF, 0x3F7A83B3, 0x3F7D3E0C,
+    0x3F800000, 0x3F8164D2, 0x3F82CD87, 0x3F843A29, 0x3F85AAC3, 0x3F871F62, 0x3F88980F, 0x3F8A14D5,
+    0x3F8B95C2, 0x3F8D1ADF, 0x3F8EA43A, 0x3F9031DC, 0x3F91C3D3, 0x3F935A2B, 0x3F94F4F0, 0x3F96942D,
+    0x3F9837F0, 0x3F99E046, 0x3F9B8D3A, 0x3F9D3EDA, 0x3F9EF532, 0x3FA0B051, 0x3FA27043, 0x3FA43516,
+    0x3FA5FED7, 0x3FA7CD94, 0x3FA9A15B, 0x3FAB7A3A, 0x3FAD583F, 0x3FAF3B79, 0x3FB123F6, 0x3FB311C4,
+]);
+
+#[inline(always)]
+pub(crate) fn dirty_exp2f(d: f32) -> f32 {
+    let redux = f32::from_bits(0x4b400000) / EXP2_TABLE_SIZE as f32;
+
+    let ui = (d + redux).to_bits();
+    let mut i0 = ui.wrapping_add(EXP2_TABLE_SIZE as u32 / 2);
+    let k = i0 / EXP2_TABLE_SIZE as u32;
+    i0 &= EXP2_TABLE_SIZE as u32 - 1;
+    let uf = f32::from_bits(ui) - redux;
+
+    let z0 = f32::from_bits(EXP2F_TABLE.0[i0 as usize]);
+    let f = d - uf;
+
+    // Sollya: fpminimax(2^x, 2, [|single...|], [-1/128; 1/128], relative);
+    let mut u = 0.24022668600082397;
+    u = f_fmlaf(u, f, 0.693149745464325);
+    u *= f;
+
+    let i2 = f32::from_bits(k.wrapping_add(0x7f) << 23);
+    f_fmlaf(u, z0, z0) * i2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perceptual_exp2_matches_system_exp() {
+        const SAMPLES: usize = 65_536;
+        let lo = -std::f32::consts::LN_2;
+        let hi = std::f32::consts::LN_2;
+        let mut max_relative_error = 0.0f32;
+        for i in 0..=SAMPLES {
+            let x = lo + (hi - lo) * (i as f32 / SAMPLES as f32);
+            let expected = x.exp();
+            let relative_error =
+                ((dirty_exp2f(x * std::f32::consts::LOG2_E) - expected) / expected).abs();
+            max_relative_error = max_relative_error.max(relative_error);
+        }
+        assert!(
+            max_relative_error <= 3.0e-7,
+            "maximum relative error {max_relative_error:e} exceeded the bound"
+        );
     }
 }
