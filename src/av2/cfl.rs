@@ -51,22 +51,6 @@ fn round_pow2_signed(v: i32, n: u32) -> i32 {
 /// Minimum variance (in Q0 luma², i.e. plain 8-bit luma units squared) that the
 /// MHCCP derivation reference region must have for the cross-component filter to
 /// be numerically well-conditioned.
-///
-/// MHCCP solves a 3-tap least-squares system whose columns are the luma tap, a
-/// non-linear luma term and a constant. When the reference luma is nearly
-/// constant (flat sky, smooth gradients) all three columns are ~constant, the
-/// system is near-singular, and the solved filter acquires an enormous gain.
-/// The encoder derives that filter from its own f32 reconstruction while the
-/// decoder derives from its integer reconstruction; the sub-LSB reference
-/// difference is then amplified into a catastrophically different (saturated)
-/// chroma prediction — the 4:4:4 low-quality "colored block" collapse. An
-/// encoder-side guard on the solved *parameters* cannot fix this: the decoder
-/// re-derives independently and can explode even when the encoder's params look
-/// tame. The reliable, drift-robust criterion is the *input* conditioning: the
-/// reference luma variance, which both sides see as ~equal (flat ± 1 LSB is
-/// still flat). Skipping MHCCP on low-variance blocks costs nothing — DC
-/// prediction already handles flat chroma — and removes the singular solves the
-/// decoder would otherwise explode on.
 const MHCCP_MIN_REF_VAR: f64 = 64.0;
 
 /// Population variance of the luma samples in the MHCCP derivation region — the
