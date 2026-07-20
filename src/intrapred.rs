@@ -506,12 +506,11 @@ pub(crate) fn intra_predict_nd(
 }
 
 /// As [`intra_predict_nd`] but with an explicit AV1 `angle_delta` in
-/// `-3..=3` (steps of 3°). The delta is applied only to the six pure diagonal
-/// modes (D45/D67/D135/D113/D157/D203), whose ±9° range stays within a single
-/// z1/z2/z3 prediction path so the existing dispatch and reference setup are
-/// reused unchanged; V/H/DC/SMOOTH*/PAETH ignore it. The `DR_INTRA_DERIVATIVE`
-/// table has valid entries at every `base + delta*3` angle. Directional edges
-/// are filtered and optionally upsampled before the zone projector runs.
+/// `-3..=3` (steps of 3°). The delta is applied to all eight directional modes;
+/// V/H deltas can cross the 90°/180° zone boundaries. The
+/// `DR_INTRA_DERIVATIVE` table has valid entries at every `base + delta*3`
+/// angle. Directional edges are filtered and optionally upsampled before the
+/// appropriate zone projector runs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn intra_predict_nd_ad(
     mode: usize,
@@ -530,6 +529,85 @@ pub(crate) fn intra_predict_nd_ad(
     out: &mut [i32],
     bd: u8,
 ) {
+    intra_predict_nd_ad_impl(
+        mode,
+        angle_delta,
+        recon,
+        stride,
+        ox,
+        oy,
+        bw,
+        bh,
+        have_tr,
+        have_bl,
+        fw,
+        fh,
+        filter_type,
+        true,
+        out,
+        bd,
+    )
+}
+
+/// Lossless counterpart of [`intra_predict_nd_ad`] reading reconstructed
+/// integer samples directly from the encoder's `i16` source/recon plane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn intra_predict_nd_ad_i16(
+    mode: usize,
+    angle_delta: i32,
+    recon: &[i16],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    have_tr: bool,
+    have_bl: bool,
+    fw: usize,
+    fh: usize,
+    filter_type: bool,
+    out: &mut [i32],
+    bd: u8,
+) {
+    intra_predict_nd_ad_impl(
+        mode,
+        angle_delta,
+        recon,
+        stride,
+        ox,
+        oy,
+        bw,
+        bh,
+        have_tr,
+        have_bl,
+        fw,
+        fh,
+        filter_type,
+        false,
+        out,
+        bd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intra_predict_nd_ad_impl<T: Copy + Into<i32>>(
+    mode: usize,
+    angle_delta: i32,
+    recon: &[T],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    have_tr: bool,
+    have_bl: bool,
+    fw: usize,
+    fh: usize,
+    filter_type: bool,
+    enable_edge_filter: bool,
+    out: &mut [i32],
+    bd: u8,
+) {
     let have_top = oy > 0;
     let have_left = ox > 0;
     let base = 1i32 << (bd - 1);
@@ -538,11 +616,11 @@ pub(crate) fn intra_predict_nd_ad(
     let edge_len = bw + bh;
     if have_top {
         for i in 0..bw {
-            above.set(i as i32, recon[(oy - 1) * stride + ox + i]);
+            above.set(i as i32, recon[(oy - 1) * stride + ox + i].into());
         }
     } else {
         let fill = if have_left {
-            recon[oy * stride + ox - 1]
+            recon[oy * stride + ox - 1].into()
         } else {
             base - 1
         };
@@ -552,11 +630,11 @@ pub(crate) fn intra_predict_nd_ad(
     }
     if have_left {
         for j in 0..bh {
-            left_edge.set(j as i32, recon[(oy + j) * stride + ox - 1]);
+            left_edge.set(j as i32, recon[(oy + j) * stride + ox - 1].into());
         }
     } else {
         let fill = if have_top {
-            recon[(oy - 1) * stride + ox]
+            recon[(oy - 1) * stride + ox].into()
         } else {
             base + 1
         };
@@ -566,12 +644,12 @@ pub(crate) fn intra_predict_nd_ad(
     }
     let corner = if have_left {
         if have_top {
-            recon[(oy - 1) * stride + ox - 1]
+            recon[(oy - 1) * stride + ox - 1].into()
         } else {
-            recon[oy * stride + ox - 1]
+            recon[oy * stride + ox - 1].into()
         }
     } else if have_top {
-        recon[(oy - 1) * stride + ox]
+        recon[(oy - 1) * stride + ox].into()
     } else {
         base
     };
@@ -584,7 +662,10 @@ pub(crate) fn intra_predict_nd_ad(
             0
         };
         for i in 0..px_have {
-            above.set((bw + i) as i32, recon[(oy - 1) * stride + ox + bw + i]);
+            above.set(
+                (bw + i) as i32,
+                recon[(oy - 1) * stride + ox + bw + i].into(),
+            );
         }
         let fill = above.get((bw + px_have).saturating_sub(1) as i32);
         for i in bw + px_have..edge_len {
@@ -598,7 +679,10 @@ pub(crate) fn intra_predict_nd_ad(
             0
         };
         for i in 0..px_have {
-            left_edge.set((bh + i) as i32, recon[(oy + bh + i) * stride + ox - 1]);
+            left_edge.set(
+                (bh + i) as i32,
+                recon[(oy + bh + i) * stride + ox - 1].into(),
+            );
         }
         let fill = left_edge.get((bh + px_have).saturating_sub(1) as i32);
         for i in bh + px_have..edge_len {
@@ -607,8 +691,8 @@ pub(crate) fn intra_predict_nd_ad(
     }
 
     let angle = match mode {
-        V_PRED => 90,
-        H_PRED => 180,
+        V_PRED => 90 + angle_delta * 3,
+        H_PRED => 180 + angle_delta * 3,
         D45_PRED => 45 + angle_delta * 3,
         VERT_LEFT_PRED => 67 + angle_delta * 3,
         D135_PRED => 135 + angle_delta * 3,
@@ -627,23 +711,27 @@ pub(crate) fn intra_predict_nd_ad(
         // on physical neighbour availability leaves the edge unprocessed while
         // the projector still uses upsampled coordinates, which desynchronizes
         // zone-2 prediction at tile/frame boundaries.
-        if angle > 90 && angle < 180 && edge_len >= 24 {
-            filter_intra_corner(&mut above, &mut left_edge);
+        if enable_edge_filter {
+            if angle > 90 && angle < 180 && edge_len >= 24 {
+                filter_intra_corner(&mut above, &mut left_edge);
+            }
+            let strength = intra_edge_filter_strength(bw, bh, filter_type, angle - 90);
+            filter_intra_edge(
+                &mut above,
+                bw + 1 + if angle < 90 { bh } else { 0 },
+                strength,
+            );
+            let strength = intra_edge_filter_strength(bh, bw, filter_type, angle - 180);
+            filter_intra_edge(
+                &mut left_edge,
+                bh + 1 + if angle > 180 { bw } else { 0 },
+                strength,
+            );
         }
-        let strength = intra_edge_filter_strength(bw, bh, filter_type, angle - 90);
-        filter_intra_edge(
-            &mut above,
-            bw + 1 + if angle < 90 { bh } else { 0 },
-            strength,
-        );
-        let strength = intra_edge_filter_strength(bh, bw, filter_type, angle - 180);
-        filter_intra_edge(
-            &mut left_edge,
-            bh + 1 + if angle > 180 { bw } else { 0 },
-            strength,
-        );
-        upsample_above = use_intra_edge_upsample(bw, bh, filter_type, angle - 90);
-        upsample_left = use_intra_edge_upsample(bh, bw, filter_type, angle - 180);
+        upsample_above =
+            enable_edge_filter && use_intra_edge_upsample(bw, bh, filter_type, angle - 90);
+        upsample_left =
+            enable_edge_filter && use_intra_edge_upsample(bh, bw, filter_type, angle - 180);
         if upsample_above {
             upsample_intra_edge(&mut above, bw + if angle < 90 { bh } else { 0 }, bd);
         }
@@ -651,25 +739,25 @@ pub(crate) fn intra_predict_nd_ad(
             upsample_intra_edge(&mut left_edge, bh + if angle > 180 { bw } else { 0 }, bd);
         }
     }
-    let mut top = [0i32; 64];
-    let mut left = [0i32; 64];
+    let mut top = [0i32; 128];
+    let mut left = [0i32; 128];
     for i in 0..edge_len {
         top[i] = above.get(i as i32);
         left[i] = left_edge.get(i as i32);
     }
 
     match mode {
-        V_PRED => {
+        _ if directional && angle == 90 => {
             for orow in out.chunks_exact_mut(bw) {
                 orow.copy_from_slice(&top[..bw]);
             }
         }
-        H_PRED => {
+        _ if directional && angle == 180 => {
             for (orow, &lv) in out.chunks_exact_mut(bw).zip(left.iter()) {
                 orow.iter_mut().for_each(|o| *o = lv);
             }
         }
-        D45_PRED | VERT_LEFT_PRED => {
+        _ if directional && angle < 90 => {
             let dx = DR_INTRA_DERIVATIVE[(angle >> 1) as usize];
             let up = upsample_above as i32;
             let max_base_x = (edge_len as i32 - 1) << up;
@@ -693,7 +781,7 @@ pub(crate) fn intra_predict_nd_ad(
                 }
             }
         }
-        D203_PRED => {
+        _ if directional && angle > 180 => {
             let dy = DR_INTRA_DERIVATIVE[((270 - angle) >> 1) as usize];
             let up = upsample_left as i32;
             let max_base_y = (edge_len as i32 - 1) << up;
@@ -718,7 +806,7 @@ pub(crate) fn intra_predict_nd_ad(
                 }
             }
         }
-        D135_PRED | D113_PRED | D157_PRED => {
+        _ if directional => {
             let dy = DR_INTRA_DERIVATIVE[((angle - 90) >> 1) as usize];
             let dx = DR_INTRA_DERIVATIVE[((180 - angle) >> 1) as usize];
             let up_a = upsample_above as i32;

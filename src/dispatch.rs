@@ -330,6 +330,7 @@ pub(crate) fn encode_lossless_monochrome(
     luma: &[i16],
     full_range: bool,
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(width > 0 && height > 0, "width/height must be non-zero");
     assert_eq!(luma.len(), width * height, "luma plane must be w*h");
@@ -353,6 +354,7 @@ pub(crate) fn encode_lossless_monochrome(
         height,
         &padded,
         threads,
+        speed,
     ));
     bytes
 }

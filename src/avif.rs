@@ -90,7 +90,7 @@ pub enum ChromaFormat {
 /// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
-    /// Exhaustive rate-distortion
+    /// Highest-effort rate-distortion search.
     #[default]
     Slow,
     /// Balanced: RDOQ is run once on the chosen mode only
@@ -165,7 +165,9 @@ pub struct EncodeConfig {
     /// Worker threads for tile-level parallelism.
     /// `0` = all available cores; `1` = serial; `N` = up to N.
     pub threads: usize,
-    /// RDO effort (AV1 lossy path). See [`Speed`]; defaults to [`Speed::Slow`].
+    /// RDO effort for AV1 lossy and lossless paths. See [`Speed`]; defaults to
+    /// [`Speed::Slow`]. In lossless mode, only Slow refines directional modes
+    /// with nonzero angle deltas.
     pub speed: Speed,
     pub adaptive_quant: bool,
     /// Enable the AV2-style **Variance Boost** adaptive-quantization scheme on the
@@ -277,7 +279,7 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the RDO effort level (AV1 lossy path). See [`Speed`].
+    /// Set the RDO effort level for AV1 lossy and lossless paths. See [`Speed`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         self

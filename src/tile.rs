@@ -27,11 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::Speed;
 use crate::cdf_tables as C;
 use crate::coefs::encode_coefs;
 use crate::cost::coef_rate_bits;
-use crate::intrapred::INTRA_MODE_CTX;
-use crate::intrapred::palette_pred;
+use crate::intrapred::{INTRA_MODE_CTX, intra_predict_nd_ad_i16, palette_pred};
 use crate::msac_enc::Writer;
 use crate::skip_tables::SKIP_CTX;
 use crate::tables::*;
@@ -79,11 +79,10 @@ fn dc_pred_4x4(plane: &[i16], stride: usize, ox: usize, oy: usize, base: i32) ->
 /// dav1d `sm_weights` for n=4 (SMOOTH predictors).
 static SM4: [i32; 4] = [255, 149, 85, 64];
 
-/// Non-directional luma/chroma modes evaluated by the lossless mode search, in
-/// CDF symbol order. DC(0), V(1), H(2), SMOOTH(9), SMOOTH_V(10), SMOOTH_H(11),
-/// PAETH(12). Directional modes are omitted (their small 4x4 reach and the
-/// edge-array machinery add little for lossless photographic content).
-static LL_MODES: [usize; 7] = [0, 1, 2, 9, 10, 11, 12];
+/// Every AV1 luma/chroma intra predictor eligible for the square lossless
+/// blocks emitted here, in CDF symbol order: DC, the eight directionals,
+/// SMOOTH variants, and PAETH.
+static LL_MODES: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
 #[derive(Clone)]
 struct LumaPalette {
@@ -499,6 +498,83 @@ fn predict_4x4(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn predict_lossless_4x4(
+    mode: usize,
+    angle_delta: i32,
+    plane: &[i16],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    block_x: usize,
+    block_y: usize,
+    block_size: usize,
+    out: &mut [i32; 16],
+    base: i32,
+    bit_depth: u8,
+) {
+    if (1..=8).contains(&mode) {
+        let tx = (ox - block_x) / 4;
+        let ty = (oy - block_y) / 4;
+        let n = block_size / 4;
+        let (outer_tr, outer_bl) = lossless_leaf_edge_flags(block_x, block_y, block_size);
+        let have_tr = tx + 1 < n || (ty == 0 && outer_tr);
+        let have_bl = tx == 0 && (ty + 1 < n || outer_bl);
+        intra_predict_nd_ad_i16(
+            mode,
+            angle_delta,
+            plane,
+            stride,
+            ox,
+            oy,
+            4,
+            4,
+            have_tr,
+            have_bl,
+            stride,
+            plane.len() / stride,
+            false,
+            out,
+            bit_depth,
+        );
+    } else {
+        predict_4x4(mode, plane, stride, ox, oy, out, base);
+    }
+}
+
+/// Return AV1's top-right and bottom-left availability flags for a square leaf
+/// in the 64x64 superblock partition tree.  These flags describe coding-order
+/// availability, not merely whether the referenced pixels are inside the
+/// frame: a geometrically present bottom-left block may not have been decoded
+/// yet.  This is the square SPLIT/NONE subset of dav1d's `intra_edge_tree`.
+fn lossless_leaf_edge_flags(block_x: usize, block_y: usize, block_size: usize) -> (bool, bool) {
+    debug_assert!(matches!(block_size, 8 | 16 | 32 | 64));
+    let mut top_has_right = true;
+    let mut left_has_bottom = false;
+    let mut size = 64usize;
+    let mut x = block_x & 63;
+    let mut y = block_y & 63;
+
+    while size > block_size {
+        let half = size / 2;
+        let right = x >= half;
+        let bottom = y >= half;
+        let quadrant = usize::from(right) + 2 * usize::from(bottom);
+        let parent_tr = top_has_right;
+        let parent_bl = left_has_bottom;
+        top_has_right = !(quadrant == 3 || (quadrant == 1 && !parent_tr));
+        left_has_bottom = quadrant == 0 || (quadrant == 2 && parent_bl);
+        if right {
+            x -= half;
+        }
+        if bottom {
+            y -= half;
+        }
+        size = half;
+    }
+    (top_has_right, left_has_bottom)
+}
+
 /// Partition context for a node, from the above/left partition-context arrays
 /// (absolute 8px-unit indexing). Matches dav1d `get_partition_ctx`.
 fn get_partition_ctx(a: &[u8], l: &[u8], bl: usize, x8: usize, y8: usize) -> usize {
@@ -533,7 +609,9 @@ fn encode_plane_block(
     n_tx: usize,
     chroma: bool,
     mode: usize,
+    angle_delta: i32,
     base: i32,
+    bit_depth: u8,
     a: &mut [u8],
     l: &mut [u8],
     palette: Option<&LumaPalette>,
@@ -577,7 +655,20 @@ fn encode_plane_block(
                     pred[row * 4..row * 4 + 4].copy_from_slice(src);
                 }
             } else {
-                predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+                predict_lossless_4x4(
+                    mode,
+                    angle_delta,
+                    plane,
+                    stride,
+                    ox,
+                    oy,
+                    bx,
+                    by,
+                    n_tx * 4,
+                    &mut pred,
+                    base,
+                    bit_depth,
+                );
             }
             for (ry, (rrow, prow)) in resid
                 .as_chunks_mut::<4>()
@@ -603,12 +694,14 @@ fn encode_plane_block(
 /// at `(bx, by)` with `mode`.
 fn plane_leaf_bits(
     mode: usize,
+    angle_delta: i32,
     plane: &[i16],
     stride: usize,
     bx: usize,
     by: usize,
     n_tx: usize,
     base: i32,
+    bit_depth: u8,
 ) -> f32 {
     let mut bits = 0f32;
     let mut pred = [0i32; 16];
@@ -617,7 +710,20 @@ fn plane_leaf_bits(
     for ty in 0..n_tx {
         for tx in 0..n_tx {
             let (ox, oy) = (bx + tx * 4, by + ty * 4);
-            predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+            predict_lossless_4x4(
+                mode,
+                angle_delta,
+                plane,
+                stride,
+                ox,
+                oy,
+                bx,
+                by,
+                n_tx * 4,
+                &mut pred,
+                base,
+                bit_depth,
+            );
             let mut any = false;
             for (ry, (rrow, prow)) in resid
                 .as_chunks_mut::<4>()
@@ -646,6 +752,7 @@ fn plane_leaf_bits(
     bits
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Best luma + best uv mode for a leaf, with total residual+overhead bits.
 #[allow(clippy::too_many_arguments)]
 fn best_leaf(
@@ -658,24 +765,68 @@ fn best_leaf(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
-) -> (f32, usize, usize, Option<LumaPalette>, bool) {
+    angle_delta_rdo: bool,
+) -> (f32, usize, i32, usize, i32, Option<LumaPalette>, bool) {
     let mut y_mode = 0usize;
+    let mut y_delta = 0i32;
     let mut yb = f32::INFINITY;
+    let mut y_directional = [(f32::INFINITY, 0usize); 8];
     for &m in LL_MODES.iter() {
-        let b = plane_leaf_bits(m, planes[0], stride, px, py, n_tx, base);
+        let mut b = plane_leaf_bits(m, 0, planes[0], stride, px, py, n_tx, base, bit_depth);
+        if (1..=8).contains(&m) {
+            b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
+            y_directional[m - 1] = (b, m);
+        }
         if b < yb {
             yb = b;
             y_mode = m;
+            y_delta = 0;
+        }
+    }
+    if angle_delta_rdo {
+        y_directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for &(_, m) in &y_directional[..3] {
+            for delta in [-3, -2, -1, 1, 2, 3] {
+                let b = plane_leaf_bits(m, delta, planes[0], stride, px, py, n_tx, base, bit_depth)
+                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                if b < yb {
+                    yb = b;
+                    y_mode = m;
+                    y_delta = delta;
+                }
+            }
         }
     }
     let mut uv_mode = 0usize;
+    let mut uv_delta = 0i32;
     let mut ub = f32::INFINITY;
+    let mut uv_directional = [(f32::INFINITY, 0usize); 8];
     for &m in LL_MODES.iter() {
-        let b = plane_leaf_bits(m, planes[1], stride, px, py, n_tx, base)
-            + plane_leaf_bits(m, planes[2], stride, px, py, n_tx, base);
+        let mut b = plane_leaf_bits(m, 0, planes[1], stride, px, py, n_tx, base, bit_depth)
+            + plane_leaf_bits(m, 0, planes[2], stride, px, py, n_tx, base, bit_depth);
+        if (1..=8).contains(&m) {
+            b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
+            uv_directional[m - 1] = (b, m);
+        }
         if b < ub {
             ub = b;
             uv_mode = m;
+            uv_delta = 0;
+        }
+    }
+    if angle_delta_rdo {
+        uv_directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for &(_, m) in &uv_directional[..3] {
+            for delta in [-3, -2, -1, 1, 2, 3] {
+                let b = plane_leaf_bits(m, delta, planes[1], stride, px, py, n_tx, base, bit_depth)
+                    + plane_leaf_bits(m, delta, planes[2], stride, px, py, n_tx, base, bit_depth)
+                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                if b < ub {
+                    ub = b;
+                    uv_mode = m;
+                    uv_delta = delta;
+                }
+            }
         }
     }
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
@@ -685,9 +836,9 @@ fn best_leaf(
     if let Some(palette) = palette.as_ref() {
         yb = palette_estimated_bits(palette, bit_depth);
         y_mode = 0;
+        y_delta = 0;
     }
-    let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
-    let ovh = 7.0 + ang(y_mode) + ang(uv_mode); // skip + y_mode + uv_mode (+ angle_deltas)
+    let ovh = 7.0; // skip + y_mode + uv_mode (angle-delta rate is above)
     let regular_bits = yb + ub + ovh;
     // skip=1 + use_intrabc=1 + zero MV-joint. The exact static CDF cost is
     // close to seven bits; eight is deliberately conservative so ordinary
@@ -705,9 +856,17 @@ fn best_leaf(
     .is_some()
         && INTRABC_BITS < regular_bits;
     if ibc {
-        (INTRABC_BITS, 0, 0, None, true)
+        (INTRABC_BITS, 0, 0, 0, 0, None, true)
     } else {
-        (regular_bits, y_mode, uv_mode, palette, false)
+        (
+            regular_bits,
+            y_mode,
+            y_delta,
+            uv_mode,
+            uv_delta,
+            palette,
+            false,
+        )
     }
 }
 
@@ -715,7 +874,9 @@ fn best_leaf(
 enum Plan {
     Leaf {
         y_mode: usize,
+        y_delta: i32,
         uv_mode: usize,
+        uv_delta: i32,
         palette: Option<LumaPalette>,
         intrabc: bool,
     },
@@ -738,8 +899,9 @@ fn plan_full(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
+    angle_delta_rdo: bool,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym, uv, palette, intrabc) = best_leaf(
+    let (bits_leaf, ym, yd, uv, uvd, palette, intrabc) = best_leaf(
         planes,
         stride,
         px,
@@ -749,6 +911,7 @@ fn plan_full(
         bit_depth,
         visible_w,
         visible_h,
+        angle_delta_rdo,
     );
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {
@@ -756,7 +919,9 @@ fn plan_full(
             none,
             Plan::Leaf {
                 y_mode: ym,
+                y_delta: yd,
                 uv_mode: uv,
+                uv_delta: uvd,
                 palette,
                 intrabc,
             },
@@ -775,7 +940,16 @@ fn plan_full(
     .enumerate()
     {
         let (b, p) = plan_full(
-            planes, stride, cx, cy, hh, base, bit_depth, visible_w, visible_h,
+            planes,
+            stride,
+            cx,
+            cy,
+            hh,
+            base,
+            bit_depth,
+            visible_w,
+            visible_h,
+            angle_delta_rdo,
         );
         split += b;
         kids[i] = Some(p);
@@ -785,7 +959,9 @@ fn plan_full(
             none,
             Plan::Leaf {
                 y_mode: ym,
+                y_delta: yd,
                 uv_mode: uv,
+                uv_delta: uvd,
                 palette,
                 intrabc,
             },
@@ -803,6 +979,7 @@ struct LlState {
     visible_h: usize,
     base: i32,
     bit_depth: u8,
+    angle_delta_rdo: bool,
     a_coef: [Vec<u8>; 3],
     l_coef: [Vec<u8>; 3],
     a_part: Vec<u8>,
@@ -1080,7 +1257,9 @@ fn code_leaf(
     py: usize,
     size: usize,
     y_mode: usize,
+    y_delta: i32,
     uv_mode: usize,
+    uv_delta: i32,
     palette: Option<&LumaPalette>,
     intrabc: bool,
 ) {
@@ -1130,12 +1309,12 @@ fn code_leaf(
     );
     wr.symbol(y_mode as u32, &kfy);
     if (1..=8).contains(&y_mode) {
-        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
+        wr.symbol((y_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1]));
     }
     let uvc = icdf13(&UV_MODE_NOCFL_CDF[y_mode]);
     wr.symbol(uv_mode as u32, &uvc);
     if (1..=8).contains(&uv_mode) {
-        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[uv_mode - 1]));
+        wr.symbol((uv_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[uv_mode - 1]));
     }
     let bsize_ctx = palette_bsize_ctx(size);
     let mode_ctx =
@@ -1176,6 +1355,7 @@ fn code_leaf(
         slot.clone_from(&stored_palette);
     }
     let modes = [y_mode, uv_mode, uv_mode];
+    let deltas = [y_delta, uv_delta, uv_delta];
     for plane in 0..3 {
         encode_plane_block(
             wr,
@@ -1186,7 +1366,9 @@ fn code_leaf(
             n_tx,
             plane != 0,
             modes[plane],
+            deltas[plane],
             st.base,
+            st.bit_depth,
             &mut st.a_coef[plane],
             &mut st.l_coef[plane],
             if plane == 0 { palette } else { None },
@@ -1255,7 +1437,9 @@ fn encode_plan(
     match plan {
         Plan::Leaf {
             y_mode,
+            y_delta,
             uv_mode,
+            uv_delta,
             palette,
             intrabc,
         } => {
@@ -1268,7 +1452,9 @@ fn encode_plan(
                 py,
                 sz8 * 8,
                 *y_mode,
+                *y_delta,
                 *uv_mode,
+                *uv_delta,
                 palette.as_ref(),
                 *intrabc,
             );
@@ -1318,6 +1504,7 @@ fn decode_sb_ll(
             st.bit_depth,
             st.visible_w,
             st.visible_h,
+            st.angle_delta_rdo,
         );
         encode_plan(wr, planes, st, bl, x8, y8, sz8, &plan);
         return;
@@ -1326,7 +1513,7 @@ fn decode_sb_ll(
         // 8x8 leaf (in-frame for multiple-of-8 dims): mode-search and code
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym, uv, palette, intrabc) = best_leaf(
+        let (_b, ym, yd, uv, uvd, palette, intrabc) = best_leaf(
             planes,
             st.w,
             px,
@@ -1336,8 +1523,22 @@ fn decode_sb_ll(
             st.bit_depth,
             st.visible_w,
             st.visible_h,
+            st.angle_delta_rdo,
         );
-        code_leaf(wr, planes, st, px, py, 8, ym, uv, palette.as_ref(), intrabc);
+        code_leaf(
+            wr,
+            planes,
+            st,
+            px,
+            py,
+            8,
+            ym,
+            yd,
+            uv,
+            uvd,
+            palette.as_ref(),
+            intrabc,
+        );
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -1376,6 +1577,7 @@ pub fn encode_tile_lossless(
     visible_h: usize,
     bit_depth: u8,
     planes: [&[i16]; 3],
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
@@ -1389,6 +1591,7 @@ pub fn encode_tile_lossless(
         visible_h,
         base: 1i32 << (bit_depth - 1),
         bit_depth,
+        angle_delta_rdo: speed.try_angle_deltas(),
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
@@ -1432,14 +1635,36 @@ fn best_leaf_mono(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
-) -> (f32, usize, Option<LumaPalette>, bool) {
+    angle_delta_rdo: bool,
+) -> (f32, usize, i32, Option<LumaPalette>, bool) {
     let mut y_mode = 0usize;
+    let mut y_delta = 0i32;
     let mut yb = f32::INFINITY;
+    let mut directional = [(f32::INFINITY, 0usize); 8];
     for &m in LL_MODES.iter() {
-        let b = plane_leaf_bits(m, luma, stride, px, py, n_tx, base);
+        let mut b = plane_leaf_bits(m, 0, luma, stride, px, py, n_tx, base, bit_depth);
+        if (1..=8).contains(&m) {
+            b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
+            directional[m - 1] = (b, m);
+        }
         if b < yb {
             yb = b;
             y_mode = m;
+            y_delta = 0;
+        }
+    }
+    if angle_delta_rdo {
+        directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for &(_, m) in &directional[..3] {
+            for delta in [-3, -2, -1, 1, 2, 3] {
+                let b = plane_leaf_bits(m, delta, luma, stride, px, py, n_tx, base, bit_depth)
+                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                if b < yb {
+                    yb = b;
+                    y_mode = m;
+                    y_delta = delta;
+                }
+            }
         }
     }
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
@@ -1449,10 +1674,10 @@ fn best_leaf_mono(
     if let Some(palette) = palette.as_ref() {
         yb = palette_estimated_bits(palette, bit_depth);
         y_mode = 0;
+        y_delta = 0;
     }
-    let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
-    let ovh = 4.0 + ang(y_mode);
+    let ovh = 4.0;
     let regular_bits = yb + ovh;
     const INTRABC_BITS: f32 = 8.0;
     let ibc = find_exact_intrabc(
@@ -1467,9 +1692,9 @@ fn best_leaf_mono(
     .is_some()
         && INTRABC_BITS < regular_bits;
     if ibc {
-        (INTRABC_BITS, 0, None, true)
+        (INTRABC_BITS, 0, 0, None, true)
     } else {
-        (regular_bits, y_mode, palette, false)
+        (regular_bits, y_mode, y_delta, palette, false)
     }
 }
 
@@ -1485,8 +1710,9 @@ fn plan_full_mono(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
+    angle_delta_rdo: bool,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym, palette, intrabc) = best_leaf_mono(
+    let (bits_leaf, ym, yd, palette, intrabc) = best_leaf_mono(
         luma,
         stride,
         px,
@@ -1496,6 +1722,7 @@ fn plan_full_mono(
         bit_depth,
         visible_w,
         visible_h,
+        angle_delta_rdo,
     );
     let none = PART_NONE_BITS + bits_leaf;
     if sz8 == 1 {
@@ -1503,7 +1730,9 @@ fn plan_full_mono(
             none,
             Plan::Leaf {
                 y_mode: ym,
+                y_delta: yd,
                 uv_mode: 0,
+                uv_delta: 0,
                 palette,
                 intrabc,
             },
@@ -1522,7 +1751,16 @@ fn plan_full_mono(
     .enumerate()
     {
         let (b, p) = plan_full_mono(
-            luma, stride, cx, cy, hh, base, bit_depth, visible_w, visible_h,
+            luma,
+            stride,
+            cx,
+            cy,
+            hh,
+            base,
+            bit_depth,
+            visible_w,
+            visible_h,
+            angle_delta_rdo,
         );
         split += b;
         kids[i] = Some(p);
@@ -1532,7 +1770,9 @@ fn plan_full_mono(
             none,
             Plan::Leaf {
                 y_mode: ym,
+                y_delta: yd,
                 uv_mode: 0,
+                uv_delta: 0,
                 palette,
                 intrabc,
             },
@@ -1553,6 +1793,7 @@ fn code_leaf_mono(
     py: usize,
     size: usize,
     y_mode: usize,
+    y_delta: i32,
     palette: Option<&LumaPalette>,
     intrabc: bool,
 ) {
@@ -1596,7 +1837,7 @@ fn code_leaf_mono(
     );
     wr.symbol(y_mode as u32, &kfy);
     if (1..=8).contains(&y_mode) {
-        wr.symbol(3, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1])); // angle_delta = 0
+        wr.symbol((y_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1]));
     }
     let bsize_ctx = palette_bsize_ctx(size);
     let mode_ctx =
@@ -1638,7 +1879,9 @@ fn code_leaf_mono(
         n_tx,
         false, // luma
         y_mode,
+        y_delta,
         st.base,
+        st.bit_depth,
         &mut st.a_coef[0],
         &mut st.l_coef[0],
         palette,
@@ -1660,6 +1903,7 @@ fn encode_plan_mono(
     match plan {
         Plan::Leaf {
             y_mode,
+            y_delta,
             palette,
             intrabc,
             ..
@@ -1673,6 +1917,7 @@ fn encode_plan_mono(
                 py,
                 sz8 * 8,
                 *y_mode,
+                *y_delta,
                 palette.as_ref(),
                 *intrabc,
             );
@@ -1715,6 +1960,7 @@ fn decode_sb_ll_mono(
             st.bit_depth,
             st.visible_w,
             st.visible_h,
+            st.angle_delta_rdo,
         );
         encode_plan_mono(wr, luma, st, bl, x8, y8, sz8, &plan);
         return;
@@ -1722,7 +1968,7 @@ fn decode_sb_ll_mono(
     if sz8 == 1 {
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym, palette, intrabc) = best_leaf_mono(
+        let (_b, ym, yd, palette, intrabc) = best_leaf_mono(
             luma,
             st.w,
             px,
@@ -1732,8 +1978,9 @@ fn decode_sb_ll_mono(
             st.bit_depth,
             st.visible_w,
             st.visible_h,
+            st.angle_delta_rdo,
         );
-        code_leaf_mono(wr, luma, st, px, py, 8, ym, palette.as_ref(), intrabc);
+        code_leaf_mono(wr, luma, st, px, py, 8, ym, yd, palette.as_ref(), intrabc);
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -1767,6 +2014,7 @@ pub fn encode_tile_lossless_mono(
     visible_h: usize,
     bit_depth: u8,
     luma: &[i16],
+    speed: Speed,
 ) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
@@ -1780,6 +2028,7 @@ pub fn encode_tile_lossless_mono(
         visible_h,
         base: 1i32 << (bit_depth - 1),
         bit_depth,
+        angle_delta_rdo: speed.try_angle_deltas(),
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
@@ -1841,6 +2090,40 @@ mod tests {
     }
 
     #[test]
+    fn lossless_directional_candidates_cover_all_modes_and_deltas() {
+        let (w, h) = (64usize, 64usize);
+        let luma: Vec<i16> = (0..w * h)
+            .map(|i| {
+                let x = i % w;
+                let y = i / w;
+                ((x * 37 + y * 53 + x * y * 3 + 19) & 255) as i16
+            })
+            .collect();
+
+        for mode in 1..=8 {
+            for delta in -3..=3 {
+                let bits = plane_leaf_bits(mode, delta, &luma, w, 16, 16, 2, 128, 8);
+                assert!(bits.is_finite(), "mode={mode} delta={delta}");
+            }
+        }
+
+        let (_, _, delta, _, _) = best_leaf_mono(&luma, w, 16, 16, 2, 128, 8, w, h, false);
+        assert_eq!(delta, 0, "Medium/Fast must not perform angle-delta RDO");
+    }
+
+    #[test]
+    fn lossless_directional_edges_follow_partition_z_order() {
+        assert_eq!(lossless_leaf_edge_flags(0, 0, 64), (true, false));
+        assert_eq!(lossless_leaf_edge_flags(0, 0, 32), (true, true));
+        assert_eq!(lossless_leaf_edge_flags(32, 0, 32), (true, false));
+        assert_eq!(lossless_leaf_edge_flags(0, 32, 32), (true, false));
+        assert_eq!(lossless_leaf_edge_flags(32, 32, 32), (false, false));
+
+        // Coordinates are superblock-local for the edge tree.
+        assert_eq!(lossless_leaf_edge_flags(64, 0, 32), (true, true));
+    }
+
+    #[test]
     fn exact_palette_wins_lossless_rdo_for_all_normative_sizes() {
         let (w, h) = (64usize, 64usize);
         for size in 2..=8usize {
@@ -1851,7 +2134,7 @@ mod tests {
                     (7 + (((x / 4) + (y / 4)) % size) * 29) as i16
                 })
                 .collect();
-            let (_, mode, palette, _) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
+            let (_, mode, _, palette, _) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h, true);
             assert_eq!(mode, 0);
             assert_eq!(palette.map(|p| p.colors.len()), Some(size), "size {size}");
         }
@@ -1866,7 +2149,7 @@ mod tests {
         let mut luma = vec![128i16; w * h];
         luma[w * h - 1] = 129;
 
-        let (_, mode, palette, intrabc) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
+        let (_, mode, _, palette, intrabc) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h, true);
         assert_eq!(mode, 0);
         assert!(palette.is_none());
         assert!(!intrabc);
@@ -2054,7 +2337,7 @@ mod tests {
         }
         let pixels = [first_row.clone(), first_row].concat();
         let luma_i16: Vec<i16> = pixels.iter().map(|&v| i16::from(v)).collect();
-        let (_, plan) = plan_full_mono(&luma_i16, w, 0, 64, 8, 128, 8, w, h);
+        let (_, plan) = plan_full_mono(&luma_i16, w, 0, 64, 8, 128, 8, w, h, true);
         assert!(matches!(plan, Plan::Leaf { intrabc: true, .. }));
 
         let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
@@ -2130,7 +2413,64 @@ mod tests {
         }
         let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
         let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
-        assert_eq!(decode_obu(&decoder, &obu, "intrabc-nondefault-dv"), pixels);
+        let decoded = decode_obu(&decoder, &obu, "intrabc-nondefault-dv");
+        if let Some(i) = decoded.iter().zip(&pixels).position(|(a, b)| a != b) {
+            panic!(
+                "first mismatch at ({}, {}): decoded={} source={}",
+                i % w,
+                i / w,
+                decoded[i],
+                pixels[i]
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_d203_zero_residual_is_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (16usize, 8usize);
+        let mut luma = vec![0i16; w * h];
+        for y in 0..h {
+            for x in 0..8 {
+                luma[y * w + x] = ((x * 37 + y * 43 + 91) & 255) as i16;
+            }
+        }
+        for ty in 0..2 {
+            for tx in 0..2 {
+                let mut pred = [0i32; 16];
+                predict_lossless_4x4(
+                    7,
+                    0,
+                    &luma,
+                    w,
+                    8 + tx * 4,
+                    ty * 4,
+                    8,
+                    0,
+                    8,
+                    &mut pred,
+                    128,
+                    8,
+                );
+                for y in 0..4 {
+                    for x in 0..4 {
+                        luma[(ty * 4 + y) * w + 8 + tx * 4 + x] = pred[y * 4 + x] as i16;
+                    }
+                }
+            }
+        }
+        let (_, mode, delta, palette, intrabc) =
+            best_leaf_mono(&luma, w, 8, 0, 2, 128, 8, w, h, true);
+        assert_eq!(
+            (mode, delta, palette.is_some(), intrabc),
+            (7, 0, false, false)
+        );
+        let pixels: Vec<u8> = luma.iter().map(|&v| v as u8).collect();
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        assert_eq!(decode_obu(&decoder, &obu, "d203-zero"), pixels);
     }
 
     #[test]
@@ -2233,14 +2573,14 @@ mod tests {
                 y[j * w + i] = (((i * 5 + j * 3) % 47) as i16) - 8;
             }
         }
-        let a = encode_tile_lossless_mono(w, h, w, h, 8, &y);
-        let b = encode_tile_lossless_mono(w, h, w, h, 8, &y);
+        let a = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow);
+        let b = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow);
         assert!(!a.is_empty(), "mono lossless output must be non-empty");
         assert_eq!(a, b, "mono lossless must be deterministic");
         // A mono leaf omits the uv_mode symbol + 2 chroma planes, so for the same
         // luma it must be strictly smaller than the 4:4:4 tile carrying that luma
         // in all three planes.
-        let c444 = encode_tile_lossless(w, h, w, h, 8, [&y, &y, &y]);
+        let c444 = encode_tile_lossless(w, h, w, h, 8, [&y, &y, &y], Speed::Slow);
         assert!(
             a.len() < c444.len(),
             "mono ({}) must be smaller than 4:4:4 ({})",
@@ -2262,9 +2602,12 @@ mod tests {
                     y[j * w + i] = (((i * 17 + j * 11) as i32) % (maxv + 1)) as i16;
                 }
             }
-            let p = encode_tile_lossless_mono(w, h, w, h, bd, &y);
+            let p = encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow);
             assert!(!p.is_empty());
-            assert_eq!(p, encode_tile_lossless_mono(w, h, w, h, bd, &y));
+            assert_eq!(
+                p,
+                encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow)
+            );
         }
     }
 }

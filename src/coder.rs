@@ -1029,7 +1029,7 @@ const SPLIT_SIGNAL_BITS: f32 = 24.0;
 /// case) while keeping the flat-content wins. Distinct from the old
 /// `prefer_32x32` prefilter, which skipped the comparison entirely.
 const NONE32_SPLIT_BIAS: f32 = 1.03;
-/// Cost of signalling a non-DC uv_mode for the 4:2:0 4x4 SMOOTH_V chroma trial.
+/// Cost of signaling a non-DC uv_mode for the 4:2:0 4x4 SMOOTH_V chroma trial.
 const SMOOTH_V_UV_SIGNAL_BITS: f32 = 4.0;
 /// Required SSE improvement (in 1/1024) for the 32x32 TX-split to be accepted
 /// on a banding-risk block. See `code_block32`.
@@ -3546,9 +3546,11 @@ pub(crate) fn encode_lossless_frame_obus(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, visible_w, visible_h, src, &pool);
+    let (tilegroup, plan) =
+        encode_lossless_tilegroup(bd, w8, h8, visible_w, visible_h, src, &pool, speed);
     assemble_lossless_frame_obus(&plan, &tilegroup)
 }
 
@@ -3559,6 +3561,7 @@ fn encode_one_lossless_tile(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     r: &(usize, usize, usize, usize),
+    speed: Speed,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(&src[0], full_w, x0, y0, tw, th);
@@ -3566,7 +3569,15 @@ fn encode_one_lossless_tile(
     let p2 = crop_plane(&src[2], full_w, x0, y0, tw, th);
     let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
     let tile_visible_h = visible_h.saturating_sub(y0).min(th);
-    crate::tile::encode_tile_lossless(tw, th, tile_visible_w, tile_visible_h, bd, [&p0, &p1, &p2])
+    crate::tile::encode_tile_lossless(
+        tw,
+        th,
+        tile_visible_w,
+        tile_visible_h,
+        bd,
+        [&p0, &p1, &p2],
+        speed,
+    )
 }
 
 fn encode_lossless_tilegroup(
@@ -3577,6 +3588,7 @@ fn encode_lossless_tilegroup(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     pool: &Pool,
+    speed: Speed,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3602,7 +3614,7 @@ fn encode_lossless_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile(bd, w8, visible_w, visible_h, src, &rects[i])
+        encode_one_lossless_tile(bd, w8, visible_w, visible_h, src, &rects[i], speed)
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3637,12 +3649,13 @@ fn encode_one_lossless_tile_mono(
     visible_h: usize,
     luma: &[i16],
     r: &(usize, usize, usize, usize),
+    speed: Speed,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
     let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
     let tile_visible_h = visible_h.saturating_sub(y0).min(th);
-    crate::tile::encode_tile_lossless_mono(tw, th, tile_visible_w, tile_visible_h, bd, &p0)
+    crate::tile::encode_tile_lossless_mono(tw, th, tile_visible_w, tile_visible_h, bd, &p0, speed)
 }
 
 /// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res
@@ -3657,6 +3670,7 @@ fn encode_lossless_mono_tilegroup(
     visible_h: usize,
     luma: &[i16],
     pool: &Pool,
+    speed: Speed,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3683,7 +3697,7 @@ fn encode_lossless_mono_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile_mono(bd, w8, visible_w, visible_h, luma, &rects[i])
+        encode_one_lossless_tile_mono(bd, w8, visible_w, visible_h, luma, &rects[i], speed)
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3722,10 +3736,11 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     visible_h: usize,
     luma: &[i16],
     threads: usize,
+    speed: Speed,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
     let (tilegroup, plan) =
-        encode_lossless_mono_tilegroup(bd, w8, h8, visible_w, visible_h, luma, &pool);
+        encode_lossless_mono_tilegroup(bd, w8, h8, visible_w, visible_h, luma, &pool, speed);
     assemble_lossless_mono_frame_obus(&plan, &tilegroup)
 }
 

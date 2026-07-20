@@ -626,6 +626,7 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
             &luma,
             full_range,
             threads,
+            speed,
         ));
     }
     let luma: Vec<i32> = img.planes[0]
@@ -683,7 +684,7 @@ pub fn encode_lossless_gray<T: Pixel>(
         0,
         true,
         cfg.threads,
-        Speed::Slow,
+        cfg.speed,
         false,
         crate::coder::VarianceBoost::off(),
         false,
@@ -734,6 +735,15 @@ pub fn encode_lossless_obu<T: Pixel>(
     color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_lossless_obu_with_speed(img, color, threads, Speed::Slow)
+}
+
+fn encode_lossless_obu_with_speed<T: Pixel>(
+    img: &PlanarImage<T>,
+    color: Option<&Cicp>,
+    threads: usize,
+    speed: Speed,
+) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
     let effective_color = lossless_rgb_cicp(color);
     let profile: u32 = if img.bit_depth == BitDepth::Twelve {
@@ -768,6 +778,7 @@ pub fn encode_lossless_obu<T: Pixel>(
         h,
         &planes_i16,
         threads,
+        speed,
     ));
     Ok(bytes)
 }
@@ -782,7 +793,7 @@ pub fn encode_lossless<T: Pixel>(
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
     let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
-    let obu = encode_lossless_obu(img, Some(&effective_color), cfg.threads)?;
+    let obu = encode_lossless_obu_with_speed(img, Some(&effective_color), cfg.threads, cfg.speed)?;
     let av1c = make_av1c(
         &obu,
         img.bit_depth.bits(),
@@ -819,7 +830,12 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
     }
 
     let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
-    let obu = encode_lossless_obu(&img.packed_3(), Some(&effective_color), cfg.threads)?;
+    let obu = encode_lossless_obu_with_speed(
+        &img.packed_3(),
+        Some(&effective_color),
+        cfg.threads,
+        cfg.speed,
+    )?;
 
     let alpha_obu = encode_lossy_gray_obu(
         &img.packed_alpha_4(),
@@ -827,7 +843,7 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         0,
         true,
         cfg.threads,
-        Speed::Slow,
+        cfg.speed,
         false,
         crate::coder::VarianceBoost::off(),
         false,
