@@ -154,38 +154,69 @@ fn exact_luma_palette(
     })
 }
 
-fn palette_estimated_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
+fn uniform_symbol_bits(n: usize, value: usize) -> f32 {
+    debug_assert!(n > 0 && value < n);
+    let bits = usize::BITS as usize - (n - 1).leading_zeros() as usize;
+    let cutoff = (1usize << bits) - n;
+    if value < cutoff {
+        (bits - 1) as f32
+    } else {
+        bits as f32
+    }
+}
+
+fn palette_color_bits(colors: &[i32], cache: &[i32], bit_depth: u8) -> f32 {
+    let mut bits = 0.0f32;
+    let mut in_cache = 0usize;
+    for &cached in cache {
+        if in_cache == colors.len() {
+            break;
+        }
+        bits += 1.0;
+        in_cache += usize::from(colors.binary_search(&cached).is_ok());
+    }
+    let out: Vec<u32> = colors
+        .iter()
+        .filter(|color| cache.binary_search(color).is_err())
+        .map(|&color| color as u32)
+        .collect();
+    if out.is_empty() {
+        return bits;
+    }
+    bits += bit_depth as f32;
+    if out.len() == 1 {
+        return bits;
+    }
+    let max_delta = out.windows(2).map(|v| v[1] - v[0]).max().unwrap();
+    let min_bits = bit_depth - 3;
+    let mut delta_bits = ceil_log2(max_delta).max(min_bits);
+    bits += 2.0;
+    let mut range = (1u32 << bit_depth) - out[0] - 1;
+    for pair in out.windows(2) {
+        bits += f32::from(delta_bits);
+        range -= pair[1] - pair[0];
+        delta_bits = delta_bits.min(ceil_log2(range));
+    }
+    bits
+}
+
+fn palette_estimated_bits(
+    palette: &LumaPalette,
+    bit_depth: u8,
+    cache: &[i32],
+    mode_ctx: usize,
+) -> f32 {
     let pixels = palette.width * palette.height;
     let size = palette.colors.len();
 
-    // Palette mode and size use fixed frame CDFs in the lossless path. The
-    // neighbour palette context is unavailable while planning, so use the
-    // neutral (no cached neighbour) mode context.
     let bsize_ctx = palette_bsize_ctx(palette.width);
-    let mode_bits = raw_symbol_cost(&[palette_y_mode_raw(bsize_ctx, 0)], 1)
+    let mode_bits = raw_symbol_cost(&[palette_y_mode_raw(bsize_ctx, mode_ctx)], 1)
         + raw_symbol_cost(palette_y_size_raw(bsize_ctx), size - 2);
-
-    // Price the no-cache color-delta syntax exactly. A live cache can only
-    // make this candidate cheaper, so this remains conservative.
-    let colors: Vec<u32> = palette.colors.iter().map(|&color| color as u32).collect();
-    let mut color_bits = bit_depth as f32;
-    if colors.len() > 1 {
-        let max_delta = colors.windows(2).map(|v| v[1] - v[0]).max().unwrap();
-        let min_bits = bit_depth - 3;
-        let mut bits = ceil_log2(max_delta).max(min_bits);
-        color_bits += 2.0;
-        let mut range = (1u32 << bit_depth) - colors[0] - 1;
-        for pair in colors.windows(2) {
-            color_bits += f32::from(bits);
-            let delta = pair[1] - pair[0];
-            range -= delta;
-            bits = bits.min(ceil_log2(range));
-        }
-    }
+    let color_bits = palette_color_bits(&palette.colors, cache, bit_depth);
 
     // The first index is uniform. Remaining indices use AV1's spatial palette
-    // contexts and therefore can be much cheaper than log2(size) on runs.
-    let mut map_bits = (size as f32).log2();
+    // contexts and therefore can be much cheaper than fixed-width coding.
+    let mut map_bits = uniform_symbol_bits(size, palette.map[0] as usize);
     for diagonal in 1..palette.width + palette.height - 1 {
         let first_x = diagonal.min(palette.width - 1);
         let last_x = diagonal.saturating_sub(palette.height - 1);
@@ -197,6 +228,12 @@ fn palette_estimated_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
     }
     let zero_txb_bits = (pixels / 16) as f32;
     mode_bits + color_bits + map_bits + zero_txb_bits
+}
+
+fn palette_best_case_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
+    (0..=2)
+        .map(|mode_ctx| palette_estimated_bits(palette, bit_depth, &palette.colors, mode_ctx))
+        .fold(f32::INFINITY, f32::min)
 }
 
 #[inline]
@@ -832,11 +869,9 @@ fn best_leaf(
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
         .then(|| exact_luma_palette(planes[0], stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
         .flatten()
-        .filter(|palette| palette_estimated_bits(palette, bit_depth) < yb);
+        .filter(|palette| palette_best_case_bits(palette, bit_depth) < yb);
     if let Some(palette) = palette.as_ref() {
-        yb = palette_estimated_bits(palette, bit_depth);
-        y_mode = 0;
-        y_delta = 0;
+        yb = yb.min(palette_estimated_bits(palette, bit_depth, &[], 0));
     }
     let ovh = 7.0; // skip + y_mode + uv_mode (angle-delta rate is above)
     let regular_bits = yb + ub + ovh;
@@ -1244,6 +1279,68 @@ fn write_palette_map(wr: &mut Writer, palette: &LumaPalette) {
     }
 }
 
+fn angle_delta_bits(mode: usize, delta: i32) -> f32 {
+    if (1..=8).contains(&mode) {
+        raw_symbol_cost(&ANGLE_DELTA_CDF[mode - 1], (delta + 3) as usize)
+    } else {
+        0.0
+    }
+}
+
+fn uv_mode_syntax_bits(y_mode: usize, uv_mode: usize, uv_delta: i32, luma_palette: bool) -> f32 {
+    let mut bits =
+        raw_symbol_cost(&UV_MODE_NOCFL_CDF[y_mode], uv_mode) + angle_delta_bits(uv_mode, uv_delta);
+    if uv_mode == 0 {
+        bits += raw_symbol_cost(&[if luma_palette { 21488 } else { 32461 }], 0);
+    }
+    bits
+}
+
+#[allow(clippy::too_many_arguments)]
+fn palette_wins_live(
+    st: &LlState,
+    luma: &[i16],
+    px: usize,
+    py: usize,
+    size: usize,
+    y_mode: usize,
+    y_delta: i32,
+    uv: Option<(usize, i32)>,
+    palette: &LumaPalette,
+) -> bool {
+    let (x8, y8, n_tx) = (px / 8, py / 8, size / 4);
+    let bsize_ctx = palette_bsize_ctx(size);
+    let mode_ctx =
+        usize::from(!st.a_palette[x8].is_empty()) + usize::from(!st.l_palette[y8].is_empty());
+    let cache = palette_cache(&st.a_palette[x8], &st.l_palette[y8], !py.is_multiple_of(64));
+    let kf_raw = &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
+        [INTRA_MODE_CTX[st.l_mode[y8] as usize]];
+
+    let mut normal_bits = plane_leaf_bits(
+        y_mode,
+        y_delta,
+        luma,
+        st.w,
+        px,
+        py,
+        n_tx,
+        st.base,
+        st.bit_depth,
+    ) + raw_symbol_cost(kf_raw, y_mode)
+        + angle_delta_bits(y_mode, y_delta);
+    if y_mode == 0 {
+        normal_bits += raw_symbol_cost(&[palette_y_mode_raw(bsize_ctx, mode_ctx)], 0);
+    }
+
+    let mut palette_bits = raw_symbol_cost(kf_raw, 0)
+        + palette_estimated_bits(palette, st.bit_depth, &cache, mode_ctx);
+    if let Some((uv_mode, uv_delta)) = uv {
+        normal_bits += uv_mode_syntax_bits(y_mode, uv_mode, uv_delta, false);
+        palette_bits += uv_mode_syntax_bits(0, uv_mode, uv_delta, true);
+    }
+    palette_bits < normal_bits
+}
+
 /// Code a square lossless leaf of `size`×`size` px at `(px, py)`: block mode
 /// info (skip=0, y_mode=DC, uv_mode) then `(size/4)²` TX_4×4 WHT per plane.
 /// uv_mode is non-CfL `UV_DC` at 64×64 (CfL not allowed) and the CfL DC symbol
@@ -1302,6 +1399,25 @@ fn code_leaf(
         }
         return;
     }
+
+    let palette = palette.filter(|palette| {
+        palette_wins_live(
+            st,
+            planes[0],
+            px,
+            py,
+            size,
+            y_mode,
+            y_delta,
+            Some((uv_mode, uv_delta)),
+            palette,
+        )
+    });
+    let (y_mode, y_delta) = if palette.is_some() {
+        (0, 0)
+    } else {
+        (y_mode, y_delta)
+    };
 
     let kfy = icdf13(
         &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
@@ -1670,11 +1786,9 @@ fn best_leaf_mono(
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
         .then(|| exact_luma_palette(luma, stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
         .flatten()
-        .filter(|palette| palette_estimated_bits(palette, bit_depth) < yb);
+        .filter(|palette| palette_best_case_bits(palette, bit_depth) < yb);
     if let Some(palette) = palette.as_ref() {
-        yb = palette_estimated_bits(palette, bit_depth);
-        y_mode = 0;
-        y_delta = 0;
+        yb = yb.min(palette_estimated_bits(palette, bit_depth, &[], 0));
     }
     // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
     let ovh = 4.0;
@@ -1831,6 +1945,14 @@ fn code_leaf_mono(
         st.l_coef[0][y4..y4 + n_tx].fill(0x40);
         return;
     }
+    let palette = palette.filter(|palette| {
+        palette_wins_live(st, luma, px, py, size, y_mode, y_delta, None, palette)
+    });
+    let (y_mode, y_delta) = if palette.is_some() {
+        (0, 0)
+    } else {
+        (y_mode, y_delta)
+    };
     let kfy = icdf13(
         &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
             [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
@@ -2153,6 +2275,19 @@ mod tests {
         assert_eq!(mode, 0);
         assert!(palette.is_none());
         assert!(!intrabc);
+    }
+
+    #[test]
+    fn palette_rate_models_uniform_map_and_color_cache_exactly() {
+        assert_eq!(uniform_symbol_bits(3, 0), 1.0);
+        assert_eq!(uniform_symbol_bits(3, 1), 2.0);
+        assert_eq!(uniform_symbol_bits(3, 2), 2.0);
+
+        let colors = [10, 20];
+        let uncached = palette_color_bits(&colors, &[], 8);
+        assert_eq!(palette_color_bits(&colors, &colors, 8), 2.0);
+        let misses: Vec<i32> = (30..46).collect();
+        assert_eq!(palette_color_bits(&colors, &misses, 8), uncached + 16.0);
     }
 
     #[test]
