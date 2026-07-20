@@ -283,7 +283,7 @@ impl Av2Encoder {
         log2r: usize,
     ) -> Av2Frame {
         let specs = tile_specs(pw, ph, log2c, log2r);
-        // Tiles are independent sub-frame encodes; parallelise across them (each tile
+        // Tiles are independent sub-frame encodes; parallelize across them (each tile
         // single-threaded). `par_map_indexed` preserves index order, so the assembled
         // stream is byte-identical to the previous serial loop. Mirrors the 4:4:4 path.
         let n = specs.len();

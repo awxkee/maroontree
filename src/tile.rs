@@ -506,39 +506,72 @@ fn intrabc_rdo_margin(size: usize) -> f32 {
     }
 }
 
-/// Resolve a predictor without porting decoder candidate weights: all IntraBC
-/// candidates in the decoder's enclosing spatial search area must agree. With
-/// no spatial candidate, use the normative fallback DV. Mixed stacks are
-/// rejected conservatively instead of risking a predictor mismatch.
+/// Resolve a predictor from the spatial locations scanned by AV1's reference-
+/// MV stack. We only use a spatial predictor when the mandatory nearest row or
+/// column contributes it and every other possible contributor agrees.
+/// Optional-only candidates are safe only when they equal the normative
+/// fallback: depending on partition z-order the decoder may not see them.
+/// Ambiguous stacks are rejected instead of risking a DV residual desync.
 fn intrabc_mv_predictor(st: &LlState, px: usize, py: usize, size: usize) -> Option<(i16, i16)> {
     let (x4, y4, n4) = (px / 4, py / 4, size / 4);
-    let x_start = x4.saturating_sub(5);
-    let x_end = (x4 + n4).min(st.w / 4 - 1);
-    let y_start = y4.saturating_sub(5);
-    let y_end = (y4 + n4).min(st.h / 4 - 1);
-
+    let (w4, h4) = (st.w / 4, st.h / 4);
+    let fallback = intrabc_default_mv(py);
     let mut found = None;
-    for y in y_start..y4 {
-        for x in x4.saturating_sub(1)..=x_end {
-            if let Some(mv) = st.ibc_mv[y * (st.w / 4) + x] {
-                if found.is_some_and(|old| old != mv) {
-                    return None;
-                }
+    let mut nearest_found = false;
+    let mut ambiguous = false;
+    let mut visit = |x: usize, y: usize, nearest: bool| {
+        if x >= w4 || y >= h4 {
+            return;
+        }
+        if let Some(mv) = st.ibc_mv[y * w4 + x] {
+            nearest_found |= nearest;
+            if found.is_some_and(|old| old != mv) {
+                ambiguous = true;
+            } else {
                 found = Some(mv);
             }
         }
+    };
+
+    if let Some(y) = y4.checked_sub(1) {
+        for x in x4..(x4 + n4).min(w4) {
+            visit(x, y, true);
+        }
     }
-    for x in x_start..x4 {
-        for y in y4.saturating_sub(1)..=y_end {
-            if let Some(mv) = st.ibc_mv[y * (st.w / 4) + x] {
-                if found.is_some_and(|old| old != mv) {
-                    return None;
-                }
-                found = Some(mv);
+    if let Some(x) = x4.checked_sub(1) {
+        for y in y4..(y4 + n4).min(h4) {
+            visit(x, y, true);
+        }
+    }
+
+    if let (Some(x), Some(y)) = (x4.checked_sub(1), y4.checked_sub(1)) {
+        visit(x, y, false);
+    }
+    if let Some(y) = y4.checked_sub(1) {
+        visit(x4 + n4, y, false);
+    }
+    for offset in [3usize, 5] {
+        if let Some(y) = y4.checked_sub(offset) {
+            for x in (x4 + 1)..(x4 + n4).min(w4) {
+                visit(x, y, false);
+            }
+        }
+        if let Some(x) = x4.checked_sub(offset) {
+            for y in (y4 + 1)..(y4 + n4).min(h4) {
+                visit(x, y, false);
             }
         }
     }
-    Some(found.unwrap_or_else(|| intrabc_default_mv(py)))
+
+    if ambiguous {
+        None
+    } else if nearest_found {
+        found
+    } else if found.is_none_or(|mv| mv == fallback) {
+        Some(fallback)
+    } else {
+        None
+    }
 }
 
 /// Build the 4x4 intra reference edges (top[4], left[4], corner) from the
@@ -912,6 +945,57 @@ fn encode_plane_block(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_plane_rect_block(
+    wr: &mut Writer,
+    cdfs: &mut Cdfs,
+    plane: &[i16],
+    stride: usize,
+    bx: usize,
+    by: usize,
+    width: usize,
+    height: usize,
+    chroma: bool,
+    mode: usize,
+    base: i32,
+    a: &mut [u8],
+    l: &mut [u8],
+) {
+    let (nw, nh) = (width / 4, height / 4);
+    let mut pred = [0i32; 16];
+    let mut resid = [0i32; 16];
+    for ty in 0..nh {
+        for tx in 0..nw {
+            let (ox, oy) = (bx + tx * 4, by + ty * 4);
+            let (ax, ly) = (ox / 4, oy / 4);
+            let skip_ctx = if nw * nh == 1 && !chroma {
+                0
+            } else if nw * nh == 1 {
+                7 + (a[ax] != 0x40) as usize + (l[ly] != 0x40) as usize
+            } else if !chroma {
+                let av = (a[ax] & 0x3f).min(4) as usize;
+                let lv = (l[ly] & 0x3f).min(4) as usize;
+                SKIP_CTX[av][lv] as usize
+            } else {
+                10 + (a[ax] != 0x40) as usize + (l[ly] != 0x40) as usize
+            };
+            let s = (a[ax] >> 6) as i32 + (l[ly] >> 6) as i32 - 2;
+            let dc_sign_ctx = (s != 0) as usize + (s > 0) as usize;
+            predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+            for row in 0..4 {
+                for x in 0..4 {
+                    let i = row * 4 + x;
+                    resid[i] = i32::from(plane[(oy + row) * stride + ox + x]) - pred[i];
+                }
+            }
+            levels_from_resid(&mut resid);
+            let res_ctx = encode_coefs(wr, cdfs, chroma, &resid, skip_ctx, dc_sign_ctx);
+            a[ax] = res_ctx;
+            l[ly] = res_ctx;
+        }
+    }
+}
+
 /// Residual-rate proxy for one chroma plane under lossless CfL. The luma AC
 /// normalization and DC base intentionally follow the decoder per TX_4X4.
 #[allow(clippy::too_many_arguments)]
@@ -1106,6 +1190,118 @@ fn plane_leaf_bits(
     bits
 }
 
+static LL_RECT_MODES: [usize; 7] = [0, 1, 2, 9, 10, 11, 12];
+static LL_RECT_FAST_MODES: [usize; 5] = [0, 1, 2, 9, 12];
+
+/// Lossless TX_4X4 rate proxy for a rectangular intra block.  Directional
+/// edge derivation depends on rectangular block geometry and is deliberately
+/// left to square leaves for now; all decoder-safe non-directional predictors
+/// are searched here.
+#[allow(clippy::too_many_arguments)]
+fn plane_rect_bits(
+    mode: usize,
+    plane: &[i16],
+    stride: usize,
+    bx: usize,
+    by: usize,
+    width: usize,
+    height: usize,
+    base: i32,
+) -> f32 {
+    let mut bits = 0.0f32;
+    let mut pred = [0i32; 16];
+    let mut resid = [0i32; 16];
+    for ty in 0..height / 4 {
+        for tx in 0..width / 4 {
+            let (ox, oy) = (bx + tx * 4, by + ty * 4);
+            predict_4x4(mode, plane, stride, ox, oy, &mut pred, base);
+            let mut any = false;
+            for row in 0..4 {
+                for x in 0..4 {
+                    let i = row * 4 + x;
+                    resid[i] = i32::from(plane[(oy + row) * stride + ox + x]) - pred[i];
+                    any |= resid[i] != 0;
+                }
+            }
+            if !any {
+                bits += 1.0;
+            } else {
+                levels_from_resid(&mut resid);
+                bits += 2.0;
+                bits += resid
+                    .iter()
+                    .map(|v| coef_rate_bits(v.unsigned_abs()))
+                    .sum::<f32>();
+            }
+        }
+    }
+    bits
+}
+
+#[derive(Clone)]
+struct BlockDecision {
+    dx: usize,
+    dy: usize,
+    width: usize,
+    height: usize,
+    y_mode: usize,
+    y_delta: i32,
+    uv_mode: usize,
+    uv_delta: i32,
+    uv_alpha: [i32; 2],
+    palette: Option<LumaPalette>,
+    intrabc: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn best_rect_block(
+    planes: [&[i16]; 3],
+    stride: usize,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    base: i32,
+    full_search: bool,
+) -> (f32, BlockDecision) {
+    let modes: &[usize] = if full_search {
+        &LL_RECT_MODES
+    } else {
+        &LL_RECT_FAST_MODES
+    };
+    let mut y = (f32::INFINITY, 0usize);
+    for &mode in modes {
+        let bits = plane_rect_bits(mode, planes[0], stride, px, py, width, height, base);
+        if bits < y.0 {
+            y = (bits, mode);
+        }
+    }
+    let mut uv = (f32::INFINITY, 0usize);
+    for &mode in modes {
+        let bits = plane_rect_bits(mode, planes[1], stride, px, py, width, height, base)
+            + plane_rect_bits(mode, planes[2], stride, px, py, width, height, base);
+        if bits < uv.0 {
+            uv = (bits, mode);
+        }
+    }
+    (
+        y.0 + uv.0 + 7.0,
+        BlockDecision {
+            dx: 0,
+            dy: 0,
+            width,
+            height,
+            y_mode: y.1,
+            y_delta: 0,
+            uv_mode: uv.1,
+            uv_delta: 0,
+            uv_alpha: [0, 0],
+            palette: None,
+            intrabc: false,
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Best luma + best uv mode for a leaf, with total residual+overhead bits.
 #[allow(clippy::too_many_arguments)]
@@ -1297,6 +1493,63 @@ fn best_leaf(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn best_partition_block(
+    planes: [&[i16]; 3],
+    stride: usize,
+    parent_x: usize,
+    parent_y: usize,
+    dx: usize,
+    dy: usize,
+    width: usize,
+    height: usize,
+    base: i32,
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
+    angle_delta_rdo: bool,
+    intrabc_index: &IntrabcIndex,
+) -> (f32, BlockDecision) {
+    let (px, py) = (parent_x + dx, parent_y + dy);
+    if width == height {
+        let (bits, ym, yd, uv, uvd, uva, palette, intrabc) = best_leaf(
+            planes,
+            stride,
+            px,
+            py,
+            width / 4,
+            base,
+            bit_depth,
+            visible_w,
+            visible_h,
+            angle_delta_rdo,
+            intrabc_index,
+        );
+        (
+            bits,
+            BlockDecision {
+                dx,
+                dy,
+                width,
+                height,
+                y_mode: ym,
+                y_delta: yd,
+                uv_mode: uv,
+                uv_delta: uvd,
+                uv_alpha: uva,
+                palette,
+                intrabc,
+            },
+        )
+    } else {
+        let (bits, mut block) =
+            best_rect_block(planes, stride, px, py, width, height, base, angle_delta_rdo);
+        block.dx = dx;
+        block.dy = dy;
+        (bits, block)
+    }
+}
+
 /// Adaptive partition plan for a fully-in-frame square block.
 enum Plan {
     Leaf {
@@ -1309,10 +1562,30 @@ enum Plan {
         intrabc: bool,
     },
     Split(Box<[Plan; 4]>),
+    Partition {
+        symbol: usize,
+        blocks: Vec<BlockDecision>,
+    },
 }
 
 const PART_NONE_BITS: f32 = 1.0;
 const PART_SPLIT_BITS: f32 = 1.5;
+const PART_RECT_BITS: f32 = 3.5;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_LL_PARTITION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn forced_ll_partition() -> usize {
+    #[cfg(test)]
+    {
+        return FORCE_LL_PARTITION.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    0
+}
 
 /// Decide none-vs-split by estimated bits; returns the plan and its cost. At
 /// 8x8, PARTITION_SPLIT produces four normative 4x4 leaves (needed for coded-
@@ -1345,6 +1618,31 @@ fn plan_full(
         intrabc_index,
     );
     let none = PART_NONE_BITS + bits_leaf;
+    let eval_partition = |symbol: usize, geometry: &[(usize, usize, usize, usize)]| {
+        let mut bits = PART_RECT_BITS;
+        let mut blocks = Vec::with_capacity(geometry.len());
+        for &(dx, dy, width, height) in geometry {
+            let (block_bits, block) = best_partition_block(
+                planes,
+                stride,
+                px,
+                py,
+                dx,
+                dy,
+                width,
+                height,
+                base,
+                bit_depth,
+                visible_w,
+                visible_h,
+                angle_delta_rdo,
+                intrabc_index,
+            );
+            bits += block_bits;
+            blocks.push(block);
+        }
+        (bits, Plan::Partition { symbol, blocks })
+    };
     if sz8 == 1 {
         let mut split = PART_SPLIT_BITS;
         let mut kids: [Option<Plan>; 4] = [None, None, None, None];
@@ -1376,22 +1674,31 @@ fn plan_full(
                 intrabc: cibc,
             });
         }
-        return if none <= split {
-            (
-                none,
-                Plan::Leaf {
-                    y_mode: ym,
-                    y_delta: yd,
-                    uv_mode: uv,
-                    uv_delta: uvd,
-                    uv_alpha: uva,
-                    palette,
-                    intrabc,
-                },
-            )
-        } else {
-            (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
-        };
+        let mut best = (
+            none,
+            Plan::Leaf {
+                y_mode: ym,
+                y_delta: yd,
+                uv_mode: uv,
+                uv_delta: uvd,
+                uv_alpha: uva,
+                palette,
+                intrabc,
+            },
+        );
+        let split_plan = (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))));
+        if split_plan.0 < best.0 {
+            best = split_plan;
+        }
+        for candidate in [
+            eval_partition(1, &[(0, 0, 8, 4), (0, 4, 8, 4)]),
+            eval_partition(2, &[(0, 0, 4, 8), (4, 0, 4, 8)]),
+        ] {
+            if candidate.0 < best.0 {
+                best = candidate;
+            }
+        }
+        return best;
     }
     let hh = sz8 / 2;
     let mut split = PART_SPLIT_BITS;
@@ -1421,22 +1728,78 @@ fn plan_full(
         split += b;
         kids[i] = Some(p);
     }
-    if none <= split {
-        (
-            none,
-            Plan::Leaf {
-                y_mode: ym,
-                y_delta: yd,
-                uv_mode: uv,
-                uv_delta: uvd,
-                uv_alpha: uva,
-                palette,
-                intrabc,
-            },
-        )
-    } else {
-        (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
+    let mut best = (
+        none,
+        Plan::Leaf {
+            y_mode: ym,
+            y_delta: yd,
+            uv_mode: uv,
+            uv_delta: uvd,
+            uv_alpha: uva,
+            palette,
+            intrabc,
+        },
+    );
+    let split_plan = (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))));
+    if split_plan.0 < best.0 {
+        best = split_plan;
     }
+    let size = sz8 * 8;
+    let half = size / 2;
+    let quarter = size / 4;
+    let geometries: [(usize, Vec<(usize, usize, usize, usize)>); 8] = [
+        (1, vec![(0, 0, size, half), (0, half, size, half)]),
+        (2, vec![(0, 0, half, size), (half, 0, half, size)]),
+        (
+            4,
+            vec![
+                (0, 0, half, half),
+                (half, 0, half, half),
+                (0, half, size, half),
+            ],
+        ),
+        (
+            5,
+            vec![
+                (0, 0, size, half),
+                (0, half, half, half),
+                (half, half, half, half),
+            ],
+        ),
+        (
+            6,
+            vec![
+                (0, 0, half, half),
+                (0, half, half, half),
+                (half, 0, half, size),
+            ],
+        ),
+        (
+            7,
+            vec![
+                (0, 0, half, size),
+                (half, 0, half, half),
+                (half, half, half, half),
+            ],
+        ),
+        (8, (0..4).map(|i| (0, i * quarter, size, quarter)).collect()),
+        (9, (0..4).map(|i| (i * quarter, 0, quarter, size)).collect()),
+    ];
+    let rect_candidates = if angle_delta_rdo {
+        if size >= 32 { 8 } else { 6 }
+    } else {
+        2
+    };
+    for (symbol, geometry) in geometries.iter().take(rect_candidates) {
+        let candidate = eval_partition(*symbol, geometry);
+        if forced_ll_partition() == *symbol {
+            return candidate;
+        }
+        if candidate.0 < best.0 {
+            best = candidate;
+        }
+    }
+    best
 }
 
 /// Mutable frame-spanning state shared across the lossless partition recursion.
@@ -1476,6 +1839,22 @@ fn write_block_skip(
     wr.symbol_adapt(usize::from(skip), &mut st.cdfs.skip[ctx]);
     st.a_skip[x4..x4 + n4].fill(skip as u8);
     st.l_skip[y4..y4 + n4].fill(skip as u8);
+}
+
+fn write_block_skip_rect(
+    wr: &mut Writer,
+    st: &mut LlState,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    skip: bool,
+) {
+    let (x4, y4, nw, nh) = (px / 4, py / 4, width / 4, height / 4);
+    let ctx = usize::from(st.a_skip[x4]) + usize::from(st.l_skip[y4]);
+    wr.symbol_adapt(usize::from(skip), &mut st.cdfs.skip[ctx]);
+    st.a_skip[x4..x4 + nw].fill(skip as u8);
+    st.l_skip[y4..y4 + nh].fill(skip as u8);
 }
 
 fn write_intrabc_mv_component(wr: &mut Writer, cdfs: &mut Cdfs, component: usize, diff: i32) {
@@ -1962,6 +2341,73 @@ fn code_leaf(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn code_leaf_rect(
+    wr: &mut Writer,
+    planes: [&[i16]; 3],
+    st: &mut LlState,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    y_mode: usize,
+    uv_mode: usize,
+) {
+    debug_assert_ne!(width, height);
+    debug_assert!(LL_RECT_MODES.contains(&y_mode));
+    debug_assert!(LL_RECT_MODES.contains(&uv_mode));
+    let (x4, y4, nw, nh) = (px / 4, py / 4, width / 4, height / 4);
+    write_block_skip_rect(wr, st, px, py, width, height, false);
+    wr.symbol_adapt(0, &mut st.cdfs.intrabc);
+
+    let y_ctx = INTRA_MODE_CTX[st.a_mode[x4] as usize] * 5 + INTRA_MODE_CTX[st.l_mode[y4] as usize];
+    wr.symbol_adapt(y_mode, &mut st.cdfs.kf_y[y_ctx]);
+    let angle_allowed = width >= 8 && height >= 8;
+    if angle_allowed && (1..=8).contains(&y_mode) {
+        wr.symbol_adapt(3, &mut st.cdfs.angle_delta[y_mode - 1]);
+    }
+    wr.symbol_adapt(uv_mode, &mut st.cdfs.uv_mode[y_mode]);
+    if angle_allowed && (1..=8).contains(&uv_mode) {
+        wr.symbol_adapt(3, &mut st.cdfs.angle_delta[uv_mode - 1]);
+    }
+
+    let palette_allowed = width >= 8 && height >= 8;
+    if palette_allowed && y_mode == 0 {
+        let bctx = (width.trailing_zeros() as usize + height.trailing_zeros() as usize - 6).min(6);
+        let mctx =
+            usize::from(!st.a_palette[x4].is_empty()) + usize::from(!st.l_palette[y4].is_empty());
+        wr.symbol_adapt(0, &mut st.cdfs.palette_y_mode[bctx][mctx]);
+    }
+    if palette_allowed && uv_mode == 0 {
+        wr.symbol_adapt(0, &mut st.cdfs.palette_uv_mode[0]);
+    }
+    st.a_mode[x4..x4 + nw].fill(y_mode as u8);
+    st.l_mode[y4..y4 + nh].fill(y_mode as u8);
+    for slot in &mut st.a_palette[x4..x4 + nw] {
+        slot.clear();
+    }
+    for slot in &mut st.l_palette[y4..y4 + nh] {
+        slot.clear();
+    }
+    for plane in 0..3 {
+        encode_plane_rect_block(
+            wr,
+            &mut st.cdfs,
+            planes[plane],
+            st.w,
+            px,
+            py,
+            width,
+            height,
+            plane != 0,
+            if plane == 0 { y_mode } else { uv_mode },
+            st.base,
+            &mut st.a_coef[plane],
+            &mut st.l_coef[plane],
+        );
+    }
+}
+
 /// Edge-aware partition recursion for lossless. A fully-in-frame 64×64
 /// superblock is one `PARTITION_NONE` block (the validated path); any block
 /// crossing the frame edge is split (4-way, or the constrained split-or-horz /
@@ -1992,6 +2438,73 @@ fn part_byte(sz8: usize) -> u8 {
         2 => 0x1c,
         4 => 0x18,
         _ => 0x10,
+    }
+}
+
+fn part_byte_px(size: usize) -> u8 {
+    match size {
+        4 => 0x1f,
+        8 => 0x1e,
+        16 => 0x1c,
+        32 => 0x18,
+        _ => 0x10,
+    }
+}
+
+fn mark_rect_partition(st: &mut LlState, x8: usize, y8: usize, sz8: usize, symbol: usize) {
+    let size = sz8 * 8;
+    let half = size / 2;
+    let quarter = size / 4;
+    let (above_size, left_size) = match symbol {
+        1 | 4 => (size, half),
+        2 | 6 => (half, size),
+        5 => (half, half),
+        7 => (half, half),
+        8 => (size, quarter),
+        9 => (quarter, size),
+        _ => unreachable!("rectangular partition symbol {symbol}"),
+    };
+    st.a_part[x8..x8 + sz8].fill(part_byte_px(above_size));
+    st.l_part[y8..y8 + sz8].fill(part_byte_px(left_size));
+}
+
+fn code_partition_block(
+    wr: &mut Writer,
+    planes: [&[i16]; 3],
+    st: &mut LlState,
+    parent_x: usize,
+    parent_y: usize,
+    block: &BlockDecision,
+) {
+    let (px, py) = (parent_x + block.dx, parent_y + block.dy);
+    if block.width == block.height {
+        code_leaf(
+            wr,
+            planes,
+            st,
+            px,
+            py,
+            block.width,
+            block.y_mode,
+            block.y_delta,
+            block.uv_mode,
+            block.uv_delta,
+            block.uv_alpha,
+            block.palette.as_ref(),
+            block.intrabc,
+        );
+    } else {
+        code_leaf_rect(
+            wr,
+            planes,
+            st,
+            px,
+            py,
+            block.width,
+            block.height,
+            block.y_mode,
+            block.uv_mode,
+        );
     }
 }
 
@@ -2086,6 +2599,13 @@ fn encode_plan(
             for (i, (cx, cy)) in corners.into_iter().enumerate() {
                 encode_plan(wr, planes, st, bl + 1, cx, cy, hh, &kids[i]);
             }
+        }
+        Plan::Partition { symbol, blocks } => {
+            write_partition_symbol(wr, st, bl, x8, y8, *symbol);
+            for block in blocks {
+                code_partition_block(wr, planes, st, px, py, block);
+            }
+            mark_rect_partition(st, x8, y8, sz8, *symbol);
         }
     }
 }
@@ -2267,9 +2787,15 @@ fn best_leaf_mono(
     let mut y_delta = 0i32;
     let mut yb = f32::INFINITY;
     let mut directional = [(f32::INFINITY, 0usize); 8];
-    for &m in LL_MODES.iter() {
+    let angle_allowed = n_tx >= 2;
+    let modes = if n_tx == 1 {
+        &LL4_MODES[..]
+    } else {
+        &LL_MODES[..]
+    };
+    for &m in modes {
         let mut b = plane_leaf_bits(m, 0, luma, stride, px, py, n_tx, base, bit_depth);
-        if (1..=8).contains(&m) {
+        if angle_allowed && (1..=8).contains(&m) {
             b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
             directional[m - 1] = (b, m);
         }
@@ -2279,7 +2805,7 @@ fn best_leaf_mono(
             y_delta = 0;
         }
     }
-    if angle_delta_rdo {
+    if angle_allowed && angle_delta_rdo {
         directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         for &(_, m) in &directional[..3] {
             for delta in [-3, -2, -1, 1, 2, 3] {
@@ -2293,7 +2819,7 @@ fn best_leaf_mono(
             }
         }
     }
-    let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
+    let palette = (n_tx >= 2 && px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
         .then(|| exact_luma_palette(luma, stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
         .flatten()
         .filter(|palette| palette_best_case_bits(palette, bit_depth) < yb);
@@ -2304,7 +2830,7 @@ fn best_leaf_mono(
     let ovh = 4.0;
     let regular_bits = yb + ovh;
     let ibc_margin = intrabc_rdo_margin(n_tx * 4);
-    let ibc = (regular_bits > 8.0 + ibc_margin)
+    let ibc = (n_tx >= 2 && regular_bits > 8.0 + ibc_margin)
         .then(|| {
             find_exact_intrabc(
                 &[luma],
@@ -2325,6 +2851,159 @@ fn best_leaf_mono(
     } else {
         (regular_bits, y_mode, y_delta, palette, false)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn best_partition_block_mono(
+    luma: &[i16],
+    stride: usize,
+    parent_x: usize,
+    parent_y: usize,
+    dx: usize,
+    dy: usize,
+    width: usize,
+    height: usize,
+    base: i32,
+    bit_depth: u8,
+    visible_w: usize,
+    visible_h: usize,
+    angle_delta_rdo: bool,
+    intrabc_index: &IntrabcIndex,
+) -> (f32, BlockDecision) {
+    let (px, py) = (parent_x + dx, parent_y + dy);
+    if width == height {
+        let (mut bits, mut ym, yd, palette, intrabc) = best_leaf_mono(
+            luma,
+            stride,
+            px,
+            py,
+            width / 4,
+            base,
+            bit_depth,
+            visible_w,
+            visible_h,
+            false,
+            intrabc_index,
+        );
+        // A/B rectangular partitions give their square children different
+        // top-right/bottom-left availability from the ordinary SPLIT tree.
+        // Until those directional edge flags are carried in BlockDecision,
+        // keep these children on predictors that need no extended diagonal
+        // edge. Palette and IntraBC remain independently eligible.
+        if palette.is_none() && !intrabc && (3..=8).contains(&ym) {
+            let mut safe = (f32::INFINITY, 0usize);
+            for &mode in &LL_RECT_FAST_MODES {
+                let mut candidate =
+                    plane_leaf_bits(mode, 0, luma, stride, px, py, width / 4, base, bit_depth);
+                if (1..=2).contains(&mode) {
+                    candidate += raw_symbol_cost(&ANGLE_DELTA_CDF[mode - 1], 3);
+                }
+                if candidate < safe.0 {
+                    safe = (candidate, mode);
+                }
+            }
+            bits = safe.0 + 4.0;
+            ym = safe.1;
+        }
+        (
+            bits,
+            BlockDecision {
+                dx,
+                dy,
+                width,
+                height,
+                y_mode: ym,
+                y_delta: yd,
+                uv_mode: 0,
+                uv_delta: 0,
+                uv_alpha: [0, 0],
+                palette,
+                intrabc,
+            },
+        )
+    } else {
+        let mut best = (f32::INFINITY, 0usize);
+        let modes: &[usize] = if angle_delta_rdo {
+            &LL_RECT_MODES
+        } else {
+            &LL_RECT_FAST_MODES
+        };
+        for &mode in modes {
+            let bits = plane_rect_bits(mode, luma, stride, px, py, width, height, base);
+            if bits < best.0 {
+                best = (bits, mode);
+            }
+        }
+        (
+            best.0 + 4.0,
+            BlockDecision {
+                dx,
+                dy,
+                width,
+                height,
+                y_mode: best.1,
+                y_delta: 0,
+                uv_mode: 0,
+                uv_delta: 0,
+                uv_alpha: [0, 0],
+                palette: None,
+                intrabc: false,
+            },
+        )
+    }
+}
+
+fn rectangular_geometries(size: usize) -> Vec<(usize, Vec<(usize, usize, usize, usize)>)> {
+    let half = size / 2;
+    let mut out = vec![
+        (1, vec![(0, 0, size, half), (0, half, size, half)]),
+        (2, vec![(0, 0, half, size), (half, 0, half, size)]),
+    ];
+    if size == 8 {
+        return out;
+    }
+    let quarter = size / 4;
+    out.extend([
+        (
+            4,
+            vec![
+                (0, 0, half, half),
+                (half, 0, half, half),
+                (0, half, size, half),
+            ],
+        ),
+        (
+            5,
+            vec![
+                (0, 0, size, half),
+                (0, half, half, half),
+                (half, half, half, half),
+            ],
+        ),
+        (
+            6,
+            vec![
+                (0, 0, half, half),
+                (0, half, half, half),
+                (half, 0, half, size),
+            ],
+        ),
+        (
+            7,
+            vec![
+                (0, 0, half, size),
+                (half, 0, half, half),
+                (half, half, half, half),
+            ],
+        ),
+    ]);
+    if size >= 32 {
+        out.extend([
+            (8, (0..4).map(|i| (0, i * quarter, size, quarter)).collect()),
+            (9, (0..4).map(|i| (i * quarter, 0, quarter, size)).collect()),
+        ]);
+    }
+    out
 }
 
 /// Mono partition plan for a fully-in-frame square block (luma only).
@@ -2356,19 +3035,93 @@ fn plan_full_mono(
         intrabc_index,
     );
     let none = PART_NONE_BITS + bits_leaf;
+    let mut best = (
+        none,
+        Plan::Leaf {
+            y_mode: ym,
+            y_delta: yd,
+            uv_mode: 0,
+            uv_delta: 0,
+            uv_alpha: [0, 0],
+            palette,
+            intrabc,
+        },
+    );
+    let eval_partition = |symbol: usize, geometry: &[(usize, usize, usize, usize)]| {
+        let mut bits = PART_RECT_BITS;
+        let mut blocks = Vec::with_capacity(geometry.len());
+        for &(dx, dy, width, height) in geometry {
+            let (block_bits, block) = best_partition_block_mono(
+                luma,
+                stride,
+                px,
+                py,
+                dx,
+                dy,
+                width,
+                height,
+                base,
+                bit_depth,
+                visible_w,
+                visible_h,
+                angle_delta_rdo,
+                intrabc_index,
+            );
+            bits += block_bits;
+            blocks.push(block);
+        }
+        (bits, Plan::Partition { symbol, blocks })
+    };
     if sz8 == 1 {
-        return (
-            none,
-            Plan::Leaf {
-                y_mode: ym,
-                y_delta: yd,
-                uv_mode: 0,
-                uv_delta: 0,
-                uv_alpha: [0, 0],
-                palette,
-                intrabc,
-            },
-        );
+        if angle_delta_rdo || forced_ll_partition() == 3 {
+            let mut split = PART_SPLIT_BITS;
+            let mut kids: [Option<Plan>; 4] = [None, None, None, None];
+            for (i, (cx, cy)) in [(px, py), (px + 4, py), (px, py + 4), (px + 4, py + 4)]
+                .into_iter()
+                .enumerate()
+            {
+                let (b, cym, cyd, cpalette, cibc) = best_leaf_mono(
+                    luma,
+                    stride,
+                    cx,
+                    cy,
+                    1,
+                    base,
+                    bit_depth,
+                    visible_w,
+                    visible_h,
+                    false,
+                    intrabc_index,
+                );
+                split += b;
+                kids[i] = Some(Plan::Leaf {
+                    y_mode: cym,
+                    y_delta: cyd,
+                    uv_mode: 0,
+                    uv_delta: 0,
+                    uv_alpha: [0, 0],
+                    palette: cpalette,
+                    intrabc: cibc,
+                });
+            }
+            let split_plan = (split, Plan::Split(Box::new(kids.map(|kid| kid.unwrap()))));
+            if forced_ll_partition() == 3 {
+                return split_plan;
+            }
+            if split_plan.0 < best.0 {
+                best = split_plan;
+            }
+        }
+        for (symbol, geometry) in rectangular_geometries(8) {
+            let candidate = eval_partition(symbol, &geometry);
+            if forced_ll_partition() == symbol {
+                return candidate;
+            }
+            if candidate.0 < best.0 {
+                best = candidate;
+            }
+        }
+        return best;
     }
     let hh = sz8 / 2;
     let mut split = PART_SPLIT_BITS;
@@ -2398,22 +3151,24 @@ fn plan_full_mono(
         split += b;
         kids[i] = Some(p);
     }
-    if none <= split {
-        (
-            none,
-            Plan::Leaf {
-                y_mode: ym,
-                y_delta: yd,
-                uv_mode: 0,
-                uv_delta: 0,
-                uv_alpha: [0, 0],
-                palette,
-                intrabc,
-            },
-        )
-    } else {
-        (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))))
+    let split_plan = (split, Plan::Split(Box::new(kids.map(|k| k.unwrap()))));
+    if split_plan.0 < best.0 {
+        best = split_plan;
     }
+    let rect_candidates = if angle_delta_rdo { 8 } else { 2 };
+    for (symbol, geometry) in rectangular_geometries(sz8 * 8)
+        .into_iter()
+        .take(rect_candidates)
+    {
+        let candidate = eval_partition(symbol, &geometry);
+        if forced_ll_partition() == symbol {
+            return candidate;
+        }
+        if candidate.0 < best.0 {
+            best = candidate;
+        }
+    }
+    best
 }
 
 /// Code a mono lossless leaf: block skip + kf_y mode (+ angle_delta) then the
@@ -2476,10 +3231,10 @@ fn code_leaf_mono(
     if (1..=8).contains(&y_mode) {
         wr.symbol_adapt((y_delta + 3) as usize, &mut st.cdfs.angle_delta[y_mode - 1]);
     }
-    let bsize_ctx = palette_bsize_ctx(size);
-    let mode_ctx =
-        usize::from(!st.a_palette[x4].is_empty()) + usize::from(!st.l_palette[y4].is_empty());
-    if y_mode == 0 {
+    if size >= 8 && y_mode == 0 {
+        let bsize_ctx = palette_bsize_ctx(size);
+        let mode_ctx =
+            usize::from(!st.a_palette[x4].is_empty()) + usize::from(!st.l_palette[y4].is_empty());
         wr.symbol_adapt(
             usize::from(palette.is_some()),
             &mut st.cdfs.palette_y_mode[bsize_ctx][mode_ctx],
@@ -2528,6 +3283,91 @@ fn code_leaf_mono(
     );
 }
 
+fn code_leaf_rect_mono(
+    wr: &mut Writer,
+    luma: &[i16],
+    st: &mut LlState,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    y_mode: usize,
+) {
+    let (x4, y4, nw, nh) = (px / 4, py / 4, width / 4, height / 4);
+    write_block_skip_rect(wr, st, px, py, width, height, false);
+    wr.symbol_adapt(0, &mut st.cdfs.intrabc);
+    let y_ctx = INTRA_MODE_CTX[st.a_mode[x4] as usize] * 5 + INTRA_MODE_CTX[st.l_mode[y4] as usize];
+    wr.symbol_adapt(y_mode, &mut st.cdfs.kf_y[y_ctx]);
+    if width >= 8 && height >= 8 && (1..=8).contains(&y_mode) {
+        wr.symbol_adapt(3, &mut st.cdfs.angle_delta[y_mode - 1]);
+    }
+    if width >= 8 && height >= 8 && y_mode == 0 {
+        let bctx = (width.trailing_zeros() as usize + height.trailing_zeros() as usize - 6).min(6);
+        let mctx =
+            usize::from(!st.a_palette[x4].is_empty()) + usize::from(!st.l_palette[y4].is_empty());
+        wr.symbol_adapt(0, &mut st.cdfs.palette_y_mode[bctx][mctx]);
+    }
+    st.a_mode[x4..x4 + nw].fill(y_mode as u8);
+    st.l_mode[y4..y4 + nh].fill(y_mode as u8);
+    for slot in &mut st.a_palette[x4..x4 + nw] {
+        slot.clear();
+    }
+    for slot in &mut st.l_palette[y4..y4 + nh] {
+        slot.clear();
+    }
+    encode_plane_rect_block(
+        wr,
+        &mut st.cdfs,
+        luma,
+        st.w,
+        px,
+        py,
+        width,
+        height,
+        false,
+        y_mode,
+        st.base,
+        &mut st.a_coef[0],
+        &mut st.l_coef[0],
+    );
+}
+
+fn code_partition_block_mono(
+    wr: &mut Writer,
+    luma: &[i16],
+    st: &mut LlState,
+    parent_x: usize,
+    parent_y: usize,
+    block: &BlockDecision,
+) {
+    let (px, py) = (parent_x + block.dx, parent_y + block.dy);
+    if block.width == block.height {
+        code_leaf_mono(
+            wr,
+            luma,
+            st,
+            px,
+            py,
+            block.width,
+            block.y_mode,
+            block.y_delta,
+            block.palette.as_ref(),
+            block.intrabc,
+        );
+    } else {
+        code_leaf_rect_mono(
+            wr,
+            luma,
+            st,
+            px,
+            py,
+            block.width,
+            block.height,
+            block.y_mode,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_plan_mono(
     wr: &mut Writer,
@@ -2567,11 +3407,50 @@ fn encode_plan_mono(
         }
         Plan::Split(kids) => {
             write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
+            if sz8 == 1 {
+                for (kid, (cx, cy)) in
+                    kids.iter()
+                        .zip([(px, py), (px + 4, py), (px, py + 4), (px + 4, py + 4)])
+                {
+                    let Plan::Leaf {
+                        y_mode,
+                        y_delta,
+                        palette,
+                        intrabc,
+                        ..
+                    } = kid
+                    else {
+                        unreachable!("4x4 monochrome partition child must be a leaf")
+                    };
+                    code_leaf_mono(
+                        wr,
+                        luma,
+                        st,
+                        cx,
+                        cy,
+                        4,
+                        *y_mode,
+                        *y_delta,
+                        palette.as_ref(),
+                        *intrabc,
+                    );
+                }
+                st.a_part[x8] = 0x1f;
+                st.l_part[y8] = 0x1f;
+                return;
+            }
             let hh = sz8 / 2;
             let corners = [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)];
             for (i, (cx, cy)) in corners.into_iter().enumerate() {
                 encode_plan_mono(wr, luma, st, bl + 1, cx, cy, hh, &kids[i]);
             }
+        }
+        Plan::Partition { symbol, blocks } => {
+            write_partition_symbol(wr, st, bl, x8, y8, *symbol);
+            for block in blocks {
+                code_partition_block_mono(wr, luma, st, px, py, block);
+            }
+            mark_rect_partition(st, x8, y8, sz8, *symbol);
         }
     }
 }
@@ -2780,7 +3659,7 @@ mod tests {
         let Some(decoder) = dav1d() else {
             return;
         };
-        let (w, h) = (8usize, 8usize);
+        let (w, h) = (16usize, 8usize);
         // Every TX_4X4 has an exactly zero-mean checkerboard. U follows luma
         // with alpha +8 and V follows it with alpha -8, while all chroma DC
         // edges average to 128. This also exercises opposite joint signs.
@@ -3233,6 +4112,200 @@ mod tests {
         assert_eq!(
             decode_obu(&decoder, &obu, "intrabc-indexed-small-far"),
             pixels
+        );
+    }
+
+    #[test]
+    fn lossless_mono_4x4_split_is_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (8usize, 8usize);
+        let pixels: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                ((x * 31 + y * 47 + (x / 4) * 73 + (y / 4) * 109) & 255) as u8
+            })
+            .collect();
+        let luma: Vec<i16> = pixels.iter().map(|&v| i16::from(v)).collect();
+        let index = IntrabcIndex::new(&[&luma], w, h);
+        FORCE_LL_PARTITION.with(|forced| forced.set(3));
+        let (_, plan) = plan_full_mono(&luma, w, 0, 0, 1, 128, 8, w, h, true, &index);
+        assert!(matches!(plan, Plan::Split(_)));
+
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        FORCE_LL_PARTITION.with(|forced| forced.set(0));
+        assert_eq!(
+            decode_obu(&decoder, &obu, "lossless-mono-4x4-split"),
+            pixels
+        );
+    }
+
+    #[test]
+    fn lossless_rectangular_partition_families_are_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (64usize, 64usize);
+        let mut planes = [vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]];
+        for (plane_index, plane) in planes.iter_mut().enumerate() {
+            for y in 0..h {
+                for x in 0..w {
+                    plane[y * w + x] = ((x * (17 + plane_index * 6)
+                        + y * (29 + plane_index * 4)
+                        + (x ^ y) * 3
+                        + plane_index * 71)
+                        & 255) as u8;
+                }
+            }
+        }
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                planes[0].clone(),
+                planes[1].clone(),
+                planes[2].clone(),
+                Vec::new(),
+            ],
+        };
+        let expected = [planes[0].clone(), planes[1].clone(), planes[2].clone()].concat();
+        for symbol in 1..=7 {
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_obu(&image, None, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(&decoder, &obu, &format!("lossless-partition-{symbol}")),
+                expected,
+                "partition symbol {symbol}"
+            );
+        }
+        let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &planes[0]).unwrap();
+        for symbol in 1..=9 {
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_gray_obu(&mono, true, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(&decoder, &obu, &format!("lossless-mono-partition-{symbol}")),
+                planes[0],
+                "monochrome partition symbol {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_mono_rectangular_partition_contexts_are_bit_exact_across_superblocks() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (128usize, 64usize);
+        let pixels: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                ((x * 17 + y * 29 + (x ^ y) * 3) & 255) as u8
+            })
+            .collect();
+        let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        for symbol in 1..=9 {
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_gray_obu(&mono, true, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(
+                    &decoder,
+                    &obu,
+                    &format!("lossless-mono-partition-context-{symbol}")
+                ),
+                pixels,
+                "monochrome partition context after symbol {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_rectangular_minimum_geometries_are_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (16usize, 16usize);
+        let planes: [Vec<u8>; 3] = std::array::from_fn(|plane| {
+            (0..w * h)
+                .map(|i| ((i * (37 + plane * 10) + (i / w) * 23 + plane * 61) & 255) as u8)
+                .collect()
+        });
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                planes[0].clone(),
+                planes[1].clone(),
+                planes[2].clone(),
+                Vec::new(),
+            ],
+        };
+        let expected = [planes[0].clone(), planes[1].clone(), planes[2].clone()].concat();
+        let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &planes[0]).unwrap();
+        for symbol in 1..=9 {
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_obu(&image, None, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(&decoder, &obu, &format!("lossless-min-partition-{symbol}")),
+                expected
+            );
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_gray_obu(&mono, true, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(
+                    &decoder,
+                    &obu,
+                    &format!("lossless-min-mono-partition-{symbol}")
+                ),
+                planes[0]
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_rdo_selects_rectangular_partition_for_mixed_orientation() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (64usize, 64usize);
+        let mut p = vec![0i16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                p[y * w + x] = if y < 32 {
+                    ((x * 4) & 255) as i16
+                } else {
+                    ((y * 4) & 255) as i16
+                };
+            }
+        }
+        let planes = [&p[..], &p[..], &p[..]];
+        let index = IntrabcIndex::new(&planes, w, h);
+        let (_, plan) = plan_full(planes, w, 0, 0, 8, 128, 8, w, h, false, &index);
+        match plan {
+            Plan::Partition { symbol: 1, .. } => {}
+            Plan::Partition { symbol, .. } => panic!("selected partition symbol {symbol}"),
+            Plan::Leaf { .. } => panic!("selected PARTITION_NONE"),
+            Plan::Split(_) => panic!("selected PARTITION_SPLIT"),
+        }
+        let bytes: Vec<u8> = p.iter().map(|&v| v as u8).collect();
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [bytes.clone(), bytes.clone(), bytes.clone(), Vec::new()],
+        };
+        let obu = encode_lossless_obu(&image, None, 1).unwrap();
+        assert_eq!(
+            decode_obu(&decoder, &obu, "lossless-rdo-rect-directional"),
+            [bytes.clone(), bytes.clone(), bytes].concat()
         );
     }
 
