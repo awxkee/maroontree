@@ -27,6 +27,28 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/// Luma mode set for BLOCK_64X64. Historically only DC/SMOOTH/PAETH were tried;
+/// the full non-directional set plus the directionals is what every other block
+/// size searches. TEMPORARY env override while the cost/benefit is measured —
+/// each candidate costs a full four-quadrant TX_32X32 encode.
+fn block64_modes() -> &'static [usize] {
+    static M: std::sync::OnceLock<&'static [usize]> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("MT_B64_MODES").ok().as_deref() {
+        Some("full") => nd_modes(),
+        Some("nodir") => {
+            static ND: [usize; 5] = [
+                DC_PRED,
+                SMOOTH_PRED,
+                SMOOTH_V_PRED,
+                SMOOTH_H_PRED,
+                PAETH_PRED,
+            ];
+            &ND
+        }
+        _ => fast_nd_modes(),
+    })
+}
+
 impl<'a> LossyTile<'a> {
     /// Luma raster quadrants of a 64x64 block, as (dx, dy) pixel offsets.
     const Q64: [(usize, usize); 4] = [(0, 0), (32, 0), (0, 32), (32, 32)];
@@ -48,8 +70,11 @@ impl<'a> LossyTile<'a> {
             trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_32X32, lam);
             let rr = idct_dequant_32x32(&cf, &self.quant);
             let distortion = self.luma_partition_distortion(bx, by, 32, 32, acq, |i| dc + rr[i]);
-            total +=
-                crate::partition_rd::rd_cost(distortion, mlam, block_rate_bits(&cf, &SCAN_32X32));
+            total += crate::partition_rd::rd_cost(
+                distortion,
+                mlam,
+                self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, DC_PRED, 0),
+            );
         }
         total
     }
@@ -132,11 +157,9 @@ impl<'a> LossyTile<'a> {
             rd_split += self.rd_cost_none32(qx, qy, prdo)
                 + self.rd_cost_chroma_partition(qx, qy, 32, Part16::None, prdo);
         }
-        if rd_none <= rd_split {
-            Part16::None
-        } else {
-            Part16::Split
-        }
+        let keep = rd_none <= rd_split;
+        crate::partstats::tally64(keep);
+        if keep { Part16::None } else { Part16::Split }
     }
 
     /// Code a fully-in-frame 64x64 region as one BLOCK_64X64. Luma is a
@@ -157,7 +180,7 @@ impl<'a> LossyTile<'a> {
         // Deblock footprint: four TX_32X32 tiles so the filter sees the interior
         // 32-sample transform edges (mirrors block16's tx-split re-record).
         for (sx, sy) in Self::Q64 {
-            self.record_blk((px + sx) / 8, (py + sy) / 8, 8);
+            self.record_tx_blk((px + sx) / 8, (py + sy) / 8, 8);
         }
 
         // Intra-edge smooth-filter flag: dav1d derives it ONCE at the BLOCK
@@ -186,9 +209,12 @@ impl<'a> LossyTile<'a> {
             // Cheap mode pick: score DC/SMOOTH/PAETH by summed four-quadrant SSE
             // + rate, each quadrant predicted from the current (pre-block) recon.
             let mut best_eff = f32::INFINITY;
-            for &m in fast_nd_modes() {
+            for &m in block64_modes() {
                 let mut eff = 0.0f32;
-                for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
+                // One 64x64 PREDICTION block; its four TX_32X32 are recorded per
+        // quadrant below. Chroma deblocks on the block, not the transforms.
+        self.record_pred_blk(x8, y8, 16);
+        for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
                     let (bx, by) = (px + sx, py + sy);
                     let (tr, bl) = Self::quad_edges(sx, sy, px, py, have_tr, have_bl);
                     let mut pred = [0i32; 1024];
@@ -229,10 +255,10 @@ impl<'a> LossyTile<'a> {
                     let rr = idct_dequant_32x32(&cf, &self.quant);
                     let sse =
                         sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, bx, by, self.bd);
-                    eff += rd_cost_i64(sse, mlam, block_rate_bits(&cf, &SCAN_32X32));
+                    eff += rd_cost_i64(sse, mlam, self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, m, 0));
                     let _ = qi;
                 }
-                eff += rate_cost(mlam, mode_signal_bits(m));
+                eff += rate_cost(mlam, self.mode_bits(px, py, m));
                 if eff < best_eff {
                     best_eff = eff;
                     y_mode = m;
@@ -389,6 +415,12 @@ impl<'a> LossyTile<'a> {
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
+        // Directional modes carry an angle_delta symbol (`use_angle_delta` is
+        // true for BLOCK_8X8 and larger). The 64x64 search offers delta 0 only.
+        if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
+            self.enc
+                .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
+        }
         // CfL is not allowed at 64x64, so uv_mode uses the NOCFL CDF (index m,
         // not 13+m) — emit it directly rather than via `emit_uv_mode`.
         self.enc

@@ -28,6 +28,46 @@
  */
 use crate::aq_common::f_fmlaf;
 
+/// Multiplier applied to the 16x16 HORZ/VERT candidates. TEMPORARY knob while
+/// the rectangle-vs-square operating point is being calibrated.
+fn rect16_bias() -> f32 {
+    static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("MT_RECT16_BIAS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ModeBitsVariant {
+    /// Historical: 0 for DC, flat 30 for everything else.
+    Flat,
+    /// Raw contextual kf_y cost (no DC bias at all).
+    Cdf,
+    /// Contextual cost scaled by k.
+    Scale(f32),
+    /// Contextual cost plus a flat non-DC bias — contextual SHAPE, restored BIAS.
+    Offset(f32),
+}
+
+/// `MT_MODE_BITS=flat | cdf | scale:K | offset:B` (default flat).
+pub(crate) fn mode_bits_variant() -> ModeBitsVariant {
+    static V: std::sync::OnceLock<ModeBitsVariant> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let s = std::env::var("MT_MODE_BITS").unwrap_or_default();
+        let (kind, arg) = s.split_once(':').unwrap_or((s.as_str(), ""));
+        let n: f32 = arg.parse().unwrap_or(0.0);
+        match kind {
+            "cdf" => ModeBitsVariant::Cdf,
+            "scale" => ModeBitsVariant::Scale(n),
+            "offset" => ModeBitsVariant::Offset(n),
+            _ => ModeBitsVariant::Flat,
+        }
+    })
+}
+
 impl<'a> LossyTile<'a> {
     /// CDFs used by DECISION-side rate estimates (RDOQ trellis, filter-intra /
     /// angle-delta costs): the frozen [`Cdfs::decision_snapshot`], so decisions
@@ -74,6 +114,10 @@ impl<'a> LossyTile<'a> {
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
             blk4t: vec![false; (w / 4) * (h / 4)],
+            pblk4: vec![0; (w / 4) * (h / 4)],
+            pblk4h: vec![0; (w / 4) * (h / 4)],
+            pblk4v: vec![false; (w / 4) * (h / 4)],
+            pblk4t: vec![false; (w / 4) * (h / 4)],
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
@@ -131,6 +175,10 @@ impl<'a> LossyTile<'a> {
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
             blk4t: vec![false; (w / 4) * (h / 4)],
+            pblk4: vec![0; (w / 4) * (h / 4)],
+            pblk4h: vec![0; (w / 4) * (h / 4)],
+            pblk4v: vec![false; (w / 4) * (h / 4)],
+            pblk4t: vec![false; (w / 4) * (h / 4)],
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
@@ -187,6 +235,10 @@ impl<'a> LossyTile<'a> {
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
             blk4t: vec![false; (w / 4) * (h / 4)],
+            pblk4: vec![0; (w / 4) * (h / 4)],
+            pblk4h: vec![0; (w / 4) * (h / 4)],
+            pblk4v: vec![false; (w / 4) * (h / 4)],
+            pblk4t: vec![false; (w / 4) * (h / 4)],
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
@@ -243,6 +295,10 @@ impl<'a> LossyTile<'a> {
             blk4h: vec![0; (w / 4) * (h / 4)],
             blk4v: vec![false; (w / 4) * (h / 4)],
             blk4t: vec![false; (w / 4) * (h / 4)],
+            pblk4: vec![0; (w / 4) * (h / 4)],
+            pblk4h: vec![0; (w / 4) * (h / 4)],
+            pblk4v: vec![false; (w / 4) * (h / 4)],
+            pblk4t: vec![false; (w / 4) * (h / 4)],
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
@@ -262,6 +318,129 @@ impl<'a> LossyTile<'a> {
             frame_w: w,
             frame_h: h,
             base_q_idx: q,
+        }
+    }
+
+    /// Entropy-accurate rate for a square LUMA transform of width `w` covering
+    /// the whole block at (px, py) — the shape every intra R-D comparison comes
+    /// in. Since the TX spans the block, `txb_skip` context is 0 (see
+    /// [`Self::skip_ctx`]); TX_32X32 codes no transform-type symbol.
+    ///
+    /// This replaces [`crate::cost::block_rate_bits`] at the decision sites: the
+    /// proxy is context-free and charges a flat 2 bits for EOB, which
+    /// systematically under-prices scattered high-frequency tails and mis-ranks
+    /// transform types and partitions against each other.
+    pub(crate) fn luma_bits(
+        &self,
+        cf: &[i32],
+        scan: &[u32],
+        w: usize,
+        px: usize,
+        py: usize,
+        y_mode: usize,
+        txtp: usize,
+    ) -> f32 {
+        if crate::cost::use_proxy_rate() {
+            return crate::cost::block_rate_bits(cf, scan);
+        }
+        let c = self.dcdf();
+        let (bx4, by4) = (px / 4, py / 4);
+        let (cls, eob_bin, txtp_cdf): (usize, &[u16], Option<&[u16]>) = match w {
+            4 => (0, &c.eob_bin_16_l, Some(&c.txtp4[y_mode])),
+            8 => (1, &c.eob_bin_64_l, Some(&c.txtp[y_mode])),
+            16 => (2, &c.eob_bin_256_l, Some(&c.txtp16[y_mode])),
+            // TX_32X32 intra implies DCT_DCT — no txtp symbol is coded.
+            _ => (3, &c.eob_bin_1024_l, None),
+        };
+        let ctx = crate::rate::RateCtx {
+            cdfs: c,
+            cls,
+            plane: 0,
+            w,
+            eob_bin,
+            skip_ctx: 0,
+            dcs_ctx: self.dc_sign_ctx_span(0, bx4, by4, w / 4, w / 4),
+            txtp: txtp_cdf.map(|cd| (cd, txtp)),
+        };
+        crate::rate::real_block_bits(cf, scan, &ctx)
+    }
+
+    /// Entropy-accurate rate for a square CHROMA transform of width `w` at
+    /// chroma position (cx, cy) of `plane` (1 or 2). Chroma codes no
+    /// transform-type symbol, and its `txb_skip` context is the
+    /// `7 + above_nz + left_nz` form the per-size helpers all share. Both chroma
+    /// planes share CDF plane index 1.
+    pub(crate) fn chroma_bits(
+        &self,
+        cf: &[i32],
+        scan: &[u32],
+        w: usize,
+        plane: usize,
+        cx: usize,
+        cy: usize,
+    ) -> f32 {
+        if crate::cost::use_proxy_rate() {
+            return crate::cost::block_rate_bits(cf, scan);
+        }
+        let c = self.dcdf();
+        let (bx4, by4) = (cx / 4, cy / 4);
+        let n4 = w / 4;
+        let (cls, eob_bin): (usize, &[u16]) = match w {
+            4 => (0, &c.eob_bin_16_c),
+            8 => (1, &c.eob_bin_64_c),
+            16 => (2, &c.eob_bin_256_c),
+            _ => (3, &c.eob_bin_1024_c),
+        };
+        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let ca = a[bx4..(bx4 + n4).min(a.len())].iter().any(|&x| x != 0x40) as usize;
+        let cl = l[by4..(by4 + n4).min(l.len())].iter().any(|&x| x != 0x40) as usize;
+        let ctx = crate::rate::RateCtx {
+            cdfs: c,
+            cls,
+            plane: 1,
+            w,
+            eob_bin,
+            skip_ctx: 7 + ca + cl,
+            dcs_ctx: self.dc_sign_ctx_span(plane, bx4, by4, n4, n4),
+            txtp: None,
+        };
+        crate::rate::real_block_bits(cf, scan, &ctx)
+    }
+
+    /// Cost of signalling luma mode `m` at (px, py).
+    ///
+    /// Defaults to the flat `MODE_SIGNAL_BITS` (30 bits for any non-DC mode).
+    ///
+    /// That looks like a rate-model bug — the true `kf_y` symbol costs only a
+    /// few bits and depends on the neighbours — but it is a MEASURED perceptual
+    /// bias, not an oversight. Substituting the real contextual CDF cost
+    /// regresses BD-rate by **+3.96% at 4:4:4 and +2.25% at 4:2:0**
+    /// (screen_shot +12.9%), because the cheap true cost lets the search leave
+    /// DC for marginal SSE gains that SSIMULACRA2 dislikes. Re-measured after
+    /// the 32x32 split-signal fix and the entropy-accurate coefficient rate, so
+    /// it is not an artifact of the old proxy model.
+    ///
+    /// `MT_CDF_MODE_BITS=1` opts into the contextual cost for further A/B.
+    pub(crate) fn mode_bits(&self, px: usize, py: usize, m: usize) -> f32 {
+        // Measured: the true kf_y symbol costs ~1.5 bits for DC and ~4.4 for
+        // non-DC, i.e. a ~2.9-bit differential where the flat model charges 30.
+        // So "flat 30" is really two things at once — a context-free SHAPE and a
+        // ~10x exaggerated DC BIAS. `offset` keeps the contextual shape and
+        // restores the bias, which is the only way to test them separately.
+        let v = mode_bits_variant();
+        if matches!(v, ModeBitsVariant::Flat) {
+            return crate::cost::mode_signal_bits(m);
+        }
+        let (bx4, by4) = (px / 4, py / 4);
+        let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
+            + INTRA_MODE_CTX[self.l_mode[by4] as usize];
+        let c = cdf_cost(&self.dcdf().kf_y[yctx], m);
+        crate::partstats::tally_mode_cost(m, c);
+        match v {
+            ModeBitsVariant::Flat => unreachable!(),
+            ModeBitsVariant::Cdf => c,
+            ModeBitsVariant::Scale(k) => c * k,
+            ModeBitsVariant::Offset(b) => c + if m == DC_PRED { 0.0 } else { b },
         }
     }
 
@@ -300,6 +479,33 @@ impl<'a> LossyTile<'a> {
             ll |= l[by4 + i];
         }
         SKIP_CTX_TBL[((la & 0x3f) as usize).min(4)][((ll & 0x3f) as usize).min(4)] as usize
+    }
+
+    /// `dc_sign` context over an arbitrary transform span (dav1d
+    /// `get_dc_sign_ctx`): sum the per-4x4 dc-sign markers across the TX's width
+    /// above and height to the left, where each marker is 0 (negative), 1
+    /// (no DC) or 2 (positive), and re-centre by the unit count. The fixed-span
+    /// [`Self::dc_sign_ctx`] is the 8x8 case; this one is needed for the 4x4 and
+    /// 32x32 transforms the R-D rate model costs, and clamps at the tile edge
+    /// where a wide TX would otherwise index past the context rows.
+    fn dc_sign_ctx_span(
+        &self,
+        plane: usize,
+        bx4: usize,
+        by4: usize,
+        nw: usize,
+        nh: usize,
+    ) -> usize {
+        let a = &self.a_coef[plane];
+        let l = &self.l_coef[plane];
+        let mut s = 0i32;
+        for &v in a[bx4..(bx4 + nw).min(a.len())].iter() {
+            s += (v >> 6) as i32 - 1;
+        }
+        for &v in l[by4..(by4 + nh).min(l.len())].iter() {
+            s += (v >> 6) as i32 - 1;
+        }
+        (s != 0) as usize + (s > 0) as usize
     }
 
     fn dc_sign_ctx(&self, plane: usize, bx4: usize, by4: usize) -> usize {
@@ -600,8 +806,11 @@ impl<'a> LossyTile<'a> {
                 self.luma_partition_distortion(px, py, 8, 8, self.quant.ac_q() as f32, |i| {
                     pred[i] + rr[i]
                 });
-            let eff =
-                crate::partition_rd::rd_cost(distortion, mlam, block_rate_bits(&cf, &SCAN_8X8));
+            let eff = crate::partition_rd::rd_cost(
+                distortion,
+                mlam,
+                self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1),
+            );
             if eff < eff8 {
                 eff8 = eff;
             }
@@ -652,7 +861,7 @@ impl<'a> LossyTile<'a> {
                 let eff = crate::partition_rd::rd_cost(
                     distortion,
                     mlam,
-                    block_rate_bits(&cf, &SCAN_4X4) + 4.0f32,
+                    self.luma_bits(&cf, &SCAN_4X4, 4, bx, by, m, 1) + 4.0f32,
                 );
                 if eff < best {
                     best = eff;
@@ -1006,11 +1215,17 @@ impl<'a> LossyTile<'a> {
             rd_split += self.rd_cost_square(px + sx, py + sy, 8, false, false, prdo);
         }
         rd_split += self.rd_cost_chroma_partition(px, py, 16, Part16::Split, prdo);
+        // Rectangle-vs-square balance. Making rectangles look CHEAPER measurably
+        // hurts (+0.49% BD-rate when the leaf estimator was sharpened), which
+        // says the 16x16 decision already leans too far toward them — the same
+        // shape of miscalibration `NONE32_SPLIT_BIAS` corrects at 32x32.
+        let rect_bias = rect16_bias();
         let rd_horz = if !horz_on {
             f32::INFINITY
         } else {
-            self.rd_cost_horz(px, py, prdo)
-                + self.rd_cost_chroma_partition(px, py, 16, Part16::Horz, prdo)
+            (self.rd_cost_horz(px, py, prdo)
+                + self.rd_cost_chroma_partition(px, py, 16, Part16::Horz, prdo))
+                * rect_bias
         };
 
         // VERT mirrors HORZ, but remains forbidden in 4:2:2.
@@ -1018,8 +1233,9 @@ impl<'a> LossyTile<'a> {
         let rd_vert = if !vert_on {
             f32::INFINITY
         } else {
-            self.rd_cost_vert(px, py, prdo)
-                + self.rd_cost_chroma_partition(px, py, 16, Part16::Vert, prdo)
+            (self.rd_cost_vert(px, py, prdo)
+                + self.rd_cost_chroma_partition(px, py, 16, Part16::Vert, prdo))
+                * rect_bias
         };
         let asym_signal = rate_cost(part_lam, ASYM_PART_SIGNAL_BITS);
         // The A/B leaf emitters are currently implemented for 4:2:0.
@@ -1062,12 +1278,14 @@ impl<'a> LossyTile<'a> {
             (rd_vert_a, Part16::VertA),
             (rd_vert_b, Part16::VertB),
         ];
-        cands
+        let chosen = cands
             .into_iter()
             .fold((f32::INFINITY, Part16::Split), |b, c| {
                 if c.0 < b.0 { c } else { b }
             })
-            .1
+            .1;
+        crate::partstats::tally16(chosen);
+        chosen
     }
 
     /// Code a 16x16 region (4:4:4 only) as a single TX_16X16 block: luma +

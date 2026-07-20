@@ -27,6 +27,18 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/// TEMPORARY diagnostic knob for the 32x32 split-signal multiplier (1.0 = the
+/// corrected pricing, 4.0 = the historical double-count).
+fn split32_signal_mult() -> f32 {
+    static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("MT_SPLIT32_MULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 impl<'a> LossyTile<'a> {
     /// Raster quadrants of a 32x32 block as (dx, dy) pixel offsets (TX_16X16).
     const Q32: [(usize, usize); 4] = [(0, 0), (16, 0), (0, 16), (16, 16)];
@@ -269,7 +281,11 @@ impl<'a> LossyTile<'a> {
             self.luma_partition_distortion(px, py, 32, 32, self.quant.ac_q() as f32, |i| {
                 dc + rr[i]
             });
-        crate::partition_rd::rd_cost(distortion, mlam, block_rate_bits(&cf, &SCAN_32X32))
+        crate::partition_rd::rd_cost(
+            distortion,
+            mlam,
+            self.luma_bits(&cf, &SCAN_32X32, 32, px, py, DC_PRED, 0),
+        )
     }
 
     fn rd_cost_split32(&self, px: usize, py: usize, prdo: f32) -> f32 {
@@ -277,7 +293,12 @@ impl<'a> LossyTile<'a> {
         let lam = trellis_lambda();
         let mlam = self.mlam();
         let (lam, mlam) = (lam * prdo, mlam * prdo);
-        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * 4.0f32);
+        // `SPLIT_SIGNAL_BITS` already accounts for the parent partition symbol,
+        // the four child symbols AND four sets of per-block headers (see its
+        // definition), so it is charged ONCE — as every other partition site
+        // does (block32.rs rect leg, lossy_state 16x16, block64). The previous
+        // `* 4.0` double-counted it at 96 bits and biased 32x32 toward merging.
+        let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * split32_signal_mult());
         for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
             let dc = dc_pred_16x16(&self.recon[0], self.w, px + sx, py + sy, self.bd as i32);
             let mut resid = [0i32; 256];
@@ -293,8 +314,11 @@ impl<'a> LossyTile<'a> {
                 self.quant.ac_q() as f32,
                 |i| dc + rr[i],
             );
-            total +=
-                crate::partition_rd::rd_cost(distortion, mlam, block_rate_bits(&cf, &SCAN_16X16));
+            total += crate::partition_rd::rd_cost(
+                distortion,
+                mlam,
+                self.luma_bits(&cf, &SCAN_16X16, 16, px + sx, py + sy, DC_PRED, 1),
+            );
         }
         total
     }
@@ -460,7 +484,9 @@ impl<'a> LossyTile<'a> {
             } else {
                 0.0
             };
-            let bits = block_rate_bits(&cf, &SCAN_32X32) + mode_signal_bits(m) + filter_bits;
+            let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, m, 0)
+                + self.mode_bits(px, py, m)
+                + filter_bits;
             let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best_eff {
                 best_eff = cost;
@@ -515,8 +541,8 @@ impl<'a> LossyTile<'a> {
                 );
                 let rr = idct_dequant_32x32(&cf, &self.quant);
                 let sse = sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
-                let bits = block_rate_bits(&cf, &SCAN_32X32);
-                let syntax_bits = mode_signal_bits(DC_PRED)
+                let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, DC_PRED, 0);
+                let syntax_bits = self.mode_bits(px, py, DC_PRED)
                     + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
                     + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
@@ -546,7 +572,7 @@ impl<'a> LossyTile<'a> {
             let ds = self.dc_sign_ctx_32(0, px / 4, py / 4);
             let wrr = idct_dequant_32x32(&lcf, &self.quant);
             let wsse = sse_recon::<1024, 32>(&lpred, &wrr, &self.src[0], self.w, px, py, self.bd);
-            let wbits = block_rate_bits(&lcf, &SCAN_32X32);
+            let wbits = self.luma_bits(&lcf, &SCAN_32X32, 32, px, py, best_mode, 0);
             let mut best_ad_cost = rd_cost_i64(wsse, mlam, wbits + cdf_cost(&ad_cdf, 3));
             for d in [-3i32, -2, -1, 1, 2, 3] {
                 let mut pred = [0i32; 1024];
@@ -588,7 +614,7 @@ impl<'a> LossyTile<'a> {
                 }
                 let rr = idct_dequant_32x32(&cf, &self.quant);
                 let sse = sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
-                let bits = block_rate_bits(&cf, &SCAN_32X32);
+                let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, best_mode, 0);
                 let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if rl.is_some() || cost < best_ad_cost {
                     best_ad_cost = cost;
@@ -661,10 +687,10 @@ impl<'a> LossyTile<'a> {
         }
         if tx_split {
             // Deblock works on TRANSFORM edges: re-record as four TX_16X16 tiles.
-            self.record_blk(x8, y8, 4);
-            self.record_blk(x8 + 2, y8, 4);
-            self.record_blk(x8, y8 + 2, 4);
-            self.record_blk(x8 + 2, y8 + 2, 4);
+            self.record_tx_blk(x8, y8, 4);
+            self.record_tx_blk(x8 + 2, y8, 4);
+            self.record_tx_blk(x8, y8 + 2, 4);
+            self.record_tx_blk(x8 + 2, y8 + 2, 4);
         }
         self.push_luma_sel(LumaSel {
             mode: best_mode as u8,
@@ -1283,7 +1309,8 @@ impl<'a> LossyTile<'a> {
                 }
                 let dcrr = idct_dequant_32x32(&ccf[ci], &self.cquant);
                 let s = sse_recon::<1024, 32>(&[dc; 1024], &dcrr, &src, 32, 0, 0, self.bd);
-                dc_cost[ci] = rd_cost_i64(s, mlam, block_rate_bits(&ccf[ci], &SCAN_32X32));
+                dc_cost[ci] =
+                    rd_cost_i64(s, mlam, self.chroma_bits(&ccf[ci], &SCAN_32X32, 32, plane, px, py));
                 let a = cfl_best_alpha(&ac, &src, dc, 1024, self.bd);
                 cfl_a[ci] = a;
                 let mut cpr = [0i32; 1024];
@@ -1298,7 +1325,8 @@ impl<'a> LossyTile<'a> {
                 let s2 = sse_recon::<1024, 32>(&cpr, &rr, &src, 32, 0, 0, self.bd);
                 cfl_ccf[ci] = q;
                 cfl_pred[ci] = cpr;
-                cfl_cost[ci] = rd_cost_i64(s2, mlam, block_rate_bits(&q, &SCAN_32X32));
+                cfl_cost[ci] =
+                    rd_cost_i64(s2, mlam, self.chroma_bits(&q, &SCAN_32X32, 32, plane, px, py));
             }
         }
         // Pure-emit replay: install the captured winner state before the
@@ -1394,7 +1422,11 @@ impl<'a> LossyTile<'a> {
                     py,
                     self.bd,
                 );
-                cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&cf_use[ci], &SCAN_32X32));
+                cur_total += rd_cost_i64(
+                    sse,
+                    mlam,
+                    self.chroma_bits(&cf_use[ci], &SCAN_32X32, 32, plane, px, py),
+                );
             }
 
             let mut best_total = cur_total;
@@ -1490,7 +1522,8 @@ impl<'a> LossyTile<'a> {
                         py,
                         self.bd,
                     );
-                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_32X32));
+                    cand_total +=
+                        rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_32X32, 32, plane, px, py));
                 }
                 if ru.is_some() || cand_total < best_total {
                     best_total = cand_total;
@@ -1636,7 +1669,11 @@ impl<'a> LossyTile<'a> {
                 cy,
                 self.bd,
             );
-            dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf_dc[ci], &SCAN_16X16));
+            dc_total += rd_cost_i64(
+                sse,
+                mlam,
+                self.chroma_bits(&ccf_dc[ci], &SCAN_16X16, 16, plane, cx, cy),
+            );
         }
         // Directional / smooth chroma modes (PAETH/SMOOTH/SMOOTH_V/SMOOTH_H), each
         // with its decoder-derived chroma tx. Winner must beat DC on the R-D metric.
@@ -1733,7 +1770,8 @@ impl<'a> LossyTile<'a> {
                     cy,
                     self.bd,
                 );
-                cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X16));
+                cand_total +=
+                    rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_16X16, 16, plane, cx, cy));
             }
             if ru.is_some() || cand_total < best_total {
                 best_total = cand_total;

@@ -372,7 +372,7 @@ impl<'a> LossyTile<'a> {
                 }
                 let dcrr = idct_dequant_16x16(&ccf[ci], &self.cquant);
                 dc_sse[ci] = sse_recon::<256, 16>(&[dc; 256], &dcrr, &src, 16, 0, 0, self.bd);
-                dc_bits[ci] = block_rate_bits(&ccf[ci], &SCAN_16X16);
+                dc_bits[ci] = self.chroma_bits(&ccf[ci], &SCAN_16X16, 16, plane, px, py);
                 let a = cfl_best_alpha(&ac, &src, dc, 256, self.bd);
                 cfl_a[ci] = a;
                 let mut cpr = [0i32; 256];
@@ -386,7 +386,7 @@ impl<'a> LossyTile<'a> {
                 let rr = idct_dequant_16x16(&q, &self.cquant);
                 cfl_ccf[ci] = q;
                 cfl_sse[ci] = sse_recon::<256, 16>(&cpr, &rr, &src, 16, 0, 0, self.bd);
-                cfl_bits[ci] = block_rate_bits(&q, &SCAN_16X16);
+                cfl_bits[ci] = self.chroma_bits(&q, &SCAN_16X16, 16, plane, px, py);
                 cpred16[ci] = cpr;
             }
             let sig = 4.0f32
@@ -444,7 +444,8 @@ impl<'a> LossyTile<'a> {
                     py,
                     self.bd,
                 );
-                cur_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf[ci], &SCAN_16X16));
+                cur_total +=
+                    rd_cost_i64(sse, mlam, self.chroma_bits(&ccf[ci], &SCAN_16X16, 16, plane, px, py));
             }
 
             // Directional / smooth chroma modes, each with its decoder-derived
@@ -546,7 +547,8 @@ impl<'a> LossyTile<'a> {
                         py,
                         self.bd,
                     );
-                    cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_16X16));
+                    cand_total +=
+                        rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_16X16, 16, plane, px, py));
                 }
                 if ru.is_some() || cand_total < best_total {
                     best_total = cand_total;
@@ -716,7 +718,8 @@ impl<'a> LossyTile<'a> {
                 cy,
                 self.bd,
             );
-            dc_total += rd_cost_i64(sse, mlam, block_rate_bits(&ccf_dc[ci], &SCAN_8X8));
+            dc_total +=
+                rd_cost_i64(sse, mlam, self.chroma_bits(&ccf_dc[ci], &SCAN_8X8, 8, plane, cx, cy));
         }
         // Directional / smooth chroma modes, each with its decoder-derived chroma tx.
         // PAETH is empirically the strongest non-DC chroma mode, searched alongside
@@ -814,7 +817,8 @@ impl<'a> LossyTile<'a> {
                     cy,
                     self.bd,
                 );
-                cand_total += rd_cost_i64(sse, mlam, block_rate_bits(&q, &SCAN_8X8));
+                cand_total +=
+                    rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_8X8, 8, plane, cx, cy));
             }
             if ru.is_some() || cand_total < best_total {
                 best_total = cand_total;

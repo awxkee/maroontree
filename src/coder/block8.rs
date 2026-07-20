@@ -137,13 +137,13 @@ impl<'a> LossyTile<'a> {
                     );
                 }
                 let sse = blk_sse(&idct_dequant_8x8(&cf, &self.quant));
-                let bits = block_rate_bits(&cf, &SCAN_8X8);
+                let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1);
                 let filter_bits = if m == DC_PRED {
                     cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(8, 8)], 0)
                 } else {
                     0.0
                 };
-                let cost = rd_cost_i64(sse, mlam, bits + mode_signal_bits(m) + filter_bits);
+                let cost = rd_cost_i64(sse, mlam, bits + self.mode_bits(px, py, m) + filter_bits);
                 if cost < best_eff {
                     best_eff = cost;
                     best_mode = m;
@@ -194,9 +194,9 @@ impl<'a> LossyTile<'a> {
                     }
                     let rr = idct_dequant_8x8(&cf, &self.quant);
                     let sse = sse_recon::<64, 8>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
-                    let coeff_bits = block_rate_bits(&cf, &SCAN_8X8);
+                    let coeff_bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, DC_PRED, 1);
                     let bits = coeff_bits
-                        + mode_signal_bits(DC_PRED)
+                        + self.mode_bits(px, py, DC_PRED)
                         + palette_signal_bits(&palette, self.bd);
                     let cost = rd_cost_i64(sse, mlam, bits);
                     if cost < best_eff {
@@ -259,8 +259,8 @@ impl<'a> LossyTile<'a> {
                     }
                     let rr = idct_dequant_8x8(&cf, &self.quant);
                     let sse = sse_recon::<64, 8>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
-                    let bits = block_rate_bits(&cf, &SCAN_8X8);
-                    let syntax_bits = mode_signal_bits(DC_PRED)
+                    let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, DC_PRED, 1);
+                    let syntax_bits = self.mode_bits(px, py, DC_PRED)
                         + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
                         + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                     let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
@@ -346,7 +346,7 @@ impl<'a> LossyTile<'a> {
                     }
                     let rr = idct_dequant_8x8(&cf, &self.quant);
                     let sse = sse_recon::<64, 8>(&pred, &rr, &self.src[0], self.w, px, py, self.bd);
-                    let bits = block_rate_bits(&cf, &SCAN_8X8);
+                    let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, best_mode, 1);
                     let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                     if rl.is_some() || cost < best_ad_cost {
                         best_ad_cost = cost;
@@ -408,7 +408,8 @@ impl<'a> LossyTile<'a> {
             );
             let rr = iadst_dequant_8x8(&acf, &self.quant);
             let asse = sse_recon::<64, 8>(&lpred_arr, &rr, &self.src[0], self.w, px, py, self.bd);
-            let abits = block_rate_bits(&acf, &SCAN_8X8);
+            let abits =
+                self.luma_bits(&acf, &SCAN_8X8, 8, px, py, best_mode, ADST_ADST_TX8_IDX);
             // Quality guard (see 16x16 ADST note): block low-q distortion-for-rate trades.
             if rl.is_some()
                 || (asse <= best_dct_sse + (best_dct_sse >> 5)
@@ -464,7 +465,15 @@ impl<'a> LossyTile<'a> {
                 };
                 let asse =
                     sse_recon::<64, 8>(&lpred_arr, &rr, &self.src[0], self.w, px, py, self.bd);
-                let abits = block_rate_bits(&acf, &SCAN_8X8);
+                let abits = self.luma_bits(
+                    &acf,
+                    &SCAN_8X8,
+                    8,
+                    px,
+                    py,
+                    best_mode,
+                    if inv_is_dctadst { DCT_ADST_TX8_IDX } else { ADST_DCT_TX8_IDX },
+                );
                 if rl.is_some()
                     || (asse <= best_dct_sse + (best_dct_sse >> 5)
                         && rd_cost_i64(asse, mlam, abits)
@@ -507,7 +516,7 @@ impl<'a> LossyTile<'a> {
             // real-SSE win); bit-exactness is carried by the inverse regardless.
             let rr = iidentity_dequant_8x8(&icf, &self.quant);
             let isse = sse_recon::<64, 8>(&lpred_arr, &rr, &self.src[0], self.w, px, py, self.bd);
-            let ibits = block_rate_bits(&icf, &SCAN_8X8);
+            let ibits = self.luma_bits(&icf, &SCAN_8X8, 8, px, py, best_mode, 0); // IDTX
             // Quality guard (see ADST note): identity spreads residual energy and
             // is cheap to code, so at low-q lambda a pure RD test over-selects it
             // and flattens detail. Require SSE-non-worsening vs the best real tx.
@@ -1560,8 +1569,8 @@ impl<'a> LossyTile<'a> {
         // Pure-emit replay: recon is preinstalled from the record; the writes
         // below would need the prediction we no longer compute.
         if self.sb_mode != SbMode::Replay {
-            let lrr = if block_skip {
-                [0i32; 64]
+        let lrr = if block_skip {
+            [0i32; 64]
             } else if best_is_idtx {
                 iidentity_dequant_8x8(&lcf, &self.quant)
             } else if best_is_adst {
@@ -1570,9 +1579,9 @@ impl<'a> LossyTile<'a> {
                 iadstdct_dequant_8x8(&lcf, &self.quant)
             } else if best_is_dctadst {
                 idctadst_dequant_8x8(&lcf, &self.quant)
-            } else {
-                idct_dequant_8x8(&lcf, &self.quant)
-            };
+        } else {
+            idct_dequant_8x8(&lcf, &self.quant)
+        };
             for (ry, (prow, rrow)) in lpred_arr
                 .as_chunks::<8>()
                 .0

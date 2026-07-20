@@ -30,12 +30,13 @@
 use crate::Speed;
 use crate::chroma_rect::*;
 use crate::dct::{
-    adst4x4_t, adst4x8_t, adst8x8_t, adst16x16_t, adstdct4x4_t, adstdct4x8_t, adstdct8x8_t,
+    adst4x4_t, adst4x8_t, adst8x8_t, adst8x16_t, adst16x8_t, adst16x16_t, adstdct4x4_t, adstdct4x8_t, adstdct8x8_t,
     adstdct16x16_t, dct4x8_t, dct8x4_t, dct8x8_t, dct8x16_t, dct16x8_t, dct16x32_t, dct32x16_t,
     dctadst4x4_t, dctadst4x8_t, dctadst8x8_t, dctadst16x16_t, fidentity8x8_t,
 };
 use crate::idct::{
-    iadst_dequant_4x4, iadst_dequant_4x8, iadst_dequant_8x8, iadst_dequant_16x16,
+    iadst_dequant_4x4, iadst_dequant_4x8, iadst_dequant_8x8, iadst_dequant_8x16,
+    iadst_dequant_16x8, iadst_dequant_16x16,
     iadstdct_dequant_4x4, iadstdct_dequant_4x8, iadstdct_dequant_8x8, iadstdct_dequant_16x16,
     idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x4, idct_dequant_8x8, idct_dequant_8x16,
     idct_dequant_16x8, idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x16,
@@ -80,7 +81,7 @@ fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
 
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Part16 {
+pub(crate) enum Part16 {
     None,
     Horz,
     Vert,
@@ -718,6 +719,15 @@ struct LossyTile<'a> {
     blk4h: Vec<u8>, // luma block HEIGHT (in 4-sample units) per 4x4 luma unit; for the deblock filter (horizontal edges)
     blk4v: Vec<bool>, // true where a luma block starts at this 4x4 column
     blk4t: Vec<bool>, // true where a luma block starts at this 4x4 row
+    /// Per-4x4 luma PREDICTION-BLOCK geometry (width/height in 4-units and the
+    /// block-start flags), as distinct from `blk4`/`blk4h` which are refined to
+    /// TRANSFORM granularity by the TX-split paths. Chroma deblocking needs the
+    /// prediction geometry: chroma has no tx_depth here, so a chroma transform
+    /// spans the whole chroma block even where luma split its transform.
+    pblk4: Vec<u8>,
+    pblk4h: Vec<u8>,
+    pblk4v: Vec<bool>,
+    pblk4t: Vec<bool>,
     skip8: Vec<bool>, // per-8x8-luma-unit block skip flag (true = no coded coeffs); for CDEF
     /// Whether the current superblock already recorded its `read_cdef()` trace
     /// point (the first non-skip block carries the per-unit `cdef_idx`).
@@ -1257,6 +1267,10 @@ struct TileOut {
     blk4h: Vec<u8>,   // per-4x4 luma block HEIGHT map (tile-local), for frame-level deblocking
     blk4v: Vec<bool>, // per-4x4 actual luma vertical-edge map
     blk4t: Vec<bool>, // per-4x4 actual luma horizontal-edge map
+    pblk4: Vec<u8>,   // per-4x4 luma PREDICTION-block width map (chroma deblock)
+    pblk4h: Vec<u8>,  // per-4x4 luma PREDICTION-block height map
+    pblk4v: Vec<bool>,
+    pblk4t: Vec<bool>,
 }
 
 /// Parallel SB-wavefront CAPTURE pass over one tile: decide every superblock's
@@ -1737,6 +1751,10 @@ fn encode_one_tile(
         let blk4h = std::mem::take(&mut tile.blk4h);
         let blk4v = std::mem::take(&mut tile.blk4v);
         let blk4t = std::mem::take(&mut tile.blk4t);
+        let pblk4 = std::mem::take(&mut tile.pblk4);
+        let pblk4h = std::mem::take(&mut tile.pblk4h);
+        let pblk4v = std::mem::take(&mut tile.pblk4v);
+        let pblk4t = std::mem::take(&mut tile.pblk4t);
         let trace = tile.enc.take_trace();
         let payload = tile.enc.done();
         let rec = if stream_rx.is_some() {
@@ -1754,6 +1772,10 @@ fn encode_one_tile(
                 blk4h,
                 blk4v,
                 blk4t,
+                pblk4,
+                pblk4h,
+                pblk4v,
+                pblk4t,
             },
             rec,
         )
@@ -2037,6 +2059,10 @@ pub(crate) fn encode_lossy_tilegroup(
     let mut blk4hf = vec![0u8; nc4f * nr4f];
     let mut blk4vf = vec![false; nc4f * nr4f];
     let mut blk4tf = vec![false; nc4f * nr4f];
+    let mut pblk4f = vec![0u8; nc4f * nr4f];
+    let mut pblk4hf = vec![0u8; nc4f * nr4f];
+    let mut pblk4vf = vec![false; nc4f * nr4f];
+    let mut pblk4tf = vec![false; nc4f * nr4f];
     for (r, out) in rects.iter().zip(outs.iter()) {
         let tsb8w = r.tw.div_ceil(8);
         let (ox8, oy8) = (r.x0 / 8, r.y0 / 8);
@@ -2058,6 +2084,10 @@ pub(crate) fn encode_lossy_tilegroup(
                     blk4hf[fy * nc4f + fx] = out.blk4h[ty * tnc4 + tx];
                     blk4vf[fy * nc4f + fx] = out.blk4v[ty * tnc4 + tx];
                     blk4tf[fy * nc4f + fx] = out.blk4t[ty * tnc4 + tx];
+                    pblk4f[fy * nc4f + fx] = out.pblk4[ty * tnc4 + tx];
+                    pblk4hf[fy * nc4f + fx] = out.pblk4h[ty * tnc4 + tx];
+                    pblk4vf[fy * nc4f + fx] = out.pblk4v[ty * tnc4 + tx];
+                    pblk4tf[fy * nc4f + fx] = out.pblk4t[ty * tnc4 + tx];
                 }
             }
         }
@@ -2111,7 +2141,8 @@ pub(crate) fn encode_lossy_tilegroup(
     // is a no-op when the derived level is 0 (e.g. lossless).
     let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
     frame_deblock(
-        &mut recon, w8, h8, cw8, ch8, disp_w, disp_h, &blk4f, &blk4hf, &blk4vf, &blk4tf, nc4f,
+        &mut recon, w8, h8, cw8, ch8, disp_w, disp_h, &blk4f, &blk4hf, &blk4vf, &blk4tf, &pblk4f,
+        &pblk4hf, &pblk4vf, &pblk4tf, nc4f,
         sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
     );
 
@@ -3123,6 +3154,19 @@ fn apply_cdef_chroma(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// TEMPORARY: chroma-deblock derivation variant selector, see `frame_deblock`.
+/// 0 = original (transform map + alignment fallback), 3 = prediction map +
+/// explicit flags. Bits are independent so each change can be measured alone.
+fn cdblk_variant() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MT_CDBLK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1) // default: prediction-geometry size map, alignment edge fallback
+    })
+}
+
 fn frame_deblock(
     recon: &mut [Vec<i32>; 3],
     w8: usize,
@@ -3135,7 +3179,11 @@ fn frame_deblock(
     blk4h: &[u8],   // luma block height map (horizontal edges)
     blk4v: &[bool], // luma block starts at this 4x4 column
     blk4t: &[bool], // luma block starts at this 4x4 row
-    nc4: usize,     // luma 4-col count == w8/4
+    pblk4: &[u8],   // luma PREDICTION-block width map (chroma edges derive from this)
+    pblk4h: &[u8],  // luma PREDICTION-block height map
+    pblk4v: &[bool],
+    pblk4t: &[bool],
+    nc4: usize, // luma 4-col count == w8/4
     sub_x: usize,
     sub_y: usize,
     mono: bool,
@@ -3170,16 +3218,44 @@ fn frame_deblock(
     let ch = ch8;
     let cnc4 = cw / 4;
     let cnr4 = ch / 4;
+    // Chroma transform geometry comes from the PREDICTION-block map, not the
+    // luma transform map: chroma carries no tx_depth here, so one chroma
+    // transform spans the whole chroma block even where luma split its own
+    // transform. Deriving from `blk4` (transform-granular) invented interior
+    // chroma edges the decoder never filters. The block-start flags are carried
+    // across too — the alignment fallback in `filter_plane` cannot place edges
+    // for blocks whose origin is not a multiple of their size (asymmetric and
+    // rectangular partitions).
     let mut cbw4 = vec![0u8; cnc4 * cnr4];
     let mut cbh4 = vec![0u8; cnc4 * cnr4];
+    let mut cbv4 = vec![false; cnc4 * cnr4];
+    let mut cbt4 = vec![false; cnc4 * cnr4];
     for cr in 0..cnr4 {
         for cc in 0..cnc4 {
             let lr = cr << ss_ver;
             let lc = cc << ss_hor;
-            let dw = blk4[lr * nc4 + lc];
-            let dh = blk4h[lr * nc4 + lc];
-            cbw4[cr * cnc4 + cc] = (dw >> ss_hor).max(1);
-            cbh4[cr * cnc4 + cc] = (dh >> ss_ver).max(1);
+            let li = lr * nc4 + lc;
+            let ci = cr * cnc4 + cc;
+            // Variant matrix (MT_CDBLK): bit0 = use PREDICTION geometry for the
+            // size map (else the luma TRANSFORM map, as before); bit1 = pass
+            // explicit block-start flags (else the alignment fallback).
+            let v = cdblk_variant();
+            let (sw, sh) = if v & 1 != 0 {
+                (pblk4[li], pblk4h[li])
+            } else {
+                (blk4[li], blk4h[li])
+            };
+            // AV1 caps a chroma transform at 32x32 (`av1_get_max_uv_txsize`).
+            // In 4:2:2 a 64x64 luma block yields a 32x64 chroma block, which is
+            // coded as stacked 32x32 transforms — so the deblock geometry must
+            // clamp to 8 4-units or it misses the interior chroma edge.
+            const MAX_UV_TX4: u8 = 8; // 32 px
+            cbw4[ci] = (sw >> ss_hor).max(1).min(MAX_UV_TX4);
+            cbh4[ci] = (sh >> ss_ver).max(1).min(MAX_UV_TX4);
+            if v & 2 != 0 {
+                cbv4[ci] = if v & 1 != 0 { pblk4v[li] } else { blk4v[li] };
+                cbt4[ci] = if v & 1 != 0 { pblk4t[li] } else { blk4t[li] };
+            }
         }
     }
     let csb = 16 >> ss_ver;
@@ -3195,8 +3271,8 @@ fn frame_deblock(
             cvis_h,
             &cbw4,
             &cbh4,
-            &[],
-            &[],
+            if cdblk_variant() & 2 != 0 { &cbv4 } else { &[] },
+            if cdblk_variant() & 2 != 0 { &cbt4 } else { &[] },
             cnc4,
             level_uv,
             false,

@@ -68,6 +68,8 @@ mod pixel;
 mod qm_tables;
 mod quant;
 mod rangecoder;
+pub(crate) mod partstats;
+mod rate;
 mod rd_sse;
 mod tables;
 mod trellis;

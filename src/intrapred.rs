@@ -621,31 +621,33 @@ pub(crate) fn intra_predict_nd_ad(
     let mut upsample_above = false;
     let mut upsample_left = false;
     if directional && angle != 90 && angle != 180 {
-        if angle > 90 && angle < 180 && have_top && have_left && edge_len >= 24 {
+        // Edge preparation above always materializes both references, filling a
+        // missing side from the available side (or the bit-depth midpoint).
+        // AV1 filters/upsamples those synthesized references too. Gating this
+        // on physical neighbour availability leaves the edge unprocessed while
+        // the projector still uses upsampled coordinates, which desynchronizes
+        // zone-2 prediction at tile/frame boundaries.
+        if angle > 90 && angle < 180 && edge_len >= 24 {
             filter_intra_corner(&mut above, &mut left_edge);
         }
-        if have_top {
-            let strength = intra_edge_filter_strength(bw, bh, filter_type, angle - 90);
-            filter_intra_edge(
-                &mut above,
-                bw + 1 + if angle < 90 { bh } else { 0 },
-                strength,
-            );
-        }
-        if have_left {
-            let strength = intra_edge_filter_strength(bh, bw, filter_type, angle - 180);
-            filter_intra_edge(
-                &mut left_edge,
-                bh + 1 + if angle > 180 { bw } else { 0 },
-                strength,
-            );
-        }
+        let strength = intra_edge_filter_strength(bw, bh, filter_type, angle - 90);
+        filter_intra_edge(
+            &mut above,
+            bw + 1 + if angle < 90 { bh } else { 0 },
+            strength,
+        );
+        let strength = intra_edge_filter_strength(bh, bw, filter_type, angle - 180);
+        filter_intra_edge(
+            &mut left_edge,
+            bh + 1 + if angle > 180 { bw } else { 0 },
+            strength,
+        );
         upsample_above = use_intra_edge_upsample(bw, bh, filter_type, angle - 90);
         upsample_left = use_intra_edge_upsample(bh, bw, filter_type, angle - 180);
-        if have_top && upsample_above {
+        if upsample_above {
             upsample_intra_edge(&mut above, bw + if angle < 90 { bh } else { 0 }, bd);
         }
-        if have_left && upsample_left {
+        if upsample_left {
             upsample_intra_edge(&mut left_edge, bh + if angle > 180 { bw } else { 0 }, bd);
         }
     }
@@ -1257,5 +1259,26 @@ mod intra_edge_tests {
         filter_intra_corner(&mut above, &mut left);
         assert_eq!(above.get(-1), left.get(-1));
         assert_eq!(above.get(-1), 100);
+    }
+
+    #[test]
+    fn z2_prediction_prepares_missing_tile_corner_edges() {
+        let recon = vec![0; 32 * 32];
+        let mut out = [0; 64];
+        intra_predict_nd_ad(
+            D157_PRED, 0, &recon, 32, 0, 0, 8, 8, false, false, 32, 32, false, &mut out, 8,
+        );
+        // Reference output from AV1's edge preparation + zone-2 projection.
+        // In particular, no uninitialized gaps (the former 40/80/12 values)
+        // may appear when both physical neighbours are unavailable.
+        assert_eq!(
+            out,
+            [
+                129, 128, 127, 127, 127, 127, 127, 127, 129, 129, 129, 129, 128, 127, 127, 127,
+                129, 129, 129, 129, 129, 129, 128, 127, 129, 129, 129, 129, 129, 129, 129, 129,
+                129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129,
+                129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129,
+            ]
+        );
     }
 }

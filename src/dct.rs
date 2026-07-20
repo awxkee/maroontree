@@ -690,6 +690,78 @@ pub(crate) fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
 }
 
 #[inline]
+/// ADST_ADST for RTX_8X16 — the DCT path's twin with both 1D passes swapped for
+/// the ADST kernel. Same rect2 `mul_q16(_, 46341)` (1/sqrt2) scaling and the same
+/// transposed coefficient store, so `SCAN_8X16` addressing is unchanged.
+fn adst8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..8usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 8 + col];
+        }
+        let c = fwd_adst16_1d(&c);
+        for fy in 0..16 {
+            tmp[fy * 8 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..16usize {
+        let r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let r = fwd_adst8_1d(&r);
+        for fx in 0..8 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+/// ADST_ADST for RTX_16X8.
+fn adst16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..16usize {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 16 + col];
+        }
+        let c = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..8usize {
+        let r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let r = fwd_adst16_1d(&r);
+        for fx in 0..16 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+pub(crate) fn adst8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix(
+        adst8x16_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        8,
+        16,
+    )
+}
+
+pub(crate) fn adst16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix(
+        adst16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+        quant,
+        16,
+        8,
+    )
+}
+
 fn dct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
     let mut tmp = [0i32; 128];
     for col in 0..8usize {

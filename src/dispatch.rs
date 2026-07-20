@@ -187,6 +187,7 @@ fn encode_lossy_frame(
         cdef_params.as_ref(),
         restoration_params.as_ref(),
     ));
+    crate::partstats::report();
     bytes
 }
 

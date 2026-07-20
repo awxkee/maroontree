@@ -239,7 +239,27 @@ pub(crate) const MODE_AOM_CALIB: f32 = 0.009005174719460433;
 /// equal-SSIM decisions match. `dc_q` is the bit-depth-correct DC dequant step.
 #[inline]
 pub(crate) fn mode_lambda_q(dc_q: f32) -> f32 {
-    MODE_AOM_CALIB * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
+    MODE_AOM_CALIB * lambda_scale() * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
+}
+
+/// TEMPORARY (experiment): `MODE_AOM_CALIB` was fitted against the context-free
+/// proxy rate. With the entropy-accurate rate model the R-D slope may sit
+/// elsewhere, so allow sweeping the lambda scale to re-locate it.
+/// TEMPORARY (experiment): force the context-free proxy rate at the decision
+/// sites, so the lambda re-tune can be measured with the rate model held fixed.
+pub(crate) fn use_proxy_rate() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("MT_PROXY_RATE").is_ok())
+}
+
+fn lambda_scale() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("MT_LAMBDA_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
 }
 
 #[inline]

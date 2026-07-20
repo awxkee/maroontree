@@ -43,9 +43,22 @@ fn trellis_lambda_aom(dc_q: f32, _ac_q: f32) -> f32 {
     TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
 }
 
+/// TEMPORARY: trellis-lambda scale for retuning. `TRELLIS_AOM_CALIB` was fitted
+/// against the old proxy coefficient rate and the pre-fix 32x32 split pricing,
+/// so the R-D slope it targets may no longer be where the encoder operates.
+fn trellis_lambda_scale() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("MT_TRELLIS_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 #[inline]
 fn scaled_trellis_lambda(dc_q: f32, ac_q: f32, lambda0: f32) -> f32 {
-    trellis_lambda_aom(dc_q, ac_q) * (lambda0 / TRELLIS_LAMBDA0)
+    trellis_lambda_aom(dc_q, ac_q) * (lambda0 / TRELLIS_LAMBDA0) * trellis_lambda_scale()
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]

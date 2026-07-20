@@ -163,7 +163,7 @@ pub struct EncodeConfig {
     /// Optional image metadata (orientation, HDR content light level, EXIF).
     pub metadata: Metadata,
     /// Worker threads for tile-level parallelism.
-    /// `0` = all available cores; `1` = serial (default); `N` = up to N.
+    /// `0` = all available cores; `1` = serial; `N` = up to N.
     pub threads: usize,
     /// RDO effort (AV1 lossy path). See [`Speed`]; defaults to [`Speed::Slow`].
     pub speed: Speed,
@@ -210,9 +210,12 @@ impl Default for EncodeConfig {
             adaptive_quant: true,
             variance_boost: true,
             dark_aq: true,
-            cdef: false,
-            wiener: false,
-            quantization_matrices: false,
+            // TEMPORARY (experiment): these three tools are fully implemented but
+            // ship disabled; the env overrides let a sweep measure what they are
+            // actually worth before deciding on new defaults.
+            cdef: std::env::var("MT_CDEF").is_ok(),
+            wiener: std::env::var("MT_WIENER").is_ok(),
+            quantization_matrices: std::env::var("MT_QM").is_ok(),
             qmatrix_level: None,
         }
     }

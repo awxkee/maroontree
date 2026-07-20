@@ -212,6 +212,42 @@ impl<'a> LossyTile<'a> {
     }
 
     fn record_blk(&mut self, x8: usize, y8: usize, dim4: u8) {
+        self.record_tx_blk(x8, y8, dim4);
+        let nc4 = self.w / 4;
+        let (bx4, by4) = (x8 * 2, y8 * 2);
+        let (d, nr4) = (dim4 as usize, self.h / 4);
+        for r in by4..(by4 + d).min(nr4) {
+            for c in bx4..(bx4 + d).min(nc4) {
+                self.pblk4[r * nc4 + c] = dim4;
+                self.pblk4h[r * nc4 + c] = dim4;
+                self.pblk4v[r * nc4 + c] = c == bx4;
+                self.pblk4t[r * nc4 + c] = r == by4;
+            }
+        }
+    }
+
+    /// Record PREDICTION geometry only, leaving the transform map intact. Used
+    /// by BLOCK_64X64, whose four TX_32X32 quadrants are transform subdivisions
+    /// of a single 64x64 prediction block.
+    fn record_pred_blk(&mut self, x8: usize, y8: usize, dim4: u8) {
+        let nc4 = self.w / 4;
+        let (bx4, by4) = (x8 * 2, y8 * 2);
+        let (d, nr4) = (dim4 as usize, self.h / 4);
+        for r in by4..(by4 + d).min(nr4) {
+            for c in bx4..(bx4 + d).min(nc4) {
+                self.pblk4[r * nc4 + c] = dim4;
+                self.pblk4h[r * nc4 + c] = dim4;
+                self.pblk4v[r * nc4 + c] = c == bx4;
+                self.pblk4t[r * nc4 + c] = r == by4;
+            }
+        }
+    }
+
+    /// Record TRANSFORM geometry only, leaving the prediction-block map intact.
+    /// Used by the TX-split paths, which subdivide a block's transforms without
+    /// changing the block itself — chroma still codes one transform over the
+    /// whole block, so its deblock edges must not follow the luma subdivision.
+    fn record_tx_blk(&mut self, x8: usize, y8: usize, dim4: u8) {
         let nc4 = self.w / 4;
         let bx4 = x8 * 2;
         let by4 = y8 * 2;
@@ -243,6 +279,10 @@ impl<'a> LossyTile<'a> {
                 self.blk4h[r * nc4 + c] = h4;
                 self.blk4v[r * nc4 + c] = c == bx4;
                 self.blk4t[r * nc4 + c] = r == by4;
+                self.pblk4[r * nc4 + c] = w4;
+                self.pblk4h[r * nc4 + c] = h4;
+                self.pblk4v[r * nc4 + c] = c == bx4;
+                self.pblk4t[r * nc4 + c] = r == by4;
             }
         }
     }

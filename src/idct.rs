@@ -140,6 +140,79 @@ pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
     tmp
 }
 
+/// ADST_ADST inverse for RTX_8X16 — `idct_dequant_8x16` with both 1D passes
+/// swapped for the ADST kernel. The rect2 prescale, the mid shift and the final
+/// `(t + 8) >> 4` are identical, so this stays bit-exact with the decoder's
+/// rectangular transform pipeline.
+pub(crate) fn iadst_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 8, 16);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 128];
+    for row in 0..16 {
+        for col in 0..8 {
+            tmp[row * 8 + col] = (coeff[row + col * 16] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..16 {
+        inv_adst8_1d(&mut tmp[row * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..8 {
+        inv_adst16_1d(&mut tmp[col..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// ADST_ADST inverse for RTX_16X8.
+pub(crate) fn iadst_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 16, 8);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 128];
+    for row in 0..8 {
+        for col in 0..16 {
+            tmp[row * 16 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..8 {
+        inv_adst16_1d(&mut tmp[row * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..16 {
+        inv_adst8_1d(&mut tmp[col..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
 pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 128];
