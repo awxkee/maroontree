@@ -33,7 +33,7 @@ use crate::skip_tables::{LO_CTX_2D, SCAN_4X4};
 
 const STRIDE: usize = 4;
 
-// hi-token (br) encoding: level in 3..=15 coded as repeated 4-sym br symbols.
+// hi-token (br) encoding: level in 3.=15 coded as repeated 4-sym br symbols.
 fn encode_hi_tok(w: &mut Writer, cdf: &mut [u16], level: u32) {
     let mut rem = level - 3; // 0..=12
     for stage in 0..4 {

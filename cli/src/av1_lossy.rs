@@ -60,7 +60,9 @@ pub(crate) fn encode_av1(
         .with_cicp(Cicp::srgb_ycbcr())
         .with_threads(args.threads)
         .with_speed(args.speed.to_maroontreee())
-        .with_updating_cdf(args.updating_cdf);
+        .with_updating_cdf(args.updating_cdf)
+        .with_screen_content(args.screen_content)
+        .with_intrabc(args.intrabc);
     cfg = match args.qmatrix {
         Some(Qmatrix::Auto) => cfg.with_quantization_matrices(true),
         Some(Qmatrix::Level(level)) => cfg.with_qmatrix_level(level),

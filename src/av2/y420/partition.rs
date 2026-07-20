@@ -155,7 +155,7 @@ struct WfSlot420 {
 
 /// Per-worker reusable scratch for the 4:2:0 wavefront decide: a private full-res
 /// luma recon (`ry`, `pw×ph`) + two QUARTERED chroma recons (`ru`/`rv`,
-/// `pcw×pch`, half-width AND half-height) plus the emit-side neighbour context
+/// `pcw×pch`, half-width AND half-height) plus the emit-side neighbor context
 /// arrays (entropy + chroma-presence + CfL + inter-state). Each cell sees the
 /// frame-initial context values, reset per cell so the result never depends on
 /// which unrelated cell a worker handled previously (the 4:4:4 race fix).
@@ -773,7 +773,7 @@ impl Av2Encoder {
 
     /// Quantize and reconstruct a square dense-inter candidate. The partition
     /// walker only decides whether to commit the returned candidate and updates
-    /// entropy-neighbour state; transform and predictor mechanics stay here.
+    /// entropy-neighbor state; transform and predictor mechanics stay here.
     #[inline(never)]
     fn evaluate_dense_inter_residual_420(
         &self,
@@ -1454,7 +1454,7 @@ impl Av2Encoder {
                     // Reproduce the frame-initial (context-free) state a wavefront worker
                     // sees before each SB decide. The 4:2:0 inter-state grids stay all-zero
                     // on the stills path this check targets, so only the entropy / chroma /
-                    // CfL neighbour arrays need resetting here.
+                    // CfL neighbor arrays need resetting here.
                     above.iter_mut().for_each(|v| *v = 0x40);
                     left.iter_mut().for_each(|v| *v = 0x40);
                     above_pctx.iter_mut().for_each(|v| *v = 0);
@@ -1572,7 +1572,7 @@ impl Av2Encoder {
     /// Decide + emit one 4:2:0 superblock (the extracted body of the `for col`
     /// walk loop). Behaviour-preserving; byte-identical. Split out so the
     /// SB-wavefront can drive it per cell with private recon + fresh contexts.
-    /// The per-row left-neighbour scalars are threaded in by value and returned.
+    /// The per-row left-neighbor scalars are threaded in by value and returned.
     fn decide_sb_420(&self, decision: Sb420Decision<'_, '_>) -> (u8, u8, u8, Option<Mv>, u8) {
         let Sb420Decision {
             enc,

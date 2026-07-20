@@ -83,10 +83,10 @@ fn clamp3(v: i32, lo: i32, hi: i32) -> i32 {
 /// Wiener filter extends the restoration-unit border by replication when the
 /// stripe/frame boundary is reached). `w`/`h` are the plane dimensions.
 #[inline]
-fn get(plane: &[i32], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
+fn get(plane: &[u16], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
     let xx = x.clamp(0, w as i32 - 1) as usize;
     let yy = y.clamp(0, h as i32 - 1) as usize;
-    plane[yy * stride + xx]
+    plane[yy * stride + xx] as i32
 }
 
 /// Apply a Wiener filter to the rectangle `[x0, x0+rw) x [y0, y0+rh)` of `plane`
@@ -94,9 +94,9 @@ fn get(plane: &[i32], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 
 /// `(hk, vk)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wiener_filter_rect(
-    dst: &mut [i32],
+    dst: &mut [u16],
     dst_y0: usize,
-    src: &[i32],
+    src: &[u16],
     stride: usize,
     w: usize,
     h: usize,
@@ -147,14 +147,14 @@ pub(crate) fn wiener_filter_rect(
                 s += vk.taps[t] * inter[iy as usize * rw + c];
             }
             let v = (s - offset_correction + round1_offset) >> round1;
-            dst[(y0 + r - dst_y0) * stride + (x0 + c)] = v.clamp(0, maxv);
+            dst[(y0 + r - dst_y0) * stride + (x0 + c)] = v.clamp(0, maxv) as u16;
         }
     }
 }
 
 pub(crate) fn wiener_filter_plane(
-    dst: &mut [i32],
-    src: &[i32],
+    dst: &mut [u16],
+    src: &[u16],
     w: usize,
     h: usize,
     hk: &WienerKernel,

@@ -104,19 +104,19 @@ impl Cdf {
             + (if count > 15 { 1 } else { 0 })
             + (if count > 31 { 1 } else { 0 })
             + floor_log2(n as u32).min(2);
-        for i in 0..n - 1 {
-            let cur = self.c[i] as i32;
+        for (i, cur) in self.c[..n - 1].iter_mut().enumerate() {
+            let cur_i32 = *cur as i32;
             // Spec §8.3.2: tmp starts at 0 and becomes 32768 at i == symbol,
             // so cdf[i] relaxes toward 0 for i < symbol and toward 32768 for
             // i >= symbol. This keeps the cumulative CDF monotonic increasing.
             let tmp = if i >= symbol { CDF_TOTAL as i32 } else { 0 };
             // move cdf[i] toward tmp by >> rate
-            let next = if tmp < cur {
-                cur - ((cur - tmp) >> rate)
+            let next = if tmp < cur_i32 {
+                cur_i32 - ((cur_i32 - tmp) >> rate)
             } else {
-                cur + ((tmp - cur) >> rate)
+                cur_i32 + ((tmp - cur_i32) >> rate)
             };
-            self.c[i] = next as u16;
+            *cur = next as u16;
         }
         if count < 32 {
             self.c[n] = (count + 1) as u16;

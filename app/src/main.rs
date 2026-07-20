@@ -26,14 +26,11 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#[cfg(feature = "aom-compare")]
+mod aom_bench;
 mod y4m2ivf;
 
-use maroontree::{
-    Av2Encoder, BitDepth, ChromaFormat, Cicp, EncodeConfig, Orientation, PlanarImage, Speed,
-    TxPart, av2_map_quality, encode_lossless, encode_rgb8,
-};
-use std::hint::black_box;
-use std::io::Write;
+use maroontree::{BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, Speed, encode_rgb8};
 use std::time::Instant;
 
 fn main() {
@@ -56,9 +53,7 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/Screenshot 2026-07-18 at 16.09.09.png")
-        .unwrap()
-        .to_rgb8();
+    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -68,23 +63,60 @@ fn main() {
     .unwrap();
     for _i in 0..15 {
         let instant = Instant::now();
-        let out = encode_lossless(
+        let out = encode_rgb8(
             &planar_rgb,
             &EncodeConfig::new()
-                .with_quality(67)
-                .with_cicp(Cicp::identity_rgb())
+                .with_quality(60)
+                .with_cicp(Cicp::srgb_ycbcr())
                 .with_chroma(ChromaFormat::Yuv444)
                 .with_speed(Speed::Fast)
                 .with_threads(12)
-                .with_variance_boost(true),
+                .with_variance_boost(true)
+                .with_screen_content(false)
+                .with_intrabc(false),
             // .with_cdef(true)
             // .with_wiener(true),
         )
         .unwrap();
-        println!("AV1 encoding time {:?}", instant.elapsed());
-        std::fs::write("./out.avif", out).unwrap();
+        println!(
+            "AV1 encoding time {:?}  ({} bytes)",
+            instant.elapsed(),
+            out.len()
+        );
+        // std::fs::write("./out.avif", out).unwrap();
     }
-    let img = image::open("./assets/manhattan.png")
+
+    // libaom reference, same source and same thread count, in-process.
+    // aom speed 6 is `avifenc -s 6`; ours Fast/Slow are our own ladder, so
+    // compare the TIMES at whatever quality each lands on, and use bench/rd
+    // for BD-rate — a single q is not a quality-matched comparison.
+    // #[cfg(feature = "aom-compare")]
+    // {
+    //     use crabby_avif::PixelFormat;
+    //     for speed in [5, 6u32, 7, 8] {
+    //         for _ in 0..3 {
+    //             match aom_bench::encode_aom(
+    //                 &img,
+    //                 img.width(),
+    //                 img.height(),
+    //                 60.0,
+    //                 speed,
+    //                 12,
+    //                 PixelFormat::Yuv444,
+    //             ) {
+    //                 Ok(t) => println!(
+    //                     "aom s{speed} encode {:?} (+{:?} rgb->yuv, total {:?})  ({} bytes)",
+    //                     t.encode,
+    //                     t.convert,
+    //                     t.total(),
+    //                     t.bytes
+    //                 ),
+    //                 Err(e) => println!("aom s{speed} failed: {e}"),
+    //             }
+    //         }
+    //     }
+    // }
+    /* let img = image::open("./assets/manhattan.png")
         .unwrap()
         // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
@@ -138,5 +170,5 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "out10_avif.avif".into());
     let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&encoded_avif_av2).unwrap();
+    f.write_all(&encoded_avif_av2).unwrap();*/
 }

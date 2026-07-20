@@ -875,7 +875,7 @@ mod tests {
             VideoPreset::Reference,
         ];
         let configs: Vec<_> = presets.into_iter().map(VideoPreset::config).collect();
-        for pair in configs.windows(2) {
+        for pair in configs.array_windows::<2>() {
             assert!(pair[0].search_range <= pair[1].search_range);
             assert!(pair[0].lookahead_frames <= pair[1].lookahead_frames);
             assert!(pair[0].minimum_block_size >= pair[1].minimum_block_size);

@@ -57,8 +57,7 @@
 
 use crate::color::Cicp;
 use crate::encoder::{
-    encode_lossless_gray_obu_with_cdf, encode_lossy_gray_obu, encode_still_lossy,
-    encode_still_lossy_420, encode_still_lossy_420_with_cdf, encode_still_lossy_422,
+    encode_lossless_gray_obu_with_cdf, encode_lossy_gray_obu, encode_still_lossy_420_with_cdf,
     encode_still_lossy_422_with_cdf, encode_still_lossy_with_cdf, encode_yuv420_obu,
     encode_yuv422_obu, encode_yuv444_obu,
 };
@@ -73,9 +72,6 @@ const MIN_DIM: u32 = 1;
 const MAX_DIM: u32 = 16_383;
 
 /// Chroma subsampling format for the AV1 encoder.
-///
-/// Determines the AV1 profile in the bitstream and the chroma plane dimensions
-/// expected by the `encode_yuv*` entry points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ChromaFormat {
     /// 4:2:0 — chroma halved both horizontally and vertically
@@ -102,24 +98,51 @@ pub enum Speed {
 }
 
 impl Speed {
-    /// Whether RDOQ (trellis) is run for *every* candidate during the mode
-    /// search. Only [`Speed::Slow`] does; the faster tiers apply RDOQ once, to
-    /// the winning mode.
+    /// Slow trellis-refines the compact model-ranked beam. Medium/Fast refine
+    /// only the selected winner. (AV2 paths; the AV1 coder uses
+    /// [`Self::per_candidate_rdoq_av1`].)
     pub(crate) fn per_candidate_rdoq(self) -> bool {
+        matches!(self, Speed::Slow)
+    }
+
+    /// AV1-coder RDOQ staging. Split from [`Self::per_candidate_rdoq`] so the
+    /// AV1 winner-only experiment cannot silently change AV2 behavior.
+    /// MEASURED 2026-07-25 — winner-only at Slow is a BAD trade in every
+    /// form: pure winner-only = 420 +1.25/+0.85/+1.76 (tuning/holdout/mid),
+    /// 444 tuning +0.61 with UNIFORM kodak damage (+0.4..+1.5; the 5-image
+    /// holdout's +0.01 was luck), for only ~4% time. Staged (plain-trellis
+    /// candidates + ctx winner) is DOMINATED: worse than winner-only at 444
+    /// (+1.71 holdout) and worse than per-candidate at 420. Per-candidate
+    /// exact-ctx RDOQ at Slow EARNS its time; winner-only IS the Medium
+    /// tier, and the delta is real quality, not fat.
+    pub(crate) fn per_candidate_rdoq_av1(self) -> bool {
         matches!(self, Speed::Slow)
     }
 
     /// Whether the winning mode is refined with an ADST_ADST transform-type
     /// search. Off only for [`Speed::Fast`] (DCT-only).
     pub(crate) fn try_adst(self) -> bool {
-        true
+        !matches!(self, Speed::Fast)
     }
 
-    /// Whether the directional angle-delta search (Δ = ±1..±3) is run. Only
-    /// [`Speed::Slow`] does; the faster tiers trial nominal angles (Δ=0) only,
-    /// since each directional mode otherwise costs 7× the RD candidates.
+    /// AV2 directional angle-delta control. Slow and Medium refine the nominal
+    /// direction; Fast keeps Δ=0.
     pub(crate) fn try_angle_deltas(self) -> bool {
-        matches!(self, Speed::Slow)
+        !matches!(self, Speed::Fast)
+    }
+
+    /// AV1 Medium keeps angle refinement where small diagonal edges benefit,
+    /// but omits the low-yield TX32 expansion. Split from the AV2 control so
+    /// this staging cannot silently alter AV2 preset behavior.
+    pub(crate) fn try_angle_deltas_av1(self, dim: usize, qidx: u8) -> bool {
+        if matches!(self, Speed::Medium) && !crate::tuning::get().angle_deltas_medium {
+            return false;
+        }
+        match self {
+            Speed::Slow => true,
+            Speed::Medium => dim <= 16 || qidx >= 112,
+            Speed::Fast => false,
+        }
     }
 
     /// Whether the intra candidate set is reduced. Only [`Speed::Fast`] does.
@@ -127,11 +150,78 @@ impl Speed {
         matches!(self, Speed::Fast)
     }
 
-    /// Whether the diagonal (angle) chroma directional modes (D45..D203) are
-    /// searched. Only Medium speed and above (i.e. not [`Speed::Fast`]); nominal
-    /// V/H are searched in every tier.
+    pub(crate) fn luma_mode_budget(self, full_res: bool) -> usize {
+        match self {
+            Speed::Fast => 1,
+            Speed::Medium => crate::tuning::get().mode_budget_medium as usize,
+            Speed::Slow => {
+                if full_res {
+                    5
+                } else {
+                    3
+                }
+            }
+        }
+    }
+
+    /// Palette clustering is deliberately outside the Fast tier. It performs
+    pub(crate) fn try_palette(self) -> bool {
+        match self {
+            Speed::Fast => false,
+            Speed::Medium => crate::tuning::get().palette_medium,
+            Speed::Slow => true,
+        }
+    }
+
+    pub(crate) fn palette_refine_budget(self) -> usize {
+        match self {
+            Speed::Fast => 0,
+            Speed::Medium => crate::tuning::get().palette_budget_medium as usize,
+            Speed::Slow => 2,
+        }
+    }
+
+    /// Fast uses a square, luma-led partition model. Rectangular candidates and
+    /// full chroma partition RDO are reserved for the quality tiers.
+    pub(crate) fn full_partition_rdo(self) -> bool {
+        match self {
+            Speed::Fast => false,
+            Speed::Medium => crate::tuning::get().full_part_rdo_medium,
+            Speed::Slow => true,
+        }
+    }
+
+    pub(crate) fn partition_refine_budget(self) -> usize {
+        let t = crate::tuning::get();
+        (match self {
+            Speed::Fast => t.part_budget_fast,
+            Speed::Medium => t.part_budget_medium,
+            Speed::Slow => t.part_budget_slow,
+        }) as usize
+    }
+
+    pub(crate) fn filter_intra_refine_budget(self) -> usize {
+        match self {
+            Speed::Slow => 0,
+            Speed::Medium | Speed::Fast => 0,
+        }
+    }
+
+    /// Fast codes chroma with the baseline DC predictor. CfL and directional
+    /// chroma each multiply transform/trellis work on both chroma planes and
+    /// dominate finely partitioned screen content.
+    pub(crate) fn full_chroma_rdo(self) -> bool {
+        match self {
+            Speed::Fast => false,
+            Speed::Medium => crate::tuning::get().full_chroma_rdo_medium,
+            Speed::Slow => true,
+        }
+    }
+
+    /// Whether diagonal chroma modes (D45..D203) are searched. Medium retains
+    /// the nominal V/H directionals; Slow adds the diagonal refinement beam.
     pub(crate) fn chroma_angle_directional(self) -> bool {
-        !matches!(self, Speed::Fast)
+        matches!(self, Speed::Slow)
     }
 
     pub(crate) fn try_directional(&self) -> bool {
@@ -174,27 +264,27 @@ pub struct EncodeConfig {
     /// Update AV1 entropy CDFs after each coded symbol. Enabled by default.
     pub updating_cdf: bool,
     pub adaptive_quant: bool,
-    /// Enable the AV2-style **Variance Boost** adaptive-quantization scheme on the
-    /// AV1 path (octile of the 64 8x8-subblock variances per superblock), instead of
-    /// the classic whole-SB variance. Only takes effect when `adaptive_quant` is
-    /// also true; off by default, so the shipping AV1 output is unchanged. Uses the
-    /// same defaults as the AV2 encoder (octile 6, strength 0.6, boost-only).
     pub variance_boost: bool,
-    /// Enable the AV2-style **dark-structured-detail** AQ protection on the AV1 path:
-    /// an extra qindex reduction for dark superblocks carrying real cross-scale
-    /// structure (rock texture, boundaries) that raw variance would quantize to
-    /// extinction at low quality. Independent of [`Self::variance_boost`] (it applies
-    /// in both the Variance Boost and classic-AQ schemes), but like all AQ it only
-    /// takes effect when `adaptive_quant` is also true. Gated to low quality
-    /// (`base_q_idx >= 150`); on by default. Mirrors the AV2 encoder's `dark_aq`.
     pub dark_aq: bool,
     /// Enable CDEF
     pub cdef: bool,
-    /// Enable luma Wiener loop restoration (off by default).
+    /// Enable luma Wiener loop restoration (off by default)
     pub wiener: bool,
     /// Enable AV1 quantization matrices. These are standard AV1 syntax and
     /// redistribute quantization error toward higher spatial frequencies.
     pub quantization_matrices: bool,
+    /// Search screen-content coding tools (palette). Palette clustering runs a
+    /// histogram, weighted k-means and a color-map trial per block; it pays for
+    /// itself on synthetic/screen material and is close to inert on camera
+    /// photographs. On by default so the encoder needs no content hint.
+    pub screen_content: bool,
+    /// Frame-level IntraBC (exact-copy blocks from the reconstructed frame).
+    /// AV1 ties `allow_intrabc` to disabling ALL in-loop filters for the
+    /// frame, so the encoder only enables it when a coverage pre-scan finds
+    /// enough exact 16x16 duplicates to pay that trade; this switch vetoes it
+    /// outright. Lossless exact-copy blocks are unaffected (lossless frames
+    /// carry no loop filters, so IntraBC costs nothing there).
+    pub intrabc: bool,
     /// Explicit matrix level (0..=15), or `None` for the conservative level-10
     /// tuning validated on the Jixel still-image corpus. Lower levels weight
     /// high frequencies more strongly; level 15 is flat.
@@ -217,12 +307,11 @@ impl Default for EncodeConfig {
             adaptive_quant: true,
             variance_boost: true,
             dark_aq: true,
-            // TEMPORARY (experiment): these three tools are fully implemented but
-            // ship disabled; the env overrides let a sweep measure what they are
-            // actually worth before deciding on new defaults.
-            cdef: std::env::var("MT_CDEF").is_ok(),
-            wiener: std::env::var("MT_WIENER").is_ok(),
-            quantization_matrices: std::env::var("MT_QM").is_ok(),
+            cdef: false,
+            wiener: false,
+            quantization_matrices: true,
+            screen_content: true,
+            intrabc: true,
             qmatrix_level: None,
         }
     }
@@ -308,6 +397,20 @@ impl EncodeConfig {
         self
     }
 
+    /// Search the screen-content tools (palette). Leaving this on costs
+    /// photographic content a little encode time; turning it off drops palette
+    /// coding entirely, which is a large regression on synthetic content.
+    pub fn with_screen_content(mut self, v: bool) -> Self {
+        self.screen_content = v;
+        self
+    }
+
+    /// Allow or veto lossy frame-level IntraBC (see [`EncodeConfig::intrabc`]).
+    pub fn with_intrabc(mut self, v: bool) -> Self {
+        self.intrabc = v;
+        self
+    }
+
     /// Enable the AV2-style dark-structured-detail AQ protection on the AV1 path.
     /// Has no effect unless [`Self::with_adaptive_quant`] is also enabled.
     pub fn with_dark_aq(mut self, v: bool) -> Self {
@@ -341,7 +444,7 @@ impl EncodeConfig {
         self
     }
 
-    pub(crate) fn vb(&self) -> crate::coder::VarianceBoost {
+    pub(crate) fn vb(&self, base_q_idx: u8) -> crate::coder::VarianceBoost {
         let mut vb = if self.variance_boost {
             crate::coder::VarianceBoost::on()
         } else {
@@ -357,7 +460,19 @@ impl EncodeConfig {
         vb.qm = if self.quantization_matrices {
             self.qmatrix_level
                 .map(crate::quant::QmLevels::uniform)
-                .unwrap_or_else(|| crate::quant::QmLevels::uniform(10))
+                .unwrap_or_else(|| {
+                    let sub = match self.chroma {
+                        ChromaFormat::Yuv420 => 2,
+                        ChromaFormat::Yuv422 => 1,
+                        _ => 0,
+                    };
+                    let c = crate::quant::qm_chroma_level_law(base_q_idx, sub);
+                    crate::quant::QmLevels {
+                        y: crate::quant::qm_level_law(base_q_idx, sub),
+                        u: c,
+                        v: c,
+                    }
+                })
         } else {
             crate::quant::QmLevels::FLAT
         };
@@ -416,8 +531,43 @@ pub(crate) fn checked_buffer_size<T>(w: usize, h: usize, ch: usize) -> Result<us
 
 /// Map quality 1..=100 → AV1 base_q_idx 1..=255.
 /// quality 100 → q = 1 (near-lossless), quality 1 → q = 255.
+/// Quality -> AV1 `base_q_idx`, recalibrated 2026-07-25 to LIBAVIF PARITY:
+/// each label targets the same output size as `avifenc -q <label>` (fit on a
+/// 4-image photo corpus at 4:2:0, per-image spread ~+-5 qindex; the old
+/// linear map ran 25-40 qindex COARSER than aom at every label, which is why
+/// same-label ladders showed us "20 SS2 points behind" while matched-rate
+/// comparisons were at parity). Labels are now comparable across encoders;
+/// BD curves are unaffected (pure re-labeling of the same RD curve).
+/// q100 stays near-lossless (qindex 1) by design; parity resumes at q98.
 fn quality_to_q(quality: u8) -> u8 {
-    (1u32 + (100 - quality as u32) * 254 / 99).clamp(1, 255) as u8
+    const ANCHORS: [(u8, u8); 14] = [
+        (1, 215),
+        (30, 140),
+        (40, 116),
+        (50, 91),
+        (60, 70),
+        (70, 53),
+        (80, 35),
+        (85, 28),
+        (90, 17),
+        (93, 12),
+        (96, 7),
+        (98, 5),
+        (99, 3),
+        (100, 1),
+    ];
+    let q = quality.clamp(1, 100);
+    let mut prev = ANCHORS[0];
+    for &(l, qi) in &ANCHORS[1..] {
+        if q <= l {
+            let (l0, q0) = (prev.0 as i32, prev.1 as i32);
+            let (l1, q1) = (l as i32, qi as i32);
+            let t = q as i32 - l0;
+            return (q0 + (q1 - q0) * t / (l1 - l0).max(1)).clamp(1, 255) as u8;
+        }
+        prev = (l, qi);
+    }
+    1
 }
 
 /// AV1 sequence profile from bit depth + chroma format.
@@ -533,35 +683,52 @@ fn dispatch_lossy<T: crate::Pixel>(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    sc: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     match chroma {
-        ChromaFormat::Yuv420 | ChromaFormat::Monochrome => {
-            if updating_cdf {
-                encode_still_lossy_420(img, q, color, threads, speed, aq, vb, cdef, wiener)
-            } else {
-                encode_still_lossy_420_with_cdf(
-                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
-                )
-            }
-        }
-        ChromaFormat::Yuv422 => {
-            if updating_cdf {
-                encode_still_lossy_422(img, q, color, threads, speed, aq, vb, cdef, wiener)
-            } else {
-                encode_still_lossy_422_with_cdf(
-                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
-                )
-            }
-        }
-        ChromaFormat::Yuv444 => {
-            if updating_cdf {
-                encode_still_lossy(img, q, color, threads, speed, aq, vb, cdef, wiener)
-            } else {
-                encode_still_lossy_with_cdf(
-                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
-                )
-            }
-        }
+        ChromaFormat::Yuv420 | ChromaFormat::Monochrome => encode_still_lossy_420_with_cdf(
+            img,
+            q,
+            color,
+            threads,
+            speed,
+            aq,
+            vb,
+            cdef,
+            wiener,
+            updating_cdf,
+            sc,
+            intrabc,
+        ),
+        ChromaFormat::Yuv422 => encode_still_lossy_422_with_cdf(
+            img,
+            q,
+            color,
+            threads,
+            speed,
+            aq,
+            vb,
+            cdef,
+            wiener,
+            updating_cdf,
+            sc,
+            intrabc,
+        ),
+        ChromaFormat::Yuv444 => encode_still_lossy_with_cdf(
+            img,
+            q,
+            color,
+            threads,
+            speed,
+            aq,
+            vb,
+            cdef,
+            wiener,
+            updating_cdf,
+            sc,
+            intrabc,
+        ),
     }
 }
 
@@ -585,10 +752,12 @@ pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -614,10 +783,12 @@ pub fn encode_rgba8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -649,11 +820,27 @@ pub fn encode_rgba8_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
+    // An opaque auxiliary image carries no information. PNG decoders commonly
+    // expose RGBA for screenshots even when every alpha sample is maximum;
+    // running the complete lossless monochrome encoder in that case dominated
+    // total encode time by several seconds.
+    if img.planes[3].iter().all(|&a| a == u8::MAX) {
+        return finalize_color(
+            color_obu,
+            img.width as u32,
+            img.height as u32,
+            8,
+            cfg.chroma,
+            cfg,
+        );
+    }
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
         true,
@@ -691,10 +878,12 @@ pub fn encode_rgb10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(
         obu,
@@ -727,10 +916,12 @@ pub fn encode_rgba10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(
         obu,
@@ -765,11 +956,23 @@ pub fn encode_rgba10_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
+    if img.planes[3].iter().all(|&a| a == 1023) {
+        return finalize_color(
+            color_obu,
+            img.width as u32,
+            img.height as u32,
+            10,
+            cfg.chroma,
+            cfg,
+        );
+    }
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
         true,
@@ -808,10 +1011,12 @@ pub fn encode_rgb12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(
         obu,
@@ -844,10 +1049,12 @@ pub fn encode_rgba12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
     finalize_color(
         obu,
@@ -885,11 +1092,23 @@ pub fn encode_rgba12_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     );
+    if img.planes[3].iter().all(|&a| a == 4095) {
+        return finalize_color(
+            color_obu,
+            img.width as u32,
+            img.height as u32,
+            12,
+            cfg.chroma,
+            cfg,
+        );
+    }
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
         true,
@@ -927,10 +1146,12 @@ pub fn encode_gray8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -961,10 +1182,12 @@ pub fn encode_gray10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -995,10 +1218,12 @@ pub fn encode_gray12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -1030,10 +1255,12 @@ pub fn encode_yuv8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -1058,10 +1285,12 @@ pub fn encode_yuv10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -1093,10 +1322,12 @@ pub fn encode_yuv12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -1132,10 +1363,12 @@ pub fn encode_yuva8_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
@@ -1176,10 +1409,12 @@ pub fn encode_yuva10_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
@@ -1221,10 +1456,12 @@ pub fn encode_yuva12_with_alpha(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_4(),
@@ -1264,10 +1501,12 @@ pub fn encode_gray_alpha8(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_2(),
@@ -1307,10 +1546,12 @@ pub fn encode_gray_alpha10(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_2(),
@@ -1350,10 +1591,12 @@ pub fn encode_gray_alpha12(
         cfg.threads,
         cfg.speed,
         cfg.adaptive_quant,
-        cfg.vb(),
+        cfg.vb(quality_to_q(cfg.quality)),
         cfg.cdef,
         cfg.wiener,
         cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let alpha_obu = encode_lossless_gray_obu_with_cdf(
         &img.packed_alpha_2(),
@@ -1386,6 +1629,8 @@ fn dispatch_yuv_u8(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
@@ -1401,6 +1646,8 @@ fn dispatch_yuv_u8(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
         ChromaFormat::Yuv422 => encode_yuv422_obu(
             planar_image,
@@ -1414,6 +1661,8 @@ fn dispatch_yuv_u8(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => encode_yuv444_obu(
             planar_image,
@@ -1427,6 +1676,8 @@ fn dispatch_yuv_u8(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
     }
 }
@@ -1445,6 +1696,8 @@ fn dispatch_yuv_u16(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
@@ -1460,6 +1713,8 @@ fn dispatch_yuv_u16(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
         ChromaFormat::Yuv422 => encode_yuv422_obu(
             planar_image,
@@ -1473,6 +1728,8 @@ fn dispatch_yuv_u16(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => encode_yuv444_obu(
             planar_image,
@@ -1486,6 +1743,8 @@ fn dispatch_yuv_u16(
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         ),
     }
 }
@@ -1587,5 +1846,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn lossy_wavefront_matches_serial_bytes() {
+        // More cells than workers makes every worker reuse its tile-local
+        // reconstruction for unrelated SBs, covering halo reload/rezeroing as
+        // well as semantic entropy packing.
+        let image = patterned_rgb(320, 192);
+        let config = |threads| {
+            EncodeConfig::new()
+                .with_quality(60)
+                .with_chroma(ChromaFormat::Yuv444)
+                .with_threads(threads)
+                .with_speed(Speed::Medium)
+                .with_variance_boost(true)
+                .with_updating_cdf(true)
+        };
+        let serial = encode_rgb8(&image, &config(1)).unwrap();
+        let wavefront = encode_rgb8(&image, &config(4)).unwrap();
+        assert_eq!(wavefront, serial);
     }
 }

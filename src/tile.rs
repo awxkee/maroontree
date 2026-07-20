@@ -38,6 +38,7 @@ use crate::intrapred::{
 use crate::msac_enc::Writer;
 use crate::skip_tables::SKIP_CTX;
 use crate::tables::*;
+use crate::util::dirty_log2f;
 use crate::wht::levels_from_resid;
 
 /// DC prediction for a 4×4 block at pixel origin (ox, oy).
@@ -193,12 +194,12 @@ fn palette_color_bits(colors: &[i32], cache: &[i32], bit_depth: u8) -> f32 {
     if out.len() == 1 {
         return bits;
     }
-    let max_delta = out.windows(2).map(|v| v[1] - v[0]).max().unwrap();
+    let max_delta = out.array_windows::<2>().map(|v| v[1] - v[0]).max().unwrap();
     let min_bits = bit_depth - 3;
     let mut delta_bits = ceil_log2(max_delta).max(min_bits);
     bits += 2.0;
     let mut range = (1u32 << bit_depth) - out[0] - 1;
-    for pair in out.windows(2) {
+    for pair in out.array_windows::<2>() {
         bits += f32::from(delta_bits);
         range -= pair[1] - pair[0];
         delta_bits = delta_bits.min(ceil_log2(range));
@@ -246,7 +247,7 @@ fn palette_best_case_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
 fn raw_symbol_cost(raw: &[u16], symbol: usize) -> f32 {
     let low = if symbol == 0 { 0 } else { raw[symbol - 1] };
     let high = raw.get(symbol).copied().unwrap_or(32768);
-    -((high - low).max(1) as f32 / 32768.0).log2()
+    -dirty_log2f((high - low).max(1) as f32 / 32768.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +370,7 @@ impl IntrabcIndex {
 /// The default DV is tried first, followed by indexed reverse-raster lookup at
 /// every integer-pixel position. Reverse raster favours recently decoded data;
 /// the index makes the work depend on hash hits rather than decoded-area size.
+#[allow(clippy::too_many_arguments)]
 fn find_exact_intrabc(
     planes: &[&[i16]],
     stride: usize,
@@ -490,7 +492,7 @@ fn intrabc_estimated_bits(candidate: IntrabcMatch, py: usize) -> f32 {
         + (i32::from(candidate.mv.1) - i32::from(pred.1)).unsigned_abs())
         as f32
         / 8.0;
-    8.0 + residual_pixels.max(1.0).log2() * 2.0
+    8.0 + dirty_log2f(residual_pixels.max(1.0)) * 2.0
 }
 
 #[inline]
@@ -1130,6 +1132,7 @@ fn cfl_alpha_candidates(
 
 /// Residual bits (coef-rate proxy) of coding one plane of an `n_tx`x`n_tx` leaf
 /// at `(bx, by)` with `mode`.
+#[allow(clippy::too_many_arguments)]
 fn plane_leaf_bits(
     mode: usize,
     angle_delta: i32,
@@ -1302,8 +1305,6 @@ fn best_rect_block(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Best luma + best uv mode for a leaf, with total residual+overhead bits.
 #[allow(clippy::too_many_arguments)]
 fn best_leaf(
     planes: [&[i16]; 3],
@@ -1578,6 +1579,7 @@ thread_local! {
 }
 
 #[inline]
+#[allow(clippy::needless_return)] // cfg(test) early-return; cfg!(test) can't see the test-only thread-local
 fn forced_ll_partition() -> usize {
     #[cfg(test)]
     {
@@ -1588,8 +1590,7 @@ fn forced_ll_partition() -> usize {
 }
 
 /// Decide none-vs-split by estimated bits; returns the plan and its cost. At
-/// 8x8, PARTITION_SPLIT produces four normative 4x4 leaves (needed for coded-
-/// lossless CfL, which is disallowed at larger block sizes).
+/// 8x8, PARTITION_SPLIT produces four normative 4x4 leaves (needed for coded-lossless CfL, which is disallowed at larger block sizes).
 #[allow(clippy::too_many_arguments)]
 fn plan_full(
     planes: [&[i16]; 3],
@@ -1747,6 +1748,7 @@ fn plan_full(
     let size = sz8 * 8;
     let half = size / 2;
     let quarter = size / 4;
+    #[allow(clippy::type_complexity)]
     let geometries: [(usize, Vec<(usize, usize, usize, usize)>); 8] = [
         (1, vec![(0, 0, size, half), (0, half, size, half)]),
         (2, vec![(0, 0, half, size), (half, 0, half, size)]),
@@ -2017,12 +2019,12 @@ fn write_palette_colors(wr: &mut Writer, colors: &[i32], cache: &[i32], bit_dept
     if out.len() == 1 {
         return;
     }
-    let max_delta = out.windows(2).map(|v| v[1] - v[0]).max().unwrap();
+    let max_delta = out.array_windows::<2>().map(|v| v[1] - v[0]).max().unwrap();
     let min_bits = bit_depth - 3;
     let mut bits = ceil_log2(max_delta).max(min_bits);
     wr.literal(2, u32::from(bits - min_bits));
     let mut range = (1u32 << bit_depth) - out[0] - 1;
-    for pair in out.windows(2) {
+    for pair in out.array_windows::<2>() {
         let delta = pair[1] - pair[0];
         wr.literal(bits, delta - 1);
         range -= delta;
@@ -2389,11 +2391,11 @@ fn code_leaf_rect(
     for slot in &mut st.l_palette[y4..y4 + nh] {
         slot.clear();
     }
-    for plane in 0..3 {
+    for (plane, &pp) in planes.iter().enumerate().take(3) {
         encode_plane_rect_block(
             wr,
             &mut st.cdfs,
-            planes[plane],
+            pp,
             st.w,
             px,
             py,
@@ -2712,6 +2714,7 @@ fn decode_sb_ll(
 /// crossing the frame boundary are split down to 8×8 leaves using AV1's
 /// frame-edge partition logic. `planes[0]`=G, `[1]`=B, `[2]`=R, each a `w*h`
 /// raster.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_tile_lossless(
     w: usize,
     h: usize,
@@ -2953,6 +2956,7 @@ fn best_partition_block_mono(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn rectangular_geometries(size: usize) -> Vec<(usize, Vec<(usize, usize, usize, usize)>)> {
     let half = size / 2;
     let mut out = vec![
@@ -3283,6 +3287,7 @@ fn code_leaf_mono(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn code_leaf_rect_mono(
     wr: &mut Writer,
     luma: &[i16],
@@ -3534,6 +3539,7 @@ fn decode_sb_ll_mono(
 /// Encode a **monochrome** lossless AV1 tile (single luma plane), width/height
 /// multiples of 8. Structure mirrors [`encode_tile_lossless`] but for a 1-plane
 /// (`mono_chrome = 1`) frame: only the luma plane is coded.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_tile_lossless_mono(
     w: usize,
     h: usize,
@@ -3841,6 +3847,8 @@ mod tests {
             false,
             false,
             true,
+            true,
+            true,
         )
         .unwrap();
         let decoded = decode_obu(&decoder, &obu, "lossy-residual");
@@ -3859,8 +3867,13 @@ mod tests {
         );
 
         for n in 2..=8usize {
+            // Coherent 4px vertical stripes of n colors. (A per-pixel
+            // pseudo-random map was used here before the palette rate model
+            // became entropy-accurate: such a map is maximally anti-correlated
+            // and the context coder correctly prices it above the transform
+            // path, so palette rightly LOSES on it now.)
             let exact: Vec<u8> = (0..w * h)
-                .map(|i| 7 + (((i * 37 + (i / w) * 11 + 3) % n) * 31) as u8)
+                .map(|i| 7 + ((((i % w) / 4 + (i / w) / 8) % n) * 31) as u8)
                 .collect();
             let exact_image = PlanarImage::from_luma(w, h, BitDepth::Eight, &exact).unwrap();
             let exact_obu = encode_lossy_gray_obu(
@@ -3874,6 +3887,8 @@ mod tests {
                 crate::coder::VarianceBoost::off(),
                 false,
                 false,
+                true,
+                true,
                 true,
             )
             .unwrap();
@@ -3904,6 +3919,8 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
+            true,
             true,
         )
         .unwrap();
@@ -4364,11 +4381,11 @@ mod tests {
             return;
         };
         let (w, h) = (128usize, 128usize);
-        let mut first = vec![0i32; w * 64];
+        let mut first = vec![0u16; w * 64];
         let mut state = 0x1055_1bc0u32;
         for sample in &mut first {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            *sample = (state >> 24) as i32;
+            *sample = (state >> 24) as u16;
         }
         let plane = [first.clone(), first].concat();
         let src = [plane.clone(), plane.clone(), plane];
@@ -4390,6 +4407,8 @@ mod tests {
             false,
             false,
             true,
+            true,
+            true,
         );
         let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-64");
         assert_eq!(decoded.len(), 3 * w * h);
@@ -4405,10 +4424,10 @@ mod tests {
             return;
         };
         let (w, h) = (256usize, 64usize);
-        let mut plane = vec![0i32; w * h];
+        let mut plane = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..128 {
-                plane[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as i32;
+                plane[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as u16;
             }
             plane.copy_within(y * w + 3..y * w + 67, y * w + 128);
             plane.copy_within(y * w + 64..y * w + 128, y * w + 192);
@@ -4431,6 +4450,8 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
+            true,
             true,
         );
         let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-nondefault-dv");

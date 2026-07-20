@@ -432,7 +432,7 @@ pub(super) fn encode_luma_sb(
     // those. SATD tracks post-transform coding cost well, so the true winner is
     // essentially always in the top few. The prediction is written into `recy` so
     // subsequent 32x32 sub-blocks predict from the prior ones (as the real coder
-    // does); TU[0] always predicts from the SB's finalized neighbours, and the
+    // does); TU[0] always predicts from the SB's finalized neighbors, and the
     // full Stage-2 pass overwrites `recy` correctly, so this scratch use is safe.
     let satd_of_mode = |recy: &mut [f32], m: usize, adelta: i32| -> u64 {
         let mut satd = 0u64;

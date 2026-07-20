@@ -18,11 +18,18 @@ exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.94.0"
 
 [dependencies]
+hashbrown = "0.17"
 
 [features]
 default = ["neon", "avx"]
 neon = []
 avx = []
+# Offline parameter study only (see src/tuning.rs + parameters_fit/)
+tuning = []
 
 [profile.release]
 debug = "line-tables-only"
+
+[profile.profiling]
+inherits = "release"
+debug = "full"

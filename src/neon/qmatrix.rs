@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
@@ -26,53 +26,36 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::aq_common::f_fmlaf;
 
-pub(crate) trait FastRound {
-    fn fast_round(self) -> Self;
-}
+use crate::dct::{FORWARD_QM_SCALES, apply_qmatrix};
+use core::arch::aarch64::*;
 
-impl FastRound for f32 {
-    fn fast_round(self) -> Self {
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse4.1"
-        ))]
-        {
-            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
-            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.round()
-        }
-        #[cfg(not(any(
-            target_arch = "aarch64",
-            all(
-                any(target_arch = "x86", target_arch = "x86_64"),
-                target_feature = "sse4.1"
-            )
-        )))]
-        {
-            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
-            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
+#[target_feature(enable = "neon")]
+pub(crate) fn apply_qmatrix_neon(levels: &mut [i32], targets: &mut [f32], inverse_weights: &[u8]) {
+    assert_eq!(levels.len(), targets.len());
+    assert_eq!(levels.len(), inverse_weights.len());
+
+    let (level_chunks, level_tail) = levels.as_chunks_mut::<4>();
+    let (target_chunks, target_tail) = targets.as_chunks_mut::<4>();
+    let (weight_chunks, weight_tail) = inverse_weights.as_chunks::<4>();
+    for ((level, target), weights) in level_chunks
+        .iter_mut()
+        .zip(target_chunks)
+        .zip(weight_chunks)
+    {
+        let scales = [
+            FORWARD_QM_SCALES[weights[0] as usize],
+            FORWARD_QM_SCALES[weights[1] as usize],
+            FORWARD_QM_SCALES[weights[2] as usize],
+            FORWARD_QM_SCALES[weights[3] as usize],
+        ];
+        unsafe {
+            let target_v = vld1q_f32(target.as_ptr());
+            let weighted = vmulq_f32(target_v, vld1q_f32(scales.as_ptr()));
+            vst1q_f32(target.as_mut_ptr(), weighted);
+            vst1q_s32(level.as_mut_ptr(), vcvtaq_s32_f32(weighted));
         }
     }
-}
 
-pub(crate) fn dirty_log2f(d: f32) -> f32 {
-    let mut ix = d.to_bits();
-    /* reduce x into [sqrt(2)/2, sqrt(2)] */
-    ix = ix.wrapping_add(0x3f800000 - 0x3f3504f3);
-    let n = (ix >> 23) as i32 - 0x7f;
-    ix = (ix & 0x007fffff).wrapping_add(0x3f3504f3);
-    let a = f32::from_bits(ix);
-
-    let x = (a - 1.) / (a + 1.);
-
-    let x2 = x * x;
-    let mut u = 0.4121985850084821691e+0;
-    u = f_fmlaf(u, x2, 0.5770780163490337802e+0);
-    u = f_fmlaf(u, x2, 0.9617966939259845749e+0);
-    f_fmlaf(x2 * x, u, f_fmlaf(x, 0.2885390081777926802e+1, n as f32))
+    apply_qmatrix(level_tail, target_tail, weight_tail);
 }

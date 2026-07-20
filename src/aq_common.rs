@@ -44,6 +44,12 @@ impl AqLuma for i32 {
         self as f32
     }
 }
+impl AqLuma for u16 {
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
 
 /// The representative variance of a superblock for Variance Boost: the value at the
 /// requested `octile` (1..=8) of the 64 sorted 8x8 variances. Octile 1 = the most
@@ -51,8 +57,6 @@ impl AqLuma for i32 {
 /// when the whole SB is low-variance).
 pub(crate) fn sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
     subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Octile o in 1..=8 maps to sorted index o*8 - 1 (o=1 -> 7, o=4 -> 31 (median-ish),
-    // o=6 -> 47 (SVT-AV1-PSY default), o=8 -> 63 (max)).
     let o = octile.clamp(1, 8) as usize;
     let idx = (o * 8 - 1).min(63);
     subvars[idx]
@@ -107,36 +111,56 @@ pub(crate) fn dirty_log1pf(d: f32) -> f32 {
 /// Variance Boost qindex delta for one superblock. `picked_var` is the octile pick
 /// (see [`sb_octile_variance`]); `ref_log` is the tile mean log-variance.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn variance_boost_delta(
     picked_var: f32,
     ref_log: f32,
+    ref_pick: f32,
     strength: f32,
     boost_only: bool,
+    mid_t: f32,
+    cut_wide_t: f32,
 ) -> i32 {
     // Work in log-variance: compresses the huge dynamic range of variance and matches
     // the reference (which is a mean of log-variances).
     let v_log = dirty_log1pf(picked_var);
-    // Low-variance threshold (curve 0): ln(1 + 256).
-    const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
-    const MAX_BOOST: f32 = 18.0; // max qindex *reduction* for the flattest SBs
-    const MAX_CUT: f32 = 10.0; // max qindex *increase* for the busiest SBs
+    let low_log = f_fmlaf(0.5, mid_t, 5.549_076); // (1.0 + 256.0).ln() at mid_t=0
+    let max_boost = 18.0f32;
+    let max_cut = 16.0f32 + 24.0 * cut_wide_t;
     // qindex per unit log-variance for each side.
-    const BOOST_SLOPE: f32 = 5.0;
-    const CUT_SLOPE: f32 = 3.0;
+    let boost_slope = 5.0 + 1.5 * mid_t;
+    let cut_slope = 6.0 + 2.0 * mid_t;
 
-    if v_log < LOW_LOG {
+    if v_log < low_log {
         // Low contrast: boost (negative delta). Deeper below threshold => stronger.
-        let d = ((LOW_LOG - v_log) * BOOST_SLOPE * strength).min(MAX_BOOST);
+        let d = ((low_log - v_log) * boost_slope * strength).min(max_boost);
         -(d.fast_round() as i32)
     } else if boost_only {
         0
     } else {
-        // Higher contrast: coarsen relative to the tile reference, capped. Using the
-        // reference (not the threshold) keeps well-textured frames near zero-mean.
-        let over = (v_log - ref_log.max(LOW_LOG)).max(0.0);
-        let d = (over * CUT_SLOPE * strength).min(MAX_CUT);
+        let anchor = if ref_pick > 0.0 {
+            ref_pick
+        } else {
+            ref_log * 0.95
+        };
+        let over = (v_log - anchor.max(low_log)).max(0.0);
+        let d = (over * cut_slope * strength).min(max_cut);
         d.fast_round() as i32
     }
+}
+
+/// AV2 entry point: the pre-widening signature (cut_wide_t = 0, byte-identical).
+pub(crate) fn variance_boost_delta_av2(
+    picked_var: f32,
+    ref_log: f32,
+    ref_pick: f32,
+    strength: f32,
+    boost_only: bool,
+    mid_t: f32,
+) -> i32 {
+    variance_boost_delta(
+        picked_var, ref_log, ref_pick, strength, boost_only, mid_t, 0.0,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -183,6 +207,7 @@ impl DarkAq {
     pub(crate) fn on() -> Self {
         DarkAq {
             enabled: true,
+            min_q: 90,
             ..DarkAq::default()
         }
     }

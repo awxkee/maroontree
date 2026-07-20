@@ -44,6 +44,8 @@
 //!   -d, --depth <8|10|12>                    Output bit depth (auto-detect from source)
 //!   -t, --threads <N>                        Worker threads; 0 = all cores   [default: all]
 //!       --no-alpha                           Discard alpha channel
+//!       --no-screen-content                  Skip palette (screen-content) search
+//!       --no-intrabc                         Veto lossy IntraBC (keeps loop filters)
 //!       --no-exif                            Strip EXIF from output
 //!       --no-icc                             Strip ICC profile from output
 //!   -s, --speed                              Encoding effort (default = slow)
@@ -116,6 +118,8 @@ struct Args {
     speed: EncodingEffort,
     qmatrix: Option<Qmatrix>,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 }
 
 fn usage() -> ! {
@@ -135,6 +139,8 @@ Options:
   -d, --depth <8|10|12>                 Output bit depth (auto from source)
   -t, --threads <N>                     Worker threads; 0 = all cores   [default: all]
       --no-alpha                        Discard alpha channel
+      --no-screen-content               Skip palette (screen-content) search
+      --no-intrabc                      Veto lossy IntraBC (keeps loop filters)
       --no-exif                         Strip EXIF metadata from output
       --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
@@ -192,6 +198,8 @@ fn parse_args() -> Args {
     let mut depth: Option<Depth> = None;
     let mut threads: usize = basic_concurrency();
     let mut no_alpha = false;
+    let mut screen_content = true;
+    let mut intrabc = true;
     let mut no_exif = false;
     let mut no_icc = false;
     let mut apply_icc = false;
@@ -206,6 +214,8 @@ fn parse_args() -> Args {
             "-v" | "--verbose" => verbose = true,
             "--lossless" => lossless = true,
             "--no-alpha" => no_alpha = true,
+            "--no-screen-content" => screen_content = false,
+            "--no-intrabc" => intrabc = false,
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
             "--apply-icc" => apply_icc = true,
@@ -322,6 +332,8 @@ fn parse_args() -> Args {
         depth,
         threads,
         no_alpha,
+        screen_content,
+        intrabc,
         no_exif,
         no_icc,
         apply_icc,

@@ -27,9 +27,23 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(clippy::needless_range_loop)]
-use crate::quant::Dct;
+use crate::quant::{Dct, qm_row};
 use crate::util::FastRound;
 use std::sync::OnceLock;
+
+#[cfg(test)]
+macro_rules! neon_fwd_tx {
+    ($neon:ident, $scalar:ident, $input:expr, $dc_q:expr, $ac_q:expr) => {{
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            unsafe { crate::neon::$neon($input, $dc_q, $ac_q) }
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        {
+            $scalar($input, $dc_q, $ac_q)
+        }
+    }};
+}
 
 pub(crate) const WC4_0: i32 = 35468; // 0.541196  * 65536
 pub(crate) const WC4_1: i32 = 85627; // 1.306563  * 65536
@@ -44,7 +58,12 @@ pub(crate) const SQRT2: i32 = 92682; // 1.414214  * 65536
 /// Worst case: 32767 * 170394 = ~5.6e9, fits in i64, shift back by 16.
 #[inline(always)]
 fn mul_q16(data: i32, coeff: i32) -> i32 {
-    (((data as i64) * (coeff as i64)) >> 16) as i32
+    // Rounding, not truncation: every butterfly stage truncated toward -inf,
+    // and the bias accumulated coherently across ~5 stages x 2 passes. Only
+    // the 32x32 kernels escaped it (they prescale by B=6 and normalise with
+    // shr_round); 4/8/16 carried a measurable negative bias into `cf` AND the
+    // `tf` the trellis prices against.
+    (((data as i64) * (coeff as i64) + 32768) >> 16) as i32
 }
 
 #[inline(always)]
@@ -58,31 +77,80 @@ fn quant_q16(data: i32, coeff: i32) -> i32 {
     if prod >= 0 { lvl } else { -lvl }
 }
 
-/// Apply AV1's forward quantization-matrix reciprocal to already normalized
-/// transform targets. Level 15 is flat, so the normal SIMD path remains
-/// untouched unless matrices are enabled.
+#[inline(never)]
+fn quant_flat(coeffs: &[i32], dc_q: i32, ac_q: i32, out: &mut [i32]) {
+    debug_assert_eq!(coeffs.len(), out.len());
+    let Some((&dc, ac)) = coeffs.split_first() else {
+        return;
+    };
+    let (dc_out, ac_out) = out.split_first_mut().unwrap();
+    *dc_out = quant_q16(dc, dc_q);
+    for (&coeff, dst) in ac.iter().zip(ac_out.iter_mut()) {
+        *dst = quant_q16(coeff, ac_q);
+    }
+}
+
+const fn forward_qm_scales() -> [f32; 256] {
+    let mut scales = [0.0; 256];
+    let mut iwt = 1usize;
+    while iwt < scales.len() {
+        let weight = (1024 + iwt / 2) / iwt;
+        scales[iwt] = weight as f32 / 32.0;
+        iwt += 1;
+    }
+    scales
+}
+
+pub(crate) const FORWARD_QM_SCALES: [f32; 256] = forward_qm_scales();
+
+/// Applies one inverse-QM row to dynamically-sized quantized coefficient
+/// buffers. Keeping the hot operation slice-based lets one SIMD function serve
+/// every AV1 transform size.
+pub(crate) type ApplyQmatrixFn = fn(&mut [i32], &mut [f32], &[u8]);
+
+pub(crate) fn apply_qmatrix(levels: &mut [i32], targets: &mut [f32], inverse_weights: &[u8]) {
+    assert_eq!(levels.len(), targets.len());
+    assert_eq!(levels.len(), inverse_weights.len());
+    for ((level, target), &iwt) in levels
+        .iter_mut()
+        .zip(targets.iter_mut())
+        .zip(inverse_weights)
+    {
+        let target_value = *target * FORWARD_QM_SCALES[iwt as usize];
+        *target = target_value;
+        // Round-to-nearest half-step dead-zone (matches `quant_q16`); the trellis
+        // makes the actual R-D keep/drop decision on the surviving levels.
+        *level = if target_value.abs() < 0.5 {
+            0
+        } else {
+            target_value.fast_round() as i32
+        };
+    }
+}
+
 #[inline]
-fn apply_qmatrix<const N: usize>(
+fn apply_qmatrix_result<const N: usize>(
     mut quantized: ([i32; N], [f32; N]),
     quant: &impl Dct,
     w: usize,
     h: usize,
+    apply: ApplyQmatrixFn,
 ) -> ([i32; N], [f32; N]) {
-    if !quant.has_qmatrix() {
-        return quantized;
-    }
-    for rc in 0..N {
-        let target = quantized.1[rc] * quant.forward_qm_weight(rc, w, h) as f32 / 32.0;
-        quantized.1[rc] = target;
-        // Round-to-nearest half-step dead-zone (matches `quant_q16`); the trellis
-        // makes the actual R-D keep/drop decision on the surviving levels.
-        quantized.0[rc] = if target.abs() < 0.5 {
-            0
-        } else {
-            target.fast_round() as i32
-        };
+    if let Some(inverse_weights) = qm_row(quant.qm_level(), quant.qm_chroma(), w, h) {
+        apply(&mut quantized.0, &mut quantized.1, inverse_weights);
     }
     quantized
+}
+
+#[cfg(test)]
+#[inline]
+fn apply_qmatrix_result_scalar<const N: usize>(
+    quantized: ([i32; N], [f32; N]),
+    quant: &impl Dct,
+    w: usize,
+    h: usize,
+) -> ([i32; N], [f32; N]) {
+    apply_qmatrix_result(quantized, quant, w, h, apply_qmatrix)
 }
 
 /// fmla equivalent: a * SQRT2 + b, all in Q15 domain
@@ -233,12 +301,7 @@ fn dct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64],
     (cf, tf)
 }
 
-/// Forward ADST8 (1-D), Q12 matrix derived as the gain-matched transpose of
-/// dav1d's integer inverse ADST8 (`inv_adst8_1d`). Calibrated so the forward/
-/// inverse round-trip gain equals the DCT pair's, so the same quant multipliers
-/// and TX_8X8 inverse shifts apply unchanged. Used only as the encoder's
-/// analysis transform; reconstruction is dav1d-exact via `iadst_dequant_8x8`.
-static ADST8_FWD_Q12: [[i32; 8]; 8] = [
+pub(crate) static ADST8_FWD_Q12: [[i32; 8]; 8] = [
     [567, 1682, 2730, 3675, 4477, 5109, 5544, 5766],
     [1682, 4480, 5766, 5109, 2732, -569, -3675, -5545],
     [2732, 5766, 3675, -1682, -5544, -4479, 569, 5109],
@@ -262,33 +325,121 @@ fn fwd_adst8_1d(inp: &[i32; 8]) -> [i32; 8] {
     out
 }
 
-/// Trellis (RDOQ) forward ADST8: levels + unrounded targets, mirroring
-/// `dct8x8_t`. Ratio is 1.0 for 8x8, so the quant multipliers apply directly.
-pub(crate) fn adst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    apply_qmatrix(
-        adst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        8,
-        8,
-    )
+fn f1ddct8x8_quant_t_direct(
+    residual: &[i32; 64],
+    qm_dc: i32,
+    qm_ac: i32,
+    vertical: bool,
+) -> ([i32; 64], [f32; 64]) {
+    let mut f = [0i32; 64];
+    if vertical {
+        // V_DCT: DCT along columns, identity along rows.
+        for x in 0..8 {
+            let mut col = [0i32; 8];
+            for (y, c) in col.iter_mut().enumerate() {
+                *c = residual[y * 8 + x];
+            }
+            dct1d_8_i32(&mut col);
+            for (y, &v) in col.iter().enumerate() {
+                f[y * 8 + x] = v * 2;
+            }
+        }
+    } else {
+        // H_DCT: DCT along rows, identity along columns.
+        for y in 0..8 {
+            let mut row = [0i32; 8];
+            row.copy_from_slice(&residual[y * 8..y * 8 + 8]);
+            dct1d_8_i32(&mut row);
+            for (x, &v) in row.iter().enumerate() {
+                f[y * 8 + x] = v * 2;
+            }
+        }
+    }
+    let mut cf = [0i32; 64];
+    let mut tf = [0f32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            let rc = y + x * 8; // transposed storage, matching the inverses
+            let m = if rc == 0 { qm_dc } else { qm_ac };
+            quant_fullstep(&mut cf, &mut tf, rc, f[y * 8 + x], m);
+        }
+    }
+    (cf, tf)
 }
 
-pub(crate) fn adstdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    apply_qmatrix(
-        adstdct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        8,
-        8,
-    )
+/// Full-step dead-zone quantizer in Q16: zero below one whole step, else
+/// round-to-nearest. The half-step `quant_q16` is for trellis-refined paths.
+#[inline]
+fn quant_fullstep<const N: usize>(
+    cf: &mut [i32; N],
+    tf: &mut [f32; N],
+    idx: usize,
+    coeff: i32,
+    q_mult: i32,
+) {
+    let prod = (coeff as i64) * (q_mult as i64);
+    tf[idx] = prod as f32 * (1.0 / 65536.0);
+    let mag = prod.unsigned_abs();
+    cf[idx] = if mag < 65536 {
+        0
+    } else {
+        let l = ((mag + 32768) >> 16) as i32;
+        if prod >= 0 { l } else { -l }
+    };
 }
 
-pub(crate) fn dctadst8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    apply_qmatrix(
-        dctadst8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        8,
-        8,
-    )
+fn f1ddct4x4_quant_t_direct(
+    residual: &[i32; 16],
+    qm_dc: i32,
+    qm_ac: i32,
+    vertical: bool,
+) -> ([i32; 16], [f32; 16]) {
+    let mut f = [0i32; 16];
+    if vertical {
+        // V_DCT: DCT along columns, identity along rows.
+        for x in 0..4 {
+            let mut col = [0i32; 4];
+            for (y, c) in col.iter_mut().enumerate() {
+                *c = residual[y * 4 + x];
+            }
+            dct1d_4_i32(&mut col);
+            for (y, &v) in col.iter().enumerate() {
+                f[y * 4 + x] = mul_q16(v * 2, SQRT2);
+            }
+        }
+    } else {
+        // H_DCT: DCT along rows, identity along columns.
+        for y in 0..4 {
+            let mut row = [0i32; 4];
+            row.copy_from_slice(&residual[y * 4..y * 4 + 4]);
+            dct1d_4_i32(&mut row);
+            for (x, &v) in row.iter().enumerate() {
+                f[y * 4 + x] = mul_q16(v * 2, SQRT2);
+            }
+        }
+    }
+    let mut cf = [0i32; 16];
+    let mut tf = [0f32; 16];
+    for y in 0..4 {
+        for x in 0..4 {
+            let rc = y + x * 4; // transposed storage, matching the inverses
+            let m = if rc == 0 { qm_dc } else { qm_ac };
+            quant_fullstep(&mut cf, &mut tf, rc, f[y * 4 + x], m);
+        }
+    }
+    (cf, tf)
+}
+
+#[cfg(test)]
+pub(crate) fn fvdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), true)
+}
+
+#[cfg(test)]
+pub(crate) fn fhdct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct8x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), false)
 }
 
 pub(crate) static ADST16_FWD_Q12: [[i16; 16]; 16] = [
@@ -371,33 +522,6 @@ fn fwd_adst16_1d(inp: &[i32; 16]) -> [i32; 16] {
     out
 }
 
-pub(crate) fn adst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    apply_qmatrix(
-        resolve_adst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        16,
-        16,
-    )
-}
-
-pub(crate) fn adstdct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    apply_qmatrix(
-        resolve_adstdct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        16,
-        16,
-    )
-}
-
-pub(crate) fn dctadst16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    apply_qmatrix(
-        resolve_dctadst16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        16,
-        16,
-    )
-}
-
 /// Shared 2-D integer DCT-16 transform core (no quantization). Output layout
 /// `out[u*16 + v]`, DC at index 0. Reused by [`dct16x16_scalar`] and [`dct16x16_t`].
 #[inline]
@@ -459,9 +583,7 @@ fn dct16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 2
 #[allow(unused)]
 pub(crate) fn dct16x16_scalar(input: &mut [i32; 256], dc_q: i32, ac_q: i32) {
     let coeffs = dct16x16_coeffs(input);
-    for (i, dst) in input.iter_mut().enumerate() {
-        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
-    }
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 pub(crate) const WC32: [i32; 16] = [
@@ -615,9 +737,7 @@ fn dct32x32_quant_t_direct(
 #[allow(unused)]
 pub(crate) fn dct32x32_scalar(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     let coeffs = dct32x32_coeffs(input);
-    for (i, dst) in input.iter_mut().enumerate() {
-        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
-    }
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 type Dct8x16Fn = fn(&mut [i32; 128], i32, i32);
@@ -689,10 +809,6 @@ pub(crate) fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     out
 }
 
-#[inline]
-/// ADST_ADST for RTX_8X16 — the DCT path's twin with both 1D passes swapped for
-/// the ADST kernel. Same rect2 `mul_q16(_, 46341)` (1/sqrt2) scaling and the same
-/// transposed coefficient store, so `SCAN_8X16` addressing is unchanged.
 fn adst8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
     let mut tmp = [0i32; 128];
     for col in 0..8usize {
@@ -718,7 +834,6 @@ fn adst8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 1
     (cf, tf)
 }
 
-/// ADST_ADST for RTX_16X8.
 fn adst16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
     let mut tmp = [0i32; 128];
     for col in 0..16usize {
@@ -744,22 +859,303 @@ fn adst16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 1
     (cf, tf)
 }
 
-pub(crate) fn adst8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    apply_qmatrix(
-        adst8x16_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+fn adstdct16x8_quant_t_direct(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..16usize {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 16 + col];
+        }
+        let c = fwd_adst8_1d(&c);
+        for fy in 0..8 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..8usize {
+        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut r);
+        for fx in 0..16 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+/// DCT_ADST for RTX_16X8 (vertical DCT-8, horizontal ADST-16).
+fn dctadst16x8_quant_t_direct(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..16usize {
+        let mut c = [0i32; 8];
+        for row in 0..8 {
+            c[row] = input[row * 16 + col];
+        }
+        dct1d_8_i32(&mut c);
+        for fy in 0..8 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..8usize {
+        let r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let r = fwd_adst16_1d(&r);
+        for fx in 0..16 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 8 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+/// ADST_DCT for RTX_8X16 (vertical ADST-16, horizontal DCT-8).
+fn adstdct8x16_quant_t_direct(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..8usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 8 + col];
+        }
+        let c = fwd_adst16_1d(&c);
+        for fy in 0..16 {
+            tmp[fy * 8 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..16usize {
+        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        dct1d_8_i32(&mut r);
+        for fx in 0..8 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+fn dctadst8x16_quant_t_direct(
+    input: &[i32; 128],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 128], [f32; 128]) {
+    let mut tmp = [0i32; 128];
+    for col in 0..8usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 8 + col];
+        }
+        dct1d_16_i32(&mut c);
+        for fy in 0..16 {
+            tmp[fy * 8 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for fy in 0..16usize {
+        let r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let r = fwd_adst8_1d(&r);
+        for fx in 0..8 {
+            let coeff = mul_q16(r[fx], 46341);
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, coeff, dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[cfg(test)]
+pub(crate) fn adstdct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            adstdct16x8_neon_quant_t,
+            adstdct16x8_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
+        quant,
+        16,
+        8,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn dctadst16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dctadst16x8_neon_quant_t,
+            dctadst16x8_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
+        quant,
+        16,
+        8,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn adstdct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            adstdct8x16_neon_quant_t,
+            adstdct8x16_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
         quant,
         8,
         16,
     )
 }
 
-pub(crate) fn adst16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    apply_qmatrix(
-        adst16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+#[cfg(test)]
+pub(crate) fn dctadst8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dctadst8x16_neon_quant_t,
+            dctadst8x16_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
         quant,
-        16,
         8,
+        16,
     )
+}
+
+fn f1ddct_rect_quant_t_direct(
+    residual: &[i32; 128],
+    qm_dc: i32,
+    qm_ac: i32,
+    w: usize,
+    vertical: bool,
+) -> ([i32; 128], [f32; 128]) {
+    let h = 128 / w;
+    let mut f = [0i32; 128];
+    if vertical {
+        // V_DCT: DCT along columns (height axis), identity along rows.
+        for x in 0..w {
+            if h == 8 {
+                let mut col = [0i32; 8];
+                for (y, c) in col.iter_mut().enumerate() {
+                    *c = residual[y * w + x];
+                }
+                dct1d_8_i32(&mut col);
+                for (y, &v) in col.iter().enumerate() {
+                    f[y * w + x] = v * 2;
+                }
+            } else {
+                let mut col = [0i32; 16];
+                for (y, c) in col.iter_mut().enumerate() {
+                    *c = residual[y * w + x];
+                }
+                dct1d_16_i32(&mut col);
+                for (y, &v) in col.iter().enumerate() {
+                    f[y * w + x] = mul_q16(v, SQRT2);
+                }
+            }
+        }
+    } else {
+        // H_DCT: DCT along rows (width axis), identity along columns.
+        for y in 0..h {
+            if w == 16 {
+                let mut row = [0i32; 16];
+                row.copy_from_slice(&residual[y * w..y * w + 16]);
+                dct1d_16_i32(&mut row);
+                for (x, &v) in row.iter().enumerate() {
+                    f[y * w + x] = mul_q16(v, SQRT2);
+                }
+            } else {
+                let mut row = [0i32; 8];
+                row.copy_from_slice(&residual[y * w..y * w + 8]);
+                dct1d_8_i32(&mut row);
+                for (x, &v) in row.iter().enumerate() {
+                    f[y * w + x] = v * 2;
+                }
+            }
+        }
+    }
+    let mut cf = [0i32; 128];
+    let mut tf = [0f32; 128];
+    for y in 0..h {
+        for x in 0..w {
+            let rc = y + x * h; // transposed storage, matching the inverses
+            let m = if rc == 0 { qm_dc } else { qm_ac };
+            quant_fullstep(&mut cf, &mut tf, rc, f[y * w + x], m);
+        }
+    }
+    (cf, tf)
+}
+
+#[cfg(test)]
+pub(crate) fn fvdct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct_rect_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), 16, true)
+}
+
+#[cfg(test)]
+pub(crate) fn fhdct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct_rect_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), 16, false)
+}
+
+#[cfg(test)]
+pub(crate) fn fvdct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct_rect_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), 8, true)
+}
+
+#[cfg(test)]
+pub(crate) fn fhdct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    f1ddct_rect_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac(), 8, false)
+}
+
+#[cfg(test)]
+pub(crate) fn fidentity_rect_t(
+    residual: &[i32; 128],
+    quant: &impl Dct,
+    w: usize,
+) -> ([i32; 128], [f32; 128]) {
+    let quant = &crate::quant::FlatDct(quant); // identity family: QM not applied
+    let h = 128 / w;
+    let (dc_q, ac_q) = (quant.dc_q(), quant.ac_q());
+    let mut cf = [0i32; 128];
+    let mut tf = [0.0f32; 128];
+    for y in 0..h {
+        for x in 0..w {
+            let rc = y + x * h;
+            let qd = if rc == 0 { dc_q } else { ac_q };
+            let num = residual[y * w + x] * 8;
+            tf[rc] = num as f32 / qd as f32;
+            let am = num.unsigned_abs() as i32;
+            cf[rc] = if am < qd {
+                0
+            } else {
+                let l = (am + qd / 2) / qd;
+                if num < 0 { -l } else { l }
+            };
+        }
+    }
+    (cf, tf)
 }
 
 fn dct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
@@ -791,9 +1187,7 @@ fn dct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 12
 #[allow(unused)]
 pub(crate) fn dct8x16_i32_scalar(input: &mut [i32; 128], dc_q: i32, ac_q: i32) {
     let coeffs = dct8x16_coeffs(input);
-    for (i, dst) in input.iter_mut().enumerate() {
-        *dst = quant_q16(coeffs[i], if i == 0 { dc_q } else { ac_q });
-    }
+    quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
 #[inline(always)]
@@ -825,7 +1219,6 @@ fn quant_levels_and_targets<const N: usize>(
     (cf, tf)
 }
 
-#[inline]
 fn adst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
     let mut tmp = [0i32; 64];
     for x in 0..8usize {
@@ -850,7 +1243,6 @@ fn adst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64]
     (cf, tf)
 }
 
-#[inline]
 fn adstdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
     let mut tmp = [0i32; 64];
     for x in 0..8usize {
@@ -875,7 +1267,6 @@ fn adstdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 
     (cf, tf)
 }
 
-#[inline]
 fn dctadst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
     let mut tmp = [0i32; 64];
     for x in 0..8usize {
@@ -1004,7 +1395,6 @@ fn dctadst16x16_quant_t_direct(
     (cf, tf)
 }
 
-#[inline]
 fn adst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
     let mut tmp = [0i32; 16];
     for x in 0..4usize {
@@ -1029,7 +1419,6 @@ fn adst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16]
     (cf, tf)
 }
 
-#[inline]
 fn adstdct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
     let mut tmp = [0i32; 16];
     for x in 0..4usize {
@@ -1107,7 +1496,6 @@ fn adst4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32]
     (cf, tf)
 }
 
-#[inline]
 fn adstdct4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
     let mut tmp = [0i32; 32];
     for col in 0..4 {
@@ -1163,13 +1551,125 @@ fn dctadst4x8_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 
     (cf, tf)
 }
 
-type Dct8x8QuantTFn = fn(&[i32; 64], i32, i32) -> ([i32; 64], [f32; 64]);
-type Dct8x16QuantTFn = fn(&[i32; 128], i32, i32) -> ([i32; 128], [f32; 128]);
-type Dct16x16QuantTFn = fn(&[i32; 256], i32, i32) -> ([i32; 256], [f32; 256]);
-type Tx16x16QuantTFn = fn(&[i32; 256], i32, i32) -> ([i32; 256], [f32; 256]);
-type Dct32x32QuantTFn = fn(&[i32; 1024], i32, i32) -> ([i32; 1024], [f32; 1024]);
-type Dct16x32QuantTFn = fn(&[i32; 512], i32, i32) -> ([i32; 512], [f32; 512]);
-type Dct32x16QuantTFn = fn(&[i32; 512], i32, i32) -> ([i32; 512], [f32; 512]);
+fn fvdct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    f1ddct4x4_quant_t_direct(input, dc_q, ac_q, true)
+}
+
+fn fhdct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    f1ddct4x4_quant_t_direct(input, dc_q, ac_q, false)
+}
+
+fn fvdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    f1ddct8x8_quant_t_direct(input, dc_q, ac_q, true)
+}
+
+fn fhdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    f1ddct8x8_quant_t_direct(input, dc_q, ac_q, false)
+}
+
+fn fvdct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    f1ddct_rect_quant_t_direct(input, dc_q, ac_q, 16, true)
+}
+
+fn fhdct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    f1ddct_rect_quant_t_direct(input, dc_q, ac_q, 16, false)
+}
+
+fn fvdct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    f1ddct_rect_quant_t_direct(input, dc_q, ac_q, 8, true)
+}
+
+fn fhdct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    f1ddct_rect_quant_t_direct(input, dc_q, ac_q, 8, false)
+}
+
+fn identity_quant_t_direct<const N: usize>(
+    residual: &[i32; N],
+    dc_q: i32,
+    ac_q: i32,
+    w: usize,
+    h: usize,
+) -> ([i32; N], [f32; N]) {
+    let mut cf = [0i32; N];
+    let mut tf = [0.0f32; N];
+    for y in 0..h {
+        for x in 0..w {
+            let rc = y + x * h;
+            let qd = if rc == 0 { dc_q } else { ac_q };
+            let num = residual[y * w + x] * 8;
+            tf[rc] = num as f32 / qd as f32;
+            let am = num.unsigned_abs() as i32;
+            cf[rc] = if am < qd {
+                0
+            } else {
+                let level = (am + qd / 2) / qd;
+                if num < 0 { -level } else { level }
+            };
+        }
+    }
+    (cf, tf)
+}
+
+fn idtx4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16], [f32; 16]) {
+    identity_quant_t_direct(input, dc_q, ac_q, 4, 4)
+}
+
+fn idtx8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    identity_quant_t_direct(input, dc_q, ac_q, 8, 8)
+}
+
+fn idtx8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    identity_quant_t_direct(input, dc_q, ac_q, 8, 16)
+}
+
+fn idtx16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
+    identity_quant_t_direct(input, dc_q, ac_q, 16, 8)
+}
+
+fn idtx16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 256], [f32; 256]) {
+    identity_quant_t_direct(input, dc_q, ac_q, 16, 16)
+}
+
+pub(crate) type DctFn<const N: usize> = fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]);
+type Dct8x8QuantTFn = DctFn<64>;
+type Dct8x16QuantTFn = DctFn<128>;
+type Dct16x16QuantTFn = DctFn<256>;
+type Tx16x16QuantTFn = DctFn<256>;
+type Dct32x32QuantTFn = DctFn<1024>;
+type Dct16x32QuantTFn = DctFn<512>;
+type Dct32x16QuantTFn = DctFn<512>;
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn apply_qmatrix_neon_wrap(levels: &mut [i32], targets: &mut [f32], inverse_weights: &[u8]) {
+    unsafe { crate::neon::apply_qmatrix_neon(levels, targets, inverse_weights) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn apply_qmatrix_avx2_wrap(levels: &mut [i32], targets: &mut [f32], inverse_weights: &[u8]) {
+    unsafe { crate::avx::apply_qmatrix_avx2(levels, targets, inverse_weights) }
+}
+
+pub(crate) fn selected_apply_qmatrix() -> ApplyQmatrixFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        apply_qmatrix_neon_wrap
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            apply_qmatrix_avx2_wrap
+        } else {
+            apply_qmatrix
+        }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    )))]
+    {
+        apply_qmatrix
+    }
+}
 
 static DCT8X8_QUANT_T: OnceLock<Dct8x8QuantTFn> = OnceLock::new();
 static DCT8X16_QUANT_T: OnceLock<Dct8x16QuantTFn> = OnceLock::new();
@@ -1254,6 +1754,74 @@ fn dct32x16_neon_quant_t_wrap(
     unsafe { crate::neon::dct32x16_neon_quant_t(input, dc_q, ac_q) }
 }
 
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+macro_rules! small_neon_wrap {
+    ($name:ident, $neon:ident, $n:literal) => {
+        fn $name(input: &[i32; $n], dc_q: i32, ac_q: i32) -> ([i32; $n], [f32; $n]) {
+            unsafe { crate::neon::$neon(input, dc_q, ac_q) }
+        }
+    };
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct4x4_neon_quant_t_wrap, dct4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct4x8_neon_quant_t_wrap, dct4x8_neon_quant_t, 32);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct8x4_neon_quant_t_wrap, dct8x4_neon_quant_t, 32);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct4x16_neon_quant_t_wrap, dct4x16_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct16x4_neon_quant_t_wrap, dct16x4_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dct16x8_neon_quant_t_wrap, dct16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adst4x4_neon_quant_t_wrap, adst4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adstdct4x4_neon_quant_t_wrap, adstdct4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dctadst4x4_neon_quant_t_wrap, dctadst4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adst4x8_neon_quant_t_wrap, adst4x8_neon_quant_t, 32);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adstdct4x8_neon_quant_t_wrap, adstdct4x8_neon_quant_t, 32);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dctadst4x8_neon_quant_t_wrap, dctadst4x8_neon_quant_t, 32);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adst8x8_neon_quant_t_wrap, adst8x8_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adstdct8x8_neon_quant_t_wrap, adstdct8x8_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dctadst8x8_neon_quant_t_wrap, dctadst8x8_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adst8x16_neon_quant_t_wrap, adst8x16_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adstdct8x16_neon_quant_t_wrap, adstdct8x16_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dctadst8x16_neon_quant_t_wrap, dctadst8x16_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adst16x8_neon_quant_t_wrap, adst16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(adstdct16x8_neon_quant_t_wrap, adstdct16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(dctadst16x8_neon_quant_t_wrap, dctadst16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fvdct4x4_neon_quant_t_wrap, fvdct4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fhdct4x4_neon_quant_t_wrap, fhdct4x4_neon_quant_t, 16);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fvdct8x8_neon_quant_t_wrap, fvdct8x8_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fhdct8x8_neon_quant_t_wrap, fhdct8x8_neon_quant_t, 64);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fvdct16x8_neon_quant_t_wrap, fvdct16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fhdct16x8_neon_quant_t_wrap, fhdct16x8_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fvdct8x16_neon_quant_t_wrap, fvdct8x16_neon_quant_t, 128);
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+small_neon_wrap!(fhdct8x16_neon_quant_t_wrap, fhdct8x16_neon_quant_t, 128);
+
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 fn dct8x8_avx2_quant_t_wrap(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
     unsafe { crate::avx::dct8x8_avx2_quant_t(input, dc_q, ac_q) }
@@ -1326,6 +1894,62 @@ fn dct32x16_avx2_quant_t_wrap(
 ) -> ([i32; 512], [f32; 512]) {
     unsafe { crate::avx::dct32x16_avx2_quant_t(input, dc_q, ac_q) }
 }
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+macro_rules! small_avx2_wrap {
+    ($name:ident, $avx2:ident, $n:literal) => {
+        fn $name(input: &[i32; $n], dc_q: i32, ac_q: i32) -> ([i32; $n], [f32; $n]) {
+            unsafe { crate::avx::$avx2(input, dc_q, ac_q) }
+        }
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct4x4_avx2_quant_t_wrap, dct4x4_avx2_quant_t, 16);
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct4x8_avx2_quant_t_wrap, dct4x8_avx2_quant_t, 32);
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct8x4_avx2_quant_t_wrap, dct8x4_avx2_quant_t, 32);
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct4x16_avx2_quant_t_wrap, dct4x16_avx2_quant_t, 64);
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct16x4_avx2_quant_t_wrap, dct16x4_avx2_quant_t, 64);
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+small_avx2_wrap!(dct16x8_avx2_quant_t_wrap, dct16x8_avx2_quant_t, 128);
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+macro_rules! avx2_wrap_set {
+    ($(($wrap:ident, $func:ident, $n:literal)),* $(,)?) => {
+        $(small_avx2_wrap!($wrap, $func, $n);)*
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+avx2_wrap_set!(
+    (adst4x4_avx2_quant_t_wrap, adst4x4_avx2_quant_t, 16),
+    (adstdct4x4_avx2_quant_t_wrap, adstdct4x4_avx2_quant_t, 16),
+    (dctadst4x4_avx2_quant_t_wrap, dctadst4x4_avx2_quant_t, 16),
+    (adst4x8_avx2_quant_t_wrap, adst4x8_avx2_quant_t, 32),
+    (adstdct4x8_avx2_quant_t_wrap, adstdct4x8_avx2_quant_t, 32),
+    (dctadst4x8_avx2_quant_t_wrap, dctadst4x8_avx2_quant_t, 32),
+    (adst8x8_avx2_quant_t_wrap, adst8x8_avx2_quant_t, 64),
+    (adstdct8x8_avx2_quant_t_wrap, adstdct8x8_avx2_quant_t, 64),
+    (dctadst8x8_avx2_quant_t_wrap, dctadst8x8_avx2_quant_t, 64),
+    (adst8x16_avx2_quant_t_wrap, adst8x16_avx2_quant_t, 128),
+    (adstdct8x16_avx2_quant_t_wrap, adstdct8x16_avx2_quant_t, 128),
+    (dctadst8x16_avx2_quant_t_wrap, dctadst8x16_avx2_quant_t, 128),
+    (adst16x8_avx2_quant_t_wrap, adst16x8_avx2_quant_t, 128),
+    (adstdct16x8_avx2_quant_t_wrap, adstdct16x8_avx2_quant_t, 128),
+    (dctadst16x8_avx2_quant_t_wrap, dctadst16x8_avx2_quant_t, 128),
+    (fvdct4x4_avx2_quant_t_wrap, fvdct4x4_avx2_quant_t, 16),
+    (fhdct4x4_avx2_quant_t_wrap, fhdct4x4_avx2_quant_t, 16),
+    (fvdct8x8_avx2_quant_t_wrap, fvdct8x8_avx2_quant_t, 64),
+    (fhdct8x8_avx2_quant_t_wrap, fhdct8x8_avx2_quant_t, 64),
+    (fvdct16x8_avx2_quant_t_wrap, fvdct16x8_avx2_quant_t, 128),
+    (fhdct16x8_avx2_quant_t_wrap, fhdct16x8_avx2_quant_t, 128),
+    (fvdct8x16_avx2_quant_t_wrap, fvdct8x16_avx2_quant_t, 128),
+    (fhdct8x16_avx2_quant_t_wrap, fhdct8x16_avx2_quant_t, 128),
+);
 
 #[inline]
 fn dct8x8_quant_t_scalar(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
@@ -1546,72 +2170,794 @@ fn resolve_dct32x16_quant_t() -> Dct32x16QuantTFn {
     })
 }
 
-pub(crate) fn dct8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    apply_qmatrix(
-        resolve_dct8x8_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        8,
-        8,
-    )
+macro_rules! selected_forward_tx {
+    ($name:ident, $scalar:ident, $neon_wrap:ident, $avx2_wrap:ident, $n:literal) => {
+        fn $name() -> DctFn<$n> {
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            {
+                $neon_wrap
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    $avx2_wrap
+                } else {
+                    $scalar
+                }
+            }
+            #[cfg(not(any(
+                all(target_arch = "aarch64", feature = "neon"),
+                all(target_arch = "x86_64", feature = "avx")
+            )))]
+            {
+                $scalar
+            }
+        }
+    };
 }
 
-/// Forward TX_8X8 **IDTX** (identity): produce quantized levels + unquantized
-/// targets that pair with `iidentity_dequant_8x8`. The inverse has uniform gain
-/// 1/8 (dequant->residual), so the forward level at raster position `y + x*8`
-/// (the inverse transposes `coeff[y + x*8]` into pixel `(y,x)`) is
-/// `round(residual[y,x] * 8 / q)` with the same full-step dead-zone as
-/// `quant_q16`. Bit-exactness with dav1d is carried entirely by the inverse;
-/// this only decides which levels get coded.
-pub(crate) fn fidentity8x8_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
-    let (dc_q, ac_q) = (quant.dc_q(), quant.ac_q());
+selected_forward_tx!(
+    selected_dct4x4,
+    dct4x4_quant_t_direct,
+    dct4x4_neon_quant_t_wrap,
+    dct4x4_avx2_quant_t_wrap,
+    16
+);
+selected_forward_tx!(
+    selected_dct4x8,
+    dct4x8_quant_t_direct,
+    dct4x8_neon_quant_t_wrap,
+    dct4x8_avx2_quant_t_wrap,
+    32
+);
+selected_forward_tx!(
+    selected_dct8x4,
+    dct8x4_quant_t_direct,
+    dct8x4_neon_quant_t_wrap,
+    dct8x4_avx2_quant_t_wrap,
+    32
+);
+selected_forward_tx!(
+    selected_dct4x16,
+    dct4x16_quant_t_direct,
+    dct4x16_neon_quant_t_wrap,
+    dct4x16_avx2_quant_t_wrap,
+    64
+);
+selected_forward_tx!(
+    selected_dct16x4,
+    dct16x4_quant_t_direct,
+    dct16x4_neon_quant_t_wrap,
+    dct16x4_avx2_quant_t_wrap,
+    64
+);
+selected_forward_tx!(
+    selected_dct16x8,
+    dct16x8_quant_t_direct,
+    dct16x8_neon_quant_t_wrap,
+    dct16x8_avx2_quant_t_wrap,
+    128
+);
+
+macro_rules! select_forward_set {
+    ($(($name:ident, $scalar:ident, $neon:ident, $avx2:ident, $n:literal)),* $(,)?) => {
+        $(selected_forward_tx!($name, $scalar, $neon, $avx2, $n);)*
+    };
+}
+
+select_forward_set!(
+    (
+        selected_adst4x4,
+        adst4x4_quant_t_direct,
+        adst4x4_neon_quant_t_wrap,
+        adst4x4_avx2_quant_t_wrap,
+        16
+    ),
+    (
+        selected_adstdct4x4,
+        adstdct4x4_quant_t_direct,
+        adstdct4x4_neon_quant_t_wrap,
+        adstdct4x4_avx2_quant_t_wrap,
+        16
+    ),
+    (
+        selected_dctadst4x4,
+        dctadst4x4_quant_t_direct,
+        dctadst4x4_neon_quant_t_wrap,
+        dctadst4x4_avx2_quant_t_wrap,
+        16
+    ),
+    (
+        selected_adst4x8,
+        adst4x8_quant_t_direct,
+        adst4x8_neon_quant_t_wrap,
+        adst4x8_avx2_quant_t_wrap,
+        32
+    ),
+    (
+        selected_adstdct4x8,
+        adstdct4x8_quant_t_direct,
+        adstdct4x8_neon_quant_t_wrap,
+        adstdct4x8_avx2_quant_t_wrap,
+        32
+    ),
+    (
+        selected_dctadst4x8,
+        dctadst4x8_quant_t_direct,
+        dctadst4x8_neon_quant_t_wrap,
+        dctadst4x8_avx2_quant_t_wrap,
+        32
+    ),
+    (
+        selected_adst8x8,
+        adst8x8_quant_t_direct,
+        adst8x8_neon_quant_t_wrap,
+        adst8x8_avx2_quant_t_wrap,
+        64
+    ),
+    (
+        selected_adstdct8x8,
+        adstdct8x8_quant_t_direct,
+        adstdct8x8_neon_quant_t_wrap,
+        adstdct8x8_avx2_quant_t_wrap,
+        64
+    ),
+    (
+        selected_dctadst8x8,
+        dctadst8x8_quant_t_direct,
+        dctadst8x8_neon_quant_t_wrap,
+        dctadst8x8_avx2_quant_t_wrap,
+        64
+    ),
+    (
+        selected_adst8x16,
+        adst8x16_quant_t_direct,
+        adst8x16_neon_quant_t_wrap,
+        adst8x16_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_adstdct8x16,
+        adstdct8x16_quant_t_direct,
+        adstdct8x16_neon_quant_t_wrap,
+        adstdct8x16_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_dctadst8x16,
+        dctadst8x16_quant_t_direct,
+        dctadst8x16_neon_quant_t_wrap,
+        dctadst8x16_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_adst16x8,
+        adst16x8_quant_t_direct,
+        adst16x8_neon_quant_t_wrap,
+        adst16x8_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_adstdct16x8,
+        adstdct16x8_quant_t_direct,
+        adstdct16x8_neon_quant_t_wrap,
+        adstdct16x8_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_dctadst16x8,
+        dctadst16x8_quant_t_direct,
+        dctadst16x8_neon_quant_t_wrap,
+        dctadst16x8_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_fvdct4x4,
+        fvdct4x4_quant_t_direct,
+        fvdct4x4_neon_quant_t_wrap,
+        fvdct4x4_avx2_quant_t_wrap,
+        16
+    ),
+    (
+        selected_fhdct4x4,
+        fhdct4x4_quant_t_direct,
+        fhdct4x4_neon_quant_t_wrap,
+        fhdct4x4_avx2_quant_t_wrap,
+        16
+    ),
+    (
+        selected_fvdct8x8,
+        fvdct8x8_quant_t_direct,
+        fvdct8x8_neon_quant_t_wrap,
+        fvdct8x8_avx2_quant_t_wrap,
+        64
+    ),
+    (
+        selected_fhdct8x8,
+        fhdct8x8_quant_t_direct,
+        fhdct8x8_neon_quant_t_wrap,
+        fhdct8x8_avx2_quant_t_wrap,
+        64
+    ),
+    (
+        selected_fvdct16x8,
+        fvdct16x8_quant_t_direct,
+        fvdct16x8_neon_quant_t_wrap,
+        fvdct16x8_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_fhdct16x8,
+        fhdct16x8_quant_t_direct,
+        fhdct16x8_neon_quant_t_wrap,
+        fhdct16x8_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_fvdct8x16,
+        fvdct8x16_quant_t_direct,
+        fvdct8x16_neon_quant_t_wrap,
+        fvdct8x16_avx2_quant_t_wrap,
+        128
+    ),
+    (
+        selected_fhdct8x16,
+        fhdct8x16_quant_t_direct,
+        fhdct8x16_neon_quant_t_wrap,
+        fhdct8x16_avx2_quant_t_wrap,
+        128
+    ),
+);
+
+/// Per-encode AV1 forward-DCT dispatch. The selected pointers are copied into
+/// each tile so block and transform-search loops never touch the module
+/// `OnceLock`s.
+#[derive(Clone, Copy)]
+pub(crate) struct DctDispatch {
+    pub(crate) apply_qmatrix: ApplyQmatrixFn,
+    pub(crate) dct4x4: DctFn<16>,
+    pub(crate) dct4x8: DctFn<32>,
+    pub(crate) dct8x4: DctFn<32>,
+    pub(crate) dct4x16: DctFn<64>,
+    pub(crate) dct16x4: DctFn<64>,
+    pub(crate) dct8x8: DctFn<64>,
+    pub(crate) dct8x16: DctFn<128>,
+    pub(crate) dct16x8: DctFn<128>,
+    pub(crate) dct16x16: DctFn<256>,
+    pub(crate) dct16x32: DctFn<512>,
+    pub(crate) dct32x16: DctFn<512>,
+    pub(crate) dct32x32: DctFn<1024>,
+
+    pub(crate) adst4x4: DctFn<16>,
+    pub(crate) adstdct4x4: DctFn<16>,
+    pub(crate) dctadst4x4: DctFn<16>,
+    pub(crate) adst4x8: DctFn<32>,
+    pub(crate) adstdct4x8: DctFn<32>,
+    pub(crate) dctadst4x8: DctFn<32>,
+    pub(crate) adst8x8: DctFn<64>,
+    pub(crate) adstdct8x8: DctFn<64>,
+    pub(crate) dctadst8x8: DctFn<64>,
+    pub(crate) adst8x16: DctFn<128>,
+    pub(crate) adstdct8x16: DctFn<128>,
+    pub(crate) dctadst8x16: DctFn<128>,
+    pub(crate) adst16x8: DctFn<128>,
+    pub(crate) adstdct16x8: DctFn<128>,
+    pub(crate) dctadst16x8: DctFn<128>,
+    pub(crate) adst16x16: DctFn<256>,
+    pub(crate) adstdct16x16: DctFn<256>,
+    pub(crate) dctadst16x16: DctFn<256>,
+
+    pub(crate) fvdct4x4: DctFn<16>,
+    pub(crate) fhdct4x4: DctFn<16>,
+    pub(crate) fvdct8x8: DctFn<64>,
+    pub(crate) fhdct8x8: DctFn<64>,
+    pub(crate) fvdct8x16: DctFn<128>,
+    pub(crate) fhdct8x16: DctFn<128>,
+    pub(crate) fvdct16x8: DctFn<128>,
+    pub(crate) fhdct16x8: DctFn<128>,
+    pub(crate) idtx4x4: DctFn<16>,
+    pub(crate) idtx8x8: DctFn<64>,
+    pub(crate) idtx8x16: DctFn<128>,
+    pub(crate) idtx16x8: DctFn<128>,
+    pub(crate) idtx16x16: DctFn<256>,
+}
+
+macro_rules! dispatch_qm_ratio_methods {
+    ($(($method:ident, $field:ident, $n:literal, $w:literal, $h:literal, $ratio:expr)),* $(,)?) => {
+        $(
+            pub(crate) fn $method(
+                &self,
+                residual: &[i32; $n],
+                quant: &impl Dct,
+            ) -> ([i32; $n], [f32; $n]) {
+                // Transform-gain compensation for the 4-wide family — the
+                // pre-dispatch wrappers applied this and the refactor dropped
+                // it (bisected 2026-07-26: +1.77% BD, x_fractal +5.70 — the
+                // mis-scaled forward made ADST-4x4/4x8 candidates falsely
+                // cheap).
+                let dc = mul_q16(quant.q_mult_dc(), $ratio);
+                let ac = mul_q16(quant.q_mult_ac(), $ratio);
+                apply_qmatrix_result(
+                    (self.$field)(residual, dc, ac),
+                    quant,
+                    $w,
+                    $h,
+                    self.apply_qmatrix,
+                )
+            }
+        )*
+    };
+}
+
+macro_rules! dispatch_qm_methods {
+    ($(($method:ident, $field:ident, $n:literal, $w:literal, $h:literal)),* $(,)?) => {
+        $(
+            pub(crate) fn $method(
+                &self,
+                residual: &[i32; $n],
+                quant: &impl Dct,
+            ) -> ([i32; $n], [f32; $n]) {
+                apply_qmatrix_result(
+                    (self.$field)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+                    quant,
+                    $w,
+                    $h,
+                    self.apply_qmatrix,
+                )
+            }
+        )*
+    };
+}
+
+macro_rules! dispatch_flat_methods {
+    ($(($method:ident, $field:ident, $n:literal)),* $(,)?) => {
+        $(
+            pub(crate) fn $method(
+                &self,
+                residual: &[i32; $n],
+                quant: &impl Dct,
+            ) -> ([i32; $n], [f32; $n]) {
+                let quant = &crate::quant::FlatDct(quant);
+                (self.$field)(residual, quant.q_mult_dc(), quant.q_mult_ac())
+            }
+        )*
+    };
+}
+
+impl DctDispatch {
+    pub(crate) fn selected() -> Self {
+        Self {
+            apply_qmatrix: selected_apply_qmatrix(),
+            dct4x4: selected_dct4x4(),
+            dct4x8: selected_dct4x8(),
+            dct8x4: selected_dct8x4(),
+            dct4x16: selected_dct4x16(),
+            dct16x4: selected_dct16x4(),
+            dct8x8: resolve_dct8x8_quant_t(),
+            dct8x16: resolve_dct8x16_quant_t(),
+            dct16x8: selected_dct16x8(),
+            dct16x16: resolve_dct16x16_quant_t(),
+            dct16x32: resolve_dct16x32_quant_t(),
+            dct32x16: resolve_dct32x16_quant_t(),
+            dct32x32: resolve_dct32x32_quant_t(),
+            adst4x4: selected_adst4x4(),
+            adstdct4x4: selected_adstdct4x4(),
+            dctadst4x4: selected_dctadst4x4(),
+            adst4x8: selected_adst4x8(),
+            adstdct4x8: selected_adstdct4x8(),
+            dctadst4x8: selected_dctadst4x8(),
+            adst8x8: selected_adst8x8(),
+            adstdct8x8: selected_adstdct8x8(),
+            dctadst8x8: selected_dctadst8x8(),
+            adst8x16: selected_adst8x16(),
+            adstdct8x16: selected_adstdct8x16(),
+            dctadst8x16: selected_dctadst8x16(),
+            adst16x8: selected_adst16x8(),
+            adstdct16x8: selected_adstdct16x8(),
+            dctadst16x8: selected_dctadst16x8(),
+            adst16x16: resolve_adst16x16_quant_t(),
+            adstdct16x16: resolve_adstdct16x16_quant_t(),
+            dctadst16x16: resolve_dctadst16x16_quant_t(),
+            fvdct4x4: selected_fvdct4x4(),
+            fhdct4x4: selected_fhdct4x4(),
+            fvdct8x8: selected_fvdct8x8(),
+            fhdct8x8: selected_fhdct8x8(),
+            fvdct8x16: selected_fvdct8x16(),
+            fhdct8x16: selected_fhdct8x16(),
+            fvdct16x8: selected_fvdct16x8(),
+            fhdct16x8: selected_fhdct16x8(),
+            idtx4x4: idtx4x4_quant_t_direct,
+            idtx8x8: idtx8x8_quant_t_direct,
+            idtx8x16: idtx8x16_quant_t_direct,
+            idtx16x8: idtx16x8_quant_t_direct,
+            idtx16x16: idtx16x16_quant_t_direct,
+        }
+    }
+
+    pub(crate) fn scalar() -> Self {
+        Self {
+            apply_qmatrix,
+            dct4x4: dct4x4_quant_t_direct,
+            dct4x8: dct4x8_quant_t_direct,
+            dct8x4: dct8x4_quant_t_direct,
+            dct4x16: dct4x16_quant_t_direct,
+            dct16x4: dct16x4_quant_t_direct,
+            dct8x8: dct8x8_quant_t_direct,
+            dct8x16: dct8x16_quant_t_direct,
+            dct16x8: dct16x8_quant_t_direct,
+            dct16x16: dct16x16_quant_t_direct,
+            dct16x32: dct16x32_quant_t_direct,
+            dct32x16: dct32x16_quant_t_direct,
+            dct32x32: dct32x32_quant_t_direct,
+            adst4x4: adst4x4_quant_t_direct,
+            adstdct4x4: adstdct4x4_quant_t_direct,
+            dctadst4x4: dctadst4x4_quant_t_direct,
+            adst4x8: adst4x8_quant_t_direct,
+            adstdct4x8: adstdct4x8_quant_t_direct,
+            dctadst4x8: dctadst4x8_quant_t_direct,
+            adst8x8: adst8x8_quant_t_direct,
+            adstdct8x8: adstdct8x8_quant_t_direct,
+            dctadst8x8: dctadst8x8_quant_t_direct,
+            adst8x16: adst8x16_quant_t_direct,
+            adstdct8x16: adstdct8x16_quant_t_direct,
+            dctadst8x16: dctadst8x16_quant_t_direct,
+            adst16x8: adst16x8_quant_t_direct,
+            adstdct16x8: adstdct16x8_quant_t_direct,
+            dctadst16x8: dctadst16x8_quant_t_direct,
+            adst16x16: adst16x16_quant_t_direct,
+            adstdct16x16: adstdct16x16_quant_t_direct,
+            dctadst16x16: dctadst16x16_quant_t_direct,
+            fvdct4x4: fvdct4x4_quant_t_direct,
+            fhdct4x4: fhdct4x4_quant_t_direct,
+            fvdct8x8: fvdct8x8_quant_t_direct,
+            fhdct8x8: fhdct8x8_quant_t_direct,
+            fvdct8x16: fvdct8x16_quant_t_direct,
+            fhdct8x16: fhdct8x16_quant_t_direct,
+            fvdct16x8: fvdct16x8_quant_t_direct,
+            fhdct16x8: fhdct16x8_quant_t_direct,
+            idtx4x4: idtx4x4_quant_t_direct,
+            idtx8x8: idtx8x8_quant_t_direct,
+            idtx8x16: idtx8x16_quant_t_direct,
+            idtx16x8: idtx16x8_quant_t_direct,
+            idtx16x16: idtx16x16_quant_t_direct,
+        }
+    }
+
+    pub(crate) fn dct4x4_t(
+        &self,
+        residual: &[i32; 16],
+        quant: &impl Dct,
+    ) -> ([i32; 16], [f32; 16]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
+        apply_qmatrix_result(
+            (self.dct4x4)(residual, dc, ac),
+            quant,
+            4,
+            4,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct4x8_t(
+        &self,
+        residual: &[i32; 32],
+        quant: &impl Dct,
+    ) -> ([i32; 32], [f32; 32]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+        apply_qmatrix_result(
+            (self.dct4x8)(residual, dc, ac),
+            quant,
+            4,
+            8,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct8x4_t(
+        &self,
+        residual: &[i32; 32],
+        quant: &impl Dct,
+    ) -> ([i32; 32], [f32; 32]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+        apply_qmatrix_result(
+            (self.dct8x4)(residual, dc, ac),
+            quant,
+            8,
+            4,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct4x16_t(
+        &self,
+        residual: &[i32; 64],
+        quant: &impl Dct,
+    ) -> ([i32; 64], [f32; 64]) {
+        apply_qmatrix_result(
+            (self.dct4x16)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            4,
+            16,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct16x4_t(
+        &self,
+        residual: &[i32; 64],
+        quant: &impl Dct,
+    ) -> ([i32; 64], [f32; 64]) {
+        apply_qmatrix_result(
+            (self.dct16x4)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            16,
+            4,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct8x8_t(
+        &self,
+        residual: &[i32; 64],
+        quant: &impl Dct,
+    ) -> ([i32; 64], [f32; 64]) {
+        apply_qmatrix_result(
+            (self.dct8x8)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            8,
+            8,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct8x16_t(
+        &self,
+        residual: &[i32; 128],
+        quant: &impl Dct,
+    ) -> ([i32; 128], [f32; 128]) {
+        apply_qmatrix_result(
+            (self.dct8x16)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            8,
+            16,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct16x8_t(
+        &self,
+        residual: &[i32; 128],
+        quant: &impl Dct,
+    ) -> ([i32; 128], [f32; 128]) {
+        apply_qmatrix_result(
+            (self.dct16x8)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            16,
+            8,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct16x16_t(
+        &self,
+        residual: &[i32; 256],
+        quant: &impl Dct,
+    ) -> ([i32; 256], [f32; 256]) {
+        apply_qmatrix_result(
+            (self.dct16x16)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            16,
+            16,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct16x32_t(
+        &self,
+        residual: &[i32; 512],
+        quant: &impl Dct,
+    ) -> ([i32; 512], [f32; 512]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
+        apply_qmatrix_result(
+            (self.dct16x32)(residual, dc, ac),
+            quant,
+            16,
+            32,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct32x16_t(
+        &self,
+        residual: &[i32; 512],
+        quant: &impl Dct,
+    ) -> ([i32; 512], [f32; 512]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
+        apply_qmatrix_result(
+            (self.dct32x16)(residual, dc, ac),
+            quant,
+            32,
+            16,
+            self.apply_qmatrix,
+        )
+    }
+
+    pub(crate) fn dct32x32_t(
+        &self,
+        residual: &[i32; 1024],
+        quant: &impl Dct,
+    ) -> ([i32; 1024], [f32; 1024]) {
+        apply_qmatrix_result(
+            (self.dct32x32)(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+            quant,
+            32,
+            32,
+            self.apply_qmatrix,
+        )
+    }
+
+    dispatch_qm_ratio_methods!(
+        (adst4x4_t, adst4x4, 16, 4, 4, RATIO_4X4_Q16),
+        (adstdct4x4_t, adstdct4x4, 16, 4, 4, RATIO_4X4_Q16),
+        (dctadst4x4_t, dctadst4x4, 16, 4, 4, RATIO_4X4_Q16),
+        (adst4x8_t, adst4x8, 32, 4, 8, RATIO_4X8_Q16),
+        (adstdct4x8_t, adstdct4x8, 32, 4, 8, RATIO_4X8_Q16),
+        (dctadst4x8_t, dctadst4x8, 32, 4, 8, RATIO_4X8_Q16),
+    );
+    dispatch_qm_methods!(
+        (adst8x8_t, adst8x8, 64, 8, 8),
+        (adstdct8x8_t, adstdct8x8, 64, 8, 8),
+        (dctadst8x8_t, dctadst8x8, 64, 8, 8),
+        (adst8x16_t, adst8x16, 128, 8, 16),
+        (adstdct8x16_t, adstdct8x16, 128, 8, 16),
+        (dctadst8x16_t, dctadst8x16, 128, 8, 16),
+        (adst16x8_t, adst16x8, 128, 16, 8),
+        (adstdct16x8_t, adstdct16x8, 128, 16, 8),
+        (dctadst16x8_t, dctadst16x8, 128, 16, 8),
+        (adst16x16_t, adst16x16, 256, 16, 16),
+        (adstdct16x16_t, adstdct16x16, 256, 16, 16),
+        (dctadst16x16_t, dctadst16x16, 256, 16, 16),
+    );
+
+    dispatch_flat_methods!(
+        (fvdct4x4_t, fvdct4x4, 16),
+        (fhdct4x4_t, fhdct4x4, 16),
+        (fvdct8x8_t, fvdct8x8, 64),
+        (fhdct8x8_t, fhdct8x8, 64),
+        (fvdct8x16_t, fvdct8x16, 128),
+        (fhdct8x16_t, fhdct8x16, 128),
+        (fvdct16x8_t, fvdct16x8, 128),
+        (fhdct16x8_t, fhdct16x8, 128),
+    );
+
+    pub(crate) fn idtx4x4_t(
+        &self,
+        residual: &[i32; 16],
+        quant: &impl Dct,
+    ) -> ([i32; 16], [f32; 16]) {
+        (self.idtx4x4)(residual, quant.dc_q(), quant.ac_q())
+    }
+
+    pub(crate) fn idtx8x8_t(
+        &self,
+        residual: &[i32; 64],
+        quant: &impl Dct,
+    ) -> ([i32; 64], [f32; 64]) {
+        (self.idtx8x8)(residual, quant.dc_q(), quant.ac_q())
+    }
+
+    pub(crate) fn idtx8x16_t(
+        &self,
+        residual: &[i32; 128],
+        quant: &impl Dct,
+    ) -> ([i32; 128], [f32; 128]) {
+        (self.idtx8x16)(residual, quant.dc_q(), quant.ac_q())
+    }
+
+    pub(crate) fn idtx16x8_t(
+        &self,
+        residual: &[i32; 128],
+        quant: &impl Dct,
+    ) -> ([i32; 128], [f32; 128]) {
+        (self.idtx16x8)(residual, quant.dc_q(), quant.ac_q())
+    }
+
+    pub(crate) fn idtx16x16_t(
+        &self,
+        residual: &[i32; 256],
+        quant: &impl Dct,
+    ) -> ([i32; 256], [f32; 256]) {
+        (self.idtx16x16)(residual, quant.dc_q(), quant.ac_q())
+    }
+}
+
+#[inline]
+fn dct16x4_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for col in 0..16usize {
+        let mut c = [0i32; 4];
+        for row in 0..4 {
+            c[row] = input[row * 16 + col];
+        }
+        dct1d_4_i32(&mut c);
+        for fy in 0..4 {
+            tmp[fy * 16 + col] = c[fy];
+        }
+    }
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
-    for y in 0..8 {
-        for x in 0..8 {
-            let rc = y + x * 8;
-            let qd = if rc == 0 { dc_q } else { ac_q };
-            let num = residual[y * 8 + x] * 8;
-            tf[rc] = num as f32 / qd as f32;
-            let am = num.unsigned_abs() as i32;
-            cf[rc] = if am < qd {
-                0
-            } else {
-                let l = (am + qd / 2) / qd;
-                if num < 0 { -l } else { l }
-            };
+    for fy in 0..4usize {
+        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        dct1d_16_i32(&mut r);
+        for fx in 0..16 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 4 + fy, r[fx], dc_q, ac_q);
         }
     }
     (cf, tf)
 }
 
-pub(crate) fn dct16x16_t(residual: &[i32; 256], quant: &impl Dct) -> ([i32; 256], [f32; 256]) {
-    apply_qmatrix(
-        resolve_dct16x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+/// DCT_DCT for RTX_4X16.
+fn dct4x16_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64], [f32; 64]) {
+    let mut tmp = [0i32; 64];
+    for col in 0..4usize {
+        let mut c = [0i32; 16];
+        for row in 0..16 {
+            c[row] = input[row * 4 + col];
+        }
+        dct1d_16_i32(&mut c);
+        for fy in 0..16 {
+            tmp[fy * 4 + col] = c[fy];
+        }
+    }
+    let mut cf = [0i32; 64];
+    let mut tf = [0.0f32; 64];
+    for fy in 0..16usize {
+        let mut r: [i32; 4] = tmp[fy * 4..fy * 4 + 4].try_into().unwrap();
+        dct1d_4_i32(&mut r);
+        for fx in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, r[fx], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+#[cfg(test)]
+pub(crate) fn dct16x4_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dct16x4_neon_quant_t,
+            dct16x4_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
         quant,
         16,
+        4,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn dct4x16_t(residual: &[i32; 64], quant: &impl Dct) -> ([i32; 64], [f32; 64]) {
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dct4x16_neon_quant_t,
+            dct4x16_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
+        quant,
+        4,
         16,
     )
 }
 
-pub(crate) fn dct32x32_t(residual: &[i32; 1024], quant: &impl Dct) -> ([i32; 1024], [f32; 1024]) {
-    apply_qmatrix(
-        resolve_dct32x32_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        32,
-        32,
-    )
-}
-
-pub(crate) fn dct8x16_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    apply_qmatrix(
-        resolve_dct8x16_quant_t()(residual, quant.q_mult_dc(), quant.q_mult_ac()),
-        quant,
-        8,
-        16,
-    )
-}
-
-#[inline]
 fn dct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 128], [f32; 128]) {
     let mut tmp = [0i32; 128];
     for col in 0..16usize {
@@ -1638,9 +2984,16 @@ fn dct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 12
     (cf, tf)
 }
 
+#[cfg(test)]
 pub(crate) fn dct16x8_t(residual: &[i32; 128], quant: &impl Dct) -> ([i32; 128], [f32; 128]) {
-    apply_qmatrix(
-        dct16x8_quant_t_direct(residual, quant.q_mult_dc(), quant.q_mult_ac()),
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dct16x8_neon_quant_t,
+            dct16x8_quant_t_direct,
+            residual,
+            quant.q_mult_dc(),
+            quant.q_mult_ac()
+        ),
         quant,
         16,
         8,
@@ -1750,7 +3103,7 @@ const RATIO_16X32_Q16: i32 = 23170; // 8/sqrt(512) = 1/(2 sqrt2)
 /// intrinsic scale as DCT_DCT 4x4, so `RATIO_4X4_Q16` and the inverse
 /// orchestration carry over unchanged. Byte-exactness is validated against
 /// aomdec/dav1d.
-static ADST4_FWD_Q12: [[i32; 4]; 4] = [
+pub(crate) static ADST4_FWD_Q12: [[i32; 4]; 4] = [
     [1868, 3510, 4730, 5379],
     [4730, 4730, 0, -4730],
     [5379, -1868, -4730, 3510],
@@ -1770,30 +3123,58 @@ fn fwd_adst4_1d(inp: &[i32; 4]) -> [i32; 4] {
     out
 }
 
-/// Trellis (RDOQ) forward ADST_ADST 4x4: levels + unrounded targets, mirroring
-/// `dct4x4_t` (same `RATIO_4X4_Q16` quant scaling).
+#[cfg(test)]
 pub(crate) fn adst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    apply_qmatrix(adst4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            adst4x4_neon_quant_t,
+            adst4x4_quant_t_direct,
+            residual,
+            m_dc,
+            m_ac
+        ),
+        quant,
+        4,
+        4,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn adstdct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    apply_qmatrix(adstdct4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            adstdct4x4_neon_quant_t,
+            adstdct4x4_quant_t_direct,
+            residual,
+            m_dc,
+            m_ac
+        ),
+        quant,
+        4,
+        4,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn dctadst4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
     let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
     let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    apply_qmatrix(dctadst4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
-}
-
-pub(crate) fn dct4x4_t(residual: &[i32; 16], quant: &impl Dct) -> ([i32; 16], [f32; 16]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X4_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X4_Q16);
-    apply_qmatrix(dct4x4_quant_t_direct(residual, m_dc, m_ac), quant, 4, 4)
+    apply_qmatrix_result_scalar(
+        neon_fwd_tx!(
+            dctadst4x4_neon_quant_t,
+            dctadst4x4_quant_t_direct,
+            residual,
+            m_dc,
+            m_ac
+        ),
+        quant,
+        4,
+        4,
+    )
 }
 
 #[inline]
@@ -1823,36 +3204,6 @@ fn dct8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32],
         }
     }
     (cf, tf)
-}
-
-pub(crate) fn dct8x4_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    apply_qmatrix(dct8x4_quant_t_direct(residual, m_dc, m_ac), quant, 8, 4)
-}
-
-pub(crate) fn dct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    apply_qmatrix(dct4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
-}
-
-pub(crate) fn adst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    apply_qmatrix(adst4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
-}
-
-pub(crate) fn adstdct4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    apply_qmatrix(adstdct4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
-}
-
-pub(crate) fn dctadst4x8_t(residual: &[i32; 32], quant: &impl Dct) -> ([i32; 32], [f32; 32]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-    apply_qmatrix(dctadst4x8_quant_t_direct(residual, m_dc, m_ac), quant, 4, 8)
 }
 
 #[inline]
@@ -1886,28 +3237,6 @@ fn dct32x16_quant_t_direct(input: &[i32; 512], dc_q: i32, ac_q: i32) -> ([i32; 5
     (cf, tf)
 }
 
-pub(crate) fn dct32x16_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    apply_qmatrix(
-        resolve_dct32x16_quant_t()(residual, m_dc, m_ac),
-        quant,
-        32,
-        16,
-    )
-}
-
-pub(crate) fn dct16x32_t(residual: &[i32; 512], quant: &impl Dct) -> ([i32; 512], [f32; 512]) {
-    let m_dc = mul_q16(quant.q_mult_dc(), RATIO_16X32_Q16);
-    let m_ac = mul_q16(quant.q_mult_ac(), RATIO_16X32_Q16);
-    apply_qmatrix(
-        resolve_dct16x32_quant_t()(residual, m_dc, m_ac),
-        quant,
-        16,
-        32,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +3244,401 @@ mod tests {
 
     fn pat(n: usize) -> Vec<i32> {
         (0..n).map(|i| ((i * 41 + 7) % 113) as i32 - 56).collect()
+    }
+
+    fn forward_parity_inputs<const N: usize>() -> [(&'static str, [i32; N]); 7] {
+        let mut seed = 0x9E37_79B9u32;
+        let random = std::array::from_fn(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 16) as i32 & 0x3ff) - 512
+        });
+        let random_12b = std::array::from_fn(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed % 8191) as i32 - 4095
+        });
+        [
+            ("zeros", [0; N]),
+            ("constant", [1023; N]),
+            (
+                "impulses",
+                std::array::from_fn(|i| {
+                    if i == 0 {
+                        4095
+                    } else if i + 1 == N {
+                        -4095
+                    } else {
+                        0
+                    }
+                }),
+            ),
+            (
+                "ramp",
+                std::array::from_fn(|i| ((i * 73 + i * i * 19 + 11) % 511) as i32 - 255),
+            ),
+            (
+                "alternating-12b",
+                std::array::from_fn(|i| if i & 1 == 0 { 4095 } else { -4095 }),
+            ),
+            ("random", random),
+            ("random-12b", random_12b),
+        ]
+    }
+
+    fn assert_selected_matches_scalar<const N: usize>(
+        name: &str,
+        selected_fn: DctFn<N>,
+        scalar_fn: DctFn<N>,
+    ) {
+        const QUANT_PAIRS: [(i32, i32); 4] = [
+            (65536, 65536),
+            (65536, 46341),
+            (32768, 32768),
+            (17341, 9017),
+        ];
+        for (case, input) in forward_parity_inputs() {
+            for (dc_q, ac_q) in QUANT_PAIRS {
+                let scalar = scalar_fn(&input, dc_q, ac_q);
+                let selected = selected_fn(&input, dc_q, ac_q);
+                assert_eq!(
+                    scalar.0, selected.0,
+                    "{name} {case}: levels differ at dc_q={dc_q}, ac_q={ac_q}"
+                );
+                for (i, (&s, &v)) in scalar.1.iter().zip(&selected.1).enumerate() {
+                    let tolerance = 1.0e-5 * s.abs().max(1.0);
+                    assert!(
+                        (s - v).abs() <= tolerance,
+                        "{name} {case}: target {i} differs at dc_q={dc_q}, ac_q={ac_q}: \
+                         scalar={s}, selected={v}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_qmatrix_matches_scalar(name: &str, simd: ApplyQmatrixFn) {
+        for len in [1, 3, 4, 7, 8, 15, 16, 31, 64, 128, 1024] {
+            let inverse_weights: Vec<u8> =
+                (0..len).map(|i| ((i * 37 + 1) % 255 + 1) as u8).collect();
+            let targets: Vec<f32> = (0..len)
+                .map(|i| match i % 8 {
+                    0 => 0.0,
+                    1 => 0.499,
+                    2 => -0.499,
+                    3 => 0.5,
+                    4 => -0.5,
+                    5 => 31.25,
+                    6 => -63.75,
+                    _ => ((i * 977 + 13) % 8191) as f32 / 17.0 - 240.0,
+                })
+                .collect();
+            let mut scalar_targets = targets.clone();
+            let mut scalar_levels = vec![i32::MIN; len];
+            apply_qmatrix(&mut scalar_levels, &mut scalar_targets, &inverse_weights);
+
+            let mut simd_targets = targets;
+            let mut simd_levels = vec![i32::MIN; len];
+            simd(&mut simd_levels, &mut simd_targets, &inverse_weights);
+
+            assert_eq!(
+                scalar_levels, simd_levels,
+                "{name}: levels differ at len={len}"
+            );
+            assert_eq!(
+                scalar_targets, simd_targets,
+                "{name}: targets differ at len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_qmatrix_matches_scalar_for_dynamic_lengths() {
+        assert_qmatrix_matches_scalar("selected", selected_apply_qmatrix());
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_qmatrix_matches_scalar_for_dynamic_lengths() {
+        assert_qmatrix_matches_scalar("neon", apply_qmatrix_neon_wrap);
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_qmatrix_matches_scalar_for_dynamic_lengths() {
+        if std::is_x86_feature_detected!("avx2") {
+            assert_qmatrix_matches_scalar("avx2", apply_qmatrix_avx2_wrap);
+        }
+    }
+
+    #[test]
+    fn selected_dct_dispatch_matches_scalar() {
+        let selected = DctDispatch::selected();
+        let scalar = DctDispatch::scalar();
+        assert_selected_matches_scalar("dct4x4", selected.dct4x4, scalar.dct4x4);
+        assert_selected_matches_scalar("dct4x8", selected.dct4x8, scalar.dct4x8);
+        assert_selected_matches_scalar("dct8x4", selected.dct8x4, scalar.dct8x4);
+        assert_selected_matches_scalar("dct4x16", selected.dct4x16, scalar.dct4x16);
+        assert_selected_matches_scalar("dct16x4", selected.dct16x4, scalar.dct16x4);
+        assert_selected_matches_scalar("dct8x8", selected.dct8x8, scalar.dct8x8);
+        assert_selected_matches_scalar("dct8x16", selected.dct8x16, scalar.dct8x16);
+        assert_selected_matches_scalar("dct16x8", selected.dct16x8, scalar.dct16x8);
+        assert_selected_matches_scalar("dct16x16", selected.dct16x16, scalar.dct16x16);
+        assert_selected_matches_scalar("dct16x32", selected.dct16x32, scalar.dct16x32);
+        assert_selected_matches_scalar("dct32x16", selected.dct32x16, scalar.dct32x16);
+        assert_selected_matches_scalar("dct32x32", selected.dct32x32, scalar.dct32x32);
+        assert_selected_matches_scalar("adst4x4", selected.adst4x4, scalar.adst4x4);
+        assert_selected_matches_scalar("adstdct4x4", selected.adstdct4x4, scalar.adstdct4x4);
+        assert_selected_matches_scalar("dctadst4x4", selected.dctadst4x4, scalar.dctadst4x4);
+        assert_selected_matches_scalar("adst4x8", selected.adst4x8, scalar.adst4x8);
+        assert_selected_matches_scalar("adstdct4x8", selected.adstdct4x8, scalar.adstdct4x8);
+        assert_selected_matches_scalar("dctadst4x8", selected.dctadst4x8, scalar.dctadst4x8);
+        assert_selected_matches_scalar("adst8x8", selected.adst8x8, scalar.adst8x8);
+        assert_selected_matches_scalar("adstdct8x8", selected.adstdct8x8, scalar.adstdct8x8);
+        assert_selected_matches_scalar("dctadst8x8", selected.dctadst8x8, scalar.dctadst8x8);
+        assert_selected_matches_scalar("adst8x16", selected.adst8x16, scalar.adst8x16);
+        assert_selected_matches_scalar("adstdct8x16", selected.adstdct8x16, scalar.adstdct8x16);
+        assert_selected_matches_scalar("dctadst8x16", selected.dctadst8x16, scalar.dctadst8x16);
+        assert_selected_matches_scalar("adst16x8", selected.adst16x8, scalar.adst16x8);
+        assert_selected_matches_scalar("adstdct16x8", selected.adstdct16x8, scalar.adstdct16x8);
+        assert_selected_matches_scalar("dctadst16x8", selected.dctadst16x8, scalar.dctadst16x8);
+        assert_selected_matches_scalar("adst16x16", selected.adst16x16, scalar.adst16x16);
+        assert_selected_matches_scalar("adstdct16x16", selected.adstdct16x16, scalar.adstdct16x16);
+        assert_selected_matches_scalar("dctadst16x16", selected.dctadst16x16, scalar.dctadst16x16);
+        assert_selected_matches_scalar("fvdct4x4", selected.fvdct4x4, scalar.fvdct4x4);
+        assert_selected_matches_scalar("fhdct4x4", selected.fhdct4x4, scalar.fhdct4x4);
+        assert_selected_matches_scalar("fvdct8x8", selected.fvdct8x8, scalar.fvdct8x8);
+        assert_selected_matches_scalar("fhdct8x8", selected.fhdct8x8, scalar.fhdct8x8);
+        assert_selected_matches_scalar("fvdct8x16", selected.fvdct8x16, scalar.fvdct8x16);
+        assert_selected_matches_scalar("fhdct8x16", selected.fhdct8x16, scalar.fhdct8x16);
+        assert_selected_matches_scalar("fvdct16x8", selected.fvdct16x8, scalar.fvdct16x8);
+        assert_selected_matches_scalar("fhdct16x8", selected.fhdct16x8, scalar.fhdct16x8);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn assert_forward_neon_matches_scalar<const N: usize>(
+        name: &str,
+        scalar_fn: fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]),
+        neon_fn: unsafe fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]),
+    ) {
+        const QUANT_PAIRS: [(i32, i32); 4] = [
+            (65536, 65536),
+            (65536, 46341),
+            (32768, 32768),
+            (17341, 9017),
+        ];
+        for (case, input) in forward_parity_inputs() {
+            for (dc_q, ac_q) in QUANT_PAIRS {
+                let scalar = scalar_fn(&input, dc_q, ac_q);
+                let neon = unsafe { neon_fn(&input, dc_q, ac_q) };
+                assert_eq!(
+                    scalar.0, neon.0,
+                    "{name} {case}: levels differ at dc_q={dc_q}, ac_q={ac_q}"
+                );
+                for (i, (&s, &n)) in scalar.1.iter().zip(&neon.1).enumerate() {
+                    let tolerance = 1.0e-5 * s.abs().max(1.0);
+                    assert!(
+                        (s - n).abs() <= tolerance,
+                        "{name} {case}: target {i} differs at dc_q={dc_q}, ac_q={ac_q}: \
+                         scalar={s}, neon={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    fn assert_forward_avx2_matches_scalar<const N: usize>(
+        name: &str,
+        scalar_fn: DctFn<N>,
+        avx2_fn: unsafe fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]),
+    ) {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        static QUANT_PAIRS: [(i32, i32); 4] = [
+            (65536, 65536),
+            (65536, 46341),
+            (32768, 32768),
+            (17341, 9017),
+        ];
+        for (case, input) in forward_parity_inputs() {
+            for (dc_q, ac_q) in QUANT_PAIRS {
+                let scalar = scalar_fn(&input, dc_q, ac_q);
+                let avx2 = unsafe { avx2_fn(&input, dc_q, ac_q) };
+                assert_eq!(
+                    scalar.0, avx2.0,
+                    "{name} {case}: levels differ at dc_q={dc_q}, ac_q={ac_q}"
+                );
+                for (i, (&s, &v)) in scalar.1.iter().zip(&avx2.1).enumerate() {
+                    let tolerance = 1.0e-5 * s.abs().max(1.0);
+                    assert!(
+                        (s - v).abs() <= tolerance,
+                        "{name} {case}: target {i} differs at dc_q={dc_q}, ac_q={ac_q}: \
+                         scalar={s}, avx2={v}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_rectangular_dct_forward_transforms_match_scalar() {
+        assert_forward_avx2_matches_scalar(
+            "dct4x8",
+            dct4x8_quant_t_direct,
+            crate::avx::dct4x8_avx2_quant_t,
+        );
+        assert_forward_avx2_matches_scalar(
+            "dct8x4",
+            dct8x4_quant_t_direct,
+            crate::avx::dct8x4_avx2_quant_t,
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_dct_forward_transforms_match_scalar() {
+        assert_forward_neon_matches_scalar(
+            "dct4x4",
+            dct4x4_quant_t_direct,
+            crate::neon::dct4x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dct4x8",
+            dct4x8_quant_t_direct,
+            crate::neon::dct4x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dct8x4",
+            dct8x4_quant_t_direct,
+            crate::neon::dct8x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dct4x16",
+            dct4x16_quant_t_direct,
+            crate::neon::dct4x16_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dct16x4",
+            dct16x4_quant_t_direct,
+            crate::neon::dct16x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dct16x8",
+            dct16x8_quant_t_direct,
+            crate::neon::dct16x8_neon_quant_t,
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_square_adst_forward_transforms_match_scalar() {
+        assert_forward_neon_matches_scalar(
+            "adst4x4",
+            adst4x4_quant_t_direct,
+            crate::neon::adst4x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adstdct4x4",
+            adstdct4x4_quant_t_direct,
+            crate::neon::adstdct4x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dctadst4x4",
+            dctadst4x4_quant_t_direct,
+            crate::neon::dctadst4x4_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adst8x8",
+            adst8x8_quant_t_direct,
+            crate::neon::adst8x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adstdct8x8",
+            adstdct8x8_quant_t_direct,
+            crate::neon::adstdct8x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dctadst8x8",
+            dctadst8x8_quant_t_direct,
+            crate::neon::dctadst8x8_neon_quant_t,
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_rectangular_adst_forward_transforms_match_scalar() {
+        assert_forward_neon_matches_scalar(
+            "adst4x8",
+            adst4x8_quant_t_direct,
+            crate::neon::adst4x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adstdct4x8",
+            adstdct4x8_quant_t_direct,
+            crate::neon::adstdct4x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dctadst4x8",
+            dctadst4x8_quant_t_direct,
+            crate::neon::dctadst4x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adst8x16",
+            adst8x16_quant_t_direct,
+            crate::neon::adst8x16_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adstdct8x16",
+            adstdct8x16_quant_t_direct,
+            crate::neon::adstdct8x16_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dctadst8x16",
+            dctadst8x16_quant_t_direct,
+            crate::neon::dctadst8x16_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adst16x8",
+            adst16x8_quant_t_direct,
+            crate::neon::adst16x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "adstdct16x8",
+            adstdct16x8_quant_t_direct,
+            crate::neon::adstdct16x8_neon_quant_t,
+        );
+        assert_forward_neon_matches_scalar(
+            "dctadst16x8",
+            dctadst16x8_quant_t_direct,
+            crate::neon::dctadst16x8_neon_quant_t,
+        );
+    }
+
+    /// The new 4:1 pairs must round-trip a residual within quant rounding at a
+    /// fine quantizer — pins the forward gain against the inverse shift chain.
+    #[test]
+    fn dct16x4_and_4x16_pair_with_inverse() {
+        use crate::idct::{idct_dequant_4x16, idct_dequant_16x4};
+        let q = Quant::new(8, 8);
+        let r: [i32; 64] = pat(64).try_into().unwrap();
+        for wide in [true, false] {
+            let (cf, rec) = if wide {
+                let (cf, _) = dct16x4_t(&r, &q);
+                (cf, idct_dequant_16x4(&cf, &q))
+            } else {
+                let (cf, _) = dct4x16_t(&r, &q);
+                (cf, idct_dequant_4x16(&cf, &q))
+            };
+            assert!(cf.iter().any(|&c| c != 0), "all-zero coeffs at fine q");
+            let sig: f64 = r.iter().map(|&v| (v as f64).powi(2)).sum();
+            let err: f64 = r
+                .iter()
+                .zip(rec.iter())
+                .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                .sum();
+            assert!(err < sig * 0.05, "wide={wide}: err {err} vs sig {sig}");
+        }
     }
 
     /// The 16x8 (wide) forward+inverse pair must reconstruct a residual to

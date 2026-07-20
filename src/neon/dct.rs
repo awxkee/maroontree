@@ -61,8 +61,8 @@ impl I32x4 {
     fn muls_q16(self, coeff: i32) -> I32x4 {
         let c = vdup_n_s32(coeff);
         I32x4(vcombine_s32(
-            vshrn_n_s64(vmull_s32(vget_low_s32(self.0), c), 16),
-            vshrn_n_s64(vmull_s32(vget_high_s32(self.0), c), 16),
+            vrshrn_n_s64(vmull_s32(vget_low_s32(self.0), c), 16),
+            vrshrn_n_s64(vmull_s32(vget_high_s32(self.0), c), 16),
         ))
     }
 
@@ -70,12 +70,6 @@ impl I32x4 {
     #[target_feature(enable = "neon")]
     fn fma_sqrt2(self, b: I32x4) -> I32x4 {
         self.muls_q16(SQRT2).add(b)
-    }
-
-    #[inline]
-    #[target_feature(enable = "neon")]
-    fn shr<const N: i32>(self) -> I32x4 {
-        I32x4(vshrq_n_s32(self.0, N))
     }
 
     #[inline]
@@ -119,12 +113,12 @@ impl I32x8 {
         let c = vdup_n_s32(coeff);
         I32x8 {
             lo: vcombine_s32(
-                vshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.lo), c)),
-                vshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.lo), c)),
+                vrshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.lo), c)),
+                vrshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.lo), c)),
             ),
             hi: vcombine_s32(
-                vshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.hi), c)),
-                vshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.hi), c)),
+                vrshrn_n_s64::<16>(vmull_s32(vget_low_s32(self.hi), c)),
+                vrshrn_n_s64::<16>(vmull_s32(vget_high_s32(self.hi), c)),
             ),
         }
     }
@@ -349,39 +343,51 @@ fn dct1d_16_v4_i32(c: &mut [I32x4; 16]) {
     c[15] = odds[7];
 }
 
+/// One lane-parallel DCT-32 held in a single 32-vector NEON state. Pair
+/// butterflies overwrite their own inputs, and the two 16-point transforms
+/// operate on the two halves in place; there is no additional transform
+/// scratch as on the AVX2 path.
 #[inline]
 #[target_feature(enable = "neon")]
 fn dct1d_32_v4_i32(c: &mut [I32x4; 32]) {
-    let mut evens = std::array::from_fn::<I32x4, 16, _>(|i| c[i].add(c[31 - i]));
-    let mut odds = std::array::from_fn::<I32x4, 16, _>(|i| c[i].sub(c[31 - i]));
-
-    dct1d_16_v4_i32(&mut evens);
-
     for i in 0..16 {
-        odds[i] = odds[i].muls_q16(WC32[i]);
+        let lo = c[i];
+        let hi = c[31 - i];
+        c[i] = lo.add(hi);
+        c[31 - i] = lo.sub(hi).muls_q16(WC32[i]);
     }
-    dct1d_16_v4_i32(&mut odds);
-
-    odds[0] = odds[0].fma_sqrt2(odds[1]);
-    odds[1] = odds[1].add(odds[2]);
-    odds[2] = odds[2].add(odds[3]);
-    odds[3] = odds[3].add(odds[4]);
-    odds[4] = odds[4].add(odds[5]);
-    odds[5] = odds[5].add(odds[6]);
-    odds[6] = odds[6].add(odds[7]);
-    odds[7] = odds[7].add(odds[8]);
-    odds[8] = odds[8].add(odds[9]);
-    odds[9] = odds[9].add(odds[10]);
-    odds[10] = odds[10].add(odds[11]);
-    odds[11] = odds[11].add(odds[12]);
-    odds[12] = odds[12].add(odds[13]);
-    odds[13] = odds[13].add(odds[14]);
-    odds[14] = odds[14].add(odds[15]);
-
-    for i in 0..16 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
+    for i in 0..8 {
+        c.swap(16 + i, 31 - i);
     }
+
+    let (even, odd) = c.split_at_mut(16);
+    let even: &mut [I32x4; 16] = even.try_into().unwrap();
+    let odd: &mut [I32x4; 16] = odd.try_into().unwrap();
+    dct1d_16_v4_i32(even);
+    dct1d_16_v4_i32(odd);
+
+    odd[0] = odd[0].fma_sqrt2(odd[1]);
+    for i in 1..15 {
+        odd[i] = odd[i].add(odd[i + 1]);
+    }
+
+    // In-place perfect shuffle: packed [even..., odd...] -> interleaved output.
+    macro_rules! rotate5 {
+        ($a:literal, $b:literal, $d:literal, $e:literal, $f:literal) => {{
+            let carry = c[$f];
+            c[$f] = c[$e];
+            c[$e] = c[$d];
+            c[$d] = c[$b];
+            c[$b] = c[$a];
+            c[$a] = carry;
+        }};
+    }
+    rotate5!(1, 2, 4, 8, 16);
+    rotate5!(3, 6, 12, 24, 17);
+    rotate5!(5, 10, 20, 9, 18);
+    rotate5!(7, 14, 28, 25, 19);
+    rotate5!(11, 22, 13, 26, 21);
+    rotate5!(15, 30, 29, 27, 23);
 }
 
 #[inline]
@@ -454,50 +460,55 @@ fn load8_i32(ptr: &[i32], stride: usize) -> [I32x8; 8] {
 #[target_feature(enable = "neon")]
 fn mul_q16_vec(data: int32x4_t, coeff: int32x4_t) -> int32x4_t {
     vcombine_s32(
-        vshrn_n_s64::<16>(vmull_s32(vget_low_s32(data), vget_low_s32(coeff))),
-        vshrn_n_s64::<16>(vmull_s32(vget_high_s32(data), vget_high_s32(coeff))),
+        vrshrn_n_s64::<16>(vmull_s32(vget_low_s32(data), vget_low_s32(coeff))),
+        vrshrn_n_s64::<16>(vmull_s32(vget_high_s32(data), vget_high_s32(coeff))),
     )
 }
 
-#[inline]
-fn quant_flat<const N: usize>(coeffs: &[i32; N], dc_q: i32, ac_q: i32, out: &mut [i32; N]) {
-    // Round-to-nearest (magnitude-symmetric) so the quant error is zero-mean,
-    // matching the scalar `quant_q16`. A bare `>> 16` truncates toward -inf and
-    // the bias accumulates into a dark dot at the block's top-left corner.
-    let mq = |a: i32, b: i32| {
-        let prod = (a as i64) * (b as i64);
-        let mag = prod.unsigned_abs();
-        if mag < 32768 {
-            return 0;
-        }
-        let lvl = ((mag + 32768) >> 16) as i32;
-        if prod >= 0 { lvl } else { -lvl }
+#[inline(never)]
+#[target_feature(enable = "neon")]
+fn quant_flat(coeffs: &[i32], dc_q: i32, ac_q: i32, out: &mut [i32]) {
+    debug_assert_eq!(coeffs.len(), out.len());
+    let (coeffs, coeff_tail) = coeffs.as_chunks::<4>();
+    let (out, out_tail) = out.as_chunks_mut::<4>();
+    debug_assert!(coeff_tail.is_empty());
+    debug_assert!(out_tail.is_empty());
+    let Some((dc, ac)) = coeffs.split_first() else {
+        return;
     };
-    out[0] = mq(coeffs[0], dc_q);
-    for i in 1..N {
-        out[i] = mq(coeffs[i], ac_q);
+    let (dc_out, ac_out) = out.split_first_mut().unwrap();
+    let ac_q = vdupq_n_s32(ac_q);
+    let dc_q = vsetq_lane_s32::<0>(dc_q, ac_q);
+    let dc = load_i32x4(dc.as_ptr()).0;
+    unsafe {
+        store_i32x4(dc_out.as_mut_ptr(), I32x4(quant_q16_vec_i32(dc, dc_q)));
+    }
+    for (coeff, dst) in ac.iter().zip(ac_out.iter_mut()) {
+        let coeff = load_i32x4(coeff.as_ptr()).0;
+        unsafe {
+            store_i32x4(dst.as_mut_ptr(), I32x4(quant_q16_vec_i32(coeff, ac_q)));
+        }
     }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn quant_q16_half_i64(prod: int64x2_t) -> int32x2_t {
-    let zero64 = vdupq_n_s64(0);
-    let mag = vabsq_s64(prod);
-    let active = vcgtq_s64(mag, vdupq_n_s64(32767));
-    let lvl = vshrq_n_s64::<16>(vaddq_s64(mag, vdupq_n_s64(32768)));
-    let neg = vnegq_s64(lvl);
-    let signed = vbslq_s64(vcltq_s64(prod, zero64), neg, lvl);
-    vmovn_s64(vbslq_s64(active, signed, zero64))
+fn restore_sign_i32(magnitude: int32x4_t, value: int32x4_t) -> int32x4_t {
+    let sign = vshrq_n_s32::<31>(value);
+    vsubq_s32(veorq_s32(magnitude, sign), sign)
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
 fn quant_q16_vec_i32(v: int32x4_t, q: int32x4_t) -> int32x4_t {
-    vcombine_s32(
-        quant_q16_half_i64(vmull_s32(vget_low_s32(v), vget_low_s32(q))),
-        quant_q16_half_i64(vmull_s32(vget_high_s32(v), vget_high_s32(q))),
-    )
+    // SQRDMULH(mag, q << 15) == round(mag * q / 65536). The explicit
+    // magnitude/sign split preserves scalar's symmetric rounding for negative
+    // coefficients. q == 65536 is the Q16 identity case; positive 1.0 is not
+    // representable in Q31, so select the magnitude directly for those lanes.
+    let magnitude = vqabsq_s32(v);
+    let unity = vceqq_s32(q, vdupq_n_s32(65536));
+    let rounded = vqrdmulhq_s32(magnitude, vshlq_n_s32::<15>(q));
+    restore_sign_i32(vbslq_s32(unity, magnitude, rounded), v)
 }
 
 #[inline]
@@ -516,6 +527,47 @@ fn store_quant_target_i32x4(
         vdupq_n_s32(ac_q)
     };
     let levels = quant_q16_vec_i32(coeff.0, q);
+    let target = vmulq_f32(
+        vmulq_f32(vcvtq_f32_s32(coeff.0), vcvtq_f32_s32(q)),
+        vdupq_n_f32(1.0 / 65536.0),
+    );
+    unsafe {
+        vst1q_s32(cf.add(base), levels);
+        vst1q_f32(tf.add(base), target);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn quant_fullstep_vec_i32(v: int32x4_t, q: int32x4_t) -> int32x4_t {
+    let magnitude = vqabsq_s32(v);
+    let unity = vceqq_s32(q, vdupq_n_s32(65536));
+    let q31 = vshlq_n_s32::<15>(q);
+    let rounded = vbslq_s32(unity, magnitude, vqrdmulhq_s32(magnitude, q31));
+    // SQDMULH is the non-rounding counterpart: for non-negative operands it
+    // is exactly floor(mag * q / 65536), hence nonzero exactly at the scalar
+    // full-step threshold. The identity lanes again bypass Q31 encoding.
+    let whole = vbslq_s32(unity, magnitude, vqdmulhq_s32(magnitude, q31));
+    let active = vcgtq_s32(whole, vdupq_n_s32(0));
+    restore_sign_i32(vbslq_s32(active, rounded, vdupq_n_s32(0)), v)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_fullstep_target_i32x4(
+    cf: *mut i32,
+    tf: *mut f32,
+    coeff: I32x4,
+    base: usize,
+    dc_q: i32,
+    ac_q: i32,
+) {
+    let q = if base == 0 {
+        vsetq_lane_s32::<0>(dc_q, vdupq_n_s32(ac_q))
+    } else {
+        vdupq_n_s32(ac_q)
+    };
+    let levels = quant_fullstep_vec_i32(coeff.0, q);
     let target = vmulq_f32(
         vmulq_f32(vcvtq_f32_s32(coeff.0), vcvtq_f32_s32(q)),
         vdupq_n_f32(1.0 / 65536.0),
@@ -579,6 +631,265 @@ fn adst1d_16_v4_i32(c: &mut [I32x4; 16]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn adst1d_4_v4_i32(c: &mut [I32x4; 4]) {
+    let mut out = [I32x4(vdupq_n_s32(0)); 4];
+    for o in 0..4usize {
+        let mut lo = vdupq_n_s64(2048);
+        let mut hi = vdupq_n_s64(2048);
+        for j in 0..4usize {
+            let k = vdup_n_s32(crate::dct::ADST4_FWD_Q12[o][j]);
+            lo = vmlal_s32(lo, vget_low_s32(c[j].0), k);
+            hi = vmlal_s32(hi, vget_high_s32(c[j].0), k);
+        }
+        out[o] = I32x4(vcombine_s32(vshrn_n_s64::<12>(lo), vshrn_n_s64::<12>(hi)));
+    }
+    *c = out;
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn adst1d_8_v4_i32(c: &mut [I32x4; 8]) {
+    let mut out = [I32x4(vdupq_n_s32(0)); 8];
+    for o in 0..8usize {
+        let mut lo = vdupq_n_s64(2048);
+        let mut hi = vdupq_n_s64(2048);
+        for j in 0..8usize {
+            let k = vdup_n_s32(crate::dct::ADST8_FWD_Q12[o][j]);
+            lo = vmlal_s32(lo, vget_low_s32(c[j].0), k);
+            hi = vmlal_s32(hi, vget_high_s32(c[j].0), k);
+        }
+        out[o] = I32x4(vcombine_s32(vshrn_n_s64::<12>(lo), vshrn_n_s64::<12>(hi)));
+    }
+    *c = out;
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn tx1d_v4_i32(c: &mut [I32x4], adst: bool) {
+    match (c.len(), adst) {
+        (4, false) => dct1d_4_v4_i32(c.try_into().unwrap()),
+        (4, true) => adst1d_4_v4_i32(c.try_into().unwrap()),
+        (8, false) => dct1d_8_v4_i32(c.try_into().unwrap()),
+        (8, true) => adst1d_8_v4_i32(c.try_into().unwrap()),
+        (16, false) => dct1d_16_v4_i32(c.try_into().unwrap()),
+        (16, true) => adst1d_16_v4_i32(c.try_into().unwrap()),
+        _ => unreachable!("unsupported NEON forward-transform length"),
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn tx_neon_quant_t<
+    const LEN: usize,
+    const W: usize,
+    const H: usize,
+    const COL_ADST: bool,
+    const ROW_ADST: bool,
+    const NORM_Q16: i32,
+>(
+    input: &[i32; LEN],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; LEN], [f32; LEN]) {
+    debug_assert_eq!(LEN, W * H);
+    debug_assert!(W.is_multiple_of(4) && H.is_multiple_of(4));
+
+    let mut tmp_u = MaybeUninit::<[i32; LEN]>::uninit();
+    for x in (0..W).step_by(4) {
+        let mut cols: [I32x4; H] =
+            std::array::from_fn(|y| load_i32x4(unsafe { input.as_ptr().add(y * W + x) }));
+        tx1d_v4_i32(&mut cols, COL_ADST);
+        store_transposed_cols_i32x4::<H>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; LEN]>::uninit();
+    let mut tf = MaybeUninit::<[f32; LEN]>::uninit();
+    for fy in (0..H).step_by(4) {
+        let mut rows: [I32x4; W] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * H + fy) }));
+        tx1d_v4_i32(&mut rows, ROW_ADST);
+        for fx in 0..W {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[fx].muls_q16(NORM_Q16),
+                fx * H + fy,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+macro_rules! small_neon_tx {
+    (
+        $name:ident, $len:literal, $w:literal, $h:literal,
+        $col_adst:literal, $row_adst:literal, $norm:literal
+    ) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(
+            input: &[i32; $len],
+            dc_q: i32,
+            ac_q: i32,
+        ) -> ([i32; $len], [f32; $len]) {
+            tx_neon_quant_t::<$len, $w, $h, $col_adst, $row_adst, $norm>(input, dc_q, ac_q)
+        }
+    };
+}
+
+small_neon_tx!(dct4x4_neon_quant_t, 16, 4, 4, false, false, 65536);
+small_neon_tx!(dct4x8_neon_quant_t, 32, 4, 8, false, false, 65536);
+small_neon_tx!(dct4x16_neon_quant_t, 64, 4, 16, false, false, 65536);
+small_neon_tx!(dct16x4_neon_quant_t, 64, 16, 4, false, false, 65536);
+small_neon_tx!(dct16x8_neon_quant_t, 128, 16, 8, false, false, 46341);
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn one_d_dct_neon_quant_t<
+    const LEN: usize,
+    const W: usize,
+    const H: usize,
+    const VERTICAL: bool,
+    const NORM_Q16: i32,
+>(
+    input: &[i32; LEN],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; LEN], [f32; LEN]) {
+    debug_assert_eq!(LEN, W * H);
+
+    let mut tmp_u = MaybeUninit::<[i32; LEN]>::uninit();
+    for x in (0..W).step_by(4) {
+        let mut cols: [I32x4; H] =
+            std::array::from_fn(|y| load_i32x4(unsafe { input.as_ptr().add(y * W + x) }));
+        if VERTICAL {
+            tx1d_v4_i32(&mut cols, false);
+        }
+        store_transposed_cols_i32x4::<H>(tmp_u.as_mut_ptr().cast(), x, &cols);
+    }
+    let tmp = unsafe { tmp_u.assume_init() };
+
+    let mut cf = MaybeUninit::<[i32; LEN]>::uninit();
+    let mut tf = MaybeUninit::<[f32; LEN]>::uninit();
+    for fy in (0..H).step_by(4) {
+        let mut rows: [I32x4; W] =
+            std::array::from_fn(|x| load_i32x4(unsafe { tmp.as_ptr().add(x * H + fy) }));
+        if !VERTICAL {
+            tx1d_v4_i32(&mut rows, false);
+        }
+        for fx in 0..W {
+            store_fullstep_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                rows[fx].muls_q16(NORM_Q16),
+                fx * H + fy,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+macro_rules! one_d_neon_tx {
+    ($name:ident, $len:literal, $w:literal, $h:literal, $vertical:literal, $norm:literal) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(
+            input: &[i32; $len],
+            dc_q: i32,
+            ac_q: i32,
+        ) -> ([i32; $len], [f32; $len]) {
+            one_d_dct_neon_quant_t::<$len, $w, $h, $vertical, $norm>(input, dc_q, ac_q)
+        }
+    };
+}
+
+one_d_neon_tx!(fvdct4x4_neon_quant_t, 16, 4, 4, true, 185364);
+one_d_neon_tx!(fhdct4x4_neon_quant_t, 16, 4, 4, false, 185364);
+one_d_neon_tx!(fvdct8x8_neon_quant_t, 64, 8, 8, true, 131072);
+one_d_neon_tx!(fhdct8x8_neon_quant_t, 64, 8, 8, false, 131072);
+one_d_neon_tx!(fvdct16x8_neon_quant_t, 128, 16, 8, true, 131072);
+one_d_neon_tx!(fhdct16x8_neon_quant_t, 128, 16, 8, false, 92682);
+one_d_neon_tx!(fvdct8x16_neon_quant_t, 128, 8, 16, true, 92682);
+one_d_neon_tx!(fhdct8x16_neon_quant_t, 128, 8, 16, false, 131072);
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x4_neon_quant_t(
+    input: &[i32; 32],
+    dc_q: i32,
+    ac_q: i32,
+) -> ([i32; 32], [f32; 32]) {
+    let r0 = unsafe { vld1q_s32(input.as_ptr()) };
+    let r1 = unsafe { vld1q_s32(input[8..].as_ptr()) };
+    let r2 = unsafe { vld1q_s32(input[16..].as_ptr()) };
+    let r3 = unsafe { vld1q_s32(input[24..].as_ptr()) };
+    let (c0, c1, c2, c3) = transpose_4x4_i32(r0, r1, r2, r3);
+
+    let r4 = unsafe { vld1q_s32(input[4..].as_ptr()) };
+    let r5 = unsafe { vld1q_s32(input[12..].as_ptr()) };
+    let r6 = unsafe { vld1q_s32(input[20..].as_ptr()) };
+    let r7 = unsafe { vld1q_s32(input[28..].as_ptr()) };
+    let (c4, c5, c6, c7) = transpose_4x4_i32(r4, r5, r6, r7);
+
+    let mut horizontal = [
+        I32x4(c0),
+        I32x4(c1),
+        I32x4(c2),
+        I32x4(c3),
+        I32x4(c4),
+        I32x4(c5),
+        I32x4(c6),
+        I32x4(c7),
+    ];
+    dct1d_8_v4_i32(&mut horizontal);
+
+    let mut cf = MaybeUninit::<[i32; 32]>::uninit();
+    let mut tf = MaybeUninit::<[f32; 32]>::uninit();
+    for fx in (0..8usize).step_by(4) {
+        let (y0, y1, y2, y3) = transpose_4x4_i32(
+            horizontal[fx].0,
+            horizontal[fx + 1].0,
+            horizontal[fx + 2].0,
+            horizontal[fx + 3].0,
+        );
+        let mut vertical = [I32x4(y0), I32x4(y1), I32x4(y2), I32x4(y3)];
+        dct1d_4_v4_i32(&mut vertical);
+        let (f0, f1, f2, f3) =
+            transpose_4x4_i32(vertical[0].0, vertical[1].0, vertical[2].0, vertical[3].0);
+        for (i, coeff) in [f0, f1, f2, f3].into_iter().enumerate() {
+            store_quant_target_i32x4(
+                cf.as_mut_ptr().cast(),
+                tf.as_mut_ptr().cast(),
+                I32x4(coeff),
+                (fx + i) * 4,
+                dc_q,
+                ac_q,
+            );
+        }
+    }
+    unsafe { (cf.assume_init(), tf.assume_init()) }
+}
+
+small_neon_tx!(adst4x4_neon_quant_t, 16, 4, 4, true, true, 65536);
+small_neon_tx!(adstdct4x4_neon_quant_t, 16, 4, 4, true, false, 65536);
+small_neon_tx!(dctadst4x4_neon_quant_t, 16, 4, 4, false, true, 65536);
+small_neon_tx!(adst4x8_neon_quant_t, 32, 4, 8, true, true, 65536);
+small_neon_tx!(adstdct4x8_neon_quant_t, 32, 4, 8, true, false, 65536);
+small_neon_tx!(dctadst4x8_neon_quant_t, 32, 4, 8, false, true, 65536);
+small_neon_tx!(adst8x8_neon_quant_t, 64, 8, 8, true, true, 65536);
+small_neon_tx!(adstdct8x8_neon_quant_t, 64, 8, 8, true, false, 65536);
+small_neon_tx!(dctadst8x8_neon_quant_t, 64, 8, 8, false, true, 65536);
+small_neon_tx!(adst8x16_neon_quant_t, 128, 8, 16, true, true, 46341);
+small_neon_tx!(adstdct8x16_neon_quant_t, 128, 8, 16, true, false, 46341);
+small_neon_tx!(dctadst8x16_neon_quant_t, 128, 8, 16, false, true, 46341);
+small_neon_tx!(adst16x8_neon_quant_t, 128, 16, 8, true, true, 46341);
+small_neon_tx!(adstdct16x8_neon_quant_t, 128, 16, 8, true, false, 46341);
+small_neon_tx!(dctadst16x8_neon_quant_t, 128, 16, 8, false, true, 46341);
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn tx16x16_adst_dct_neon_quant_t<const COL_ADST: bool, const ROW_ADST: bool>(
     input: &[i32; 256],
     dc_q: i32,
@@ -610,7 +921,7 @@ fn tx16x16_adst_dct_neon_quant_t<const COL_ADST: bool, const ROW_ADST: bool>(
             store_quant_target_i32x4(
                 cf.as_mut_ptr().cast(),
                 tf.as_mut_ptr().cast(),
-                rows[u].shr::<1>(),
+                rows[u].shr_round::<1>(),
                 u * 16 + y,
                 dc_q,
                 ac_q,
@@ -671,7 +982,7 @@ pub(crate) fn dct16x16_neon_quant_t(
             store_quant_target_i32x4(
                 cf.as_mut_ptr().cast(),
                 tf.as_mut_ptr().cast(),
-                rows[u].shr::<1>(),
+                rows[u].shr_round::<1>(),
                 u * 16 + y,
                 dc_q,
                 ac_q,
@@ -755,9 +1066,6 @@ pub(crate) fn dct32x32_neon_i32(input: &mut [i32; 1024], dc_q: i32, ac_q: i32) {
     quant_flat(&coeffs, dc_q, ac_q, input);
 }
 
-/// Forward 2-D integer 8x16 DCT (NEON) -> normalized coefficients
-/// `out[fx*16 + fy]` (horiz freq fx 0..8, vert freq fy 0..16; DC at index 0),
-/// pre-quantization. Mirrors scalar `dct8x16_coeffs`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon_coeffs(input: &[i32; 128]) -> [i32; 128] {
     // Stage 1: vertical DCT-16 in two 4-column groups.  This avoids the old
@@ -990,8 +1298,67 @@ pub(crate) fn dct32x16_neon_quant_t(
 
 #[cfg(test)]
 mod neon_vs_scalar {
+    use super::{quant_fullstep_vec_i32, quant_q16_vec_i32};
     use crate::dct::{dct8x16_i32_scalar, dct32x32_scalar};
     use crate::neon::{dct8x16_neon_i32, dct32x32_neon_i32};
+    use std::arch::aarch64::{vld1q_s32, vst1q_s32};
+
+    #[target_feature(enable = "neon")]
+    fn quant_vectors(values: [i32; 4], quants: [i32; 4]) -> ([i32; 4], [i32; 4]) {
+        let values_v = unsafe { vld1q_s32(values.as_ptr()) };
+        let quants_v = unsafe { vld1q_s32(quants.as_ptr()) };
+        let mut half = [0i32; 4];
+        let mut full = [0i32; 4];
+        unsafe {
+            vst1q_s32(half.as_mut_ptr(), quant_q16_vec_i32(values_v, quants_v));
+            vst1q_s32(
+                full.as_mut_ptr(),
+                quant_fullstep_vec_i32(values_v, quants_v),
+            );
+        }
+        (half, full)
+    }
+
+    fn quant_scalar(value: i32, q: i32, fullstep: bool) -> i32 {
+        let product = i64::from(value) * i64::from(q);
+        let magnitude = product.unsigned_abs();
+        if magnitude < if fullstep { 65536 } else { 32768 } {
+            return 0;
+        }
+        let level = ((magnitude + 32768) >> 16) as i32;
+        if product < 0 { -level } else { level }
+    }
+
+    #[test]
+    fn qrdmulh_quantizers_match_scalar_for_every_q16_multiplier() {
+        let mut state = 0x9e37_79b9u32;
+        for q in 1..=65536i32 {
+            let half = (32768 + q - 1) / q;
+            let full = (65536 + q - 1) / q;
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let random = ((state & 0x07ff_ffff) as i32) - 0x0400_0000;
+            for values in [
+                [half - 1, half, 1 - half, -half],
+                [full - 1, full, 1 - full, -full],
+                [random, -random, i32::MAX, -i32::MAX],
+            ] {
+                let quants = [q; 4];
+                let (half_neon, full_neon) = unsafe { quant_vectors(values, quants) };
+                let half_scalar = values.map(|value| quant_scalar(value, q, false));
+                let full_scalar = values.map(|value| quant_scalar(value, q, true));
+                assert_eq!(half_neon, half_scalar, "half-step q={q} values={values:?}");
+                assert_eq!(full_neon, full_scalar, "full-step q={q} values={values:?}");
+            }
+        }
+
+        let values = [1, -4095, 0x0123_4567, -0x0123_4567];
+        let quants = [65536, 32768, 17341, 1];
+        let (half_neon, full_neon) = unsafe { quant_vectors(values, quants) };
+        let half_scalar = std::array::from_fn(|i| quant_scalar(values[i], quants[i], false));
+        let full_scalar = std::array::from_fn(|i| quant_scalar(values[i], quants[i], true));
+        assert_eq!(half_neon, half_scalar);
+        assert_eq!(full_neon, full_scalar);
+    }
 
     /// Simple 32-bit LCG for deterministic pseudo-random inputs in -512..=511
     /// (well within the safe range for WC32[15] ≈ 10×). NOTE: a real spread of

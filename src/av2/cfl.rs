@@ -33,7 +33,7 @@ use crate::av2::helpers::{
 use crate::av2::mhccp;
 use crate::av2::proj::Basis;
 use crate::av2::{itx422, tables};
-use crate::util::FastRound;
+use crate::util::{FastRound, dirty_log2f};
 
 pub(crate) const CFL_ADD_BITS_ALPHA: i32 = 5;
 pub(crate) const CFL_ALPHABET_SIZE: u8 = 8; // magnitude indices 0..=7 -> |alpha| 1..=8
@@ -1272,7 +1272,7 @@ pub(crate) fn mhccp_eval_leaf(input: &MhccpLeafInput<'_>) -> Option<CflChoice> {
 fn filter_dir_bits(size_group: usize, dir: u8) -> f32 {
     // Cumulative CDF (AVM domain) per group: [c0, c1]; p(0)=c0, p(1)=c1-c0,
     // p(2)=32768-c1. (Stored elsewhere as ICDF; reconstruct AVM cdf here.)
-    const CUM: [[u32; 2]; 4] = [
+    static CUM: [[u32; 2]; 4] = [
         [10923, 21845],
         [8795, 15105],
         [10433, 15974],
@@ -1286,7 +1286,7 @@ fn filter_dir_bits(size_group: usize, dir: u8) -> f32 {
         _ => 32768 - c1,
     } as f32
         / 32768.0;
-    -(p.max(1e-6)).log2()
+    -dirty_log2f(p.max(1e-6))
 }
 
 #[allow(clippy::too_many_arguments)]

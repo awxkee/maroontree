@@ -58,8 +58,8 @@ struct WfSlot {
 }
 
 /// Per-worker reusable scratch for the wavefront decide: a private full-plane recon
-/// (zero own-block + halo of finished neighbours each cell) plus the emit-side
-/// neighbour context arrays. Each cell must see the frame-initial context values,
+/// (zero own-block + halo of finished neighbors each cell) plus the emit-side
+/// neighbor context arrays. Each cell must see the frame-initial context values,
 /// not arbitrary values left by an unrelated SB previously handled by the worker.
 /// One instance per thread via `thread_local!`, sized on first use.
 #[derive(Default)]
@@ -2908,7 +2908,7 @@ impl Av2Encoder {
                     }
                 };
                 // SATD prune: each chroma mode is one 64x64 prediction from
-                // neighbours (independent), so rank by SATD(pred, source) over
+                // neighbors (independent), so rank by SATD(pred, source) over
                 // U+V and full-encode only the top-K.
                 let keep_uv = if self.speed.reduced_modes() {
                     2
@@ -4994,7 +4994,7 @@ impl Av2Encoder {
         let fresh_ctx = false;
         // Step 2b (wavefront recon plumbing, serial gate): route each SB's decide
         // through a private full-plane buffer whose only valid data is the halo
-        // (finished neighbours) copied from the real recon `out`. Poisoning the rest
+        // (finished neighbors) copied from the real recon `out`. Poisoning the rest
         // proves the halo is a complete superset of every read `decide_sb` makes
         // OUTSIDE its own 64×64 block — the exact isolation a parallel wavefront
         // worker has. The parallel branch below always uses the same geometry.
@@ -5006,7 +5006,7 @@ impl Av2Encoder {
         const HALO_BAND: usize = 32;
         const HALO_AR: usize = 64;
         // The private buffer must mirror B1's zero-initialised recon plane as seen by
-        // decide: zero everywhere except the finished-neighbour halo. Own-block and
+        // decide: zero everywhere except the finished-neighbor halo. Own-block and
         // not-yet-coded regions read as 0 exactly as in B1's fresh plane. (A missed
         // *non-zero* causal read still diverges, so the gate keeps its detecting power.)
         const POISON: f32 = 0.0;
@@ -5056,7 +5056,7 @@ impl Av2Encoder {
         };
         // Step 3: parallel SB-wavefront decide (stills only). Each SB is decided by a
         // worker under the `par_wavefront_wpp` (d=2r+c) schedule — top+left+above-right
-        // neighbours finished — reading its halo from the shared recon and writing its
+        // neighbors finished — reading its halo from the shared recon and writing its
         // own 64×64 block back (sound raw-ptr disjoint access), capturing into a per-SB
         // record. Merged raster → the serial Replay emits.
         // Worker scratch is reset to the same frame-initial contexts used by the
@@ -5102,7 +5102,7 @@ impl Av2Encoder {
                         let by = sb_y.saturating_sub(HALO_BAND);
                         // CRITICAL for parallel correctness: the thread-local buffer is
                         // REUSED across cells, so it must present decide the SAME view B1's
-                        // fresh plane does — ZERO everywhere except the finished-neighbour
+                        // fresh plane does — ZERO everywhere except the finished-neighbor
                         // halo. Rather than enumerate every region decide might read (the
                         // walk path reaches beyond the obvious halo box), we keep the whole
                         // buffer ZERO by INVARIANT: it starts zero (allocated in `ensure`),
@@ -5111,7 +5111,7 @@ impl Av2Encoder {
                         // buffer is all-zero, decide reads its halo (copied real) and zero
                         // everywhere else, exactly like B1. Bounded cost (dirty region), no
                         // per-cell whole-plane zero.
-                        // Halo (finished neighbours): top band + left band, from `out`.
+                        // Halo (finished neighbors): top band + left band, from `out`.
                         // SAFETY: under WPP these regions are earlier-diagonal (finished),
                         // not being written concurrently; own-block writes are disjoint.
                         unsafe {

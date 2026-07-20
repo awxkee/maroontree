@@ -27,10 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{
-    dct4x4_t, dct4x8_t, dct8x8_t, dct8x16_t, dct16x16_t, dct16x32_t, dct32x32, dct32x32_t,
-};
 use crate::qm_tables::AV1_IQM;
+use crate::util::FastRound;
 
 pub(crate) const QM_FLAT_LEVEL: u8 = 15;
 
@@ -71,8 +69,24 @@ fn qm_offset(w: usize, h: usize) -> usize {
         (16, 8) => 1552,
         (16, 32) => 1680,
         (32, 16) => 2192,
+        (4, 16) => 2704,
+        (16, 4) => 2768,
+        (8, 32) => 2832,
+        (32, 8) => 3088,
         _ => panic!("unsupported AV1 QM transform size {w}x{h}"),
     }
+}
+
+/// The inverse QM table row for one transform size, or `None` when flat.
+/// Resolving the table offset ONCE per block instead of once per coefficient:
+/// `qm_offset` is a 14-arm match that sat inside every dequant/trellis loop.
+#[inline]
+pub(crate) fn qm_row(level: u8, chroma: bool, w: usize, h: usize) -> Option<&'static [u8]> {
+    if level >= QM_FLAT_LEVEL {
+        return None;
+    }
+    let off = qm_offset(w, h);
+    Some(&AV1_IQM[level as usize][chroma as usize][off..off + w * h])
 }
 
 #[inline]
@@ -80,11 +94,10 @@ pub(crate) fn qm_weight(level: u8, chroma: bool, rc: usize, w: usize, h: usize) 
     if level >= QM_FLAT_LEVEL {
         return 32;
     }
-    // Coefficients are stored x-major (`rc = x*h + y`), while the normative
-    // matrix is row-major (`y*w + x`).
-    let x = rc / h;
-    let y = rc % h;
-    AV1_IQM[level as usize][chroma as usize][qm_offset(w, h) + y * w + x]
+    // AV1_IQM stores dav1d's runtime tables verbatim, which are already in
+    // dav1d's transposed coefficient order == our x-major cf layout
+    // (`rc = x*h + y`), so the index is linear — no remap.
+    AV1_IQM[level as usize][chroma as usize][qm_offset(w, h) + rc]
 }
 
 /// DC dequant value `dav1d_dq_tbl[bd][q][0]` for bit_depth 8/10/12.
@@ -106,12 +119,102 @@ pub(crate) fn ac_q(base_q_idx: u8, bd: u8) -> u16 {
     t[base_q_idx as usize]
 }
 
-pub(crate) fn chroma_dc_delta(base_q_idx: u8) -> i32 {
+pub(crate) fn top_ease_t(base_q_idx: u8) -> f32 {
+    let t = crate::tuning::get();
+    ((t.top_ease_knee - base_q_idx as f32) / t.top_ease_width).clamp(0.0, 1.0)
+}
+
+#[inline]
+pub(crate) fn top_ease() -> f32 {
+    crate::tuning::get().top_ease
+}
+
+#[inline]
+fn qm_high_quality_t(base_q_idx: u8) -> f32 {
+    let t = crate::tuning::get();
+    ((t.qm_hq_knee - base_q_idx as f32) / t.qm_hq_width).clamp(0.0, 1.0)
+}
+
+pub(crate) fn qm_level_law(base_q_idx: u8, sub: usize) -> u8 {
+    let subsampled = sub != 0;
+    const HI: f32 = 48.0; // level 8 at this qindex
+    const LO: f32 = 128.0; // level 0 at and above this qindex
+    let qi = base_q_idx as f32;
+    if qi <= 20.0 {
+        if subsampled { 8 } else { 15 }
+    } else if qi <= HI {
+        let top = if subsampled { 8.0 } else { 15.0 };
+        (top + (8.0 - top) * (qi - 20.0) / (HI - 20.0)).fast_round() as u8
+    } else if qi >= LO {
+        0
+    } else {
+        (8.0 * (LO - qi) / (LO - HI)).fast_round() as u8
+    }
+}
+
+pub(crate) fn qm_chroma_level_law(base_q_idx: u8, sub: usize) -> u8 {
+    if sub != 0 {
+        return qm_level_law(base_q_idx, sub);
+    }
+    const TOP: u8 = 2; // chroma level from the top through the mid band
+    let pinned = TOP.min(qm_level_law(base_q_idx, sub));
+    let t = top_ease() * qm_high_quality_t(base_q_idx);
+    if t > 0.0 {
+        (pinned as f32 + (15.0 - pinned as f32) * t).round() as u8
+    } else {
+        pinned
+    }
+}
+
+const UV420_MID_D: i32 = 28;
+fn uv420_mid_delta(base_q_idx: u8) -> i32 {
+    let qi = base_q_idx as i32;
+    let d = UV420_MID_D;
+    if qi <= 20 {
+        0
+    } else if qi < 64 {
+        -(d * (qi - 20)) / 44
+    } else if qi <= 96 {
+        -d
+    } else if qi < 136 {
+        -(d * (136 - qi)) / 40
+    } else {
+        0
+    }
+}
+
+fn top_444_uac() -> i32 {
+    crate::tuning::get().top_444_uac as i32
+}
+
+pub(crate) fn chroma_ac_delta(base_q_idx: u8, sub: usize) -> i32 {
+    match sub {
+        2 => return uv420_mid_delta(base_q_idx),
+        1 => return 0,
+        _ => {}
+    }
+    let qi = base_q_idx as i32;
+    if qi <= 20 {
+        top_444_uac()
+    } else if qi >= 96 {
+        24
+    } else {
+        24 * (qi - 20) / 76
+    }
+}
+
+/// Frame-level chroma-DC qindex delta (`DeltaQUDc`), same `sub` convention.
+pub(crate) fn chroma_dc_delta(base_q_idx: u8, sub: usize) -> i32 {
     let q = base_q_idx as i32;
-    if q <= 160 {
+    let deep = if q <= 160 {
         0
     } else {
         -((q - 160) / 3).min(32)
+    };
+    if sub == 2 {
+        deep + uv420_mid_delta(base_q_idx)
+    } else {
+        deep
     }
 }
 
@@ -166,7 +269,7 @@ pub(crate) trait Dct {
         (base * weight + 16) >> 5
     }
 
-    #[inline]
+    #[cfg(test)]
     fn forward_qm_weight(&self, rc: usize, w: usize, h: usize) -> i32 {
         if !self.has_qmatrix() {
             return 32;
@@ -176,8 +279,32 @@ pub(crate) trait Dct {
     }
 }
 
-/// Precomputed dequant coefficients + inverse-transform clips for one
-/// (base_q_idx, bit_depth). Cheap to copy; build once and hand to the transforms.
+pub(crate) struct FlatDct<'a, T: Dct>(pub &'a T);
+
+impl<T: Dct> Dct for FlatDct<'_, T> {
+    fn dc_q(&self) -> i32 {
+        self.0.dc_q()
+    }
+    fn ac_q(&self) -> i32 {
+        self.0.ac_q()
+    }
+    fn clips(&self) -> (i32, i32, i32, i32, i32) {
+        self.0.clips()
+    }
+    fn q_mult_dc(&self) -> i32 {
+        self.0.q_mult_dc()
+    }
+    fn q_mult_ac(&self) -> i32 {
+        self.0.q_mult_ac()
+    }
+    fn qm_level(&self) -> u8 {
+        QM_FLAT_LEVEL
+    }
+    fn qm_chroma(&self) -> bool {
+        self.0.qm_chroma()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Quant {
     dc: i32,
@@ -191,6 +318,9 @@ pub(crate) struct Quant {
     cf_max: i32,
     qm_level: u8,
     qm_chroma: bool,
+    /// AC-side qindex this quantizer was built from (chroma includes its
+    /// frame-level AC delta); drives the coefficient-dropout thresholds.
+    qidx: u8,
 }
 
 impl Quant {
@@ -199,49 +329,15 @@ impl Quant {
         Self::new_with_qm(base_q_idx, bd, QM_FLAT_LEVEL)
     }
 
+    pub(crate) fn luma_dc_delta_probe(base_q_idx: u8) -> i32 {
+        let _ = base_q_idx;
+        -8
+    }
+
     pub(crate) fn new_with_qm(base_q_idx: u8, bd: u8, qm_level: u8) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
-        let dc = dc_q(base_q_idx, bd) as i32;
-        let ac = ac_q(base_q_idx, bd) as i32;
-        Quant {
-            dc,
-            ac,
-            q_mult_dc: (65536.0_f64 / dc as f64).round() as i32,
-            q_mult_ac: (65536.0_f64 / ac as f64).round() as i32,
-            rmin,
-            rmax,
-            cmin,
-            cmax,
-            cf_max,
-            qm_level: qm_level.min(QM_FLAT_LEVEL),
-            qm_chroma: false,
-        }
-    }
-
-    pub(crate) fn new_chroma(base_q_idx: u8, bd: u8) -> Self {
-        Self::new_chroma_with_delta_qm(base_q_idx, chroma_dc_delta(base_q_idx), bd, QM_FLAT_LEVEL)
-    }
-
-    /// As [`Self::new_chroma`] but with an explicit chroma-DC qindex delta. Under
-    /// adaptive quantization the per-superblock qindex (`CurrentQIndex`) changes,
-    /// but the chroma-DC delta is a frame-level constant signaled once in the
-    /// header (`DeltaQUDc`, derived from the frame `base_q_idx`). The decoder
-    /// forms the chroma-DC qindex as `CurrentQIndex + DeltaQUDc`, so the encoder
-    /// must apply that same frame-level delta to the AQ-adjusted qindex rather
-    /// than recomputing it from the local qindex.
-    #[allow(dead_code)]
-    pub(crate) fn new_chroma_with_delta(base_q_idx: u8, dc_delta: i32, bd: u8) -> Self {
-        Self::new_chroma_with_delta_qm(base_q_idx, dc_delta, bd, QM_FLAT_LEVEL)
-    }
-
-    pub(crate) fn new_chroma_with_delta_qm(
-        base_q_idx: u8,
-        dc_delta: i32,
-        bd: u8,
-        qm_level: u8,
-    ) -> Self {
-        let dc_idx = (base_q_idx as i32 + dc_delta).clamp(0, 255) as u8;
-        let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
+        let dc_idx =
+            (base_q_idx as i32 + Self::luma_dc_delta_probe(base_q_idx)).clamp(0, 255) as u8;
         let dc = dc_q(dc_idx, bd) as i32;
         let ac = ac_q(base_q_idx, bd) as i32;
         Quant {
@@ -255,7 +351,55 @@ impl Quant {
             cmax,
             cf_max,
             qm_level: qm_level.min(QM_FLAT_LEVEL),
+            qm_chroma: false,
+            qidx: base_q_idx,
+        }
+    }
+
+    pub(crate) fn qidx(&self) -> u8 {
+        self.qidx
+    }
+
+    pub(crate) fn new_chroma(base_q_idx: u8, bd: u8) -> Self {
+        Self::new_chroma_with_delta_qm(
+            base_q_idx,
+            chroma_dc_delta(base_q_idx, 0),
+            0,
+            bd,
+            QM_FLAT_LEVEL,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_chroma_with_delta(base_q_idx: u8, dc_delta: i32, bd: u8) -> Self {
+        Self::new_chroma_with_delta_qm(base_q_idx, dc_delta, 0, bd, QM_FLAT_LEVEL)
+    }
+
+    pub(crate) fn new_chroma_with_delta_qm(
+        base_q_idx: u8,
+        dc_delta: i32,
+        ac_delta: i32,
+        bd: u8,
+        qm_level: u8,
+    ) -> Self {
+        let dc_idx = (base_q_idx as i32 + dc_delta).clamp(0, 255) as u8;
+        let ac_idx = (base_q_idx as i32 + ac_delta).clamp(0, 255) as u8;
+        let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
+        let dc = dc_q(dc_idx, bd) as i32;
+        let ac = ac_q(ac_idx, bd) as i32;
+        Quant {
+            dc,
+            ac,
+            q_mult_dc: (65536.0_f64 / dc as f64).round() as i32,
+            q_mult_ac: (65536.0_f64 / ac as f64).round() as i32,
+            rmin,
+            rmax,
+            cmin,
+            cmax,
+            cf_max,
+            qm_level: qm_level.min(QM_FLAT_LEVEL),
             qm_chroma: true,
+            qidx: ac_idx,
         }
     }
 }
@@ -291,66 +435,36 @@ impl Dct for Quant {
     }
 }
 
-pub(crate) fn forward_dct_quant_8x8_t(
-    residual: &[i32; 64],
-    q: &impl Dct,
-) -> ([i32; 64], [f32; 64]) {
-    dct8x8_t(residual, q)
-}
-
-/// As [`forward_dct_quant_16x16`] but also returns the pre-round real targets.
-pub(crate) fn forward_dct_quant_16x16_t(
-    residual: &[i32; 256],
-    q: &impl Dct,
-) -> ([i32; 256], [f32; 256]) {
-    dct16x16_t(residual, q)
-}
-
-#[allow(unused)]
-pub(crate) fn forward_dct_quant_32x32(residual: &mut [i32; 1024], q: &impl Dct) {
-    dct32x32(residual, q)
-}
-
-pub(crate) fn forward_dct_quant_32x32_t(
-    residual: &[i32; 1024],
-    q: &impl Dct,
-) -> ([i32; 1024], [f32; 1024]) {
-    dct32x32_t(residual, q)
-}
-
-/// As [`forward_dct_quant_4x8`] but also returns the pre-round real targets.
-pub(crate) fn forward_dct_quant_4x8_t(
-    residual: &[i32; 32],
-    q: &impl Dct,
-) -> ([i32; 32], [f32; 32]) {
-    dct4x8_t(residual, q)
-}
-
-/// As [`forward_dct_quant_8x16`] but also returns the pre-round real targets.
-pub(crate) fn forward_dct_quant_8x16_t(
-    residual: &[i32; 128],
-    q: &impl Dct,
-) -> ([i32; 128], [f32; 128]) {
-    dct8x16_t(residual, q)
-}
-
-pub(crate) fn forward_dct_quant_16x32_t(
-    residual: &[i32; 512],
-    q: &impl Dct,
-) -> ([i32; 512], [f32; 512]) {
-    dct16x32_t(residual, q)
-}
-
-pub(crate) fn forward_dct_quant_4x4_t(
-    residual: &[i32; 16],
-    q: &impl Dct,
-) -> ([i32; 16], [f32; 16]) {
-    dct4x4_t(residual, q)
-}
-
 #[cfg(test)]
 mod qm_tests {
     use super::*;
+
+    #[test]
+    fn high_quality_qm_taper_preserves_shaping_then_flattens() {
+        assert_eq!(qm_high_quality_t(17), 0.0);
+        assert_eq!(qm_high_quality_t(12), 0.0);
+        assert!((qm_high_quality_t(10) - 0.4).abs() < f32::EPSILON);
+        assert_eq!(qm_high_quality_t(7), 1.0);
+        assert_eq!(qm_high_quality_t(1), 1.0);
+    }
+
+    #[test]
+    fn high_quality_qm_taper_is_format_specific() {
+        // Neither subsampled format flattens at the top any more: measured
+        // 2026-07-27, flattening cost top-band holdout -1.78% at 420 and
+        // -3.20% at 422. Both hold level 8 down to qindex 0.
+        for sub in [1usize, 2] {
+            for qi in [20u8, 12, 7, 1] {
+                assert_eq!(qm_level_law(qi, sub), 8, "sub={sub} qi={qi}");
+            }
+        }
+        // Full-resolution luma is unaffected and stays flat at the top.
+        assert_eq!(qm_level_law(7, 0), QM_FLAT_LEVEL);
+
+        // Full-resolution chroma follows the same bounded transition.
+        assert_eq!(qm_chroma_level_law(12, 0), 2);
+        assert_eq!(qm_chroma_level_law(7, 0), QM_FLAT_LEVEL);
+    }
 
     #[test]
     fn flat_level_preserves_scalar_quantizers() {

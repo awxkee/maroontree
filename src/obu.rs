@@ -74,9 +74,6 @@ pub(crate) fn frame_header_lossless() -> Vec<u8> {
     frame_header_lossless_tiled(1, 1)
 }
 
-/// Like [`frame_header_lossless`] but emits the tile-count increment bits needed
-/// when the frame spans more than one 64x64 superblock (single tile is always
-/// signaled; see `frame_header_lossy_multitile` for the tiling rationale).
 pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8> {
     // Single tile: one `0` stop-bit per dimension that spans >1 superblock.
     let cols = if sb_cols > 1 { vec![false] } else { vec![] };
@@ -84,11 +81,6 @@ pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8>
     frame_header_lossless_impl(&cols, &rows, 0, 0, false, false, true)
 }
 
-/// Multi-tile lossless frame header. `cols_incr` / `rows_incr` are the
-/// `increment_tile_*_log2` bit sequences (computed by the encoder's tiling
-/// planner); when `tile_cols_log2 + tile_rows_log2 > 0` the header also codes
-/// `context_update_tile_id` + `tile_size_bytes_minus_1` (`TileSizeBytes = 4`),
-/// exactly like the lossy multi-tile header.
 pub(crate) fn frame_header_lossless_multitile(
     cols_incr: &[bool],
     rows_incr: &[bool],
@@ -107,8 +99,6 @@ pub(crate) fn frame_header_lossless_multitile(
     )
 }
 
-/// Like [`frame_header_lossless_multitile`] but terminated with `trailing_bits()`
-/// for carriage in a standalone `OBU_FRAME_HEADER` (type 3).
 pub(crate) fn frame_header_lossless_multitile_th(
     cols_incr: &[bool],
     rows_incr: &[bool],
@@ -127,11 +117,6 @@ pub(crate) fn frame_header_lossless_multitile_th(
     )
 }
 
-/// Monochrome (`NumPlanes == 1`) lossless frame header. Identical to
-/// [`frame_header_lossless_multitile`] except the two chroma `DeltaQ` delta-coded
-/// flags are omitted: `quantization_params()` reads them only for
-/// `NumPlanes > 1`, so a monochrome frame must not code them or the decoder
-/// misaligns the bitstream.
 pub(crate) fn frame_header_lossless_mono_multitile(
     cols_incr: &[bool],
     rows_incr: &[bool],
@@ -232,6 +217,8 @@ fn frame_header_lossless_impl(
 pub(crate) fn frame_header_lossy_multitile(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
@@ -246,6 +233,8 @@ pub(crate) fn frame_header_lossy_multitile(
     frame_header_lossy_impl(
         base_q_idx,
         qm,
+        uac_delta,
+        udc_delta,
         cols_incr,
         rows_incr,
         !updating_cdf,
@@ -264,6 +253,8 @@ pub(crate) fn frame_header_lossy_multitile(
 pub(crate) fn frame_header_lossy_multitile_th(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
@@ -278,6 +269,8 @@ pub(crate) fn frame_header_lossy_multitile_th(
     frame_header_lossy_impl(
         base_q_idx,
         qm,
+        uac_delta,
+        udc_delta,
         cols_incr,
         rows_incr,
         !updating_cdf,
@@ -292,12 +285,6 @@ pub(crate) fn frame_header_lossy_multitile_th(
     )
 }
 
-/// Emit a frame as a separate `OBU_FRAME_HEADER` (type 3) followed by an
-/// `OBU_TILE_GROUP` (type 4), rather than a combined `OBU_FRAME` (type 6). This
-/// is the layout libaom/rav1e use for tiled frames; ffmpeg's `av1_frame_merge`
-/// bitstream filter handles it cleanly, whereas a multi-tile combined
-/// `OBU_FRAME` trips its parser in some versions. `frame_header` must already be
-/// terminated with `trailing_bits()` (see [`frame_header_lossy_multitile_th`]).
 pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Vec<u8> {
     let mut out = wrap_obu(ObuType::FrameHeader, frame_header);
     out.extend_from_slice(&wrap_obu(ObuType::TileGroup, tile_group));
@@ -356,11 +343,6 @@ fn write_cdef_params(w: &mut BitWriter, cdef: &CdefParams, mono: bool) {
     }
 }
 
-/// Loop-restoration parameters for the frame header. This encoder only enables
-/// **luma Wiener** restoration with the smallest restoration-unit size (64x64,
-/// `lr_unit_shift = 0`, one unit per superblock); chroma is always
-/// `RESTORE_NONE`. `enabled = false` writes the all-`RESTORE_NONE` form (the
-/// no-op the decoder also runs when restoration is off).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LrParams {
     /// True when luma uses RESTORE_WIENER; false => all planes RESTORE_NONE.
@@ -394,6 +376,8 @@ fn write_lr_params(w: &mut BitWriter, lr: &LrParams, num_planes: usize) {
 fn frame_header_lossy_impl(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     disable_cdf_update: bool,
@@ -430,16 +414,29 @@ fn frame_header_lossy_impl(
     }
     // quantization_params()
     w.f(base_q_idx as u32, 8); // base_q_idx (non-zero -> lossy)
-    w.flag(false); // DeltaQYDc delta_coded
+    {
+        let ydc = crate::quant::Quant::luma_dc_delta_probe(base_q_idx);
+        if ydc != 0 {
+            w.flag(true);
+            w.f((ydc & 0x7f) as u32, 7);
+        } else {
+            w.flag(false); // DeltaQYDc delta_coded
+        }
+    }
     if !mono {
-        let uv_dc = crate::quant::chroma_dc_delta(base_q_idx);
+        let uv_dc = udc_delta;
         if uv_dc != 0 {
             w.flag(true); // DeltaQUDc delta_coded
             w.f((uv_dc & 0x7f) as u32, 7); // su(1+6): 7-bit two's complement
         } else {
             w.flag(false); // DeltaQUDc delta_coded
         }
-        w.flag(false); // DeltaQUAc delta_coded (== 0)
+        if uac_delta != 0 {
+            w.flag(true); // DeltaQUAc delta_coded
+            w.f((uac_delta & 0x7f) as u32, 7); // su(1+6): 7-bit two's complement
+        } else {
+            w.flag(false); // DeltaQUAc delta_coded (== 0)
+        }
     }
     let using_qmatrix = qm.y < 15 || qm.u < 15 || qm.v < 15;
     w.flag(using_qmatrix);
@@ -509,11 +506,6 @@ pub(crate) fn wrap_obu_frame(frame_header: &[u8], tile_data: &[u8]) -> Vec<u8> {
     wrap_obu(ObuType::Frame, &payload)
 }
 
-/// Still sequence header with explicit color encoding and selectable `bit_depth`
-/// (8, 10, or 12). `profile`: 1 = 4:4:4 (8/10-bit), 2 = 4:2:2 or any 12-bit,
-/// 0 = 4:2:0. Writes `color_config()` with the full CICP triplet, range,
-/// bit-depth flags, and (for 4:2:0) chroma sample position. 4:4:4 subsampling
-/// (ss_x = ss_y = 0) is assumed.
 pub(crate) fn sequence_header_cicp(
     width: u32,
     height: u32,
@@ -536,8 +528,6 @@ pub(crate) fn sequence_header_cicp(
     )
 }
 
-/// Like [`sequence_header_cicp`] but with explicit chroma subsampling flags:
-/// `(ss_x, ss_y)` = `(0,0)` → 4:4:4, `(1,0)` → 4:2:2, `(1,1)` → 4:2:0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sequence_header_cicp_ss(
     width: u32,
@@ -563,12 +553,6 @@ pub(crate) fn sequence_header_cicp_ss(
     )
 }
 
-/// Monochrome (`mono_chrome = 1`, `NumPlanes = 1`) sequence header — a single
-/// luma plane, used to encode an AVIF alpha auxiliary image (alpha in AV1 is a
-/// separate grayscale image, not a 4th channel). `mono_chrome` is only coded
-/// when `seq_profile != 1`, so monochrome uses profile 0 (8/10-bit) or 2
-/// (12-bit). `color_description_present_flag` is 0 (CP/TC/MC default to
-/// unspecified, the norm for an alpha plane); `color_range` is still coded.
 pub(crate) fn sequence_header_mono(
     width: u32,
     height: u32,
@@ -616,16 +600,6 @@ pub(crate) fn sequence_header_mono(
     wrap_obu(ObuType::SequenceHeader, &w.into_bytes())
 }
 
-/// Core sequence-header writer with explicit chroma subsampling `ss_x`/`ss_y`
-/// (0/1 each): (0,0) = 4:4:4, (1,0) = 4:2:2, (1,1) = 4:2:0. Subsampling is coded
-/// in `color_config` only for profile 2 at 12-bit (otherwise it is implied by
-/// the profile); `chroma_sample_position` is coded whenever the format is 4:2:0.
-///
-/// `color` is optional: when `None`, `color_description_present_flag` is 0 and
-/// primaries/transfer/matrix default to *_UNSPECIFIED. With no description the
-/// MC_IDENTITY path is unreachable, so `color_range` and the subsampling/CSP
-/// bits are always coded; `color_range` defaults to limited (0) and
-/// `chroma_sample_position` to CSP_UNKNOWN (0).
 #[allow(clippy::too_many_arguments)]
 fn seq_header_ss(
     width: u32,

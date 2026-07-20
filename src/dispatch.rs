@@ -33,8 +33,10 @@ use crate::coder::{
     encode_lossy_tilegroup, pad_to_mult8,
 };
 use crate::color::Cicp;
+use crate::encoding_context::EncodingContext;
 use crate::obu::temporal_delimiter;
 use crate::par::Pool;
+use crate::pixel::Pixel;
 
 #[derive(Clone, Copy)]
 enum PixelLayout<'a> {
@@ -108,13 +110,33 @@ impl PixelLayout<'_> {
     }
 }
 
+fn pad_to_mult8_u16<T: Pixel>(
+    src: &[T],
+    width: usize,
+    height: usize,
+    padded_width: usize,
+    padded_height: usize,
+    bit_depth: u8,
+) -> Vec<u16> {
+    let mut out = Vec::with_capacity(padded_width * padded_height);
+    for row in src.chunks_exact(width).take(height) {
+        out.extend(row.iter().map(|&sample| sample.to_u16_clamped(bit_depth)));
+        let edge = *out.last().expect("plane width must be non-zero");
+        out.resize(out.len() + padded_width - width, edge);
+    }
+    for _ in height..padded_height {
+        out.extend_from_within((height - 1) * padded_width..height * padded_width);
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
-fn encode_lossy_frame(
+fn encode_lossy_frame<T: Pixel>(
     base_q_idx: u8,
     bit_depth: u8,
     width: usize,
     height: usize,
-    planes: [&[i32]; 3],
+    planes: [&[T]; 3],
     layout: PixelLayout<'_>,
     pool: &Pool,
     speed: Speed,
@@ -123,15 +145,49 @@ fn encode_lossy_frame(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     assert!(width > 0 && height > 0, "width/height must be non-zero");
     assert_eq!(planes[0].len(), width * height, "luma plane must be w*h");
+    let (base_q_idx, variance_boost) = {
+        let shift = if aq && variance_boost.enabled {
+            crate::coder::baseq_shift(base_q_idx)
+        } else {
+            0
+        };
+        if shift != 0 {
+            let shifted = (base_q_idx as i32 + shift).clamp(1, 254) as u8;
+            let mut vb = variance_boost;
+            vb.base_shift = shift;
+            // QM + chroma-delta laws must follow the base the DECODER sees.
+            let (sx, sy) = layout.subsampling();
+            let sub = sx + sy;
+            let c = crate::quant::qm_chroma_level_law(shifted, sub);
+            vb.qm = crate::quant::QmLevels {
+                y: crate::quant::qm_level_law(shifted, sub),
+                u: c,
+                v: c,
+            };
+            (shifted, vb)
+        } else {
+            (base_q_idx, variance_boost)
+        }
+    };
 
     let (sub_x, sub_y) = layout.subsampling();
     let monochrome = layout.is_monochrome();
     let (padded_width, padded_height) = (align8(width), align8(height));
+    // Convert/clamp and edge-pad directly into the lossy coder's u16 storage.
     let mut source = [
-        pad_to_mult8(planes[0], width, height, padded_width, padded_height),
+        pad_to_mult8_u16(
+            planes[0],
+            width,
+            height,
+            padded_width,
+            padded_height,
+            bit_depth,
+        ),
         Vec::new(),
         Vec::new(),
     ];
@@ -147,16 +203,18 @@ fn encode_lossy_frame(
                 chroma_width * chroma_height,
                 "chroma plane has invalid dimensions"
             );
-            source[plane] = pad_to_mult8(
+            source[plane] = pad_to_mult8_u16(
                 planes[plane],
                 chroma_width,
                 chroma_height,
                 padded_chroma_width,
                 padded_chroma_height,
+                bit_depth,
             );
         }
     }
 
+    let context = EncodingContext::new(pool, speed, variance_boost);
     let (tilegroup, tiling, cdef_params, restoration_params, allow_intrabc) =
         encode_lossy_tilegroup(
             base_q_idx,
@@ -169,13 +227,13 @@ fn encode_lossy_frame(
             sub_x,
             sub_y,
             monochrome,
-            pool,
-            speed,
+            &context,
             aq,
-            &variance_boost,
             cdef,
             wiener,
             updating_cdf,
+            screen_content,
+            intrabc,
         );
 
     let mut bytes = temporal_delimiter();
@@ -183,6 +241,8 @@ fn encode_lossy_frame(
     bytes.extend_from_slice(&assemble_frame_obus(
         base_q_idx,
         variance_boost.qm,
+        crate::quant::chroma_ac_delta(base_q_idx, sub_x + sub_y),
+        crate::quant::chroma_dc_delta(base_q_idx, sub_x + sub_y),
         &tiling,
         &tilegroup,
         monochrome,
@@ -196,14 +256,14 @@ fn encode_lossy_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_lossy_444(
+pub(crate) fn encode_lossy_444<T: Pixel>(
     base_q_idx: u8,
     bit_depth: u8,
     width: usize,
     height: usize,
-    luma: &[i32],
-    u: &[i32],
-    v: &[i32],
+    luma: &[T],
+    u: &[T],
+    v: &[T],
     color: Option<&Cicp>,
     pool: &Pool,
     speed: Speed,
@@ -212,6 +272,8 @@ pub(crate) fn encode_lossy_444(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -227,18 +289,20 @@ pub(crate) fn encode_lossy_444(
         cdef,
         wiener,
         updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_lossy_422(
+pub(crate) fn encode_lossy_422<T: Pixel>(
     base_q_idx: u8,
     bit_depth: u8,
     width: usize,
     height: usize,
-    luma: &[i32],
-    u: &[i32],
-    v: &[i32],
+    luma: &[T],
+    u: &[T],
+    v: &[T],
     color: Option<&Cicp>,
     pool: &Pool,
     speed: Speed,
@@ -247,6 +311,8 @@ pub(crate) fn encode_lossy_422(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -262,18 +328,20 @@ pub(crate) fn encode_lossy_422(
         cdef,
         wiener,
         updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_lossy_420(
+pub(crate) fn encode_lossy_420<T: Pixel>(
     base_q_idx: u8,
     bit_depth: u8,
     width: usize,
     height: usize,
-    luma: &[i32],
-    u: &[i32],
-    v: &[i32],
+    luma: &[T],
+    u: &[T],
+    v: &[T],
     color: Option<&Cicp>,
     pool: &Pool,
     speed: Speed,
@@ -282,6 +350,8 @@ pub(crate) fn encode_lossy_420(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -297,16 +367,18 @@ pub(crate) fn encode_lossy_420(
         cdef,
         wiener,
         updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_lossy_monochrome(
+pub(crate) fn encode_lossy_monochrome<T: Pixel>(
     base_q_idx: u8,
     bit_depth: u8,
     width: usize,
     height: usize,
-    luma: &[i32],
+    luma: &[T],
     full_range: bool,
     threads: usize,
     speed: Speed,
@@ -315,6 +387,8 @@ pub(crate) fn encode_lossy_monochrome(
     cdef: bool,
     wiener: bool,
     updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
     encode_lossy_frame(
@@ -331,9 +405,12 @@ pub(crate) fn encode_lossy_monochrome(
         cdef,
         wiener,
         updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossless_monochrome(
     bit_depth: u8,
     width: usize,
@@ -370,4 +447,53 @@ pub(crate) fn encode_lossless_monochrome(
         updating_cdf,
     ));
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static U16_CONVERSIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    struct DirectPixel(u16);
+
+    impl Pixel for DirectPixel {
+        fn to_i32(self) -> i32 {
+            panic!("u16 padding must not widen through i32")
+        }
+
+        fn to_u16_clamped(self, bit_depth: u8) -> u16 {
+            U16_CONVERSIONS.fetch_add(1, Ordering::Relaxed);
+            self.0.min((1u16 << bit_depth) - 1)
+        }
+
+        fn to_f32(self) -> f32 {
+            panic!("u16 padding must not convert through f32")
+        }
+
+        fn from_i32_clamped(_v: i32, _bit_depth: u8) -> Self {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn u16_conversion_and_padding_share_one_pass() {
+        U16_CONVERSIONS.store(0, Ordering::Relaxed);
+        let src = [
+            DirectPixel(12),
+            DirectPixel(300),
+            DirectPixel(5),
+            DirectPixel(40),
+        ];
+        let padded = pad_to_mult8_u16(&src, 2, 2, 8, 8, 8);
+
+        assert_eq!(U16_CONVERSIONS.load(Ordering::Relaxed), src.len());
+        assert_eq!(&padded[..8], &[12, 255, 255, 255, 255, 255, 255, 255]);
+        assert_eq!(&padded[8..16], &[5, 40, 40, 40, 40, 40, 40, 40]);
+        for row in padded[16..].chunks_exact(8) {
+            assert_eq!(row, &padded[8..16]);
+        }
+    }
 }
