@@ -36,6 +36,7 @@ pub(crate) struct Writer {
     cnt: i16,
     low: EcWin,
     precarry: Vec<u16>,
+    updating_cdf: bool,
 }
 
 impl Default for Writer {
@@ -51,7 +52,13 @@ impl Writer {
             cnt: -9,
             low: 0,
             precarry: Vec::new(),
+            updating_cdf: true,
         }
+    }
+
+    pub(crate) fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
+        self.updating_cdf = updating_cdf;
+        self
     }
 
     #[inline]
@@ -104,6 +111,15 @@ impl Writer {
             "cdf not decreasing"
         );
         self.store(fl, fh, nms as u16);
+    }
+
+    /// Encode a symbol and update its persistent AV1 inverse CDF.
+    #[inline]
+    pub(crate) fn symbol_adapt(&mut self, s: usize, cdf: &mut [u16]) {
+        self.symbol(s as u32, cdf);
+        if self.updating_cdf {
+            crate::odec::update_cdf(cdf, s);
+        }
     }
 
     /// Encode a single bool with probability-of-true `f` (Q15).

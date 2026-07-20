@@ -177,6 +177,8 @@ pub(crate) struct OdEcEncoder {
     /// skipping all entropy-coding work. Bytes from a sink encoder are
     /// meaningless — never call `done()` expecting output.
     pub(crate) sink: bool,
+    /// Whether `encode_symbol` mutates its CDF after coding the symbol.
+    pub(crate) updating_cdf: bool,
 }
 
 impl Default for OdEcEncoder {
@@ -194,7 +196,13 @@ impl OdEcEncoder {
             precarry: Vec::new(),
             trace: None,
             sink: false,
+            updating_cdf: true,
         }
+    }
+
+    pub(crate) fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
+        self.updating_cdf = updating_cdf;
+        self
     }
 
     /// Start recording every subsequent `store` into a fresh trace.
@@ -309,7 +317,9 @@ impl OdEcEncoder {
     /// Encode symbol `s`, then adapt `cdf` (dav1d-compatible).
     pub(crate) fn encode_symbol(&mut self, s: usize, cdf: &mut [u16]) {
         self.encode_symbol_noupdate(s, cdf);
-        update_cdf(cdf, s);
+        if self.updating_cdf {
+            update_cdf(cdf, s);
+        }
     }
 
     /// `ns(n)` — non-symmetric flat coding of a value in `0..n` (spec 4.10.7).

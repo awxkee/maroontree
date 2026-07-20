@@ -124,6 +124,7 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            updating_cdf: true,
             dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
             dec_live: false,
             sb_mode: SbMode::Off,
@@ -187,6 +188,7 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            updating_cdf: true,
             dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
             dec_live: false,
             sb_mode: SbMode::Off,
@@ -249,6 +251,7 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            updating_cdf: true,
             dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
             dec_live: false,
             sb_mode: SbMode::Off,
@@ -311,6 +314,7 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)),
+            updating_cdf: true,
             dec_cdfs: Cdfs::decision_snapshot(crate::coef_q::qcat(q)),
             dec_live: false,
             sb_mode: SbMode::Off,
@@ -1305,6 +1309,12 @@ impl<'a> LossyTile<'a> {
     /// builder-style chaining at tile construction.
     fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        self
+    }
+
+    fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
+        self.updating_cdf = updating_cdf;
+        self.enc.updating_cdf = updating_cdf;
         self
     }
 

@@ -69,7 +69,8 @@ pub(crate) fn encode_av1_lossless(
         .with_chroma(chroma_fmt)
         .with_cicp(color)
         .with_threads(args.threads)
-        .with_speed(args.speed.to_maroontreee());
+        .with_speed(args.speed.to_maroontreee())
+        .with_updating_cdf(args.updating_cdf);
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());

@@ -57,12 +57,14 @@
 
 use crate::color::Cicp;
 use crate::encoder::{
-    encode_lossy_gray_obu, encode_still_lossy, encode_still_lossy_420, encode_still_lossy_422,
-    encode_yuv420_obu, encode_yuv422_obu, encode_yuv444_obu,
+    encode_lossless_gray_obu_with_cdf, encode_lossy_gray_obu, encode_still_lossy,
+    encode_still_lossy_420, encode_still_lossy_420_with_cdf, encode_still_lossy_422,
+    encode_still_lossy_422_with_cdf, encode_still_lossy_with_cdf, encode_yuv420_obu,
+    encode_yuv422_obu, encode_yuv444_obu,
 };
 use crate::err::EncodeError;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
-use crate::{BitDepth, PlanarImage, encode_lossless_gray_obu, isobmff};
+use crate::{BitDepth, PlanarImage, isobmff};
 use std::num::NonZeroUsize;
 
 const MIN_DIM: u32 = 1;
@@ -169,6 +171,8 @@ pub struct EncodeConfig {
     /// [`Speed::Slow`]. In lossless mode, only Slow refines directional modes
     /// with nonzero angle deltas.
     pub speed: Speed,
+    /// Update AV1 entropy CDFs after each coded symbol. Enabled by default.
+    pub updating_cdf: bool,
     pub adaptive_quant: bool,
     /// Enable the AV2-style **Variance Boost** adaptive-quantization scheme on the
     /// AV1 path (octile of the 64 8x8-subblock variances per superblock), instead of
@@ -209,6 +213,7 @@ impl Default for EncodeConfig {
                 .unwrap_or(NonZeroUsize::new(1).unwrap())
                 .get(),
             speed: Speed::Slow,
+            updating_cdf: true,
             adaptive_quant: true,
             variance_boost: true,
             dark_aq: true,
@@ -282,6 +287,12 @@ impl EncodeConfig {
     /// Set the RDO effort level for AV1 lossy and lossless paths. See [`Speed`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        self
+    }
+
+    /// Enable or disable AV1 CDF adaptation for both lossless and lossy paths.
+    pub fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
+        self.updating_cdf = updating_cdf;
         self
     }
 
@@ -521,16 +532,35 @@ fn dispatch_lossy<T: crate::Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     match chroma {
         ChromaFormat::Yuv420 | ChromaFormat::Monochrome => {
-            encode_still_lossy_420(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            if updating_cdf {
+                encode_still_lossy_420(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            } else {
+                encode_still_lossy_420_with_cdf(
+                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
+                )
+            }
         }
         ChromaFormat::Yuv422 => {
-            encode_still_lossy_422(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            if updating_cdf {
+                encode_still_lossy_422(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            } else {
+                encode_still_lossy_422_with_cdf(
+                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
+                )
+            }
         }
         ChromaFormat::Yuv444 => {
-            encode_still_lossy(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            if updating_cdf {
+                encode_still_lossy(img, q, color, threads, speed, aq, vb, cdef, wiener)
+            } else {
+                encode_still_lossy_with_cdf(
+                    img, q, color, threads, speed, aq, vb, cdef, wiener, false,
+                )
+            }
         }
     }
 }
@@ -558,6 +588,7 @@ pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -586,6 +617,7 @@ pub fn encode_rgba8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -620,8 +652,14 @@ pub fn encode_rgba8_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -656,6 +694,7 @@ pub fn encode_rgb10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(
         obu,
@@ -691,6 +730,7 @@ pub fn encode_rgba10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(
         obu,
@@ -728,8 +768,14 @@ pub fn encode_rgba10_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -765,6 +811,7 @@ pub fn encode_rgb12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(
         obu,
@@ -800,6 +847,7 @@ pub fn encode_rgba12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
     finalize_color(
         obu,
@@ -840,8 +888,14 @@ pub fn encode_rgba12_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     );
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -876,6 +930,7 @@ pub fn encode_gray8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(
         obu,
@@ -909,6 +964,7 @@ pub fn encode_gray10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(
         obu,
@@ -942,6 +998,7 @@ pub fn encode_gray12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(
         obu,
@@ -976,6 +1033,7 @@ pub fn encode_yuv8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(obu, img.width as u32, img.height as u32, 8, cfg.chroma, cfg)
 }
@@ -1003,6 +1061,7 @@ pub fn encode_yuv10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(
         obu,
@@ -1037,6 +1096,7 @@ pub fn encode_yuv12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
     finalize_color(
         obu,
@@ -1075,8 +1135,14 @@ pub fn encode_yuva8_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1113,8 +1179,14 @@ pub fn encode_yuva10_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1152,8 +1224,14 @@ pub fn encode_yuva12_with_alpha(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_4(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_4(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1189,8 +1267,14 @@ pub fn encode_gray_alpha8(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_2(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1226,8 +1310,14 @@ pub fn encode_gray_alpha10(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_2(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1263,8 +1353,14 @@ pub fn encode_gray_alpha12(
         cfg.vb(),
         cfg.cdef,
         cfg.wiener,
+        cfg.updating_cdf,
     )?;
-    let alpha_obu = encode_lossless_gray_obu(&img.packed_alpha_2(), true, cfg.threads)?;
+    let alpha_obu = encode_lossless_gray_obu_with_cdf(
+        &img.packed_alpha_2(),
+        true,
+        cfg.threads,
+        cfg.updating_cdf,
+    )?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1289,6 +1385,7 @@ fn dispatch_yuv_u8(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
@@ -1303,6 +1400,7 @@ fn dispatch_yuv_u8(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
         ChromaFormat::Yuv422 => encode_yuv422_obu(
             planar_image,
@@ -1315,6 +1413,7 @@ fn dispatch_yuv_u8(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => encode_yuv444_obu(
             planar_image,
@@ -1327,6 +1426,7 @@ fn dispatch_yuv_u8(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
     }
 }
@@ -1344,6 +1444,7 @@ fn dispatch_yuv_u16(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_with(chroma)?;
     match chroma {
@@ -1358,6 +1459,7 @@ fn dispatch_yuv_u16(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
         ChromaFormat::Yuv422 => encode_yuv422_obu(
             planar_image,
@@ -1370,6 +1472,7 @@ fn dispatch_yuv_u16(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => encode_yuv444_obu(
             planar_image,
@@ -1382,6 +1485,7 @@ fn dispatch_yuv_u16(
             vb,
             cdef,
             wiener,
+            updating_cdf,
         ),
     }
 }

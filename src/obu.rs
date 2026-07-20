@@ -81,7 +81,7 @@ pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8>
     // Single tile: one `0` stop-bit per dimension that spans >1 superblock.
     let cols = if sb_cols > 1 { vec![false] } else { vec![] };
     let rows = if sb_rows > 1 { vec![false] } else { vec![] };
-    frame_header_lossless_impl(&cols, &rows, 0, 0, false, false)
+    frame_header_lossless_impl(&cols, &rows, 0, 0, false, false, true)
 }
 
 /// Multi-tile lossless frame header. `cols_incr` / `rows_incr` are the
@@ -94,6 +94,7 @@ pub(crate) fn frame_header_lossless_multitile(
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -102,6 +103,7 @@ pub(crate) fn frame_header_lossless_multitile(
         tile_rows_log2,
         false,
         false,
+        updating_cdf,
     )
 }
 
@@ -112,6 +114,7 @@ pub(crate) fn frame_header_lossless_multitile_th(
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -120,6 +123,7 @@ pub(crate) fn frame_header_lossless_multitile_th(
         tile_rows_log2,
         true,
         false,
+        updating_cdf,
     )
 }
 
@@ -133,6 +137,7 @@ pub(crate) fn frame_header_lossless_mono_multitile(
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -141,6 +146,7 @@ pub(crate) fn frame_header_lossless_mono_multitile(
         tile_rows_log2,
         false,
         true,
+        updating_cdf,
     )
 }
 
@@ -151,6 +157,7 @@ pub(crate) fn frame_header_lossless_mono_multitile_th(
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -159,6 +166,7 @@ pub(crate) fn frame_header_lossless_mono_multitile_th(
         tile_rows_log2,
         true,
         true,
+        updating_cdf,
     )
 }
 
@@ -169,11 +177,14 @@ fn frame_header_lossless_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     // (reduced_still_picture_header => frame_type=KEY_FRAME, show_frame=1,
     //  error_resilient_mode=1, frame_size_override=0, etc., none coded)
-    w.flag(true); // disable_cdf_update = 1 (encoder is non-adaptive; decoder must not adapt)
+    // The lossless tile writer freezes or updates every decoder-visible CDF
+    // consistently with this frame flag.
+    w.flag(!updating_cdf); // disable_cdf_update
     // The lossless tile writer evaluates AV1 palette mode for every eligible
     // block, so screen-content tools must be enabled even when no block wins.
     w.flag(true); // allow_screen_content_tools (seq force = SELECT)
@@ -230,13 +241,14 @@ pub(crate) fn frame_header_lossy_multitile(
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
         qm,
         cols_incr,
         rows_incr,
-        false,
+        !updating_cdf,
         tile_cols_log2,
         tile_rows_log2,
         false,
@@ -261,13 +273,14 @@ pub(crate) fn frame_header_lossy_multitile_th(
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
         qm,
         cols_incr,
         rows_incr,
-        false,
+        !updating_cdf,
         tile_cols_log2,
         tile_rows_log2,
         true,
@@ -395,7 +408,7 @@ fn frame_header_lossy_impl(
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
-    w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive image path, 1 = static isolated APIs)
+    w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive, 1 = static)
     w.flag(true); // allow_screen_content_tools (lossy luma palette enabled)
     w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different

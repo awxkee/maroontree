@@ -28,7 +28,7 @@
  */
 
 use crate::Speed;
-use crate::cdf_tables as C;
+use crate::coder::Cdfs;
 use crate::coefs::encode_coefs;
 use crate::cost::coef_rate_bits;
 use crate::intrapred::{INTRA_MODE_CTX, intra_predict_nd_ad_i16, palette_pred};
@@ -622,8 +622,8 @@ fn get_partition_ctx(a: &[u8], l: &[u8], bl: usize, x8: usize, y8: usize) -> usi
 /// Probability (0..32768) for the binary `is_split` decision at a frame edge.
 /// `top` → `gather_top_partition_prob` (have_h only), else
 /// `gather_left_partition_prob` (have_v only). Operates directly on the icdf
-/// partition CDF (cdf_tables already store dav1d's inverse-cdf entries).
-fn gather_split_prob(cdf: &[u16; 10], top: bool) -> u16 {
+/// partition CDF.
+fn gather_split_prob(cdf: &[u16], top: bool) -> u16 {
     let i = |s: usize| cdf[s] as i32;
     let out = if top {
         (i(1) - i(4)) + i(5) + (i(8) - i(7))
@@ -639,6 +639,7 @@ fn gather_split_prob(cdf: &[u16; 10], top: bool) -> u16 {
 #[allow(clippy::too_many_arguments)]
 fn encode_plane_block(
     w: &mut Writer,
+    cdfs: &mut Cdfs,
     plane: &[i16],
     stride: usize,
     bx: usize,
@@ -720,7 +721,7 @@ fn encode_plane_block(
                 }
             }
             levels_from_resid(&mut resid);
-            let res_ctx = encode_coefs(w, chroma, &resid, skip_ctx, dc_sign_ctx);
+            let res_ctx = encode_coefs(w, cdfs, chroma, &resid, skip_ctx, dc_sign_ctx);
             a[ax] = res_ctx;
             l[ly] = res_ctx;
         }
@@ -1015,6 +1016,7 @@ struct LlState {
     base: i32,
     bit_depth: u8,
     angle_delta_rdo: bool,
+    cdfs: Box<Cdfs>,
     a_coef: [Vec<u8>; 3],
     l_coef: [Vec<u8>; 3],
     a_part: Vec<u8>,
@@ -1036,31 +1038,17 @@ fn write_block_skip(
     size: usize,
     skip: bool,
 ) {
-    const RAW: [u16; 3] = [31671, 16515, 4576];
     let (x4, y4, n4) = (px / 4, py / 4, size / 4);
     let ctx = usize::from(st.a_skip[x4]) + usize::from(st.l_skip[y4]);
-    write_raw_symbol(wr, usize::from(skip), &[RAW[ctx]]);
+    wr.symbol_adapt(usize::from(skip), &mut st.cdfs.skip[ctx]);
     st.a_skip[x4..x4 + n4].fill(skip as u8);
     st.l_skip[y4..y4 + n4].fill(skip as u8);
 }
 
-fn write_raw_symbol(wr: &mut Writer, symbol: usize, raw: &[u16]) {
-    let mut cdf = Vec::with_capacity(raw.len() + 1);
-    cdf.extend(raw.iter().map(|&v| 32768 - v));
-    cdf.push(0);
-    wr.symbol(symbol as u32, &cdf);
-}
-
-fn write_intrabc_mv_component(wr: &mut Writer, diff: i32) {
+fn write_intrabc_mv_component(wr: &mut Writer, cdfs: &mut Cdfs, component: usize, diff: i32) {
     debug_assert_ne!(diff, 0);
     debug_assert_eq!(diff & 7, 0);
-    const CLASSES: [u16; 10] = [
-        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767,
-    ];
-    const CLASS_N: [u16; 10] = [
-        17408, 17920, 18944, 20480, 22528, 24576, 28672, 29952, 29952, 30720,
-    ];
-    write_raw_symbol(wr, usize::from(diff < 0), &[16384]);
+    wr.symbol_adapt(usize::from(diff < 0), &mut cdfs.mv_sign[component]);
     let up = diff.unsigned_abs() as usize / 8 - 1;
     let class = if up <= 1 {
         0
@@ -1068,26 +1056,26 @@ fn write_intrabc_mv_component(wr: &mut Writer, diff: i32) {
         usize::BITS as usize - 1 - up.leading_zeros() as usize
     };
     debug_assert!(class <= 10);
-    write_raw_symbol(wr, class, &CLASSES);
+    wr.symbol_adapt(class, &mut cdfs.mv_classes[component]);
     if class == 0 {
-        write_raw_symbol(wr, up, &[27648]);
+        wr.symbol_adapt(up, &mut cdfs.mv_class0[component]);
     } else {
-        for (n, &cdf) in CLASS_N.iter().enumerate().take(class) {
-            write_raw_symbol(wr, (up >> n) & 1, &[cdf]);
+        for n in 0..class {
+            wr.symbol_adapt((up >> n) & 1, &mut cdfs.mv_class_n[component][n]);
         }
     }
 }
 
-fn write_intrabc_mv(wr: &mut Writer, mv: (i16, i16), pred: (i16, i16)) {
+fn write_intrabc_mv(wr: &mut Writer, cdfs: &mut Cdfs, mv: (i16, i16), pred: (i16, i16)) {
     let dy = i32::from(mv.0) - i32::from(pred.0);
     let dx = i32::from(mv.1) - i32::from(pred.1);
     let joint = usize::from(dx != 0) | (usize::from(dy != 0) << 1);
-    write_raw_symbol(wr, joint, &[4096, 11264, 19328]);
+    wr.symbol_adapt(joint, &mut cdfs.mv_joint);
     if dy != 0 {
-        write_intrabc_mv_component(wr, dy);
+        write_intrabc_mv_component(wr, cdfs, 0, dy);
     }
     if dx != 0 {
-        write_intrabc_mv_component(wr, dx);
+        write_intrabc_mv_component(wr, cdfs, 1, dx);
     }
 }
 
@@ -1265,7 +1253,7 @@ fn palette_color_ctx(map: &[u8], stride: usize, y: usize, x: usize, size: usize)
     (ctx, symbol)
 }
 
-fn write_palette_map(wr: &mut Writer, palette: &LumaPalette) {
+fn write_palette_map(wr: &mut Writer, cdfs: &mut Cdfs, palette: &LumaPalette) {
     let size = palette.colors.len();
     write_uniform(wr, size, palette.map[0] as usize);
     for diagonal in 1..palette.width + palette.height - 1 {
@@ -1274,7 +1262,7 @@ fn write_palette_map(wr: &mut Writer, palette: &LumaPalette) {
         for x in (last_x..=first_x).rev() {
             let y = diagonal - x;
             let (ctx, symbol) = palette_color_ctx(&palette.map, palette.width, y, x, size);
-            write_raw_symbol(wr, symbol, palette_y_color_raw(size, ctx));
+            wr.symbol_adapt(symbol, &mut cdfs.palette_y_color[size - 2][ctx]);
         }
     }
 }
@@ -1373,10 +1361,10 @@ fn code_leaf(
     write_block_skip(wr, st, px, py, size, intrabc);
     // `allow_intrabc` is frame-wide, so every block carries this flag. The
     // default CDF strongly favours ordinary intra blocks.
-    write_raw_symbol(wr, intrabc as usize, &[30531]);
+    wr.symbol_adapt(intrabc as usize, &mut st.cdfs.intrabc);
     if intrabc {
         let candidate = candidate.unwrap();
-        write_intrabc_mv(wr, candidate.mv, predictor.unwrap());
+        write_intrabc_mv(wr, &mut st.cdfs, candidate.mv, predictor.unwrap());
 
         let u8sz = size / 8;
         st.a_mode[x8..x8 + u8sz].fill(0);
@@ -1419,30 +1407,31 @@ fn code_leaf(
         (y_mode, y_delta)
     };
 
-    let kfy = icdf13(
-        &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
-            [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
-    );
-    wr.symbol(y_mode as u32, &kfy);
+    let y_ctx = INTRA_MODE_CTX[st.a_mode[x8] as usize] * 5 + INTRA_MODE_CTX[st.l_mode[y8] as usize];
+    wr.symbol_adapt(y_mode, &mut st.cdfs.kf_y[y_ctx]);
     if (1..=8).contains(&y_mode) {
-        wr.symbol((y_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1]));
+        wr.symbol_adapt((y_delta + 3) as usize, &mut st.cdfs.angle_delta[y_mode - 1]);
     }
-    let uvc = icdf13(&UV_MODE_NOCFL_CDF[y_mode]);
-    wr.symbol(uv_mode as u32, &uvc);
+    wr.symbol_adapt(uv_mode, &mut st.cdfs.uv_mode[y_mode]);
     if (1..=8).contains(&uv_mode) {
-        wr.symbol((uv_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[uv_mode - 1]));
+        wr.symbol_adapt(
+            (uv_delta + 3) as usize,
+            &mut st.cdfs.angle_delta[uv_mode - 1],
+        );
     }
     let bsize_ctx = palette_bsize_ctx(size);
     let mode_ctx =
         usize::from(!st.a_palette[x8].is_empty()) + usize::from(!st.l_palette[y8].is_empty());
     if y_mode == 0 {
-        write_raw_symbol(
-            wr,
+        wr.symbol_adapt(
             usize::from(palette.is_some()),
-            &[palette_y_mode_raw(bsize_ctx, mode_ctx)],
+            &mut st.cdfs.palette_y_mode[bsize_ctx][mode_ctx],
         );
         if let Some(palette) = palette {
-            write_raw_symbol(wr, palette.colors.len() - 2, palette_y_size_raw(bsize_ctx));
+            wr.symbol_adapt(
+                palette.colors.len() - 2,
+                &mut st.cdfs.palette_y_size[bsize_ctx],
+            );
             let cache = palette_cache(&st.a_palette[x8], &st.l_palette[y8], !py.is_multiple_of(64));
             write_palette_colors(wr, &palette.colors, &cache, st.bit_depth);
         }
@@ -1450,11 +1439,13 @@ fn code_leaf(
     if uv_mode == 0 {
         // No chroma palette is selected. The context is one when luma uses a
         // palette and zero otherwise.
-        let raw = if palette.is_some() { 21488 } else { 32461 };
-        write_raw_symbol(wr, 0, &[raw]);
+        wr.symbol_adapt(
+            0,
+            &mut st.cdfs.palette_uv_mode[usize::from(palette.is_some())],
+        );
     }
     if let Some(palette) = palette {
-        write_palette_map(wr, palette);
+        write_palette_map(wr, &mut st.cdfs, palette);
     }
     let u8sz = size / 8;
     for u in x8..x8 + u8sz {
@@ -1475,6 +1466,7 @@ fn code_leaf(
     for plane in 0..3 {
         encode_plane_block(
             wr,
+            &mut st.cdfs,
             planes[plane],
             st.w,
             px,
@@ -1492,39 +1484,27 @@ fn code_leaf(
     }
 }
 
-/// Convert a 12-entry dav1d raw CDF to the writer's inverse-cdf form (`32768-p`,
-/// trailing 0).
-#[inline]
-fn icdf13(raw: &[u16; 12]) -> [u16; 13] {
-    let mut o = [0u16; 13];
-    for (ov, &rv) in o.iter_mut().zip(raw.iter()) {
-        *ov = 32768 - rv;
-    }
-    o
-}
-
-/// Convert a 6-entry dav1d raw CDF (angle_delta, 7 symbols) to inverse-cdf form.
-#[inline]
-fn icdf7(raw: &[u16; 6]) -> [u16; 7] {
-    let mut o = [0u16; 7];
-    for (ov, &rv) in o.iter_mut().zip(raw.iter()) {
-        *ov = 32768 - rv;
-    }
-    o
-}
-
 /// Edge-aware partition recursion for lossless. A fully-in-frame 64×64
 /// superblock is one `PARTITION_NONE` block (the validated path); any block
 /// crossing the frame edge is split (4-way, or the constrained split-or-horz /
 /// split-or-vert bool, or an implicit split) down to 8×8 leaves, all square.
-/// Partition CDF for a node at level `bl` and the given context.
-fn part_cdf(st: &LlState, bl: usize, x8: usize, y8: usize) -> &[u16] {
+fn partition_ctx(st: &LlState, bl: usize, x8: usize, y8: usize) -> usize {
+    get_partition_ctx(&st.a_part, &st.l_part, bl, x8, y8)
+}
+
+fn write_partition_symbol(
+    wr: &mut Writer,
+    st: &mut LlState,
+    bl: usize,
+    x8: usize,
+    y8: usize,
+    symbol: usize,
+) {
     let ctx = get_partition_ctx(&st.a_part, &st.l_part, bl, x8, y8);
-    match bl {
-        1 => &C::PART_SPLIT_64[ctx],
-        2 => &C::PART_SPLIT_32[ctx],
-        3 => &C::PART_SPLIT_16[ctx],
-        _ => &C::PART_8[ctx],
+    if bl == 4 {
+        wr.symbol_adapt(symbol, &mut st.cdfs.part_bl8[ctx]);
+    } else {
+        wr.symbol_adapt(symbol, &mut st.cdfs.part_split[bl - 1][ctx]);
     }
 }
 
@@ -1559,7 +1539,7 @@ fn encode_plan(
             palette,
             intrabc,
         } => {
-            wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
+            write_partition_symbol(wr, st, bl, x8, y8, 0); // PARTITION_NONE
             code_leaf(
                 wr,
                 planes,
@@ -1583,7 +1563,7 @@ fn encode_plan(
             }
         }
         Plan::Split(kids) => {
-            wr.symbol(3, part_cdf(st, bl, x8, y8)); // PARTITION_SPLIT
+            write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
             let hh = sz8 / 2;
             let corners = [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)];
             for (i, (cx, cy)) in corners.into_iter().enumerate() {
@@ -1627,8 +1607,7 @@ fn decode_sb_ll(
     }
     if sz8 == 1 {
         // 8x8 leaf (in-frame for multiple-of-8 dims): mode-search and code
-        let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
-        wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
+        write_partition_symbol(wr, st, 4, x8, y8, 0); // PARTITION_NONE
         let (_b, ym, yd, uv, uvd, palette, intrabc) = best_leaf(
             planes,
             st.w,
@@ -1664,13 +1643,20 @@ fn decode_sb_ll(
     let hh = sz8 / 2;
     let have_h = (x8 + hh) * 8 < st.w;
     let have_v = (y8 + hh) * 8 < st.h;
-    let cdf = part_cdf(st, bl, x8, y8);
     if have_h && have_v {
-        wr.symbol(3, cdf); // PARTITION_SPLIT
+        write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
     } else if have_h {
-        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), true));
+        let ctx = partition_ctx(st, bl, x8, y8);
+        wr.bool(
+            true,
+            gather_split_prob(&st.cdfs.part_split[bl - 1][ctx], true),
+        );
     } else if have_v {
-        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), false));
+        let ctx = partition_ctx(st, bl, x8, y8);
+        wr.bool(
+            true,
+            gather_split_prob(&st.cdfs.part_split[bl - 1][ctx], false),
+        );
     }
     for (cx, cy) in [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)] {
         if cx * 8 < st.w && cy * 8 < st.h {
@@ -1694,12 +1680,13 @@ pub fn encode_tile_lossless(
     bit_depth: u8,
     planes: [&[i16]; 3],
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
         "width/height must be multiples of 8"
     );
-    let mut wr = Writer::new();
+    let mut wr = Writer::new().with_updating_cdf(updating_cdf);
     let mut st = LlState {
         w,
         h,
@@ -1708,6 +1695,7 @@ pub fn encode_tile_lossless(
         base: 1i32 << (bit_depth - 1),
         bit_depth,
         angle_delta_rdo: speed.try_angle_deltas(),
+        cdfs: Box::new(Cdfs::new_lossless(updating_cdf)),
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
@@ -1922,10 +1910,10 @@ fn code_leaf_mono(
             && (i32::from(candidate.mv.1) - i32::from(pred.1)).unsigned_abs() <= 16_384
     });
     write_block_skip(wr, st, px, py, size, intrabc);
-    write_raw_symbol(wr, intrabc as usize, &[30531]);
+    wr.symbol_adapt(intrabc as usize, &mut st.cdfs.intrabc);
     if intrabc {
         let candidate = candidate.unwrap();
-        write_intrabc_mv(wr, candidate.mv, predictor.unwrap());
+        write_intrabc_mv(wr, &mut st.cdfs, candidate.mv, predictor.unwrap());
         let u8sz = size / 8;
         st.a_mode[x8..x8 + u8sz].fill(0);
         st.l_mode[y8..y8 + u8sz].fill(0);
@@ -1953,28 +1941,27 @@ fn code_leaf_mono(
     } else {
         (y_mode, y_delta)
     };
-    let kfy = icdf13(
-        &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
-            [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
-    );
-    wr.symbol(y_mode as u32, &kfy);
+    let y_ctx = INTRA_MODE_CTX[st.a_mode[x8] as usize] * 5 + INTRA_MODE_CTX[st.l_mode[y8] as usize];
+    wr.symbol_adapt(y_mode, &mut st.cdfs.kf_y[y_ctx]);
     if (1..=8).contains(&y_mode) {
-        wr.symbol((y_delta + 3) as u32, &icdf7(&ANGLE_DELTA_CDF[y_mode - 1]));
+        wr.symbol_adapt((y_delta + 3) as usize, &mut st.cdfs.angle_delta[y_mode - 1]);
     }
     let bsize_ctx = palette_bsize_ctx(size);
     let mode_ctx =
         usize::from(!st.a_palette[x8].is_empty()) + usize::from(!st.l_palette[y8].is_empty());
     if y_mode == 0 {
-        write_raw_symbol(
-            wr,
+        wr.symbol_adapt(
             usize::from(palette.is_some()),
-            &[palette_y_mode_raw(bsize_ctx, mode_ctx)],
+            &mut st.cdfs.palette_y_mode[bsize_ctx][mode_ctx],
         );
         if let Some(palette) = palette {
-            write_raw_symbol(wr, palette.colors.len() - 2, palette_y_size_raw(bsize_ctx));
+            wr.symbol_adapt(
+                palette.colors.len() - 2,
+                &mut st.cdfs.palette_y_size[bsize_ctx],
+            );
             let cache = palette_cache(&st.a_palette[x8], &st.l_palette[y8], !py.is_multiple_of(64));
             write_palette_colors(wr, &palette.colors, &cache, st.bit_depth);
-            write_palette_map(wr, palette);
+            write_palette_map(wr, &mut st.cdfs, palette);
         }
     }
     // (mono: HasChroma == false ⇒ no uv_mode symbol, no chroma residual)
@@ -1994,6 +1981,7 @@ fn code_leaf_mono(
     }
     encode_plane_block(
         wr,
+        &mut st.cdfs,
         luma,
         st.w,
         px,
@@ -2030,7 +2018,7 @@ fn encode_plan_mono(
             intrabc,
             ..
         } => {
-            wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
+            write_partition_symbol(wr, st, bl, x8, y8, 0); // PARTITION_NONE
             code_leaf_mono(
                 wr,
                 luma,
@@ -2048,7 +2036,7 @@ fn encode_plan_mono(
             st.l_part[y8..y8 + sz8].fill(pb);
         }
         Plan::Split(kids) => {
-            wr.symbol(3, part_cdf(st, bl, x8, y8)); // PARTITION_SPLIT
+            write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
             let hh = sz8 / 2;
             let corners = [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)];
             for (i, (cx, cy)) in corners.into_iter().enumerate() {
@@ -2088,8 +2076,7 @@ fn decode_sb_ll_mono(
         return;
     }
     if sz8 == 1 {
-        let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
-        wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
+        write_partition_symbol(wr, st, 4, x8, y8, 0); // PARTITION_NONE
         let (_b, ym, yd, palette, intrabc) = best_leaf_mono(
             luma,
             st.w,
@@ -2111,13 +2098,20 @@ fn decode_sb_ll_mono(
     let hh = sz8 / 2;
     let have_h = (x8 + hh) * 8 < st.w;
     let have_v = (y8 + hh) * 8 < st.h;
-    let cdf = part_cdf(st, bl, x8, y8);
     if have_h && have_v {
-        wr.symbol(3, cdf); // PARTITION_SPLIT
+        write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
     } else if have_h {
-        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), true));
+        let ctx = partition_ctx(st, bl, x8, y8);
+        wr.bool(
+            true,
+            gather_split_prob(&st.cdfs.part_split[bl - 1][ctx], true),
+        );
     } else if have_v {
-        wr.bool(true, gather_split_prob(cdf.try_into().unwrap(), false));
+        let ctx = partition_ctx(st, bl, x8, y8);
+        wr.bool(
+            true,
+            gather_split_prob(&st.cdfs.part_split[bl - 1][ctx], false),
+        );
     }
     for (cx, cy) in [(x8, y8), (x8 + hh, y8), (x8, y8 + hh), (x8 + hh, y8 + hh)] {
         if cx * 8 < st.w && cy * 8 < st.h {
@@ -2137,12 +2131,13 @@ pub fn encode_tile_lossless_mono(
     bit_depth: u8,
     luma: &[i16],
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     assert!(
         w.is_multiple_of(8) && h.is_multiple_of(8),
         "width/height must be multiples of 8"
     );
-    let mut wr = Writer::new();
+    let mut wr = Writer::new().with_updating_cdf(updating_cdf);
     let mut st = LlState {
         w,
         h,
@@ -2151,6 +2146,7 @@ pub fn encode_tile_lossless_mono(
         base: 1i32 << (bit_depth - 1),
         bit_depth,
         angle_delta_rdo: speed.try_angle_deltas(),
+        cdfs: Box::new(Cdfs::new_lossless(updating_cdf)),
         a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
         l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
         a_part: vec![0; w / 8],
@@ -2323,6 +2319,7 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
         )
         .unwrap();
         let decoded = decode_obu(&decoder, &obu, "lossy-residual");
@@ -2356,6 +2353,7 @@ mod tests {
                 crate::coder::VarianceBoost::off(),
                 false,
                 false,
+                true,
             )
             .unwrap();
             assert_eq!(decode_obu(&decoder, &exact_obu, "lossy-exact"), exact);
@@ -2385,6 +2383,7 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
         )
         .unwrap();
         let many_decoded = decode_obu(&decoder, &many_obu, "lossy-many");
@@ -2639,6 +2638,7 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
         );
         let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-64");
         assert_eq!(decoded.len(), 3 * w * h);
@@ -2680,6 +2680,7 @@ mod tests {
             crate::coder::VarianceBoost::off(),
             false,
             false,
+            true,
         );
         let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-nondefault-dv");
         for decoded_plane in decoded.chunks_exact(w * h) {
@@ -2708,14 +2709,14 @@ mod tests {
                 y[j * w + i] = (((i * 5 + j * 3) % 47) as i16) - 8;
             }
         }
-        let a = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow);
-        let b = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow);
+        let a = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow, true);
+        let b = encode_tile_lossless_mono(w, h, w, h, 8, &y, Speed::Slow, true);
         assert!(!a.is_empty(), "mono lossless output must be non-empty");
         assert_eq!(a, b, "mono lossless must be deterministic");
         // A mono leaf omits the uv_mode symbol + 2 chroma planes, so for the same
         // luma it must be strictly smaller than the 4:4:4 tile carrying that luma
         // in all three planes.
-        let c444 = encode_tile_lossless(w, h, w, h, 8, [&y, &y, &y], Speed::Slow);
+        let c444 = encode_tile_lossless(w, h, w, h, 8, [&y, &y, &y], Speed::Slow, true);
         assert!(
             a.len() < c444.len(),
             "mono ({}) must be smaller than 4:4:4 ({})",
@@ -2737,11 +2738,11 @@ mod tests {
                     y[j * w + i] = (((i * 17 + j * 11) as i32) % (maxv + 1)) as i16;
                 }
             }
-            let p = encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow);
+            let p = encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow, true);
             assert!(!p.is_empty());
             assert_eq!(
                 p,
-                encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow)
+                encode_tile_lossless_mono(w, h, w, h, bd, &y, Speed::Slow, true)
             );
         }
     }

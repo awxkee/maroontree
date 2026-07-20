@@ -115,6 +115,7 @@ struct Args {
     verbose: bool,
     speed: EncodingEffort,
     qmatrix: Option<Qmatrix>,
+    updating_cdf: bool,
 }
 
 fn usage() -> ! {
@@ -138,6 +139,7 @@ Options:
       --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
       --qm <auto|0-15>                  Enable AV1 quantization matrices
+      --no-cdf-update                   Freeze AV1 entropy CDFs
   -s, --speed                           Encoding effort (default = slow)
   -v, --verbose                         Print timing and file stats
   -h, --help                            Print this help"
@@ -196,6 +198,7 @@ fn parse_args() -> Args {
     let mut verbose = false;
     let mut speed = EncodingEffort::Slow;
     let mut qmatrix = None;
+    let mut updating_cdf = true;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -206,6 +209,7 @@ fn parse_args() -> Args {
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
             "--apply-icc" => apply_icc = true,
+            "--no-cdf-update" => updating_cdf = false,
             "--qm" => {
                 let value = args.next().unwrap_or_default();
                 qmatrix = Some(if value == "auto" {
@@ -324,6 +328,7 @@ fn parse_args() -> Args {
         verbose,
         speed,
         qmatrix,
+        updating_cdf,
     }
 }
 

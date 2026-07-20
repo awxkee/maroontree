@@ -122,6 +122,7 @@ fn encode_lossy_frame(
     variance_boost: VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     assert!(width > 0 && height > 0, "width/height must be non-zero");
     assert_eq!(planes[0].len(), width * height, "luma plane must be w*h");
@@ -174,6 +175,7 @@ fn encode_lossy_frame(
             &variance_boost,
             cdef,
             wiener,
+            updating_cdf,
         );
 
     let mut bytes = temporal_delimiter();
@@ -188,6 +190,7 @@ fn encode_lossy_frame(
         allow_intrabc,
         cdef_params.as_ref(),
         restoration_params.as_ref(),
+        updating_cdf,
     ));
     bytes
 }
@@ -208,6 +211,7 @@ pub(crate) fn encode_lossy_444(
     variance_boost: VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -222,6 +226,7 @@ pub(crate) fn encode_lossy_444(
         variance_boost,
         cdef,
         wiener,
+        updating_cdf,
     )
 }
 
@@ -241,6 +246,7 @@ pub(crate) fn encode_lossy_422(
     variance_boost: VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -255,6 +261,7 @@ pub(crate) fn encode_lossy_422(
         variance_boost,
         cdef,
         wiener,
+        updating_cdf,
     )
 }
 
@@ -274,6 +281,7 @@ pub(crate) fn encode_lossy_420(
     variance_boost: VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     encode_lossy_frame(
         base_q_idx,
@@ -288,6 +296,7 @@ pub(crate) fn encode_lossy_420(
         variance_boost,
         cdef,
         wiener,
+        updating_cdf,
     )
 }
 
@@ -305,6 +314,7 @@ pub(crate) fn encode_lossy_monochrome(
     variance_boost: VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
     encode_lossy_frame(
@@ -320,6 +330,7 @@ pub(crate) fn encode_lossy_monochrome(
         variance_boost,
         cdef,
         wiener,
+        updating_cdf,
     )
 }
 
@@ -331,6 +342,7 @@ pub(crate) fn encode_lossless_monochrome(
     full_range: bool,
     threads: usize,
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     assert!(width > 0 && height > 0, "width/height must be non-zero");
     assert_eq!(luma.len(), width * height, "luma plane must be w*h");
@@ -355,6 +367,7 @@ pub(crate) fn encode_lossless_monochrome(
         &padded,
         threads,
         speed,
+        updating_cdf,
     ));
     bytes
 }

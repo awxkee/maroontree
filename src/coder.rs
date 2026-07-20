@@ -266,6 +266,38 @@ pub(crate) struct Cdfs {
 }
 
 impl Cdfs {
+    /// Frame-initial lossless state. The static mode deliberately restores the
+    /// legacy inverse-CDF tables used before adaptation was introduced.
+    pub(crate) fn new_lossless(updating_cdf: bool) -> Self {
+        let mut c = Self::new(0);
+        if updating_cdf {
+            return c;
+        }
+        use crate::cdf_tables as legacy;
+        c.txb_skip[0] = legacy::C_SKIP.iter().map(|v| v.to_vec()).collect();
+        c.eob_bin_16_l = legacy::EOB_BIN16[0].to_vec();
+        c.eob_bin_16_c = legacy::EOB_BIN16[1].to_vec();
+        for plane in 0..2 {
+            c.eob_hi[0][plane] = legacy::EOB_HI[plane].iter().map(|v| v.to_vec()).collect();
+            c.eob_base[0][plane] = legacy::EOB_BASE[plane].iter().map(|v| v.to_vec()).collect();
+            c.base_tok[0][plane] = legacy::BASE_TOK[plane].iter().map(|v| v.to_vec()).collect();
+            c.br_tok[0][plane] = legacy::BR_TOK[plane].iter().map(|v| v.to_vec()).collect();
+            c.dc_sign[plane] = legacy::DC_SIGN[plane].iter().map(|v| v.to_vec()).collect();
+        }
+        for (level, table) in [
+            &legacy::PART_SPLIT_64,
+            &legacy::PART_SPLIT_32,
+            &legacy::PART_SPLIT_16,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.part_split[level] = table.iter().map(|v| v.to_vec()).collect();
+        }
+        c.part_bl8 = legacy::PART_8.iter().map(|v| v.to_vec()).collect();
+        c
+    }
+
     /// Frozen snapshot used for DECISION-side rate estimates (`dec_cdfs`).
     /// Mostly the frame-initial CDFs, except symbols whose default prior sits
     /// far from its adapted steady state on real content: there a frozen
@@ -774,6 +806,7 @@ struct LossyTile<'a> {
     cdef_point_marked: bool,
     enc: OdEcEncoder,
     cdfs: Cdfs,
+    updating_cdf: bool,
     /// Frozen frame-initial CDF snapshot used by every DECISION-side rate
     /// estimate (RDOQ trellis, filter-intra / angle-delta mode costs). The
     /// adaptive `cdfs` above is emit-only. Keeping decisions off the adaptive
@@ -1348,6 +1381,7 @@ fn wavefront_capture(
     speed: Speed,
     aq: bool,
     vb: &VarianceBoost,
+    updating_cdf: bool,
     tx: std::sync::mpsc::Sender<(usize, DecisionRecord)>,
 ) {
     use crate::av2::helpers::{PlaneWriter, par_wavefront_pool_with};
@@ -1368,7 +1402,8 @@ fn wavefront_capture(
                 _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
             }
         }
-        .with_speed(speed);
+        .with_speed(speed)
+        .with_updating_cdf(updating_cdf);
         t.frame_x0 = r.x0;
         t.frame_y0 = r.y0;
         t.frame_w = full_w;
@@ -1521,7 +1556,7 @@ fn wavefront_capture(
                 }
             }
             // --- per-cell resets ---
-            let mut enc = OdEcEncoder::new();
+            let mut enc = OdEcEncoder::new().with_updating_cdf(t.updating_cdf);
             enc.sink = true;
             t.enc = enc;
             t.rec = DecisionRecord::default();
@@ -1669,6 +1704,7 @@ fn encode_one_tile(
     record: bool,
     wf_threads: usize,
     allow_intrabc: bool,
+    updating_cdf: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -1701,7 +1737,8 @@ fn encode_one_tile(
             }
         }
         .with_speed(speed)
-        .with_intrabc(allow_intrabc);
+        .with_intrabc(allow_intrabc)
+        .with_updating_cdf(updating_cdf);
         tile.sb_mode = sb_mode;
         tile.rec = rec_in;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
@@ -1850,6 +1887,7 @@ fn encode_one_tile(
                     speed,
                     aq,
                     vb,
+                    updating_cdf,
                     tx,
                 );
                 start.elapsed()
@@ -1889,8 +1927,9 @@ fn replay_tile_with_filters(
     cdef: Option<&CdefReplay>,
     frame_w: usize,
     frame_h: usize,
+    updating_cdf: bool,
 ) -> Vec<u8> {
-    let mut enc = OdEcEncoder::new();
+    let mut enc = OdEcEncoder::new().with_updating_cdf(updating_cdf);
     let mut wr_cdf = wiener_restore_icdf();
     let mut lr_ref_v = crate::wiener::WIENER_TAPS_MID;
     let mut lr_ref_h = crate::wiener::WIENER_TAPS_MID;
@@ -1979,6 +2018,7 @@ pub(crate) fn encode_lossy_tilegroup(
     vb: &VarianceBoost,
     cdef_on: bool,
     wiener_on: bool,
+    updating_cdf: bool,
 ) -> (
     Vec<u8>,
     Tiling,
@@ -2157,6 +2197,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 record,
                 inner,
                 allow_intrabc,
+                updating_cdf,
             )
         })
     } else {
@@ -2178,6 +2219,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 record,
                 0,
                 allow_intrabc,
+                updating_cdf,
             )
         })
     };
@@ -2365,6 +2407,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 cdef_replay.as_ref(),
                 w8,
                 h8,
+                updating_cdf,
             )
         });
     }
@@ -3504,6 +3547,7 @@ pub(crate) fn assemble_frame_obus(
     allow_intrabc: bool,
     cdef: Option<&crate::obu::CdefParams>,
     lr: Option<&crate::obu::LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = frame_header_lossy_multitile_th(
@@ -3518,6 +3562,7 @@ pub(crate) fn assemble_frame_obus(
             allow_intrabc,
             cdef,
             lr,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
@@ -3533,6 +3578,7 @@ pub(crate) fn assemble_frame_obus(
             allow_intrabc,
             cdef,
             lr,
+            updating_cdf,
         );
         wrap_obu_frame(&fh, tilegroup)
     }
@@ -3547,11 +3593,21 @@ pub(crate) fn encode_lossless_frame_obus(
     src: &[Vec<i16>; 3],
     threads: usize,
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) =
-        encode_lossless_tilegroup(bd, w8, h8, visible_w, visible_h, src, &pool, speed);
-    assemble_lossless_frame_obus(&plan, &tilegroup)
+    let (tilegroup, plan) = encode_lossless_tilegroup(
+        bd,
+        w8,
+        h8,
+        visible_w,
+        visible_h,
+        src,
+        &pool,
+        speed,
+        updating_cdf,
+    );
+    assemble_lossless_frame_obus(&plan, &tilegroup, updating_cdf)
 }
 
 fn encode_one_lossless_tile(
@@ -3562,6 +3618,7 @@ fn encode_one_lossless_tile(
     src: &[Vec<i16>; 3],
     r: &(usize, usize, usize, usize),
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(&src[0], full_w, x0, y0, tw, th);
@@ -3577,6 +3634,7 @@ fn encode_one_lossless_tile(
         bd,
         [&p0, &p1, &p2],
         speed,
+        updating_cdf,
     )
 }
 
@@ -3589,6 +3647,7 @@ fn encode_lossless_tilegroup(
     src: &[Vec<i16>; 3],
     pool: &Pool,
     speed: Speed,
+    updating_cdf: bool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3614,7 +3673,16 @@ fn encode_lossless_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile(bd, w8, visible_w, visible_h, src, &rects[i], speed)
+        encode_one_lossless_tile(
+            bd,
+            w8,
+            visible_w,
+            visible_h,
+            src,
+            &rects[i],
+            speed,
+            updating_cdf,
+        )
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3624,18 +3692,24 @@ fn encode_lossless_tilegroup(
 /// a combined `OBU_FRAME` (type 6); multiple tiles use a separate
 /// `OBU_FRAME_HEADER` (type 3) + `OBU_TILE_GROUP` (type 4), the layout strict
 /// parsers (ffmpeg's cbs_av1) accept.
-fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
+fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8], updating_cdf: bool) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = crate::obu::frame_header_lossless_multitile_th(
             &plan.cols_incr,
             &plan.rows_incr,
             plan.tcl,
             plan.trl,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
-        let fh =
-            crate::obu::frame_header_lossless_multitile(&plan.cols_incr, &plan.rows_incr, 0, 0);
+        let fh = crate::obu::frame_header_lossless_multitile(
+            &plan.cols_incr,
+            &plan.rows_incr,
+            0,
+            0,
+            updating_cdf,
+        );
         wrap_obu_frame(&fh, tilegroup)
     }
 }
@@ -3650,12 +3724,22 @@ fn encode_one_lossless_tile_mono(
     luma: &[i16],
     r: &(usize, usize, usize, usize),
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
     let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
     let tile_visible_h = visible_h.saturating_sub(y0).min(th);
-    crate::tile::encode_tile_lossless_mono(tw, th, tile_visible_w, tile_visible_h, bd, &p0, speed)
+    crate::tile::encode_tile_lossless_mono(
+        tw,
+        th,
+        tile_visible_w,
+        tile_visible_h,
+        bd,
+        &p0,
+        speed,
+        updating_cdf,
+    )
 }
 
 /// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res
@@ -3671,6 +3755,7 @@ fn encode_lossless_mono_tilegroup(
     luma: &[i16],
     pool: &Pool,
     speed: Speed,
+    updating_cdf: bool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3697,7 +3782,16 @@ fn encode_lossless_mono_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile_mono(bd, w8, visible_w, visible_h, luma, &rects[i], speed)
+        encode_one_lossless_tile_mono(
+            bd,
+            w8,
+            visible_w,
+            visible_h,
+            luma,
+            &rects[i],
+            speed,
+            updating_cdf,
+        )
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3706,13 +3800,18 @@ fn encode_lossless_mono_tilegroup(
 /// Wrap a mono lossless tile group with a `mono_chrome = 1` lossless frame
 /// header (single tile ⇒ combined `OBU_FRAME`; multi-tile ⇒ `OBU_FRAME_HEADER` +
 /// `OBU_TILE_GROUP`).
-fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
+fn assemble_lossless_mono_frame_obus(
+    plan: &Tiling,
+    tilegroup: &[u8],
+    updating_cdf: bool,
+) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = crate::obu::frame_header_lossless_mono_multitile_th(
             &plan.cols_incr,
             &plan.rows_incr,
             plan.tcl,
             plan.trl,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
@@ -3721,6 +3820,7 @@ fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8>
             &plan.rows_incr,
             0,
             0,
+            updating_cdf,
         );
         wrap_obu_frame(&fh, tilegroup)
     }
@@ -3737,11 +3837,21 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     luma: &[i16],
     threads: usize,
     speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) =
-        encode_lossless_mono_tilegroup(bd, w8, h8, visible_w, visible_h, luma, &pool, speed);
-    assemble_lossless_mono_frame_obus(&plan, &tilegroup)
+    let (tilegroup, plan) = encode_lossless_mono_tilegroup(
+        bd,
+        w8,
+        h8,
+        visible_w,
+        visible_h,
+        luma,
+        &pool,
+        speed,
+        updating_cdf,
+    );
+    assemble_lossless_mono_frame_obus(&plan, &tilegroup, updating_cdf)
 }
 
 #[cfg(test)]
