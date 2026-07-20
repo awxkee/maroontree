@@ -27,8 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub(crate) static BLK_SKIP: [u16; 2] = [1097, 0];
-
 pub(crate) static C_SKIP: [[u16; 2]; 13] = [
     [919, 0],
     [26876, 0],

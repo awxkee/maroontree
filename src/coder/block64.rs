@@ -53,6 +53,235 @@ impl<'a> LossyTile<'a> {
     /// Luma raster quadrants of a 64x64 block, as (dx, dy) pixel offsets.
     const Q64: [(usize, usize); 4] = [(0, 0), (32, 0), (0, 32), (32, 32)];
 
+    fn intrabc64_predictor(&self, px: usize, py: usize) -> Option<(i16, i16)> {
+        let (x4, y4, n4, stride4) = (px / 4, py / 4, 16, self.w / 4);
+        let x_start = x4.saturating_sub(5);
+        let x_end = (x4 + n4).min(stride4 - 1);
+        let y_start = y4.saturating_sub(5);
+        let y_end = (y4 + n4).min(self.h / 4 - 1);
+        let mut found = None;
+        for y in y_start..y4 {
+            for x in x4.saturating_sub(1)..=x_end {
+                if let Some(mv) = self.ibc_mv[y * stride4 + x] {
+                    if found.is_some_and(|old| old != mv) {
+                        return None;
+                    }
+                    found = Some(mv);
+                }
+            }
+        }
+        for x in x_start..x4 {
+            for y in y4.saturating_sub(1)..=y_end {
+                if let Some(mv) = self.ibc_mv[y * stride4 + x] {
+                    if found.is_some_and(|old| old != mv) {
+                        return None;
+                    }
+                    found = Some(mv);
+                }
+            }
+        }
+        Some(found.unwrap_or_else(|| if py < 64 { (0, -2560) } else { (-512, 0) }))
+    }
+
+    fn find_intrabc64(
+        &self,
+        px: usize,
+        py: usize,
+    ) -> Option<(usize, usize, (i16, i16), (i16, i16))> {
+        if !self.allow_intrabc {
+            return None;
+        }
+        let pred = self.intrabc64_predictor(px, py)?;
+        let sbx = px / 64 * 64;
+        let sby = py / 64 * 64;
+        let exact = |rx: usize, ry: usize| {
+            (0..if self.mono { 1 } else { 3 }).all(|plane| {
+                let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
+                let sy = usize::from(plane != 0 && self.ss420);
+                let stride = if plane == 0 { self.w } else { self.cw };
+                let (x, y, ref_x, ref_y) = (px >> sx, py >> sy, rx >> sx, ry >> sy);
+                let (bw, bh) = (64 >> sx, 64 >> sy);
+                (0..bh).all(|row| {
+                    self.src[plane][(y + row) * stride + x..][..bw]
+                        == self.src[plane][(ref_y + row) * stride + ref_x..][..bw]
+                })
+            })
+        };
+        let legal = |rx: usize, ry: usize| {
+            rx + 64 <= self.w
+                && ry + 64 <= self.h
+                && ry + 64 <= sby + 64
+                && (ry + 64 <= sby || rx + 64 <= sbx)
+        };
+        let make = |rx: usize, ry: usize| {
+            let dy = (ry as isize - py as isize) * 8;
+            let dx = (rx as isize - px as isize) * 8;
+            i16::try_from(dy)
+                .ok()
+                .zip(i16::try_from(dx).ok())
+                .filter(|&(dy, dx)| {
+                    (i32::from(dy) - i32::from(pred.0)).unsigned_abs() <= 16_384
+                        && (i32::from(dx) - i32::from(pred.1)).unsigned_abs() <= 16_384
+                })
+                .map(|mv| (rx, ry, mv, pred))
+        };
+        let default = if py < 64 {
+            px.checked_sub(320).map(|x| (x, py))
+        } else if py.is_multiple_of(64) {
+            Some((px, py - 64))
+        } else {
+            None
+        };
+        if let Some((rx, ry)) = default
+            && legal(rx, ry)
+            && exact(rx, ry)
+        {
+            return make(rx, ry);
+        }
+        let wanted = [
+            self.src[0][py * self.w + px],
+            self.src[0][py * self.w + px + 63],
+            self.src[0][(py + 63) * self.w + px],
+            self.src[0][(py + 63) * self.w + px + 63],
+        ];
+        let mut probes = 0usize;
+        for ry in (0..=py.min(self.h - 64)).rev() {
+            for rx in (0..=self.w - 64).rev() {
+                if !legal(rx, ry) {
+                    continue;
+                }
+                probes += 1;
+                let hash = [
+                    self.src[0][ry * self.w + rx],
+                    self.src[0][ry * self.w + rx + 63],
+                    self.src[0][(ry + 63) * self.w + rx],
+                    self.src[0][(ry + 63) * self.w + rx + 63],
+                ];
+                if hash == wanted
+                    && exact(rx, ry)
+                    && let Some(found) = make(rx, ry)
+                {
+                    return Some(found);
+                }
+                if probes == 4096 {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn rd_cost_intrabc64(&self, px: usize, py: usize, prdo: f32) -> Option<f32> {
+        let (rx, ry, mv, pred) = self.find_intrabc64(px, py)?;
+        let mut distortion = 0i64;
+        for plane in 0..if self.mono { 1 } else { 3 } {
+            let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
+            let sy = usize::from(plane != 0 && self.ss420);
+            let stride = if plane == 0 { self.w } else { self.cw };
+            let (x, y, ref_x, ref_y) = (px >> sx, py >> sy, rx >> sx, ry >> sy);
+            let (bw, bh) = (64 >> sx, 64 >> sy);
+            for row in 0..bh {
+                for col in 0..bw {
+                    let d = self.src[plane][(y + row) * stride + x + col]
+                        - self.recon[plane][(ref_y + row) * stride + ref_x + col];
+                    distortion += i64::from(d) * i64::from(d);
+                }
+            }
+        }
+        let residual_pixels = ((i32::from(mv.0) - i32::from(pred.0)).unsigned_abs()
+            + (i32::from(mv.1) - i32::from(pred.1)).unsigned_abs())
+            as f32
+            / 8.0;
+        Some(rd_cost_i64(
+            distortion,
+            self.mlam() * prdo,
+            8.0 + residual_pixels.max(1.0).log2() * 2.0,
+        ))
+    }
+
+    fn encode_intrabc_mv_component(&mut self, comp: usize, diff: i32) {
+        self.enc
+            .encode_symbol(usize::from(diff < 0), &mut self.cdfs.mv_sign[comp]);
+        let up = diff.unsigned_abs() as usize / 8 - 1;
+        let class = if up <= 1 {
+            0
+        } else {
+            usize::BITS as usize - 1 - up.leading_zeros() as usize
+        };
+        self.enc
+            .encode_symbol(class, &mut self.cdfs.mv_classes[comp]);
+        if class == 0 {
+            self.enc.encode_symbol(up, &mut self.cdfs.mv_class0[comp]);
+        } else {
+            for n in 0..class {
+                self.enc
+                    .encode_symbol((up >> n) & 1, &mut self.cdfs.mv_class_n[comp][n]);
+            }
+        }
+    }
+
+    fn encode_intrabc_mv(&mut self, mv: (i16, i16), pred: (i16, i16)) {
+        let dy = i32::from(mv.0) - i32::from(pred.0);
+        let dx = i32::from(mv.1) - i32::from(pred.1);
+        let joint = usize::from(dx != 0) | (usize::from(dy != 0) << 1);
+        self.enc.encode_symbol(joint, &mut self.cdfs.mv_joint);
+        if dy != 0 {
+            self.encode_intrabc_mv_component(0, dy);
+        }
+        if dx != 0 {
+            self.encode_intrabc_mv_component(1, dx);
+        }
+    }
+
+    fn code_block64_intrabc(&mut self, x8: usize, y8: usize) {
+        #[cfg(test)]
+        LOSSY_INTRABC_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (px, py) = (x8 * 8, y8 * 8);
+        self.aq_cancel_skipped_sb();
+        let (rx, ry, mv, pred) = self
+            .find_intrabc64(px, py)
+            .expect("legal IntraBC64 reference");
+        let (bx4, by4, stride4) = (px / 4, py / 4, self.w / 4);
+        let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
+        self.enc.encode_symbol(1, &mut self.cdfs.skip[sctx]);
+        self.enc.encode_symbol(1, &mut self.cdfs.intrabc);
+        self.encode_intrabc_mv(mv, pred);
+
+        self.record_blk(x8, y8, 16);
+        self.mark_skip8_rect(x8, y8, 8, 8, true);
+        self.a_skip[bx4..bx4 + 16].fill(1);
+        self.l_skip[by4..by4 + 16].fill(1);
+        self.a_mode[bx4..bx4 + 16].fill(DC_PRED as u8);
+        self.l_mode[by4..by4 + 16].fill(DC_PRED as u8);
+        self.a_tx[bx4..bx4 + 16].fill(4);
+        self.l_tx[by4..by4 + 16].fill(4);
+        self.commit_uv_mode(px, py, 64, 64, DC_PRED);
+        for slot in &mut self.a_palette[bx4..bx4 + 16] {
+            slot.clear();
+        }
+        for slot in &mut self.l_palette[by4..by4 + 16] {
+            slot.clear();
+        }
+        for y in by4..by4 + 16 {
+            self.ibc_mv[y * stride4 + bx4..y * stride4 + bx4 + 16].fill(Some(mv));
+        }
+
+        for plane in 0..if self.mono { 1 } else { 3 } {
+            let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
+            let sy = usize::from(plane != 0 && self.ss420);
+            let stride = if plane == 0 { self.w } else { self.cw };
+            let (x, y, ref_x, ref_y) = (px >> sx, py >> sy, rx >> sx, ry >> sy);
+            let (bw, bh) = (64 >> sx, 64 >> sy);
+            for row in 0..bh {
+                let src = (ref_y + row) * stride + ref_x..(ref_y + row) * stride + ref_x + bw;
+                self.recon[plane].copy_within(src, (y + row) * stride + x);
+            }
+            let (cx4, cy4, cw4, ch4) = (x / 4, y / 4, bw / 4, bh / 4);
+            self.a_coef[plane][cx4..cx4 + cw4].fill(0x40);
+            self.l_coef[plane][cy4..cy4 + ch4].fill(0x40);
+        }
+    }
+
     /// Luma-only R-D proxy for coding a 64x64 as one BLOCK_64X64 (four DC-pred
     /// TX_32X32 quadrants). Chroma is added by the caller. Mirrors
     /// `rd_cost_split32`'s style: SATD distortion + `block_rate_bits` rate.
@@ -157,6 +386,11 @@ impl<'a> LossyTile<'a> {
             rd_split += self.rd_cost_none32(qx, qy, prdo)
                 + self.rd_cost_chroma_partition(qx, qy, 32, Part16::None, prdo);
         }
+        if let Some(rd_ibc) = self.rd_cost_intrabc64(px, py, prdo)
+            && rd_ibc < rd_none.min(rd_split)
+        {
+            return Part16::Intrabc;
+        }
         let keep = rd_none <= rd_split;
         crate::partstats::tally64(keep);
         if keep { Part16::None } else { Part16::Split }
@@ -212,9 +446,9 @@ impl<'a> LossyTile<'a> {
             for &m in block64_modes() {
                 let mut eff = 0.0f32;
                 // One 64x64 PREDICTION block; its four TX_32X32 are recorded per
-        // quadrant below. Chroma deblocks on the block, not the transforms.
-        self.record_pred_blk(x8, y8, 16);
-        for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
+                // quadrant below. Chroma deblocks on the block, not the transforms.
+                self.record_pred_blk(x8, y8, 16);
+                for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
                     let (bx, by) = (px + sx, py + sy);
                     let (tr, bl) = Self::quad_edges(sx, sy, px, py, have_tr, have_bl);
                     let mut pred = [0i32; 1024];
@@ -255,7 +489,11 @@ impl<'a> LossyTile<'a> {
                     let rr = idct_dequant_32x32(&cf, &self.quant);
                     let sse =
                         sse_recon::<1024, 32>(&pred, &rr, &self.src[0], self.w, bx, by, self.bd);
-                    eff += rd_cost_i64(sse, mlam, self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, m, 0));
+                    eff += rd_cost_i64(
+                        sse,
+                        mlam,
+                        self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, m, 0),
+                    );
                     let _ = qi;
                 }
                 eff += rate_cost(mlam, self.mode_bits(px, py, m));

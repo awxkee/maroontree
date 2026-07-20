@@ -179,7 +179,9 @@ fn frame_header_lossless_impl(
     w.flag(true); // allow_screen_content_tools (seq force = SELECT)
     w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    w.flag(false); // allow_intrabc
+    // The lossless tile writer may select exact-copy blocks from the previous
+    // decoded superblock row. `force_integer_mv` is set above as required.
+    w.flag(true); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     for &b in cols_incr {
         w.flag(b);
@@ -225,6 +227,7 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
 ) -> Vec<u8> {
@@ -239,6 +242,7 @@ pub(crate) fn frame_header_lossy_multitile(
         false,
         mono,
         aq,
+        allow_intrabc,
         cdef,
         lr,
     )
@@ -254,6 +258,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
 ) -> Vec<u8> {
@@ -268,6 +273,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         true,
         mono,
         aq,
+        allow_intrabc,
         cdef,
         lr,
     )
@@ -383,6 +389,7 @@ fn frame_header_lossy_impl(
     trailing: bool,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
 ) -> Vec<u8> {
@@ -392,7 +399,7 @@ fn frame_header_lossy_impl(
     w.flag(true); // allow_screen_content_tools (lossy luma palette enabled)
     w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    w.flag(false); // allow_intrabc
+    w.flag(allow_intrabc);
     w.flag(true); // uniform_tile_spacing_flag
     // increment_tile_cols_log2 / increment_tile_rows_log2: walk from the
     // decoder's derived minimum up to the chosen TileColsLog2 / TileRowsLog2.
@@ -434,40 +441,38 @@ fn frame_header_lossy_impl(
     w.flag(false); // segmentation_enabled
     // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded). When
     // adaptive quantization is on, signal superblock delta-Q: present=1 plus a
-    // 2-bit delta_q_res, then delta_lf_present=0 (allow_intrabc is 0 here, so the
-    // delta_lf_present flag is coded and we leave loop-filter deltas off).
+    // 2-bit delta_q_res. delta_lf_present is omitted when IntraBC is enabled.
     if aq {
         w.flag(true); // delta_q_present = 1
         w.f(crate::coder::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
-        w.flag(false); // delta_lf_present = 0
+        if !allow_intrabc {
+            w.flag(false); // delta_lf_present = 0
+        }
     } else {
         w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
     }
-    // CodedLossless = 0 => loop_filter_params():
-    let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
-    w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
-    w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
-    if lvl_y != 0 && !mono {
-        // u/v levels coded only when (level[0] || level[1]) and NumPlanes > 1
-        w.f(lvl_uv as u32, 6); // loop_filter_level[2] (U)
-        w.f(lvl_uv as u32, 6); // loop_filter_level[3] (V)
-    }
-    w.f(0, 3); // loop_filter_sharpness = 0
-    w.flag(false); // loop_filter_delta_enabled = 0
+    // allow_intrabc suppresses loop-filter, CDEF and loop-restoration syntax.
+    if !allow_intrabc {
+        let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
+        w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
+        w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
+        if lvl_y != 0 && !mono {
+            w.f(lvl_uv as u32, 6);
+            w.f(lvl_uv as u32, 6);
+        }
+        w.f(0, 3); // loop_filter_sharpness = 0
+        w.flag(false); // loop_filter_delta_enabled = 0
 
-    let noop_cdef = CdefParams {
-        bits: 0,
-        damping: 3,
-        strengths: vec![(0, 0, 0, 0)],
-    };
-    let cdef = cdef.unwrap_or(&noop_cdef);
-    write_cdef_params(&mut w, cdef, mono);
-    // lr_params(): sequence enable_restoration = 1, so always coded. Defaults to
-    // all RESTORE_NONE (no-op) unless luma Wiener is enabled for this frame.
-    let noop_lr = LrParams::default();
-    let lr = lr.unwrap_or(&noop_lr);
-    let num_planes = if mono { 1 } else { 3 };
-    write_lr_params(&mut w, lr, num_planes);
+        let noop_cdef = CdefParams {
+            bits: 0,
+            damping: 3,
+            strengths: vec![(0, 0, 0, 0)],
+        };
+        write_cdef_params(&mut w, cdef.unwrap_or(&noop_cdef), mono);
+        let noop_lr = LrParams::default();
+        let num_planes = if mono { 1 } else { 3 };
+        write_lr_params(&mut w, lr.unwrap_or(&noop_lr), num_planes);
+    }
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     // TX_MODE_SELECT: every intra luma block > BLOCK_4X4 codes a `tx_depth`
     // symbol (see `code_tx_depth`), enabling per-block transform splitting —

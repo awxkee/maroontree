@@ -156,24 +156,25 @@ fn encode_lossy_frame(
         }
     }
 
-    let (tilegroup, tiling, cdef_params, restoration_params) = encode_lossy_tilegroup(
-        base_q_idx,
-        bit_depth,
-        padded_width,
-        padded_height,
-        width,
-        height,
-        &source,
-        sub_x,
-        sub_y,
-        monochrome,
-        pool,
-        speed,
-        aq,
-        &variance_boost,
-        cdef,
-        wiener,
-    );
+    let (tilegroup, tiling, cdef_params, restoration_params, allow_intrabc) =
+        encode_lossy_tilegroup(
+            base_q_idx,
+            bit_depth,
+            padded_width,
+            padded_height,
+            width,
+            height,
+            &source,
+            sub_x,
+            sub_y,
+            monochrome,
+            pool,
+            speed,
+            aq,
+            &variance_boost,
+            cdef,
+            wiener,
+        );
 
     let mut bytes = temporal_delimiter();
     bytes.extend_from_slice(&layout.sequence_header(width, height, bit_depth));
@@ -184,10 +185,10 @@ fn encode_lossy_frame(
         &tilegroup,
         monochrome,
         aq,
+        allow_intrabc,
         cdef_params.as_ref(),
         restoration_params.as_ref(),
     ));
-    crate::partstats::report();
     bytes
 }
 

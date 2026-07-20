@@ -157,10 +157,204 @@ fn exact_luma_palette(
 
 fn palette_estimated_bits(palette: &LumaPalette, bit_depth: u8) -> f32 {
     let pixels = palette.width * palette.height;
-    let map_bits = (palette.colors.len() as f32).log2() * pixels as f32;
-    let color_bits = (palette.colors.len() * bit_depth as usize) as f32;
+    let size = palette.colors.len();
+
+    // Palette mode and size use fixed frame CDFs in the lossless path. The
+    // neighbour palette context is unavailable while planning, so use the
+    // neutral (no cached neighbour) mode context.
+    let bsize_ctx = palette_bsize_ctx(palette.width);
+    let mode_bits = raw_symbol_cost(&[palette_y_mode_raw(bsize_ctx, 0)], 1)
+        + raw_symbol_cost(palette_y_size_raw(bsize_ctx), size - 2);
+
+    // Price the no-cache color-delta syntax exactly. A live cache can only
+    // make this candidate cheaper, so this remains conservative.
+    let colors: Vec<u32> = palette.colors.iter().map(|&color| color as u32).collect();
+    let mut color_bits = bit_depth as f32;
+    if colors.len() > 1 {
+        let max_delta = colors.windows(2).map(|v| v[1] - v[0]).max().unwrap();
+        let min_bits = bit_depth - 3;
+        let mut bits = ceil_log2(max_delta).max(min_bits);
+        color_bits += 2.0;
+        let mut range = (1u32 << bit_depth) - colors[0] - 1;
+        for pair in colors.windows(2) {
+            color_bits += f32::from(bits);
+            let delta = pair[1] - pair[0];
+            range -= delta;
+            bits = bits.min(ceil_log2(range));
+        }
+    }
+
+    // The first index is uniform. Remaining indices use AV1's spatial palette
+    // contexts and therefore can be much cheaper than log2(size) on runs.
+    let mut map_bits = (size as f32).log2();
+    for diagonal in 1..palette.width + palette.height - 1 {
+        let first_x = diagonal.min(palette.width - 1);
+        let last_x = diagonal.saturating_sub(palette.height - 1);
+        for x in (last_x..=first_x).rev() {
+            let y = diagonal - x;
+            let (ctx, symbol) = palette_color_ctx(&palette.map, palette.width, y, x, size);
+            map_bits += raw_symbol_cost(palette_y_color_raw(size, ctx), symbol);
+        }
+    }
     let zero_txb_bits = (pixels / 16) as f32;
-    4.0 + color_bits + map_bits + zero_txb_bits
+    mode_bits + color_bits + map_bits + zero_txb_bits
+}
+
+#[inline]
+fn raw_symbol_cost(raw: &[u16], symbol: usize) -> f32 {
+    let low = if symbol == 0 { 0 } else { raw[symbol - 1] };
+    let high = raw.get(symbol).copied().unwrap_or(32768);
+    -((high - low).max(1) as f32 / 32768.0).log2()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntrabcMatch {
+    ref_x: usize,
+    ref_y: usize,
+    mv: (i16, i16),
+}
+
+/// Find an exact block match in the portion of the tile that AV1 has decoded.
+/// The default DV is tried first, followed by a reverse-raster hash search over
+/// every integer-pixel position. Reverse raster favours short DVs and
+/// the 4096-probe cap bounds photographic-image work without restricting the
+/// displacement represented in the bitstream.
+fn find_exact_intrabc(
+    planes: &[&[i16]],
+    stride: usize,
+    px: usize,
+    py: usize,
+    size: usize,
+    width: usize,
+    height: usize,
+) -> Option<IntrabcMatch> {
+    if px + size > width || py + size > height {
+        return None;
+    }
+    let sbx = px / 64 * 64;
+    let sby = py / 64 * 64;
+    let exact = |ref_x: usize, ref_y: usize| {
+        planes.iter().all(|plane| {
+            (0..size).all(|y| {
+                plane[(py + y) * stride + px..][..size]
+                    == plane[(ref_y + y) * stride + ref_x..][..size]
+            })
+        })
+    };
+    let legal = |ref_x: usize, ref_y: usize| {
+        ref_x + size <= width
+            && ref_y + size <= height
+            && ref_y + size <= sby + 64
+            && (ref_y + size <= sby || ref_x + size <= sbx)
+    };
+    let make = |ref_x: usize, ref_y: usize| {
+        let dy = (ref_y as isize - py as isize) * 8;
+        let dx = (ref_x as isize - px as isize) * 8;
+        (i16::try_from(dy).ok())
+            .zip(i16::try_from(dx).ok())
+            .map(|(dy, dx)| IntrabcMatch {
+                ref_x,
+                ref_y,
+                mv: (dy, dx),
+            })
+    };
+
+    let default = if py < 64 {
+        px.checked_sub(320).map(|x| (x, py))
+    } else if py.is_multiple_of(64) {
+        Some((px, py - 64))
+    } else {
+        None
+    };
+    if let Some((x, y)) = default
+        && legal(x, y)
+        && exact(x, y)
+    {
+        return make(x, y);
+    }
+    // Exhaustive integer-position probing is reserved for the large blocks
+    // where IntraBC amortizes its DV syntax. Small blocks retain the cheap
+    // default-DV probe above and avoid multiplying partition-search work.
+    if size < 32 {
+        return None;
+    }
+
+    // Four widely-spaced samples are the hash gate; a hit is always verified
+    // across every sample and plane above.
+    let p = planes[0];
+    let fingerprint = |x: usize, y: usize| {
+        let q = size - 1;
+        [
+            p[y * stride + x],
+            p[y * stride + x + q],
+            p[(y + q) * stride + x],
+            p[(y + q) * stride + x + q],
+        ]
+    };
+    let wanted = fingerprint(px, py);
+    let mut probes = 0usize;
+    for ref_y in (0..=py.min(height - size)).rev() {
+        for ref_x in (0..=width - size).rev() {
+            if !legal(ref_x, ref_y) {
+                continue;
+            }
+            probes += 1;
+            if fingerprint(ref_x, ref_y) == wanted
+                && exact(ref_x, ref_y)
+                && let Some(found) = make(ref_x, ref_y)
+            {
+                return Some(found);
+            }
+            if probes == 4096 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn intrabc_default_mv(py: usize) -> (i16, i16) {
+    if py < 64 {
+        (0, -2560) // 320 pixels left, in 1/8-pixel MV units
+    } else {
+        (-512, 0) // 64 pixels up
+    }
+}
+
+/// Resolve a predictor without porting decoder candidate weights: all IntraBC
+/// candidates in the decoder's enclosing spatial search area must agree. With
+/// no spatial candidate, use the normative fallback DV. Mixed stacks are
+/// rejected conservatively instead of risking a predictor mismatch.
+fn intrabc_mv_predictor(st: &LlState, px: usize, py: usize, size: usize) -> Option<(i16, i16)> {
+    let (x4, y4, n4) = (px / 4, py / 4, size / 4);
+    let x_start = x4.saturating_sub(5);
+    let x_end = (x4 + n4).min(st.w / 4 - 1);
+    let y_start = y4.saturating_sub(5);
+    let y_end = (y4 + n4).min(st.h / 4 - 1);
+
+    let mut found = None;
+    for y in y_start..y4 {
+        for x in x4.saturating_sub(1)..=x_end {
+            if let Some(mv) = st.ibc_mv[y * (st.w / 4) + x] {
+                if found.is_some_and(|old| old != mv) {
+                    return None;
+                }
+                found = Some(mv);
+            }
+        }
+    }
+    for x in x_start..x4 {
+        for y in y4.saturating_sub(1)..=y_end {
+            if let Some(mv) = st.ibc_mv[y * (st.w / 4) + x] {
+                if found.is_some_and(|old| old != mv) {
+                    return None;
+                }
+                found = Some(mv);
+            }
+        }
+    }
+    Some(found.unwrap_or_else(|| intrabc_default_mv(py)))
 }
 
 /// Build the 4x4 intra reference edges (top[4], left[4], corner) from the
@@ -464,7 +658,7 @@ fn best_leaf(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
-) -> (f32, usize, usize, Option<LumaPalette>) {
+) -> (f32, usize, usize, Option<LumaPalette>, bool) {
     let mut y_mode = 0usize;
     let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
@@ -486,14 +680,35 @@ fn best_leaf(
     }
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
         .then(|| exact_luma_palette(planes[0], stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
-        .flatten();
+        .flatten()
+        .filter(|palette| palette_estimated_bits(palette, bit_depth) < yb);
     if let Some(palette) = palette.as_ref() {
         yb = palette_estimated_bits(palette, bit_depth);
         y_mode = 0;
     }
     let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     let ovh = 7.0 + ang(y_mode) + ang(uv_mode); // skip + y_mode + uv_mode (+ angle_deltas)
-    (yb + ub + ovh, y_mode, uv_mode, palette)
+    let regular_bits = yb + ub + ovh;
+    // skip=1 + use_intrabc=1 + zero MV-joint. The exact static CDF cost is
+    // close to seven bits; eight is deliberately conservative so ordinary
+    // intra/palette still wins when it is equally compact.
+    const INTRABC_BITS: f32 = 8.0;
+    let ibc = find_exact_intrabc(
+        &planes,
+        stride,
+        px,
+        py,
+        n_tx * 4,
+        stride,
+        planes[0].len() / stride,
+    )
+    .is_some()
+        && INTRABC_BITS < regular_bits;
+    if ibc {
+        (INTRABC_BITS, 0, 0, None, true)
+    } else {
+        (regular_bits, y_mode, uv_mode, palette, false)
+    }
 }
 
 /// Adaptive partition plan for a fully-in-frame square block.
@@ -502,6 +717,7 @@ enum Plan {
         y_mode: usize,
         uv_mode: usize,
         palette: Option<LumaPalette>,
+        intrabc: bool,
     },
     Split(Box<[Plan; 4]>),
 }
@@ -523,7 +739,7 @@ fn plan_full(
     visible_w: usize,
     visible_h: usize,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym, uv, palette) = best_leaf(
+    let (bits_leaf, ym, uv, palette, intrabc) = best_leaf(
         planes,
         stride,
         px,
@@ -542,6 +758,7 @@ fn plan_full(
                 y_mode: ym,
                 uv_mode: uv,
                 palette,
+                intrabc,
             },
         );
     }
@@ -570,6 +787,7 @@ fn plan_full(
                 y_mode: ym,
                 uv_mode: uv,
                 palette,
+                intrabc,
             },
         )
     } else {
@@ -591,8 +809,27 @@ struct LlState {
     l_part: Vec<u8>,
     a_mode: Vec<u8>, // luma y_mode per 8px unit (for kf_y context)
     l_mode: Vec<u8>,
+    a_skip: Vec<u8>, // block skip flags per 4px unit
+    l_skip: Vec<u8>,
+    ibc_mv: Vec<Option<(i16, i16)>>, // decoded IntraBC MVs per 4x4 unit
     a_palette: Vec<Vec<i32>>,
     l_palette: Vec<Vec<i32>>,
+}
+
+fn write_block_skip(
+    wr: &mut Writer,
+    st: &mut LlState,
+    px: usize,
+    py: usize,
+    size: usize,
+    skip: bool,
+) {
+    const RAW: [u16; 3] = [31671, 16515, 4576];
+    let (x4, y4, n4) = (px / 4, py / 4, size / 4);
+    let ctx = usize::from(st.a_skip[x4]) + usize::from(st.l_skip[y4]);
+    write_raw_symbol(wr, usize::from(skip), &[RAW[ctx]]);
+    st.a_skip[x4..x4 + n4].fill(skip as u8);
+    st.l_skip[y4..y4 + n4].fill(skip as u8);
 }
 
 fn write_raw_symbol(wr: &mut Writer, symbol: usize, raw: &[u16]) {
@@ -600,6 +837,46 @@ fn write_raw_symbol(wr: &mut Writer, symbol: usize, raw: &[u16]) {
     cdf.extend(raw.iter().map(|&v| 32768 - v));
     cdf.push(0);
     wr.symbol(symbol as u32, &cdf);
+}
+
+fn write_intrabc_mv_component(wr: &mut Writer, diff: i32) {
+    debug_assert_ne!(diff, 0);
+    debug_assert_eq!(diff & 7, 0);
+    const CLASSES: [u16; 10] = [
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767,
+    ];
+    const CLASS_N: [u16; 10] = [
+        17408, 17920, 18944, 20480, 22528, 24576, 28672, 29952, 29952, 30720,
+    ];
+    write_raw_symbol(wr, usize::from(diff < 0), &[16384]);
+    let up = diff.unsigned_abs() as usize / 8 - 1;
+    let class = if up <= 1 {
+        0
+    } else {
+        usize::BITS as usize - 1 - up.leading_zeros() as usize
+    };
+    debug_assert!(class <= 10);
+    write_raw_symbol(wr, class, &CLASSES);
+    if class == 0 {
+        write_raw_symbol(wr, up, &[27648]);
+    } else {
+        for (n, &cdf) in CLASS_N.iter().enumerate().take(class) {
+            write_raw_symbol(wr, (up >> n) & 1, &[cdf]);
+        }
+    }
+}
+
+fn write_intrabc_mv(wr: &mut Writer, mv: (i16, i16), pred: (i16, i16)) {
+    let dy = i32::from(mv.0) - i32::from(pred.0);
+    let dx = i32::from(mv.1) - i32::from(pred.1);
+    let joint = usize::from(dx != 0) | (usize::from(dy != 0) << 1);
+    write_raw_symbol(wr, joint, &[4096, 11264, 19328]);
+    if dy != 0 {
+        write_intrabc_mv_component(wr, dy);
+    }
+    if dx != 0 {
+        write_intrabc_mv_component(wr, dx);
+    }
 }
 
 fn write_uniform(wr: &mut Writer, n: usize, value: usize) {
@@ -805,10 +1082,48 @@ fn code_leaf(
     y_mode: usize,
     uv_mode: usize,
     palette: Option<&LumaPalette>,
+    intrabc: bool,
 ) {
     let n_tx = size / 4;
-    wr.symbol(0, &C::BLK_SKIP); // skip = 0
     let (x8, y8) = (px / 8, py / 8);
+    let candidate = intrabc
+        .then(|| find_exact_intrabc(&planes, st.w, px, py, size, st.w, st.h))
+        .flatten();
+    let predictor = candidate.and_then(|_| intrabc_mv_predictor(st, px, py, size));
+    let intrabc = candidate.zip(predictor).is_some_and(|(candidate, pred)| {
+        (i32::from(candidate.mv.0) - i32::from(pred.0)).unsigned_abs() <= 16_384
+            && (i32::from(candidate.mv.1) - i32::from(pred.1)).unsigned_abs() <= 16_384
+    });
+    write_block_skip(wr, st, px, py, size, intrabc);
+    // `allow_intrabc` is frame-wide, so every block carries this flag. The
+    // default CDF strongly favours ordinary intra blocks.
+    write_raw_symbol(wr, intrabc as usize, &[30531]);
+    if intrabc {
+        let candidate = candidate.unwrap();
+        write_intrabc_mv(wr, candidate.mv, predictor.unwrap());
+
+        let u8sz = size / 8;
+        st.a_mode[x8..x8 + u8sz].fill(0);
+        st.l_mode[y8..y8 + u8sz].fill(0);
+        for slot in &mut st.a_palette[x8..x8 + u8sz] {
+            slot.clear();
+        }
+        for slot in &mut st.l_palette[y8..y8 + u8sz] {
+            slot.clear();
+        }
+        let (x4, y4) = (px / 4, py / 4);
+        let mv = candidate.mv;
+        let stride4 = st.w / 4;
+        for y in y4..y4 + n_tx {
+            st.ibc_mv[y * stride4 + x4..y * stride4 + x4 + n_tx].fill(Some(mv));
+        }
+        for plane in 0..3 {
+            st.a_coef[plane][x4..x4 + n_tx].fill(0x40);
+            st.l_coef[plane][y4..y4 + n_tx].fill(0x40);
+        }
+        return;
+    }
+
     let kfy = icdf13(
         &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
             [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
@@ -942,6 +1257,7 @@ fn encode_plan(
             y_mode,
             uv_mode,
             palette,
+            intrabc,
         } => {
             wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
             code_leaf(
@@ -954,6 +1270,7 @@ fn encode_plan(
                 *y_mode,
                 *uv_mode,
                 palette.as_ref(),
+                *intrabc,
             );
             let pb = part_byte(sz8);
             for u in x8..x8 + sz8 {
@@ -1009,7 +1326,7 @@ fn decode_sb_ll(
         // 8x8 leaf (in-frame for multiple-of-8 dims): mode-search and code
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym, uv, palette) = best_leaf(
+        let (_b, ym, uv, palette, intrabc) = best_leaf(
             planes,
             st.w,
             px,
@@ -1020,7 +1337,7 @@ fn decode_sb_ll(
             st.visible_w,
             st.visible_h,
         );
-        code_leaf(wr, planes, st, px, py, 8, ym, uv, palette.as_ref());
+        code_leaf(wr, planes, st, px, py, 8, ym, uv, palette.as_ref(), intrabc);
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -1078,6 +1395,9 @@ pub fn encode_tile_lossless(
         l_part: vec![0; h / 8],
         a_mode: vec![0; w / 8],
         l_mode: vec![0; h / 8],
+        a_skip: vec![0; w / 4],
+        l_skip: vec![0; h / 4],
+        ibc_mv: vec![None; (w / 4) * (h / 4)],
         a_palette: vec![Vec::new(); w / 8],
         l_palette: vec![Vec::new(); h / 8],
     };
@@ -1112,7 +1432,7 @@ fn best_leaf_mono(
     bit_depth: u8,
     visible_w: usize,
     visible_h: usize,
-) -> (f32, usize, Option<LumaPalette>) {
+) -> (f32, usize, Option<LumaPalette>, bool) {
     let mut y_mode = 0usize;
     let mut yb = f32::INFINITY;
     for &m in LL_MODES.iter() {
@@ -1124,7 +1444,8 @@ fn best_leaf_mono(
     }
     let palette = (px + n_tx * 4 <= visible_w && py + n_tx * 4 <= visible_h)
         .then(|| exact_luma_palette(luma, stride, px, py, n_tx * 4, n_tx * 4, bit_depth))
-        .flatten();
+        .flatten()
+        .filter(|palette| palette_estimated_bits(palette, bit_depth) < yb);
     if let Some(palette) = palette.as_ref() {
         yb = palette_estimated_bits(palette, bit_depth);
         y_mode = 0;
@@ -1132,7 +1453,24 @@ fn best_leaf_mono(
     let ang = |m: usize| if (1..=8).contains(&m) { 1.5f32 } else { 0.0f32 };
     // skip + y_mode (+ angle_delta); no uv_mode symbol in a mono frame.
     let ovh = 4.0 + ang(y_mode);
-    (yb + ovh, y_mode, palette)
+    let regular_bits = yb + ovh;
+    const INTRABC_BITS: f32 = 8.0;
+    let ibc = find_exact_intrabc(
+        &[luma],
+        stride,
+        px,
+        py,
+        n_tx * 4,
+        stride,
+        luma.len() / stride,
+    )
+    .is_some()
+        && INTRABC_BITS < regular_bits;
+    if ibc {
+        (INTRABC_BITS, 0, None, true)
+    } else {
+        (regular_bits, y_mode, palette, false)
+    }
 }
 
 /// Mono partition plan for a fully-in-frame square block (luma only).
@@ -1148,7 +1486,7 @@ fn plan_full_mono(
     visible_w: usize,
     visible_h: usize,
 ) -> (f32, Plan) {
-    let (bits_leaf, ym, palette) = best_leaf_mono(
+    let (bits_leaf, ym, palette, intrabc) = best_leaf_mono(
         luma,
         stride,
         px,
@@ -1167,6 +1505,7 @@ fn plan_full_mono(
                 y_mode: ym,
                 uv_mode: 0,
                 palette,
+                intrabc,
             },
         );
     }
@@ -1195,6 +1534,7 @@ fn plan_full_mono(
                 y_mode: ym,
                 uv_mode: 0,
                 palette,
+                intrabc,
             },
         )
     } else {
@@ -1214,10 +1554,42 @@ fn code_leaf_mono(
     size: usize,
     y_mode: usize,
     palette: Option<&LumaPalette>,
+    intrabc: bool,
 ) {
     let n_tx = size / 4;
-    wr.symbol(0, &C::BLK_SKIP); // skip = 0
     let (x8, y8) = (px / 8, py / 8);
+    let candidate = intrabc
+        .then(|| find_exact_intrabc(&[luma], st.w, px, py, size, st.w, st.h))
+        .flatten();
+    let predictor = candidate.and_then(|_| intrabc_mv_predictor(st, px, py, size));
+    let intrabc = candidate.zip(predictor).is_some_and(|(candidate, pred)| {
+        (i32::from(candidate.mv.0) - i32::from(pred.0)).unsigned_abs() <= 16_384
+            && (i32::from(candidate.mv.1) - i32::from(pred.1)).unsigned_abs() <= 16_384
+    });
+    write_block_skip(wr, st, px, py, size, intrabc);
+    write_raw_symbol(wr, intrabc as usize, &[30531]);
+    if intrabc {
+        let candidate = candidate.unwrap();
+        write_intrabc_mv(wr, candidate.mv, predictor.unwrap());
+        let u8sz = size / 8;
+        st.a_mode[x8..x8 + u8sz].fill(0);
+        st.l_mode[y8..y8 + u8sz].fill(0);
+        for slot in &mut st.a_palette[x8..x8 + u8sz] {
+            slot.clear();
+        }
+        for slot in &mut st.l_palette[y8..y8 + u8sz] {
+            slot.clear();
+        }
+        let (x4, y4) = (px / 4, py / 4);
+        let mv = candidate.mv;
+        let stride4 = st.w / 4;
+        for y in y4..y4 + n_tx {
+            st.ibc_mv[y * stride4 + x4..y * stride4 + x4 + n_tx].fill(Some(mv));
+        }
+        st.a_coef[0][x4..x4 + n_tx].fill(0x40);
+        st.l_coef[0][y4..y4 + n_tx].fill(0x40);
+        return;
+    }
     let kfy = icdf13(
         &KF_Y_MODE_CDF[INTRA_MODE_CTX[st.a_mode[x8] as usize]]
             [INTRA_MODE_CTX[st.l_mode[y8] as usize]],
@@ -1287,17 +1659,26 @@ fn encode_plan_mono(
     let (px, py) = (x8 * 8, y8 * 8);
     match plan {
         Plan::Leaf {
-            y_mode, palette, ..
+            y_mode,
+            palette,
+            intrabc,
+            ..
         } => {
             wr.symbol(0, part_cdf(st, bl, x8, y8)); // PARTITION_NONE
-            code_leaf_mono(wr, luma, st, px, py, sz8 * 8, *y_mode, palette.as_ref());
+            code_leaf_mono(
+                wr,
+                luma,
+                st,
+                px,
+                py,
+                sz8 * 8,
+                *y_mode,
+                palette.as_ref(),
+                *intrabc,
+            );
             let pb = part_byte(sz8);
-            for u in x8..x8 + sz8 {
-                st.a_part[u] = pb;
-            }
-            for u in y8..y8 + sz8 {
-                st.l_part[u] = pb;
-            }
+            st.a_part[x8..x8 + sz8].fill(pb);
+            st.l_part[y8..y8 + sz8].fill(pb);
         }
         Plan::Split(kids) => {
             wr.symbol(3, part_cdf(st, bl, x8, y8)); // PARTITION_SPLIT
@@ -1341,7 +1722,7 @@ fn decode_sb_ll_mono(
     if sz8 == 1 {
         let ctx = get_partition_ctx(&st.a_part, &st.l_part, 4, x8, y8);
         wr.symbol(0, &C::PART_8[ctx]); // PARTITION_NONE
-        let (_b, ym, palette) = best_leaf_mono(
+        let (_b, ym, palette, intrabc) = best_leaf_mono(
             luma,
             st.w,
             px,
@@ -1352,7 +1733,7 @@ fn decode_sb_ll_mono(
             st.visible_w,
             st.visible_h,
         );
-        code_leaf_mono(wr, luma, st, px, py, 8, ym, palette.as_ref());
+        code_leaf_mono(wr, luma, st, px, py, 8, ym, palette.as_ref(), intrabc);
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -1405,6 +1786,9 @@ pub fn encode_tile_lossless_mono(
         l_part: vec![0; h / 8],
         a_mode: vec![0; w / 8],
         l_mode: vec![0; h / 8],
+        a_skip: vec![0; w / 4],
+        l_skip: vec![0; h / 4],
+        ibc_mv: vec![None; (w / 4) * (h / 4)],
         a_palette: vec![Vec::new(); w / 8],
         l_palette: vec![Vec::new(); h / 8],
     };
@@ -1467,10 +1851,25 @@ mod tests {
                     (7 + (((x / 4) + (y / 4)) % size) * 29) as i16
                 })
                 .collect();
-            let (_, mode, palette) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
+            let (_, mode, palette, _) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
             assert_eq!(mode, 0);
-            assert_eq!(palette.unwrap().colors.len(), size);
+            assert_eq!(palette.map(|p| p.colors.len()), Some(size), "size {size}");
         }
+    }
+
+    #[test]
+    fn exact_palette_loses_when_spatial_prediction_is_cheaper() {
+        let (w, h) = (64usize, 64usize);
+        // This block has an exact two-entry palette, but DC predicts every
+        // sample except one. Coding that single residual is far cheaper than
+        // transmitting a palette index for all 4096 samples.
+        let mut luma = vec![128i16; w * h];
+        luma[w * h - 1] = 129;
+
+        let (_, mode, palette, intrabc) = best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h);
+        assert_eq!(mode, 0);
+        assert!(palette.is_none());
+        assert!(!intrabc);
     }
 
     #[test]
@@ -1639,6 +2038,190 @@ mod tests {
         };
         let obu = encode_lossless_obu(&image, None, 1).unwrap();
         assert_eq!(decode_obu(&decoder, &obu, "444"), [y, u, v].concat());
+    }
+
+    #[test]
+    fn lossless_intrabc_default_dv_is_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (128usize, 128usize);
+        let mut first_row = vec![0u8; w * 64];
+        let mut state = 0x1bc0_6400u32;
+        for sample in &mut first_row {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = (state >> 24) as u8;
+        }
+        let pixels = [first_row.clone(), first_row].concat();
+        let luma_i16: Vec<i16> = pixels.iter().map(|&v| i16::from(v)).collect();
+        let (_, plan) = plan_full_mono(&luma_i16, w, 0, 64, 8, 128, 8, w, h);
+        assert!(matches!(plan, Plan::Leaf { intrabc: true, .. }));
+
+        let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let mono_obu = encode_lossless_gray_obu(&mono, true, 1).unwrap();
+        assert_eq!(decode_obu(&decoder, &mono_obu, "intrabc-mono"), pixels);
+
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [pixels.clone(), pixels.clone(), pixels.clone(), Vec::new()],
+        };
+        let obu = encode_lossless_obu(&image, None, 1).unwrap();
+        assert_eq!(
+            decode_obu(&decoder, &obu, "intrabc-444"),
+            [pixels.clone(), pixels.clone(), pixels].concat()
+        );
+    }
+
+    #[test]
+    fn lossless_intrabc_neighbor_mv_transition_is_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // The first SB row can use the default horizontal DV at x=320. At the
+        // next SB row the fallback changes to the vertical DV, but the block
+        // above remains a spatial MV candidate. A zero residual must therefore
+        // not be coded against the vertical fallback at that position.
+        let (w, h) = (384usize, 128usize);
+        let mut first = vec![0u8; w * 64];
+        let mut state = 0x1bc0_0320u32;
+        for sample in &mut first {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = (state >> 24) as u8;
+        }
+        for y in 0..64 {
+            let row = y * w;
+            first.copy_within(row..row + 64, row + 320);
+        }
+        let pixels = [first.clone(), first].concat();
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        assert_eq!(
+            decode_obu(&decoder, &obu, "intrabc-neighbor-mv-transition"),
+            pixels
+        );
+    }
+
+    #[test]
+    fn lossless_intrabc_nondefault_dv_and_stack_prediction_are_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (256usize, 64usize);
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..64 {
+            for x in 0..64 {
+                pixels[y * w + x] = ((x * 37 + y * 19 + (x ^ y) * 7) & 255) as u8;
+            }
+        }
+        for y in 0..64 {
+            for x in 64..128 {
+                pixels[y * w + x] = ((x * 11 + y * 43 + 91) & 255) as u8;
+            }
+        }
+        // The first copy uses the deliberately unaligned integer DV -125px and
+        // therefore a +195px residual from the first-row fallback (-320px).
+        // The second uses -128px, exercising a nonzero residual from the -125px
+        // spatial-stack predictor installed by the first copy.
+        for y in 0..64 {
+            pixels.copy_within(y * w + 3..y * w + 67, y * w + 128);
+            pixels.copy_within(y * w + 64..y * w + 128, y * w + 192);
+        }
+        let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
+        assert_eq!(decode_obu(&decoder, &obu, "intrabc-nondefault-dv"), pixels);
+    }
+
+    #[test]
+    fn lossy_intrabc_64_decodes_and_copies_reconstruction() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (128usize, 128usize);
+        let mut first = vec![0i32; w * 64];
+        let mut state = 0x1055_1bc0u32;
+        for sample in &mut first {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = (state >> 24) as i32;
+        }
+        let plane = [first.clone(), first].concat();
+        let src = [plane.clone(), plane.clone(), plane];
+        crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pool = crate::par::Pool::new(1);
+        let obu = crate::dispatch::encode_lossy_444(
+            80,
+            8,
+            w,
+            h,
+            &src[0],
+            &src[1],
+            &src[2],
+            None,
+            &pool,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+        );
+        let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-64");
+        assert_eq!(decoded.len(), 3 * w * h);
+        for decoded_plane in decoded.chunks_exact(w * h) {
+            assert_eq!(&decoded_plane[..w * 64], &decoded_plane[w * 64..]);
+        }
+        assert!(crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn lossy_intrabc_nondefault_dv_decodes_and_uses_reconstruction() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (256usize, 64usize);
+        let mut plane = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..128 {
+                plane[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as i32;
+            }
+            plane.copy_within(y * w + 3..y * w + 67, y * w + 128);
+            plane.copy_within(y * w + 64..y * w + 128, y * w + 192);
+        }
+        let src = [plane.clone(), plane.clone(), plane];
+        crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pool = crate::par::Pool::new(1);
+        let obu = crate::dispatch::encode_lossy_444(
+            80,
+            8,
+            w,
+            h,
+            &src[0],
+            &src[1],
+            &src[2],
+            None,
+            &pool,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+        );
+        let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-nondefault-dv");
+        for decoded_plane in decoded.chunks_exact(w * h) {
+            for y in 0..h {
+                assert_eq!(
+                    &decoded_plane[y * w + 3..y * w + 67],
+                    &decoded_plane[y * w + 128..y * w + 192]
+                );
+                assert_eq!(
+                    &decoded_plane[y * w + 64..y * w + 128],
+                    &decoded_plane[y * w + 192..y * w + 256]
+                );
+            }
+        }
+        assert!(
+            crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed) >= 2
+        );
     }
 
     #[test]

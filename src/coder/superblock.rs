@@ -399,6 +399,7 @@ impl<'a> LossyTile<'a> {
                     }
                 });
                 match choice {
+                    Part16::Intrabc => unreachable!("IntraBC is selected only at 64x64"),
                     Part16::Horz => {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
@@ -511,6 +512,15 @@ impl<'a> LossyTile<'a> {
             && (y8 + 8) * 8 <= self.h
         {
             let choice = self.part_decision(|t| t.choose_64(x8, y8));
+            if choice == Part16::Intrabc {
+                let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+                self.enc
+                    .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]);
+                self.code_block64_intrabc(x8, y8);
+                self.a_part[x8..x8 + 8].fill(0x10);
+                self.l_part[y8..y8 + 8].fill(0x10);
+                return;
+            }
             if choice == Part16::None {
                 let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                 self.enc

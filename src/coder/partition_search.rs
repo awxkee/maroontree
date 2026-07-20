@@ -702,7 +702,6 @@ impl<'a> LossyTile<'a> {
     fn code_block16_vert_444(&mut self, x8: usize, y8: usize) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda();
-        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         for half in 0..2 {
             let (px, py) = (x8 * 8 + half * 8, y8 * 8);

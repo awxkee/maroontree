@@ -27,6 +27,13 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/// `MT_NO_PROXY32` disables the full 32x32 partition estimator (falls back to
+/// the historical DC-only proxy) for A/B.
+fn full_partition_proxy32() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("MT_NO_PROXY32").is_err())
+}
+
 /// TEMPORARY diagnostic knob for the 32x32 split-signal multiplier (1.0 = the
 /// corrected pricing, 4.0 = the historical double-count).
 fn split32_signal_mult() -> f32 {
@@ -267,6 +274,14 @@ impl<'a> LossyTile<'a> {
     }
 
     fn rd_cost_none32(&self, px: usize, py: usize, prdo: f32) -> f32 {
+        // The whole-32 leg is compared against four 16x16 children; pricing
+        // either side DC-only makes the comparison depend on which side happens
+        // to suit DC, not on what the encoder will actually code. `rd_cost_square`
+        // carries the same mode set and transform refinement the final block
+        // gets, so both legs are now estimated the same way.
+        if full_partition_proxy32() {
+            return self.rd_cost_square(px, py, 32, false, false, prdo);
+        }
         let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
         let lam = trellis_lambda();
         let mlam = self.mlam();
@@ -289,6 +304,14 @@ impl<'a> LossyTile<'a> {
     }
 
     fn rd_cost_split32(&self, px: usize, py: usize, prdo: f32) -> f32 {
+        if full_partition_proxy32() {
+            let mlam = self.mlam() * prdo;
+            let mut total = rate_cost(mlam, SPLIT_SIGNAL_BITS * split32_signal_mult());
+            for (sx, sy) in [(0usize, 0usize), (16, 0), (0, 16), (16, 16)] {
+                total += self.rd_cost_square(px + sx, py + sy, 16, false, false, prdo);
+            }
+            return total;
+        }
         let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
         let lam = trellis_lambda();
         let mlam = self.mlam();

@@ -30,18 +30,18 @@
 use crate::Speed;
 use crate::chroma_rect::*;
 use crate::dct::{
-    adst4x4_t, adst4x8_t, adst8x8_t, adst8x16_t, adst16x8_t, adst16x16_t, adstdct4x4_t, adstdct4x8_t, adstdct8x8_t,
-    adstdct16x16_t, dct4x8_t, dct8x4_t, dct8x8_t, dct8x16_t, dct16x8_t, dct16x32_t, dct32x16_t,
-    dctadst4x4_t, dctadst4x8_t, dctadst8x8_t, dctadst16x16_t, fidentity8x8_t,
+    adst4x4_t, adst4x8_t, adst8x8_t, adst8x16_t, adst16x8_t, adst16x16_t, adstdct4x4_t,
+    adstdct4x8_t, adstdct8x8_t, adstdct16x16_t, dct4x8_t, dct8x4_t, dct8x8_t, dct8x16_t, dct16x8_t,
+    dct16x32_t, dct32x16_t, dctadst4x4_t, dctadst4x8_t, dctadst8x8_t, dctadst16x16_t,
+    fidentity8x8_t,
 };
 use crate::idct::{
     iadst_dequant_4x4, iadst_dequant_4x8, iadst_dequant_8x8, iadst_dequant_8x16,
-    iadst_dequant_16x8, iadst_dequant_16x16,
-    iadstdct_dequant_4x4, iadstdct_dequant_4x8, iadstdct_dequant_8x8, iadstdct_dequant_16x16,
-    idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x4, idct_dequant_8x8, idct_dequant_8x16,
-    idct_dequant_16x8, idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x16,
-    idct_dequant_32x32, idctadst_dequant_4x4, idctadst_dequant_4x8, idctadst_dequant_8x8,
-    idctadst_dequant_16x16, iidentity_dequant_8x8,
+    iadst_dequant_16x8, iadst_dequant_16x16, iadstdct_dequant_4x4, iadstdct_dequant_4x8,
+    iadstdct_dequant_8x8, iadstdct_dequant_16x16, idct_dequant_4x4, idct_dequant_4x8,
+    idct_dequant_8x4, idct_dequant_8x8, idct_dequant_8x16, idct_dequant_16x8, idct_dequant_16x16,
+    idct_dequant_16x32, idct_dequant_32x16, idct_dequant_32x32, idctadst_dequant_4x4,
+    idctadst_dequant_4x8, idctadst_dequant_8x8, idctadst_dequant_16x16, iidentity_dequant_8x8,
 };
 use crate::obu::{
     frame_header_lossy_multitile, frame_header_lossy_multitile_th, wrap_obu_frame,
@@ -59,6 +59,9 @@ pub(crate) static LOSSY_PALETTE_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static LOSSY_PALETTE_RESIDUAL_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOSSY_INTRABC_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(not(test))]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
@@ -82,6 +85,7 @@ fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Part16 {
+    Intrabc,
     None,
     Horz,
     Vert,
@@ -214,6 +218,12 @@ fn inv_chroma_4x8(tx: ChromaTx, levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
 
 pub(crate) struct Cdfs {
     pub(crate) skip: Vec<Vec<u16>>,                 // block skip [3 ctx]
+    pub(crate) intrabc: Vec<u16>,                   // use_intrabc
+    pub(crate) mv_joint: Vec<u16>,                  // MV_JOINT
+    pub(crate) mv_sign: [Vec<u16>; 2],              // vertical, horizontal
+    pub(crate) mv_classes: [Vec<u16>; 2],           // MV class 0..10
+    pub(crate) mv_class0: [Vec<u16>; 2],            // class-zero integer bit
+    pub(crate) mv_class_n: [[Vec<u16>; 10]; 2],     // class-N integer bits
     pub(crate) part_bl8: Vec<Vec<u16>>,             // PARTITION_NONE @ 8x8 [4 ctx]
     pub(crate) part_split: Vec<Vec<Vec<u16>>>,      // SPLIT [bl-1=0..3][4 ctx]
     pub(crate) kf_y: Vec<Vec<u16>>, // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
@@ -368,6 +378,29 @@ impl Cdfs {
         ];
         Cdfs {
             skip: SKIP_CDF.iter().map(|&v| icdf(&[v])).collect(),
+            intrabc: icdf(&[30531]),
+            mv_joint: icdf(&[4096, 11264, 19328]),
+            mv_sign: std::array::from_fn(|_| icdf(&[16384])),
+            mv_classes: std::array::from_fn(|_| {
+                icdf(&[
+                    28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767,
+                ])
+            }),
+            mv_class0: std::array::from_fn(|_| icdf(&[27648])),
+            mv_class_n: std::array::from_fn(|_| {
+                [
+                    icdf(&[17408]),
+                    icdf(&[17920]),
+                    icdf(&[18944]),
+                    icdf(&[20480]),
+                    icdf(&[22528]),
+                    icdf(&[24576]),
+                    icdf(&[28672]),
+                    icdf(&[29952]),
+                    icdf(&[29952]),
+                    icdf(&[30720]),
+                ]
+            }),
             part_bl8: PART_BL8_CDF.iter().map(|r| icdf(r)).collect(),
             txsz: [
                 TXSZ_CAT0_CDF.iter().map(|r| icdf(r)).collect(),
@@ -635,6 +668,10 @@ struct AqCtx {
     /// decoder `CurrentQIndex`, updated by each signaled delta; reset to `base_q`
     /// at the start of the tile (delta-Q does not persist across tiles).
     cur_qidx: i32,
+    /// Decoder qindex on entry to the current superblock. A whole-SB skip does
+    /// not execute `read_delta_qindex`, so its tentative AQ change is rolled
+    /// back to this value.
+    prev_qidx: i32,
     /// tile mean activity, the zero-delta reference (see [`tile_ref_activity`]).
     ref_act: f32,
     /// armed at the start of each superblock; the first coded block emits the
@@ -664,6 +701,7 @@ impl AqCtx {
             base_q: 0,
             res_log2: 0,
             cur_qidx: 0,
+            prev_qidx: 0,
             ref_act: 0.0,
             read_deltas: false,
             pending: 0,
@@ -696,6 +734,8 @@ struct LossyTile<'a> {
     ss422: bool, // chroma horizontally subsampled (4:2:2)
     ss420: bool, // chroma horizontally + vertically subsampled (4:2:0)
     mono: bool,  // monochrome: code luma only (NumPlanes=1, no chroma syntax)
+    allow_intrabc: bool,
+    ibc_mv: Vec<Option<(i16, i16)>>,
     src: &'a [Vec<i32>; 3],
     recon: [Vec<i32>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
@@ -1628,6 +1668,7 @@ fn encode_one_tile(
     vb: &VarianceBoost,
     record: bool,
     wf_threads: usize,
+    allow_intrabc: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -1659,7 +1700,8 @@ fn encode_one_tile(
                 _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
             }
         }
-        .with_speed(speed);
+        .with_speed(speed)
+        .with_intrabc(allow_intrabc);
         tile.sb_mode = sb_mode;
         tile.rec = rec_in;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
@@ -1942,6 +1984,7 @@ pub(crate) fn encode_lossy_tilegroup(
     Tiling,
     Option<crate::obu::CdefParams>,
     Option<crate::obu::LrParams>,
+    bool,
 ) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -1988,6 +2031,82 @@ pub(crate) fn encode_lossy_tilegroup(
         }
     }
 
+    // IntraBC is a frame-wide switch that suppresses all in-loop filters. Keep
+    // the ordinary photographic path unchanged unless at least one complete
+    // 64x64 block has an exact legal source match inside its tile.
+    let allow_intrabc = !mono
+        && rects.iter().any(|r| {
+            (0..r.th).step_by(64).any(|ly| {
+                (0..r.tw).step_by(64).any(|lx| {
+                    if lx + 64 > r.tw || ly + 64 > r.th {
+                        return false;
+                    }
+                    let exact = |ref_lx: usize, ref_ly: usize| {
+                        (0..3).all(|plane| {
+                            let sx = usize::from(plane != 0 && sub_x != 0);
+                            let sy = usize::from(plane != 0 && sub_y != 0);
+                            let stride = if plane == 0 { w8 } else { cw8 };
+                            let (x, y) = ((r.x0 + lx) >> sx, (r.y0 + ly) >> sy);
+                            let (rx, ry) = ((r.x0 + ref_lx) >> sx, (r.y0 + ref_ly) >> sy);
+                            let (bw, bh) = (64 >> sx, 64 >> sy);
+                            (0..bh).all(|row| {
+                                src[plane][(y + row) * stride + x..][..bw]
+                                    == src[plane][(ry + row) * stride + rx..][..bw]
+                            })
+                        })
+                    };
+                    let sbx = lx / 64 * 64;
+                    let sby = ly / 64 * 64;
+                    let legal = |rx: usize, ry: usize| {
+                        rx + 64 <= r.tw
+                            && ry + 64 <= r.th
+                            && ry + 64 <= sby + 64
+                            && (ry + 64 <= sby || rx + 64 <= sbx)
+                    };
+                    let default = if ly < 64 {
+                        lx.checked_sub(320).map(|x| (x, ly))
+                    } else {
+                        Some((lx, ly - 64))
+                    };
+                    if default.is_some_and(|(x, y)| legal(x, y) && exact(x, y)) {
+                        return true;
+                    }
+                    let luma_x = r.x0 + lx;
+                    let luma_y = r.y0 + ly;
+                    let wanted = [
+                        src[0][luma_y * w8 + luma_x],
+                        src[0][luma_y * w8 + luma_x + 63],
+                        src[0][(luma_y + 63) * w8 + luma_x],
+                        src[0][(luma_y + 63) * w8 + luma_x + 63],
+                    ];
+                    let mut probes = 0usize;
+                    for ry in (0..=ly.min(r.th - 64)).rev() {
+                        for rx in (0..=r.tw - 64).rev() {
+                            if !legal(rx, ry) {
+                                continue;
+                            }
+                            probes += 1;
+                            let x = r.x0 + rx;
+                            let y = r.y0 + ry;
+                            let hash = [
+                                src[0][y * w8 + x],
+                                src[0][y * w8 + x + 63],
+                                src[0][(y + 63) * w8 + x],
+                                src[0][(y + 63) * w8 + x + 63],
+                            ];
+                            if hash == wanted && exact(rx, ry) {
+                                return true;
+                            }
+                            if probes == 4096 {
+                                return false;
+                            }
+                        }
+                    }
+                    false
+                })
+            })
+        });
+
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
 
@@ -1998,12 +2117,16 @@ pub(crate) fn encode_lossy_tilegroup(
     // the tile pool would oversubscribe — same no-nesting rule as the AV2
     // wavefront). Wide frames get mandatory column tiles (MAX_TILE_WIDTH), so
     // per-tile is the only shape that covers them.
-    let wf_threads = if want > 1 && !multitile { want } else { 0 };
+    let wf_threads = if want > 1 && !multitile && !allow_intrabc {
+        want
+    } else {
+        0
+    };
 
     // Recording the symbol trace lets a winning Wiener unit or a per-unit CDEF
     // grid be signaled by a cheap replay instead of a second full encode of
     // every tile.
-    let record = (wiener_on || cdef_on) && base_q_idx != 0;
+    let record = !allow_intrabc && (wiener_on || cdef_on) && base_q_idx != 0;
     let mut outs: Vec<TileOut> = if wf_threads > 1 && n < want {
         // Split the budget: `outer` tiles in flight × `inner`-wide wavefront
         // inside each (outer*inner == want, no oversubscription — the inner
@@ -2018,15 +2141,43 @@ pub(crate) fn encode_lossy_tilegroup(
         let inner = (wf_threads / outer).max(2);
         pool.map_indexed(outer, n, |i| {
             encode_one_tile(
-                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
-                record, inner,
+                base_q_idx,
+                bd,
+                w8,
+                h8,
+                cw8,
+                sub_x,
+                sub_y,
+                mono,
+                src,
+                &rects[i],
+                speed,
+                aq,
+                vb,
+                record,
+                inner,
+                allow_intrabc,
             )
         })
     } else {
         pool.map_indexed(nthreads, n, |i| {
             encode_one_tile(
-                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
-                record, 0,
+                base_q_idx,
+                bd,
+                w8,
+                h8,
+                cw8,
+                sub_x,
+                sub_y,
+                mono,
+                src,
+                &rects[i],
+                speed,
+                aq,
+                vb,
+                record,
+                0,
+                allow_intrabc,
             )
         })
     };
@@ -2139,15 +2290,16 @@ pub(crate) fn encode_lossy_tilegroup(
     // reconstruction so that inter-tile edges are filtered exactly as the
     // decoder does (deblocking is not tile-independent in AV1). `filter_plane`
     // is a no-op when the derived level is 0 (e.g. lossless).
-    let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
-    frame_deblock(
-        &mut recon, w8, h8, cw8, ch8, disp_w, disp_h, &blk4f, &blk4hf, &blk4vf, &blk4tf, &pblk4f,
-        &pblk4hf, &pblk4vf, &pblk4tf, nc4f,
-        sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
-    );
+    if !allow_intrabc {
+        let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
+        frame_deblock(
+            &mut recon, w8, h8, cw8, ch8, disp_w, disp_h, &blk4f, &blk4hf, &blk4vf, &blk4tf,
+            &pblk4f, &pblk4hf, &pblk4vf, &pblk4tf, nc4f, sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
+        );
+    }
 
     // Frame-level CDEF (R-D searched; may pick per-64x64-unit signaling).
-    let cdef_decision = if cdef_on && base_q_idx != 0 {
+    let cdef_decision = if !allow_intrabc && cdef_on && base_q_idx != 0 {
         frame_cdef(
             &mut recon, src, &skip8, sb8w, w8, h8, cw8, ch8, disp_w, disp_h, sub_x, sub_y, mono,
             base_q_idx, bd, speed, pool,
@@ -2158,11 +2310,36 @@ pub(crate) fn encode_lossy_tilegroup(
 
     // Frame-level luma Wiener loop restoration (searched on the CDEF-filtered
     // recon, matching the decoder's filter order).
-    let lr_unit = if wiener_on && base_q_idx != 0 {
+    let lr_unit = if !allow_intrabc && wiener_on && base_q_idx != 0 {
         frame_wiener_search(&recon[0], &src[0], w8, h8, bd, pool)
     } else {
         None
     };
+
+    // Oracle: dump the encoder's own final reconstruction (post deblock/CDEF/LR
+    // — exactly what the decoder should produce) for all planes, so it can be
+    // compared pixel-for-pixel against avifdec output. A bitstream that decodes
+    // without error only proves the SYNTAX is valid, not that the encoder and
+    // decoder agree on the pixels. Chroma must be included: a luma-only check
+    // misses chroma-side desyncs entirely.
+    if let Ok(path) = std::env::var("MT_DUMP_RECON") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let (cdw, cdh) = (disp_w >> sub_x, disp_h >> sub_y);
+            let planes: [(usize, usize, usize); 3] =
+                [(disp_w, disp_h, w8), (cdw, cdh, cw8), (cdw, cdh, cw8)];
+            let n = if mono { 1 } else { 3 };
+            let _ = writeln!(f, "MTREC {disp_w} {disp_h} {cdw} {cdh} {n}");
+            for (pl, &(pw, ph, stride)) in planes.iter().enumerate().take(n) {
+                for y in 0..ph {
+                    let row: Vec<u8> = (0..pw)
+                        .map(|x| (recon[pl][y * stride + x] >> (bd - 8)).clamp(0, 255) as u8)
+                        .collect();
+                    let _ = f.write_all(&row);
+                }
+            }
+        }
+    }
 
     // Signal the winning filter syntax by replaying each tile's recorded
     // symbols with the read_lr symbols / per-unit cdef_idx literals
@@ -2194,7 +2371,13 @@ pub(crate) fn encode_lossy_tilegroup(
     let lr = lr_unit.map(|_| crate::obu::LrParams { luma_wiener: true });
 
     let tilegroup = assemble_tilegroup(payloads);
-    (tilegroup, plan, cdef_decision.map(|d| d.params), lr)
+    (
+        tilegroup,
+        plan,
+        cdef_decision.map(|d| d.params),
+        lr,
+        allow_intrabc,
+    )
 }
 
 /// CDEF damping derived from the base quantizer (spec range 3..=6); higher q ->
@@ -3318,6 +3501,7 @@ pub(crate) fn assemble_frame_obus(
     tilegroup: &[u8],
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&crate::obu::CdefParams>,
     lr: Option<&crate::obu::LrParams>,
 ) -> Vec<u8> {
@@ -3331,6 +3515,7 @@ pub(crate) fn assemble_frame_obus(
             plan.trl,
             mono,
             aq,
+            allow_intrabc,
             cdef,
             lr,
         );
@@ -3345,6 +3530,7 @@ pub(crate) fn assemble_frame_obus(
             0,
             mono,
             aq,
+            allow_intrabc,
             cdef,
             lr,
         );
@@ -3658,6 +3844,8 @@ mod aq_tests {
         let make_tile = || {
             let mut tile = LossyTile::new_420(100, 8, 64, 64, &src, QmLevels::FLAT);
             tile.aq.enabled = true;
+            tile.aq.prev_qidx = 100;
+            tile.aq.cur_qidx = 98;
             tile.aq.read_deltas = true;
             tile.aq.pending = -2;
             tile
@@ -3669,12 +3857,17 @@ mod aq_tests {
             skipped.aq.read_deltas,
             "a skipped whole superblock must return before read_delta_qindex"
         );
+        assert_eq!(skipped.aq.cur_qidx, 100, "skipped SB must roll AQ back");
 
         let mut coded = make_tile();
         coded.code_skip_and_sb_tokens_64(false, 0);
         assert!(
             !coded.aq.read_deltas,
             "a non-skipped whole superblock must consume its delta-Q"
+        );
+        assert_eq!(
+            coded.aq.cur_qidx, 98,
+            "coded SB keeps its signaled AQ qindex"
         );
     }
 

@@ -94,6 +94,8 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: false,
             mono: false,
+            allow_intrabc: false,
+            ibc_mv: vec![None; (w / 4) * (h / 4)],
             src,
             recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
@@ -155,6 +157,8 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: false,
             mono: true,
+            allow_intrabc: false,
+            ibc_mv: vec![None; (w / 4) * (h / 4)],
             src,
             recon: [vec![0; w * h], Vec::new(), Vec::new()],
             a_coef: [vec![0x40; w / 4], Vec::new(), Vec::new()],
@@ -215,6 +219,8 @@ impl<'a> LossyTile<'a> {
             ss422: true,
             ss420: false,
             mono: false,
+            allow_intrabc: false,
+            ibc_mv: vec![None; (w / 4) * (h / 4)],
             src,
             recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
@@ -275,6 +281,8 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: true,
             mono: false,
+            allow_intrabc: false,
+            ibc_mv: vec![None; (w / 4) * (h / 4)],
             src,
             recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
@@ -1126,6 +1134,7 @@ impl<'a> LossyTile<'a> {
         let sub_x = (self.ss420 || self.ss422) as usize;
         let sub_y = self.ss420 as usize;
         let blocks: &[(usize, usize, usize, usize)] = match part {
+            Part16::Intrabc => unreachable!("IntraBC has no intra chroma partition"),
             Part16::None => &[(0, 0, luma_dim, luma_dim)],
             Part16::Split => {
                 let half = luma_dim / 2;
@@ -1299,6 +1308,11 @@ impl<'a> LossyTile<'a> {
         self
     }
 
+    fn with_intrabc(mut self, enabled: bool) -> Self {
+        self.allow_intrabc = enabled;
+        self
+    }
+
     /// Turn on variance-based adaptive quantization for this tile. `ref_act` is
     /// the tile mean activity (see [`tile_ref_activity`]); the running
     /// `CurrentQIndex` starts at the frame base. Must be paired with a frame
@@ -1309,6 +1323,7 @@ impl<'a> LossyTile<'a> {
             base_q,
             res_log2: AQ_RES_LOG2,
             cur_qidx: base_q as i32,
+            prev_qidx: base_q as i32,
             ref_act,
             read_deltas: false,
             pending: 0,
@@ -1476,9 +1491,15 @@ impl<'a> LossyTile<'a> {
     /// the accumulator to the cell's qindex, arm the delta-q token, and
     /// retarget the quantizers.
     fn aq_begin_sb_cell(&mut self, cell: &AqCell) {
-        let newq = cell.newq as i32;
+        self.aq.prev_qidx = self.aq.cur_qidx;
+        let target = cell.newq as i32;
+        let step = 1i32 << self.aq.res_log2;
+        let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
+            .fast_round()
+            .clamp(-(AQ_MAX_STEPS as f32), AQ_MAX_STEPS as f32) as i32;
+        let newq = (self.aq.cur_qidx + steps * step).clamp(1, 255);
         self.aq.cur_qidx = newq;
-        self.aq.pending = cell.steps;
+        self.aq.pending = steps;
         self.aq.read_deltas = true;
         self.quant = Quant::new_with_qm(newq as u8, self.bd, self.quant.qm_level());
         // The chroma-DC delta is a frame-level constant (DeltaQUDc, derived from
@@ -1489,6 +1510,26 @@ impl<'a> LossyTile<'a> {
         self.cquant = Quant::new_chroma_with_delta_qm(
             newq as u8,
             frame_dc_delta,
+            self.bd,
+            self.cquant.qm_level(),
+        );
+    }
+
+    /// Undo the tentative AQ retarget when a whole 64x64 block is skipped.
+    /// AV1 returns before `read_delta_qindex` in that case, leaving the decoder's
+    /// `CurrentQIndex` unchanged; the encoder must quantize the next SB from the
+    /// same state.
+    fn aq_cancel_skipped_sb(&mut self) {
+        if !self.aq.enabled || !self.aq.read_deltas {
+            return;
+        }
+        let q = self.aq.prev_qidx as u8;
+        self.aq.cur_qidx = self.aq.prev_qidx;
+        self.aq.pending = 0;
+        self.quant = Quant::new_with_qm(q, self.bd, self.quant.qm_level());
+        self.cquant = Quant::new_chroma_with_delta_qm(
+            q,
+            chroma_dc_delta(self.aq.base_q),
             self.bd,
             self.cquant.qm_level(),
         );
@@ -1553,6 +1594,9 @@ impl<'a> LossyTile<'a> {
             self.enc.trace_cdef_mark();
         }
         self.code_delta_q_if_armed();
+        if self.allow_intrabc {
+            self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+        }
     }
 
     /// Whole-superblock counterpart of [`Self::code_skip_and_sb_tokens`]. AV1's
@@ -1563,6 +1607,10 @@ impl<'a> LossyTile<'a> {
         self.enc
             .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
         if block_skip {
+            self.aq_cancel_skipped_sb();
+            if self.allow_intrabc {
+                self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+            }
             return;
         }
         if !self.cdef_point_marked {
@@ -1570,6 +1618,9 @@ impl<'a> LossyTile<'a> {
             self.enc.trace_cdef_mark();
         }
         self.code_delta_q_if_armed();
+        if self.allow_intrabc {
+            self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+        }
     }
 
     /// Emit the `read_delta_qindex()` token for the first block of a superblock,
