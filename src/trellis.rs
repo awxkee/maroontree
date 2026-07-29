@@ -51,74 +51,6 @@ fn scaled_trellis_lambda(dc_q: f32, ac_q: f32, lambda0: f32) -> f32 {
     trellis_lambda_aom(dc_q, ac_q) * (lambda0 / TRELLIS_LAMBDA0)
 }
 
-pub(crate) fn dropout_qcoeff(cf: &mut [i32], scan: &[u32], w: usize, h: usize, qindex: i32) {
-    const COEFF_MAX: i32 = 2;
-    const CONTINUITY_MAX: i32 = 2;
-    if !(16..=128).contains(&qindex) {
-        return;
-    }
-    let base_size = w.max(h) as i32;
-    let multiplier = (qindex / 32).clamp(2, 8);
-    let num_before = multiplier * base_size.clamp(16, 32);
-    let num_after = multiplier * base_size.clamp(16, 32);
-    let max_eob = scan.len() as i32;
-    let cur_eob = scan
-        .iter()
-        .rposition(|&rc| cf[rc as usize] != 0)
-        .map_or(0, |i| i as i32 + 1);
-    if cur_eob == 0 || cur_eob <= num_before || max_eob <= num_before + num_after {
-        return;
-    }
-    let mut count_zeros_before = 0i32;
-    let mut count_zeros_after = 0i32;
-    let mut count_nonzeros = 0i32;
-    let mut idx = -1i32;
-    for i in 0..cur_eob {
-        let rc = scan[i as usize] as usize;
-        if cf[rc].abs() > COEFF_MAX {
-            count_zeros_before = 0;
-            count_zeros_after = 0;
-            count_nonzeros = 0;
-            idx = -1;
-        } else if cf[rc] == 0 {
-            if idx == -1 {
-                count_zeros_before += 1;
-            } else {
-                count_zeros_after += 1;
-            }
-        } else {
-            if count_zeros_before >= num_before {
-                if idx == -1 {
-                    idx = i;
-                }
-                count_nonzeros += 1;
-            } else {
-                count_zeros_before = 0;
-            }
-        }
-        if count_nonzeros > CONTINUITY_MAX {
-            count_zeros_before = 0;
-            count_zeros_after = 0;
-            count_nonzeros = 0;
-            idx = -1;
-        }
-        if idx != -1 && i == cur_eob - 1 {
-            count_zeros_after += max_eob - cur_eob;
-        }
-        if count_zeros_after >= num_after {
-            for j in idx..=i {
-                cf[scan[j as usize] as usize] = 0;
-            }
-            count_zeros_before += i - idx + 1;
-            count_zeros_after = 0;
-            count_nonzeros = 0;
-            idx = -1;
-        }
-    }
-}
-
-pub(crate) const TRELLIS_DROPOUT: bool = false;
-
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn trellis_optimize_ctx(
     cf: &mut [i32],
@@ -135,7 +67,7 @@ pub(crate) fn trellis_optimize_ctx(
     eob_bin_cdf: &[u16],
     dcs_ctx: usize,
     qm_level: u8,
-    qindex: i32,
+    _qindex: i32,
 ) {
     if lambda0 <= 0.0 {
         return;
@@ -568,9 +500,6 @@ pub(crate) fn trellis_optimize_ctx(
             for &rc in scan[(e + 1)..m].iter() {
                 cf[rc as usize] = 0;
             }
-        }
-        if TRELLIS_DROPOUT {
-            dropout_qcoeff(cf, scan, w, h, qindex);
         }
     });
 }

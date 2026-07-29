@@ -2515,6 +2515,7 @@ pub(crate) fn encode_16x32_chroma_coeffs(
 }
 
 /// Luma coeff coder for RTX_16X32 (16 wide x 32 tall).
+#[cfg(any())]
 pub(crate) fn encode_16x32_luma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,
@@ -2613,6 +2614,7 @@ pub(crate) fn encode_16x32_luma_coeffs(
 }
 
 /// Luma coeff coder for RTX_32X16 (32 wide x 16 tall).
+#[cfg(any())]
 pub(crate) fn encode_32x16_luma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,
@@ -2711,6 +2713,7 @@ pub(crate) fn encode_32x16_luma_coeffs(
 }
 
 /// Chroma coeff coder for RTX_32X16 (32 wide x 16 tall).
+#[cfg(any())]
 pub(crate) fn encode_32x16_chroma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,

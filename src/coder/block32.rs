@@ -31,18 +31,6 @@ const fn bottomup_split32() -> bool {
     true
 }
 
-const RECT32_ENABLED: bool = false;
-
-const AB32_ENABLED: bool = false;
-
-const fn ab32_bias() -> f32 {
-    1.0
-}
-
-const fn rect32_bias() -> f32 {
-    1.1
-}
-
 const fn full_partition_proxy32() -> bool {
     true
 }
@@ -301,71 +289,6 @@ impl<'a> LossyTile<'a> {
         }
         best
     }
-    /// Decision-side price of one equipped 32-level rect leaf: the emitter's
-    /// mode search re-run under the caller's prdo-scaled lambdas, distortion
-    /// via the masking-weighted partition metric, epoch-memoized (the two
-    /// rect orientations and the 64-level SPLIT recompute share leaves).
-    fn rd_cost_rect32_leaf(&self, px: usize, py: usize, vert: bool, prdo: f32) -> f32 {
-        let mlam = self.mlam() * prdo;
-        let dc = if vert {
-            self.intrapred.dc_pred_16x32(&self.recon[0], self.w, px, py, self.bd as i32)
-        } else {
-            self.intrapred.dc_pred_32x16(&self.recon[0], self.w, px, py, self.bd as i32)
-        };
-        let key = (
-            (1u64 << 62)
-                | ((px as u64) << 40)
-                | ((py as u64) << 20)
-                | ((dc as u64) << 1)
-                | vert as u64,
-            prdo.to_bits(),
-        );
-        let epoch = self.emit_epoch.get();
-        if let Some(&(e, dist, bits)) = self.rect_leaf_cache.borrow().get(&key)
-            && e == epoch
-        {
-            return crate::partition_rd::rd_cost(dist, mlam, bits);
-        }
-        let (w, h) = if vert { (16usize, 32usize) } else { (32, 16) };
-        let scan: &[u32] = if vert { &SCAN_16X32 } else { &SCAN_32X16 };
-        let dlam = trellis_lambda() * prdo;
-        let (y_mode, pred, resid_scratch, cf) =
-            self.rect32_luma_mode_search(px, py, vert, dc, dlam, mlam);
-        self.sc().put_i512(resid_scratch);
-        let rr = if vert {
-            self.idct.idct_dequant_16x32(&cf, &self.quant)
-        } else {
-            self.idct.idct_dequant_32x16(&cf, &self.quant)
-        };
-        let distortion = self.luma_partition_distortion(
-            px,
-            py,
-            w,
-            h,
-            self.quant.ac_q() as f32,
-            &pred[..],
-            0,
-            &rr[..],
-        );
-        let (bx4, by4) = (px / 4, py / 4);
-        let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
-            + INTRA_MODE_CTX[self.l_mode[by4] as usize];
-        let mut bits = cdf_cost(&self.dcdf().kf_y[yctx], y_mode);
-        if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
-            bits += cdf_cost(&self.dcdf().angle_delta[y_mode - V_PRED], 3);
-        }
-        bits += self.luma_rect_bits(&cf[..], scan, w, h, px, py, y_mode, 1);
-        self.rect_leaf_cache
-            .borrow_mut()
-            .insert(key, (epoch, distortion, bits));
-        {
-            let mut sc = self.sc();
-            sc.put_i512(pred);
-            sc.put_i512(cf);
-        }
-        crate::partition_rd::rd_cost(distortion, mlam, bits)
-    }
-
     fn rd_choice_rect32(
         &self,
         x8: usize,
@@ -469,125 +392,6 @@ impl<'a> LossyTile<'a> {
             } else {
                 (Part16::Split, rd_split)
             };
-        }
-        let rect32_on = self.speed == Speed::Slow
-            && self.speed.full_partition_rdo()
-            && !self.mono
-            && RECT32_ENABLED;
-        if rect32_on {
-            let mlam = self.mlam() * prdo;
-            let sig = rate_cost(mlam, self.partition_signal_bits());
-            let rd_horz = (sig
-                + self.rd_cost_rect32_leaf(px, py, false, prdo)
-                + self.rd_cost_rect32_leaf(px, py + 16, false, prdo)
-                + self.rd_cost_chroma_partition(px, py, 32, Part16::Horz, prdo))
-                * rect32_bias();
-            let rd_vert = (sig
-                + self.rd_cost_rect32_leaf(px, py, true, prdo)
-                + self.rd_cost_rect32_leaf(px + 16, py, true, prdo)
-                + self.rd_cost_chroma_partition(px, py, 32, Part16::Vert, prdo))
-                * rect32_bias();
-            let best_rect = rd_horz.min(rd_vert);
-            if best_rect < rd_none.min(rd_split) {
-                return if rd_horz <= rd_vert {
-                    (Part16::Horz, rd_horz)
-                } else {
-                    (Part16::Vert, rd_vert)
-                };
-            }
-        }
-        // A/B T-shapes at the 32 parent: one equipped 32x16/16x32 trailing or
-        // leading leaf + two 16x16 squares. Unlike pure HORZ/VERT (closed as
-        // net-negative), only ONE half is a rect; the squares keep the full
-        // 16-level tooling. The 16x16 children of a T-shape are forced
-        // BLOCK_16X16 leaves (no nested partition), so they are priced with
-        // `rd_cost_square` (the NONE-16 estimator), NOT the 16-level best
-        // total. Chroma for all three pieces is priced by
-        // `rd_cost_chroma_partition` at luma_dim 32.
-        let ab32_on = self.speed == Speed::Slow
-            && self.speed.full_partition_rdo()
-            && self.ss420
-            && AB32_ENABLED;
-        if ab32_on {
-            let mlam = self.mlam() * prdo;
-            let asym_sig = rate_cost(mlam, self.partition_signal_bits());
-            // Children on the same axis as SPLIT's: `rd_cost_square` at Slow
-            // is the chroma-coupled joint proxy (the same estimator behind the
-            // 16-level totals), so NO separate chroma term for them — only the
-            // rect piece's chroma is added (the rect leaf pricer is luma-only).
-            let sq = |sx: usize, sy: usize| {
-                self.rd_cost_square(px + sx, py + sy, 16, false, false, prdo)
-            };
-            let rect_chroma = |ox: usize, oy: usize, lw: usize, lh: usize| {
-                if coupled_square {
-                    let sub_x = (self.ss420 || self.ss422) as usize;
-                    let sub_y = self.ss420 as usize;
-                    self.chroma_partition_weight_at(px + ox, py + oy, lw, lh)
-                        * self.rd_cost_chroma_block(
-                            (px + ox) >> sub_x,
-                            (py + oy) >> sub_y,
-                            lw >> sub_x,
-                            lh >> sub_y,
-                            prdo,
-                        )
-                } else {
-                    0.0 // uncoupled: the full-partition chroma term is added below
-                }
-            };
-            let full_chroma = |part: Part16| {
-                if coupled_square {
-                    0.0
-                } else {
-                    self.rd_cost_chroma_partition(px, py, 32, part, prdo)
-                }
-            };
-            let bias = ab32_bias();
-            let cands = [
-                (
-                    Part16::HorzA,
-                    asym_sig
-                        + sq(0, 0)
-                        + sq(16, 0)
-                        + self.rd_cost_rect32_leaf(px, py + 16, false, prdo)
-                        + rect_chroma(0, 16, 32, 16)
-                        + full_chroma(Part16::HorzA),
-                ),
-                (
-                    Part16::HorzB,
-                    asym_sig
-                        + self.rd_cost_rect32_leaf(px, py, false, prdo)
-                        + rect_chroma(0, 0, 32, 16)
-                        + sq(0, 16)
-                        + sq(16, 16)
-                        + full_chroma(Part16::HorzB),
-                ),
-                (
-                    Part16::VertA,
-                    asym_sig
-                        + sq(0, 0)
-                        + sq(0, 16)
-                        + self.rd_cost_rect32_leaf(px + 16, py, true, prdo)
-                        + rect_chroma(16, 0, 16, 32)
-                        + full_chroma(Part16::VertA),
-                ),
-                (
-                    Part16::VertB,
-                    asym_sig
-                        + self.rd_cost_rect32_leaf(px, py, true, prdo)
-                        + rect_chroma(0, 0, 16, 32)
-                        + sq(16, 0)
-                        + sq(16, 16)
-                        + full_chroma(Part16::VertB),
-                ),
-            ];
-            let (ab_part, ab_cost) = cands
-                .into_iter()
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap();
-            let ab_cost = ab_cost * bias;
-            if ab_cost < rd_none.min(rd_split) {
-                return (ab_part, ab_cost);
-            }
         }
         // (previous state, kept for the record:)
         // 32-level HORZ/VERT candidates were DISABLED (2026-07-21): with
@@ -1249,7 +1053,6 @@ impl<'a> LossyTile<'a> {
         // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
         let mut best_delta: i32 = 0;
         if rl.is_none()
-            && angle_delta_enabled()
             && self.speed.try_angle_deltas_av1(32, self.base_q_idx)
             && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
             && best_mode != V_PRED
@@ -1937,6 +1740,7 @@ impl<'a> LossyTile<'a> {
     /// full DCT + trellis + entropy-rate pipeline under the caller's lambdas.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
+    #[cfg(any())]
     fn rect32_luma_mode_search(
         &self,
         px: usize,
@@ -2085,6 +1889,7 @@ impl<'a> LossyTile<'a> {
         (best.1, best.2, best.3, best.4)
     }
 
+    #[cfg(any())]
     fn code_block32_rect(&mut self, x8: usize, y8: usize, vert: bool) {
         self.code_block32_rect_halves(x8, y8, vert, 0..2);
     }
@@ -2103,6 +1908,7 @@ impl<'a> LossyTile<'a> {
     /// Returns (packed cf [sub0|sub1], packed prediction, recon, sse, bits,
     /// per-sub txtp16 indices).
     #[allow(clippy::type_complexity)]
+    #[cfg(any())]
     fn rect32_split_try(
         &mut self,
         px: usize,
@@ -2311,6 +2117,7 @@ impl<'a> LossyTile<'a> {
     /// one half (`1..2` for the trailing leaf of HORZ_A/VERT_A, `0..1` for
     /// the leading leaf of HORZ_B/VERT_B) with the 16x16 squares coded by the
     /// caller. Lambdas stay anchored at the 32 parent either way.
+    #[cfg(any())]
     fn code_block32_rect_halves(
         &mut self,
         x8: usize,
@@ -2739,6 +2546,7 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    #[cfg(any())]
     fn emit_chroma_rect(
         &mut self,
         plane: usize,

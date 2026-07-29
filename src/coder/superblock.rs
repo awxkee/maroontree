@@ -109,14 +109,7 @@ impl<'a> LossyTile<'a> {
         debug_assert_eq!(N, w * h);
         debug_assert!(modes.len() <= 13);
         let mut ranked = FixedList::<(u64, usize), 13>::new((0, DC_PRED));
-        const MID32_FLAT_ONLY: bool = false;
-        let deny_dir_32 = MID32_FLAT_ONLY
-            && N == 1024
-            && (41..=143).contains(&(self.aq.base_q as i32));
         for &mode in modes {
-            if deny_dir_32 && (1..=8).contains(&mode) {
-                continue;
-            }
             let mut pred = [0i32; N];
             if mode == DC_PRED {
                 pred.fill(self.intrapred.dc_pred(
@@ -535,103 +528,8 @@ impl<'a> LossyTile<'a> {
                         self.l_part[y8..y8 + 4].fill(0x18);
                         return;
                     }
-                    Part16::Horz => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(1, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block32_rect(x8, y8, false);
-                        self.a_part[x8..x8 + 4].fill(0x18);
-                        self.l_part[y8..y8 + 4].fill(0x1c);
-                        return;
-                    }
-                    Part16::Vert => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(2, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block32_rect(x8, y8, true);
-                        self.a_part[x8..x8 + 4].fill(0x1c);
-                        self.l_part[y8..y8 + 4].fill(0x18);
-                        return;
-                    }
-                    // A/B T-shapes: two BLOCK_16X16 leaves + one 32x16/16x32
-                    // rect leaf, z-order. Child edge flags mirror the BL16
-                    // A/B arms scaled to 16px children; al_part_ctx values are
-                    // dav1d's bl32 tts/tbs/tls/trs rows.
-                    Part16::HorzA => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(4, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block16(
-                            x8,
-                            y8,
-                            y8 > 0 && (x8 * 8 + 16) < self.w,
-                            x8 > 0 && (y8 * 8 + 16) < self.h,
-                        );
-                        self.code_block16(
-                            x8 + 2,
-                            y8,
-                            thr && y8 > 0 && (x8 * 8 + 32) < self.w,
-                            false,
-                        );
-                        self.code_block32_rect_halves(x8, y8, false, 1..2);
-                        self.a_part[x8..x8 + 4].fill(0x18);
-                        self.l_part[y8..y8 + 4].fill(0x1c);
-                        return;
-                    }
-                    Part16::HorzB => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(5, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block32_rect_halves(x8, y8, false, 0..1);
-                        self.code_block16(
-                            x8,
-                            y8 + 2,
-                            (x8 * 8 + 16) < self.w,
-                            lhb && x8 > 0 && (y8 * 8 + 32) < self.h,
-                        );
-                        self.code_block16(x8 + 2, y8 + 2, false, false);
-                        self.a_part[x8..x8 + 4].fill(0x1c);
-                        self.l_part[y8..y8 + 4].fill(0x1c);
-                        return;
-                    }
-                    Part16::VertA => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(6, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block16(
-                            x8,
-                            y8,
-                            y8 > 0 && (x8 * 8 + 16) < self.w,
-                            x8 > 0 && (y8 * 8 + 16) < self.h,
-                        );
-                        self.code_block16(
-                            x8,
-                            y8 + 2,
-                            false,
-                            lhb && x8 > 0 && (y8 * 8 + 32) < self.h,
-                        );
-                        self.code_block32_rect_halves(x8, y8, true, 1..2);
-                        self.a_part[x8..x8 + 4].fill(0x1c);
-                        self.l_part[y8..y8 + 4].fill(0x18);
-                        return;
-                    }
-                    Part16::VertB => {
-                        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
-                        self.enc
-                            .encode_symbol(7, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block32_rect_halves(x8, y8, true, 0..1);
-                        self.code_block16(
-                            x8 + 2,
-                            y8,
-                            thr && y8 > 0 && (x8 * 8 + 32) < self.w,
-                            true,
-                        );
-                        self.code_block16(x8 + 2, y8 + 2, false, false);
-                        self.a_part[x8..x8 + 4].fill(0x1c);
-                        self.l_part[y8..y8 + 4].fill(0x1c);
-                        return;
-                    }
-                    _ => {}
+                    Part16::Split => {}
+                    _ => unreachable!("disabled 32x32 partition"),
                 }
             }
         }
