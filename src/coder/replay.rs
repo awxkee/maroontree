@@ -50,9 +50,23 @@ enum TxSel {
     AdstDct,
     DctAdst,
     Idtx,
-    /// 16x16 luma coded as four TX_8X8 (`tx_depth = 1`), DCT sub-transforms;
-    /// the coefficient record carries the four 8x8s packed quadrant-major.
-    SplitDct,
+    /// 16x16 luma coded as four TX_8X8 (`tx_depth = 1`); the payload carries
+    /// each quadrant's txtp in the TX_8X8 7-type set (all-1 = all-DCT, the
+    /// value other levels' TX splits use) and the coefficient record packs
+    /// the four 8x8s quadrant-major.
+    SplitDct([u8; 4]),
+    /// 16x16 luma coded as SIXTEEN TX_4X4 (`tx_depth = 2`, raster order);
+    /// payload = per-TX txtp4 symbols, coefficient record packs the sixteen
+    /// 4x4s TX-raster-major.
+    Split16Tx([u8; 16]),
+    /// 1-D hybrids (V_DCT / H_DCT), TX_8X8 and TX_4X4.
+    VDct,
+    HDct,
+    /// 8x8 luma coded as four TX_4X4 (`tx_depth = 1`); the payload carries
+    /// each sub-TX's txtp4 symbol (0=IDTX, 1=DCT, 2=V_DCT, 3=H_DCT,
+    /// 4=ADST_ADST) in raster order, and the coefficient record packs the
+    /// four 4x4s quadrant-major.
+    Split4Tx([u8; 4]),
 }
 
 impl TxSel {
@@ -95,6 +109,8 @@ struct LumaSel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UvSel {
     uv: u8,
+    /// Selected UV palette size, or zero (4:4:4 exact chroma palette).
+    palette: u8,
 }
 
 /// Call-order log of one tile's RD decisions. Sequences are independent
@@ -122,9 +138,9 @@ struct DecisionRecord {
     /// The superblock's reconstructed pixel blocks (per plane, tightly packed
     /// `h2*w2`), ONE entry per SB. Streamed with the record so the pure-emit
     /// replay copies pixels in instead of re-running prediction + inverse
-    /// transforms; unconverted (DC) leaves then read correct neighbours and
+    /// transforms; unconverted (DC) leaves then read correct neighbors and
     /// regenerate identical values.
-    recon: Vec<[Vec<i32>; 3]>,
+    recon: Vec<[Vec<u16>; 3]>,
 }
 
 /// Cursor state for [`SbMode::Replay`]; one position per record sequence.

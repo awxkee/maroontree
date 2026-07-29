@@ -33,6 +33,7 @@ use crate::av2::cdfs_uv_qcx as uvq;
 use crate::av2::cdfx_4tx::*;
 use crate::av2::cfl;
 use crate::av2::tables_tx32::TX_PART_2D_64;
+use hashbrown::HashMap;
 
 /// Expand a static ICDF slice to include counter + PARA rate words.
 /// `nsyms` = alphabet size = number of entries before the sentinel.
@@ -240,7 +241,7 @@ pub(crate) struct CdfState {
     pub(crate) do_split: Vec<Vec<u16>>, // [64 partition_ctx]
     pub(crate) do_square_split: Vec<Vec<u16>>, // [8 square_split_ctx]
     pub(crate) rect_type: Vec<Vec<u16>>, // [64 partition_ctx]
-    pub(crate) txfm_bools: std::collections::HashMap<u16, Vec<u16>>,
+    pub(crate) txfm_bools: HashMap<u16, Vec<u16>>,
     /// CCSO per-superblock on/off flag, adaptive 2-symbol CDF. Indexed
     /// [plane][ctx] with CCSO_PLANES=3, CCSO_CONTEXT=4. Phase 1 only uses
     /// plane 1 (U), but all three planes are initialized to the AVM defaults.
@@ -499,7 +500,7 @@ impl CdfState {
                     )
                 })
                 .collect(),
-            txfm_bools: std::collections::HashMap::new(),
+            txfm_bools: HashMap::new(),
             // CCSO blk on/off flag CDFs. AVM default_ccso_cdf[plane][ctx]:
             // CDF2 value a0 -> icdf0 = 32768 - a0; PARA2(a,b,c) = (a+2,b+3,c+4).
             ccso: {

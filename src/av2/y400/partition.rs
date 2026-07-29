@@ -48,7 +48,7 @@ struct WfSlot400 {
 }
 
 /// Per-worker reusable scratch for the 4:0:0 wavefront decide: a private luma recon
-/// (`ry`, full-res `pw×ph`) plus the emit-side neighbour context arrays. 4:0:0 is
+/// (`ry`, full-res `pw×ph`) plus the emit-side neighbor context arrays. 4:0:0 is
 /// luma-only, so there is no chroma recon/halo/context here. Each cell sees the
 /// frame-initial context values, reset per cell so the result never depends on
 /// which cell a worker handled previously.
@@ -265,7 +265,7 @@ impl Av2Encoder {
                         // decide the same all-zero-except-halo view the serial fresh plane
                         // does. It starts zero (in `ensure`) and each cell RE-ZEROES exactly
                         // what it dirtied (below), so on entry it is all-zero. Copy the halo
-                        // (finished top/left neighbours) from the shared recon.
+                        // (finished top/left neighbors) from the shared recon.
                         // SAFETY: under WPP these regions are earlier-diagonal (finished),
                         // not being written concurrently; own-block writes are disjoint.
                         unsafe {

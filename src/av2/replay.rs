@@ -85,7 +85,7 @@ pub(crate) struct Whole64Decision {
     pub chroma: WholeChroma,
     /// The winner's 64×64 reconstruction (luma, u, v), captured at decide time so
     /// replay can `put_block` it directly instead of re-running predict+itx+add.
-    /// Row-major 64×64. Feeds neighbouring blocks' prediction in replay.
+    /// Row-major 64×64. Feeds neighboring blocks' prediction in replay.
     pub recon_y: Vec<f32>,
     pub recon_u: Vec<f32>,
     pub recon_v: Vec<f32>,
@@ -112,7 +112,7 @@ pub(crate) struct LeafDecision {
     /// Luma intra mode (32×32 split leaf) or 16×16 tx-type index; 0 where unused.
     pub mode_idx: usize,
     /// The leaf's luma reconstruction, row-major `bw_mi*4 × bh_mi*4`, restored via
-    /// `put_block(_rect)` in replay so neighbours + emit contexts match the search.
+    /// `put_block(_rect)` in replay so neighbors + emit contexts match the search.
     pub recon_y: Vec<f32>,
 }
 
@@ -357,7 +357,7 @@ pub(crate) struct Luma420 {
     pub tus: [Vec<Coeff>; 4],
     pub mode_idx: usize,
     pub adelta: i8,
-    /// 64×64 luma reconstruction (row-major), restored in replay for CfL/neighbours.
+    /// 64×64 luma reconstruction (row-major), restored in replay for CfL/neighbors.
     pub recon_y: Vec<f32>,
 }
 

@@ -27,22 +27,18 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{dct4x4_t, dct4x8_t, dct8x4_t, dct8x16_t, dct16x8_t, dct16x32_t, dct32x16_t};
-use crate::idct::{
-    idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x4, idct_dequant_8x16, idct_dequant_16x8,
-    idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x16,
-};
-use crate::intrapred::{
-    dc_pred_4x4, dc_pred_4x8, dc_pred_8x4, dc_pred_8x16, dc_pred_16x8, dc_pred_16x16,
-    dc_pred_16x32, dc_pred_32x16,
-};
-use crate::quant::{Quant, forward_dct_quant_16x16_t};
+use crate::dct::DctDispatch;
+use crate::idct::IdctDispatch;
+use crate::intrapred::IntraPredDispatch;
+use crate::quant::Quant;
 use crate::tables::{
     SCAN_4X4, SCAN_4X8, SCAN_8X4, SCAN_8X16, SCAN_16X8, SCAN_16X16, SCAN_16X32, SCAN_32X16,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn chroma_dc_rect(
-    recon: &[i32],
+    intrapred: &IntraPredDispatch,
+    recon: &[u16],
     stride: usize,
     x: usize,
     y: usize,
@@ -50,13 +46,7 @@ pub(crate) fn chroma_dc_rect(
     height: usize,
     bit_depth: i32,
 ) -> i32 {
-    match (width, height) {
-        (32, 16) => dc_pred_32x16(recon, stride, x, y, bit_depth),
-        (16, 32) => dc_pred_16x32(recon, stride, x, y, bit_depth),
-        (16, 8) => dc_pred_16x8(recon, stride, x, y, bit_depth),
-        (8, 16) => dc_pred_8x16(recon, stride, x, y, bit_depth),
-        _ => dc_pred_16x16(recon, stride, x, y, bit_depth),
-    }
+    intrapred.dc_pred(recon, stride, x, y, width, height, bit_depth)
 }
 
 pub(crate) fn scan_rect(width: usize, height: usize) -> &'static [u32] {
@@ -70,6 +60,7 @@ pub(crate) fn scan_rect(width: usize, height: usize) -> &'static [u32] {
 }
 
 pub(crate) fn fwd_chroma_rect(
+    dct: &DctDispatch,
     width: usize,
     height: usize,
     residual: &[i32; 512],
@@ -78,26 +69,21 @@ pub(crate) fn fwd_chroma_rect(
     let mut coefficients = [0i32; 512];
     let mut targets = [0.0f32; 512];
     match (width, height) {
-        (32, 16) => return dct32x16_t(residual, quantizer),
-        (16, 32) => return dct16x32_t(residual, quantizer),
+        (32, 16) => return dct.dct32x16_t(residual, quantizer),
+        (16, 32) => return dct.dct16x32_t(residual, quantizer),
         (16, 8) => {
-            let mut input = [0i32; 128];
-            input.copy_from_slice(&residual[..128]);
-            let (output, target) = dct16x8_t(&input, quantizer);
+            let (output, target) = dct.dct16x8_t(residual.first_chunk::<128>().unwrap(), quantizer);
             coefficients[..128].copy_from_slice(&output);
             targets[..128].copy_from_slice(&target);
         }
         (8, 16) => {
-            let mut input = [0i32; 128];
-            input.copy_from_slice(&residual[..128]);
-            let (output, target) = dct8x16_t(&input, quantizer);
+            let (output, target) = dct.dct8x16_t(residual.first_chunk::<128>().unwrap(), quantizer);
             coefficients[..128].copy_from_slice(&output);
             targets[..128].copy_from_slice(&target);
         }
         _ => {
-            let mut input = [0i32; 256];
-            input.copy_from_slice(&residual[..256]);
-            let (output, target) = forward_dct_quant_16x16_t(&input, quantizer);
+            let (output, target) =
+                dct.dct16x16_t(residual.first_chunk::<256>().unwrap(), quantizer);
             coefficients[..256].copy_from_slice(&output);
             targets[..256].copy_from_slice(&target);
         }
@@ -106,6 +92,7 @@ pub(crate) fn fwd_chroma_rect(
 }
 
 pub(crate) fn inv_chroma_rect(
+    idct: &IdctDispatch,
     width: usize,
     height: usize,
     coefficients: &[i32; 512],
@@ -113,29 +100,31 @@ pub(crate) fn inv_chroma_rect(
 ) -> [i32; 512] {
     let mut residual = [0i32; 512];
     match (width, height) {
-        (32, 16) => return idct_dequant_32x16(coefficients, quantizer),
-        (16, 32) => return idct_dequant_16x32(coefficients, quantizer),
+        (32, 16) => return idct.idct_dequant_32x16(coefficients, quantizer),
+        (16, 32) => return idct.idct_dequant_16x32(coefficients, quantizer),
         (16, 8) => {
-            let mut input = [0i32; 128];
-            input.copy_from_slice(&coefficients[..128]);
-            residual[..128].copy_from_slice(&idct_dequant_16x8(&input, quantizer));
+            residual[..128].copy_from_slice(
+                &idct.idct_dequant_16x8(coefficients.first_chunk::<128>().unwrap(), quantizer),
+            );
         }
         (8, 16) => {
-            let mut input = [0i32; 128];
-            input.copy_from_slice(&coefficients[..128]);
-            residual[..128].copy_from_slice(&idct_dequant_8x16(&input, quantizer));
+            residual[..128].copy_from_slice(
+                &idct.idct_dequant_8x16(coefficients.first_chunk::<128>().unwrap(), quantizer),
+            );
         }
         _ => {
-            let mut input = [0i32; 256];
-            input.copy_from_slice(&coefficients[..256]);
-            residual[..256].copy_from_slice(&idct_dequant_16x16(&input, quantizer));
+            residual[..256].copy_from_slice(
+                &idct.idct_dequant_16x16(coefficients.first_chunk::<256>().unwrap(), quantizer),
+            );
         }
     }
     residual
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn chroma_dc_rect8(
-    recon: &[i32],
+    intrapred: &IntraPredDispatch,
+    recon: &[u16],
     stride: usize,
     x: usize,
     y: usize,
@@ -143,11 +132,7 @@ pub(crate) fn chroma_dc_rect8(
     height: usize,
     bit_depth: i32,
 ) -> i32 {
-    match (width, height) {
-        (8, 4) => dc_pred_8x4(recon, stride, x, y, bit_depth),
-        (4, 8) => dc_pred_4x8(recon, stride, x, y, bit_depth),
-        _ => dc_pred_4x4(recon, stride, x, y, bit_depth),
-    }
+    intrapred.dc_pred(recon, stride, x, y, width, height, bit_depth)
 }
 
 pub(crate) fn scan_rect8(width: usize, height: usize) -> &'static [u32] {
@@ -159,6 +144,7 @@ pub(crate) fn scan_rect8(width: usize, height: usize) -> &'static [u32] {
 }
 
 pub(crate) fn fwd_chroma_rect8(
+    dct: &DctDispatch,
     width: usize,
     height: usize,
     residual: &[i32; 64],
@@ -168,23 +154,17 @@ pub(crate) fn fwd_chroma_rect8(
     let mut targets = [0.0f32; 64];
     match (width, height) {
         (8, 4) => {
-            let mut input = [0i32; 32];
-            input.copy_from_slice(&residual[..32]);
-            let (output, target) = dct8x4_t(&input, quantizer);
+            let (output, target) = dct.dct8x4_t(residual.first_chunk::<32>().unwrap(), quantizer);
             coefficients[..32].copy_from_slice(&output);
             targets[..32].copy_from_slice(&target);
         }
         (4, 8) => {
-            let mut input = [0i32; 32];
-            input.copy_from_slice(&residual[..32]);
-            let (output, target) = dct4x8_t(&input, quantizer);
+            let (output, target) = dct.dct4x8_t(residual.first_chunk::<32>().unwrap(), quantizer);
             coefficients[..32].copy_from_slice(&output);
             targets[..32].copy_from_slice(&target);
         }
         _ => {
-            let mut input = [0i32; 16];
-            input.copy_from_slice(&residual[..16]);
-            let (output, target) = dct4x4_t(&input, quantizer);
+            let (output, target) = dct.dct4x4_t(residual.first_chunk::<16>().unwrap(), quantizer);
             coefficients[..16].copy_from_slice(&output);
             targets[..16].copy_from_slice(&target);
         }
@@ -193,6 +173,7 @@ pub(crate) fn fwd_chroma_rect8(
 }
 
 pub(crate) fn inv_chroma_rect8(
+    idct: &IdctDispatch,
     width: usize,
     height: usize,
     coefficients: &[i32; 64],
@@ -201,19 +182,19 @@ pub(crate) fn inv_chroma_rect8(
     let mut residual = [0i32; 64];
     match (width, height) {
         (8, 4) => {
-            let mut input = [0i32; 32];
-            input.copy_from_slice(&coefficients[..32]);
-            residual[..32].copy_from_slice(&idct_dequant_8x4(&input, quantizer));
+            residual[..32].copy_from_slice(
+                &idct.idct_dequant_8x4(coefficients.first_chunk::<32>().unwrap(), quantizer),
+            );
         }
         (4, 8) => {
-            let mut input = [0i32; 32];
-            input.copy_from_slice(&coefficients[..32]);
-            residual[..32].copy_from_slice(&idct_dequant_4x8(&input, quantizer));
+            residual[..32].copy_from_slice(
+                &idct.idct_dequant_4x8(coefficients.first_chunk::<32>().unwrap(), quantizer),
+            );
         }
         _ => {
-            let mut input = [0i32; 16];
-            input.copy_from_slice(&coefficients[..16]);
-            residual[..16].copy_from_slice(&idct_dequant_4x4(&input, quantizer));
+            residual[..16].copy_from_slice(
+                &idct.idct_dequant_4x4(coefficients.first_chunk::<16>().unwrap(), quantizer),
+            );
         }
     }
     residual

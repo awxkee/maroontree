@@ -28,19 +28,40 @@
  */
 mod dct;
 mod idct;
+mod intrapred;
+mod kmeans;
+mod loopfilter;
+mod qmatrix;
 mod rd;
 mod trellis;
 mod wht;
 
 pub(crate) use dct::{
-    adst16x16_avx2_quant_t, adstdct16x16_avx2_quant_t, dct8x8_avx2_quant_t, dct8x16_avx2_i32,
-    dct8x16_avx2_quant_t, dct16x16_avx2_quant_t, dct16x32_avx2_quant_t, dct32x16_avx2_quant_t,
-    dct32x32_avx2_i32, dct32x32_avx2_quant_t, dctadst16x16_avx2_quant_t,
+    adst4x4_avx2_quant_t, adst4x8_avx2_quant_t, adst8x8_avx2_quant_t, adst8x16_avx2_quant_t,
+    adst16x8_avx2_quant_t, adst16x16_avx2_quant_t, adstdct4x4_avx2_quant_t,
+    adstdct4x8_avx2_quant_t, adstdct8x8_avx2_quant_t, adstdct8x16_avx2_quant_t,
+    adstdct16x8_avx2_quant_t, adstdct16x16_avx2_quant_t, dct4x4_avx2_quant_t, dct4x8_avx2_quant_t,
+    dct4x16_avx2_quant_t, dct8x4_avx2_quant_t, dct8x8_avx2_quant_t, dct8x16_avx2_i32,
+    dct8x16_avx2_quant_t, dct16x4_avx2_quant_t, dct16x8_avx2_quant_t, dct16x16_avx2_quant_t,
+    dct16x32_avx2_quant_t, dct32x16_avx2_quant_t, dct32x32_avx2_i32, dct32x32_avx2_quant_t,
+    dctadst4x4_avx2_quant_t, dctadst4x8_avx2_quant_t, dctadst8x8_avx2_quant_t,
+    dctadst8x16_avx2_quant_t, dctadst16x8_avx2_quant_t, dctadst16x16_avx2_quant_t,
+    fhdct4x4_avx2_quant_t, fhdct8x8_avx2_quant_t, fhdct8x16_avx2_quant_t, fhdct16x8_avx2_quant_t,
+    fvdct4x4_avx2_quant_t, fvdct8x8_avx2_quant_t, fvdct8x16_avx2_quant_t, fvdct16x8_avx2_quant_t,
 };
-pub(crate) use idct::{
-    iadst_dequant_16x16_avx2, iadstdct_dequant_16x16_avx2, idct_dequant_8x8_avx2,
-    idct_dequant_16x16_avx2, idct_dequant_32x32_avx2, idctadst_dequant_16x16_avx2,
+pub(crate) use idct::*;
+pub(crate) use intrapred::{
+    cfl_ac_444_u16_avx2, cfl_ac_sub_u16_avx2, cfl_best_alpha_u16_avx2, cfl_pred_avx2, dc_pred_avx2,
+    dr_predict_avx2, edge_conv5_avx2, filter_intra_cells_avx2, horizontal_avx2, paeth_avx2,
+    smooth_avx2, smooth_h_avx2, smooth_v_avx2, vertical_avx2,
 };
-pub(crate) use rd::{residual_dc_avx2, residual_pred_avx2, sse_recon_avx2};
+pub(crate) use kmeans::{luma_nearest_indices_avx2, uv_nearest_indices_avx2};
+pub(crate) use loopfilter::{loop_filter_avx2, loop_filter_batch_avx2};
+pub(crate) use qmatrix::apply_qmatrix_avx2;
+pub(crate) use rd::{
+    all_zero_i32_avx2, luma_satd_avx2, reconstruct_avx2, residual_dc_avx2, residual_pred_avx2,
+    satd_sad_proxy_avx2, sse_recon_avx2, sse_u16_avx2, sum_i32_avx2, sum_u16_avx2,
+    sum_u16_strided_avx2,
+};
 pub(crate) use trellis::{trellis_dist_current_zero_scan_avx2, trellis_round_down_scan_avx2};
 pub(crate) use wht::fwht_raw_avx2;

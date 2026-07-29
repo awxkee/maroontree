@@ -44,6 +44,8 @@
 //!   -d, --depth <8|10|12>                    Output bit depth (auto-detect from source)
 //!   -t, --threads <N>                        Worker threads; 0 = all cores   [default: all]
 //!       --no-alpha                           Discard alpha channel
+//!       --no-screen-content                  Skip palette (screen-content) search
+//!       --no-intrabc                         Veto lossy IntraBC (keeps loop filters)
 //!       --no-exif                            Strip EXIF from output
 //!       --no-icc                             Strip ICC profile from output
 //!   -s, --speed                              Encoding effort (default = slow)
@@ -115,6 +117,9 @@ struct Args {
     verbose: bool,
     speed: EncodingEffort,
     qmatrix: Option<Qmatrix>,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 }
 
 fn usage() -> ! {
@@ -134,10 +139,13 @@ Options:
   -d, --depth <8|10|12>                 Output bit depth (auto from source)
   -t, --threads <N>                     Worker threads; 0 = all cores   [default: all]
       --no-alpha                        Discard alpha channel
+      --no-screen-content               Skip palette (screen-content) search
+      --no-intrabc                      Veto lossy IntraBC (keeps loop filters)
       --no-exif                         Strip EXIF metadata from output
       --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
       --qm <auto|0-15>                  Enable AV1 quantization matrices
+      --no-cdf-update                   Freeze AV1 entropy CDFs
   -s, --speed                           Encoding effort (default = slow)
   -v, --verbose                         Print timing and file stats
   -h, --help                            Print this help"
@@ -190,12 +198,15 @@ fn parse_args() -> Args {
     let mut depth: Option<Depth> = None;
     let mut threads: usize = basic_concurrency();
     let mut no_alpha = false;
+    let mut screen_content = true;
+    let mut intrabc = true;
     let mut no_exif = false;
     let mut no_icc = false;
     let mut apply_icc = false;
     let mut verbose = false;
     let mut speed = EncodingEffort::Slow;
     let mut qmatrix = None;
+    let mut updating_cdf = true;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -203,9 +214,12 @@ fn parse_args() -> Args {
             "-v" | "--verbose" => verbose = true,
             "--lossless" => lossless = true,
             "--no-alpha" => no_alpha = true,
+            "--no-screen-content" => screen_content = false,
+            "--no-intrabc" => intrabc = false,
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
             "--apply-icc" => apply_icc = true,
+            "--no-cdf-update" => updating_cdf = false,
             "--qm" => {
                 let value = args.next().unwrap_or_default();
                 qmatrix = Some(if value == "auto" {
@@ -318,12 +332,15 @@ fn parse_args() -> Args {
         depth,
         threads,
         no_alpha,
+        screen_content,
+        intrabc,
         no_exif,
         no_icc,
         apply_icc,
         verbose,
         speed,
         qmatrix,
+        updating_cdf,
     }
 }
 

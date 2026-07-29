@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::aq_common::f_fmlaf;
 use crate::coder::*;
 use crate::coeffs::get_lo_ctx_2d;
 use crate::cost::*;
@@ -34,10 +35,12 @@ use crate::trellis_dist::{
     trellis_dist_current_zero_scan, trellis_dist_one, trellis_round_down_scan,
 };
 
-/// Trellis RD lambda on libaom's KF rdmult shape `dc_q^2*(3.3+0.0015*dc_q)`
-/// (av1/encoder/txb_rdopt.c uses the frame DC-quant rdmult), calibrated to the
-/// legacy `TRELLIS_LAMBDA0*ac_q^2*2` at q=128.
-const TRELLIS_AOM_CALIB: f32 = 0.045025873597302174;
+const TRELLIS_AOM_CALIB: f32 = 0.045025873597302174 * 0.5525;
+
+fn trellis_tilt_mag_cap() -> f32 {
+    crate::tuning::get().trellis_tilt_mag_cap
+}
+
 #[inline]
 fn trellis_lambda_aom(dc_q: f32, _ac_q: f32) -> f32 {
     TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
@@ -48,6 +51,74 @@ fn scaled_trellis_lambda(dc_q: f32, ac_q: f32, lambda0: f32) -> f32 {
     trellis_lambda_aom(dc_q, ac_q) * (lambda0 / TRELLIS_LAMBDA0)
 }
 
+pub(crate) fn dropout_qcoeff(cf: &mut [i32], scan: &[u32], w: usize, h: usize, qindex: i32) {
+    const COEFF_MAX: i32 = 2;
+    const CONTINUITY_MAX: i32 = 2;
+    if !(16..=128).contains(&qindex) {
+        return;
+    }
+    let base_size = w.max(h) as i32;
+    let multiplier = (qindex / 32).clamp(2, 8);
+    let num_before = multiplier * base_size.clamp(16, 32);
+    let num_after = multiplier * base_size.clamp(16, 32);
+    let max_eob = scan.len() as i32;
+    let cur_eob = scan
+        .iter()
+        .rposition(|&rc| cf[rc as usize] != 0)
+        .map_or(0, |i| i as i32 + 1);
+    if cur_eob == 0 || cur_eob <= num_before || max_eob <= num_before + num_after {
+        return;
+    }
+    let mut count_zeros_before = 0i32;
+    let mut count_zeros_after = 0i32;
+    let mut count_nonzeros = 0i32;
+    let mut idx = -1i32;
+    for i in 0..cur_eob {
+        let rc = scan[i as usize] as usize;
+        if cf[rc].abs() > COEFF_MAX {
+            count_zeros_before = 0;
+            count_zeros_after = 0;
+            count_nonzeros = 0;
+            idx = -1;
+        } else if cf[rc] == 0 {
+            if idx == -1 {
+                count_zeros_before += 1;
+            } else {
+                count_zeros_after += 1;
+            }
+        } else {
+            if count_zeros_before >= num_before {
+                if idx == -1 {
+                    idx = i;
+                }
+                count_nonzeros += 1;
+            } else {
+                count_zeros_before = 0;
+            }
+        }
+        if count_nonzeros > CONTINUITY_MAX {
+            count_zeros_before = 0;
+            count_zeros_after = 0;
+            count_nonzeros = 0;
+            idx = -1;
+        }
+        if idx != -1 && i == cur_eob - 1 {
+            count_zeros_after += max_eob - cur_eob;
+        }
+        if count_zeros_after >= num_after {
+            for j in idx..=i {
+                cf[scan[j as usize] as usize] = 0;
+            }
+            count_zeros_before += i - idx + 1;
+            count_zeros_after = 0;
+            count_nonzeros = 0;
+            idx = -1;
+        }
+    }
+}
+
+pub(crate) const TRELLIS_DROPOUT: bool = false;
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn trellis_optimize_ctx(
     cf: &mut [i32],
@@ -57,19 +128,44 @@ pub(crate) fn trellis_optimize_ctx(
     scan: &[u32],
     lambda0: f32,
     w: usize,
+    h: usize,
     cdfs: &Cdfs,
     cls: usize,
     plane: usize,
     eob_bin_cdf: &[u16],
     dcs_ctx: usize,
+    qm_level: u8,
+    qindex: i32,
 ) {
     if lambda0 <= 0.0 {
         return;
     }
     let n = scan.len();
+    // Read straight from the static QM table: this used to heap-allocate a
+    // `w*w` Vec of weights on EVERY call and resolve the table offset once per
+    // coefficient. `qm_row` resolves the offset once; the per-access work is a
+    // byte load and a multiply, so no precomputed buffer is warranted.
+    let qm_table = crate::quant::qm_row(qm_level, plane != 0, w, h);
+    let qm_full = qm_level >= 6;
+    let qm_at = |rc: usize| -> f32 {
+        let wq = qm_table.map_or(32.0, |t| t[rc] as f32) / 32.0;
+        if qm_full { wq * wq } else { wq }
+    };
     let lambda = scaled_trellis_lambda(dc_q, ac_q, lambda0);
-    let log2w = w.trailing_zeros() as usize;
-    let stride = w;
+    // Shape-generic coefficient geometry, identical to the rate twin in
+    // `rate.rs`: positions decompose against the HEIGHT (`rc >> log2h`,
+    // `rc & (h - 1)`) with `stride == h`, and the base-token position offsets
+    // come from the aspect-specific table. For a square block this is exactly
+    // the old `w`-only form.
+    let log2h = h.trailing_zeros() as usize;
+    let stride = h;
+    let lo_off = if w < h {
+        &crate::tables::LO_CTX_OFF_WLH
+    } else if w > h {
+        &crate::tables::LO_CTX_OFF_WGH
+    } else {
+        &LO_CTX_OFF
+    };
     // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
     // re-walking the nested arrays on every coefficient).
     let base_tok = &cdfs.base_tok[cls][plane];
@@ -77,40 +173,32 @@ pub(crate) fn trellis_optimize_ctx(
     let eob_hi = &cdfs.eob_hi[cls][plane];
     let eob_base = &cdfs.eob_base[cls][plane];
     let dc_sign = &cdfs.dc_sign[plane];
+    let cost_table = cost_q_table();
     let dq2_dc = dc_q * dc_q;
     let dq2_ac = ac_q * ac_q;
-    let dist = |rc: usize, lev: i32| trellis_dist_one(tf, rc, lev, dq2_dc, dq2_ac);
+    let band_t = cdfs.band_tilt;
+    let n_inv = 1.0 / n as f32;
 
-    // Precompute the base-range (hi_tok) ladder cost for every br context and
-    // every total_br in 0..=12, once per call. `hi_tok_cost` otherwise reruns a
-    // 4-step `cdf_cost` ladder for every level-3+ coefficient (hot at high
-    // quality). Only worth the ~0.5us setup for the larger transforms (n >= 256),
-    // where it is called hundreds of times; small blocks use the direct path.
-    // Accumulation order matches `hi_tok_cost` exactly, so the chosen levels are
-    // identical either way.
-    let use_br_table = n >= 256;
+    let distw = |idx: usize, rc: usize, lev: i32| -> f32 {
+        let mut d = trellis_dist_one(tf, rc, lev, dq2_dc, dq2_ac);
+        if qm_table.is_some() {
+            d *= qm_at(rc);
+        }
+        if band_t != 0.0 && tf[rc].abs() < trellis_tilt_mag_cap() {
+            d /= 1.0 + band_t * (idx as f32 * n_inv);
+        }
+        d
+    };
+
+    // Gate lowered 256 -> 64 with the shared `br_cum_row` builder (2026-07-26
+    // cost-precache pass): the eager 21-row build is ~84 cdf_cost calls, paid
+    // back by any block whose candidates take the hi_tok ladder more than a
+    // few dozen times — true from 8x8 up. 4x4 keeps the direct path.
+    let use_br_table = n >= 64;
     let mut br_cum = [[0f32; 13]; 21];
     if use_br_table {
         for (row, br) in br_cum.iter_mut().zip(br_tok.iter()) {
-            let c = [
-                cdf_cost(br, 0),
-                cdf_cost(br, 1),
-                cdf_cost(br, 2),
-                cdf_cost(br, 3),
-            ];
-            for (j, slot) in row.iter_mut().enumerate() {
-                let mut coded = 0i32;
-                let mut bits = 0.0f32;
-                for _ in 0..(COEFF_BASE_RANGE / 3) {
-                    let s = (j as i32 - coded).min(3);
-                    bits += c[s as usize];
-                    coded += s;
-                    if s < 3 {
-                        break;
-                    }
-                }
-                *slot = bits;
-            }
+            *row = br_cum_row_with_table(br, cost_table);
         }
     }
     // Base-range tail cost for magnitude `m` (>= 3) in br context `bc`.
@@ -123,10 +211,9 @@ pub(crate) fn trellis_optimize_ctx(
             }
             bits
         } else {
-            hi_tok_cost(m, &br_tok[bc])
+            hi_tok_cost_with_table(m, &br_tok[bc], cost_table)
         }
     };
-
     let eob: i32 = scan
         .iter()
         .rposition(|&rc| cf[rc as usize] != 0)
@@ -137,44 +224,71 @@ pub(crate) fn trellis_optimize_ctx(
     let eu = eob as usize;
 
     thread_local! {
-        static SCRATCH: std::cell::RefCell<(
-            Vec<u8>,
-            Vec<f32>,
-            Vec<f32>,
-            Vec<f32>,
-            Vec<f32>,
-        )> = const {
-            std::cell::RefCell::new((
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ))
-        };
+    static SCRATCH: std::cell::RefCell<(
+        Vec<u8>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<usize>,
+    )> = const {
+        std::cell::RefCell::new((
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    };
     }
     SCRATCH.with_borrow_mut(|scratch| {
-        let (levels, pre, suf0, dist_cur, dist_zero) = (
+        let (levels, pre, suf0, dist_cur, dist_zero, dirty) = (
             &mut scratch.0,
             &mut scratch.1,
             &mut scratch.2,
             &mut scratch.3,
             &mut scratch.4,
+            &mut scratch.5,
         );
-        levels.clear();
-        levels.resize(w * (w + 4), 0);
+        // Context levels are sparse after quantization. Clear only the nonzero
+        // positions left by the preceding call instead of memset'ing the whole
+        // padded TX plane for every candidate.
+        for &idx in dirty.iter() {
+            levels[idx] = 0;
+        }
+        dirty.clear();
+        let levels_need = (w + 2) * (h + 2);
+        if levels.len() < levels_need {
+            levels.resize(levels_need, 0);
+        }
+        // Positions past the last nonzero (eu) contribute the same zero-level
+        // distortion constant to every EOB candidate and to skip, so all the
+        // scans below truncate to m = eu + 1 — byte-identical decisions, but
+        // a mid-q TX32 goes from 1024-length passes to a few tens. (`n` still
+        // feeds ctx_e and the band-tilt normalizer, which are spec/n-based.)
+        let m = eu + 1;
+        pre.resize(m + 1, 0.0);
+        suf0.resize(m + 1, 0.0);
+        dist_cur.resize(m, 0.0);
+        dist_zero.resize(m, 0.0);
         let set_level = |levels: &mut [u8], rc: usize, m: u32| {
-            levels[(rc >> log2w) * stride + (rc & (w - 1))] = level_byte(m);
+            levels[(rc >> log2h) * stride + (rc & (h - 1))] = level_byte(m);
         };
         for &rc32 in &scan[..eu + 1] {
             let rc = rc32 as usize;
-            set_level(levels, rc, cf[rc].unsigned_abs());
+            let magnitude = cf[rc].unsigned_abs();
+            if magnitude != 0 {
+                let pos = (rc >> log2h) * stride + (rc & (h - 1));
+                levels[pos] = level_byte(magnitude);
+                dirty.push(pos);
+            }
         }
 
         // Interior base-token context + br context for a position, from `levels`.
         let interior_ctx = |levels: &[u8], rc: usize| -> (usize, usize) {
-            let (x, y) = (rc >> log2w, rc & (w - 1));
-            let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, &LO_CTX_OFF, stride);
+            let (x, y) = (rc >> log2h, rc & (h - 1));
+            let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, lo_off, stride);
             let mag = hi_mag & 63;
             let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
             (ctx, bc as usize)
@@ -190,10 +304,10 @@ pub(crate) fn trellis_optimize_ctx(
         // Rate of an interior coefficient at level k (base_tok + br + AC sign).
         let interior_rate = |ctx: usize, bc: usize, k: u32| -> f32 {
             if k == 0 {
-                return cdf_cost(&base_tok[ctx], 0);
+                return cdf_cost_with_table(&base_tok[ctx], 0, cost_table);
             }
             let tok = k.min(3);
-            let mut b = cdf_cost(&base_tok[ctx], tok as usize);
+            let mut b = cdf_cost_with_table(&base_tok[ctx], tok as usize, cost_table);
             if tok == 3 {
                 b += hi_cost(k, bc);
             }
@@ -212,10 +326,10 @@ pub(crate) fn trellis_optimize_ctx(
             // br/Golomb tail (k >= 3) and distortion vary per candidate. Float-op
             // order matches `interior_rate` exactly so the choice is unchanged.
             let bt = &base_tok[ctx];
-            let bt0 = cdf_cost(bt, 0);
-            let bt1 = cdf_cost(bt, 1);
-            let bt2 = cdf_cost(bt, 2);
-            let bt3 = cdf_cost(bt, 3);
+            let bt0 = cdf_cost_with_table(bt, 0, cost_table);
+            let bt1 = cdf_cost_with_table(bt, 1, cost_table);
+            let bt2 = cdf_cost_with_table(bt, 2, cost_table);
+            let bt3 = cdf_cost_with_table(bt, 3, cost_table);
             let rate_k = |k: u32| -> f32 {
                 match k {
                     0 => bt0,
@@ -225,10 +339,10 @@ pub(crate) fn trellis_optimize_ctx(
                 }
             };
             let mut best_k = l;
-            let mut best_c = dist(rc, l as i32) + rate_cost(lambda, rate_k(l));
+            let mut best_c = distw(i, rc, l as i32) + rate_cost(lambda, rate_k(l));
 
             for k in (0..l).rev() {
-                let dk = dist(rc, k as i32);
+                let dk = distw(i, rc, k as i32);
                 // dist grows monotonically as k falls below l (l <= |tf|), and the
                 // rate is non-negative, so once dist alone reaches best_c no smaller
                 // level can win. Exact, just stops the scan early.
@@ -258,19 +372,19 @@ pub(crate) fn trellis_optimize_ctx(
                 let sgn = (cf[rc] < 0) as usize;
                 let dc_rate = |k: u32| -> f32 {
                     if k == 0 {
-                        return cdf_cost(&base_tok[0], 0);
+                        return cdf_cost_with_table(&base_tok[0], 0, cost_table);
                     }
                     let tok = k.min(3);
-                    let mut b = cdf_cost(&base_tok[0], tok as usize);
+                    let mut b = cdf_cost_with_table(&base_tok[0], tok as usize, cost_table);
                     if tok == 3 {
                         b += hi_cost(k, bc);
                     }
-                    b + cdf_cost(&dc_sign[dcs_ctx], sgn)
+                    b + cdf_cost_with_table(&dc_sign[dcs_ctx], sgn, cost_table)
                 };
                 let mut best_k = l;
-                let mut best_c = dist(rc, l as i32) + rate_cost(lambda, dc_rate(l));
+                let mut best_c = distw(0, rc, l as i32) + rate_cost(lambda, dc_rate(l));
                 for k in (0..l).rev() {
-                    let dk = dist(rc, k as i32);
+                    let dk = distw(0, rc, k as i32);
                     if dk >= best_c {
                         break;
                     }
@@ -298,10 +412,10 @@ pub(crate) fn trellis_optimize_ctx(
             } else {
                 32 - (e as u32).leading_zeros() as usize
             };
-            let mut c = cdf_cost(eob_bin_cdf, bin);
+            let mut c = cdf_cost_with_table(eob_bin_cdf, bin, cost_table);
             if bin > 1 {
                 let nbits = bin - 2;
-                c += cdf_cost(&eob_hi[bin], (e >> nbits) & 1);
+                c += cdf_cost_with_table(&eob_hi[bin], (e >> nbits) & 1, cost_table);
                 c += nbits as f32; // remaining eob offset bits (bypass)
             }
             c
@@ -309,10 +423,10 @@ pub(crate) fn trellis_optimize_ctx(
         let eob_coeff_cost = |e: usize, m: u32| -> f32 {
             let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
             let tok = m.min(3);
-            let mut c = cdf_cost(&eob_base[ctx_e], tok as usize - 1);
+            let mut c = cdf_cost_with_table(&eob_base[ctx_e], tok as usize - 1, cost_table);
             if tok == 3 {
                 let rc = scan[e] as usize;
-                let (ex, ey) = (rc >> log2w, rc & (w - 1));
+                let (ex, ey) = (rc >> log2h, rc & (h - 1));
                 let bc = if (ex | ey) > 1 { 14 } else { 7 };
                 c += hi_cost(m, bc);
             }
@@ -321,12 +435,27 @@ pub(crate) fn trellis_optimize_ctx(
 
         // pre[e] = interior cost of positions [1, e-1]; an EOB candidate at e then
         // adds only e's own eob-coeff cost. dist precomputed in scan order.
-        pre.resize(n + 1, 0.0);
         pre[0] = 0.0;
         pre[1] = 0.0;
-        dist_cur.resize(n, 0.0);
-        dist_zero.resize(n, 0.0);
-        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, scan, dq2_dc, dq2_ac);
+        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, &scan[..m], dq2_dc, dq2_ac);
+        if qm_table.is_some() {
+            for i in 0..m {
+                let rc = scan[i] as usize;
+                let w2 = qm_at(rc);
+                dist_cur[i] *= w2;
+                dist_zero[i] *= w2;
+            }
+        }
+        if band_t != 0.0 {
+            for i in 0..m {
+                let rc = scan[i] as usize;
+                if tf[rc].abs() < trellis_tilt_mag_cap() {
+                    let wgt = 1.0 / (1.0 + band_t * (i as f32 * n_inv));
+                    dist_zero[i] *= wgt;
+                    dist_cur[i] *= wgt;
+                }
+            }
+        }
         let mut acc = 0.0f32; // pre[1]: empty prefix
 
         // Interior positions 1..=eu written to pre[2..=eu+1]: pre[i+1]=sum_{1..i}.
@@ -341,24 +470,17 @@ pub(crate) fn trellis_optimize_ctx(
             *out_pre = acc;
         }
 
-        // Trailing positions eu+1..n coded as zero: distortion only.
-        let dist_tail = dist_zero[eu + 1..n].iter();
-        let pre_tail = pre[eu + 2..n + 1].iter_mut();
-        for (&dist, out_pre) in dist_tail.zip(pre_tail) {
-            acc += dist;
-            *out_pre = acc;
-        }
+        let _ = acc; // prefix ends at eu (positions past eu are truncated)
 
-        suf0.resize(n + 1, 0.0);
-        suf0[n] = 0.0;
+        suf0[m] = 0.0;
 
         let mut sacc = 0.0f32;
 
-        // Suffix over 1..n, reversed.
-        for (&dist, out_suf) in dist_zero[1..n]
+        // Suffix over 1..m, reversed.
+        for (&dist, out_suf) in dist_zero[1..m]
             .iter()
             .rev()
-            .zip(suf0[1..n].iter_mut().rev())
+            .zip(suf0[1..m].iter_mut().rev())
         {
             sacc += dist;
             *out_suf = sacc;
@@ -367,15 +489,15 @@ pub(crate) fn trellis_optimize_ctx(
         let dc_rc = scan[0] as usize;
         let dc_m = cf[dc_rc].unsigned_abs();
         let dc_cost = if dc_m == 0 {
-            rate_cost(lambda, cdf_cost(&base_tok[0], 0))
+            rate_cost(lambda, cdf_cost_with_table(&base_tok[0], 0, cost_table))
         } else {
             let bc = dc_brc(levels);
             let tok = dc_m.min(3);
-            let mut b = cdf_cost(&base_tok[0], tok as usize);
+            let mut b = cdf_cost_with_table(&base_tok[0], tok as usize, cost_table);
             if tok == 3 {
                 b += hi_cost(dc_m, bc);
             }
-            b += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
+            b += cdf_cost_with_table(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize, cost_table);
             rate_cost(lambda, b)
         } + dist_cur[0];
 
@@ -385,10 +507,10 @@ pub(crate) fn trellis_optimize_ctx(
 
         // eob_coeff cost + distortion for magnitude m at position e (m >= 1).
         let eob_cand = |e: usize, m: u32| -> f32 {
-            rate_cost(lambda, eob_coeff_cost(e, m)) + dist(scan[e] as usize, m as i32)
+            rate_cost(lambda, eob_coeff_cost(e, m)) + distw(e, scan[e] as usize, m as i32)
         };
 
-        for (e, (&pre_e, &suf_next)) in pre[..n].iter().zip(&suf0[1..=n]).enumerate().skip(1) {
+        for (e, (&pre_e, &suf_next)) in pre[..m].iter().zip(&suf0[1..=m]).enumerate().skip(1) {
             let rc = scan[e] as usize;
             let m = cf[rc].unsigned_abs();
             if m == 0 {
@@ -415,11 +537,12 @@ pub(crate) fn trellis_optimize_ctx(
         if dc_m != 0 {
             let ctx_e = 1usize; // e == 0
             let tok = dc_m.min(3);
-            let mut c0 = cdf_cost(eob_bin_cdf, 0) + cdf_cost(&eob_base[ctx_e], tok as usize - 1);
+            let mut c0 = cdf_cost_with_table(eob_bin_cdf, 0, cost_table)
+                + cdf_cost_with_table(&eob_base[ctx_e], tok as usize - 1, cost_table);
             if tok == 3 {
                 c0 += hi_cost(dc_m, dc_brc(levels));
             }
-            c0 += cdf_cost(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize);
+            c0 += cdf_cost_with_table(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize, cost_table);
             let total0 = rate_cost(lambda, c0) + dist_cur[0] + suf0[1];
             if total0 < best_cost {
                 best_cost = total0;
@@ -429,7 +552,7 @@ pub(crate) fn trellis_optimize_ctx(
         }
         let skip_cost = suf0[1] + dist_zero[0] + rate_cost(lambda, 1.0f32);
         if best_e < 0 || skip_cost < best_cost {
-            for &rc32 in scan.iter() {
+            for &rc32 in scan[..m].iter() {
                 cf[rc32 as usize] = 0;
             }
         } else {
@@ -442,9 +565,12 @@ pub(crate) fn trellis_optimize_ctx(
                     best_m as i32
                 };
             }
-            for i in (e + 1)..n {
-                cf[scan[i] as usize] = 0;
+            for &rc in scan[(e + 1)..m].iter() {
+                cf[rc as usize] = 0;
             }
+        }
+        if TRELLIS_DROPOUT {
+            dropout_qcoeff(cf, scan, w, h, qindex);
         }
     });
 }
@@ -471,37 +597,31 @@ pub(crate) fn trellis_optimize(
     // Step A: per-coefficient round-down (toward zero) by local R-D.
     trellis_round_down_scan(cf, tf, &scan[..=eob_idx], dc_q2, ac_q2, lambda);
 
+    // Everything past the last nonzero is already zero, and a zero coefficient
+    // has dist_cur == dist_zero, so the tail past eob_idx adds the SAME
+    // constant to every EOB candidate and to the skip cost — it cannot move
+    // the argmin. Truncate every scan to m = eob_idx + 1 (a mid-q TX32 has
+    // n = 1024 but eob ~ tens; decisions are byte-identical to the full scan).
+    let m = eob_idx + 1;
+
     thread_local! {
-        #[allow(clippy::type_complexity)]
-        static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+        static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     }
     SCRATCH.with_borrow_mut(|scratch| {
-        let (suf0, pre, dist_cur, dist_zero) = (
-            &mut scratch.0,
-            &mut scratch.1,
-            &mut scratch.2,
-            &mut scratch.3,
-        );
+        let (suf0, dist_cur, dist_zero) = (&mut scratch.0, &mut scratch.1, &mut scratch.2);
 
-        dist_cur.resize(n, 0.0);
-        dist_zero.resize(n, 0.0);
-        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, scan, dc_q2, ac_q2);
+        dist_cur.resize(m, 0.0);
+        dist_zero.resize(m, 0.0);
+        trellis_dist_current_zero_scan(dist_cur, dist_zero, tf, cf, &scan[..m], dc_q2, ac_q2);
 
-        suf0.resize(n + 1, 0.0); // distortion of zeroing coeffs from i..n
-        suf0[n] = 0.0; // cumulative seed (read as suf0[n]; not written by the loop)
-        assert!(suf0.len() > n, "suf0 must be indexed up to n");
-        for i in (0..n).rev() {
+        suf0.resize(m + 1, 0.0); // distortion of zeroing coeffs from i..m
+        suf0[m] = 0.0; // cumulative seed (read as suf0[m]; not written by the loop)
+        assert!(suf0.len() > m, "suf0 must be indexed up to m");
+        assert!(dist_zero.len() >= m);
+        assert!(dist_cur.len() >= m);
+        for i in (0..m).rev() {
             suf0[i] = suf0[i + 1] + dist_zero[i];
-        }
-        pre.resize(n + 1, 0.0); // interior cost of coeffs strictly before i
-        assert!(pre.len() > n, "pre must be indexed up to n");
-
-        pre[0] = 0.0; // empty-prefix seed
-        for (i, &rc32) in scan[..n].iter().enumerate() {
-            let rc = rc32 as usize;
-            pre[i + 1] =
-                pre[i] + dist_cur[i] + rate_cost(lambda, coef_rate_bits(cf[rc].unsigned_abs()));
         }
         let eob_sig = |e: usize| -> f32 {
             let bin = if e < 2 {
@@ -510,34 +630,32 @@ pub(crate) fn trellis_optimize(
                 (32 - (e as u32).leading_zeros()) as usize
             };
             let extra = if bin > 1 { bin - 2 } else { 0 };
-            (bin as f32) * 0.9 + extra as f32 + 2.0 // eob_pt + extra bits + eob_base token
+            f_fmlaf(bin as f32, 0.9, extra as f32 + 2.0) // eob_pt + extra bits + eob_base token
         };
 
         let mut best_e: i32 = -1;
         let mut best_cost = f32::INFINITY;
-        for (e, ((&rc32, &pre), &suf0)) in scan[..n]
-            .iter()
-            .zip(pre.iter())
-            .zip(suf0[1..].iter())
-            .enumerate()
-        {
+        let mut pre = 0.0f32; // interior cost of coefficients strictly before e
+        for (e, (&rc32, &suf0)) in scan[..m].iter().zip(suf0[1..].iter()).enumerate() {
             let rc = rc32 as usize;
-            if cf[rc] == 0 {
-                continue; // the EOB must land on a nonzero
+            if cf[rc] != 0 {
+                let c = pre + dist_cur[e] + rate_cost(lambda, eob_sig(e)) + suf0;
+                if c < best_cost {
+                    best_cost = c;
+                    best_e = e as i32;
+                }
             }
-            let c = pre + dist_cur[e] + rate_cost(lambda, eob_sig(e)) + suf0;
-            if c < best_cost {
-                best_cost = c;
-                best_e = e as i32;
-            }
+            // Preserve the original left-to-right f32 recurrence exactly while
+            // folding the old prefix-building pass into candidate selection.
+            pre = pre + dist_cur[e] + rate_cost(lambda, coef_rate_bits(cf[rc].unsigned_abs()));
         }
         let skip_cost = suf0[0] + rate_cost(lambda, 1.0f32); // zero everything + the txb_skip flag
         if best_e < 0 || skip_cost < best_cost {
-            for &rc32 in scan.iter() {
+            for &rc32 in scan[..m].iter() {
                 cf[rc32 as usize] = 0;
             }
         } else {
-            for &x32 in scan[(best_e as usize + 1)..n].iter() {
+            for &x32 in scan[(best_e as usize + 1)..m].iter() {
                 cf[x32 as usize] = 0;
             }
         }
@@ -593,11 +711,14 @@ mod tests {
                 &SCAN_16X16,
                 0.05,
                 16,
+                16,
                 &cdfs,
                 2,
                 0,
                 &cdfs.eob_bin_256_l,
                 0,
+                15,
+                60,
             );
             if let Some(e) = SCAN_16X16.iter().rposition(|&r| opt[r as usize] != 0) {
                 for &r in &SCAN_16X16[e + 1..] {

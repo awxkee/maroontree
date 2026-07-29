@@ -114,9 +114,7 @@ fn load_col_lanes(row: &[i32], x: usize, lanes: usize) -> __m256i {
     if lanes == 8 {
         unsafe { _mm256_loadu_si256(row.as_ptr().add(x).cast::<__m256i>()) }
     } else {
-        let mut a = [0i32; 8];
-        a[..4].copy_from_slice(&row[x..x + 4]);
-        from_array(a)
+        _mm256_castsi128_si256(unsafe { _mm_loadu_si128(row[x..x + 4].as_ptr().cast()) })
     }
 }
 

@@ -129,17 +129,22 @@ const CR_B: i32 = -666; // round(-0.081312 * 8192)
 
 /// Convert RGB rows to three output planes in parallel row bands. `f` maps one
 /// (r, g, b) pixel to the three outputs; planes are zipped per band.
-fn csc_rows_par<T: Pixel + Sync>(
+fn csc_rows_par<T, O0, O1, O2>(
     pool: &crate::par::Pool,
     w: usize,
     rgb: [&[T]; 3],
-    out: [&mut [i32]; 3],
-    f: impl Fn(i32, i32, i32) -> (i32, i32, i32) + Sync,
-) {
+    out: (&mut [O0], &mut [O1], &mut [O2]),
+    f: impl Fn(i32, i32, i32) -> (O0, O1, O2) + Sync,
+) where
+    T: Pixel + Sync,
+    O0: Send,
+    O1: Send,
+    O2: Send,
+{
     const BAND: usize = 64; // rows per work item
-    let [o0, o1, o2] = out;
+    let (o0, o1, o2) = out;
     #[allow(clippy::type_complexity)]
-    let items: Vec<(usize, (&mut [i32], (&mut [i32], &mut [i32])))> = o0
+    let items: Vec<(usize, (&mut [O0], (&mut [O1], &mut [O2])))> = o0
         .chunks_mut(BAND * w)
         .zip(o1.chunks_mut(BAND * w).zip(o2.chunks_mut(BAND * w)))
         .enumerate()
@@ -363,7 +368,7 @@ impl<T: Pixel> PlanarImage<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn encode_still_lossy<T: Pixel>(
+pub(crate) fn encode_still_lossy_with_cdf<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
     color: Option<&Cicp>,
@@ -373,6 +378,9 @@ pub fn encode_still_lossy<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -387,17 +395,17 @@ pub fn encode_still_lossy<T: Pixel>(
     let off_q = (off as i32) << Q;
     let mx_i = mx as i32;
     let pool = crate::par::Pool::new(threads);
-    let (mut y, mut cb, mut cr) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+    let (mut y, mut cb, mut cr) = (vec![0u16; n], vec![0u16; n], vec![0u16; n]);
     csc_rows_par(
         &pool,
         img.width,
         [&img.planes[2], &img.planes[0], &img.planes[1]],
-        [&mut y, &mut cb, &mut cr],
+        (&mut y, &mut cb, &mut cr),
         |ri, gi, bi| {
             (
-                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
-                ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i),
-                ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i),
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i) as u16,
+                ((CB_R * ri + CB_G * gi + CB_B * bi + off_q + HALF) >> Q).clamp(0, mx_i) as u16,
+                ((CR_R * ri + CR_G * gi + CR_B * bi + off_q + HALF) >> Q).clamp(0, mx_i) as u16,
             )
         },
     );
@@ -416,11 +424,14 @@ pub fn encode_still_lossy<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn encode_still_lossy_422<T: Pixel>(
+pub(crate) fn encode_still_lossy_422_with_cdf<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
     color: Option<&Cicp>,
@@ -430,6 +441,9 @@ pub fn encode_still_lossy_422<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -442,7 +456,7 @@ pub fn encode_still_lossy_422<T: Pixel>(
     let off = (1i32 << (bd.bits() - 1)) as f32;
     let mx = maxv as f32;
     let cw = w.div_ceil(2);
-    let mut y = vec![0i32; w * h];
+    let mut y = vec![0u16; w * h];
 
     let off_q = (off as i32) << Q;
     let mx_i = mx as i32;
@@ -455,10 +469,10 @@ pub fn encode_still_lossy_422<T: Pixel>(
         &pool,
         w,
         [&img.planes[2], &img.planes[0], &img.planes[1]],
-        [&mut y, &mut fcb_q, &mut fcr_q],
+        (&mut y, &mut fcb_q, &mut fcr_q),
         |ri, gi, bi| {
             (
-                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i) as u16,
                 CB_R * ri + CB_G * gi + CB_B * bi + off_q,
                 CR_R * ri + CR_G * gi + CR_B * bi + off_q,
             )
@@ -466,12 +480,12 @@ pub fn encode_still_lossy_422<T: Pixel>(
     );
     const HALF_AVG: i32 = 1 << Q;
 
-    let (mut cb, mut cr) = (vec![0i32; cw * h], vec![0i32; cw * h]);
+    let (mut cb, mut cr) = (vec![0u16; cw * h], vec![0u16; cw * h]);
 
     // Horizontal 2:1 averaging, parallel over disjoint output row bands.
     {
         #[allow(clippy::type_complexity)]
-        let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
+        let items: Vec<(usize, (&mut [u16], &mut [u16]))> = cb
             .chunks_mut(cw)
             .zip(cr.chunks_mut(cw))
             .enumerate()
@@ -485,8 +499,8 @@ pub fn encode_still_lossy_422<T: Pixel>(
                 let cb1 = fcb[row * w + x1];
                 let cr0 = fcr[row * w + x0];
                 let cr1 = fcr[row * w + x1];
-                *cb = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
-                *cr = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i);
+                *cb = ((cb0 + cb1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i) as u16;
+                *cr = ((cr0 + cr1 + HALF_AVG) >> (Q + 1)).clamp(0, mx_i) as u16;
             }
         });
     }
@@ -505,11 +519,14 @@ pub fn encode_still_lossy_422<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn encode_still_lossy_420<T: Pixel>(
+pub(crate) fn encode_still_lossy_420_with_cdf<T: Pixel>(
     img: &PlanarImage<T>,
     base_q_idx: u8,
     color: Option<&Cicp>,
@@ -519,6 +536,9 @@ pub fn encode_still_lossy_420<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Vec<u8> {
     assert!(
         img.width > 0 && img.height > 0,
@@ -535,7 +555,7 @@ pub fn encode_still_lossy_420<T: Pixel>(
     let off_q = (off as i32) << Q;
     let mx_i = mx as i32;
 
-    let mut y = vec![0i32; w * h];
+    let mut y = vec![0u16; w * h];
     let mut fcb_q = vec![0i32; w * h];
     let mut fcr_q = vec![0i32; w * h];
 
@@ -544,10 +564,10 @@ pub fn encode_still_lossy_420<T: Pixel>(
         &pool,
         w,
         [&img.planes[2], &img.planes[0], &img.planes[1]],
-        [&mut y, &mut fcb_q, &mut fcr_q],
+        (&mut y, &mut fcb_q, &mut fcr_q),
         |ri, gi, bi| {
             (
-                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i),
+                ((Y_R * ri + Y_G * gi + Y_B * bi + HALF) >> Q).clamp(0, mx_i) as u16,
                 CB_R * ri + CB_G * gi + CB_B * bi + off_q,
                 CR_R * ri + CR_G * gi + CR_B * bi + off_q,
             )
@@ -556,12 +576,12 @@ pub fn encode_still_lossy_420<T: Pixel>(
 
     const HALF_AVG: i32 = 1 << (Q + 1); // rounding bias for >> (Q + 2)
 
-    let (mut cb, mut cr) = (vec![0i32; cw * ch], vec![0i32; cw * ch]);
+    let (mut cb, mut cr) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
 
     // 2x2 averaging, parallel over disjoint output row bands.
     {
         #[allow(clippy::type_complexity)]
-        let items: Vec<(usize, (&mut [i32], &mut [i32]))> = cb
+        let items: Vec<(usize, (&mut [u16], &mut [u16]))> = cb
             .chunks_mut(cw)
             .zip(cr.chunks_mut(cw))
             .enumerate()
@@ -575,8 +595,8 @@ pub fn encode_still_lossy_420<T: Pixel>(
                 let avg_q =
                     |f: &[i32]| f[y0 * w + x0] + f[y0 * w + x1] + f[y1 * w + x0] + f[y1 * w + x1];
 
-                *cb = ((avg_q(fcb) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
-                *cr = ((avg_q(fcr) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i);
+                *cb = ((avg_q(fcb) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i) as u16;
+                *cr = ((avg_q(fcr) + HALF_AVG) >> (Q + 2)).clamp(0, mx_i) as u16;
             }
         });
     }
@@ -595,6 +615,9 @@ pub fn encode_still_lossy_420<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     )
 }
 
@@ -610,6 +633,9 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
@@ -626,18 +652,16 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
             &luma,
             full_range,
             threads,
+            speed,
+            updating_cdf,
         ));
     }
-    let luma: Vec<i32> = img.planes[0]
-        .iter()
-        .map(|v| v.to_i32().clamp(0, maxv))
-        .collect();
     let bytes = crate::dispatch::encode_lossy_monochrome(
         base_q_idx,
         bit_depth.bits(),
         img.width,
         img.height,
-        &luma,
+        &img.planes[0],
         full_range,
         threads,
         speed,
@@ -645,6 +669,9 @@ pub(crate) fn encode_lossy_gray_obu<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     );
     Ok(bytes)
 }
@@ -653,6 +680,15 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
     img: &PlanarImage<T>,
     full_range: bool,
     threads: usize,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_lossless_gray_obu_with_cdf(img, full_range, threads, true)
+}
+
+pub(crate) fn encode_lossless_gray_obu_with_cdf<T: Pixel>(
+    img: &PlanarImage<T>,
+    full_range: bool,
+    threads: usize,
+    updating_cdf: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     validate_dims(img.width as u32, img.height as u32)?;
     img.validate_400()?;
@@ -667,6 +703,9 @@ pub fn encode_lossless_gray_obu<T: Pixel>(
         crate::coder::VarianceBoost::off(),
         false,
         false,
+        updating_cdf,
+        true,
+        true,
     )
 }
 
@@ -683,11 +722,14 @@ pub fn encode_lossless_gray<T: Pixel>(
         0,
         true,
         cfg.threads,
-        Speed::Slow,
+        cfg.speed,
         false,
         crate::coder::VarianceBoost::off(),
         false,
         false,
+        cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     finalize_color(
         obu,
@@ -734,6 +776,16 @@ pub fn encode_lossless_obu<T: Pixel>(
     color: Option<&Cicp>,
     threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_lossless_obu_with_speed(img, color, threads, Speed::Slow, true)
+}
+
+fn encode_lossless_obu_with_speed<T: Pixel>(
+    img: &PlanarImage<T>,
+    color: Option<&Cicp>,
+    threads: usize,
+    speed: Speed,
+    updating_cdf: bool,
+) -> Result<Vec<u8>, EncodeError> {
     img.validate_444()?;
     let effective_color = lossless_rgb_cicp(color);
     let profile: u32 = if img.bit_depth == BitDepth::Twelve {
@@ -768,6 +820,8 @@ pub fn encode_lossless_obu<T: Pixel>(
         h,
         &planes_i16,
         threads,
+        speed,
+        updating_cdf,
     ));
     Ok(bytes)
 }
@@ -782,7 +836,13 @@ pub fn encode_lossless<T: Pixel>(
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
     let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
-    let obu = encode_lossless_obu(img, Some(&effective_color), cfg.threads)?;
+    let obu = encode_lossless_obu_with_speed(
+        img,
+        Some(&effective_color),
+        cfg.threads,
+        cfg.speed,
+        cfg.updating_cdf,
+    )?;
     let av1c = make_av1c(
         &obu,
         img.bit_depth.bits(),
@@ -819,7 +879,13 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
     }
 
     let effective_color = lossless_rgb_cicp(cfg.color_encoding.as_ref());
-    let obu = encode_lossless_obu(&img.packed_3(), Some(&effective_color), cfg.threads)?;
+    let obu = encode_lossless_obu_with_speed(
+        &img.packed_3(),
+        Some(&effective_color),
+        cfg.threads,
+        cfg.speed,
+        cfg.updating_cdf,
+    )?;
 
     let alpha_obu = encode_lossy_gray_obu(
         &img.packed_alpha_4(),
@@ -827,11 +893,14 @@ pub fn encode_lossless_with_alpha<T: Pixel + Copy>(
         0,
         true,
         cfg.threads,
-        Speed::Slow,
+        cfg.speed,
         false,
         crate::coder::VarianceBoost::off(),
         false,
         false,
+        cfg.updating_cdf,
+        cfg.screen_content,
+        cfg.intrabc,
     )?;
     let mut effective_cfg = cfg.clone();
     effective_cfg.color_encoding = Some(effective_color);
@@ -859,24 +928,21 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_444()?;
     assert_ne!(base_q_idx, 0, "use encode_still for lossless");
-    let maxv = (1i32 << bit_depth.bits()) - 1;
-    let to_i = |p: &[T]| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
     let pool = crate::par::Pool::new(threads);
     let bytes = crate::dispatch::encode_lossy_444(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
         planar_image.height,
-        &to_i(&planar_image.planes[0]),
-        &to_i(&planar_image.planes[1]),
-        &to_i(&planar_image.planes[2]),
+        &planar_image.planes[0],
+        &planar_image.planes[1],
+        &planar_image.planes[2],
         color,
         &pool,
         speed,
@@ -884,6 +950,9 @@ pub(crate) fn encode_yuv444_obu<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     );
     Ok(bytes)
 }
@@ -901,24 +970,21 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_422()?;
     assert!(base_q_idx != 0, "4:2:2 doesn't support lossless encoding");
-    let maxv = (1i32 << bit_depth.bits()) - 1;
-    let to_i = |p: &[T]| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
     let pool = crate::par::Pool::new(threads);
     let bytes = crate::dispatch::encode_lossy_422(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
         planar_image.height,
-        &to_i(&planar_image.planes[0]),
-        &to_i(&planar_image.planes[1]),
-        &to_i(&planar_image.planes[2]),
+        &planar_image.planes[0],
+        &planar_image.planes[1],
+        &planar_image.planes[2],
         color,
         &pool,
         speed,
@@ -926,6 +992,9 @@ pub(crate) fn encode_yuv422_obu<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     );
     Ok(bytes)
 }
@@ -943,24 +1012,21 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
     vb: crate::coder::VarianceBoost,
     cdef: bool,
     wiener: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc: bool,
 ) -> Result<Vec<u8>, EncodeError> {
     planar_image.validate_420()?;
     assert!(base_q_idx != 0, "use encode_still for lossless");
-    let maxv = (1i32 << bit_depth.bits()) - 1;
-    let to_i = |p: &[T]| {
-        p.iter()
-            .map(|v| v.to_i32().clamp(0, maxv))
-            .collect::<Vec<i32>>()
-    };
     let pool = crate::par::Pool::new(threads);
     let bytes = crate::dispatch::encode_lossy_420(
         base_q_idx,
         bit_depth.bits(),
         planar_image.width,
         planar_image.height,
-        &to_i(&planar_image.planes[0]),
-        &to_i(&planar_image.planes[1]),
-        &to_i(&planar_image.planes[2]),
+        &planar_image.planes[0],
+        &planar_image.planes[1],
+        &planar_image.planes[2],
         color,
         &pool,
         speed,
@@ -968,6 +1034,9 @@ pub(crate) fn encode_yuv420_obu<T: Pixel>(
         vb,
         cdef,
         wiener,
+        updating_cdf,
+        screen_content,
+        intrabc,
     );
     Ok(bytes)
 }
@@ -1038,6 +1107,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cdf_update_flag_keeps_lossless_and_lossy_streams_decodable() {
+        let decoder = std::env::var_os("AVIFDEC").map(PathBuf::from).or_else(|| {
+            let path = PathBuf::from("/opt/homebrew/bin/avifdec");
+            path.is_file().then_some(path)
+        });
+        let Some(decoder) = decoder else {
+            return;
+        };
+        let (w, h) = (96usize, 80usize);
+        let rgb: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let x = i % w;
+                let y = i / w;
+                [
+                    ((x * 17 + y * 3) & 255) as u8,
+                    ((x * 5 + y * 29) & 255) as u8,
+                    (((x ^ y) * 11) & 255) as u8,
+                ]
+            })
+            .collect();
+        let image = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb).unwrap();
+        for (lossless, updating_cdf) in [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let cfg = EncodeConfig::new()
+                .with_chroma(ChromaFormat::Yuv444)
+                .with_threads(if updating_cdf { 1 } else { 4 })
+                .with_quality(70)
+                .with_updating_cdf(updating_cdf);
+            let avif = if lossless {
+                encode_lossless(&image, &cfg).unwrap()
+            } else {
+                crate::avif::encode_rgb8(&image, &cfg).unwrap()
+            };
+            let stem = format!(
+                "maroontree-cdf-{}-{}-{}",
+                lossless,
+                updating_cdf,
+                std::process::id()
+            );
+            let input = std::env::temp_dir().join(format!("{stem}.avif"));
+            let output = std::env::temp_dir().join(format!("{stem}.png"));
+            std::fs::write(&input, avif).unwrap();
+            let status = Command::new(&decoder)
+                .arg(&input)
+                .arg(&output)
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_file(input);
+            let _ = std::fs::remove_file(output);
+            assert!(
+                status.success(),
+                "lossless={lossless}, updating_cdf={updating_cdf}"
+            );
+        }
+    }
+
     /// Non-multiple-of-8 sizes must not panic and must produce a non-empty
     /// stream for both very small and odd dimensions.
     #[test]
@@ -1047,7 +1173,7 @@ mod tests {
             let img = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Twelve, &rgb).unwrap();
             assert!(!encode_lossless_obu(&img, None, 9).unwrap().is_empty());
             assert!(
-                !encode_still_lossy(
+                !encode_still_lossy_with_cdf(
                     &img,
                     16,
                     Some(&Cicp::srgb_ycbcr()),
@@ -1056,7 +1182,10 @@ mod tests {
                     false,
                     VarianceBoost::off(),
                     true,
-                    false
+                    false,
+                    true,
+                    true,
+                    true,
                 )
                 .is_empty()
             );

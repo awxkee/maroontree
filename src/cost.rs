@@ -1,7 +1,7 @@
 //! Rate / cost estimation used by the mode search and trellis: calibrated
 //! per-level token costs, CDF costs, and lambda helpers. Extracted from `av1real`.
 
-use crate::intrapred::DC_PRED;
+use crate::aq_common::f_fmlaf;
 use crate::tables::{COEFF_BASE_RANGE, EOB_BITW, NUM_BASE_LEVELS};
 
 #[allow(dead_code)]
@@ -33,7 +33,7 @@ fn coef_rate_bits_slow(level: u32) -> f32 {
             b += steps * 1.3;
             if level >= 15 {
                 let v = level - 15;
-                b += 2.0 * ((32 - (v + 1).leading_zeros()) as f32) - 1.0;
+                b += f_fmlaf(2.0, (32 - (v + 1).leading_zeros()) as f32, -1.0);
             }
             b
         }
@@ -70,6 +70,8 @@ pub(crate) const ADST_ADST_TX8_IDX: usize = 4;
 /// IDTX=0, DCT_DCT=1, V_DCT=2, H_DCT=3, ADST_ADST=4, ADST_DCT=5, DCT_ADST=6).
 pub(crate) const ADST_DCT_TX8_IDX: usize = 5;
 pub(crate) const DCT_ADST_TX8_IDX: usize = 6;
+/// dav1d DTT4_IDTX set index for IDTX at TX_16X16 intra (5-type set).
+pub(crate) const IDTX_TX16_IDX: usize = 0;
 /// dav1d DTT4_IDTX set index for ADST_ADST at TX_16X16 intra (5-type set).
 pub(crate) const ADST_ADST_TX16_IDX: usize = 2;
 /// Asymmetric ADST set indices at TX_16X16 intra (5-type DTT4_IDTX set:
@@ -80,30 +82,6 @@ pub(crate) const DCT_ADST_TX16_IDX: usize = 4;
 pub(crate) fn trellis_lambda() -> f32 {
     TRELLIS_LAMBDA0
 }
-
-// ---------------------------------------------------------------------------
-// libaom rdmult port (av1/encoder/rd.c, BSD-2-Clause — same license family as
-// this crate). Reimplemented in Rust from the reference algorithm, not copied
-// verbatim. For an all-intra still (AVIF key frame) the relevant path is the
-// KF_UPDATE branch of `av1_compute_rd_mult_based_on_qindex`.
-//
-//   q       = av1_dc_quant_QTX(qindex, 0, bit_depth)   // == our dc_q()
-//   rdmult  = q * q
-//   rdmult *= def_kf_rd_multiplier(q) = 3.3 + 0.0015*q  // KF branch
-//   // SSIMULACRA2 / IQ tuning weight (good-quality, non-realtime):
-//   weight  = clamp(((255 - qindex) * 3) / 4, 0, 72) + 128   // 128..200
-//   rdmult *= weight / 128
-//   // bit-depth normalization: 8-bit none, 10-bit >>4, 12-bit >>8
-//
-// libaom's integer RDCOST is
-//   RDCOST(rdmult, R, D) = ((rdmult * R + (1<<9)) >> 10) + (D << 4)
-// with R in *real* entropy-coded bits (Q9, 1 bit = 512) and D = integer SSE.
-// This crate keeps a *proxy* bit estimate and integer SSE, so the integer rdmult
-// cannot be used as-is. We expose the libaom rdmult shape (the q-dependence and
-// the SSIMULACRA2 weight — the parts that fix decision *consistency* across q)
-// and fold the fixed-point/units difference into one calibration constant so
-// `cost = SSE + mode_lambda_aom(...) * proxy_bits` stays on the same scale the
-// existing thresholds were tuned against.
 
 /// libaom's DC-quant-domain KF rd multiplier: `3.3 + 0.0015*q`.
 #[inline]
@@ -118,28 +96,7 @@ fn def_kf_rd_multiplier(q: f32) -> f32 {
 #[inline]
 pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f32 {
     let w = (((255i32 - qindex as i32) * 3) / 4).clamp(0, 72) + 128;
-    w as f32 / 128.0
-}
-
-#[allow(dead_code)]
-pub(crate) const AOM_RDMULT_CALIB: f32 = 1.0 / (1 << 4) as f32; // undo libaom's D<<4
-
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn mode_lambda_aom(dc_q: f32, qindex: u8, bd: u8, tune_ssimulacra2: bool) -> f32 {
-    let mut rdmult = dc_q * dc_q * def_kf_rd_multiplier(dc_q);
-    if tune_ssimulacra2 {
-        rdmult *= aom_ssimulacra2_rdmult_weight(qindex);
-    }
-    // Bit-depth normalisation (libaom: 10-bit >>4, 12-bit >>8).
-    rdmult *= match bd {
-        10 => 1.0 / (1 << 4) as f32,
-        12 => 1.0 / (1 << 8) as f32,
-        _ => 1.0,
-    };
-    // libaom RDCOST weights rate as rdmult/1024 against D<<4 distortion; our cost
-    // compares against raw SSE, so divide by 1024 and by the D<<4 factor.
-    rdmult * (1.0 / 1024.0) * AOM_RDMULT_CALIB
+    w as f32 * (1. / 128.0)
 }
 
 #[inline]
@@ -174,10 +131,18 @@ pub(crate) fn cost_q_table() -> &'static [u32; 32769] {
 /// is a precomputed fixed-point table lookup (see [`cost_q_table`]).
 #[inline]
 pub(crate) fn cdf_cost(cdf: &[u16], s: usize) -> f32 {
+    cdf_cost_with_table(cdf, s, cost_q_table())
+}
+
+/// [`cdf_cost`] with the immutable probability-cost table supplied by the
+/// caller. Hot coefficient loops use this form so one `OnceLock` state check is
+/// paid per block instead of once per coded symbol.
+#[inline]
+pub(crate) fn cdf_cost_with_table(cdf: &[u16], s: usize, table: &[u32; 32769]) -> f32 {
     let fl = if s > 0 { cdf[s - 1] as i32 } else { 32768 };
     let fh = cdf[s] as i32;
     let p = (fl - fh).max(1) as usize;
-    cost_q_table()[p] as f32 * COST_Q_SCALE_INV
+    table[p] as f32 * COST_Q_SCALE_INV
 }
 
 /// Bypass bits for the Exp-Golomb tail coding `v` (level ≥ 15 carries `v=L-15`).
@@ -187,15 +152,49 @@ pub(crate) fn golomb_cost(v: u32) -> f32 {
     (2 * len - 1) as f32
 }
 
-/// Accurate bit cost of the base-range (hi_tok) ladder for magnitude `m` (≥ 3)
-/// against `br_cdf`, plus the Exp-Golomb tail when `m ≥ 15`.
-pub(crate) fn hi_tok_cost(m: u32, br_cdf: &[u16]) -> f32 {
+/// Cumulative base-range ladder costs for one br context row: entry `j`
+/// is the ladder cost of `total_br == j` (j = (m-3).min(12)); the Golomb
+/// tail for m >= 15 is added by the caller. Float-op order matches
+/// `hi_tok_cost` term-for-term so cached and direct values are identical. The
+/// caller supplies a hoisted probability-cost table.
+pub(crate) fn br_cum_row_with_table(br_cdf: &[u16], table: &[u32; 32769]) -> [f32; 13] {
+    let c = [
+        cdf_cost_with_table(br_cdf, 0, table),
+        cdf_cost_with_table(br_cdf, 1, table),
+        cdf_cost_with_table(br_cdf, 2, table),
+        cdf_cost_with_table(br_cdf, 3, table),
+    ];
+    // The ladder consumes groups of three. Spell out the four possible prefix
+    // lengths to avoid 13 tiny nested loops while preserving the exact
+    // left-to-right f32 addition order of `hi_tok_cost`.
+    let c3x2 = c[3] + c[3];
+    let c3x3 = c3x2 + c[3];
+    let c3x4 = c3x3 + c[3];
+    [
+        c[0],
+        c[1],
+        c[2],
+        c[3] + c[0],
+        c[3] + c[1],
+        c[3] + c[2],
+        c3x2 + c[0],
+        c3x2 + c[1],
+        c3x2 + c[2],
+        c3x3 + c[0],
+        c3x3 + c[1],
+        c3x3 + c[2],
+        c3x4,
+    ]
+}
+
+/// [`hi_tok_cost`] with a caller-hoisted probability-cost table.
+pub(crate) fn hi_tok_cost_with_table(m: u32, br_cdf: &[u16], table: &[u32; 32769]) -> f32 {
     let total_br = (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE);
     let mut coded = 0i32;
     let mut bits = 0.0f32;
     for _ in 0..(COEFF_BASE_RANGE / 3) {
         let s = (total_br - coded).min(3);
-        bits += cdf_cost(br_cdf, s as usize);
+        bits += cdf_cost_with_table(br_cdf, s as usize, table);
         coded += s;
         if s < 3 {
             break;
@@ -221,25 +220,27 @@ pub(crate) fn block_rate_bits(cf: &[i32], scan: &[u32]) -> f32 {
     bits
 }
 
-/// R-D weight for the intra luma mode search (cost = pixel SSE + lambda * proxy
-/// Legacy mode-search lambda scale (`ac_q^2` units); retained as the calibration
-/// reference for `mode_lambda_q` and its tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MODE_LAMBDA0: f32 = 0.02;
 
-/// Calibration folding libaom's rdmult scale onto this crate's (proxy-bits, SSE)
-/// axis, fixed so `mode_lambda_q` matches the legacy `MODE_LAMBDA0*ac_q^2` at the
-/// q=128 reference. Only the *shape* changes, not the reference operating point.
 pub(crate) const MODE_AOM_CALIB: f32 = 0.009005174719460433;
 
-/// Mode-search lambda with libaom's key-frame rdmult *shape*
-/// `dc_q^2 * (3.3 + 0.0015*dc_q)` (av1/encoder/rd.c KF path) instead of the
-/// naive `ac_q^2`. The old law grew ~2x too fast at high qindex, over-dropping
-/// coefficients where libaom keeps them; this tracks libaom's q-dependence so
-/// equal-SSIM decisions match. `dc_q` is the bit-depth-correct DC dequant step.
 #[inline]
 pub(crate) fn mode_lambda_q(dc_q: f32) -> f32 {
-    MODE_AOM_CALIB * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
+    MODE_AOM_CALIB * lambda_scale() * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
+}
+
+pub(crate) fn use_proxy_rate(speed: crate::avif::Speed) -> bool {
+    let t = crate::tuning::get();
+    match speed {
+        crate::avif::Speed::Fast => t.proxy_rate_fast,
+        crate::avif::Speed::Medium => t.proxy_rate_medium,
+        crate::avif::Speed::Slow => t.proxy_rate_slow,
+    }
+}
+
+fn lambda_scale() -> f32 {
+    1.0
 }
 
 #[inline]
@@ -251,19 +252,6 @@ pub(crate) fn rate_cost(lambda: f32, rate: f32) -> f32 {
 pub(crate) fn rd_cost_i64(distortion: i64, lambda: f32, rate: f32) -> f32 {
     distortion as f32 + rate_cost(lambda, rate)
 }
-
-/// Rough extra bits to *signal* a non-DC luma mode (DC is the most probable
-/// symbol; the others cost a little more). Keeps the search from switching modes
-/// for a negligible residual gain.
-/// Estimated cost (in bits) of *choosing* a non-DC luma mode: the rare y_mode
-/// symbol, the shift of the uv_mode CDF context (chroma still codes DC, but
-/// under a less-favourable context), and CDF-adaptation churn. DC is free. This
-/// is what makes the search only leave DC for a clear net win.
-#[inline]
-pub(crate) fn mode_signal_bits(m: usize) -> f32 {
-    if m == DC_PRED { 0.0 } else { MODE_SIGNAL_BITS }
-}
-pub(crate) const MODE_SIGNAL_BITS: f32 = 30.0;
 
 #[cfg(test)]
 mod tests {

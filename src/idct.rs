@@ -26,10 +26,9 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::quant::{Dct, QM_FLAT_LEVEL, qm_weight};
-use std::sync::OnceLock;
+use crate::quant::{Dct, Quant};
 
-pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
+pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &Quant) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 512];
     for rc in 0..512 {
@@ -63,7 +62,800 @@ pub(crate) fn idct_dequant_32x16(levels: &[i32; 512], q: &impl Dct) -> [i32; 512
     tmp
 }
 
-pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512] {
+pub(crate) type InvDctFn<const N: usize> = fn(&[i32; N], &Quant) -> [i32; N];
+
+fn idct_dequant_8x8_scalar_quant(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    idct_dequant_8x8_scalar(levels, &IdctDequant::new(q, 8, 8))
+}
+
+fn idct_dequant_16x16_scalar_quant(levels: &[i32; 256], q: &Quant) -> [i32; 256] {
+    idct_dequant_16x16_scalar(levels, &IdctDequant::new(q, 16, 16))
+}
+
+fn iadstdct_dequant_16x16_scalar_quant(levels: &[i32; 256], q: &Quant) -> [i32; 256] {
+    iadstdct_dequant_16x16_scalar(levels, &IdctDequant::new(q, 16, 16))
+}
+
+fn idctadst_dequant_16x16_scalar_quant(levels: &[i32; 256], q: &Quant) -> [i32; 256] {
+    idctadst_dequant_16x16_scalar(levels, &IdctDequant::new(q, 16, 16))
+}
+
+fn iadst_dequant_16x16_scalar_quant(levels: &[i32; 256], q: &Quant) -> [i32; 256] {
+    iadst_dequant_16x16_scalar(levels, &IdctDequant::new(q, 16, 16))
+}
+
+fn idct_dequant_32x32_scalar_quant(levels: &[i32; 1024], q: &Quant) -> [i32; 1024] {
+    idct_dequant_32x32_scalar(levels, &IdctDequant::new(q, 32, 32))
+}
+
+macro_rules! define_inverse_dispatch {
+    ($((
+        $field:ident, $n:literal, $w:literal, $h:literal, $_dq:literal, $flat:literal,
+        $scalar:path, $neon_wrap:ident, $neon:path, $avx_wrap:ident, $avx:path
+    )),* $(,)?) => {
+        $(
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            fn $neon_wrap(levels: &[i32; $n], q: &Quant) -> [i32; $n] {
+                let dequant = if $flat {
+                    IdctDequant::new_flat(q)
+                } else {
+                    IdctDequant::new(q, $w, $h)
+                };
+                unsafe { $neon(levels, &dequant) }
+            }
+
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            fn $avx_wrap(levels: &[i32; $n], q: &Quant) -> [i32; $n] {
+                let dequant = if $flat {
+                    IdctDequant::new_flat(q)
+                } else {
+                    IdctDequant::new(q, $w, $h)
+                };
+                unsafe { $avx(levels, &dequant) }
+            }
+        )*
+
+        #[derive(Clone, Copy)]
+        pub(crate) struct IdctDispatch {
+            $(pub(crate) $field: InvDctFn<$n>,)*
+        }
+
+        impl IdctDispatch {
+            pub(crate) fn selected() -> Self {
+                Self {
+                    $($field: {
+                        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+                        {
+                            $neon_wrap
+                        }
+                        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+                        {
+                            if std::is_x86_feature_detected!("avx2") {
+                                $avx_wrap
+                            } else {
+                                $scalar
+                            }
+                        }
+                        #[cfg(not(any(
+                            all(target_arch = "aarch64", feature = "neon"),
+                            all(target_arch = "x86_64", feature = "avx")
+                        )))]
+                        {
+                            $scalar
+                        }
+                    },)*
+                }
+            }
+
+            pub(crate) fn scalar() -> Self {
+                Self { $($field: $scalar,)* }
+            }
+
+            $(
+                #[inline]
+                pub(crate) fn $field(
+                    &self,
+                    levels: &[i32; $n],
+                    q: &Quant,
+                ) -> [i32; $n] {
+                    (self.$field)(levels, q)
+                }
+            )*
+        }
+    };
+}
+
+define_inverse_dispatch!(
+    (
+        idct_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        false,
+        idct_dequant_4x4,
+        idct4x4_neon_dispatch,
+        crate::neon::idct_dequant_4x4_neon,
+        idct4x4_avx2_dispatch,
+        crate::avx::idct_dequant_4x4_avx2
+    ),
+    (
+        idct_dequant_4x8,
+        32,
+        4,
+        8,
+        0,
+        false,
+        idct_dequant_4x8,
+        idct4x8_neon_dispatch,
+        crate::neon::idct_dequant_4x8_neon,
+        idct4x8_avx2_dispatch,
+        crate::avx::idct_dequant_4x8_avx2
+    ),
+    (
+        idct_dequant_8x4,
+        32,
+        8,
+        4,
+        0,
+        false,
+        idct_dequant_8x4,
+        idct8x4_neon_dispatch,
+        crate::neon::idct_dequant_8x4_neon,
+        idct8x4_avx2_dispatch,
+        crate::avx::idct_dequant_8x4_avx2
+    ),
+    (
+        idct_dequant_4x16,
+        64,
+        4,
+        16,
+        0,
+        false,
+        idct_dequant_4x16,
+        idct4x16_neon_dispatch,
+        crate::neon::idct_dequant_4x16_neon,
+        idct4x16_avx2_dispatch,
+        crate::avx::idct_dequant_4x16_avx2
+    ),
+    (
+        idct_dequant_16x4,
+        64,
+        16,
+        4,
+        0,
+        false,
+        idct_dequant_16x4,
+        idct16x4_neon_dispatch,
+        crate::neon::idct_dequant_16x4_neon,
+        idct16x4_avx2_dispatch,
+        crate::avx::idct_dequant_16x4_avx2
+    ),
+    (
+        idct_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        false,
+        idct_dequant_8x8_scalar_quant,
+        idct8x8_neon_dispatch2,
+        crate::neon::idct_dequant_8x8_neon,
+        idct8x8_avx2_dispatch2,
+        crate::avx::idct_dequant_8x8_avx2
+    ),
+    (
+        idct_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        false,
+        idct_dequant_8x16,
+        idct8x16_neon_dispatch,
+        crate::neon::idct_dequant_8x16_neon,
+        idct8x16_avx2_dispatch,
+        crate::avx::idct_dequant_8x16_avx2
+    ),
+    (
+        idct_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        false,
+        idct_dequant_16x8,
+        idct16x8_neon_dispatch,
+        crate::neon::idct_dequant_16x8_neon,
+        idct16x8_avx2_dispatch,
+        crate::avx::idct_dequant_16x8_avx2
+    ),
+    (
+        idct_dequant_16x16,
+        256,
+        16,
+        16,
+        0,
+        false,
+        idct_dequant_16x16_scalar_quant,
+        idct16x16_neon_dispatch2,
+        crate::neon::idct_dequant_16x16_neon,
+        idct16x16_avx2_dispatch2,
+        crate::avx::idct_dequant_16x16_avx2
+    ),
+    (
+        idct_dequant_16x32,
+        512,
+        16,
+        32,
+        1,
+        false,
+        idct_dequant_16x32,
+        idct16x32_neon_dispatch,
+        crate::neon::idct_dequant_16x32_neon,
+        idct16x32_avx2_dispatch,
+        crate::avx::idct_dequant_16x32_avx2
+    ),
+    (
+        idct_dequant_32x16,
+        512,
+        32,
+        16,
+        1,
+        false,
+        idct_dequant_32x16,
+        idct32x16_neon_dispatch,
+        crate::neon::idct_dequant_32x16_neon,
+        idct32x16_avx2_dispatch,
+        crate::avx::idct_dequant_32x16_avx2
+    ),
+    (
+        idct_dequant_32x32,
+        1024,
+        32,
+        32,
+        1,
+        false,
+        idct_dequant_32x32_scalar_quant,
+        idct32x32_neon_dispatch2,
+        crate::neon::idct_dequant_32x32_neon,
+        idct32x32_avx2_dispatch2,
+        crate::avx::idct_dequant_32x32_avx2
+    ),
+    (
+        iadst_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        false,
+        iadst_dequant_4x4,
+        iadst4x4_neon_dispatch,
+        crate::neon::iadst_dequant_4x4_neon,
+        iadst4x4_avx2_dispatch,
+        crate::avx::iadst_dequant_4x4_avx2
+    ),
+    (
+        iadstdct_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        false,
+        iadstdct_dequant_4x4,
+        iadstdct4x4_neon_dispatch,
+        crate::neon::iadstdct_dequant_4x4_neon,
+        iadstdct4x4_avx2_dispatch,
+        crate::avx::iadstdct_dequant_4x4_avx2
+    ),
+    (
+        idctadst_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        false,
+        idctadst_dequant_4x4,
+        idctadst4x4_neon_dispatch,
+        crate::neon::idctadst_dequant_4x4_neon,
+        idctadst4x4_avx2_dispatch,
+        crate::avx::idctadst_dequant_4x4_avx2
+    ),
+    (
+        iadst_dequant_4x8,
+        32,
+        4,
+        8,
+        0,
+        false,
+        iadst_dequant_4x8,
+        iadst4x8_neon_dispatch,
+        crate::neon::iadst_dequant_4x8_neon,
+        iadst4x8_avx2_dispatch,
+        crate::avx::iadst_dequant_4x8_avx2
+    ),
+    (
+        iadstdct_dequant_4x8,
+        32,
+        4,
+        8,
+        0,
+        false,
+        iadstdct_dequant_4x8,
+        iadstdct4x8_neon_dispatch,
+        crate::neon::iadstdct_dequant_4x8_neon,
+        iadstdct4x8_avx2_dispatch,
+        crate::avx::iadstdct_dequant_4x8_avx2
+    ),
+    (
+        idctadst_dequant_4x8,
+        32,
+        4,
+        8,
+        0,
+        false,
+        idctadst_dequant_4x8,
+        idctadst4x8_neon_dispatch,
+        crate::neon::idctadst_dequant_4x8_neon,
+        idctadst4x8_avx2_dispatch,
+        crate::avx::idctadst_dequant_4x8_avx2
+    ),
+    (
+        iadst_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        false,
+        iadst_dequant_8x8,
+        iadst8x8_neon_dispatch,
+        crate::neon::iadst_dequant_8x8_neon,
+        iadst8x8_avx2_dispatch,
+        crate::avx::iadst_dequant_8x8_avx2
+    ),
+    (
+        iadstdct_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        false,
+        iadstdct_dequant_8x8,
+        iadstdct8x8_neon_dispatch,
+        crate::neon::iadstdct_dequant_8x8_neon,
+        iadstdct8x8_avx2_dispatch,
+        crate::avx::iadstdct_dequant_8x8_avx2
+    ),
+    (
+        idctadst_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        false,
+        idctadst_dequant_8x8,
+        idctadst8x8_neon_dispatch,
+        crate::neon::idctadst_dequant_8x8_neon,
+        idctadst8x8_avx2_dispatch,
+        crate::avx::idctadst_dequant_8x8_avx2
+    ),
+    (
+        iadst_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        false,
+        iadst_dequant_8x16,
+        iadst8x16_neon_dispatch,
+        crate::neon::iadst_dequant_8x16_neon,
+        iadst8x16_avx2_dispatch,
+        crate::avx::iadst_dequant_8x16_avx2
+    ),
+    (
+        iadstdct_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        false,
+        iadstdct_dequant_8x16,
+        iadstdct8x16_neon_dispatch,
+        crate::neon::iadstdct_dequant_8x16_neon,
+        iadstdct8x16_avx2_dispatch,
+        crate::avx::iadstdct_dequant_8x16_avx2
+    ),
+    (
+        idctadst_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        false,
+        idctadst_dequant_8x16,
+        idctadst8x16_neon_dispatch,
+        crate::neon::idctadst_dequant_8x16_neon,
+        idctadst8x16_avx2_dispatch,
+        crate::avx::idctadst_dequant_8x16_avx2
+    ),
+    (
+        iadst_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        false,
+        iadst_dequant_16x8,
+        iadst16x8_neon_dispatch,
+        crate::neon::iadst_dequant_16x8_neon,
+        iadst16x8_avx2_dispatch,
+        crate::avx::iadst_dequant_16x8_avx2
+    ),
+    (
+        iadstdct_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        false,
+        iadstdct_dequant_16x8,
+        iadstdct16x8_neon_dispatch,
+        crate::neon::iadstdct_dequant_16x8_neon,
+        iadstdct16x8_avx2_dispatch,
+        crate::avx::iadstdct_dequant_16x8_avx2
+    ),
+    (
+        idctadst_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        false,
+        idctadst_dequant_16x8,
+        idctadst16x8_neon_dispatch,
+        crate::neon::idctadst_dequant_16x8_neon,
+        idctadst16x8_avx2_dispatch,
+        crate::avx::idctadst_dequant_16x8_avx2
+    ),
+    (
+        iadst_dequant_16x16,
+        256,
+        16,
+        16,
+        0,
+        false,
+        iadst_dequant_16x16_scalar_quant,
+        iadst16x16_neon_dispatch2,
+        crate::neon::iadst_dequant_16x16_neon,
+        iadst16x16_avx2_dispatch2,
+        crate::avx::iadst_dequant_16x16_avx2
+    ),
+    (
+        iadstdct_dequant_16x16,
+        256,
+        16,
+        16,
+        0,
+        false,
+        iadstdct_dequant_16x16_scalar_quant,
+        iadstdct16x16_neon_dispatch2,
+        crate::neon::iadstdct_dequant_16x16_neon,
+        iadstdct16x16_avx2_dispatch2,
+        crate::avx::iadstdct_dequant_16x16_avx2
+    ),
+    (
+        idctadst_dequant_16x16,
+        256,
+        16,
+        16,
+        0,
+        false,
+        idctadst_dequant_16x16_scalar_quant,
+        idctadst16x16_neon_dispatch2,
+        crate::neon::idctadst_dequant_16x16_neon,
+        idctadst16x16_avx2_dispatch2,
+        crate::avx::idctadst_dequant_16x16_avx2
+    ),
+    (
+        ivdct_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        true,
+        ivdct_dequant_4x4,
+        ivdct4x4_neon_dispatch,
+        crate::neon::ivdct_dequant_4x4_neon,
+        ivdct4x4_avx2_dispatch,
+        crate::avx::ivdct_dequant_4x4_avx2
+    ),
+    (
+        ihdct_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        true,
+        ihdct_dequant_4x4,
+        ihdct4x4_neon_dispatch,
+        crate::neon::ihdct_dequant_4x4_neon,
+        ihdct4x4_avx2_dispatch,
+        crate::avx::ihdct_dequant_4x4_avx2
+    ),
+    (
+        ivdct_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        true,
+        ivdct_dequant_8x8,
+        ivdct8x8_neon_dispatch,
+        crate::neon::ivdct_dequant_8x8_neon,
+        ivdct8x8_avx2_dispatch,
+        crate::avx::ivdct_dequant_8x8_avx2
+    ),
+    (
+        ihdct_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        true,
+        ihdct_dequant_8x8,
+        ihdct8x8_neon_dispatch,
+        crate::neon::ihdct_dequant_8x8_neon,
+        ihdct8x8_avx2_dispatch,
+        crate::avx::ihdct_dequant_8x8_avx2
+    ),
+    (
+        ivdct_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        true,
+        ivdct_dequant_8x16,
+        ivdct8x16_neon_dispatch,
+        crate::neon::ivdct_dequant_8x16_neon,
+        ivdct8x16_avx2_dispatch,
+        crate::avx::ivdct_dequant_8x16_avx2
+    ),
+    (
+        ihdct_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        true,
+        ihdct_dequant_8x16,
+        ihdct8x16_neon_dispatch,
+        crate::neon::ihdct_dequant_8x16_neon,
+        ihdct8x16_avx2_dispatch,
+        crate::avx::ihdct_dequant_8x16_avx2
+    ),
+    (
+        ivdct_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        true,
+        ivdct_dequant_16x8,
+        ivdct16x8_neon_dispatch,
+        crate::neon::ivdct_dequant_16x8_neon,
+        ivdct16x8_avx2_dispatch,
+        crate::avx::ivdct_dequant_16x8_avx2
+    ),
+    (
+        ihdct_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        true,
+        ihdct_dequant_16x8,
+        ihdct16x8_neon_dispatch,
+        crate::neon::ihdct_dequant_16x8_neon,
+        ihdct16x8_avx2_dispatch,
+        crate::avx::ihdct_dequant_16x8_avx2
+    ),
+    (
+        iidentity_dequant_4x4,
+        16,
+        4,
+        4,
+        0,
+        true,
+        iidentity_dequant_4x4,
+        iidtx4x4_neon_dispatch,
+        crate::neon::iidentity_dequant_4x4_neon,
+        iidtx4x4_avx2_dispatch,
+        crate::avx::iidentity_dequant_4x4_avx2
+    ),
+    (
+        iidentity_dequant_8x8,
+        64,
+        8,
+        8,
+        0,
+        true,
+        iidentity_dequant_8x8,
+        iidtx8x8_neon_dispatch,
+        crate::neon::iidentity_dequant_8x8_neon,
+        iidtx8x8_avx2_dispatch,
+        crate::avx::iidentity_dequant_8x8_avx2
+    ),
+    (
+        iidtx_dequant_8x16,
+        128,
+        8,
+        16,
+        0,
+        true,
+        iidtx_dequant_8x16,
+        iidtx8x16_neon_dispatch,
+        crate::neon::iidtx_dequant_8x16_neon,
+        iidtx8x16_avx2_dispatch,
+        crate::avx::iidtx_dequant_8x16_avx2
+    ),
+    (
+        iidtx_dequant_16x8,
+        128,
+        16,
+        8,
+        0,
+        true,
+        iidtx_dequant_16x8,
+        iidtx16x8_neon_dispatch,
+        crate::neon::iidtx_dequant_16x8_neon,
+        iidtx16x8_avx2_dispatch,
+        crate::avx::iidtx_dequant_16x8_avx2
+    ),
+    (
+        iidentity_dequant_16x16,
+        256,
+        16,
+        16,
+        0,
+        true,
+        iidentity_dequant_16x16,
+        iidtx16x16_neon_dispatch,
+        crate::neon::iidentity_dequant_16x16_neon,
+        iidtx16x16_avx2_dispatch,
+        crate::avx::iidentity_dequant_16x16_avx2
+    ),
+);
+
+#[cfg(test)]
+mod inverse_dispatch_tests {
+    use super::*;
+
+    fn levels<const N: usize>(seed: u32) -> [i32; N] {
+        let mut out = [0; N];
+        let mut state = seed ^ N as u32;
+        for (i, value) in out.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let level = ((state >> 24) as i32 & 63) - 31;
+            *value = if i % 9 == 0 { 0 } else { level };
+        }
+        out[0] = 19;
+        out
+    }
+
+    #[test]
+    fn selected_inverse_dispatch_matches_scalar() {
+        let selected = IdctDispatch::selected();
+        let scalar = IdctDispatch::scalar();
+        let quants = [
+            Quant::new(8, 8),
+            Quant::new(96, 8),
+            Quant::new_chroma(40, 10),
+        ];
+
+        macro_rules! check {
+            ($field:ident, $n:literal) => {
+                for (qi, q) in quants.iter().enumerate() {
+                    for seed in [0x1234_5678, 0x8765_4321, 0xa5a5_5a5a] {
+                        let input = levels::<$n>(seed ^ qi as u32);
+                        assert_eq!(
+                            selected.$field(&input, q),
+                            scalar.$field(&input, q),
+                            "{} N={} q={} seed={seed:#x}",
+                            stringify!($field),
+                            $n,
+                            qi,
+                        );
+                    }
+                }
+            };
+        }
+
+        check!(idct_dequant_4x4, 16);
+        check!(idct_dequant_4x8, 32);
+        check!(idct_dequant_8x4, 32);
+        check!(idct_dequant_4x16, 64);
+        check!(idct_dequant_16x4, 64);
+        check!(idct_dequant_8x8, 64);
+        check!(idct_dequant_8x16, 128);
+        check!(idct_dequant_16x8, 128);
+        check!(idct_dequant_16x16, 256);
+        check!(idct_dequant_16x32, 512);
+        check!(idct_dequant_32x16, 512);
+        check!(idct_dequant_32x32, 1024);
+        check!(iadst_dequant_4x4, 16);
+        check!(iadstdct_dequant_4x4, 16);
+        check!(idctadst_dequant_4x4, 16);
+        check!(iadst_dequant_4x8, 32);
+        check!(iadstdct_dequant_4x8, 32);
+        check!(idctadst_dequant_4x8, 32);
+        check!(iadst_dequant_8x8, 64);
+        check!(iadstdct_dequant_8x8, 64);
+        check!(idctadst_dequant_8x8, 64);
+        check!(iadst_dequant_8x16, 128);
+        check!(iadstdct_dequant_8x16, 128);
+        check!(idctadst_dequant_8x16, 128);
+        check!(iadst_dequant_16x8, 128);
+        check!(iadstdct_dequant_16x8, 128);
+        check!(idctadst_dequant_16x8, 128);
+        check!(iadst_dequant_16x16, 256);
+        check!(iadstdct_dequant_16x16, 256);
+        check!(idctadst_dequant_16x16, 256);
+        check!(ivdct_dequant_4x4, 16);
+        check!(ihdct_dequant_4x4, 16);
+        check!(ivdct_dequant_8x8, 64);
+        check!(ihdct_dequant_8x8, 64);
+        check!(ivdct_dequant_8x16, 128);
+        check!(ihdct_dequant_8x16, 128);
+        check!(ivdct_dequant_16x8, 128);
+        check!(ihdct_dequant_16x8, 128);
+        check!(iidentity_dequant_4x4, 16);
+        check!(iidentity_dequant_8x8, 64);
+        check!(iidtx_dequant_8x16, 128);
+        check!(iidtx_dequant_16x8, 128);
+        check!(iidentity_dequant_16x16, 256);
+    }
+
+    #[test]
+    fn selected_inverse_dispatch_with_qmatrix_matches_scalar_at_every_bit_depth() {
+        let selected = IdctDispatch::selected();
+        let scalar = IdctDispatch::scalar();
+        let quants = [
+            Quant::new_with_qm(40, 8, 0),
+            Quant::new_with_qm(96, 10, 7),
+            Quant::new_with_qm(180, 12, 14),
+            Quant::new_chroma_with_delta_qm(128, -7, 11, 12, 3),
+        ];
+        macro_rules! check {
+            ($field:ident, $n:literal) => {
+                for (qi, q) in quants.iter().enumerate() {
+                    for seed in [0x0123_4567, 0x89ab_cdef, 0x55aa_33cc] {
+                        let input = levels::<$n>(seed ^ qi as u32);
+                        assert_eq!(
+                            selected.$field(&input, q),
+                            scalar.$field(&input, q),
+                            "{} N={} qmatrix={} seed={seed:#x}",
+                            stringify!($field),
+                            $n,
+                            qi,
+                        );
+                    }
+                }
+            };
+        }
+        check!(idct_dequant_8x8, 64);
+        check!(idct_dequant_8x16, 128);
+        check!(idct_dequant_16x8, 128);
+        check!(iadstdct_dequant_8x8, 64);
+        check!(idct_dequant_16x16, 256);
+        check!(iadstdct_dequant_16x16, 256);
+        check!(idct_dequant_32x32, 1024);
+        check!(idct_dequant_16x32, 512);
+        check!(idct_dequant_32x16, 512);
+    }
+}
+
+pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &Quant) -> [i32; 512] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 512];
     for rc in 0..512 {
@@ -101,7 +893,79 @@ pub(crate) fn idct_dequant_16x32(levels: &[i32; 512], q: &impl Dct) -> [i32; 512
     tmp
 }
 
-pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
+/// DCT_DCT inverse for RTX_16X4 — the 2:1 pipeline without the rect2 prescale
+/// (dav1d applies `*181/256` only to 2:1 shapes). Row inv_dct16 over 4 rows,
+/// mid shift 1, column inv_dct4, final `(t + 8) >> 4`.
+pub(crate) fn idct_dequant_16x4(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 16, 4);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for row in 0..4 {
+        for col in 0..16 {
+            tmp[row * 16 + col] = coeff[row + col * 4];
+        }
+    }
+    for row in 0..4 {
+        inv_dct16_1d(&mut tmp[row * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..16 {
+        inv_dct4_1d(&mut tmp[col..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// DCT_DCT inverse for RTX_4X16.
+pub(crate) fn idct_dequant_4x16(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 4, 16);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for row in 0..16 {
+        for col in 0..4 {
+            tmp[row * 4 + col] = coeff[row + col * 16];
+        }
+    }
+    for row in 0..16 {
+        inv_dct4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_dct16_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 128];
     for rc in 0..128 {
@@ -140,7 +1004,260 @@ pub(crate) fn idct_dequant_16x8(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
     tmp
 }
 
-pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128] {
+/// ADST_ADST inverse for RTX_8X16 — `idct_dequant_8x16` with both 1D passes
+/// swapped for the ADST kernel. The rect2 prescale, the mid shift and the final
+/// `(t + 8) >> 4` are identical, so this stays bit-exact with the decoder's
+/// rectangular transform pipeline.
+pub(crate) fn iadst_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 8, 16);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 128];
+    for row in 0..16 {
+        for col in 0..8 {
+            tmp[row * 8 + col] = (coeff[row + col * 16] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..16 {
+        inv_adst8_1d(&mut tmp[row * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..8 {
+        inv_adst16_1d(&mut tmp[col..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// ADST_ADST inverse for RTX_16X8.
+pub(crate) fn iadst_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = q.dequant_step(rc, 16, 8);
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 128];
+    for row in 0..8 {
+        for col in 0..16 {
+            tmp[row * 16 + col] = (coeff[row + col * 8] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..8 {
+        inv_adst16_1d(&mut tmp[row * 16..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for col in 0..16 {
+        inv_adst8_1d(&mut tmp[col..], 16, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// One 1-D pass kind of the rect16 inverse pipeline. `Id8`/`Id16` are dav1d's
+/// identity kernels (x2 resp. `2x + ((x*1697+1024)>>11)`, no internal clamp);
+/// the DCT/ADST kernels are the shared clamped 1-D inverses.
+#[derive(Clone, Copy, PartialEq)]
+enum RectPass {
+    Dct8,
+    Dct16,
+    Adst8,
+    Adst16,
+    Id8,
+    Id16,
+}
+
+#[inline]
+fn id16_1d(v: i32) -> i32 {
+    2 * v + ((v * 1697 + 1024) >> 11)
+}
+
+fn irect_dequant_128(
+    levels: &[i32; 128],
+    q: &Quant,
+    w: usize,
+    row_pass: RectPass,
+    col_pass: RectPass,
+    qm: bool,
+) -> [i32; 128] {
+    let h = 128 / w;
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 128];
+    for rc in 0..128 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qs = if qm {
+            q.dequant_step(rc, w, h)
+        } else if rc == 0 {
+            dc_q
+        } else {
+            ac_q
+        };
+        let mag = ((lvl.unsigned_abs() as u64 * qs as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 128];
+    for row in 0..h {
+        for col in 0..w {
+            tmp[row * w + col] = (coeff[row + col * h] * 181 + 128) >> 8;
+        }
+    }
+    let apply_row = |tmp: &mut [i32; 128], pass: RectPass| match pass {
+        RectPass::Dct8 => {
+            for row in 0..h {
+                inv_dct8_1d(&mut tmp[row * w..], 1, rmin, rmax);
+            }
+        }
+        RectPass::Dct16 => {
+            for row in 0..h {
+                inv_dct16_1d(&mut tmp[row * w..], 1, rmin, rmax);
+            }
+        }
+        RectPass::Adst8 => {
+            for row in 0..h {
+                inv_adst8_1d(&mut tmp[row * w..], 1, rmin, rmax);
+            }
+        }
+        RectPass::Adst16 => {
+            for row in 0..h {
+                inv_adst16_1d(&mut tmp[row * w..], 1, rmin, rmax);
+            }
+        }
+        RectPass::Id8 => {
+            for t in tmp.iter_mut() {
+                *t *= 2;
+            }
+        }
+        RectPass::Id16 => {
+            for t in tmp.iter_mut() {
+                *t = id16_1d(*t);
+            }
+        }
+    };
+    apply_row(&mut tmp, row_pass);
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    match col_pass {
+        RectPass::Dct8 => {
+            for col in 0..w {
+                inv_dct8_1d(&mut tmp[col..], w, cmin, cmax);
+            }
+        }
+        RectPass::Dct16 => {
+            for col in 0..w {
+                inv_dct16_1d(&mut tmp[col..], w, cmin, cmax);
+            }
+        }
+        RectPass::Adst8 => {
+            for col in 0..w {
+                inv_adst8_1d(&mut tmp[col..], w, cmin, cmax);
+            }
+        }
+        RectPass::Adst16 => {
+            for col in 0..w {
+                inv_adst16_1d(&mut tmp[col..], w, cmin, cmax);
+            }
+        }
+        RectPass::Id8 => {
+            for t in tmp.iter_mut() {
+                *t *= 2;
+            }
+        }
+        RectPass::Id16 => {
+            for t in tmp.iter_mut() {
+                *t = id16_1d(*t);
+            }
+        }
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// ADST_DCT inverse for RTX_16X8 (vertical ADST-8, horizontal DCT-16).
+pub(crate) fn iadstdct_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 16, RectPass::Dct16, RectPass::Adst8, true)
+}
+
+/// DCT_ADST inverse for RTX_16X8 (vertical DCT-8, horizontal ADST-16).
+pub(crate) fn idctadst_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 16, RectPass::Adst16, RectPass::Dct8, true)
+}
+
+/// ADST_DCT inverse for RTX_8X16 (vertical ADST-16, horizontal DCT-8).
+pub(crate) fn iadstdct_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 8, RectPass::Dct8, RectPass::Adst16, true)
+}
+
+/// DCT_ADST inverse for RTX_8X16 (vertical DCT-16, horizontal ADST-8).
+pub(crate) fn idctadst_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 8, RectPass::Adst8, RectPass::Dct16, true)
+}
+
+/// V_DCT inverse for RTX_16X8 (row identity-16, column inv DCT-8).
+pub(crate) fn ivdct_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    // identity family: QM not applied (qm = false == flat dc/ac dequant)
+    irect_dequant_128(levels, q, 16, RectPass::Id16, RectPass::Dct8, false)
+}
+
+/// H_DCT inverse for RTX_16X8 (row inv DCT-16, column identity-8).
+pub(crate) fn ihdct_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    // identity family: QM not applied (qm = false == flat dc/ac dequant)
+    irect_dequant_128(levels, q, 16, RectPass::Dct16, RectPass::Id8, false)
+}
+
+/// V_DCT inverse for RTX_8X16 (row identity-8, column inv DCT-16).
+pub(crate) fn ivdct_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    // identity family: QM not applied (qm = false == flat dc/ac dequant)
+    irect_dequant_128(levels, q, 8, RectPass::Id8, RectPass::Dct16, false)
+}
+
+/// H_DCT inverse for RTX_8X16 (row inv DCT-8, column identity-16).
+pub(crate) fn ihdct_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    // identity family: QM not applied (qm = false == flat dc/ac dequant)
+    irect_dequant_128(levels, q, 8, RectPass::Dct8, RectPass::Id16, false)
+}
+
+/// IDTX inverse for RTX_16X8 (identity both passes, no quantizer matrix).
+pub(crate) fn iidtx_dequant_16x8(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 16, RectPass::Id16, RectPass::Id8, false)
+}
+
+/// IDTX inverse for RTX_8X16 (identity both passes, no quantizer matrix).
+pub(crate) fn iidtx_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
+    irect_dequant_128(levels, q, 8, RectPass::Id8, RectPass::Id16, false)
+}
+
+pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &Quant) -> [i32; 128] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 128];
     for rc in 0..128 {
@@ -179,7 +1296,7 @@ pub(crate) fn idct_dequant_8x16(levels: &[i32; 128], q: &impl Dct) -> [i32; 128]
 }
 
 /// 8x4 inverse: coeff layout `[fx*4+fy]` (8 wide x 4 tall). Transpose of 4x8.
-pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
@@ -216,7 +1333,7 @@ pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
     tmp
 }
 
-pub(crate) fn idct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+pub(crate) fn idct_dequant_4x8(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
@@ -333,35 +1450,7 @@ pub(crate) fn inv_adst8_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[5 * s] = -(((t6 - t7) * 181 + 128) >> 8);
 }
 
-pub(crate) type IdctDequantFn<const N: usize> =
-    unsafe fn(&[i32; N], dequant: &IdctDequant) -> [i32; N];
-
-pub(crate) fn idct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
-    let dequant = IdctDequant::new(q, 8, 8);
-    if q.has_qmatrix() {
-        return idct_dequant_8x8_scalar(levels, &dequant);
-    }
-    static DEQUANT_8X8: OnceLock<IdctDequantFn<64>> = OnceLock::new();
-    let f = DEQUANT_8X8.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::idct_dequant_8x8_neon;
-                return idct_dequant_8x8_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::idct_dequant_8x8_avx2;
-                return idct_dequant_8x8_avx2;
-            }
-        }
-        idct_dequant_8x8_scalar
-    });
-    unsafe { f(levels, &dequant) }
-}
-
+#[derive(Clone, Copy)]
 pub(crate) struct IdctDequant {
     pub(crate) dc_q: i32,
     pub(crate) ac_q: i32,
@@ -370,15 +1459,15 @@ pub(crate) struct IdctDequant {
     pub(crate) cmin: i32,
     pub(crate) cmax: i32,
     pub(crate) cf_max: i32,
-    pub(crate) qm_level: u8,
-    pub(crate) qm_chroma: bool,
-    pub(crate) tx_w: usize,
-    pub(crate) tx_h: usize,
+    /// The transform's inverse QM row, resolved once in `new`; `None` when
+    /// the matrix is flat. Supersedes carrying (level, chroma, tx_w, tx_h)
+    /// and re-deriving the table offset for every coefficient.
+    pub(crate) qm: Option<&'static [u8]>,
 }
 
 impl IdctDequant {
     #[inline]
-    fn new(q: &impl Dct, tx_w: usize, tx_h: usize) -> Self {
+    fn new(q: &Quant, tx_w: usize, tx_h: usize) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
         Self {
             dc_q: q.dc_q(),
@@ -388,21 +1477,32 @@ impl IdctDequant {
             cmin,
             cmax,
             cf_max,
-            qm_level: q.qm_level(),
-            qm_chroma: q.qm_chroma(),
-            tx_w,
-            tx_h,
+            qm: crate::quant::qm_row(q.qm_level(), q.qm_chroma(), tx_w, tx_h),
+        }
+    }
+
+    #[inline]
+    fn new_flat(q: &Quant) -> Self {
+        let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+        Self {
+            dc_q: q.dc_q(),
+            ac_q: q.ac_q(),
+            rmin,
+            rmax,
+            cmin,
+            cmax,
+            cf_max,
+            qm: None,
         }
     }
 
     #[inline]
     fn step(&self, rc: usize) -> i32 {
         let base = if rc == 0 { self.dc_q } else { self.ac_q };
-        if self.qm_level == QM_FLAT_LEVEL {
+        let Some(table) = self.qm else {
             return base;
-        }
-        let weight = qm_weight(self.qm_level, self.qm_chroma, rc, self.tx_w, self.tx_h) as i32;
-        (base * weight + 16) >> 5
+        };
+        (base * table[rc] as i32 + 16) >> 5
     }
 }
 
@@ -448,15 +1548,77 @@ pub(crate) fn idct_dequant_8x8_scalar(levels: &[i32; 64], dequant: &IdctDequant)
     tmp
 }
 
-/// Reconstruct an 8x8 residual from quantized levels using dav1d's EXACT integer
-/// inverse for TX_8X8 **ADST_ADST**. Same per-size orchestration as
-/// `idct_dequant_8x8` (dequant, transpose, row pass, `(t+1)>>1` clip, col pass,
-/// `(t+8)>>4`); only the 1-D kernel changes to `inv_adst8_1d`. Because the shifts
-/// and clip ranges are per transform-size (not per type), this is bit-identical
-/// to dav1d's TX_8X8 ADST_ADST inverse.
-/// Inverse ADST_DCT 8x8 (decoder): horizontal (rows) inverse DCT, then vertical
-/// (cols) inverse ADST. Matches the `adstdct8x8` forward.
-pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+pub(crate) fn ivdct_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qd = q.dequant_step(rc, 8, 8);
+        let mag = ((lvl.unsigned_abs() as u64 * qd as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    for t in tmp.iter_mut() {
+        *t *= 2; // row pass: identity8
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for x in 0..8 {
+        inv_dct8_1d(&mut tmp[x..], 8, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+pub(crate) fn ihdct_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 64];
+    for rc in 0..64 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qd = q.dequant_step(rc, 8, 8);
+        let mag = ((lvl.unsigned_abs() as u64 * qd as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = coeff[y + x * 8];
+        }
+    }
+    for y in 0..8 {
+        inv_dct8_1d(&mut tmp[y * 8..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 1) >> 1).clamp(cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t *= 2; // col pass: identity8
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
@@ -490,7 +1652,7 @@ pub(crate) fn iadstdct_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64
     tmp
 }
 
-pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
@@ -524,7 +1686,7 @@ pub(crate) fn idctadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64
     tmp
 }
 
-pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 64];
     for rc in 0..64 {
@@ -558,7 +1720,8 @@ pub(crate) fn iadst_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
     tmp
 }
 
-pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &Quant) -> [i32; 64] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
     let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
     let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
     let mut coeff = [0i32; 64];
@@ -588,6 +1751,46 @@ pub(crate) fn iidentity_dequant_8x8(levels: &[i32; 64], q: &impl Dct) -> [i32; 6
     // Col pass: identity (x2), then the per-size (t+8)>>4 final shift.
     for t in tmp.iter_mut() {
         *t *= 2;
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// dav1d-exact TX_16X16 IDTX inverse: dequant, transpose, identity16 per pass
+/// (`2*x + ((x*1697 + 1024) >> 11)`), row shift (t+2)>>2 with the
+/// intermediate clip, col shift (t+8)>>4.
+pub(crate) fn iidentity_dequant_16x16(levels: &[i32; 256], q: &Quant) -> [i32; 256] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
+    let (dc_q, ac_q) = (q.dc_q(), q.ac_q());
+    let mut coeff = [0i32; 256];
+    for rc in 0..256 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let qd = if rc == 0 { dc_q } else { ac_q };
+        let mag = ((lvl.unsigned_abs() as u64 * qd as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            tmp[y * 16 + x] = coeff[y + x * 16];
+        }
+    }
+    let id16 = |v: i32| 2 * v + ((v * 1697 + 1024) >> 11);
+    for t in tmp.iter_mut() {
+        *t = id16(*t);
+    }
+    for t in tmp.iter_mut() {
+        *t = ((*t + 2) >> 2).clamp(cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = id16(*t);
     }
     for t in tmp.iter_mut() {
         *t = (*t + 8) >> 4;
@@ -656,32 +1859,6 @@ pub(crate) fn inv_dct16_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[13 * s] = clip(t2 - t13a);
     c[14 * s] = clip(t1 - t14);
     c[15 * s] = clip(t0 - t15a);
-}
-
-pub(crate) fn idct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let dequant = IdctDequant::new(q, 16, 16);
-    if q.has_qmatrix() {
-        return idct_dequant_16x16_scalar(levels, &dequant);
-    }
-    static DEQUANT_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
-    let f = DEQUANT_16X16.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::idct_dequant_16x16_neon;
-                return idct_dequant_16x16_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::idct_dequant_16x16_avx2;
-                return idct_dequant_16x16_avx2;
-            }
-        }
-        idct_dequant_16x16_scalar
-    });
-    unsafe { f(levels, &dequant) }
 }
 
 pub(crate) fn idct_dequant_16x16_scalar(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
@@ -870,32 +2047,6 @@ fn inv16x16_dequant_scalar(
     tmp
 }
 
-pub(crate) fn iadstdct_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let dequant = IdctDequant::new(q, 16, 16);
-    if q.has_qmatrix() {
-        return iadstdct_dequant_16x16_scalar(levels, &dequant);
-    }
-    static DEQUANT_IADSTDCT_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
-    let f = DEQUANT_IADSTDCT_16X16.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::iadstdct_dequant_16x16_neon;
-                return iadstdct_dequant_16x16_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::iadstdct_dequant_16x16_avx2;
-                return iadstdct_dequant_16x16_avx2;
-            }
-        }
-        iadstdct_dequant_16x16_scalar
-    });
-    unsafe { f(levels, &dequant) }
-}
-
 pub(crate) fn iadstdct_dequant_16x16_scalar(
     levels: &[i32; 256],
     dequant: &IdctDequant,
@@ -903,66 +2054,11 @@ pub(crate) fn iadstdct_dequant_16x16_scalar(
     inv16x16_dequant_scalar(levels, dequant, inv_dct16_1d, inv_adst16_1d)
 }
 
-/// TX_16X16 DCT_ADST reconstruction (dav1d-exact): horizontal inverse ADST,
-/// vertical inverse DCT. Matches the `dctadst16x16` forward path.
-pub(crate) fn idctadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let dequant = IdctDequant::new(q, 16, 16);
-    if q.has_qmatrix() {
-        return idctadst_dequant_16x16_scalar(levels, &dequant);
-    }
-    static DEQUANT_IDCTADST_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
-    let f = DEQUANT_IDCTADST_16X16.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::idctadst_dequant_16x16_neon;
-                return idctadst_dequant_16x16_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::idctadst_dequant_16x16_avx2;
-                return idctadst_dequant_16x16_avx2;
-            }
-        }
-        idctadst_dequant_16x16_scalar
-    });
-    unsafe { f(levels, &dequant) }
-}
-
 pub(crate) fn idctadst_dequant_16x16_scalar(
     levels: &[i32; 256],
     dequant: &IdctDequant,
 ) -> [i32; 256] {
     inv16x16_dequant_scalar(levels, dequant, inv_adst16_1d, inv_dct16_1d)
-}
-
-/// TX_16X16 ADST_ADST reconstruction (dav1d-exact).
-pub(crate) fn iadst_dequant_16x16(levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
-    let dequant = IdctDequant::new(q, 16, 16);
-    if q.has_qmatrix() {
-        return iadst_dequant_16x16_scalar(levels, &dequant);
-    }
-    static DEQUANT_IADST_16X16: OnceLock<IdctDequantFn<256>> = OnceLock::new();
-    let f = DEQUANT_IADST_16X16.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::iadst_dequant_16x16_neon;
-                return iadst_dequant_16x16_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::iadst_dequant_16x16_avx2;
-                return iadst_dequant_16x16_avx2;
-            }
-        }
-        iadst_dequant_16x16_scalar
-    });
-    unsafe { f(levels, &dequant) }
 }
 
 pub(crate) fn iadst_dequant_16x16_scalar(levels: &[i32; 256], dequant: &IdctDequant) -> [i32; 256] {
@@ -1120,32 +2216,6 @@ pub(crate) fn inv_dct32_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
     c[31 * s] = clip(t0 - t31);
 }
 
-pub(crate) fn idct_dequant_32x32(levels: &[i32; 1024], q: &impl Dct) -> [i32; 1024] {
-    let dequant = IdctDequant::new(q, 32, 32);
-    if q.has_qmatrix() {
-        return idct_dequant_32x32_scalar(levels, &dequant);
-    }
-    static DEQUANT_32X32: OnceLock<IdctDequantFn<1024>> = OnceLock::new();
-    let f = DEQUANT_32X32.get_or_init(|| {
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                use crate::neon::idct_dequant_32x32_neon;
-                return idct_dequant_32x32_neon;
-            }
-        }
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                use crate::avx::idct_dequant_32x32_avx2;
-                return idct_dequant_32x32_avx2;
-            }
-        }
-        idct_dequant_32x32_scalar
-    });
-    unsafe { f(levels, &dequant) }
-}
-
 pub(crate) fn idct_dequant_32x32_scalar(
     levels: &[i32; 1024],
     dequant: &IdctDequant,
@@ -1190,7 +2260,96 @@ pub(crate) fn idct_dequant_32x32_scalar(
     tmp
 }
 
-pub(crate) fn idct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+pub(crate) fn iidentity_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let q = q.dequant_step(rc, 4, 4);
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for t in tmp.iter_mut() {
+        let i = *t;
+        *t = i + ((i * 1697 + 2048) >> 12);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        let i = *t;
+        *t = i + ((i * 1697 + 2048) >> 12);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// dav1d's exact TX_4X4 V_DCT inverse: identity4 rows (x sqrt2 via the 1697
+/// formula), the shift=0 inter-pass clamp, dct4 columns, final `(t+8)>>4`.
+pub(crate) fn ivdct_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let qd = q.dequant_step(rc, 4, 4);
+        let mag = ((lvl.unsigned_abs() as u64 * qd as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for t in tmp.iter_mut() {
+        let i = *t;
+        *t = i + ((i * 1697 + 2048) >> 12);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..4 {
+        inv_dct4_1d(&mut tmp[col..], 4, cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+/// dav1d's exact TX_4X4 H_DCT inverse: dct4 rows, the shift=0 inter-pass
+/// clamp, identity4 columns, final `(t+8)>>4`.
+pub(crate) fn ihdct_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
+    let q = &crate::quant::FlatDct(q); // identity family: QM not applied
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut tmp = [0i32; 16];
+    for (rc, &lvl) in levels.iter().enumerate() {
+        let qd = q.dequant_step(rc, 4, 4);
+        let mag = ((lvl.unsigned_abs() as u64 * qd as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        let coeff = if lvl < 0 { -mag } else { mag };
+        let (fx, fy) = (rc / 4, rc % 4);
+        tmp[fy * 4 + fx] = coeff;
+    }
+    for row in 0..4 {
+        inv_dct4_1d(&mut tmp[row * 4..], 1, rmin, rmax);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for t in tmp.iter_mut() {
+        let i = *t;
+        *t = i + ((i * 1697 + 2048) >> 12);
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+pub(crate) fn idct_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
@@ -1249,7 +2408,7 @@ pub(crate) fn inv_adst4_1d(c: &mut [i32], s: usize, _min: i32, _max: i32) {
     c[3 * s] = o3;
 }
 
-pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
@@ -1275,7 +2434,7 @@ pub(crate) fn iadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
     tmp
 }
 
-pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
@@ -1303,7 +2462,7 @@ pub(crate) fn iadstdct_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16
 
 /// Inverse DCT_ADST 4x4 (AV1 `DCT_ADST`): inv_adst on rows (first), inv_dct on
 /// columns (second). Pairs with the `dctadst4x4` forward.
-pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut tmp = [0i32; 16];
     for (rc, &lvl) in levels.iter().enumerate() {
@@ -1329,7 +2488,7 @@ pub(crate) fn idctadst_dequant_4x4(levels: &[i32; 16], q: &impl Dct) -> [i32; 16
     tmp
 }
 
-pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
@@ -1363,7 +2522,7 @@ pub(crate) fn iadstdct_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32
     tmp
 }
 
-pub(crate) fn idctadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+pub(crate) fn idctadst_dequant_4x8(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
@@ -1482,7 +2641,7 @@ mod adst4_tests {
     }
 }
 
-pub(crate) fn iadst_dequant_4x8(levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+pub(crate) fn iadst_dequant_4x8(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];
     for rc in 0..32 {
@@ -1533,10 +2692,20 @@ mod avx2_itx_tests {
             cmin: -(1 << 15),
             cmax: (1 << 15) - 1,
             cf_max: (1 << 22) - 1,
-            qm_level: QM_FLAT_LEVEL,
-            qm_chroma: false,
-            tx_w: 32,
-            tx_h: 32,
+            qm: None,
+        }
+    }
+
+    fn dequant_8bit() -> IdctDequant {
+        IdctDequant {
+            dc_q: 77,
+            ac_q: 91,
+            rmin: i16::MIN as i32,
+            rmax: i16::MAX as i32,
+            cmin: i16::MIN as i32,
+            cmax: i16::MAX as i32,
+            cf_max: i16::MAX as i32,
+            qm: None,
         }
     }
 
@@ -1557,11 +2726,12 @@ mod avx2_itx_tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let dq = dequant();
         let levels = fill_levels::<64>();
-        let scalar = idct_dequant_8x8_scalar(&levels, &dq);
-        let avx2 = unsafe { crate::avx::idct_dequant_8x8_avx2(&levels, &dq) };
-        assert_eq!(scalar, avx2);
+        for dq in [dequant(), dequant_8bit()] {
+            let scalar = idct_dequant_8x8_scalar(&levels, &dq);
+            let avx2 = unsafe { crate::avx::idct_dequant_8x8_avx2(&levels, &dq) };
+            assert_eq!(scalar, avx2);
+        }
     }
 
     #[test]
@@ -1569,11 +2739,12 @@ mod avx2_itx_tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let dq = dequant();
         let levels = fill_levels::<256>();
-        let scalar = idct_dequant_16x16_scalar(&levels, &dq);
-        let avx2 = unsafe { crate::avx::idct_dequant_16x16_avx2(&levels, &dq) };
-        assert_eq!(scalar, avx2);
+        for dq in [dequant(), dequant_8bit()] {
+            let scalar = idct_dequant_16x16_scalar(&levels, &dq);
+            let avx2 = unsafe { crate::avx::idct_dequant_16x16_avx2(&levels, &dq) };
+            assert_eq!(scalar, avx2);
+        }
     }
 
     #[test]
@@ -1581,11 +2752,12 @@ mod avx2_itx_tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        let dq = dequant();
         let levels = fill_levels::<1024>();
-        let scalar = idct_dequant_32x32_scalar(&levels, &dq);
-        let avx2 = unsafe { crate::avx::idct_dequant_32x32_avx2(&levels, &dq) };
-        assert_eq!(scalar, avx2);
+        for dq in [dequant(), dequant_8bit()] {
+            let scalar = idct_dequant_32x32_scalar(&levels, &dq);
+            let avx2 = unsafe { crate::avx::idct_dequant_32x32_avx2(&levels, &dq) };
+            assert_eq!(scalar, avx2);
+        }
     }
 }
 
@@ -1602,10 +2774,7 @@ mod neon_itx_tests {
             cmin: -(1 << 15),
             cmax: (1 << 15) - 1,
             cf_max: (1 << 22) - 1,
-            qm_level: QM_FLAT_LEVEL,
-            qm_chroma: false,
-            tx_w: 32,
-            tx_h: 32,
+            qm: None,
         }
     }
 
@@ -1655,5 +2824,133 @@ mod neon_itx_tests {
         let scalar = idct_dequant_32x32_scalar(&levels, &dq);
         let neon = unsafe { crate::neon::idct_dequant_32x32_neon(&levels, &dq) };
         assert_eq!(scalar, neon);
+    }
+}
+
+#[cfg(test)]
+mod vh_dct_tests {
+    use super::*;
+    use crate::dct::{fhdct8x8_t, fvdct8x8_t};
+    use crate::quant::Quant;
+
+    #[test]
+    fn vh_dct_8x8_roundtrip_recovers_residual() {
+        let q = Quant::new(40, 8);
+        // Structured residuals each transform should like: a vertical edge
+        // (H_DCT-friendly), a horizontal edge (V_DCT-friendly).
+        let mut vert_edge = [0i32; 64];
+        let mut horz_edge = [0i32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                vert_edge[y * 8 + x] = if x < 4 { 60 } else { -60 };
+                horz_edge[y * 8 + x] = if y < 4 { 60 } else { -60 };
+            }
+        }
+        for (name, resid, fwd, inv) in [
+            (
+                "hdct",
+                &vert_edge,
+                fhdct8x8_t as fn(&[i32; 64], &Quant) -> ([i32; 64], [f32; 64]),
+                ihdct_dequant_8x8 as fn(&[i32; 64], &Quant) -> [i32; 64],
+            ),
+            ("vdct", &horz_edge, fvdct8x8_t, ivdct_dequant_8x8),
+        ] {
+            let (cf, _tf) = fwd(resid, &q);
+            assert!(cf.iter().any(|&c| c != 0), "{name}: no levels coded");
+            let rr = inv(&cf, &q);
+            let mut err = 0i64;
+            for i in 0..64 {
+                err += (rr[i] - resid[i]).pow(2) as i64;
+            }
+            let mse = err as f64 / 64.0;
+            // Quantization error only: must be well under one step^2.
+            let step = q.ac_q() as f64;
+            assert!(
+                mse < step * step,
+                "{name}: mse {mse} vs step^2 {}",
+                step * step
+            );
+        }
+    }
+
+    // Every new rect16 forward/inverse pair must reconstruct a structured
+    // residual to within quantization error — this pins the derived forward
+    // scales (identity 1/8 gain, 2*sqrt2 1-D factor, hybrid compositions)
+    // against the dav1d-shaped inverse pipeline.
+    #[test]
+    fn rect16_seven_type_roundtrips() {
+        use crate::dct::{
+            adstdct8x16_t, adstdct16x8_t, dctadst8x16_t, dctadst16x8_t, fhdct8x16_t, fhdct16x8_t,
+            fidentity_rect_t, fvdct8x16_t, fvdct16x8_t,
+        };
+        let q = Quant::new(40, 8);
+        // Mixed-structure residual: edges both ways plus a gradient, exercised
+        // through every kernel (each must round-trip regardless of preference).
+        let mut resid = [0i32; 128];
+        for wsel in [16usize, 8] {
+            let h = 128 / wsel;
+            for y in 0..h {
+                for x in 0..wsel {
+                    resid[y * wsel + x] =
+                        (if x < wsel / 2 { 40 } else { -40 }) + (y as i32 - h as i32 / 2) * 6;
+                }
+            }
+            type F = fn(&[i32; 128], &Quant) -> ([i32; 128], [f32; 128]);
+            type I = fn(&[i32; 128], &Quant) -> [i32; 128];
+            let pairs: Vec<(&str, F, I)> = if wsel == 16 {
+                vec![
+                    (
+                        "adstdct16x8",
+                        adstdct16x8_t as F,
+                        iadstdct_dequant_16x8 as I,
+                    ),
+                    ("dctadst16x8", dctadst16x8_t, idctadst_dequant_16x8),
+                    ("vdct16x8", fvdct16x8_t, ivdct_dequant_16x8),
+                    ("hdct16x8", fhdct16x8_t, ihdct_dequant_16x8),
+                ]
+            } else {
+                vec![
+                    (
+                        "adstdct8x16",
+                        adstdct8x16_t as F,
+                        iadstdct_dequant_8x16 as I,
+                    ),
+                    ("dctadst8x16", dctadst8x16_t, idctadst_dequant_8x16),
+                    ("vdct8x16", fvdct8x16_t, ivdct_dequant_8x16),
+                    ("hdct8x16", fhdct8x16_t, ihdct_dequant_8x16),
+                ]
+            };
+            for (name, fwd, inv) in pairs {
+                let (cf, _tf) = fwd(&resid, &q);
+                assert!(cf.iter().any(|&c| c != 0), "{name}: no levels coded");
+                let rr = inv(&cf, &q);
+                let mut err = 0i64;
+                for i in 0..128 {
+                    err += (rr[i] - resid[i]).pow(2) as i64;
+                }
+                let mse = err as f64 / 128.0;
+                let step = q.ac_q() as f64;
+                assert!(
+                    mse < step * step,
+                    "{name}: mse {mse} vs step^2 {}",
+                    step * step
+                );
+            }
+            // IDTX pair.
+            let (cf, _tf) = fidentity_rect_t(&resid, &q, wsel);
+            assert!(cf.iter().any(|&c| c != 0), "idtx{wsel}: no levels coded");
+            let rr = if wsel == 16 {
+                iidtx_dequant_16x8(&cf, &q)
+            } else {
+                iidtx_dequant_8x16(&cf, &q)
+            };
+            let mut err = 0i64;
+            for i in 0..128 {
+                err += (rr[i] - resid[i]).pow(2) as i64;
+            }
+            let mse = err as f64 / 128.0;
+            let step = q.ac_q() as f64;
+            assert!(mse < step * step, "idtx{wsel}: mse {mse}");
+        }
     }
 }

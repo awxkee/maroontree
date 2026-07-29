@@ -29,6 +29,7 @@
 
 use super::*;
 use crate::av2::coder::EobCdf;
+use crate::util::dirty_log2f;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn project_chroma_rdoq(
@@ -348,7 +349,7 @@ pub(super) fn chroma_mode_decide_leaf(
             )
         }
     };
-    // SATD prune: each chroma mode is one bs×bs prediction from neighbours
+    // SATD prune: each chroma mode is one bs×bs prediction from neighbors
     // (independent) — rank by SATD over U+V, full-encode only the top-K.
     let keep_uv = if reduced {
         2
@@ -782,7 +783,7 @@ pub(super) fn code_422_chroma_tu(
         (levu, levv)
     };
     let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-    let cbwl = (cw.min(32) as f32).log2() as i32;
+    let cbwl = dirty_log2f(cw.min(32) as f32) as i32;
     let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
     encode_chroma_block_rect_w(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area, cbwl);
     let up_ = uc.iter().any(|&(_, l)| l != 0);

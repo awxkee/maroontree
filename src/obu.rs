@@ -74,26 +74,19 @@ pub(crate) fn frame_header_lossless() -> Vec<u8> {
     frame_header_lossless_tiled(1, 1)
 }
 
-/// Like [`frame_header_lossless`] but emits the tile-count increment bits needed
-/// when the frame spans more than one 64x64 superblock (single tile is always
-/// signaled; see `frame_header_lossy_multitile` for the tiling rationale).
 pub(crate) fn frame_header_lossless_tiled(sb_cols: u32, sb_rows: u32) -> Vec<u8> {
     // Single tile: one `0` stop-bit per dimension that spans >1 superblock.
     let cols = if sb_cols > 1 { vec![false] } else { vec![] };
     let rows = if sb_rows > 1 { vec![false] } else { vec![] };
-    frame_header_lossless_impl(&cols, &rows, 0, 0, false, false)
+    frame_header_lossless_impl(&cols, &rows, 0, 0, false, false, true)
 }
 
-/// Multi-tile lossless frame header. `cols_incr` / `rows_incr` are the
-/// `increment_tile_*_log2` bit sequences (computed by the encoder's tiling
-/// planner); when `tile_cols_log2 + tile_rows_log2 > 0` the header also codes
-/// `context_update_tile_id` + `tile_size_bytes_minus_1` (`TileSizeBytes = 4`),
-/// exactly like the lossy multi-tile header.
 pub(crate) fn frame_header_lossless_multitile(
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -102,16 +95,16 @@ pub(crate) fn frame_header_lossless_multitile(
         tile_rows_log2,
         false,
         false,
+        updating_cdf,
     )
 }
 
-/// Like [`frame_header_lossless_multitile`] but terminated with `trailing_bits()`
-/// for carriage in a standalone `OBU_FRAME_HEADER` (type 3).
 pub(crate) fn frame_header_lossless_multitile_th(
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -120,19 +113,16 @@ pub(crate) fn frame_header_lossless_multitile_th(
         tile_rows_log2,
         true,
         false,
+        updating_cdf,
     )
 }
 
-/// Monochrome (`NumPlanes == 1`) lossless frame header. Identical to
-/// [`frame_header_lossless_multitile`] except the two chroma `DeltaQ` delta-coded
-/// flags are omitted: `quantization_params()` reads them only for
-/// `NumPlanes > 1`, so a monochrome frame must not code them or the decoder
-/// misaligns the bitstream.
 pub(crate) fn frame_header_lossless_mono_multitile(
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -141,6 +131,7 @@ pub(crate) fn frame_header_lossless_mono_multitile(
         tile_rows_log2,
         false,
         true,
+        updating_cdf,
     )
 }
 
@@ -151,6 +142,7 @@ pub(crate) fn frame_header_lossless_mono_multitile_th(
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossless_impl(
         cols_incr,
@@ -159,6 +151,7 @@ pub(crate) fn frame_header_lossless_mono_multitile_th(
         tile_rows_log2,
         true,
         true,
+        updating_cdf,
     )
 }
 
@@ -169,17 +162,22 @@ fn frame_header_lossless_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     // (reduced_still_picture_header => frame_type=KEY_FRAME, show_frame=1,
     //  error_resilient_mode=1, frame_size_override=0, etc., none coded)
-    w.flag(true); // disable_cdf_update = 1 (encoder is non-adaptive; decoder must not adapt)
+    // The lossless tile writer freezes or updates every decoder-visible CDF
+    // consistently with this frame flag.
+    w.flag(!updating_cdf); // disable_cdf_update
     // The lossless tile writer evaluates AV1 palette mode for every eligible
     // block, so screen-content tools must be enabled even when no block wins.
     w.flag(true); // allow_screen_content_tools (seq force = SELECT)
     w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    w.flag(false); // allow_intrabc
+    // The lossless tile writer may select exact-copy blocks from the previous
+    // decoded superblock row. `force_integer_mv` is set above as required.
+    w.flag(true); // allow_intrabc
     w.flag(true); // uniform_tile_spacing_flag
     for &b in cols_incr {
         w.flag(b);
@@ -219,26 +217,33 @@ fn frame_header_lossless_impl(
 pub(crate) fn frame_header_lossy_multitile(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
         qm,
+        uac_delta,
+        udc_delta,
         cols_incr,
         rows_incr,
-        false,
+        !updating_cdf,
         tile_cols_log2,
         tile_rows_log2,
         false,
         mono,
         aq,
+        allow_intrabc,
         cdef,
         lr,
     )
@@ -248,37 +253,38 @@ pub(crate) fn frame_header_lossy_multitile(
 pub(crate) fn frame_header_lossy_multitile_th(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
         qm,
+        uac_delta,
+        udc_delta,
         cols_incr,
         rows_incr,
-        false,
+        !updating_cdf,
         tile_cols_log2,
         tile_rows_log2,
         true,
         mono,
         aq,
+        allow_intrabc,
         cdef,
         lr,
     )
 }
 
-/// Emit a frame as a separate `OBU_FRAME_HEADER` (type 3) followed by an
-/// `OBU_TILE_GROUP` (type 4), rather than a combined `OBU_FRAME` (type 6). This
-/// is the layout libaom/rav1e use for tiled frames; ffmpeg's `av1_frame_merge`
-/// bitstream filter handles it cleanly, whereas a multi-tile combined
-/// `OBU_FRAME` trips its parser in some versions. `frame_header` must already be
-/// terminated with `trailing_bits()` (see [`frame_header_lossy_multitile_th`]).
 pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Vec<u8> {
     let mut out = wrap_obu(ObuType::FrameHeader, frame_header);
     out.extend_from_slice(&wrap_obu(ObuType::TileGroup, tile_group));
@@ -337,11 +343,6 @@ fn write_cdef_params(w: &mut BitWriter, cdef: &CdefParams, mono: bool) {
     }
 }
 
-/// Loop-restoration parameters for the frame header. This encoder only enables
-/// **luma Wiener** restoration with the smallest restoration-unit size (64x64,
-/// `lr_unit_shift = 0`, one unit per superblock); chroma is always
-/// `RESTORE_NONE`. `enabled = false` writes the all-`RESTORE_NONE` form (the
-/// no-op the decoder also runs when restoration is off).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LrParams {
     /// True when luma uses RESTORE_WIENER; false => all planes RESTORE_NONE.
@@ -375,6 +376,8 @@ fn write_lr_params(w: &mut BitWriter, lr: &LrParams, num_planes: usize) {
 fn frame_header_lossy_impl(
     base_q_idx: u8,
     qm: crate::quant::QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     cols_incr: &[bool],
     rows_incr: &[bool],
     disable_cdf_update: bool,
@@ -383,16 +386,17 @@ fn frame_header_lossy_impl(
     trailing: bool,
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
-    w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive image path, 1 = static isolated APIs)
+    w.flag(disable_cdf_update); // disable_cdf_update (0 = adaptive, 1 = static)
     w.flag(true); // allow_screen_content_tools (lossy luma palette enabled)
     w.flag(true); // force_integer_mv (seq force = SELECT)
     w.flag(false); // render_and_frame_size_different
-    w.flag(false); // allow_intrabc
+    w.flag(allow_intrabc);
     w.flag(true); // uniform_tile_spacing_flag
     // increment_tile_cols_log2 / increment_tile_rows_log2: walk from the
     // decoder's derived minimum up to the chosen TileColsLog2 / TileRowsLog2.
@@ -410,16 +414,29 @@ fn frame_header_lossy_impl(
     }
     // quantization_params()
     w.f(base_q_idx as u32, 8); // base_q_idx (non-zero -> lossy)
-    w.flag(false); // DeltaQYDc delta_coded
+    {
+        let ydc = crate::quant::Quant::luma_dc_delta_probe(base_q_idx);
+        if ydc != 0 {
+            w.flag(true);
+            w.f((ydc & 0x7f) as u32, 7);
+        } else {
+            w.flag(false); // DeltaQYDc delta_coded
+        }
+    }
     if !mono {
-        let uv_dc = crate::quant::chroma_dc_delta(base_q_idx);
+        let uv_dc = udc_delta;
         if uv_dc != 0 {
             w.flag(true); // DeltaQUDc delta_coded
             w.f((uv_dc & 0x7f) as u32, 7); // su(1+6): 7-bit two's complement
         } else {
             w.flag(false); // DeltaQUDc delta_coded
         }
-        w.flag(false); // DeltaQUAc delta_coded (== 0)
+        if uac_delta != 0 {
+            w.flag(true); // DeltaQUAc delta_coded
+            w.f((uac_delta & 0x7f) as u32, 7); // su(1+6): 7-bit two's complement
+        } else {
+            w.flag(false); // DeltaQUAc delta_coded (== 0)
+        }
     }
     let using_qmatrix = qm.y < 15 || qm.u < 15 || qm.v < 15;
     w.flag(using_qmatrix);
@@ -434,40 +451,38 @@ fn frame_header_lossy_impl(
     w.flag(false); // segmentation_enabled
     // delta_q_params() (base_q_idx != 0 => delta_q_present bit is coded). When
     // adaptive quantization is on, signal superblock delta-Q: present=1 plus a
-    // 2-bit delta_q_res, then delta_lf_present=0 (allow_intrabc is 0 here, so the
-    // delta_lf_present flag is coded and we leave loop-filter deltas off).
+    // 2-bit delta_q_res. delta_lf_present is omitted when IntraBC is enabled.
     if aq {
         w.flag(true); // delta_q_present = 1
         w.f(crate::coder::AQ_DELTA_Q_RES_LOG2 as u32, 2); // delta_q_res
-        w.flag(false); // delta_lf_present = 0
+        if !allow_intrabc {
+            w.flag(false); // delta_lf_present = 0
+        }
     } else {
         w.flag(false); // delta_q_present = 0  (=> delta_lf absent)
     }
-    // CodedLossless = 0 => loop_filter_params():
-    let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
-    w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
-    w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
-    if lvl_y != 0 && !mono {
-        // u/v levels coded only when (level[0] || level[1]) and NumPlanes > 1
-        w.f(lvl_uv as u32, 6); // loop_filter_level[2] (U)
-        w.f(lvl_uv as u32, 6); // loop_filter_level[3] (V)
-    }
-    w.f(0, 3); // loop_filter_sharpness = 0
-    w.flag(false); // loop_filter_delta_enabled = 0
+    // allow_intrabc suppresses loop-filter, CDEF and loop-restoration syntax.
+    if !allow_intrabc {
+        let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
+        w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
+        w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
+        if lvl_y != 0 && !mono {
+            w.f(lvl_uv as u32, 6);
+            w.f(lvl_uv as u32, 6);
+        }
+        w.f(0, 3); // loop_filter_sharpness = 0
+        w.flag(false); // loop_filter_delta_enabled = 0
 
-    let noop_cdef = CdefParams {
-        bits: 0,
-        damping: 3,
-        strengths: vec![(0, 0, 0, 0)],
-    };
-    let cdef = cdef.unwrap_or(&noop_cdef);
-    write_cdef_params(&mut w, cdef, mono);
-    // lr_params(): sequence enable_restoration = 1, so always coded. Defaults to
-    // all RESTORE_NONE (no-op) unless luma Wiener is enabled for this frame.
-    let noop_lr = LrParams::default();
-    let lr = lr.unwrap_or(&noop_lr);
-    let num_planes = if mono { 1 } else { 3 };
-    write_lr_params(&mut w, lr, num_planes);
+        let noop_cdef = CdefParams {
+            bits: 0,
+            damping: 3,
+            strengths: vec![(0, 0, 0, 0)],
+        };
+        write_cdef_params(&mut w, cdef.unwrap_or(&noop_cdef), mono);
+        let noop_lr = LrParams::default();
+        let num_planes = if mono { 1 } else { 3 };
+        write_lr_params(&mut w, lr.unwrap_or(&noop_lr), num_planes);
+    }
     // read_tx_mode(): !CodedLossless => tx_mode_select bit
     // TX_MODE_SELECT: every intra luma block > BLOCK_4X4 codes a `tx_depth`
     // symbol (see `code_tx_depth`), enabling per-block transform splitting —
@@ -491,11 +506,6 @@ pub(crate) fn wrap_obu_frame(frame_header: &[u8], tile_data: &[u8]) -> Vec<u8> {
     wrap_obu(ObuType::Frame, &payload)
 }
 
-/// Still sequence header with explicit color encoding and selectable `bit_depth`
-/// (8, 10, or 12). `profile`: 1 = 4:4:4 (8/10-bit), 2 = 4:2:2 or any 12-bit,
-/// 0 = 4:2:0. Writes `color_config()` with the full CICP triplet, range,
-/// bit-depth flags, and (for 4:2:0) chroma sample position. 4:4:4 subsampling
-/// (ss_x = ss_y = 0) is assumed.
 pub(crate) fn sequence_header_cicp(
     width: u32,
     height: u32,
@@ -518,8 +528,6 @@ pub(crate) fn sequence_header_cicp(
     )
 }
 
-/// Like [`sequence_header_cicp`] but with explicit chroma subsampling flags:
-/// `(ss_x, ss_y)` = `(0,0)` → 4:4:4, `(1,0)` → 4:2:2, `(1,1)` → 4:2:0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sequence_header_cicp_ss(
     width: u32,
@@ -545,12 +553,6 @@ pub(crate) fn sequence_header_cicp_ss(
     )
 }
 
-/// Monochrome (`mono_chrome = 1`, `NumPlanes = 1`) sequence header — a single
-/// luma plane, used to encode an AVIF alpha auxiliary image (alpha in AV1 is a
-/// separate grayscale image, not a 4th channel). `mono_chrome` is only coded
-/// when `seq_profile != 1`, so monochrome uses profile 0 (8/10-bit) or 2
-/// (12-bit). `color_description_present_flag` is 0 (CP/TC/MC default to
-/// unspecified, the norm for an alpha plane); `color_range` is still coded.
 pub(crate) fn sequence_header_mono(
     width: u32,
     height: u32,
@@ -598,16 +600,6 @@ pub(crate) fn sequence_header_mono(
     wrap_obu(ObuType::SequenceHeader, &w.into_bytes())
 }
 
-/// Core sequence-header writer with explicit chroma subsampling `ss_x`/`ss_y`
-/// (0/1 each): (0,0) = 4:4:4, (1,0) = 4:2:2, (1,1) = 4:2:0. Subsampling is coded
-/// in `color_config` only for profile 2 at 12-bit (otherwise it is implied by
-/// the profile); `chroma_sample_position` is coded whenever the format is 4:2:0.
-///
-/// `color` is optional: when `None`, `color_description_present_flag` is 0 and
-/// primaries/transfer/matrix default to *_UNSPECIFIED. With no description the
-/// MC_IDENTITY path is unreachable, so `color_range` and the subsampling/CSP
-/// bits are always coded; `color_range` defaults to limited (0) and
-/// `chroma_sample_position` to CSP_UNKNOWN (0).
 #[allow(clippy::too_many_arguments)]
 fn seq_header_ss(
     width: u32,

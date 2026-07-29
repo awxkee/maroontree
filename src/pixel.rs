@@ -31,6 +31,9 @@ use crate::err::EncodeError;
 pub trait Pixel: Copy + Default + PartialEq + Send + Sync + std::fmt::Debug {
     /// Promote a stored sample to the signed working type used by the transform.
     fn to_i32(self) -> i32;
+    /// Convert an input sample directly to the lossy coder's unsigned storage,
+    /// clipped to `[0, (1<<bit_depth)-1]`.
+    fn to_u16_clamped(self, bit_depth: u8) -> u16;
     fn to_f32(self) -> f32;
     /// Clip a reconstructed signed value back into `[0, (1<<bit_depth)-1]`.
     fn from_i32_clamped(v: i32, bit_depth: u8) -> Self;
@@ -40,6 +43,10 @@ impl Pixel for u8 {
     #[inline]
     fn to_i32(self) -> i32 {
         self as i32
+    }
+    #[inline]
+    fn to_u16_clamped(self, _bit_depth: u8) -> u16 {
+        self as u16
     }
     #[inline]
     fn to_f32(self) -> f32 {
@@ -55,6 +62,10 @@ impl Pixel for u16 {
     #[inline]
     fn to_i32(self) -> i32 {
         self as i32
+    }
+    #[inline]
+    fn to_u16_clamped(self, bit_depth: u8) -> u16 {
+        self.min((1u16 << bit_depth) - 1)
     }
     #[inline]
     fn to_f32(self) -> f32 {
@@ -73,6 +84,11 @@ impl Pixel for i32 {
         self
     }
     #[inline]
+    fn to_u16_clamped(self, bit_depth: u8) -> u16 {
+        let max = (1i32 << bit_depth) - 1;
+        self.clamp(0, max) as u16
+    }
+    #[inline]
     fn to_f32(self) -> f32 {
         self as f32
     }
@@ -87,6 +103,11 @@ impl Pixel for f32 {
     #[inline]
     fn to_i32(self) -> i32 {
         self as i32
+    }
+    #[inline]
+    fn to_u16_clamped(self, bit_depth: u8) -> u16 {
+        let max = ((1u16 << bit_depth) - 1) as f32;
+        self.clamp(0.0, max) as u16
     }
     #[inline]
     fn to_f32(self) -> f32 {

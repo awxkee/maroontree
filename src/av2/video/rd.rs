@@ -46,7 +46,8 @@ pub(crate) fn rd_mult(qstep: u32) -> f32 {
 /// (dropping AVM's fixed >>9 / <<7 shifts as a common scale).
 #[inline]
 pub(crate) fn rd_cost(distortion: f32, rate_bits: f32, qstep: u32) -> f32 {
-    distortion + rate_bits * rd_mult(qstep) / 512.0
+    const RECIP_512: f32 = 1. / 512.0;
+    distortion + rate_bits * rd_mult(qstep) * RECIP_512
 }
 
 /// SS2-calibrated distortion weight applied uniformly to inter distortion so the

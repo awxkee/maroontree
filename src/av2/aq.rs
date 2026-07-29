@@ -300,11 +300,13 @@ impl AqState {
             return self.base_q;
         }
         let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.vb_octile);
-        let vb_delta = crate::aq_common::variance_boost_delta(
+        let vb_delta = crate::aq_common::variance_boost_delta_av2(
             picked,
             self.ref_act,
+            0.0, // AV2 path: no same-domain reference; keeps the 0.95 fallback
             self.vb_strength,
             self.vb_boost_only,
+            0.0,
         );
         let dark = self.dark_protection(yp, pw, sb_y, sb_x, width, height);
         let flat_boost = (-vb_delta).max(0);

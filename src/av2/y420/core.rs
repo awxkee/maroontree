@@ -1636,7 +1636,7 @@ impl Av2Encoder {
                             }
                         };
                         // SATD prune: each chroma mode is one 32x32 prediction from
-                        // neighbours (independent) — rank by SATD over U+V, full-encode top-K.
+                        // neighbors (independent) — rank by SATD over U+V, full-encode top-K.
                         let keep_uv = if self.speed.reduced_modes() { 2 } else { 3 };
                         let cand_modes: Vec<usize> = if cand_modes.len() > keep_uv {
                             let mut r: Vec<(u64, usize)> = cand_modes

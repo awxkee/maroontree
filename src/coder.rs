@@ -29,19 +29,10 @@
 
 use crate::Speed;
 use crate::chroma_rect::*;
-use crate::dct::{
-    adst4x4_t, adst4x8_t, adst8x8_t, adst16x16_t, adstdct4x4_t, adstdct4x8_t, adstdct8x8_t,
-    adstdct16x16_t, dct4x8_t, dct8x4_t, dct8x8_t, dct8x16_t, dct16x8_t, dct16x32_t, dct32x16_t,
-    dctadst4x4_t, dctadst4x8_t, dctadst8x8_t, dctadst16x16_t, fidentity8x8_t,
-};
-use crate::idct::{
-    iadst_dequant_4x4, iadst_dequant_4x8, iadst_dequant_8x8, iadst_dequant_16x16,
-    iadstdct_dequant_4x4, iadstdct_dequant_4x8, iadstdct_dequant_8x8, iadstdct_dequant_16x16,
-    idct_dequant_4x4, idct_dequant_4x8, idct_dequant_8x4, idct_dequant_8x8, idct_dequant_8x16,
-    idct_dequant_16x8, idct_dequant_16x16, idct_dequant_16x32, idct_dequant_32x16,
-    idct_dequant_32x32, idctadst_dequant_4x4, idctadst_dequant_4x8, idctadst_dequant_8x8,
-    idctadst_dequant_16x16, iidentity_dequant_8x8,
-};
+use crate::dct::DctDispatch;
+use crate::encoding_context::EncodingContext;
+use crate::idct::IdctDispatch;
+use crate::kmeans::KmeansDispatch;
 use crate::obu::{
     frame_header_lossy_multitile, frame_header_lossy_multitile_th, wrap_obu_frame,
     wrap_obu_frame_split,
@@ -49,6 +40,7 @@ use crate::obu::{
 use crate::odec::OdEcEncoder;
 use crate::par::Pool;
 use crate::quant::QmLevels;
+use hashbrown::HashMap;
 #[cfg(test)]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -58,6 +50,9 @@ pub(crate) static LOSSY_PALETTE_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 pub(crate) static LOSSY_PALETTE_RESIDUAL_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOSSY_INTRABC_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(not(test))]
 pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
@@ -73,14 +68,80 @@ pub static HORZ_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 pub static VERT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-#[inline]
-fn filter_intra_sse_allowed(candidate_sse: i64, best_sse: i64) -> bool {
-    candidate_sse <= best_sse
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawSseGuard {
+    FilterIntra,
+    TxType,
+    TxSplit,
+}
+
+impl RawSseGuard {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FilterIntra => "filter-intra",
+            Self::TxType => "tx-type",
+            Self::TxSplit => "tx-split",
+        }
+    }
+}
+
+fn raw_sse_guard_disabled(kind: RawSseGuard) -> bool {
+    let _ = kind;
+    false
+}
+
+fn raw_sse_guard_stats_enabled() -> bool {
+    false
+}
+
+/// Apply one heuristic SSE policy while retaining the pure-RD choice as a
+/// shadow decision. Opt-in diagnostics are deliberately machine-readable so a
+/// holdout runner can join them with image-level SSIMULACRA2 deltas. Logging is
+/// capped per process because an image can contain hundreds of thousands of
+/// transform candidates.
+fn raw_sse_guard_choice(
+    tag: &'static str,
+    kind: RawSseGuard,
+    baseline_sse: i64,
+    candidate_sse: i64,
+    baseline_rd: f32,
+    candidate_rd: f32,
+    guarded_choice: bool,
+) -> bool {
+    let rd_choice = candidate_rd < baseline_rd;
+    let final_choice = if raw_sse_guard_disabled(kind) {
+        rd_choice
+    } else {
+        guarded_choice
+    };
+    if raw_sse_guard_stats_enabled() && (rd_choice || guarded_choice) {
+        static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let event = EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if event < 2048 {
+            let sse_delta = candidate_sse - baseline_sse;
+            let sse_percent = if baseline_sse == 0 {
+                0.0
+            } else {
+                100.0 * sse_delta as f64 / baseline_sse as f64
+            };
+            eprintln!(
+                "RAW_SSE_GUARD tag={tag} class={} rd_advantage={:.3} raw_sse_difference={sse_delta} raw_sse_percent={sse_percent:.3} rd_selected={} guarded_selected={} final_selected={} guard_changed={}",
+                kind.name(),
+                baseline_rd - candidate_rd,
+                u8::from(rd_choice),
+                u8::from(guarded_choice),
+                u8::from(final_choice),
+                u8::from(rd_choice != guarded_choice),
+            );
+        }
+    }
+    final_choice
 }
 
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Part16 {
+pub(crate) enum Part16 {
+    Intrabc,
     None,
     Horz,
     Vert,
@@ -89,7 +150,100 @@ enum Part16 {
     HorzB,
     VertA,
     VertB,
+    /// PARTITION_HORZ_4: four stacked 16x4 strips (symbol 8).
+    Horz4,
+    /// PARTITION_VERT_4: four side-by-side 4x16 strips (symbol 9).
+    Vert4,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FixedList<T: Copy, const N: usize> {
+    items: [T; N],
+    len: usize,
+}
+
+impl<T: Copy, const N: usize> FixedList<T, N> {
+    #[inline]
+    fn new(fill: T) -> Self {
+        Self {
+            items: [fill; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, value: T) {
+        debug_assert!(self.len < N);
+        self.items[self.len] = value;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
+    fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len);
+        let value = self.items[index];
+        self.items.copy_within(index + 1..self.len, index);
+        self.len -= 1;
+        value
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        &self.items[..self.len]
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.items[..self.len]
+    }
+}
+
+impl<T: Copy, const N: usize> std::ops::Deref for FixedList<T, N> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T: Copy, const N: usize> std::ops::DerefMut for FixedList<T, N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<T: Copy + PartialEq, const N: usize> FixedList<T, N> {
+    fn dedup(&mut self) {
+        if self.len < 2 {
+            return;
+        }
+        let mut out = 1usize;
+        for i in 1..self.len {
+            if self.items[i] != self.items[out - 1] {
+                self.items[out] = self.items[i];
+                out += 1;
+            }
+        }
+        self.len = out;
+    }
+}
+
+impl<'a, T: Copy, const N: usize> IntoIterator for &'a FixedList<T, N> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 use crate::aq_common::{DarkAq, dirty_log1pf};
 use crate::trellis::{trellis_optimize, trellis_optimize_ctx};
 
@@ -137,110 +291,230 @@ fn chroma_tx_for_mode(mode: usize) -> ChromaTx {
 
 /// Forward transform + trellis quant for an 8x8 chroma block under the given
 /// chroma tx kind. Returns levels + unrounded targets like the other `*_t`.
-fn fwd_chroma_8x8(tx: ChromaTx, resid: &[i32; 64], q: &impl Dct) -> ([i32; 64], [f32; 64]) {
+fn fwd_chroma_8x8(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 64],
+    q: &Quant,
+) -> ([i32; 64], [f32; 64]) {
     match tx {
-        ChromaTx::DctDct => forward_dct_quant_8x8_t(resid, q),
-        ChromaTx::AdstAdst => adst8x8_t(resid, q),
-        ChromaTx::AdstDct => adstdct8x8_t(resid, q),
-        ChromaTx::DctAdst => dctadst8x8_t(resid, q),
+        ChromaTx::DctDct => dct.dct8x8_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst8x8_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct8x8_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst8x8_t(resid, q),
     }
 }
 
-fn inv_chroma_8x8(tx: ChromaTx, levels: &[i32; 64], q: &impl Dct) -> [i32; 64] {
+fn inv_chroma_8x8(idct: &IdctDispatch, tx: ChromaTx, levels: &[i32; 64], q: &Quant) -> [i32; 64] {
     match tx {
-        ChromaTx::DctDct => idct_dequant_8x8(levels, q),
-        ChromaTx::AdstAdst => iadst_dequant_8x8(levels, q),
-        ChromaTx::AdstDct => iadstdct_dequant_8x8(levels, q),
-        ChromaTx::DctAdst => idctadst_dequant_8x8(levels, q),
+        ChromaTx::DctDct => idct.idct_dequant_8x8(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_8x8(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_8x8(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_8x8(levels, q),
     }
 }
 
 /// Forward transform + trellis quant for a 16x16 chroma block under the given
 /// chroma tx kind (mirrors `fwd_chroma_8x8` at TX_16X16).
-fn fwd_chroma_16x16(tx: ChromaTx, resid: &[i32; 256], q: &impl Dct) -> ([i32; 256], [f32; 256]) {
+fn fwd_chroma_16x16(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 256],
+    q: &Quant,
+) -> ([i32; 256], [f32; 256]) {
     match tx {
-        ChromaTx::DctDct => forward_dct_quant_16x16_t(resid, q),
-        ChromaTx::AdstAdst => adst16x16_t(resid, q),
-        ChromaTx::AdstDct => adstdct16x16_t(resid, q),
-        ChromaTx::DctAdst => dctadst16x16_t(resid, q),
+        ChromaTx::DctDct => dct.dct16x16_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst16x16_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct16x16_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst16x16_t(resid, q),
     }
 }
 
-fn inv_chroma_16x16(tx: ChromaTx, levels: &[i32; 256], q: &impl Dct) -> [i32; 256] {
+fn inv_chroma_16x16(
+    idct: &IdctDispatch,
+    tx: ChromaTx,
+    levels: &[i32; 256],
+    q: &Quant,
+) -> [i32; 256] {
     match tx {
-        ChromaTx::DctDct => idct_dequant_16x16(levels, q),
-        ChromaTx::AdstAdst => iadst_dequant_16x16(levels, q),
-        ChromaTx::AdstDct => iadstdct_dequant_16x16(levels, q),
-        ChromaTx::DctAdst => idctadst_dequant_16x16(levels, q),
+        ChromaTx::DctDct => idct.idct_dequant_16x16(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_16x16(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_16x16(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_16x16(levels, q),
     }
 }
 
-fn fwd_chroma_4x4(tx: ChromaTx, resid: &[i32; 16], q: &impl Dct) -> ([i32; 16], [f32; 16]) {
+/// Forward transform + quant for a 16x8 / 8x16 chroma block under the given
+/// chroma tx kind (the decoder derives it from the uv_mode; rect chroma at
+/// 4:4:4 rect16 leaves).
+fn fwd_chroma_16x8(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 128],
+    q: &Quant,
+) -> ([i32; 128], [f32; 128]) {
     match tx {
-        ChromaTx::DctDct => forward_dct_quant_4x4_t(resid, q),
-        ChromaTx::AdstAdst => adst4x4_t(resid, q),
-        ChromaTx::AdstDct => adstdct4x4_t(resid, q),
-        ChromaTx::DctAdst => dctadst4x4_t(resid, q),
+        ChromaTx::DctDct => dct.dct16x8_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst16x8_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct16x8_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst16x8_t(resid, q),
     }
 }
 
-fn inv_chroma_4x4(tx: ChromaTx, levels: &[i32; 16], q: &impl Dct) -> [i32; 16] {
+fn inv_chroma_16x8(
+    idct: &IdctDispatch,
+    tx: ChromaTx,
+    levels: &[i32; 128],
+    q: &Quant,
+) -> [i32; 128] {
     match tx {
-        ChromaTx::DctDct => idct_dequant_4x4(levels, q),
-        ChromaTx::AdstAdst => iadst_dequant_4x4(levels, q),
-        ChromaTx::AdstDct => iadstdct_dequant_4x4(levels, q),
-        ChromaTx::DctAdst => idctadst_dequant_4x4(levels, q),
+        ChromaTx::DctDct => idct.idct_dequant_16x8(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_16x8(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_16x8(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_16x8(levels, q),
     }
 }
 
-fn fwd_chroma_4x8(tx: ChromaTx, resid: &[i32; 32], q: &impl Dct) -> ([i32; 32], [f32; 32]) {
+fn fwd_chroma_8x16(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 128],
+    q: &Quant,
+) -> ([i32; 128], [f32; 128]) {
     match tx {
-        ChromaTx::DctDct => forward_dct_quant_4x8_t(resid, q),
-        ChromaTx::AdstAdst => adst4x8_t(resid, q),
-        ChromaTx::AdstDct => adstdct4x8_t(resid, q),
-        ChromaTx::DctAdst => dctadst4x8_t(resid, q),
+        ChromaTx::DctDct => dct.dct8x16_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst8x16_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct8x16_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst8x16_t(resid, q),
     }
 }
 
-fn inv_chroma_4x8(tx: ChromaTx, levels: &[i32; 32], q: &impl Dct) -> [i32; 32] {
+fn inv_chroma_8x16(
+    idct: &IdctDispatch,
+    tx: ChromaTx,
+    levels: &[i32; 128],
+    q: &Quant,
+) -> [i32; 128] {
     match tx {
-        ChromaTx::DctDct => idct_dequant_4x8(levels, q),
-        ChromaTx::AdstAdst => iadst_dequant_4x8(levels, q),
-        ChromaTx::AdstDct => iadstdct_dequant_4x8(levels, q),
-        ChromaTx::DctAdst => idctadst_dequant_4x8(levels, q),
+        ChromaTx::DctDct => idct.idct_dequant_8x16(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_8x16(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_8x16(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_8x16(levels, q),
     }
 }
+
+fn fwd_chroma_4x4(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 16],
+    q: &Quant,
+) -> ([i32; 16], [f32; 16]) {
+    match tx {
+        ChromaTx::DctDct => dct.dct4x4_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst4x4_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct4x4_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst4x4_t(resid, q),
+    }
+}
+
+fn inv_chroma_4x4(idct: &IdctDispatch, tx: ChromaTx, levels: &[i32; 16], q: &Quant) -> [i32; 16] {
+    match tx {
+        ChromaTx::DctDct => idct.idct_dequant_4x4(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_4x4(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_4x4(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_4x4(levels, q),
+    }
+}
+
+fn fwd_chroma_4x8(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 32],
+    q: &Quant,
+) -> ([i32; 32], [f32; 32]) {
+    match tx {
+        ChromaTx::DctDct => dct.dct4x8_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst4x8_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct4x8_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst4x8_t(resid, q),
+    }
+}
+
+fn inv_chroma_4x8(idct: &IdctDispatch, tx: ChromaTx, levels: &[i32; 32], q: &Quant) -> [i32; 32] {
+    match tx {
+        ChromaTx::DctDct => idct.idct_dequant_4x8(levels, q),
+        ChromaTx::AdstAdst => idct.iadst_dequant_4x8(levels, q),
+        ChromaTx::AdstDct => idct.iadstdct_dequant_4x8(levels, q),
+        ChromaTx::DctAdst => idct.idctadst_dequant_4x8(levels, q),
+    }
+}
+
+/// Raw read view of the wavefront capture's finished-recon planes (see
+/// `LossyTile::ibc_shared`). (ptr, len, stride) per plane, luma first.
+#[derive(Clone, Copy)]
+pub(crate) struct IbcSharedRecon {
+    pub(crate) planes: [(*const u16, usize, usize); 3],
+}
+// SAFETY: reads are restricted to wavefront-finished cells (disjoint from all
+// concurrent writers) by the IntraBC legality rule; the planes outlive every
+// worker (allocated before the pool, dropped after it joins).
+unsafe impl Send for IbcSharedRecon {}
+unsafe impl Sync for IbcSharedRecon {}
 
 pub(crate) struct Cdfs {
-    pub(crate) skip: Vec<Vec<u16>>,                 // block skip [3 ctx]
-    pub(crate) part_bl8: Vec<Vec<u16>>,             // PARTITION_NONE @ 8x8 [4 ctx]
-    pub(crate) part_split: Vec<Vec<Vec<u16>>>,      // SPLIT [bl-1=0..3][4 ctx]
-    pub(crate) kf_y: Vec<Vec<u16>>, // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
-    pub(crate) uv_mode: Vec<Vec<u16>>, // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
-    pub(crate) angle_delta: Vec<Vec<u16>>, // angle_delta[8 directional modes]
-    pub(crate) filter_intra: Vec<Vec<u16>>, // use_filter_intra [BLOCK_SIZES_ALL]
-    pub(crate) filter_intra_mode: Vec<u16>, // five filter-intra predictors
+    /// Trellis frequency-tilt strength for this tile's format — see
+    /// `trellis_tilt_mag_cap()` in trellis.rs. Holdout-selected per chroma
+    /// format 2026-07-21 (NB selected ON the holdout after many iterations,
+    /// so treat the exact constants with a grain of salt): 420 t=5.0 =
+    /// **-5.18% BD, all 9 images negative**; 422 t=3.5 = -4.28% all
+    /// negative; 444 t=1.2 = -2.10% (h_abstract +0.89, the one exception —
+    /// 444 is chronically tilt-sensitive on sharp synthetics). Applied to
+    /// the luma plane only in practice (chroma coding does not run
+    /// trellis_optimize_ctx). Zero disables (lossless, tests).
+    pub(crate) band_tilt: f32,
+    pub(crate) skip: Vec<Vec<u16>>,             // block skip [3 ctx]
+    pub(crate) intrabc: Vec<u16>,               // use_intrabc
+    pub(crate) mv_joint: Vec<u16>,              // MV_JOINT
+    pub(crate) mv_sign: [Vec<u16>; 2],          // vertical, horizontal
+    pub(crate) mv_classes: [Vec<u16>; 2],       // MV class 0..10
+    pub(crate) mv_class0: [Vec<u16>; 2],        // class-zero integer bit
+    pub(crate) mv_class_n: [[Vec<u16>; 10]; 2], // class-N integer bits
+    pub(crate) part_bl8: Vec<Vec<u16>>,         // PARTITION_NONE @ 8x8 [4 ctx]
+    pub(crate) part_split: Vec<Vec<Vec<u16>>>,  // SPLIT [bl-1=0..3][4 ctx]
+    pub(crate) kf_y: Vec<Vec<u16>>,             // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
+    pub(crate) uv_mode: Vec<Vec<u16>>,          // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
+    pub(crate) angle_delta: Vec<Vec<u16>>,      // angle_delta[8 directional modes]
+    pub(crate) filter_intra: Vec<Vec<u16>>,     // use_filter_intra [BLOCK_SIZES_ALL]
+    pub(crate) filter_intra_mode: Vec<u16>,     // five filter-intra predictors
     pub(crate) palette_y_mode: Vec<Vec<Vec<u16>>>, // [7 bsize ctx][3 neighbor ctx]
-    pub(crate) palette_y_size: Vec<Vec<u16>>, // [7 bsize ctx], sizes 2..8
-    pub(crate) palette_uv_mode: [Vec<u16>; 2], // luma palette absent/present
+    pub(crate) palette_y_size: Vec<Vec<u16>>,   // [7 bsize ctx], sizes 2..8
+    pub(crate) palette_uv_mode: [Vec<u16>; 2],  // luma palette absent/present
     pub(crate) palette_y_color: Vec<Vec<Vec<u16>>>, // [size-2][5 map ctx]
-    pub(crate) cfl_sign: Vec<u16>,  // cfl joint-sign (8 symbols)
-    pub(crate) cfl_alpha: Vec<Vec<u16>>, // cfl alpha magnitude [6 ctx]
-    pub(crate) txsz: [Vec<Vec<u16>>; 4], // intra tx_depth [t_dim.max-1][3 ctx]
-    pub(crate) txtp: Vec<Vec<u16>>, // intra txtp TX_8X8 luma, per intra mode [13]
-    pub(crate) txtp4: Vec<Vec<u16>>, // intra txtp TX_4X4 luma, per intra mode [13]
-    pub(crate) txtp16: Vec<Vec<u16>>, // intra txtp TX_16X16 luma, per intra mode [13]
-    pub(crate) txb_skip: [Vec<Vec<u16>>; 4], // [class][13 ctx] (class 3 = TX_32X32)
+    pub(crate) palette_uv_size: Vec<Vec<u16>>,  // [7 bsize ctx], sizes 2..8
+    pub(crate) palette_uv_color: Vec<Vec<Vec<u16>>>, // [size-2][5 map ctx]
+    pub(crate) cfl_sign: Vec<u16>,              // cfl joint-sign (8 symbols)
+    pub(crate) cfl_alpha: Vec<Vec<u16>>,        // cfl alpha magnitude [6 ctx]
+    pub(crate) txsz: [Vec<Vec<u16>>; 4],        // intra tx_depth [t_dim.max-1][3 ctx]
+    pub(crate) txtp: Vec<Vec<u16>>,             // intra txtp TX_8X8 luma, per intra mode [13]
+    pub(crate) txtp4: Vec<Vec<u16>>,            // intra txtp TX_4X4 luma, per intra mode [13]
+    pub(crate) txtp16: Vec<Vec<u16>>,           // intra txtp TX_16X16 luma, per intra mode [13]
+    pub(crate) txb_skip: [Vec<Vec<u16>>; 4],    // [class][13 ctx] (class 3 = TX_32X32)
     pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
     pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][21 ctx]
     pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][4 ctx]
     pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][11 bins], each a 2-sym CDF
-    pub(crate) dc_sign: [Vec<Vec<u16>>; 2], // [plane][3 ctx]
-    pub(crate) eob_bin_16_c: Vec<u16>, // chroma, 4x4
-    pub(crate) eob_bin_16_l: Vec<u16>, // luma, 4x4
+    pub(crate) dc_sign: [Vec<Vec<u16>>; 2],     // [plane][3 ctx]
+    pub(crate) eob_bin_16_c: Vec<u16>,          // chroma, 4x4
+    pub(crate) eob_bin_16_l: Vec<u16>,          // luma, 4x4
     pub(crate) eob_bin_32_c: Vec<u16>,
     pub(crate) eob_bin_32_l: Vec<u16>,
-    pub(crate) eob_bin_64_l: Vec<u16>,   // luma, 8x8
+    pub(crate) eob_bin_64_l: Vec<u16>, // luma, 8x8
+    /// 1-D tx-class (V_DCT/H_DCT) luma eob bins — dav1d eob_bin_64[0][1].
+    pub(crate) eob_bin_16_l1d: Vec<u16>, // luma 4x4, 1-D tx classes
+    pub(crate) eob_bin_64_l1d: Vec<u16>,
+    /// Luma 128-coeff eob bins for the 1-D tx classes (V_DCT/H_DCT at
+    /// RTX_16X8/RTX_8X16): dav1d `eob_bin_128[0][is_1d=1]`.
+    pub(crate) eob_bin_128_l1d: Vec<u16>,
     pub(crate) eob_bin_64_c: Vec<u16>,   // chroma, 8x8
     pub(crate) eob_bin_256_l: Vec<u16>,  // luma, 16x16 (class 2)
     pub(crate) eob_bin_256_c: Vec<u16>,  // chroma, 16x16 (class 2)
@@ -255,6 +529,199 @@ pub(crate) struct Cdfs {
 }
 
 impl Cdfs {
+    /// Return every adaptive CDF leaf in a stable logical order. The raw
+    /// pointers are used only while this `Cdfs` instance remains alive and no
+    /// table Vec is resized. Capture workers translate their own addresses to
+    /// these indices; the raster packer uses the same indices on its live
+    /// adaptive state.
+    fn semantic_slots(&mut self) -> Vec<(*mut u16, usize)> {
+        let mut out = Vec::with_capacity(1400);
+        let mut push = |v: &mut Vec<u16>| out.push((v.as_mut_ptr(), v.len()));
+
+        for v in &mut self.skip {
+            push(v);
+        }
+        push(&mut self.intrabc);
+        push(&mut self.mv_joint);
+        for v in &mut self.mv_sign {
+            push(v);
+        }
+        for v in &mut self.mv_classes {
+            push(v);
+        }
+        for v in &mut self.mv_class0 {
+            push(v);
+        }
+        for plane in &mut self.mv_class_n {
+            for v in plane {
+                push(v);
+            }
+        }
+        for v in &mut self.part_bl8 {
+            push(v);
+        }
+        for level in &mut self.part_split {
+            for v in level {
+                push(v);
+            }
+        }
+        for v in &mut self.kf_y {
+            push(v);
+        }
+        for v in &mut self.uv_mode {
+            push(v);
+        }
+        for v in &mut self.angle_delta {
+            push(v);
+        }
+        for v in &mut self.filter_intra {
+            push(v);
+        }
+        push(&mut self.filter_intra_mode);
+        for size in &mut self.palette_y_mode {
+            for v in size {
+                push(v);
+            }
+        }
+        for v in &mut self.palette_y_size {
+            push(v);
+        }
+        for v in &mut self.palette_uv_mode {
+            push(v);
+        }
+        for size in &mut self.palette_y_color {
+            for v in size {
+                push(v);
+            }
+        }
+        for v in &mut self.palette_uv_size {
+            push(v);
+        }
+        for size in &mut self.palette_uv_color {
+            for v in size {
+                push(v);
+            }
+        }
+        push(&mut self.cfl_sign);
+        for v in &mut self.cfl_alpha {
+            push(v);
+        }
+        for cat in &mut self.txsz {
+            for v in cat {
+                push(v);
+            }
+        }
+        for v in &mut self.txtp {
+            push(v);
+        }
+        for v in &mut self.txtp4 {
+            push(v);
+        }
+        for v in &mut self.txtp16 {
+            push(v);
+        }
+        for class in &mut self.txb_skip {
+            for v in class {
+                push(v);
+            }
+        }
+        for class in &mut self.base_tok {
+            for plane in class {
+                for v in plane {
+                    push(v);
+                }
+            }
+        }
+        for class in &mut self.br_tok {
+            for plane in class {
+                for v in plane {
+                    push(v);
+                }
+            }
+        }
+        for class in &mut self.eob_base {
+            for plane in class {
+                for v in plane {
+                    push(v);
+                }
+            }
+        }
+        for class in &mut self.eob_hi {
+            for plane in class {
+                for v in plane {
+                    push(v);
+                }
+            }
+        }
+        for plane in &mut self.dc_sign {
+            for v in plane {
+                push(v);
+            }
+        }
+        for v in [
+            &mut self.eob_bin_16_c,
+            &mut self.eob_bin_16_l,
+            &mut self.eob_bin_32_c,
+            &mut self.eob_bin_32_l,
+            &mut self.eob_bin_64_l,
+            &mut self.eob_bin_16_l1d,
+            &mut self.eob_bin_64_l1d,
+            &mut self.eob_bin_128_l1d,
+            &mut self.eob_bin_64_c,
+            &mut self.eob_bin_256_l,
+            &mut self.eob_bin_256_c,
+            &mut self.eob_bin_128_c,
+            &mut self.eob_bin_128_l,
+            &mut self.eob_bin_1024_l,
+            &mut self.eob_bin_1024_c,
+            &mut self.eob_bin_512_c,
+            &mut self.eob_bin_512_l,
+            &mut self.delta_q,
+            &mut self.wiener_restore,
+        ] {
+            push(v);
+        }
+        debug_assert!(out.len() <= u16::MAX as usize);
+        out
+    }
+
+    pub(crate) fn with_band_tilt(mut self, t: f32) -> Self {
+        self.band_tilt = t;
+        self
+    }
+
+    /// Frame-initial lossless state. The static mode deliberately restores the
+    /// legacy inverse-CDF tables used before adaptation was introduced.
+    pub(crate) fn new_lossless(updating_cdf: bool) -> Self {
+        let mut c = Self::new(0);
+        if updating_cdf {
+            return c;
+        }
+        use crate::cdf_tables as legacy;
+        c.txb_skip[0] = legacy::C_SKIP.iter().map(|v| v.to_vec()).collect();
+        c.eob_bin_16_l = legacy::EOB_BIN16[0].to_vec();
+        c.eob_bin_16_c = legacy::EOB_BIN16[1].to_vec();
+        for plane in 0..2 {
+            c.eob_hi[0][plane] = legacy::EOB_HI[plane].iter().map(|v| v.to_vec()).collect();
+            c.eob_base[0][plane] = legacy::EOB_BASE[plane].iter().map(|v| v.to_vec()).collect();
+            c.base_tok[0][plane] = legacy::BASE_TOK[plane].iter().map(|v| v.to_vec()).collect();
+            c.br_tok[0][plane] = legacy::BR_TOK[plane].iter().map(|v| v.to_vec()).collect();
+            c.dc_sign[plane] = legacy::DC_SIGN[plane].iter().map(|v| v.to_vec()).collect();
+        }
+        for (level, table) in [
+            &legacy::PART_SPLIT_64,
+            &legacy::PART_SPLIT_32,
+            &legacy::PART_SPLIT_16,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.part_split[level] = table.iter().map(|v| v.to_vec()).collect();
+        }
+        c.part_bl8 = legacy::PART_8.iter().map(|v| v.to_vec()).collect();
+        c
+    }
+
     /// Frozen snapshot used for DECISION-side rate estimates (`dec_cdfs`).
     /// Mostly the frame-initial CDFs, except symbols whose default prior sits
     /// far from its adapted steady state on real content: there a frozen
@@ -366,7 +833,31 @@ impl Cdfs {
             ],
         ];
         Cdfs {
+            band_tilt: 0.0,
             skip: SKIP_CDF.iter().map(|&v| icdf(&[v])).collect(),
+            intrabc: icdf(&[30531]),
+            mv_joint: icdf(&[4096, 11264, 19328]),
+            mv_sign: std::array::from_fn(|_| icdf(&[16384])),
+            mv_classes: std::array::from_fn(|_| {
+                icdf(&[
+                    28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767,
+                ])
+            }),
+            mv_class0: std::array::from_fn(|_| icdf(&[27648])),
+            mv_class_n: std::array::from_fn(|_| {
+                [
+                    icdf(&[17408]),
+                    icdf(&[17920]),
+                    icdf(&[18944]),
+                    icdf(&[20480]),
+                    icdf(&[22528]),
+                    icdf(&[24576]),
+                    icdf(&[28672]),
+                    icdf(&[29952]),
+                    icdf(&[29952]),
+                    icdf(&[30720]),
+                ]
+            }),
             part_bl8: PART_BL8_CDF.iter().map(|r| icdf(r)).collect(),
             txsz: [
                 TXSZ_CAT0_CDF.iter().map(|r| icdf(r)).collect(),
@@ -398,6 +889,8 @@ impl Cdfs {
             palette_y_size: palette_y_size_cdfs(),
             palette_uv_mode: [icdf(&[32461]), icdf(&[21488])],
             palette_y_color: palette_y_color_cdfs(),
+            palette_uv_size: palette_uv_size_cdfs(),
+            palette_uv_color: palette_uv_color_cdfs(),
             cfl_sign: icdf(&CFL_SIGN_CDF),
             cfl_alpha: CFL_ALPHA_CDF.iter().map(|r| icdf(r)).collect(),
             uv_mode: {
@@ -429,6 +922,9 @@ impl Cdfs {
             eob_bin_32_c: icdf(&Q::EOB_BIN_32_CHROMA[qctx]),
             eob_bin_32_l: icdf(&Q::EOB_BIN_32_LUMA[qctx]),
             eob_bin_64_l: icdf(&Q::EOB_BIN_64_LUMA[qctx]),
+            eob_bin_16_l1d: icdf(&Q::EOB_BIN_16_LUMA_1D[qctx]),
+            eob_bin_64_l1d: icdf(&Q::EOB_BIN_64_LUMA_1D[qctx]),
+            eob_bin_128_l1d: icdf(&Q::EOB_BIN_128_LUMA_1D[qctx]),
             eob_bin_64_c: icdf(&Q::EOB_BIN_64_CHROMA[qctx]),
             eob_bin_256_l: icdf(&Q::EOB_BIN_256_LUMA[qctx]),
             eob_bin_256_c: icdf(&Q::EOB_BIN_256_CHROMA[qctx]),
@@ -448,21 +944,55 @@ impl Cdfs {
     }
 }
 
-/// log-resolution of the delta-q step: the signaled `delta_q_res` is `1 << this`
-/// (so a step of 4 qindex units). Matches `av2/aq.rs::AQ_RES_LOG2`.
 const AQ_RES_LOG2: u8 = 2;
-/// Same value, exposed for the frame-header writer (`delta_q_res`) so the
-/// signaled resolution always matches the per-SB step used by the encoder.
 pub(crate) const AQ_DELTA_Q_RES_LOG2: u8 = AQ_RES_LOG2;
-/// Spec limit: a single `read_delta_qindex` token without the literal-extension
-/// escape can carry magnitudes 0..=2 directly; we keep the per-SB step within a
-/// modest range and never need the `DELTA_Q_SMALL` escape (3+).
 const AQ_MAX_STEPS: i32 = 12;
+
+/// Base-shift experiment scaffolding. **Unreachable as shipped.**
+///
+/// `BASEQ_SHIFT_K` is a plain const with no setter, and `baseq_shift` returns 0
+/// unconditionally when it is 0. So `dispatch.rs`'s `if shift != 0` block never
+/// runs, `VarianceBoost::base_shift` is always 0, and the
+/// `if delta < 0 && self.aq.base_shift > 0` re-anchoring branch in
+/// `aq_sb_target` is dead with it.
+///
+/// Unlike `aq_slope`/`aq_max_delta` (revivable via
+/// `EncodeConfig::with_variance_boost(false)`), there is NO configuration that
+/// makes this live — verified by tracing every assignment to `base_shift`.
+/// Safe to delete along with `baseq_shift`, the `base_shift` field, the
+/// dispatch block and the `aq_sb_target` branch.
+pub(crate) const BASEQ_SHIFT_K: i32 = 0;
+pub(crate) fn baseq_shift(base_q_idx: u8) -> i32 {
+    let qi = base_q_idx as i32;
+    let k = BASEQ_SHIFT_K;
+    if k == 0 || qi <= 40 {
+        0
+    } else if qi < 56 {
+        k * (qi - 40) / 16
+    } else if qi <= 112 {
+        k
+    } else if qi < 144 {
+        k * (144 - qi) / 32
+    } else {
+        0
+    }
+}
 /// qindex per unit of log-activity (how hard flat vs busy regions are pushed).
-/// Tuned on photographic stills; override at run time with `AQ_SLOPE`.
-const AQ_SLOPE: f32 = 5.0;
+///
+/// ONLY REACHED WITH VARIANCE BOOST DISABLED. Its sole consumer is
+/// `aq_target_qidx`, which lives in the `else` of `if self.aq.vb_enabled` in
+/// `aq_sb_target`; Variance Boost is on by default, so the default encoder
+/// never evaluates this. A liveness sweep therefore reports it as dead — it is
+/// not: `EncodeConfig::variance_boost(false)` makes this path live again.
+/// Do not delete it, and do not tune it against default-config measurements.
+fn aq_slope() -> f32 {
+    crate::tuning::get().aq_slope
+}
 /// per-superblock qindex delta clamp, before res-quantization.
-const AQ_MAX_DELTA: f32 = 28.0;
+/// Same reachability caveat as [`aq_slope`].
+fn aq_max_delta() -> f32 {
+    crate::tuning::get().aq_max_delta
+}
 
 /// Variance Boost configuration, carried from the encoder option down to the
 /// per-tile [`AqCtx`]. `enabled == false` selects the classic whole-SB AQ (the
@@ -477,6 +1007,9 @@ pub(crate) struct VarianceBoost {
     /// Dark-structured-detail protection, combined with the variance boost by `max`.
     /// Independent of `enabled`: fires in both the Variance Boost and classic-AQ paths.
     pub dark: DarkAq,
+    /// Mid-band base-q shift this frame was encoded with (see [`baseq_shift`]);
+    /// the AQ protection side anchors to `base_q - base_shift`.
+    pub base_shift: i32,
     pub qm: QmLevels,
 }
 
@@ -489,6 +1022,7 @@ impl VarianceBoost {
             strength: 1.0,
             boost_only: false,
             dark: DarkAq::off(),
+            base_shift: 0,
             qm: QmLevels::FLAT,
         }
     }
@@ -498,20 +1032,17 @@ impl VarianceBoost {
             enabled: true,
             octile: 6,
             strength: 1.0,
-            boost_only: true,
+            boost_only: false,
             dark: DarkAq::on(),
+            base_shift: 0,
             qm: QmLevels::FLAT,
         }
     }
 }
 
-/// Mean+variance of the (up to) 64x64 luma region whose top-left is
-/// `(sb_x, sb_y)`, returned as `ln(1 + variance)` — a perceptually reasonable
-/// "activity" that compresses the huge dynamic range of raw variance. Operates
-/// on the padded `i32` luma plane of stride `pw`.
 #[inline(never)]
-fn sb_activity(
-    yp: &[i32],
+pub(crate) fn sb_activity(
+    yp: &[u16],
     pw: usize,
     sb_y: usize,
     sb_x: usize,
@@ -523,23 +1054,14 @@ fn sb_activity(
     if h == 0 || w == 0 {
         return 0.0;
     }
-    let mut sum = 0i64;
-    let mut sum2 = 0i64;
-    for r in 0..h {
-        let base = (sb_y + r) * pw + sb_x;
-        for &c in &yp[base..base + w] {
-            let v = c as i64;
-            sum += v;
-            sum2 += v * v;
-        }
-    }
+    let (sum, sum_sq) = block_moments_i32(yp, pw, sb_x, sb_y, w, h);
     let n = (h * w) as f32;
     let mean = sum as f32 / n;
-    let var = (sum2 as f32 / n - mean * mean).max(0.0);
+    let var = (sum_sq as f32 / n - mean * mean).max(0.0);
     dirty_log1pf(var)
 }
 
-fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
+fn tile_ref_activity(yp: &[u16], pw: usize, w: usize, h: usize) -> f32 {
     let mut sum = 0f32;
     let mut cnt = 0f32;
     for sb_y in (0..h).step_by(64) {
@@ -551,9 +1073,30 @@ fn tile_ref_activity(yp: &[i32], pw: usize, w: usize, h: usize) -> f32 {
     if cnt > 0.0 { sum / cnt } else { 5.0 }
 }
 
+/// Tile mean of log1p(octile-6 8x8 subblock variance) — the cut-side anchor
+/// in the SAME domain as the per-SB `picked` value.
+fn tile_ref_picked(yp: &[u16], pw: usize, w: usize, h: usize, octile: u8, bd: u8) -> f32 {
+    let var_scale = 1.0 / (1u32 << (2 * (bd - 8))) as f32;
+    let mut sum = 0f32;
+    let mut cnt = 0f32;
+    for sb_y in (0..h).step_by(64) {
+        for sb_x in (0..w).step_by(64) {
+            let mut subvars = [0f32; 64];
+            let filled = aq_sb_subblock_variances(yp, pw, sb_y, sb_x, w, h, &mut subvars);
+            if filled == 0 {
+                continue;
+            }
+            let picked = crate::aq_common::sb_octile_variance(&mut subvars, octile);
+            sum += dirty_log1pf(picked * var_scale);
+            cnt += 1.0;
+        }
+    }
+    if cnt > 0.0 { sum / cnt } else { 5.0 }
+}
+
 fn aq_params() -> (f32, f32, f32) {
     // (slope, max delta, coarsen scale). Coarsen scale 1.0 == pure variance.
-    (AQ_SLOPE, AQ_MAX_DELTA, 1.0)
+    (aq_slope(), aq_max_delta(), 1.0)
 }
 
 fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
@@ -570,7 +1113,7 @@ fn aq_target_qidx(base_q: i32, activity: f32, ref_act: f32) -> i32 {
 }
 
 fn aq_sb_subblock_variances(
-    yp: &[i32],
+    yp: &[u16],
     pw: usize,
     sb_y: usize,
     sb_x: usize,
@@ -590,19 +1133,10 @@ fn aq_sb_subblock_variances(
                 *out = f32::NAN; // out-of-frame, patched below
                 continue;
             }
-            let mut sum = 0i64;
-            let mut sum2 = 0i64;
-            for r in 0..h {
-                let base = (y0 + r) * pw + x0;
-                for &v in &yp[base..base + w] {
-                    let v = v as i64;
-                    sum += v;
-                    sum2 += v * v;
-                }
-            }
+            let (sum, sum_sq) = block_moments_i32(yp, pw, x0, y0, w, h);
             let n = (h * w) as f32;
             let mean = sum as f32 / n;
-            let var = (sum2 as f32 / n - mean * mean).max(0.0);
+            let var = (sum_sq as f32 / n - mean * mean).max(0.0);
             *out = var;
             acc += var;
             filled += 1;
@@ -634,8 +1168,17 @@ struct AqCtx {
     /// decoder `CurrentQIndex`, updated by each signaled delta; reset to `base_q`
     /// at the start of the tile (delta-Q does not persist across tiles).
     cur_qidx: i32,
+    /// Decoder qindex on entry to the current superblock. A whole-SB skip does
+    /// not execute `read_delta_qindex`, so its tentative AQ change is rolled
+    /// back to this value.
+    prev_qidx: i32,
     /// tile mean activity, the zero-delta reference (see [`tile_ref_activity`]).
     ref_act: f32,
+    /// Same-domain cut reference: tile mean of log1p(octile-6 8x8 variance) —
+    /// the anchor the coarsen side compares against (the whole-SB `ref_act`
+    /// is systematically higher than the octile domain, which had silently
+    /// disabled cuts; see `variance_boost_delta`).
+    ref_pick: f32,
     /// armed at the start of each superblock; the first coded block emits the
     /// `read_delta_qindex` token and disarms it (spec `ReadDeltas`).
     read_deltas: bool,
@@ -654,6 +1197,9 @@ struct AqCtx {
     vb_boost_only: bool,
     /// Dark-structured-detail protection (see [`DarkAq`]); independent of `vb_enabled`.
     dark: DarkAq,
+    /// Mid-band base-shift the frame was encoded with; protection deltas
+    /// anchor to `base_q - base_shift` (see `aq_sb_target`).
+    base_shift: i32,
 }
 
 impl AqCtx {
@@ -663,7 +1209,9 @@ impl AqCtx {
             base_q: 0,
             res_log2: 0,
             cur_qidx: 0,
+            prev_qidx: 0,
             ref_act: 0.0,
+            ref_pick: 0.0,
             read_deltas: false,
             pending: 0,
             vb_enabled: false,
@@ -671,6 +1219,7 @@ impl AqCtx {
             vb_strength: 1.0,
             vb_boost_only: false,
             dark: DarkAq::off(),
+            base_shift: 0,
         }
     }
 }
@@ -680,12 +1229,28 @@ impl AqCtx {
 /// Produced in raster order by `precompute_aq_grid`; indexed `row * cols + col`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AqCell {
+    /// Raster-chain qindex BEFORE this SB (the anchor). Cells must start from
+    /// this — NOT the worker's own accumulator: the clamp(1, 255) at
+    /// near-lossless qindex breaks the shared-lattice property that otherwise
+    /// makes any-prev derivations converge (kodak20 q99 t8 silent corruption).
+    prev: u8,
     newq: u8,
     steps: i32,
 }
 
 /// Whole-frame lossy encoder state.
 struct LossyTile<'a> {
+    /// One-entry cache of the current superblock's activity, for the
+    /// LOCAL masking reference (see `perceptual_rd_scale`). Blocks are coded
+    /// in SB order so a single slot hits almost always. Key is (sb_x, sb_y).
+    sb_act_cache: std::cell::Cell<(u32, u32, f32)>,
+    /// Pre-resolved per-encode forward-DCT implementations.
+    dct: DctDispatch,
+    /// Pre-resolved per-encode inverse-transform implementations.
+    idct: IdctDispatch,
+    intrapred: IntraPredDispatch,
+    kmeans: KmeansDispatch,
+    rd: crate::rd_sse::RdDispatch,
     bd: u8,
     quant: Quant,
     cquant: Quant,
@@ -695,8 +1260,15 @@ struct LossyTile<'a> {
     ss422: bool, // chroma horizontally subsampled (4:2:2)
     ss420: bool, // chroma horizontally + vertically subsampled (4:2:0)
     mono: bool,  // monochrome: code luma only (NumPlanes=1, no chroma syntax)
-    src: &'a [Vec<i32>; 3],
-    recon: [Vec<i32>; 3],
+    /// Frame-level U/V weight used by the shared-tree partition proxy.
+    chroma_part_weight: f32,
+    allow_intrabc: bool,
+    /// Search the screen-content tools (palette). Frame-level; see
+    /// [`crate::EncodeConfig::with_screen_content`].
+    screen_content: bool,
+    ibc_mv: Vec<Option<(i16, i16)>>,
+    src: &'a [Vec<u16>; 3],
+    recon: [Vec<u16>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
     l_coef: [Vec<u8>; 3], // len h/4, absolute by4
     /// Per-4x4-column coded-TX log2-width (dav1d `a->tx_intra`), -1 at tile
@@ -704,37 +1276,71 @@ struct LossyTile<'a> {
     a_tx: Vec<i8>,
     /// Per-4x4-row coded-TX log2-height (dav1d `l->tx_intra`).
     l_tx: Vec<i8>,
-    a_part: Vec<u8>,          // len w/8, absolute x8
-    l_part: Vec<u8>,          // len h/8, absolute y8
-    a_skip: Vec<u8>,          // block skip flag per 4x4 col, absolute bx4
-    l_skip: Vec<u8>,          // block skip flag per 4x4 row, absolute by4
-    a_mode: Vec<u8>,          // luma intra mode per 4x4 col (for kf y-mode context)
-    l_mode: Vec<u8>,          // luma intra mode per 4x4 row
-    a_uv_mode: Vec<u8>,       // chroma intra mode above each luma 4x4 column
-    l_uv_mode: Vec<u8>,       // chroma intra mode left of each luma 4x4 row
-    a_palette: Vec<Vec<i32>>, // luma palette colors above each 4x4 column
+    a_part: Vec<u8>,    // len w/8, absolute x8
+    l_part: Vec<u8>,    // len h/8, absolute y8
+    a_skip: Vec<u8>,    // block skip flag per 4x4 col, absolute bx4
+    l_skip: Vec<u8>,    // block skip flag per 4x4 row, absolute by4
+    a_mode: Vec<u8>,    // luma intra mode per 4x4 col (for kf y-mode context)
+    l_mode: Vec<u8>,    // luma intra mode per 4x4 row
+    a_uv_mode: Vec<u8>, // chroma intra mode above each luma 4x4 column
+    l_uv_mode: Vec<u8>, // chroma intra mode left of each luma 4x4 row
+    a_palette: Vec<Vec<i32>>,
+    /// Above/left neighbor chroma-palette U colors (the UV color cache is
+    /// U-plane only, dav1d al_pal[..][1]); empty = no UV palette there.
+    a_palette_uv: Vec<Vec<i32>>, // luma palette colors above each 4x4 column
     l_palette: Vec<Vec<i32>>, // luma palette colors left of each 4x4 row
+    l_palette_uv: Vec<Vec<i32>>,
     blk4: Vec<u8>, // luma block WIDTH (in 4-sample units) per 4x4 luma unit; for the deblock filter (vertical edges)
     blk4h: Vec<u8>, // luma block HEIGHT (in 4-sample units) per 4x4 luma unit; for the deblock filter (horizontal edges)
     blk4v: Vec<bool>, // true where a luma block starts at this 4x4 column
     blk4t: Vec<bool>, // true where a luma block starts at this 4x4 row
+    /// Per-4x4 luma PREDICTION-BLOCK geometry (width/height in 4-units and the
+    /// block-start flags), as distinct from `blk4`/`blk4h` which are refined to
+    /// TRANSFORM granularity by the TX-split paths.
+    pblk4: Vec<u8>,
+    pblk4h: Vec<u8>,
+    pblk4v: Vec<bool>,
+    pblk4t: Vec<bool>,
     skip8: Vec<bool>, // per-8x8-luma-unit block skip flag (true = no coded coeffs); for CDEF
     /// Whether the current superblock already recorded its `read_cdef()` trace
     /// point (the first non-skip block carries the per-unit `cdef_idx`).
     cdef_point_marked: bool,
+    /// Memo for the partition proxy's palette candidate (rd_cost_square):
+    /// keyed by packed (px, py, dim). The bottom-up partition search re-prices
+    /// the same square up to ~3x; the palette candidate (histogram + weighted
+    /// k-means + map + distortion) is the costliest per-call piece, and its
+    /// inputs (source, quant, decision CDFs) are immutable per tile.
+    pal_est_cache: std::cell::RefCell<HashMap<u64, [(f32, f32); 3]>>,
+    /// Exact, epoch-stamped memo for derived chroma block RD costs shared by
+    /// multiple partition families under the same perceptual multiplier.
+    chroma_rd_cache: std::cell::RefCell<HashMap<u128, (u64, f32)>>,
+    /// Memo for the full 16-level partition decision (`rd_choice_16`): the
+    /// bottom-up pricing evaluates each 16-block up to ~3x (64-level refine,
+    /// 32-level SPLIT leg, then decode_sb's own descend). Epoch stamping keeps
+    /// reuse bit-exact after any emitted block changes prediction context.
+    rd16_cache: std::cell::RefCell<HashMap<u32, (u64, Part16, f32)>>,
+    /// Epoch-stamped memo for the decision-stage rect16 leaf proxy
+    #[allow(clippy::type_complexity)]
+    rect_leaf_cache: std::cell::RefCell<HashMap<(u64, u32), (u64, f32, f32)>>,
+    /// Reusable trial buffers (see [`CoderScratch`]); `Rc<RefCell>` so the
+    /// [`SBuf`] guards and the `&self` decision paths can reach the pool
+    /// without borrowing the tile.
+    scratch: std::rc::Rc<std::cell::RefCell<CoderScratch>>,
+    /// Exact 8x8-as-four-4x4 luma proxy, reused by the 16-level decision and
+    /// the eventual 8-level decision within one reconstruction epoch.
+    split4_rd_cache: std::cell::RefCell<HashMap<u128, (u64, f32)>>,
+    /// Bumped on every emitted (or sink-captured) leaf block.
+    emit_epoch: std::cell::Cell<u64>,
+    /// Lazily built frame-wide IntraBC exact-match index (see `LossyIbcIndex`).
+    ibc_index: std::cell::RefCell<Option<LossyIbcIndex>>,
+    /// Wavefront-capture read view of the shared finished-recon planes.
+    ibc_shared: Option<IbcSharedRecon>,
     enc: OdEcEncoder,
     cdfs: Cdfs,
+    updating_cdf: bool,
     /// Frozen frame-initial CDF snapshot used by every DECISION-side rate
-    /// estimate (RDOQ trellis, filter-intra / angle-delta mode costs). The
-    /// adaptive `cdfs` above is emit-only. Keeping decisions off the adaptive
-    /// chain makes them independent of SB coding order, which is what allows
-    /// the SB-wavefront to decide superblocks out of raster order while the
-    /// serial emit keeps full CDF adaptivity.
+    /// estimate (RDOQ trellis, filter-intra / angle-delta mode costs).
     dec_cdfs: Box<Cdfs>,
-    /// `MT_AV1_LIVE_DECIDE_CDF=1`: route decision-side rate estimates back to
-    /// the live adaptive `cdfs` (pre-wavefront historical behavior). A/B and
-    /// regression-hunting escape hatch only — incompatible with the wavefront.
-    dec_live: bool,
     /// Decision capture/replay mode (see `coder/replay.rs`). `Off` in
     /// production until the wavefront lands.
     sb_mode: SbMode,
@@ -764,15 +1370,15 @@ struct LossyTile<'a> {
     frame_y0: usize,
     frame_w: usize,
     frame_h: usize,
-    /// Base quant index this tile was built with. Stored so the R-D search can
-    /// apply libaom's SSIMULACRA2 rdmult weight (see `cost::mode_lambda_aom` /
-    /// `aom_ssimulacra2_rdmult_weight`), which is a function of qindex.
+    /// Base quant index this tile was built with
     base_q_idx: u8,
 }
 
 // Keep the state type and shared imports in this module while splitting its
 // implementation by coding responsibility. `include!` preserves private field
 // access without widening the encoder's internal API.
+
+include!("coder/scratch.rs");
 include!("coder/replay.rs");
 include!("coder/lossy_state.rs");
 include!("coder/palette.rs");
@@ -783,21 +1389,20 @@ include!("coder/block32.rs");
 include!("coder/block64.rs");
 include!("coder/superblock.rs");
 
-/// Sum of squared error between the source and the reconstruction
-/// `clamp(pred + residual)` over a `D`×`D` luma block at `(px,py)`. `N = D*D`.
-/// Used by the partition R-D estimator to score a candidate block size.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn sse_recon<const N: usize, const D: usize>(
+    rd: &crate::rd_sse::RdDispatch,
     pred: &[i32; N],
     resid: &[i32; N],
-    src: &[i32],
+    src: &[u16],
     stride: usize,
     px: usize,
     py: usize,
     bd: u8,
 ) -> i64 {
     debug_assert_eq!(N, D * D);
-    crate::rd_sse::sse_recon(pred, resid, src, stride, px, py, D, D, bd)
+    rd.sse_recon(pred, resid, src, stride, px, py, D, D, bd)
 }
 
 /// Asymmetric-ADST tx-type search. A/B knob for the ADST_DCT/DCT_ADST trials;
@@ -904,57 +1509,12 @@ fn is_directional_mode(mode: usize) -> bool {
     (V_PRED..=VERT_LEFT_PRED).contains(&mode)
 }
 
-/// Cheap first-stage directional ranking. SATD estimates transform-domain
-/// sparsity while SAD prevents a transform-friendly but visibly biased predictor
-/// from ranking too highly. The 4x4 Hadamard sum is normalized to SAD scale.
-fn satd_sad_proxy(
-    src: &[i32],
-    src_stride: usize,
-    pred: &[i32],
-    pred_stride: usize,
-    w: usize,
-    h: usize,
-) -> u64 {
-    #[inline]
-    fn had4(a: i32, b: i32, c: i32, d: i32) -> [i32; 4] {
-        let (e, f, g, h) = (a + c, a - c, b + d, b - d);
-        [e + g, f + h, f - h, e - g]
-    }
-
-    debug_assert_eq!(w & 3, 0);
-    debug_assert_eq!(h & 3, 0);
-    let mut sad = 0u64;
-    let mut satd = 0u64;
-    for ty in (0..h).step_by(4) {
-        for tx in (0..w).step_by(4) {
-            let mut rows = [[0i32; 4]; 4];
-            for r in 0..4 {
-                let sr = &src[(ty + r) * src_stride + tx..];
-                let pr = &pred[(ty + r) * pred_stride + tx..];
-                let d: [i32; 4] = std::array::from_fn(|x| sr[x] - pr[x]);
-                sad += d.iter().map(|v| v.unsigned_abs() as u64).sum::<u64>();
-                rows[r] = had4(d[0], d[1], d[2], d[3]);
-            }
-            #[allow(clippy::needless_range_loop)]
-            for x in 0..4 {
-                let col = had4(rows[0][x], rows[1][x], rows[2][x], rows[3][x]);
-                satd += col.iter().map(|v| v.unsigned_abs() as u64).sum::<u64>();
-            }
-        }
-    }
-    sad + (satd >> 2)
+fn prdo_k() -> f32 {
+    0.4
 }
 
-/// Strength (and sign) of the variance-weighted "SSIM-style" RD adjustment.
-/// The per-block rate weight is scaled by
-/// `exp(K * (block_activity - tile_mean_activity))`, clamped to `[1/C, C]`:
-///   K > 0  → busy blocks get a larger rate weight (fewer bits there — visual
-///            masking hides the error), flat blocks more bits (aom `tune=ssim`);
-///   K < 0  → the opposite (protect texture, spend more bits on busy blocks);
-///   K = 0  → disabled (no change).
-/// Disabled by default.
-fn prdo_k() -> f32 {
-    0.0
+fn prdo_k_444() -> f32 {
+    0.5
 }
 
 /// Clamp `C` for the perceptual RD scale: the per-block scale is limited to
@@ -963,57 +1523,46 @@ fn prdo_clamp() -> f32 {
     2.0
 }
 
-/// Extra rate (in bits) attributed to a PARTITION_SPLIT decision over
-/// PARTITION_NONE in the R-D partition search. Splitting signals one partition
-/// symbol at the parent plus four child partition symbols and four sets of
-/// per-block mode/skip headers; this lumped constant biases the search toward
-/// the larger block on a tie, matching how a full RDO would price the extra
-/// syntax. Tuned conservatively — too low over-splits (bloats rate), too high
-/// under-splits (blurs detail).
-const SPLIT_SIGNAL_BITS: f32 = 24.0;
-/// Mild split-favoring bias applied to the 32x32 PARTITION_NONE leg in the real
-/// NONE-vs-SPLIT R-D comparison (`choose_rect32`). The SATD distortion proxy
-/// undervalues the fine detail a single 32x32 loses when it merges four busier
-/// 16x16 blocks, so an unbiased comparison over-merges on textured content and
-/// costs SSIMULACRA2. 1.03 recovers that (best on the textured cityscape/420
-/// case) while keeping the flat-content wins. Distinct from the old
-/// `prefer_32x32` prefilter, which skipped the comparison entirely.
-const NONE32_SPLIT_BIAS: f32 = 1.03;
-/// Cost of signalling a non-DC uv_mode for the 4:2:0 4x4 SMOOTH_V chroma trial.
-const SMOOTH_V_UV_SIGNAL_BITS: f32 = 4.0;
+fn prdo_upper_clamp() -> f32 {
+    1.5
+}
+
+fn vbp_thresh_420() -> f32 {
+    crate::tuning::get().vbp_thresh_420
+}
+
+fn none32_split_bias() -> f32 {
+    crate::tuning::get().none32_split_bias
+}
+fn top_none_bias_420(base_q: u8) -> f32 {
+    let t = crate::tuning::get();
+    if base_q <= 20 {
+        t.top_none_bias_420_hi
+    } else {
+        t.top_none_bias_420_lo
+    }
+}
+/// Cost of signaling a non-DC uv_mode for the 4:2:0 4x4 SMOOTH_V chroma trial.
+fn smooth_v_uv_signal_bits() -> f32 {
+    crate::tuning::get().smooth_v_uv_signal_bits
+}
 /// Required SSE improvement (in 1/1024) for the 32x32 TX-split to be accepted
 /// on a banding-risk block. See `code_block32`.
 const SPLIT32_SSE_MARGIN: i64 = 64;
 /// Same split-favoring thumb for the 64x64 SB NONE-vs-SPLIT decision (see
 /// `choose_64`). BLOCK_64X64 shares one prediction over a large area, so the
 /// distortion proxy is even coarser than at 32x32; the bias guards detail.
-const NONE64_SPLIT_BIAS: f32 = 1.03;
-/// Extra weight on the 64x64 NONE leg's chroma cost for the subsampling modes
-/// where chroma carries more information (see `choose_64`). Compensates for the
-/// CfL + chroma-mode-search headroom the SPLIT leg's 32x32 children get and a
-/// whole-64 block cannot.
-const CHROMA64_HANDICAP_422: f32 = 1.6;
-const CHROMA64_HANDICAP_444: f32 = 2.2;
+fn none64_split_bias() -> f32 {
+    crate::tuning::get().none64_split_bias
+}
 /// Master switch for the whole-superblock BLOCK_64X64 intra path (4:2:0 only).
 pub static BLOCK64_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
-const ASYM_PART_SIGNAL_BITS: f32 = SPLIT_SIGNAL_BITS;
-/// Extra uncertainty charge for A partitions whose final rectangular leaf
-/// predicts from siblings that have not yet been reconstructed during the
-/// lightweight partition RDO. This keeps marginal wins from exploiting stale
-/// edge pixels while preserving candidates with a clear distortion advantage.
-const ASYM_DEPENDENT_RDO_BITS: f32 = 32.0;
-/// Minimum ac quantizer for the rectangular PARTITION_H candidate. Below this
-/// (high quality) the DC-only 16x8 sub-blocks lose to the square path's full
-/// mode search, so HORZ is gated off — libaom's Q-adaptive partition strategy.
-const AC_Q_HORZ_MIN: i32 = 100;
-/// Unpruned 32x32 rectangle search is a strong medium/low-quality win but can
-/// regress fine high-quality texture. Keep it to the measured coarse-q regime.
-const UNPRUNED_RECT32_MIN_QINDEX: u8 = 128;
-/// Weight of chroma in shared-tree partition R-D. Raw U/V SSE is too strong
-/// relative to luma for perceptual RGB quality, especially after subsampling;
-/// one eighth keeps color edges relevant without letting them dominate.
-const CHROMA_PART_RD_WEIGHT: f32 = 0.125;
+
+#[inline]
+fn chroma_part_rd_weight(ss420: bool, ss422: bool, _src: &[Vec<u16>; 3], _bd: u8) -> f32 {
+    if ss420 || ss422 { 0.0625 } else { 0.03125 }
+}
 
 pub(crate) fn align8(n: usize) -> usize {
     (n + 7) & !7
@@ -1046,7 +1595,7 @@ fn tile_log2(blk: u32, target: u32) -> u32 {
     k
 }
 
-/// AV1 `increment_*_log2` bit sequence signalling `target` to a decoder that
+/// AV1 `increment_*_log2` bit sequence signaling `target` to a decoder that
 /// starts at `min` and reads bits while its running value is `< max`: a `1` for
 /// each step up, then a terminating `0` when `target < max` (at `max` the
 /// decoder's loop ends on its own and reads no further bit).
@@ -1149,11 +1698,11 @@ fn crop_plane<T: Copy>(
 }
 
 fn stitch_plane(
-    dst: &mut [i32],
+    dst: &mut [u16],
     full_w: usize,
     x0: usize,
     y0: usize,
-    tile: &[i32],
+    tile: &[u16],
     tw: usize,
     th: usize,
 ) {
@@ -1187,7 +1736,7 @@ fn emit_lr_sb_syms(
 ) {
     const UNIT: usize = 64;
     const MI: usize = 4;
-    let count_units = |frame: usize| -> usize { (1).max((frame + (UNIT >> 1)) / UNIT) };
+    let count_units = |frame: usize| -> usize { 1.max((frame + (UNIT >> 1)) / UNIT) };
     let unit_rows = count_units(frame_h);
     let unit_cols = count_units(frame_w);
     // Frame-absolute superblock position in 4x4 MI units (luma).
@@ -1251,25 +1800,50 @@ struct TileRect {
 struct TileOut {
     payload: Vec<u8>,
     trace: Option<Box<crate::odec::SymbolTrace>>,
-    recon: [Vec<i32>; 3],
+    recon: [Vec<u16>; 3],
     skip8: Vec<bool>, // per-8x8 luma-unit skip flag (tile-local, row-major over ceil(tw/8))
     blk4: Vec<u8>,    // per-4x4 luma block WIDTH map (tile-local), for frame-level deblocking
     blk4h: Vec<u8>,   // per-4x4 luma block HEIGHT map (tile-local), for frame-level deblocking
     blk4v: Vec<bool>, // per-4x4 actual luma vertical-edge map
     blk4t: Vec<bool>, // per-4x4 actual luma horizontal-edge map
+    pblk4: Vec<u8>,   // per-4x4 luma PREDICTION-block width map (chroma deblock)
+    pblk4h: Vec<u8>,  // per-4x4 luma PREDICTION-block height map
+    pblk4v: Vec<bool>,
+    pblk4t: Vec<bool>,
 }
 
-/// Parallel SB-wavefront CAPTURE pass over one tile: decide every superblock's
+/// Completed output of one parallel superblock decision. Unlike the old
+/// `DecisionRecord`, this contains no search winners, coefficient copies, or
+/// reconstruction copies: only the compact syntax operations consumed by the
+/// raster entropy lane.
+struct CapturedSb {
+    tokens: crate::odec::EntropyTokens,
+}
+
+struct WavefrontPlanes {
+    recon: [Vec<u16>; 3],
+    skip8: Vec<bool>,
+    blk4: Vec<u8>,
+    blk4h: Vec<u8>,
+    blk4v: Vec<bool>,
+    blk4t: Vec<bool>,
+    pblk4: Vec<u8>,
+    pblk4h: Vec<u8>,
+    pblk4v: Vec<bool>,
+    pblk4t: Vec<bool>,
+}
+
+/// Parallel SB-wavefront capture pass over one tile: decide every superblock's
 /// RD choices out of raster order (schedule `d = 2r + c`, so top, left AND
-/// above-right neighbours are always finished) and return the raster-merged
-/// [`DecisionRecord`]. The caller then runs a serial [`SbMode::Replay`] emit,
-/// which regenerates the byte-identical bitstream with full CDF adaptivity.
+/// above-right neighbors are always finished), publish final reconstruction
+/// and filter maps directly into disjoint shared regions, and stream compact
+/// entropy operations to the raster packer. The packer restores full CDF
+/// adaptivity without traversing blocks a second time.
 ///
-/// Safety of the parallelism rests on three PROVEN properties (env gates):
-/// - decisions read recon only inside the halo bands (`MT_AV1_HALO_CHECK`);
+/// Safety of the parallelism rests on three proven properties:
+/// - decisions read reconstruction only inside the halo bands;
 /// - every ctx-array read stays inside the SB's exact own column/row segment
-///   (`MT_AV1_CTX_CHECK`, zero margin — margins would NOT be wavefront-safe
-///   for `l_*`: their neighbouring rows have a different last-writer under
+///   (zero margin—neighboring `l_*` rows have a different last writer under
 ///   diagonal order than under raster order);
 /// - decisions never read the adaptive CDFs or encoder state (frozen
 ///   `dec_cdfs`, Phase 1) — so each worker captures into a sink encoder.
@@ -1289,13 +1863,21 @@ fn wavefront_capture(
     sub_x: usize,
     sub_y: usize,
     mono: bool,
-    tsrc: &[Vec<i32>; 3],
+    tsrc: &[Vec<u16>; 3],
     r: &TileRect,
     speed: Speed,
+    dct: DctDispatch,
+    idct: IdctDispatch,
+    intrapred: IntraPredDispatch,
+    kmeans: KmeansDispatch,
+    rd: crate::rd_sse::RdDispatch,
     aq: bool,
     vb: &VarianceBoost,
-    tx: std::sync::mpsc::Sender<(usize, DecisionRecord)>,
-) {
+    updating_cdf: bool,
+    allow_intrabc: bool,
+    screen_content: bool,
+    tx: std::sync::mpsc::Sender<(usize, CapturedSb)>,
+) -> WavefrontPlanes {
     use crate::av2::helpers::{PlaneWriter, par_wavefront_pool_with};
     const HB: usize = 4; // halo band thickness (AV1 intra needs 1 px; generous)
     let sb_rows = r.th.div_ceil(64);
@@ -1314,7 +1896,11 @@ fn wavefront_capture(
                 _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
             }
         }
-        .with_speed(speed);
+        .with_dispatch(dct, idct, intrapred, kmeans, rd)
+        .with_speed(speed)
+        .with_intrabc(allow_intrabc)
+        .with_screen_content(screen_content)
+        .with_updating_cdf(updating_cdf);
         t.frame_x0 = r.x0;
         t.frame_y0 = r.y0;
         t.frame_w = full_w;
@@ -1322,7 +1908,15 @@ fn wavefront_capture(
         if let Some(ref_act) = ref_act {
             t.enable_aq(base_q_idx, ref_act, vb);
         }
-        t.sb_mode = SbMode::Capture;
+        // Decisions run normally, but their final syntax is captured directly
+        // as semantic entropy tokens. There is no winner/coeff replay record.
+        t.sb_mode = SbMode::Off;
+        let slots = t.cdfs.semantic_slots();
+        t.enc.set_semantic_cdfs(&slots);
+        // Capture records the table identity + symbol. Only the raster packer
+        // consumes live probabilities, so adapting worker-private CDF copies
+        // is duplicate work (decision RDO reads `dec_cdfs`, never `cdfs`).
+        t.enc.updating_cdf = false;
         t.enc.sink = true;
         t
     };
@@ -1331,10 +1925,23 @@ fn wavefront_capture(
     let proto = mk_tile();
     let aq_grid = proto.precompute_aq_grid();
     let mut done = [
-        vec![0i32; proto.recon[0].len()],
-        vec![0i32; proto.recon[1].len()],
-        vec![0i32; proto.recon[2].len()],
+        vec![0u16; proto.recon[0].len()],
+        vec![0u16; proto.recon[1].len()],
+        vec![0u16; proto.recon[2].len()],
     ];
+    let stride4 = r.tw / 4;
+    let h4 = r.th / 4;
+    let stride8 = r.tw.div_ceil(8);
+    let h8 = r.th.div_ceil(8);
+    let mut skip8 = vec![true; stride8 * h8];
+    let mut blk4 = vec![0u8; stride4 * h4];
+    let mut blk4h = vec![0u8; stride4 * h4];
+    let mut blk4v = vec![false; stride4 * h4];
+    let mut blk4t = vec![false; stride4 * h4];
+    let mut pblk4 = vec![0u8; stride4 * h4];
+    let mut pblk4h = vec![0u8; stride4 * h4];
+    let mut pblk4v = vec![false; stride4 * h4];
+    let mut pblk4t = vec![false; stride4 * h4];
     // Ctx handoff arrays, frame-initial (clones of a fresh tile's arrays).
     let mut h_arrs: Vec<Vec<u8>> = vec![
         proto.a_coef[0].clone(),
@@ -1354,9 +1961,27 @@ fn wavefront_capture(
     ];
     let (ss422, ss420) = (proto.ss422, proto.ss420);
     let cw = proto.cw;
+    let allow_ibc = proto.allow_intrabc;
+    let (w4, h4) = (r.tw / 4, r.th / 4);
+    let proto_a_tx: Vec<u8> = proto.a_tx.iter().map(|&v| v as u8).collect();
+    let proto_l_tx: Vec<u8> = proto.l_tx.iter().map(|&v| v as u8).collect();
     drop(proto);
+    // Shared IntraBC MV plane: each cell writes its own SB region after
+    // finishing (packed (dy<<16)|dx, 0 = none — a zero DV cannot exist);
+    // cells preload their predictor window from it (finished neighbors) so
+    // the DV predictor sees exactly the serial pass's state.
+    let mut ibc_plane: Vec<i32> = vec![0; if allow_ibc { w4 * h4 } else { 0 }];
+    // Shared palette-context planes: the above/left neighbor palettes
+    // (a_palette / l_palette), packed 9 x i32 per 4-sample position
+    // ([len, c0..c7]). Handing these across cells lets the palette DECISION
+    // pricing use the real color cache + mode context (it was deliberately
+    // context-free before, which underprices palette in dense regions).
+    let mut apal_plane: Vec<i32> = vec![0; w4 * 9];
+    let mut lpal_plane: Vec<i32> = vec![0; h4 * 9];
+    let mut atx_plane: Vec<u8> = proto_a_tx;
+    let mut ltx_plane: Vec<u8> = proto_l_tx;
     // Disjoint-write views. Plane p stride: luma w, chroma cw.
-    let dws: Vec<PlaneWriter<i32>> = {
+    let dws: Vec<PlaneWriter<u16>> = {
         let mut it = done.iter_mut();
         let l = it.next().unwrap();
         let u = it.next().unwrap();
@@ -1367,6 +1992,11 @@ fn wavefront_capture(
             PlaneWriter::new(v, cw.max(1)),
         ]
     };
+    let ibcw = PlaneWriter::new(&mut ibc_plane, w4.max(1));
+    let apalw = PlaneWriter::new(&mut apal_plane, (w4 * 9).max(1));
+    let lpalw = PlaneWriter::new(&mut lpal_plane, (h4 * 9).max(1));
+    let atxw = PlaneWriter::new(&mut atx_plane, w4.max(1));
+    let ltxw = PlaneWriter::new(&mut ltx_plane, h4.max(1));
     let hws: Vec<PlaneWriter<u8>> = h_arrs
         .iter_mut()
         .map(|a| {
@@ -1374,6 +2004,15 @@ fn wavefront_capture(
             PlaneWriter::new(a, stride)
         })
         .collect();
+    let skip8w = PlaneWriter::new(&mut skip8, stride8.max(1));
+    let blk4w = PlaneWriter::new(&mut blk4, stride4.max(1));
+    let blk4hw = PlaneWriter::new(&mut blk4h, stride4.max(1));
+    let blk4vw = PlaneWriter::new(&mut blk4v, stride4.max(1));
+    let blk4tw = PlaneWriter::new(&mut blk4t, stride4.max(1));
+    let pblk4w = PlaneWriter::new(&mut pblk4, stride4.max(1));
+    let pblk4hw = PlaneWriter::new(&mut pblk4h, stride4.max(1));
+    let pblk4vw = PlaneWriter::new(&mut pblk4v, stride4.max(1));
+    let pblk4tw = PlaneWriter::new(&mut pblk4t, stride4.max(1));
     par_wavefront_pool_with(
         nthreads,
         sb_rows,
@@ -1403,6 +2042,13 @@ fn wavefront_capture(
                 let x0 = bx.saturating_sub(HB);
                 let x1 = (bx + 2 * bw).min(pw);
                 let y0 = by.saturating_sub(HB);
+                // A worker may receive an unrelated next cell, so initialize
+                // only samples that are unavailable to that cell. The valid
+                // top and left halos are overwritten from `done` below; zeroing
+                // them as part of the previous cell's teardown was redundant.
+                for row2 in by..(by + bh).min(ph) {
+                    t.recon[p][row2 * pw + bx..row2 * pw + x1].fill(0);
+                }
                 // SAFETY: halo regions belong to earlier diagonals (finished,
                 // not being written); regions are in-plane.
                 unsafe {
@@ -1466,21 +2112,84 @@ fn wavefront_capture(
                     unsafe { hws[i].copy_region_to(&mut arr[..], 0, s, 1, e - s) };
                 }
             }
+            // --- IntraBC: preload the DV-predictor window from the shared
+            // MV plane and expose the finished-recon read view ---
+            if allow_ibc {
+                let (ibp, _ibl, ibs) = ibcw.read_view();
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                let x0 = sbx4.saturating_sub(8);
+                let x1 = (sbx4 + 24).min(w4);
+                let y0 = sby4.saturating_sub(8);
+                let y1 = (sby4 + 24).min(h4);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        // SAFETY: finished cells hold real values; unfinished
+                        // cells hold the initial zeros, which decode to None —
+                        // exactly the serial "not yet coded" state.
+                        let v = unsafe { *ibp.add(y * ibs + x) };
+                        t.ibc_mv[y * (t.w / 4) + x] = if v == 0 {
+                            None
+                        } else {
+                            Some(((v >> 16) as i16, v as i16))
+                        };
+                    }
+                }
+                t.ibc_shared = Some(IbcSharedRecon {
+                    planes: [dws[0].read_view(), dws[1].read_view(), dws[2].read_view()],
+                });
+            }
+            // --- palette-context copy-in: own segments, packed 9xi32 ---
+            {
+                let (ap, _al, _s1) = apalw.read_view();
+                let (lp, _ll, _s2) = lpalw.read_view();
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                for (arr, base, ptr, lim) in [
+                    (&mut t.a_palette, sbx4, ap, w4),
+                    (&mut t.l_palette, sby4, lp, h4),
+                ] {
+                    for i in 0..16usize {
+                        let pos = base + i;
+                        if pos >= lim {
+                            break;
+                        }
+                        // SAFETY: own segment, last written by the finished
+                        // above/left cell (or frame-initial zeros = empty).
+                        let n = unsafe { *ptr.add(pos * 9) } as usize;
+                        let v = &mut arr[pos];
+                        v.clear();
+                        for k in 0..n.min(8) {
+                            v.push(unsafe { *ptr.add(pos * 9 + 1 + k) });
+                        }
+                    }
+                }
+            }
+            // --- tx-size ctx copy-in: own segments (i8 as raw bytes) ---
+            {
+                let (atp, _al, _s1) = atxw.read_view();
+                let (ltp, _ll, _s2) = ltxw.read_view();
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                let na = 16usize.min(w4.saturating_sub(sbx4));
+                for i in 0..na {
+                    // SAFETY: own segment, last written by the finished above
+                    // cell (or frame-initial).
+                    t.a_tx[sbx4 + i] = unsafe { *atp.add(sbx4 + i) } as i8;
+                }
+                let nl = 16usize.min(h4.saturating_sub(sby4));
+                for i in 0..nl {
+                    // SAFETY: own segment (left cell / frame-initial).
+                    t.l_tx[sby4 + i] = unsafe { *ltp.add(sby4 + i) } as i8;
+                }
+            }
             // --- per-cell resets ---
-            let mut enc = OdEcEncoder::new();
-            enc.sink = true;
-            t.enc = enc;
-            t.rec = DecisionRecord::default();
+            t.enc.begin_semantic_sink();
             t.cur = RecordCursor::default();
             t.cdef_point_marked = false;
             if !aq_grid.is_empty() {
                 t.aq_begin_sb_cell(&aq_grid[row * sb_cols + col]);
             }
             t.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
-            // --- write-out: own recon block into the finished planes, and
-            // into the cell record (streamed to the pure-emit replay) ---
-            let mut blk = [0i32; 64 * 64];
-            let mut cell_recon: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            // --- write-out: copy each own recon block directly into the
+            // finished planes, without a transient contiguous SB scratch ---
             for p in 0..3 {
                 if t.recon[p].is_empty() {
                     continue;
@@ -1492,15 +2201,46 @@ fn wavefront_capture(
                 let (bw, bh) = (64usize >> sx, 64usize >> sy);
                 let w2 = (bx + bw).min(pw) - bx;
                 let h2 = (by + bh).min(ph) - by;
-                for row2 in 0..h2 {
-                    blk[row2 * w2..row2 * w2 + w2]
-                        .copy_from_slice(&t.recon[p][(by + row2) * pw + bx..][..w2]);
-                }
                 // SAFETY: own SB block — no other concurrent writer.
-                unsafe { dws[p].write_block(by, bx, h2, w2, &blk[..h2 * w2]) };
-                cell_recon[p] = blk[..h2 * w2].to_vec();
+                unsafe { dws[p].copy_region_from(&t.recon[p], pw, by, bx, h2, w2) };
             }
-            t.rec.recon.push(cell_recon);
+            if allow_ibc {
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                let bw = (sbx4 + 16).min(w4) - sbx4;
+                let bh = (sby4 + 16).min(h4) - sby4;
+                let mut buf = [0i32; 16 * 16];
+                for y in 0..bh {
+                    for x in 0..bw {
+                        buf[y * bw + x] = match t.ibc_mv[(sby4 + y) * (t.w / 4) + sbx4 + x] {
+                            Some((dy, dx)) => ((dy as u16 as i32) << 16) | (dx as u16 as i32),
+                            None => 0,
+                        };
+                    }
+                }
+                // SAFETY: own SB region — no other concurrent writer.
+                unsafe { ibcw.write_block(sby4, sbx4, bh, bw, &buf[..bw * bh]) };
+            }
+            {
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                for (arr, base, w, lim) in [
+                    (&t.a_palette, sbx4, &apalw, w4),
+                    (&t.l_palette, sby4, &lpalw, h4),
+                ] {
+                    let mut buf = [0i32; 9 * 16];
+                    let n = 16usize.min(lim.saturating_sub(base));
+                    for i in 0..n {
+                        let v = &arr[base + i];
+                        buf[i * 9] = v.len() as i32;
+                        for (k, &c) in v.iter().take(8).enumerate() {
+                            buf[i * 9 + 1 + k] = c;
+                        }
+                    }
+                    if n > 0 {
+                        // SAFETY: own segment — no other concurrent writer.
+                        unsafe { w.write_block(0, base * 9, 1, n * 9, &buf[..n * 9]) };
+                    }
+                }
+            }
             // --- write-out: own ctx segments into the handoff arrays ---
             for (i, &(s, n)) in segs.iter().enumerate() {
                 let arr = unsafe { &mut *arr_of(t, i) };
@@ -1514,33 +2254,75 @@ fn wavefront_capture(
                     unsafe { hws[i].write_block(0, s, 1, e - s, &arr[s..e]) };
                 }
             }
-            // --- zero-invariant: reset the dirtied recon regions ---
-            for p in 0..3 {
-                if t.recon[p].is_empty() {
-                    continue;
+            // --- tx-size ctx write-out: own segments ---
+            {
+                let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                let na = 16usize.min(w4.saturating_sub(sbx4));
+                if na > 0 {
+                    let mut buf = [0u8; 16];
+                    for (dst, &src) in buf.iter_mut().zip(&t.a_tx[sbx4..sbx4 + na]) {
+                        *dst = src as u8;
+                    }
+                    // SAFETY: own exact segment — disjoint writers.
+                    unsafe { atxw.write_block(0, sbx4, 1, na, &buf[..na]) };
                 }
-                let (sx, sy) = shift(p);
-                let pw = if p == 0 { t.w } else { t.cw };
-                let ph = t.recon[p].len() / pw;
-                let (bx, by) = (sb_x >> sx, sb_y >> sy);
-                let (bw, bh) = (64usize >> sx, 64usize >> sy);
-                let x0 = bx.saturating_sub(HB);
-                let x1 = (bx + 2 * bw).min(pw);
-                for row2 in by.saturating_sub(HB)..(by + bh).min(ph) {
-                    t.recon[p][row2 * pw + x0..row2 * pw + x1].fill(0);
+                let nl = 16usize.min(h4.saturating_sub(sby4));
+                if nl > 0 {
+                    let mut buf = [0u8; 16];
+                    for (dst, &src) in buf.iter_mut().zip(&t.l_tx[sby4..sby4 + nl]) {
+                        *dst = src as u8;
+                    }
+                    // SAFETY: own exact segment — disjoint writers.
+                    unsafe { ltxw.write_block(0, sby4, 1, nl, &buf[..nl]) };
                 }
             }
-            let rec = std::mem::take(&mut t.rec);
-            tx.send((row * sb_cols + col, rec))
-                .expect("wavefront replay receiver dropped");
+            let x4 = sb_x / 4;
+            let y4 = sb_y / 4;
+            let stride4 = t.w / 4;
+            let bw4 = 16usize.min(stride4.saturating_sub(x4));
+            let bh4 = 16usize.min((t.h / 4).saturating_sub(y4));
+            let x8 = sb_x / 8;
+            let y8 = sb_y / 8;
+            let stride8 = t.w.div_ceil(8);
+            let bw8 = 8usize.min(stride8.saturating_sub(x8));
+            let bh8 = 8usize.min(t.h.div_ceil(8).saturating_sub(y8));
+            // SAFETY: every writer covers only this cell's disjoint map block.
+            unsafe {
+                skip8w.copy_region_from(&t.skip8, stride8, y8, x8, bh8, bw8);
+                blk4w.copy_region_from(&t.blk4, stride4, y4, x4, bh4, bw4);
+                blk4hw.copy_region_from(&t.blk4h, stride4, y4, x4, bh4, bw4);
+                blk4vw.copy_region_from(&t.blk4v, stride4, y4, x4, bh4, bw4);
+                blk4tw.copy_region_from(&t.blk4t, stride4, y4, x4, bh4, bw4);
+                pblk4w.copy_region_from(&t.pblk4, stride4, y4, x4, bh4, bw4);
+                pblk4hw.copy_region_from(&t.pblk4h, stride4, y4, x4, bh4, bw4);
+                pblk4vw.copy_region_from(&t.pblk4v, stride4, y4, x4, bh4, bw4);
+                pblk4tw.copy_region_from(&t.pblk4t, stride4, y4, x4, bh4, bw4);
+            }
+            let cell = CapturedSb {
+                tokens: t.enc.take_semantic(),
+            };
+            tx.send((row * sb_cols + col, cell))
+                .expect("wavefront entropy receiver dropped");
         },
     );
+    WavefrontPlanes {
+        recon: done,
+        skip8,
+        blk4,
+        blk4h,
+        blk4v,
+        blk4t,
+        pblk4,
+        pblk4h,
+        pblk4v,
+        pblk4t,
+    }
 }
 
 /// Copy a superblock's packed per-plane recon blocks INTO the tile's planes
 /// (pure-emit replay install). Geometry mirrors `blocks_geom_extract`.
 #[allow(clippy::needless_range_loop)] // `p` indexes tile planes AND blocks in lockstep
-fn blocks_geom_apply(tile: &mut LossyTile, sb_x: usize, sb_y: usize, blocks: &[Vec<i32>; 3]) {
+fn blocks_geom_apply(tile: &mut LossyTile, sb_x: usize, sb_y: usize, blocks: &[Vec<u16>; 3]) {
     for p in 0..3 {
         if tile.recon[p].is_empty() || blocks[p].is_empty() {
             continue;
@@ -1568,7 +2350,7 @@ fn blocks_geom_apply(tile: &mut LossyTile, sb_x: usize, sb_y: usize, blocks: &[V
 /// Extract a superblock's per-plane recon blocks OUT of the tile's planes
 /// (capture side of the pure-emit record).
 #[allow(clippy::needless_range_loop)] // `p` indexes tile planes AND out blocks in lockstep
-fn blocks_geom_extract(tile: &LossyTile, sb_x: usize, sb_y: usize, out: &mut [Vec<i32>; 3]) {
+fn blocks_geom_extract(tile: &LossyTile, sb_x: usize, sb_y: usize, out: &mut [Vec<u16>; 3]) {
     for p in 0..3 {
         if tile.recon[p].is_empty() {
             continue;
@@ -1593,6 +2375,56 @@ fn blocks_geom_extract(tile: &LossyTile, sb_x: usize, sb_y: usize, out: &mut [Ve
     }
 }
 
+fn pack_wavefront_tile(
+    base_q_idx: u8,
+    r: &TileRect,
+    record: bool,
+    updating_cdf: bool,
+    rx: &std::sync::mpsc::Receiver<(usize, CapturedSb)>,
+) -> TileOut {
+    let sb_cols = r.tw.div_ceil(64);
+    let sb_rows = r.th.div_ceil(64);
+    let sb_count = sb_cols * sb_rows;
+    let mut pending: Vec<Option<CapturedSb>> = (0..sb_count).map(|_| None).collect();
+
+    let mut enc = OdEcEncoder::new().with_updating_cdf(updating_cdf);
+    if record {
+        enc.begin_trace();
+    }
+    let mut cdfs = Cdfs::new(crate::coef_q::qcat(base_q_idx));
+    let mut slots = cdfs.semantic_slots();
+
+    for sb_i in 0..sb_count {
+        while pending[sb_i].is_none() {
+            let (i, cell) = rx.recv().expect("wavefront capture stopped early");
+            assert!(i < pending.len(), "wavefront cell index out of range");
+            assert!(pending[i].is_none(), "duplicate wavefront cell");
+            pending[i] = Some(cell);
+        }
+        let cell = pending[sb_i].take().unwrap();
+
+        enc.trace_mark();
+        enc.replay_semantic(&cell.tokens, &mut slots);
+    }
+
+    let trace = enc.take_trace();
+    let payload = enc.done();
+    TileOut {
+        payload,
+        trace,
+        recon: Default::default(),
+        skip8: Vec::new(),
+        blk4: Vec::new(),
+        blk4h: Vec::new(),
+        blk4v: Vec::new(),
+        blk4t: Vec::new(),
+        pblk4: Vec::new(),
+        pblk4h: Vec::new(),
+        pblk4v: Vec::new(),
+        pblk4t: Vec::new(),
+    }
+}
+
 /// Encode a single tile as an independent sub-frame. Pure function of its inputs
 /// (no shared mutable state), so it is safe to run on any thread. When `mono`,
 /// only the luma plane is coded (`src[1]`/`src[2]` ignored, chroma recon empty).
@@ -1607,13 +2439,21 @@ fn encode_one_tile(
     sub_x: usize,
     sub_y: usize,
     mono: bool,
-    src: &[Vec<i32>; 3],
+    src: &[Vec<u16>; 3],
     r: &TileRect,
     speed: Speed,
+    dct: DctDispatch,
+    idct: IdctDispatch,
+    intrapred: IntraPredDispatch,
+    kmeans: KmeansDispatch,
+    rd: crate::rd_sse::RdDispatch,
     aq: bool,
     vb: &VarianceBoost,
     record: bool,
     wf_threads: usize,
+    allow_intrabc: bool,
+    updating_cdf: bool,
+    screen_content: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -1645,7 +2485,11 @@ fn encode_one_tile(
                 _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
             }
         }
-        .with_speed(speed);
+        .with_dispatch(dct, idct, intrapred, kmeans, rd)
+        .with_speed(speed)
+        .with_intrabc(allow_intrabc)
+        .with_screen_content(screen_content)
+        .with_updating_cdf(updating_cdf);
         tile.sb_mode = sb_mode;
         tile.rec = rec_in;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
@@ -1688,7 +2532,7 @@ fn encode_one_tile(
                 }
                 // Pure-emit replay: install this SB's captured recon blocks
                 // up front. Converted leaves skip prediction/recon entirely;
-                // unconverted (DC) leaves read correct neighbours and rewrite
+                // unconverted (DC) leaves read correct neighbors and rewrite
                 // identical pixels.
                 if sb_mode == SbMode::Replay {
                     let idx = if stream_rx.is_some() { 0 } else { sb_i };
@@ -1708,7 +2552,7 @@ fn encode_one_tile(
                 }
                 tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
                 if sb_mode == SbMode::Capture {
-                    let mut cell_recon: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                    let mut cell_recon: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
                     blocks_geom_extract(&tile, sb_x, sb_y, &mut cell_recon);
                     tile.rec.recon.push(cell_recon);
                 }
@@ -1737,6 +2581,10 @@ fn encode_one_tile(
         let blk4h = std::mem::take(&mut tile.blk4h);
         let blk4v = std::mem::take(&mut tile.blk4v);
         let blk4t = std::mem::take(&mut tile.blk4t);
+        let pblk4 = std::mem::take(&mut tile.pblk4);
+        let pblk4h = std::mem::take(&mut tile.pblk4h);
+        let pblk4v = std::mem::take(&mut tile.pblk4v);
+        let pblk4t = std::mem::take(&mut tile.pblk4t);
         let trace = tile.enc.take_trace();
         let payload = tile.enc.done();
         let rec = if stream_rx.is_some() {
@@ -1754,24 +2602,24 @@ fn encode_one_tile(
                 blk4h,
                 blk4v,
                 blk4t,
+                pblk4,
+                pblk4h,
+                pblk4v,
+                pblk4t,
             },
             rec,
         )
     };
     let (out, _) = if wf_threads > 1 {
-        // Pipeline the serial adaptive-CDF replay behind parallel capture.
-        // One worker owns replay while the remaining budget decides later SBs;
-        // records may arrive out of order but are consumed in raster order.
-        let ((out, rec), _capture_elapsed, _replay_elapsed) = std::thread::scope(|scope| {
+        // Pipeline the lightweight adaptive-CDF token packer behind parallel
+        // capture. The packer does no block traversal or reconstruction.
+        let out = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();
-            // The replay lane is PURE EMIT (captured coeffs + recon blocks)
-            // and spends its life recv()-blocked on capture — so capture gets
-            // the FULL budget; the +1 oversubscription is absorbed by the
-            // replay thread's blocking waits.
+            // The entropy lane spends most of its life recv()-blocked on
+            // capture, so capture keeps the full requested worker budget.
             let capture_threads = wf_threads;
             let tsrc_ref = &tsrc;
             let capture = scope.spawn(move || {
-                let start = std::time::Instant::now();
                 wavefront_capture(
                     capture_threads,
                     base_q_idx,
@@ -1784,19 +2632,34 @@ fn encode_one_tile(
                     tsrc_ref,
                     r,
                     speed,
+                    dct,
+                    idct,
+                    intrapred,
+                    kmeans,
+                    rd,
                     aq,
                     vb,
+                    updating_cdf,
+                    allow_intrabc,
+                    screen_content,
                     tx,
-                );
-                start.elapsed()
+                )
             });
-            let replay_start = std::time::Instant::now();
-            let replay = run(SbMode::Replay, DecisionRecord::default(), Some(&rx));
-            let replay_elapsed = replay_start.elapsed();
-            let capture_elapsed = capture.join().expect("wavefront capture panicked");
-            (replay, capture_elapsed, replay_elapsed)
+            let mut packed = pack_wavefront_tile(base_q_idx, r, record, updating_cdf, &rx);
+            let planes = capture.join().expect("wavefront capture panicked");
+            packed.recon = planes.recon;
+            packed.skip8 = planes.skip8;
+            packed.blk4 = planes.blk4;
+            packed.blk4h = planes.blk4h;
+            packed.blk4v = planes.blk4v;
+            packed.blk4t = planes.blk4t;
+            packed.pblk4 = planes.pblk4;
+            packed.pblk4h = planes.pblk4h;
+            packed.pblk4v = planes.pblk4v;
+            packed.pblk4t = planes.pblk4t;
+            packed
         });
-        (out, rec)
+        (out, DecisionRecord::default())
     } else {
         run(SbMode::Off, DecisionRecord::default(), None)
     };
@@ -1825,8 +2688,9 @@ fn replay_tile_with_filters(
     cdef: Option<&CdefReplay>,
     frame_w: usize,
     frame_h: usize,
+    updating_cdf: bool,
 ) -> Vec<u8> {
-    let mut enc = OdEcEncoder::new();
+    let mut enc = OdEcEncoder::new().with_updating_cdf(updating_cdf);
     let mut wr_cdf = wiener_restore_icdf();
     let mut lr_ref_v = crate::wiener::WIENER_TAPS_MID;
     let mut lr_ref_h = crate::wiener::WIENER_TAPS_MID;
@@ -1890,6 +2754,13 @@ fn wavefront_should_use_tiles(sb_cols: usize, sb_rows: usize, threads: usize) ->
         return false;
     }
     let cells = sb_cols * sb_rows;
+    // Small frames never tile: the thread count would change the TILING PLAN
+    // and thus the bitstream (t2/t3/t8 on a 6x9-SB frame produced 2/4/8-tile
+    // grids, +6% bytes at t8), breaking the -tN == -t1 invariant for frames
+    // that encode in ~a second anyway. 256 SBs = ~1MP.
+    if cells < 256 {
+        return false;
+    }
     let wave_work_floor = cells.div_ceil(threads - 1);
     let wave_dependency_floor = sb_cols + 2 * sb_rows.saturating_sub(1);
     let wave_floor = wave_work_floor.max(wave_dependency_floor);
@@ -1905,22 +2776,32 @@ pub(crate) fn encode_lossy_tilegroup(
     h8: usize,
     disp_w: usize,
     disp_h: usize,
-    src: &[Vec<i32>; 3],
+    src: &[Vec<u16>; 3],
     sub_x: usize,
     sub_y: usize,
     mono: bool,
-    pool: &Pool,
-    speed: Speed,
+    context: &EncodingContext<'_>,
     aq: bool,
-    vb: &VarianceBoost,
     cdef_on: bool,
     wiener_on: bool,
+    updating_cdf: bool,
+    screen_content: bool,
+    intrabc_allowed: bool,
 ) -> (
     Vec<u8>,
     Tiling,
     Option<crate::obu::CdefParams>,
     Option<crate::obu::LrParams>,
+    bool,
 ) {
+    let pool = context.thread_pool;
+    let speed = context.speed;
+    let vb = &context.boost;
+    let dct = context.dct_dispatch();
+    let idct = context.idct_dispatch();
+    let intrapred = context.intrapred;
+    let kmeans = context.kmeans;
+    let rd = context.rd;
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
 
@@ -1929,11 +2810,9 @@ pub(crate) fn encode_lossy_tilegroup(
     // frames, byte-identical to the untiled output).
     let want = pool.width();
     // Prefer minimal tiling + SB wavefront when the dependency graph can feed
-    // the requested worker count.  Otherwise use ordinary parallel tiles: a
+    // the requested worker count. Otherwise, use ordinary parallel tiles: a
     // narrow WPP graph cannot manufacture parallelism, and forcing it was up
     // to 2-3x slower on small/medium images.
-    // Leave a 35% margin in favour of WPP's compression advantage.  Fall back
-    // only when its mathematical lower bound is already clearly worse.
     let multitile =
         want > 1 && wavefront_should_use_tiles(sb_cols as usize, sb_rows as usize, want);
     let tile_target = if multitile { want } else { 1 };
@@ -1966,11 +2845,79 @@ pub(crate) fn encode_lossy_tilegroup(
         }
     }
 
+    let allow_intrabc = intrabc_allowed
+        && !mono
+        && rects.iter().any(|r| {
+            // Coverage threshold: IntraBC costs the whole frame its loop
+            // filters, so one duplicate pair is NOT enough (h_vvc's letterbox
+            // bars measured +3.3% BD from lost deblock). Count NON-FLAT
+            // aligned 16x16 blocks with an exact earlier duplicate; require
+            // a meaningful fraction of the tile before paying the trade.
+            let mut seen: HashMap<u64, (usize, usize)> = HashMap::new();
+            let exact16 = |ax: usize, ay: usize, bx: usize, by: usize| {
+                (0..3).all(|plane| {
+                    let sx = usize::from(plane != 0 && sub_x != 0);
+                    let sy = usize::from(plane != 0 && sub_y != 0);
+                    let stride = if plane == 0 { w8 } else { cw8 };
+                    let (bw, bh) = (16 >> sx, 16 >> sy);
+                    let (ax, ay) = ((r.x0 + ax) >> sx, (r.y0 + ay) >> sy);
+                    let (bx, by) = ((r.x0 + bx) >> sx, (r.y0 + by) >> sy);
+                    (0..bh).all(|row| {
+                        src[plane][(ay + row) * stride + ax..][..bw]
+                            == src[plane][(by + row) * stride + bx..][..bw]
+                    })
+                })
+            };
+            let mut total = 0usize;
+            let mut dup = 0usize;
+            for ly in (0..r.th.saturating_sub(15)).step_by(16) {
+                for lx in (0..r.tw.saturating_sub(15)).step_by(16) {
+                    total += 1;
+                    // Flat blocks (single luma value) duplicate trivially —
+                    // black bars, blank sky — and gain nothing from a copy
+                    // that DC prediction doesn't already provide.
+                    let (x0, y0) = (r.x0 + lx, r.y0 + ly);
+                    let first = src[0][y0 * w8 + x0];
+                    let flat = (0..16).all(|row| {
+                        src[0][(y0 + row) * w8 + x0..][..16]
+                            .iter()
+                            .all(|&v| v == first)
+                    });
+                    if flat {
+                        continue;
+                    }
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for (plane, sp) in src.iter().enumerate() {
+                        let sx = usize::from(plane != 0 && sub_x != 0);
+                        let sy = usize::from(plane != 0 && sub_y != 0);
+                        let stride = if plane == 0 { w8 } else { cw8 };
+                        let (x, y) = ((r.x0 + lx) >> sx, (r.y0 + ly) >> sy);
+                        let (bw, bh) = (16 >> sx, 16 >> sy);
+                        for row in 0..bh {
+                            for &v in &sp[(y + row) * stride + x..][..bw] {
+                                h ^= v as u64;
+                                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                            }
+                        }
+                    }
+                    if let Some(&(ox, oy)) = seen.get(&h) {
+                        if exact16(ox, oy, lx, ly) {
+                            dup += 1;
+                        }
+                    } else {
+                        seen.insert(h, (lx, ly));
+                    }
+                }
+            }
+            dup >= 8 && dup * 20 >= total
+        });
+
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
 
     // SB-wavefront: parallelize WITHIN each tile — parallel decision capture
-    // (d = 2r+c wavefront) + serial replay emit, byte-identical per tile.
+    // (d = 2r+c wavefront) plus a lightweight raster entropy lane,
+    // byte-identical per tile.
     // Tiles are then encoded SEQUENTIALLY with the full thread budget inside
     // each (wavefront capture spawns its own scoped workers; nesting it under
     // the tile pool would oversubscribe — same no-nesting rule as the AV2
@@ -1981,30 +2928,72 @@ pub(crate) fn encode_lossy_tilegroup(
     // Recording the symbol trace lets a winning Wiener unit or a per-unit CDEF
     // grid be signaled by a cheap replay instead of a second full encode of
     // every tile.
-    let record = (wiener_on || cdef_on) && base_q_idx != 0;
+    let record = !allow_intrabc && (wiener_on || cdef_on) && base_q_idx != 0;
     let mut outs: Vec<TileOut> = if wf_threads > 1 && n < want {
         // Split the budget: `outer` tiles in flight × `inner`-wide wavefront
         // inside each (outer*inner == want, no oversubscription — the inner
-        // scoped workers replace their outer worker's idle time during the
-        // serial replay of other tiles). Single-tile frames get the full
+        // scoped workers replace their outer worker's idle time while other
+        // tiles are packed). Single-tile frames get the full
         // budget inside the one tile.
-        // Capture/replay pipelining needs at least three lanes per tile: one
-        // replay lane and two decision lanes.  If there are already at least
+        // Capture/packing pipelining needs at least three lanes per tile: one
+        // packing lane and two decision lanes. If there are already at least
         // as many geometry-stable tiles as workers, the branch below simply
         // runs those tiles directly without an unnecessary inner wavefront.
         let outer = n.min((wf_threads / 3).max(1));
         let inner = (wf_threads / outer).max(2);
         pool.map_indexed(outer, n, |i| {
             encode_one_tile(
-                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
-                record, inner,
+                base_q_idx,
+                bd,
+                w8,
+                h8,
+                cw8,
+                sub_x,
+                sub_y,
+                mono,
+                src,
+                &rects[i],
+                speed,
+                dct,
+                idct,
+                intrapred,
+                kmeans,
+                rd,
+                aq,
+                vb,
+                record,
+                inner,
+                allow_intrabc,
+                updating_cdf,
+                screen_content,
             )
         })
     } else {
         pool.map_indexed(nthreads, n, |i| {
             encode_one_tile(
-                base_q_idx, bd, w8, h8, cw8, sub_x, sub_y, mono, src, &rects[i], speed, aq, vb,
-                record, 0,
+                base_q_idx,
+                bd,
+                w8,
+                h8,
+                cw8,
+                sub_x,
+                sub_y,
+                mono,
+                src,
+                &rects[i],
+                speed,
+                dct,
+                idct,
+                intrapred,
+                kmeans,
+                rd,
+                aq,
+                vb,
+                record,
+                0,
+                allow_intrabc,
+                updating_cdf,
+                screen_content,
             )
         })
     };
@@ -2018,12 +3007,12 @@ pub(crate) fn encode_lossy_tilegroup(
     // Small per-8x8 / per-4x4 maps: stitched serially (they are tiny).
     // Monochrome has only a luma plane; chroma recon stays empty.
     let mut recon = if mono {
-        [vec![0i32; w8 * h8], Vec::new(), Vec::new()]
+        [vec![0u16; w8 * h8], Vec::new(), Vec::new()]
     } else {
         [
-            vec![0i32; w8 * h8],
-            vec![0i32; cw8 * ch8],
-            vec![0i32; cw8 * ch8],
+            vec![0u16; w8 * h8],
+            vec![0u16; cw8 * ch8],
+            vec![0u16; cw8 * ch8],
         ]
     };
     let sb8w = w8.div_ceil(8);
@@ -2037,6 +3026,10 @@ pub(crate) fn encode_lossy_tilegroup(
     let mut blk4hf = vec![0u8; nc4f * nr4f];
     let mut blk4vf = vec![false; nc4f * nr4f];
     let mut blk4tf = vec![false; nc4f * nr4f];
+    let mut pblk4f = vec![0u8; nc4f * nr4f];
+    let mut pblk4hf = vec![0u8; nc4f * nr4f];
+    let mut pblk4vf = vec![false; nc4f * nr4f];
+    let mut pblk4tf = vec![false; nc4f * nr4f];
     for (r, out) in rects.iter().zip(outs.iter()) {
         let tsb8w = r.tw.div_ceil(8);
         let (ox8, oy8) = (r.x0 / 8, r.y0 / 8);
@@ -2058,6 +3051,10 @@ pub(crate) fn encode_lossy_tilegroup(
                     blk4hf[fy * nc4f + fx] = out.blk4h[ty * tnc4 + tx];
                     blk4vf[fy * nc4f + fx] = out.blk4v[ty * tnc4 + tx];
                     blk4tf[fy * nc4f + fx] = out.blk4t[ty * tnc4 + tx];
+                    pblk4f[fy * nc4f + fx] = out.pblk4[ty * tnc4 + tx];
+                    pblk4hf[fy * nc4f + fx] = out.pblk4h[ty * tnc4 + tx];
+                    pblk4vf[fy * nc4f + fx] = out.pblk4v[ty * tnc4 + tx];
+                    pblk4tf[fy * nc4f + fx] = out.pblk4t[ty * tnc4 + tx];
                 }
             }
         }
@@ -2067,7 +3064,7 @@ pub(crate) fn encode_lossy_tilegroup(
     // plane, so (plane, tile row) pairs stitch in parallel.
     let ncols = col_starts.len();
     {
-        let mut items: Vec<(usize, usize, &mut [i32])> = Vec::new();
+        let mut items: Vec<(usize, usize, &mut [u16])> = Vec::new();
         for (pl, plane) in recon.iter_mut().enumerate() {
             if plane.is_empty() {
                 continue;
@@ -2109,14 +3106,38 @@ pub(crate) fn encode_lossy_tilegroup(
     // reconstruction so that inter-tile edges are filtered exactly as the
     // decoder does (deblocking is not tile-independent in AV1). `filter_plane`
     // is a no-op when the derived level is 0 (e.g. lossless).
-    let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
-    frame_deblock(
-        &mut recon, w8, h8, cw8, ch8, disp_w, disp_h, &blk4f, &blk4hf, &blk4vf, &blk4tf, nc4f,
-        sub_x, sub_y, mono, lvl_y, lvl_uv, bd,
-    );
+    if !allow_intrabc {
+        let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
+        frame_deblock(
+            &context.loopfilter,
+            pool,
+            &mut recon,
+            w8,
+            h8,
+            cw8,
+            ch8,
+            disp_w,
+            disp_h,
+            &blk4f,
+            &blk4hf,
+            &blk4vf,
+            &blk4tf,
+            &pblk4f,
+            &pblk4hf,
+            &pblk4vf,
+            &pblk4tf,
+            nc4f,
+            sub_x,
+            sub_y,
+            mono,
+            lvl_y,
+            lvl_uv,
+            bd,
+        );
+    }
 
     // Frame-level CDEF (R-D searched; may pick per-64x64-unit signaling).
-    let cdef_decision = if cdef_on && base_q_idx != 0 {
+    let cdef_decision = if !allow_intrabc && cdef_on && base_q_idx != 0 {
         frame_cdef(
             &mut recon, src, &skip8, sb8w, w8, h8, cw8, ch8, disp_w, disp_h, sub_x, sub_y, mono,
             base_q_idx, bd, speed, pool,
@@ -2127,7 +3148,7 @@ pub(crate) fn encode_lossy_tilegroup(
 
     // Frame-level luma Wiener loop restoration (searched on the CDEF-filtered
     // recon, matching the decoder's filter order).
-    let lr_unit = if wiener_on && base_q_idx != 0 {
+    let lr_unit = if !allow_intrabc && wiener_on && base_q_idx != 0 {
         frame_wiener_search(&recon[0], &src[0], w8, h8, bd, pool)
     } else {
         None
@@ -2157,13 +3178,45 @@ pub(crate) fn encode_lossy_tilegroup(
                 cdef_replay.as_ref(),
                 w8,
                 h8,
+                updating_cdf,
             )
         });
     }
     let lr = lr_unit.map(|_| crate::obu::LrParams { luma_wiener: true });
 
+    // Debug: dump the final reconstruction (post-deblock/CDEF) for the
+    // dav1d conformance oracle (bench/rd/oscan.sh + oraclecmp.py). This
+    // hook was lost in a refactor once (2026-07-26) and the oracle failed
+    // 0/90 silently — keep it adjacent to tilegroup assembly.
+    if let Ok(path) = std::env::var("MT_DUMP_RECON") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            // ceil, not floor: for odd display dims the last chroma col/row
+            // is real coded content (AV1 chroma dims are ceil(w >> sub)).
+            let (cdw, cdh) = (disp_w.div_ceil(1 << sub_x), disp_h.div_ceil(1 << sub_y));
+            let planes: [(usize, usize, usize); 3] =
+                [(disp_w, disp_h, w8), (cdw, cdh, cw8), (cdw, cdh, cw8)];
+            let np = if mono { 1 } else { 3 };
+            let _ = writeln!(f, "MTREC {disp_w} {disp_h} {cdw} {cdh} {np}");
+            for (pl, &(pw, ph, stride)) in planes.iter().enumerate().take(np) {
+                for y in 0..ph {
+                    let row: Vec<u8> = (0..pw)
+                        .map(|x| (recon[pl][y * stride + x] >> (bd - 8)).clamp(0, 255) as u8)
+                        .collect();
+                    let _ = f.write_all(&row);
+                }
+            }
+        }
+    }
+
     let tilegroup = assemble_tilegroup(payloads);
-    (tilegroup, plan, cdef_decision.map(|d| d.params), lr)
+    (
+        tilegroup,
+        plan,
+        cdef_decision.map(|d| d.params),
+        lr,
+        allow_intrabc,
+    )
 }
 
 /// CDEF damping derived from the base quantizer (spec range 3..=6); higher q ->
@@ -2173,15 +3226,15 @@ fn cdef_damping(base_q_idx: u8) -> u8 {
 }
 
 fn frame_wiener_search(
-    recon: &[i32],
-    src: &[i32],
+    recon: &[u16],
+    src: &[u16],
     w: usize,
     h: usize,
     bd: u8,
     pool: &Pool,
 ) -> Option<crate::wiener::WienerUnit> {
     use crate::wiener::{WienerKernel, wiener_filter_plane};
-    let sse = |a: &[i32]| -> i64 {
+    let sse = |a: &[u16]| -> i64 {
         let mut s = 0i64;
         for i in 0..w * h {
             let d = (a[i] - src[i]) as i64;
@@ -2205,7 +3258,7 @@ fn frame_wiener_search(
         let (h_taps, v_taps) = cands[i];
         let hk = WienerKernel::from_coded(*h_taps);
         let vk = WienerKernel::from_coded(*v_taps);
-        let mut tmp = vec![0i32; w * h];
+        let mut tmp = vec![0u16; w * h];
         wiener_filter_plane(&mut tmp, recon, w, h, &hk, &vk, bd);
         sse(&tmp)
     });
@@ -2239,24 +3292,10 @@ pub(crate) struct CdefFrameDecision {
     pub(crate) unit_cols: usize,
 }
 
-/// R-D CDEF search: one searched active strength (luma + chroma), then an exact
-/// rate-distortion choice between OFF, a global strength (`cdef_bits = 0`), and
-/// per-64x64-unit signaling (`cdef_bits = 1`, 2-entry table `[(0,0),(y,uv)]`,
-/// one raw `cdef_idx` bit at each non-all-skip unit).
-///
-/// Distortion is libaom's perceptual `cdef_dist_8x8` for luma (variance-masked
-/// SSE — the metric libaom tuned CDEF against, aligned with SSIMULACRA2) and
-/// plain SSE for chroma. Rate is exact: the per-unit index is an equiprobable
-/// literal (1 bit) and the second strength-table entry costs 12 header bits
-/// (6 when monochrome); both indices of a signaled unit cost the same bit, so
-/// the per-unit on/off choice reduces to min distortion while the rate only
-/// arbitrates OFF vs global vs per-unit. lambda uses the same libaom-shaped
-/// `mode_lambda_q(dc_q)` the mode search runs on, keeping CDEF on the encoder's
-/// single (SSE, bits) axis.
 #[allow(clippy::too_many_arguments)]
 fn frame_cdef(
-    recon: &mut [Vec<i32>; 3],
-    src: &[Vec<i32>; 3],
+    recon: &mut [Vec<u16>; 3],
+    src: &[Vec<u16>; 3],
     skip8: &[bool],
     sb8w: usize,
     w8: usize,
@@ -2462,7 +3501,7 @@ fn frame_cdef(
         [0, 1, 2, 3, 4, 5, 6, 7] // 4:2:0 / 4:4:4 (identity)
     };
     let chroma_damping = damping - 1;
-    let snap_uv: [Vec<i32>; 2] = if mono {
+    let snap_uv: [Vec<u16>; 2] = if mono {
         [Vec::new(), Vec::new()]
     } else {
         [recon[1].clone(), recon[2].clone()]
@@ -2788,14 +3827,10 @@ fn frame_cdef(
     Some(decision)
 }
 
-/// Distortion of one (possibly partially visible) 8x8: the perceptual
-/// `cdef_dist_8x8` when the block is fully inside the visible frame, otherwise
-/// plain SSE over the visible `vis_w` x `vis_h` window (the x64 variance
-/// calibration needs a full 8x8; matches the shared metric's edge fallback).
 #[allow(clippy::too_many_arguments)]
 fn cdef_block_dist_vis(
-    src: &[i32],
-    dst: &[i32],
+    src: &[u16],
+    dst: &[u16],
     stride: usize,
     vis_w: usize,
     vis_h: usize,
@@ -2818,16 +3853,10 @@ fn cdef_block_dist_vis(
     s
 }
 
-/// Per-64x64-unit luma perceptual CDEF distortion for one candidate strength
-/// (`pri == sec == 0` measures the unfiltered baseline). `recon` is the MARKED
-/// plane (out-of-frame samples = `CDEF_VERY_LARGE`); distortion counts only the
-/// visible `disp_w` x `disp_h` window. Skip 8x8s are excluded entirely — the
-/// decoder never filters them, so their distortion is identical across every
-/// option and cancels out of the R-D comparison.
 #[allow(clippy::too_many_arguments)]
 fn cdef_luma_unit_dists(
-    recon: &[i32],
-    src: &[i32],
+    recon: &[u16],
+    src: &[u16],
     w: usize,
     h: usize,
     disp_w: usize,
@@ -2901,8 +3930,8 @@ fn cdef_luma_unit_dists(
 /// variance calibration of the perceptual metric (libaom also uses MSE here).
 #[allow(clippy::too_many_arguments)]
 fn cdef_chroma_unit_sse(
-    recon: &[i32],
-    src: &[i32],
+    recon: &[u16],
+    src: &[u16],
     cw: usize,
     _ch: usize,
     cw_vis: usize,
@@ -2942,7 +3971,7 @@ fn cdef_chroma_unit_sse(
                 continue; // fully outside the visible chroma frame
             }
             let u = (lby / 8) * uc + lbx / 8;
-            let cand: &[i32] = if filtering {
+            let cand: &[u16] = if filtering {
                 // dir 0 when the signaled pri strength is 0 (see luma above).
                 let dir = if pri == 0 {
                     0
@@ -2987,8 +4016,8 @@ fn cdef_chroma_unit_sse(
 /// (`cdef_bits = 1`), only 8x8s inside on-units are filtered.
 #[allow(clippy::too_many_arguments)]
 fn apply_cdef_plane(
-    plane: &mut [i32],
-    snapshot: &[i32],
+    plane: &mut [u16],
+    snapshot: &[u16],
     w: usize,
     _h: usize,
     dirs: &[usize],
@@ -3004,7 +4033,7 @@ fn apply_cdef_plane(
     use crate::cdef;
     // Every 8x8 reads the pre-CDEF snapshot and writes only its own rows, so
     // 8-row bands filter in parallel with identical output to the serial pass.
-    let items: Vec<(usize, &mut [i32])> = plane.chunks_mut(8 * w).enumerate().collect();
+    let items: Vec<(usize, &mut [u16])> = plane.chunks_mut(8 * w).enumerate().collect();
     pool.for_each(pool.width(), items, |(bi8, band)| {
         let y = bi8 * 8;
         for x in (0..w).step_by(8) {
@@ -3046,16 +4075,10 @@ fn apply_cdef_plane(
     });
 }
 
-/// Per-luma-8x8 chroma CDEF. For each non-skip luma 8x8 block, the covering
-/// chroma sub-block — 8x8 (4:4:4), 4x8 (4:2:2) or 4x4 (4:2:0) — is filtered with
-/// the remapped luma direction (`uv_dir[ldir]`) and `damping` (already the luma
-/// damping minus one). Chroma never applies the variance-based strength scaling.
-/// `skip8`/`sb8w` are the luma per-8x8 skip map; an 8x8 luma block that is skip
-/// leaves its chroma untouched, matching the decoders' noskip_mask.
 #[allow(clippy::too_many_arguments)]
 fn apply_cdef_chroma(
-    plane: &mut [i32],
-    snapshot: &[i32],
+    plane: &mut [u16],
+    snapshot: &[u16],
     cw: usize,
     ch: usize,
     ldirs: &[usize],
@@ -3077,7 +4100,7 @@ fn apply_cdef_chroma(
     let cbh = 8 >> sub_y;
     // One band per luma block-row (cbh chroma rows): disjoint writes, shared
     // pre-CDEF snapshot reads — identical output to the serial pass.
-    let items: Vec<(usize, &mut [i32])> = plane.chunks_mut(cbh * cw).enumerate().collect();
+    let items: Vec<(usize, &mut [u16])> = plane.chunks_mut(cbh * cw).enumerate().collect();
     pool.for_each(pool.width(), items, |(lby, band)| {
         if lby >= nby {
             return;
@@ -3123,8 +4146,15 @@ fn apply_cdef_chroma(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn cdblk_variant() -> u32 {
+    1
+}
+
+#[allow(clippy::too_many_arguments)]
 fn frame_deblock(
-    recon: &mut [Vec<i32>; 3],
+    loopfilter: &crate::loopfilter::LoopFilterDispatch,
+    pool: &Pool,
+    recon: &mut [Vec<u16>; 3],
     w8: usize,
     h8: usize,
     cw8: usize,
@@ -3135,7 +4165,11 @@ fn frame_deblock(
     blk4h: &[u8],   // luma block height map (horizontal edges)
     blk4v: &[bool], // luma block starts at this 4x4 column
     blk4t: &[bool], // luma block starts at this 4x4 row
-    nc4: usize,     // luma 4-col count == w8/4
+    pblk4: &[u8],   // luma PREDICTION-block width map (chroma edges derive from this)
+    pblk4h: &[u8],  // luma PREDICTION-block height map
+    pblk4v: &[bool],
+    pblk4t: &[bool],
+    nc4: usize, // luma 4-col count == w8/4
     sub_x: usize,
     sub_y: usize,
     mono: bool,
@@ -3144,7 +4178,8 @@ fn frame_deblock(
     bd: u8,
 ) {
     if level_y > 0 {
-        crate::loopfilter::filter_plane(
+        crate::loopfilter::filter_plane_parallel(
+            loopfilter,
             &mut recon[0],
             w8,
             h8,
@@ -3159,6 +4194,7 @@ fn frame_deblock(
             true,
             16, // 64px superblock -> 16 4-unit rows
             bd,
+            pool,
         );
     }
     if mono || level_uv <= 0 {
@@ -3170,38 +4206,64 @@ fn frame_deblock(
     let ch = ch8;
     let cnc4 = cw / 4;
     let cnr4 = ch / 4;
+    // Chroma transform geometry comes from the PREDICTION-block map, not the
+    // luma transform map: chroma carries no tx_depth here, so one chroma
+    // transform spans the whole chroma block even where luma split its own
+    // transform. Deriving from `blk4` (transform-granular) invented interior
+    // chroma edges the decoder never filters. The block-start flags are carried
+    // across too — the alignment fallback in `filter_plane` cannot place edges
+    // for blocks whose origin is not a multiple of their size (asymmetric and
+    // rectangular partitions).
     let mut cbw4 = vec![0u8; cnc4 * cnr4];
     let mut cbh4 = vec![0u8; cnc4 * cnr4];
+    let mut cbv4 = vec![false; cnc4 * cnr4];
+    let mut cbt4 = vec![false; cnc4 * cnr4];
     for cr in 0..cnr4 {
         for cc in 0..cnc4 {
             let lr = cr << ss_ver;
             let lc = cc << ss_hor;
-            let dw = blk4[lr * nc4 + lc];
-            let dh = blk4h[lr * nc4 + lc];
-            cbw4[cr * cnc4 + cc] = (dw >> ss_hor).max(1);
-            cbh4[cr * cnc4 + cc] = (dh >> ss_ver).max(1);
+            let li = lr * nc4 + lc;
+            let ci = cr * cnc4 + cc;
+            // Variant matrix: bit0 = use PREDICTION geometry for the
+            // size map (else the luma TRANSFORM map, as before); bit1 = pass
+            // explicit block-start flags (else the alignment fallback).
+            let v = cdblk_variant();
+            let (sw, sh) = if v & 1 != 0 {
+                (pblk4[li], pblk4h[li])
+            } else {
+                (blk4[li], blk4h[li])
+            };
+            // AV1 caps a chroma transform at 32x32 (`av1_get_max_uv_txsize`).
+            // In 4:2:2 a 64x64 luma block yields a 32x64 chroma block, which is
+            // coded as stacked 32x32 transforms — so the deblock geometry must
+            // clamp to 8 4-units or it misses the interior chroma edge.
+            const MAX_UV_TX4: u8 = 8; // 32 px
+            cbw4[ci] = (sw >> ss_hor).max(1).min(MAX_UV_TX4);
+            cbh4[ci] = (sh >> ss_ver).max(1).min(MAX_UV_TX4);
+            if v & 2 != 0 {
+                cbv4[ci] = if v & 1 != 0 { pblk4v[li] } else { blk4v[li] };
+                cbt4[ci] = if v & 1 != 0 { pblk4t[li] } else { blk4t[li] };
+            }
         }
     }
     let csb = 16 >> ss_ver;
     let cvis_w = disp_w.div_ceil(1 << ss_hor);
     let cvis_h = disp_h.div_ceil(1 << ss_ver);
-    #[allow(clippy::needless_range_loop)]
-    for plane in 1..3 {
-        crate::loopfilter::filter_plane(
-            &mut recon[plane],
-            cw,
-            ch,
-            cvis_w,
-            cvis_h,
-            &cbw4,
-            &cbh4,
-            &[],
-            &[],
-            cnc4,
-            level_uv,
-            false,
-            csb,
-            bd,
+    let cbv4 = if cdblk_variant() & 2 != 0 {
+        cbv4.as_slice()
+    } else {
+        &[]
+    };
+    let cbt4 = if cdblk_variant() & 2 != 0 {
+        cbt4.as_slice()
+    } else {
+        &[]
+    };
+
+    for pixels in &mut recon[1..] {
+        crate::loopfilter::filter_plane_parallel(
+            loopfilter, pixels, cw, ch, cvis_w, cvis_h, &cbw4, &cbh4, cbv4, cbt4, cnc4, level_uv,
+            false, csb, bd, pool,
         );
     }
 }
@@ -3238,44 +4300,57 @@ fn assemble_tilegroup(payloads: Vec<Vec<u8>>) -> Vec<u8> {
 pub(crate) fn assemble_frame_obus(
     base_q_idx: u8,
     qm: QmLevels,
+    uac_delta: i32,
+    udc_delta: i32,
     plan: &Tiling,
     tilegroup: &[u8],
     mono: bool,
     aq: bool,
+    allow_intrabc: bool,
     cdef: Option<&crate::obu::CdefParams>,
     lr: Option<&crate::obu::LrParams>,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = frame_header_lossy_multitile_th(
             base_q_idx,
             qm,
+            uac_delta,
+            udc_delta,
             &plan.cols_incr,
             &plan.rows_incr,
             plan.tcl,
             plan.trl,
             mono,
             aq,
+            allow_intrabc,
             cdef,
             lr,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
         let fh = frame_header_lossy_multitile(
             base_q_idx,
             qm,
+            uac_delta,
+            udc_delta,
             &plan.cols_incr,
             &plan.rows_incr,
             0,
             0,
             mono,
             aq,
+            allow_intrabc,
             cdef,
             lr,
+            updating_cdf,
         );
         wrap_obu_frame(&fh, tilegroup)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossless_frame_obus(
     bd: u8,
     w8: usize,
@@ -3284,12 +4359,25 @@ pub(crate) fn encode_lossless_frame_obus(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     threads: usize,
+    speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) = encode_lossless_tilegroup(bd, w8, h8, visible_w, visible_h, src, &pool);
-    assemble_lossless_frame_obus(&plan, &tilegroup)
+    let (tilegroup, plan) = encode_lossless_tilegroup(
+        bd,
+        w8,
+        h8,
+        visible_w,
+        visible_h,
+        src,
+        &pool,
+        speed,
+        updating_cdf,
+    );
+    assemble_lossless_frame_obus(&plan, &tilegroup, updating_cdf)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_one_lossless_tile(
     bd: u8,
     full_w: usize,
@@ -3297,6 +4385,8 @@ fn encode_one_lossless_tile(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     r: &(usize, usize, usize, usize),
+    speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(&src[0], full_w, x0, y0, tw, th);
@@ -3304,9 +4394,19 @@ fn encode_one_lossless_tile(
     let p2 = crop_plane(&src[2], full_w, x0, y0, tw, th);
     let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
     let tile_visible_h = visible_h.saturating_sub(y0).min(th);
-    crate::tile::encode_tile_lossless(tw, th, tile_visible_w, tile_visible_h, bd, [&p0, &p1, &p2])
+    crate::tile::encode_tile_lossless(
+        tw,
+        th,
+        tile_visible_w,
+        tile_visible_h,
+        bd,
+        [&p0, &p1, &p2],
+        speed,
+        updating_cdf,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_lossless_tilegroup(
     bd: u8,
     w8: usize,
@@ -3315,6 +4415,8 @@ fn encode_lossless_tilegroup(
     visible_h: usize,
     src: &[Vec<i16>; 3],
     pool: &Pool,
+    speed: Speed,
+    updating_cdf: bool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3340,7 +4442,16 @@ fn encode_lossless_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile(bd, w8, visible_w, visible_h, src, &rects[i])
+        encode_one_lossless_tile(
+            bd,
+            w8,
+            visible_w,
+            visible_h,
+            src,
+            &rects[i],
+            speed,
+            updating_cdf,
+        )
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3350,24 +4461,31 @@ fn encode_lossless_tilegroup(
 /// a combined `OBU_FRAME` (type 6); multiple tiles use a separate
 /// `OBU_FRAME_HEADER` (type 3) + `OBU_TILE_GROUP` (type 4), the layout strict
 /// parsers (ffmpeg's cbs_av1) accept.
-fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
+fn assemble_lossless_frame_obus(plan: &Tiling, tilegroup: &[u8], updating_cdf: bool) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = crate::obu::frame_header_lossless_multitile_th(
             &plan.cols_incr,
             &plan.rows_incr,
             plan.tcl,
             plan.trl,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
-        let fh =
-            crate::obu::frame_header_lossless_multitile(&plan.cols_incr, &plan.rows_incr, 0, 0);
+        let fh = crate::obu::frame_header_lossless_multitile(
+            &plan.cols_incr,
+            &plan.rows_incr,
+            0,
+            0,
+            updating_cdf,
+        );
         wrap_obu_frame(&fh, tilegroup)
     }
 }
 
 /// Crop the single luma plane to a tile rect and encode it as a mono lossless
 /// tile. Pure function of its inputs (safe on any thread).
+#[allow(clippy::too_many_arguments)]
 fn encode_one_lossless_tile_mono(
     bd: u8,
     full_w: usize,
@@ -3375,18 +4493,30 @@ fn encode_one_lossless_tile_mono(
     visible_h: usize,
     luma: &[i16],
     r: &(usize, usize, usize, usize),
+    speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let (x0, y0, tw, th) = *r;
     let p0 = crop_plane(luma, full_w, x0, y0, tw, th);
     let tile_visible_w = visible_w.saturating_sub(x0).min(tw);
     let tile_visible_h = visible_h.saturating_sub(y0).min(th);
-    crate::tile::encode_tile_lossless_mono(tw, th, tile_visible_w, tile_visible_h, bd, &p0)
+    crate::tile::encode_tile_lossless_mono(
+        tw,
+        th,
+        tile_visible_w,
+        tile_visible_h,
+        bd,
+        &p0,
+        speed,
+        updating_cdf,
+    )
 }
 
 /// Monochrome counterpart of [`encode_lossless_tilegroup`]: a single full-res
 /// luma plane (`w8*h8`, padded to a multiple of 8) tiled identically to the
 /// 4:4:4 path. Byte-identical output for a fixed tiling regardless of thread
 /// count.
+#[allow(clippy::too_many_arguments)]
 fn encode_lossless_mono_tilegroup(
     bd: u8,
     w8: usize,
@@ -3395,6 +4525,8 @@ fn encode_lossless_mono_tilegroup(
     visible_h: usize,
     luma: &[i16],
     pool: &Pool,
+    speed: Speed,
+    updating_cdf: bool,
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
@@ -3421,7 +4553,16 @@ fn encode_lossless_mono_tilegroup(
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
-        encode_one_lossless_tile_mono(bd, w8, visible_w, visible_h, luma, &rects[i])
+        encode_one_lossless_tile_mono(
+            bd,
+            w8,
+            visible_w,
+            visible_h,
+            luma,
+            &rects[i],
+            speed,
+            updating_cdf,
+        )
     });
 
     (assemble_tilegroup(payloads), plan)
@@ -3430,13 +4571,18 @@ fn encode_lossless_mono_tilegroup(
 /// Wrap a mono lossless tile group with a `mono_chrome = 1` lossless frame
 /// header (single tile ⇒ combined `OBU_FRAME`; multi-tile ⇒ `OBU_FRAME_HEADER` +
 /// `OBU_TILE_GROUP`).
-fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8> {
+fn assemble_lossless_mono_frame_obus(
+    plan: &Tiling,
+    tilegroup: &[u8],
+    updating_cdf: bool,
+) -> Vec<u8> {
     if plan.tcl + plan.trl > 0 {
         let fh = crate::obu::frame_header_lossless_mono_multitile_th(
             &plan.cols_incr,
             &plan.rows_incr,
             plan.tcl,
             plan.trl,
+            updating_cdf,
         );
         wrap_obu_frame_split(&fh, tilegroup)
     } else {
@@ -3445,6 +4591,7 @@ fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8>
             &plan.rows_incr,
             0,
             0,
+            updating_cdf,
         );
         wrap_obu_frame(&fh, tilegroup)
     }
@@ -3452,6 +4599,7 @@ fn assemble_lossless_mono_frame_obus(plan: &Tiling, tilegroup: &[u8]) -> Vec<u8>
 
 /// Encode a monochrome lossless frame's OBU portion from a padded `w8*h8` luma
 /// plane. Caller prepends temporal delimiter, sequence header, metadata.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossless_mono_frame_obus(
     bd: u8,
     w8: usize,
@@ -3460,16 +4608,69 @@ pub(crate) fn encode_lossless_mono_frame_obus(
     visible_h: usize,
     luma: &[i16],
     threads: usize,
+    speed: Speed,
+    updating_cdf: bool,
 ) -> Vec<u8> {
     let pool = Pool::new(threads);
-    let (tilegroup, plan) =
-        encode_lossless_mono_tilegroup(bd, w8, h8, visible_w, visible_h, luma, &pool);
-    assemble_lossless_mono_frame_obus(&plan, &tilegroup)
+    let (tilegroup, plan) = encode_lossless_mono_tilegroup(
+        bd,
+        w8,
+        h8,
+        visible_w,
+        visible_h,
+        luma,
+        &pool,
+        speed,
+        updating_cdf,
+    );
+    assemble_lossless_mono_frame_obus(&plan, &tilegroup, updating_cdf)
 }
 
 #[cfg(test)]
 mod aq_tests {
     use super::*;
+
+    fn emit_semantic_fixture(enc: &mut OdEcEncoder, cdfs: &mut Cdfs) {
+        for i in 0..64 {
+            let skip_ctx = i % cdfs.skip.len();
+            enc.encode_symbol(i & 1, &mut cdfs.skip[skip_ctx]);
+            enc.encode_bool(i & 2 != 0, 4096 + (i as u16 * 257));
+
+            let part_ctx = i % cdfs.part_split[0].len();
+            let part_n = cdfs.part_split[0][part_ctx].len() - 1;
+            enc.encode_symbol(i % part_n, &mut cdfs.part_split[0][part_ctx]);
+            enc.encode_gathered_partition(i & 4 != 0, &cdfs.part_split[0][part_ctx]);
+
+            enc.encode_symbol_noupdate(i & 1, &cdfs.intrabc);
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_match_live_entropy_coding() {
+        for updating_cdf in [false, true] {
+            let mut capture_cdfs = Cdfs::new(crate::coef_q::qcat(140));
+            let capture_slots = capture_cdfs.semantic_slots();
+            let mut capture = OdEcEncoder::new().with_updating_cdf(false);
+            capture.set_semantic_cdfs(&capture_slots);
+            capture.begin_semantic_sink();
+            emit_semantic_fixture(&mut capture, &mut capture_cdfs);
+            let tokens = capture.take_semantic();
+
+            let mut reference_cdfs = Cdfs::new(crate::coef_q::qcat(140));
+            let mut reference = OdEcEncoder::new().with_updating_cdf(updating_cdf);
+            emit_semantic_fixture(&mut reference, &mut reference_cdfs);
+            let expected = reference.done();
+
+            let mut packed_cdfs = Cdfs::new(crate::coef_q::qcat(140));
+            let mut packed_slots = packed_cdfs.semantic_slots();
+            let mut packed = OdEcEncoder::new().with_updating_cdf(updating_cdf);
+            packed.replay_semantic(&tokens, &mut packed_slots);
+
+            assert_eq!(packed.done(), expected, "updating_cdf={updating_cdf}");
+            assert_eq!(packed_cdfs.skip, reference_cdfs.skip);
+            assert_eq!(packed_cdfs.part_split, reference_cdfs.part_split);
+        }
+    }
 
     #[test]
     fn directional_top_k_keeps_three_lowest_costs() {
@@ -3486,18 +4687,53 @@ mod aq_tests {
 
     #[test]
     fn satd_sad_proxy_is_zero_only_for_equal_blocks() {
-        let src = [7i32; 16];
-        assert_eq!(satd_sad_proxy(&src, 4, &src, 4, 4, 4), 0);
-        let mut pred = src;
-        pred[5] += 3;
-        assert!(satd_sad_proxy(&src, 4, &pred, 4, 4, 4) > 0);
+        let rd = crate::rd_sse::RdDispatch::selected();
+        let src = [7u16; 16];
+        let pred = [7i32; 16];
+        assert_eq!(rd.satd_sad_proxy(&src, 4, &pred, 4, 4, 4), 0);
+        let mut pred2 = pred;
+        pred2[5] += 3;
+        assert!(rd.satd_sad_proxy(&src, 4, &pred2, 4, 4, 4) > 0);
     }
 
     #[test]
-    fn filter_intra_never_trades_reconstruction_for_rate() {
-        assert!(filter_intra_sse_allowed(99, 100));
-        assert!(filter_intra_sse_allowed(100, 100));
-        assert!(!filter_intra_sse_allowed(101, 100));
+    fn moment_grid_matches_independent_4x4_blocks() {
+        const STRIDE: usize = 23;
+        let plane: Vec<i32> = (0..STRIDE * 19)
+            .map(|i| ((i * 37 + i / STRIDE * 11) & 1023) as i32)
+            .collect();
+        let (px, py) = (3, 2);
+        let cells = block_moment_grid_16x16(&plane, STRIDE, px, py);
+        for cy in 0..4 {
+            for cx in 0..4 {
+                assert_eq!(
+                    cells[cy * 4 + cx],
+                    block_moments_i32(&plane, STRIDE, px + cx * 4, py + cy * 4, 4, 4),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_sse_guard_tracks_the_shadow_rd_choice() {
+        assert!(raw_sse_guard_choice(
+            "test",
+            RawSseGuard::FilterIntra,
+            100,
+            99,
+            20.0,
+            10.0,
+            true,
+        ));
+        assert!(!raw_sse_guard_choice(
+            "test",
+            RawSseGuard::FilterIntra,
+            100,
+            101,
+            20.0,
+            10.0,
+            false,
+        ));
     }
 
     #[test]
@@ -3517,7 +4753,7 @@ mod aq_tests {
     fn aq_grid_matches_serial() {
         // 200x136 luma: 4x3 SB grid with 8px right / bottom partial SBs.
         let (w, h) = (200usize, 136usize);
-        let mut y = vec![0i32; w * h];
+        let mut y = vec![0u16; w * h];
         for r in 0..h {
             for c in 0..w {
                 // dark gradient + texture patches + flat bands
@@ -3527,7 +4763,7 @@ mod aq_tests {
                 } else {
                     0
                 };
-                y[r * w + c] = (base + tex).clamp(0, 255);
+                y[r * w + c] = (base + tex).clamp(0, 255) as u16;
             }
         }
         let src = [y, vec![128; w * h], vec![128; w * h]];
@@ -3542,6 +4778,7 @@ mod aq_tests {
                         strength: 1.0,
                         boost_only: false,
                         dark: DarkAq::on(),
+                        base_shift: 0,
                         qm: QmLevels::FLAT,
                     };
                     t.enable_aq(base_q, ref_act, &vb);
@@ -3575,13 +4812,15 @@ mod aq_tests {
     #[test]
     fn skipped_whole_64_does_not_consume_delta_q() {
         let src = [
-            vec![128i32; 64 * 64],
-            vec![128i32; 32 * 32],
-            vec![128i32; 32 * 32],
+            vec![128u16; 64 * 64],
+            vec![128u16; 32 * 32],
+            vec![128u16; 32 * 32],
         ];
         let make_tile = || {
             let mut tile = LossyTile::new_420(100, 8, 64, 64, &src, QmLevels::FLAT);
             tile.aq.enabled = true;
+            tile.aq.prev_qidx = 100;
+            tile.aq.cur_qidx = 98;
             tile.aq.read_deltas = true;
             tile.aq.pending = -2;
             tile
@@ -3593,12 +4832,17 @@ mod aq_tests {
             skipped.aq.read_deltas,
             "a skipped whole superblock must return before read_delta_qindex"
         );
+        assert_eq!(skipped.aq.cur_qidx, 100, "skipped SB must roll AQ back");
 
         let mut coded = make_tile();
         coded.code_skip_and_sb_tokens_64(false, 0);
         assert!(
             !coded.aq.read_deltas,
             "a non-skipped whole superblock must consume its delta-Q"
+        );
+        assert_eq!(
+            coded.aq.cur_qidx, 98,
+            "coded SB keeps its signaled AQ qindex"
         );
     }
 
@@ -3624,7 +4868,7 @@ mod aq_tests {
             }
             p
         };
-        let d = DarkAq::on(); // enabled, min_q = 150
+        let d = DarkAq::on(); // enabled, min_q = 90 (2026-07-24 gate ship)
         let dark = build(36);
         let bright = build(180);
         let flat_dark = vec![24i32; 64 * 64]; // dark but no structure
@@ -3644,7 +4888,7 @@ mod aq_tests {
         );
 
         // Gate: disabled below min_q (high quality / low qindex).
-        assert_eq!(dark_prot(&d, 100, &dark, 8), 0, "gated out below min_q");
+        assert_eq!(dark_prot(&d, 60, &dark, 8), 0, "gated out below min_q");
         // Disabled config is always inert.
         assert_eq!(
             dark_prot(&DarkAq::off(), base_q, &dark, 8),
@@ -3679,9 +4923,9 @@ mod aq_tests {
     #[test]
     fn chroma_rd_can_favor_a_split_on_color_detail() {
         let mut src = [
-            vec![128i32; 32 * 32],
-            vec![128i32; 32 * 32],
-            vec![128i32; 32 * 32],
+            vec![128u16; 32 * 32],
+            vec![128u16; 32 * 32],
+            vec![128u16; 32 * 32],
         ];
         for y in 0..16 {
             for x in 0..16 {
@@ -3697,5 +4941,140 @@ mod aq_tests {
             split < none,
             "four color-homogeneous chroma blocks should beat one mixed block: split={split}, none={none}"
         );
+    }
+
+    #[test]
+    fn uv_rate_matches_emitted_cdf_transaction() {
+        let src = [
+            vec![128u16; 16 * 16],
+            vec![128u16; 16 * 16],
+            vec![128u16; 16 * 16],
+        ];
+        let tile = LossyTile::new(120, 8, 16, 16, &src, QmLevels::FLAT);
+        let y_mode = PAETH_PRED;
+        assert_eq!(
+            tile.uv_mode_bits(y_mode, DC_PRED, None),
+            cdf_cost(&tile.dcdf().uv_mode[13 + y_mode], DC_PRED)
+        );
+        let a = [2, -3];
+        let expected = cdf_cost(&tile.dcdf().uv_mode[13 + y_mode], CFL_PRED)
+            + cdf_cost(&tile.dcdf().cfl_sign, 6)
+            + cdf_cost(&tile.dcdf().cfl_alpha[4], 1)
+            + cdf_cost(&tile.dcdf().cfl_alpha[2], 2);
+        assert_eq!(tile.uv_mode_bits(y_mode, CFL_PRED, Some(a)), expected);
+    }
+
+    #[test]
+    fn local_chroma_weight_responds_to_local_color_detail() {
+        let flat = [
+            vec![128u16; 16 * 16],
+            vec![128u16; 16 * 16],
+            vec![128u16; 16 * 16],
+        ];
+        let mut color = flat.clone();
+        for y in 0..16 {
+            for x in 0..16 {
+                color[1][y * 16 + x] = if x < 8 { 24 } else { 232 };
+                color[2][y * 16 + x] = if y < 8 { 224 } else { 32 };
+            }
+        }
+        let flat_tile = LossyTile::new(120, 8, 16, 16, &flat, QmLevels::FLAT);
+        let color_tile = LossyTile::new(120, 8, 16, 16, &color, QmLevels::FLAT);
+        assert!(
+            color_tile.chroma_partition_weight_at(0, 0, 16, 16)
+                > flat_tile.chroma_partition_weight_at(0, 0, 16, 16)
+        );
+    }
+
+    #[test]
+    fn block64_mode_trial_restores_reconstruction() {
+        let mut src = [
+            vec![0u16; 64 * 64],
+            vec![128u16; 64 * 64],
+            vec![128u16; 64 * 64],
+        ];
+        for y in 0..64 {
+            for x in 0..64 {
+                src[0][y * 64 + x] = ((x * 5 + y * 3 + (x ^ y)) & 255) as u16;
+            }
+        }
+        let mut tile =
+            LossyTile::new(160, 8, 64, 64, &src, QmLevels::FLAT).with_speed(Speed::Medium);
+        let before = tile.recon[0].clone();
+        let (_, cost) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
+        assert!(cost.is_finite());
+        assert_eq!(tile.recon[0], before);
+    }
+}
+
+#[cfg(test)]
+mod hog_model_tests {
+    use super::*;
+
+    /// The ported libaom HOG model must pick the direction the block's edges
+    /// actually run in: stripes normal to an axis score that axis's mode
+    /// highest, diagonals score the matching diagonal mode highest.
+    #[test]
+    fn hog_scores_match_block_orientation() {
+        let (w, h) = (32usize, 32usize);
+        // (pattern, expected argmax over [V, H, D45, D135, D113, D157, D203, D67])
+        type HogCase = (&'static str, fn(usize, usize) -> u16, usize);
+        let cases: [HogCase; 4] = [
+            (
+                "horizontal stripes",
+                |_x, y| if (y / 4) % 2 == 0 { 40 } else { 200 },
+                1,
+            ),
+            (
+                "vertical stripes",
+                |x, _y| if (x / 4) % 2 == 0 { 40 } else { 200 },
+                0,
+            ),
+            (
+                "diagonal 45",
+                |x, y| if ((x + y) / 4) % 2 == 0 { 40 } else { 200 },
+                2,
+            ),
+            (
+                "diagonal 135",
+                |x, y| {
+                    if ((16 + x - y.min(15)) / 4) % 2 == 0 {
+                        40
+                    } else {
+                        200
+                    }
+                },
+                3,
+            ),
+        ];
+        for (name, f, want) in cases {
+            let mut yp = vec![0u16; w * h];
+            for yy in 0..h {
+                for xx in 0..w {
+                    yp[yy * w + xx] = f(xx, yy);
+                }
+            }
+            let src = [yp, vec![128u16; w * h], vec![128u16; w * h]];
+            let tile = LossyTile::new(100, 8, w, h, &src, QmLevels::FLAT);
+            let sc = tile.hog_directional_scores(0, 0, 16);
+            let got = sc
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap();
+            assert_eq!(got, want, "{name}: scores {sc:?}");
+        }
+        // A flat block has no gradient, so scores collapse to the model bias.
+        let src = [
+            vec![128u16; w * h],
+            vec![128u16; w * h],
+            vec![128u16; w * h],
+        ];
+        let tile = LossyTile::new(100, 8, w, h, &src, QmLevels::FLAT);
+        let sc = tile.hog_directional_scores(0, 0, 16);
+        for (got, want) in sc.iter().zip(crate::tables::INTRA_HOG_BIAS.iter()) {
+            assert!((got - want).abs() < 1e-6, "flat block should equal bias");
+        }
     }
 }

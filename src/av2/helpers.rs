@@ -361,18 +361,6 @@ pub(crate) fn dc_pred(rec: &[f32], w: usize, y0: usize, x0: usize, bs: usize, ne
     dc_pred_bounded(rec, w, y0, x0, bs, neutral, usize::MAX, usize::MAX)
 }
 
-/// AVM `highbd_dc_predictor_subsampled` (reconintra.h): the chroma DC base for a
-/// CfL block wider or taller than 32 px subsamples its reference ring by 2 (in
-/// each dimension larger than 32) and divides by the *subsampled* sample count.
-/// AVM guards this on `uv_mode == UV_CFL_PRED && (txw > 32 || txh > 32)`, so it is
-/// the correct DC base only for the whole-64 CfL chroma path — the standard
-/// (full-reference) `dc_pred` stays correct everywhere else.
-///
-/// The divisor uses AVM `resolve_divisor_32`, which for a power-of-two count
-/// (always 32 or 64 here) reduces exactly to round-half-up `(sum + count/2) /
-/// count`; the result is clipped to the pixel range like AVM's
-/// `clip_pixel_highbd`. Interior-only, matching the unbounded `dc_pred` this path
-/// already relied on (the whole-64 SB reads a padded, SB-aligned plane).
 pub(crate) fn dc_pred_cfl_subsampled(
     rec: &[f32],
     w: usize,
@@ -435,12 +423,12 @@ pub(crate) fn dc_pred_bounded(
     let avail_left = if fh_a == usize::MAX {
         bs
     } else {
-        (fh_a.saturating_sub(y0)).min(bs).max(1)
+        fh_a.saturating_sub(y0).min(bs).max(1)
     };
     let avail_above = if fw_a == usize::MAX {
         bs
     } else {
-        (fw_a.saturating_sub(x0)).min(bs).max(1)
+        fw_a.saturating_sub(x0).min(bs).max(1)
     };
     let sa: i64 = if ha {
         (0..bs)
@@ -1285,16 +1273,6 @@ pub(crate) fn tx16_distortion(src: &[f32; 256], rec: &[f32]) -> f32 {
     pixel + 0.5 * edge
 }
 
-/// Choose a non-DCT TX_16X16 only when it wins the edge-aware RD comparison.
-///
-/// `dc_only[i]` marks a candidate whose quantised levels have no AC coefficient.
-/// A non-DCT tx_type is only *signaled* when the leaf has an AC coefficient
-/// (`encode_luma_leaf_16x16_full` gates it on `eob >= 1`, mirroring AVM which
-/// reads the intra ext-tx symbol only for eob>1), so a DC-only leaf always
-/// decodes as DCT_DCT. Under ADST/mixed the DC basis function is a DST-VII ramp
-/// (not flat), so a DC-only ADST reconstruction is a gradient while the decoder
-/// produces a flat DCT block — the 4:4:4 "content from nowhere" mismatch. Never
-/// pick a DC-only non-DCT candidate; DCT is exact (and optimal) for flat leaves.
 pub(crate) fn choose_tx16_type(cost: [f32; 4], distortion: [f32; 4], dc_only: [bool; 4]) -> usize {
     let mut best = cost[0];
     let mut choice = 0;
@@ -1497,30 +1475,6 @@ where
         .collect()
 }
 
-/// Dependency-ordered wavefront over an `rows × cols` grid of superblocks: cell
-/// `(r, c)` is only visited after `(r-1, c)` and `(r, c-1)`, so all cells on the
-/// same anti-diagonal `r + c` are mutually independent and run in parallel (one
-/// barrier per diagonal). Peak parallelism is `min(rows, cols)`.
-///
-/// This is the **format-agnostic Stage-A engine** for the staged-threading
-/// decouple: each chroma core (444/420/422/400) supplies the same shape of
-/// per-SB *decide* closure — read the already-finished top/left neighbour
-/// reconstruction, decide the SB, write its own SB region + record entry — and
-/// this driver parallelises it so a single tile saturates all cores without the
-/// compression cost of extra tiles. Emit stays a serial raster replay of the
-/// records (entropy is inherently sequential; the decide is CDF-independent, so
-/// only the recon dependency constrains ordering — exactly this wavefront).
-///
-/// The closure runs on worker threads, so any shared state it mutates (the recon
-/// planes, the per-SB record slots) must use interior mutability. Soundness of
-/// such disjoint writes rests on the invariant this driver guarantees: when
-/// `(r, c)` runs, every cell on diagonals `< r + c` has finished, and no other
-/// cell on the current diagonal touches `(r, c)`'s SB region — so each closure
-/// writes ONLY its own SB block and reads ONLY prior-diagonal neighbours.
-///
-/// Not yet wired into a core's Stage A (that needs the full per-SB decide/emit
-/// decouple + a disjoint-recon-write wrapper); it is the shared driver every
-/// format will call once that lands. See `av2-staged-threading-decouple` memory.
 #[allow(dead_code)]
 pub(crate) fn par_wavefront<F>(nthreads: usize, rows: usize, cols: usize, f: F)
 where
@@ -1541,21 +1495,6 @@ where
     }
 }
 
-/// Row-skewed (WPP-style) wavefront that additionally satisfies the **above-right**
-/// dependency AV2 intra prediction needs: cell `(r, c)` runs only after `(r-1,c-1)`,
-/// `(r-1,c)`, `(r-1,c+1)` (above-right!) and `(r,c-1)` have all finished.
-///
-/// Ordering key `d = 2r + c` achieves this: every one of those four predecessors
-/// maps to a strictly smaller `d` (`2r+c-3`, `2r+c-2`, `2r+c-1`, `2r+c-1`), so they
-/// lie on an earlier barrier; and no two cells sharing a `d` depend on each other
-/// (a same-`d` neighbour of `(r,c)` would be `(r-1,c+2)`, which is not a
-/// predecessor). Peak parallelism is `~min(rows, (cols+1)/2)` — half the plain
-/// anti-diagonal's, the price of the extra dependency, but correct for AV2 intra.
-///
-/// Unlike [`par_wavefront`] (`d = r+c`), this is the schedule a 4:4:4 SB decide can
-/// actually run under: the plain anti-diagonal places `(r-1,c+1)` on the *same*
-/// diagonal (concurrent), so an SB reading its above-right neighbour's recon would
-/// race a half-written block. Barrier per diagonal via [`par_map_indexed`].
 #[allow(dead_code)]
 pub(crate) fn par_wavefront_wpp<F>(nthreads: usize, rows: usize, cols: usize, f: F)
 where
@@ -1582,33 +1521,6 @@ where
     }
 }
 
-/// **Persistent-pool** wavefront. With `needs_above_right`, it uses the WPP
-/// `d = 2r + c` schedule; otherwise it uses the wider `d = r + c` top/left-only
-/// schedule. Workers spawn **once** for the whole wavefront and loop over its
-/// diagonals with a barrier between each.
-///
-/// Why it matters: each format's per-SB decide closure keeps its recon scratch in
-/// a `thread_local!` full-plane buffer (~100+ MB for large frames). Under the
-/// old per-diagonal `par_map_indexed` driver the worker threads are re-created
-/// every diagonal, so that `thread_local` is RE-ALLOCATED per diagonal per worker
-/// → memory-bandwidth saturation that REGRESSES scaling past ~4 threads. Here the
-/// workers persist across all diagonals, so each worker's `thread_local` is
-/// allocated exactly once.
-///
-/// Returns per-cell results indexed `r * cols + c`; every cell is produced exactly
-/// once (all `Some` on return). Correctness rests on three invariants:
-///  1. The `barrier.wait()` after each diagonal enforces the finished-neighbour
-///     dependency — every cell of diagonal `d` is written (and every recon write
-///     its closure made is globally visible, the barrier being a full fence)
-///     before ANY worker starts diagonal `d+1`, which reads those cells' SB
-///     regions as its halo.
-///  2. Result writes are disjoint: each cell `(r, c)` writes `results[r*cols+c]`
-///     exactly once, so the raw-pointer view never aliases across workers.
-///  3. `f` keeps using the existing `thread_local!` scratch unchanged; persistence
-///     across diagonals is what makes that allocation one-time.
-///
-/// `nthreads <= 1` runs serially in diagonal order (matching the parallel visit
-/// order). See `av2-staged-threading-decouple` memory.
 pub(crate) fn par_wavefront_pool<T, F>(
     nthreads: usize,
     rows: usize,
@@ -1753,11 +1665,13 @@ where
 
             let mut state = ready.lock().expect("wavefront queue poisoned");
             state.remaining -= 1;
+            let mut newly_ready = 0usize;
             let mut release = |j: usize| {
                 debug_assert!(state.deps[j] > 0);
                 state.deps[j] -= 1;
                 if state.deps[j] == 0 {
                     state.queue.push_back(j);
+                    newly_ready += 1;
                 }
             };
             // Exact reverse edges of the dependency set above.
@@ -1770,8 +1684,17 @@ where
                     release(i + cols - 1); // below-left consumes above-right
                 }
             }
-            if state.remaining == 0 || !state.queue.is_empty() {
+            // Wake exactly as many sleepers as there is new work. At most three
+            // cells become ready per completion, so the old `notify_all` was a
+            // thundering herd of up to `nthreads` wakeups per cheap cell — pure
+            // contention on fast-coding content. The completing worker keeps one
+            // ready cell for itself by looping, so wake `newly_ready - 1`.
+            if state.remaining == 0 {
                 wake.notify_all();
+            } else {
+                for _ in 1..newly_ready {
+                    wake.notify_one();
+                }
             }
         }
     };
@@ -1786,16 +1709,6 @@ where
     results
 }
 
-/// A raw mutable view over one reconstruction plane that lets `par_wavefront`
-/// closures write their own superblock blocks concurrently. `Send + Sync` is
-/// asserted unsafely; soundness rests on the wavefront invariant — each cell
-/// writes ONLY its own SB block, so no two concurrent writers touch the same
-/// byte, and any bytes read (finished neighbours from earlier diagonals) are
-/// never being written at the same time.
-///
-/// Not yet wired into a core (integration also needs the `DecideOnly` mode + the
-/// per-SB decouple); shipped now as the tested companion to [`par_wavefront`].
-#[allow(dead_code)]
 pub(crate) struct PlaneWriter<T: Copy> {
     ptr: *mut T,
     len: usize,
@@ -1807,7 +1720,6 @@ pub(crate) struct PlaneWriter<T: Copy> {
 unsafe impl<T: Copy + Send> Send for PlaneWriter<T> {}
 unsafe impl<T: Copy + Send + Sync> Sync for PlaneWriter<T> {}
 
-#[allow(dead_code)]
 impl<T: Copy> PlaneWriter<T> {
     pub(crate) fn new(plane: &mut [T], stride: usize) -> Self {
         Self {
@@ -1815,6 +1727,14 @@ impl<T: Copy> PlaneWriter<T> {
             len: plane.len(),
             stride,
         }
+    }
+
+    /// Read-only raw view (ptr, len, stride) sharing this writer's provenance.
+    /// Used by AV1 IntraBC wavefront capture: workers READ finished cells'
+    /// reconstruction through this view while other cells write disjoint
+    /// regions — sound under the same disjoint-block contract as the writes.
+    pub(crate) fn read_view(&self) -> (*const T, usize, usize) {
+        (self.ptr as *const T, self.len, self.stride)
     }
 
     /// Write an `h × w` block (row-major `src`) at plane offset `(y, x)`.
@@ -1832,9 +1752,37 @@ impl<T: Copy> PlaneWriter<T> {
         }
     }
 
+    /// Copy a strided source region to the same `(y, x)` in this plane.
+    ///
+    /// # Safety
+    /// The destination rectangle must be exclusively owned by the caller and
+    /// both source and destination rectangles must be in bounds.
+    pub(crate) unsafe fn copy_region_from(
+        &self,
+        src: &[T],
+        src_stride: usize,
+        y: usize,
+        x: usize,
+        h: usize,
+        w: usize,
+    ) {
+        if h == 0 || w == 0 {
+            return;
+        }
+        debug_assert!((y + h - 1) * self.stride + x + w <= self.len);
+        debug_assert!((y + h - 1) * src_stride + x + w <= src.len());
+        for r in 0..h {
+            let dst_off = (y + r) * self.stride + x;
+            let src_off = (y + r) * src_stride + x;
+            // SAFETY: caller guarantees exclusive access to this destination.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(dst_off), w) };
+            dst.copy_from_slice(&src[src_off..src_off + w]);
+        }
+    }
+
     /// Copy an `h × w` region at `(y, x)` FROM this plane into `dst` (a full-plane
     /// buffer with the same stride) at the SAME coordinates. Used by a wavefront
-    /// worker to pull its halo (finished neighbours) out of the shared recon plane.
+    /// worker to pull its halo (finished neighbors) out of the shared recon plane.
     ///
     /// # Safety
     /// No thread may be WRITING this region concurrently. Under `par_wavefront_wpp`
@@ -1870,7 +1818,7 @@ mod tests {
             let ok = AtomicBool::new(true);
             let idx = |r: usize, c: usize| r * cols + c;
             par_wavefront(4, rows, cols, |r, c| {
-                // Both causal neighbours must already be finished when we run.
+                // Both causal neighbors must already be finished when we run.
                 if r > 0 && !done[idx(r - 1, c)].load(Ordering::Acquire) {
                     ok.store(false, Ordering::Relaxed);
                 }
@@ -1881,7 +1829,7 @@ mod tests {
             });
             assert!(
                 ok.load(Ordering::Relaxed),
-                "{rows}x{cols}: cell ran before top/left neighbour"
+                "{rows}x{cols}: cell ran before top/left neighbor"
             );
             assert!(
                 done.iter().all(|b| b.load(Ordering::Relaxed)),
@@ -1928,7 +1876,7 @@ mod tests {
             });
             assert!(
                 ok.load(Ordering::Relaxed),
-                "{rows}x{cols}: cell ran before a causal (incl. above-right) neighbour"
+                "{rows}x{cols}: cell ran before a causal (incl. above-right) neighbor"
             );
             assert!(
                 done.iter().all(|b| b.load(Ordering::Relaxed)),
@@ -1978,7 +1926,7 @@ mod tests {
             });
             assert!(
                 ok.load(Ordering::Relaxed),
-                "{rows}x{cols}: cell ran before a causal (incl. above-right) neighbour"
+                "{rows}x{cols}: cell ran before a causal (incl. above-right) neighbor"
             );
             for r in 0..rows {
                 for c in 0..cols {

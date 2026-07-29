@@ -86,8 +86,8 @@ fn constrain_spec(diff: i32, strength: i32, damping: i32) -> i32 {
 /// spec `cdef_direction` process: it correlates the 8x8 luma block against the 8
 /// directional patterns and returns the best. `bd_shift = bd - 8` normalizes
 /// high-bit-depth samples to 8-bit before the variance comparison.
-pub(crate) fn cdef_direction(
-    plane: &[i32],
+pub(crate) fn cdef_direction<P: crate::intrapred::Pel>(
+    plane: &[P],
     stride: usize,
     x: usize,
     y: usize,
@@ -104,7 +104,7 @@ pub(crate) fn cdef_direction(
             // edge sample is replicated, which is a reasonable direction estimate.
             let yy = (y + i).min(rows - 1);
             let xx = (x + j).min(stride - 1);
-            let p = (plane[yy * stride + xx] >> coeff_shift) - 128;
+            let p = (plane[yy * stride + xx].widen() >> coeff_shift) - 128;
             partial[0][i + j] += p;
             partial[1][i + j / 2] += p;
             partial[2][i] += p;
@@ -176,9 +176,9 @@ pub(crate) fn adjust_pri(pri: i32, var: i32) -> i32 {
 /// bit depth. Out-of-frame / skip taps are marked `CDEF_VERY_LARGE` in `src`
 /// and excluded. Mirrors spec `cdef_filter` for one 8x8.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cdef_filter_8x8(
-    dst: &mut [i32],
-    src: &[i32],
+pub(crate) fn cdef_filter_8x8<P: crate::intrapred::Pel>(
+    dst: &mut [P],
+    src: &[P],
     stride: usize,
     x: usize,
     y: usize,
@@ -196,10 +196,10 @@ pub(crate) fn cdef_filter_8x8(
 /// clamping are identical regardless of block size — only the iteration bounds
 /// change — so this exactly mirrors the decoders' per-sub-block chroma filtering.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cdef_filter_block(
-    dst: &mut [i32],
+pub(crate) fn cdef_filter_block<P: crate::intrapred::Pel>(
+    dst: &mut [P],
     dst_y0: usize,
-    src: &[i32],
+    src: &[P],
     stride: usize,
     x: usize,
     y: usize,
@@ -237,7 +237,7 @@ pub(crate) fn cdef_filter_block(
             if cx >= stride || cy >= rows {
                 continue; // partial-edge block: skip out-of-frame samples
             }
-            let centre = src[cy * stride + cx];
+            let centre = src[cy * stride + cx].widen();
             if centre == CDEF_VERY_LARGE {
                 // Out-of-frame centre (marked snapshot): the decoder has no such
                 // pixel, so leave `dst` untouched.
@@ -293,7 +293,7 @@ pub(crate) fn cdef_filter_block(
             if clipping {
                 out = out.clamp(min, max);
             }
-            dst[(cy - dst_y0) * stride + cx] = out.clamp(0, maxv);
+            dst[(cy - dst_y0) * stride + cx] = P::narrow(out.clamp(0, maxv));
         }
     }
 }
@@ -301,7 +301,7 @@ pub(crate) fn cdef_filter_block(
 /// Fetch a sample with bounds check; out-of-frame returns `CDEF_VERY_LARGE` so
 /// the caller excludes it (spec pads with the large value).
 #[inline]
-fn sample(plane: &[i32], stride: usize, x: i32, y: i32) -> i32 {
+fn sample<P: crate::intrapred::Pel>(plane: &[P], stride: usize, x: i32, y: i32) -> i32 {
     if x < 0 || y < 0 {
         return CDEF_VERY_LARGE;
     }
@@ -310,7 +310,7 @@ fn sample(plane: &[i32], stride: usize, x: i32, y: i32) -> i32 {
     if x >= stride || y >= rows {
         return CDEF_VERY_LARGE;
     }
-    plane[y * stride + x]
+    plane[y * stride + x].widen()
 }
 
 /// Candidate primary strengths searched per 64x64 (kept small for speed).
@@ -319,13 +319,20 @@ pub(crate) static PRI_CANDIDATES: [i32; 4] = [0, 1, 2, 4];
 pub(crate) static SEC_CANDIDATES: [i32; 3] = [0, 1, 2];
 
 /// SSE over one (possibly edge-clipped) 8x8 block of a plane.
-pub(crate) fn block_sse_8x8(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, y: usize) -> i64 {
+pub(crate) fn block_sse_8x8<P: crate::intrapred::Pel>(
+    a: &[P],
+    b: &[P],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+) -> i64 {
     let mut s = 0i64;
     let yh = (y + 8).min(h);
     let xw = (x + 8).min(w);
     for yy in y..yh {
         for xx in x..xw {
-            let d = (a[yy * w + xx] - b[yy * w + xx]) as i64;
+            let d = (a[yy * w + xx].widen() as i64) - (b[yy * w + xx].widen() as i64);
             s += d * d;
         }
     }
@@ -341,9 +348,9 @@ pub(crate) fn block_sse_8x8(a: &[i32], b: &[i32], w: usize, h: usize, x: usize, 
 /// `dst` is the candidate (filtered/unfiltered) recon, `src` the source. Partial
 /// edge blocks fall back to plain SSE (the ×64 variance calibration needs a full
 /// 8x8). This is an encoder-side decision metric, not part of the bitstream.
-pub(crate) fn cdef_dist_8x8(
-    src: &[i32],
-    dst: &[i32],
+pub(crate) fn cdef_dist_8x8<P: crate::intrapred::Pel>(
+    src: &[P],
+    dst: &[P],
     w: usize,
     h: usize,
     x: usize,
@@ -356,8 +363,8 @@ pub(crate) fn cdef_dist_8x8(
     let (mut ss, mut sd, mut ss2, mut sd2, mut ssd) = (0i64, 0i64, 0i64, 0i64, 0i64);
     for yy in y..y + 8 {
         for xx in x..x + 8 {
-            let s = src[yy * w + xx] as i64;
-            let d = dst[yy * w + xx] as i64;
+            let s = src[yy * w + xx].widen() as i64;
+            let d = dst[yy * w + xx].widen() as i64;
             ss += s;
             sd += d;
             ss2 += s * s;

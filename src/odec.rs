@@ -26,7 +26,6 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 const EC_PROB_SHIFT: u32 = 6;
 const EC_MIN_PROB: u32 = 4;
 const WINDOW_SIZE: i16 = 32; // ec_window = u32
@@ -58,10 +57,6 @@ pub(crate) fn update_cdf(cdf: &mut [u16], val: usize) {
         }
     }
 }
-
-// ----------------------------------------------------------------------------
-// Encoder
-// ----------------------------------------------------------------------------
 
 /// Encode-side inverse of the spec's `inverse_recenter(r, v)`. Maps an absolute
 /// value `v` in `0..n` to its recentred code so that values near the reference
@@ -96,6 +91,20 @@ pub(crate) fn inverse_recenter(r: u32, v: u32) -> u32 {
     } else {
         r + (v >> 1)
     }
+}
+
+const TOKEN_TAG_SHIFT: u32 = 30;
+const TOKEN_TAG_MASK: u32 = 3 << TOKEN_TAG_SHIFT;
+const TOKEN_BOOL: u32 = 1 << TOKEN_TAG_SHIFT;
+const TOKEN_GATHERED_PARTITION: u32 = 2 << TOKEN_TAG_SHIFT;
+const TOKEN_NOUPDATE: u32 = 3 << TOKEN_TAG_SHIFT;
+
+#[derive(Default)]
+pub(crate) struct EntropyTokens {
+    /// Two high tag bits select adaptive symbol, fixed boolean, gathered
+    /// partition boolean, or non-adapting symbol. Payloads fit in 24 bits.
+    pub(crate) ops: Vec<u32>,
+    pub(crate) cdef_point: Option<u32>,
 }
 
 /// Raw `store` ops with per-superblock `mark`s; replaying through a fresh
@@ -137,6 +146,12 @@ impl SymbolTrace {
         self.marks.len()
     }
 
+    /// All recorded ops (debug dumps).
+    #[allow(unused)]
+    pub(crate) fn ops(&self) -> &[u64] {
+        &self.ops
+    }
+
     /// Ops of superblock `i`: from its mark up to the next mark (or the end).
     pub(crate) fn sb_ops(&self, i: usize) -> &[u64] {
         let a = self.marks[i] as usize;
@@ -171,12 +186,14 @@ pub(crate) struct OdEcEncoder {
     cnt: i16,
     precarry: Vec<u16>,
     trace: Option<Box<SymbolTrace>>,
-    /// Discard mode for wavefront capture workers: `store` becomes a no-op
-    /// (no range coding, no output growth). Decisions never read encoder
-    /// state, so a sink capture records the identical `DecisionRecord` while
-    /// skipping all entropy-coding work. Bytes from a sink encoder are
-    /// meaningless — never call `done()` expecting output.
+    semantic: Option<EntropyTokens>,
+    /// Discard mode for wavefront capture workers: semantic operations are
+    /// recorded, but `store` performs no range coding and grows no output.
+    /// Bytes from a sink encoder are meaningless — never call `done()`
+    /// expecting output.
     pub(crate) sink: bool,
+    /// Whether `encode_symbol` mutates its CDF after coding the symbol.
+    pub(crate) updating_cdf: bool,
 }
 
 impl Default for OdEcEncoder {
@@ -193,8 +210,15 @@ impl OdEcEncoder {
             cnt: -9,
             precarry: Vec::new(),
             trace: None,
+            semantic: None,
             sink: false,
+            updating_cdf: true,
         }
+    }
+
+    pub(crate) fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
+        self.updating_cdf = updating_cdf;
+        self
     }
 
     /// Start recording every subsequent `store` into a fresh trace.
@@ -215,10 +239,92 @@ impl OdEcEncoder {
         if let Some(t) = self.trace.as_mut() {
             t.cdef_mark();
         }
+        if let Some(t) = self.semantic.as_mut()
+            && t.cdef_point.is_none()
+        {
+            t.cdef_point = Some(t.ops.len() as u32);
+        }
     }
 
     pub(crate) fn take_trace(&mut self) -> Option<Box<SymbolTrace>> {
         self.trace.take()
+    }
+
+    /// Tag each capture-worker CDF with its stable logical ID. Capture never
+    /// consumes probability values, so the adaptation-counter word is free.
+    pub(crate) fn set_semantic_cdfs(&mut self, cdfs: &[(*mut u16, usize)]) {
+        for (i, &(ptr, len)) in cdfs.iter().enumerate() {
+            debug_assert!(len > 0);
+            // SAFETY: these slots belong exclusively to this worker tile.
+            unsafe { *ptr.add(len - 1) = i as u16 };
+        }
+    }
+
+    /// Reset the arithmetic sink and begin one superblock's semantic stream.
+    /// The CDF registry is deliberately retained across cells.
+    pub(crate) fn begin_semantic_sink(&mut self) {
+        self.low = 0;
+        self.rng = 0x8000;
+        self.cnt = -9;
+        self.precarry.clear();
+        self.trace = None;
+        self.semantic = Some(EntropyTokens::default());
+        self.sink = true;
+    }
+
+    pub(crate) fn take_semantic(&mut self) -> EntropyTokens {
+        self.semantic
+            .take()
+            .expect("semantic capture was not enabled")
+    }
+
+    /// Apply an unresolved capture stream to this encoder and the packer's
+    /// live adaptive CDF slots.
+    pub(crate) fn replay_semantic(
+        &mut self,
+        tokens: &EntropyTokens,
+        cdfs: &mut [(*mut u16, usize)],
+    ) {
+        let split = tokens.cdef_point.map(|v| v as usize);
+        for (i, &token) in tokens.ops.iter().enumerate() {
+            if split == Some(i) {
+                self.trace_cdef_mark();
+            }
+            if token & TOKEN_TAG_MASK == 0 {
+                let cdf = ((token >> 8) & 0xffff) as usize;
+                let symbol = (token & 0xff) as usize;
+                let (ptr, len) = cdfs[cdf];
+                // SAFETY: slots were collected from one live `Cdfs`
+                // instance, its Vec allocations are not resized while
+                // packing, and tokens are consumed strictly sequentially.
+                let table = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                self.encode_symbol(symbol, table);
+            } else if token & TOKEN_TAG_MASK == TOKEN_BOOL {
+                let value = token & 1 != 0;
+                let probability = ((token >> 1) & 0xffff) as u16;
+                self.encode_bool(value, probability);
+            } else if token & TOKEN_TAG_MASK == TOKEN_GATHERED_PARTITION {
+                let cdf = ((token >> 1) & 0xffff) as usize;
+                let top = token & 1 != 0;
+                let (ptr, len) = cdfs[cdf];
+                // SAFETY: same slot lifetime argument as the adaptive arm;
+                // this operation reads but deliberately does not adapt it.
+                let table = unsafe { std::slice::from_raw_parts(ptr, len) };
+                let p = crate::coeffs::gather_split_prob_icdf(table, top);
+                self.encode_bool(true, p);
+            } else {
+                let cdf = ((token >> 8) & 0xffff) as usize;
+                let symbol = (token & 0xff) as usize;
+                let (ptr, len) = cdfs[cdf];
+                // SAFETY: same stable-slot contract; this arm deliberately
+                // leaves the selected table unmodified.
+                let table = unsafe { std::slice::from_raw_parts(ptr, len) };
+                self.encode_symbol_noupdate(symbol, table);
+            }
+        }
+        if split == Some(tokens.ops.len()) {
+            self.trace_cdef_mark();
+        }
     }
 
     /// Re-emit previously recorded ops through this encoder.
@@ -281,12 +387,42 @@ impl OdEcEncoder {
         self.rng
     }
     pub(crate) fn encode_bool(&mut self, val: bool, f: u16) {
+        if let Some(t) = self.semantic.as_mut() {
+            t.ops.push(TOKEN_BOOL | ((f as u32) << 1) | val as u32);
+            if self.sink {
+                return;
+            }
+        }
         // equivalent to symbol(val, [f, 0]) with nms = 2 - val
         let s = val as u32;
         let cdf = [f as u32, 0u32];
         let nms = 2 - s;
         let fl = if s > 0 { cdf[(s - 1) as usize] } else { 32768 };
         let fh = cdf[s as usize];
+        self.store(fl, fh, nms);
+    }
+
+    /// Encode an AV1 cropped-edge partition boolean whose probability is
+    /// gathered from a live multi-symbol partition CDF without adapting it.
+    pub(crate) fn encode_gathered_partition(&mut self, top: bool, cdf: &[u16]) {
+        if let Some(t) = self.semantic.as_mut() {
+            let key = *cdf.last().expect("empty partition CDF");
+            t.ops
+                .push(TOKEN_GATHERED_PARTITION | ((key as u32) << 1) | top as u32);
+            if self.sink {
+                return;
+            }
+        }
+        let p = crate::coeffs::gather_split_prob_icdf(cdf, top);
+        let s = 1u32;
+        let fixed = [p as u32, 0u32];
+        let nms = 2 - s;
+        let fl = if s > 0 {
+            fixed[(s - 1) as usize]
+        } else {
+            32768
+        };
+        let fh = fixed[s as usize];
         self.store(fl, fh, nms);
     }
 
@@ -299,7 +435,15 @@ impl OdEcEncoder {
     }
 
     /// Encode symbol `s` against an inverse-form `cdf` (NOT adapted).
+    #[allow(unused)]
     pub(crate) fn encode_symbol_noupdate(&mut self, s: usize, cdf: &[u16]) {
+        if let Some(t) = self.semantic.as_mut() {
+            let key = *cdf.last().expect("empty non-adaptive CDF");
+            t.ops.push(TOKEN_NOUPDATE | ((key as u32) << 8) | s as u32);
+            if self.sink {
+                return;
+            }
+        }
         let nms = (cdf.len() - s) as u32;
         let fl = if s > 0 { cdf[s - 1] as u32 } else { 32768 };
         let fh = cdf[s] as u32;
@@ -308,8 +452,21 @@ impl OdEcEncoder {
 
     /// Encode symbol `s`, then adapt `cdf` (dav1d-compatible).
     pub(crate) fn encode_symbol(&mut self, s: usize, cdf: &mut [u16]) {
-        self.encode_symbol_noupdate(s, cdf);
-        update_cdf(cdf, s);
+        if let Some(t) = self.semantic.as_mut() {
+            let key = *cdf.last().expect("empty adaptive CDF");
+            debug_assert!(s < 256);
+            t.ops.push(((key as u32) << 8) | s as u32);
+            if self.sink {
+                return;
+            }
+        }
+        let nms = (cdf.len() - s) as u32;
+        let fl = if s > 0 { cdf[s - 1] as u32 } else { 32768 };
+        let fh = cdf[s] as u32;
+        self.store(fl, fh, nms);
+        if self.updating_cdf {
+            update_cdf(cdf, s);
+        }
     }
 
     /// `ns(n)` — non-symmetric flat coding of a value in `0..n` (spec 4.10.7).

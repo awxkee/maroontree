@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::av2::cdf_state::{CdfState, update_cdf};
+use crate::util::dirty_log2f;
 
 pub(crate) static MIN_PROB: [[u16; 8]; 8] = [
     [63, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
@@ -352,7 +353,7 @@ impl RangeEncoder {
             0
         };
         let probability = (hi - lo).max(1) as f32 / 32768.0;
-        -probability.log2()
+        -dirty_log2f(probability)
     }
 
     /// Estimate the syntax rate from the tile's current adaptive CDFs without

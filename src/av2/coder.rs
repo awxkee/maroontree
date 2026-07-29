@@ -3949,14 +3949,14 @@ fn encode_luma_palette_colors(
     enc.encode_bypass(colors[0] as u32, bit_depth as u32);
     let min_bits = bit_depth as u32 - 3;
     let max_delta = colors
-        .windows(2)
+        .array_windows::<2>()
         .map(|v| (v[1] - v[0]) as u32)
         .max()
         .unwrap();
     let mut bits = ceil_log2(max_delta).max(min_bits);
     enc.encode_bypass(bits - min_bits, 2);
     let mut range = (1u32 << bit_depth) - colors[0] as u32 - 1;
-    for pair in colors.windows(2) {
+    for pair in colors.array_windows::<2>() {
         let delta = (pair[1] - pair[0]) as u32;
         enc.encode_bypass(delta - 1, bits);
         range -= delta;
