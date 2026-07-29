@@ -26,23 +26,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/// TEMPORARY A/B switch for the rectangular-leaf luma MODE search.
-fn rect_leaf_mode_search_enabled() -> bool {
-    true
-}
-
-/// TEMPORARY A/B switch for the rectangular-leaf transform-type search.
-fn rect_leaf_tx_search_enabled() -> bool {
-    true
-}
-
-/// Filter-intra trial in the partition proxy: implemented and measured, but
-/// **default OFF**. It is worth -0.08% on the tuning corpus and nothing on
-/// holdout (-0.27% -> -0.25%, i.e. within noise) while costing real time.
-fn proxy_filter_intra_enabled() -> bool {
-    false
-}
-
 /// Inverse + dequant for a rect16 luma transform by 7-type txtp symbol
 /// (0 = IDTX, 1 = DCT_DCT, 2 = V_DCT, 3 = H_DCT, 4 = ADST_ADST,
 /// 5 = ADST_DCT, 6 = DCT_ADST). `vert` selects RTX_8X16 vs RTX_16X8.
@@ -78,11 +61,6 @@ fn inv_rect_luma_128(
     }
 }
 
-/// TEMPORARY A/B switch for the partition proxy's transform refinement.
-fn proxy_tx_refine_enabled() -> bool {
-    true
-}
-
 /// Trellis calibration for the compact partition-proxy beam. NOT a speed
 /// knob (2026-07-24 ladder): gating it off at Medium collapsed synthetic
 /// content (x_screen +46% / x_fractal +31% vs Slow — un-RDOQ'd proxy prices
@@ -92,51 +70,6 @@ fn proxy_tx_refine_enabled() -> bool {
 /// only 0.05s of 0.40 and gave back 0.6%.
 fn proxy_candidate_rdoq(speed: Speed) -> bool {
     !matches!(speed, Speed::Fast)
-}
-
-/// Mode set used by the partition-decision proxy (`rd_cost_square`).
-/// Threshold for [`LossyTile::hog_directional_scores`]: a directional mode
-/// whose score is at or below this is never predicted. libaom uses
-/// `{-1.2, -1.2, -0.6, 0.4}` for its four `intra_pruning_with_hog` levels.
-/// `NEG_INFINITY` prunes nothing (bit-identical to no pruning at all).
-///
-/// MEASURED 2026-07-24, DEFAULT OFF. All three libaom thresholds are
-/// BD-rate-neutral to three decimals — in fact byte-identical output, because
-/// the modes this drops are exactly the ones the SATD beam was already going
-/// to reject — but every one of them is SLOWER on photographs:
-/// kodak20 +1.4..+2.8%, x_oahu +3.3..+5.5%; only x_screen at 0.4 wins
-/// (-5.6%), where strong directional structure prunes many modes.
-///
-/// The reason is structural: libaom gains from HOG because it prunes full RD
-/// evaluations, whereas `proxy_mode_beam` already narrows 13 modes to 2 with
-/// SATD, so HOG can only save the cheaper *ranking* stage — and recomputing
-/// Sobel + bin bisection per block costs more than it saves. libaom avoids
-/// that by computing per-pixel gradients ONCE per superblock
-/// (`lowbd_compute_gradient_info_sb`) and having each block merely accumulate
-/// them. Retry from there, not from a per-block Sobel.
-const HOG_PRUNE_THRESH: f32 = f32::NEG_INFINITY;
-
-/// Bin index for a Sobel gradient, by bisection on `(dy << 16) / dx`.
-/// Direct port of libaom `get_hist_bin_idx`.
-#[inline]
-fn hog_bin_idx(dx: i32, dy: i32) -> usize {
-    let ratio = (dy * (1 << 16)) / dx;
-    let th = &HOG_BIN_THRESHOLDS;
-    let (lo, hi) = if ratio <= th[7] {
-        (0, 7)
-    } else if ratio <= th[15] {
-        (8, 15)
-    } else if ratio <= th[23] {
-        (16, 23)
-    } else {
-        (24, 31)
-    };
-    for (idx, &t) in th.iter().enumerate().take(hi + 1).skip(lo) {
-        if ratio <= t {
-            return idx;
-        }
-    }
-    31
 }
 
 /// Margin for the 8x8 SPLIT4 breakout, the [`split_breakout_k`] analogue one
@@ -177,27 +110,6 @@ fn split_breakout_k(speed: Speed) -> f32 {
     }
 }
 
-const PROXY_RDOQ_MSE_T: f32 = f32::INFINITY;
-
-#[inline]
-fn proxy_rdoq_pays(resid: &[i32], ac_q: f32) -> bool {
-    if !PROXY_RDOQ_MSE_T.is_finite() {
-        return true;
-    }
-    let sum_sq: i64 = resid.iter().map(|&v| (v as i64) * (v as i64)).sum();
-    let mse = sum_sq as f32 / resid.len() as f32;
-    mse <= PROXY_RDOQ_MSE_T * ac_q * ac_q
-}
-
-fn proxy_modes(reduced: bool) -> &'static [usize] {
-    if reduced { fast_nd_modes() } else { nd_modes() }
-}
-
-/// Use cheap prediction-domain ranking before the transform/trellis/rate stage.
-fn proxy_mode_beam_enabled() -> bool {
-    true
-}
-
 fn proxy_mode_beam_len(speed: Speed, _dim: usize) -> usize {
     match speed {
         Speed::Fast => 1,
@@ -217,70 +129,7 @@ struct Luma16BeamCandidate {
     palette: Option<LossyLumaPalette>,
 }
 
-fn block_hog_kernel(
-    src: &[u16],
-    stride: usize,
-    px: usize,
-    py: usize,
-    dim: usize,
-) -> [f32; 32] {
-    let mut hist = [0.0f32; 32];
-    let mut total = 0.1f32;
-    for r in 1..dim - 1 {
-        let row = (py + r) * stride + px;
-        for c in 1..dim - 1 {
-            let i = row + c;
-            let (up, dn) = (i - stride, i + stride);
-            let dx = (src[up + 1] as i32 + 2 * src[i + 1] as i32 + src[dn + 1] as i32)
-                - (src[up - 1] as i32 + 2 * src[i - 1] as i32 + src[dn - 1] as i32);
-            let dy = (src[dn - 1] as i32 + 2 * src[dn] as i32 + src[dn + 1] as i32)
-                - (src[up - 1] as i32 + 2 * src[up] as i32 + src[up + 1] as i32);
-            let magnitude = dx.abs() + dy.abs();
-            if magnitude == 0 {
-                continue;
-            }
-            total += magnitude as f32;
-            if dx == 0 {
-                hist[0] += (magnitude / 2) as f32;
-                hist[31] += (magnitude / 2) as f32;
-            } else {
-                hist[hog_bin_idx(dx, dy)] += magnitude as f32;
-            }
-        }
-    }
-    for bin in &mut hist {
-        *bin /= total;
-    }
-    hist
-}
-
-fn hog_directional_scores_kernel(hist: &[f32; 32]) -> [f32; 8] {
-    std::array::from_fn(|mode| {
-        let mut dot = 0.0f32;
-        for (&feature, &weight) in hist.iter().zip(&INTRA_HOG_WEIGHTS[mode]) {
-            dot += feature * weight;
-        }
-        INTRA_HOG_BIAS[mode] + dot
-    })
-}
-
 impl<'a> LossyTile<'a> {
-    /// 32-bin histogram of Sobel gradient orientations over the SOURCE pixels
-    /// of a `dim`x`dim` block, weighted by gradient magnitude and normalized.
-    /// Direct port of libaom `lowbd_generate_hog` (interior pixels only, so
-    /// no neighbour access is needed).
-    fn block_hog(&self, px: usize, py: usize, dim: usize) -> [f32; 32] {
-        block_hog_kernel(&self.src[0], self.w, px, py, dim)
-    }
-
-    /// Scores for the eight directional modes, indexed by `mode - V_PRED`
-    /// (V, H, D45, D135, D113, D157, D203, D67 — our constants are in that
-    /// same order). One 8x32 dot product; the model has no hidden layer.
-    fn hog_directional_scores(&self, px: usize, py: usize, dim: usize) -> [f32; 8] {
-        let hist = self.block_hog(px, py, dim);
-        hog_directional_scores_kernel(&hist)
-    }
-
     fn proxy_mode_beam<const N: usize>(
         &self,
         px: usize,
@@ -291,18 +140,7 @@ impl<'a> LossyTile<'a> {
         pred: &mut [i32; N],
     ) -> FixedList<usize, 13> {
         let mut ranked = FixedList::<(u64, usize), 13>::new((0, DC_PRED));
-        // Gradient-histogram pruning: score the eight directional modes from
-        // the source's edge orientations and drop the ones that disagree with
-        // it BEFORE predicting them. Non-directional modes are always kept.
-        let hog = (HOG_PRUNE_THRESH > f32::NEG_INFINITY)
-            .then(|| self.hog_directional_scores(px, py, dim));
         for &m in nd_modes() {
-            if let Some(scores) = hog.as_ref()
-                && (V_PRED..=VERT_LEFT_PRED).contains(&m)
-                && scores[m - V_PRED] <= HOG_PRUNE_THRESH
-            {
-                continue;
-            }
             if m == DC_PRED {
                 let d = self.intrapred.dc_pred(&self.recon[0], self.w, px, py, dim, dim, self.bd as i32);
                 pred.fill(d);
@@ -402,8 +240,6 @@ impl<'a> LossyTile<'a> {
         let lam = trellis_lambda();
         let mlam = self.mlam();
         let (lam, mlam) = (lam * prdo, mlam * prdo);
-        let reduced = self.speed.reduced_modes();
-        let configured_modes: &[usize] = proxy_modes(reduced);
         let mut best = f32::INFINITY;
         if self.try_palette() {
             let key = ((px as u64) << 34) | ((py as u64) << 8) | dim as u64;
@@ -479,11 +315,11 @@ impl<'a> LossyTile<'a> {
         let mut win16: Option<(usize, [i32; 256], [i32; 256])> = None;
         match dim {
             8 => {
-                let beam = proxy_mode_beam_enabled().then(|| {
+                let beam = {
                     let mut pred = self.sbuf_i64();
                     self.proxy_mode_beam::<64>(px, py, 8, have_tr, have_bl, &mut pred)
-                });
-                let modes = beam.as_deref().unwrap_or(configured_modes);
+                };
+                let modes = &beam;
                 let scan = &SCAN_8X8;
                 for &m in modes {
                     let mut pred = [0i32; 64];
@@ -520,7 +356,7 @@ impl<'a> LossyTile<'a> {
                         8,
                     );
                     let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
-                    if proxy_candidate_rdoq(self.speed) && proxy_rdoq_pays(&resid[..], acq) {
+                    if proxy_candidate_rdoq(self.speed) {
                         trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
                     }
                     let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
@@ -547,9 +383,7 @@ impl<'a> LossyTile<'a> {
                 // prices every leaf as DCT-only while the real block may code it
                 // far cheaper, so leaves that respond well to ADST are
                 // systematically undervalued in the partition decision.
-                if self.speed.try_adst()
-                    && proxy_tx_refine_enabled()
-                    && let Some((m, pred, resid)) = win
+                if self.speed.try_adst() && let Some((m, pred, resid)) = win
                 {
                     for txtp in [ADST_ADST_TX8_IDX, 0] {
                         let (mut cf, tf) = if txtp == ADST_ADST_TX8_IDX {
@@ -578,65 +412,15 @@ impl<'a> LossyTile<'a> {
                         best = best.min(crate::partition_rd::rd_cost(d, mlam, b));
                     }
                 }
-                // Filter intra, mirroring the final block (DC_PRED only,
-                // max(w,h) <= 32). The proxy could not see it at all, so any
-                // leaf whose real encode wins with filter intra was priced as
-                // if that tool did not exist.
-                if proxy_filter_intra_enabled() {
-                    let fi_bits =
-                        cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(8, 8)], 1)
-                            + cdf_cost(&self.dcdf().filter_intra_mode, 0)
-                            + self.mode_bits(px, py, DC_PRED);
-                    for fm in FILTER_INTRA_MODES {
-                        let mut pred = [0i32; 64];
-                        self.intrapred.filter_predict(
-                            fm,
-                            &self.recon[0],
-                            self.w,
-                            px,
-                            py,
-                            8,
-                            8,
-                            &mut pred,
-                            self.bd,
-                        );
-                        let mut resid = [0i32; 64];
-                        self.rd.residual_pred(
-                            &mut resid,
-                            &pred[..],
-                            &self.src[0],
-                            self.w,
-                            px,
-                            py,
-                            8,
-                            8,
-                        );
-                        let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
-                        trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
-                        let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
-                        let d = self.luma_partition_distortion(
-                            px,
-                            py,
-                            8,
-                            8,
-                            self.quant.ac_q() as f32,
-                            &pred,
-                            0,
-                            &rr[..],
-                        );
-                        let b = self.luma_bits(&cf, scan, 8, px, py, DC_PRED, 1) + fi_bits;
-                        best = best.min(crate::partition_rd::rd_cost(d, mlam, b));
-                    }
-                }
             }
             16 => {
                 let coupled =
                     !self.mono && self.speed == Speed::Slow && joint_luma_uv_proxy_enabled();
-                let beam = proxy_mode_beam_enabled().then(|| {
+                let beam = {
                     let mut pred = self.sbuf_i256();
                     self.proxy_mode_beam::<256>(px, py, 16, have_tr, have_bl, &mut pred)
-                });
-                let modes = beam.as_deref().unwrap_or(configured_modes);
+                };
+                let modes = &beam;
                 let scan = &SCAN_16X16;
                 #[allow(clippy::type_complexity)]
                 let mut joint_beam: [Option<(
@@ -681,7 +465,7 @@ impl<'a> LossyTile<'a> {
                         16,
                     );
                     let (mut cf, tf) = self.dct.dct16x16_t(&resid, &self.quant);
-                    if proxy_candidate_rdoq(self.speed) && proxy_rdoq_pays(&resid[..], acq) {
+                    if proxy_candidate_rdoq(self.speed) {
                         trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
                     }
                     let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
@@ -740,10 +524,7 @@ impl<'a> LossyTile<'a> {
                     }
                     best = joint_best;
                 }
-                if self.speed.try_adst()
-                    && proxy_tx_refine_enabled()
-                    && !coupled
-                    && let Some((m, pred, resid)) = win16
+                if self.speed.try_adst() && !coupled && let Some((m, pred, resid)) = win16
                 {
                     let (mut cf, tf) = self.dct.adst16x16_t(&resid, &self.quant);
                     trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
@@ -762,65 +543,15 @@ impl<'a> LossyTile<'a> {
                         + self.mode_bits(px, py, m);
                     best = best.min(crate::partition_rd::rd_cost(d, mlam, b));
                 }
-                // Filter intra, mirroring the final block (DC_PRED only,
-                // max(w,h) <= 32). The proxy could not see it at all, so any
-                // leaf whose real encode wins with filter intra was priced as
-                // if that tool did not exist.
-                if proxy_filter_intra_enabled() && !coupled {
-                    let fi_bits =
-                        cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(16, 16)], 1)
-                            + cdf_cost(&self.dcdf().filter_intra_mode, 0)
-                            + self.mode_bits(px, py, DC_PRED);
-                    for fm in FILTER_INTRA_MODES {
-                        let mut pred = self.sbuf_i256();
-                        self.intrapred.filter_predict(
-                            fm,
-                            &self.recon[0],
-                            self.w,
-                            px,
-                            py,
-                            16,
-                            16,
-                            &mut pred[..],
-                            self.bd,
-                        );
-                        let mut resid = self.sbuf_i256();
-                        self.rd.residual_pred(
-                            &mut resid[..],
-                            &pred[..],
-                            &self.src[0],
-                            self.w,
-                            px,
-                            py,
-                            16,
-                            16,
-                        );
-                        let (mut cf, tf) = self.dct.dct16x16_t(&resid, &self.quant);
-                        trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
-                        let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
-                        let d = self.luma_partition_distortion(
-                            px,
-                            py,
-                            16,
-                            16,
-                            self.quant.ac_q() as f32,
-                            &pred[..],
-                            0,
-                            &rr[..],
-                        );
-                        let b = self.luma_bits(&cf, scan, 16, px, py, DC_PRED, 1) + fi_bits;
-                        best = best.min(crate::partition_rd::rd_cost(d, mlam, b));
-                    }
-                }
             }
             32 => {
                 let coupled =
                     !self.mono && self.speed == Speed::Slow && joint_luma_uv_proxy_enabled();
-                let beam = proxy_mode_beam_enabled().then(|| {
+                let beam = {
                     let mut pred = self.sbuf_i1024();
                     self.proxy_mode_beam::<1024>(px, py, 32, have_tr, have_bl, &mut pred)
-                });
-                let modes = beam.as_deref().unwrap_or(configured_modes);
+                };
+                let modes = &beam;
                 let scan = &SCAN_32X32;
                 #[allow(clippy::type_complexity)]
                 let mut joint_beam: [Option<(
@@ -864,7 +595,7 @@ impl<'a> LossyTile<'a> {
                         32,
                     );
                     let (mut cf, tf) = self.dct.dct32x32_t(&resid, &self.quant);
-                    if proxy_candidate_rdoq(self.speed) && proxy_rdoq_pays(&resid[..], acq) {
+                    if proxy_candidate_rdoq(self.speed) {
                         trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
                     }
                     let rr = self.idct.idct_dequant_32x32(&cf, &self.quant);
@@ -1084,7 +815,7 @@ impl<'a> LossyTile<'a> {
         // at Medium it grew the tier ~60% for decision work Medium's budget
         // cannot carry — Medium keeps the pre-equip DC leaf.
         let modes: &[usize] =
-            if !refine || !rect_leaf_mode_search_enabled() || self.speed != Speed::Slow {
+            if !refine || self.speed != Speed::Slow {
                 &[DC_PRED]
             } else {
                 &Self::RECT_LEAF_MODES
@@ -1203,7 +934,7 @@ impl<'a> LossyTile<'a> {
         mlam: f32,
         refine: bool,
     ) -> (usize, [i32; 128]) {
-        if !refine || !rect_leaf_tx_search_enabled() || self.speed != Speed::Slow {
+        if !refine || self.speed != Speed::Slow {
             return (1, *dct_cf);
         }
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
@@ -3540,7 +3271,6 @@ impl<'a> LossyTile<'a> {
         // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
         let mut best_delta: i32 = 0;
         if rl.is_none()
-            && angle_delta_enabled()
             && self.speed.try_angle_deltas_av1(16, self.base_q_idx)
             && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
             && best_mode != V_PRED
@@ -3697,8 +3427,7 @@ impl<'a> LossyTile<'a> {
         }
         // Asymmetric-ADST refinement (ADST_DCT / DCT_ADST) for TX_16X16, same
         // rationale as the 8x8 path. Competes with the running tx winner.
-        if rl.is_none() && best_palette16.is_none() && self.speed.try_adst() && asym_adst_enabled()
-        {
+        if rl.is_none() && best_palette16.is_none() && self.speed.try_adst() {
             let mut best_txtp16_sse = if txtp16 == 1 { i64::MAX } else { best_dct_sse };
             let mut best_txtp16_bits = best_dct_bits;
             if txtp16 == 1 {

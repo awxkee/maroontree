@@ -130,37 +130,12 @@ fn block_moment_grid_16x16<P: Pel>(
     cells
 }
 
-/// Mid-band ramp for the AQ cut-tail widening: 0 outside the bleed band,
-/// 1 through qi 56..112 (the aom field study band), tapering at both ends.
-fn aq_cut_band_t(base_q: i32) -> f32 {
-    let qi = base_q as f32;
-    if qi <= 40.0 {
-        0.0
-    } else if qi < 56.0 {
-        (qi - 40.0) / 16.0
-    } else if qi <= 112.0 {
-        1.0
-    } else if qi < 144.0 {
-        (144.0 - qi) / 32.0
-    } else {
-        0.0
-    }
-}
-
-/// Experiment strengths for the qindex-field reshape (0.0 = shipped shape).
-const AQ_CUT_R_WIDE: f32 = 0.0; // extra cut-side clamp ratio at full band_t
-const AQ_FLOOR_TIGHTEN: f32 = 0.0; // boost-side ratio reduction at full band_t
-
 fn clamp_aq_delta_relative(base_q: i32, delta: i32, bd: u8) -> i32 {
     let r: f32 = crate::tuning::get().aq_r;
-    let band = aq_cut_band_t(base_q);
-    // Asymmetric window: the cut side may widen toward the aom tail (qstep
-    // ratio ~2 at their +40) while the boost side may tighten (their floor
-    // stops 13 qindex above ours).
     let r = if delta > 0 {
-        r + AQ_CUT_R_WIDE * band
+        r
     } else {
-        (r - AQ_FLOOR_TIGHTEN * band).max(1.05)
+        r.max(1.05)
     };
     if delta == 0 {
         return delta;
@@ -1567,67 +1542,6 @@ impl<'a> LossyTile<'a> {
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 4]);
         let s = suma + suml - 6;
-        (s != 0) as usize + (s > 0) as usize
-    }
-
-    fn dc_sign_ctx_32x16_luma(&self, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[0], &self.l_coef[0]);
-        let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 8]);
-        let sl: i32 = sum_coef_sign(&l[by4..by4 + 4]);
-        let s = sa + sl - 12;
-        (s != 0) as usize + (s > 0) as usize
-    }
-
-    fn dc_sign_ctx_16x32_luma(&self, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[0], &self.l_coef[0]);
-        let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
-        let sl: i32 = sum_coef_sign(&l[by4..by4 + 8]);
-        let s = sa + sl - 12;
-        (s != 0) as usize + (s > 0) as usize
-    }
-
-    fn skip_ctx_32x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let ca = a[bx4..bx4 + 8].iter().any(|&x| x != 0x40) as usize;
-        let cl = l[by4..by4 + 4].iter().any(|&x| x != 0x40) as usize;
-        7 + ca + cl
-    }
-
-    fn dc_sign_ctx_32x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 8]);
-        let sl: i32 = sum_coef_sign(&l[by4..by4 + 4]);
-        let s = sa + sl - 12;
-        (s != 0) as usize + (s > 0) as usize
-    }
-
-    fn skip_ctx_16x32_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let ca = a[bx4..bx4 + 4].iter().any(|&x| x != 0x40) as usize;
-        let cl = l[by4..by4 + 8].iter().any(|&x| x != 0x40) as usize;
-        7 + ca + cl
-    }
-
-    fn dc_sign_ctx_16x32_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
-        let sl: i32 = sum_coef_sign(&l[by4..by4 + 8]);
-        let s = sa + sl - 12;
-        (s != 0) as usize + (s > 0) as usize
-    }
-
-    fn skip_ctx_16x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let ca = a[bx4..bx4 + 4].iter().any(|&x| x != 0x40) as usize;
-        let cl = l[by4..by4 + 4].iter().any(|&x| x != 0x40) as usize;
-        7 + ca + cl
-    }
-
-    fn dc_sign_ctx_16x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
-        let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
-        let sl: i32 = sum_coef_sign(&l[by4..by4 + 4]);
-        let s = sa + sl - 8;
         (s != 0) as usize + (s > 0) as usize
     }
 
@@ -3247,11 +3161,7 @@ impl<'a> LossyTile<'a> {
                     self.aq.vb_strength,
                     self.aq.vb_boost_only,
                     mid_t,
-                    if AQ_CUT_R_WIDE > 0.0 {
-                        aq_cut_band_t(base_q)
-                    } else {
-                        0.0
-                    },
+                    0.0,
                 );
                 // protection = max(flat-region boost, dark boost); keep the coarsen
                 // (positive) side of the variance boost only when neither fires.

@@ -1070,7 +1070,6 @@ impl<'a> LossyTile<'a> {
         let mut best_delta: i32 = 0;
         outline_block8(|| {
             if rl.is_none()
-                && angle_delta_enabled()
                 && self.speed.try_angle_deltas_av1(8, self.base_q_idx)
                 && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
                 && best_mode != V_PRED
@@ -1243,7 +1242,7 @@ impl<'a> LossyTile<'a> {
         // it grows away from the reference edge in one direction (wants ADST
         // there) and is flat across it (wants DCT). ADST_DCT = vertical ADST,
         // DCT_ADST = horizontal ADST. Each competes with the running tx winner.
-        if rl.is_none() && self.speed.try_adst() && asym_adst_enabled() {
+        if rl.is_none() && self.speed.try_adst() {
             for (fwd_t, inv_is_dctadst) in [(false, false), (true, true)] {
                 let mut resid = [0i32; 64];
                 self.rd

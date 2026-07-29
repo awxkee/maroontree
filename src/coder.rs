@@ -75,67 +75,28 @@ enum RawSseGuard {
     TxSplit,
 }
 
-impl RawSseGuard {
-    fn name(self) -> &'static str {
-        match self {
-            Self::FilterIntra => "filter-intra",
-            Self::TxType => "tx-type",
-            Self::TxSplit => "tx-split",
-        }
-    }
-}
-
 fn raw_sse_guard_disabled(kind: RawSseGuard) -> bool {
     let _ = kind;
     false
 }
 
-fn raw_sse_guard_stats_enabled() -> bool {
-    false
-}
-
 /// Apply one heuristic SSE policy while retaining the pure-RD choice as a
-/// shadow decision. Opt-in diagnostics are deliberately machine-readable so a
-/// holdout runner can join them with image-level SSIMULACRA2 deltas. Logging is
-/// capped per process because an image can contain hundreds of thousands of
-/// transform candidates.
+/// shadow decision.
 fn raw_sse_guard_choice(
-    tag: &'static str,
+    _tag: &'static str,
     kind: RawSseGuard,
-    baseline_sse: i64,
-    candidate_sse: i64,
+    _baseline_sse: i64,
+    _candidate_sse: i64,
     baseline_rd: f32,
     candidate_rd: f32,
     guarded_choice: bool,
 ) -> bool {
     let rd_choice = candidate_rd < baseline_rd;
-    let final_choice = if raw_sse_guard_disabled(kind) {
+    if raw_sse_guard_disabled(kind) {
         rd_choice
     } else {
         guarded_choice
-    };
-    if raw_sse_guard_stats_enabled() && (rd_choice || guarded_choice) {
-        static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let event = EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if event < 2048 {
-            let sse_delta = candidate_sse - baseline_sse;
-            let sse_percent = if baseline_sse == 0 {
-                0.0
-            } else {
-                100.0 * sse_delta as f64 / baseline_sse as f64
-            };
-            eprintln!(
-                "RAW_SSE_GUARD tag={tag} class={} rd_advantage={:.3} raw_sse_difference={sse_delta} raw_sse_percent={sse_percent:.3} rd_selected={} guarded_selected={} final_selected={} guard_changed={}",
-                kind.name(),
-                baseline_rd - candidate_rd,
-                u8::from(rd_choice),
-                u8::from(guarded_choice),
-                u8::from(final_choice),
-                u8::from(rd_choice != guarded_choice),
-            );
-        }
     }
-    final_choice
 }
 
 /// Partition decision for a 16x16 luma region.
@@ -1403,16 +1364,6 @@ fn sse_recon<const N: usize, const D: usize>(
 ) -> i64 {
     debug_assert_eq!(N, D * D);
     rd.sse_recon(pred, resid, src, stride, px, py, D, D, bd)
-}
-
-/// Asymmetric-ADST tx-type search. A/B knob for the ADST_DCT/DCT_ADST trials;
-/// enabled by default.
-fn asym_adst_enabled() -> bool {
-    true
-}
-
-fn angle_delta_enabled() -> bool {
-    true
 }
 
 #[inline]
@@ -5004,77 +4955,5 @@ mod aq_tests {
         let (_, cost) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
         assert!(cost.is_finite());
         assert_eq!(tile.recon[0], before);
-    }
-}
-
-#[cfg(test)]
-mod hog_model_tests {
-    use super::*;
-
-    /// The ported libaom HOG model must pick the direction the block's edges
-    /// actually run in: stripes normal to an axis score that axis's mode
-    /// highest, diagonals score the matching diagonal mode highest.
-    #[test]
-    fn hog_scores_match_block_orientation() {
-        let (w, h) = (32usize, 32usize);
-        // (pattern, expected argmax over [V, H, D45, D135, D113, D157, D203, D67])
-        type HogCase = (&'static str, fn(usize, usize) -> u16, usize);
-        let cases: [HogCase; 4] = [
-            (
-                "horizontal stripes",
-                |_x, y| if (y / 4) % 2 == 0 { 40 } else { 200 },
-                1,
-            ),
-            (
-                "vertical stripes",
-                |x, _y| if (x / 4) % 2 == 0 { 40 } else { 200 },
-                0,
-            ),
-            (
-                "diagonal 45",
-                |x, y| if ((x + y) / 4) % 2 == 0 { 40 } else { 200 },
-                2,
-            ),
-            (
-                "diagonal 135",
-                |x, y| {
-                    if ((16 + x - y.min(15)) / 4) % 2 == 0 {
-                        40
-                    } else {
-                        200
-                    }
-                },
-                3,
-            ),
-        ];
-        for (name, f, want) in cases {
-            let mut yp = vec![0u16; w * h];
-            for yy in 0..h {
-                for xx in 0..w {
-                    yp[yy * w + xx] = f(xx, yy);
-                }
-            }
-            let src = [yp, vec![128u16; w * h], vec![128u16; w * h]];
-            let tile = LossyTile::new(100, 8, w, h, &src, QmLevels::FLAT);
-            let sc = tile.hog_directional_scores(0, 0, 16);
-            let got = sc
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i)
-                .unwrap();
-            assert_eq!(got, want, "{name}: scores {sc:?}");
-        }
-        // A flat block has no gradient, so scores collapse to the model bias.
-        let src = [
-            vec![128u16; w * h],
-            vec![128u16; w * h],
-            vec![128u16; w * h],
-        ];
-        let tile = LossyTile::new(100, 8, w, h, &src, QmLevels::FLAT);
-        let sc = tile.hog_directional_scores(0, 0, 16);
-        for (got, want) in sc.iter().zip(crate::tables::INTRA_HOG_BIAS.iter()) {
-            assert!((got - want).abs() < 1e-6, "flat block should equal bias");
-        }
     }
 }
