@@ -1929,6 +1929,16 @@ fn wavefront_capture(
     // context-free before, which underprices palette in dense regions).
     let mut apal_plane: Vec<i32> = vec![0; w4 * 9];
     let mut lpal_plane: Vec<i32> = vec![0; h4 * 9];
+    // The UV palette context needs the same handoff as the luma one. Without
+    // it `a_palette_uv`/`l_palette_uv` kept whatever the WORKER last left in
+    // them, so the UV palette symbols were coded against a context that
+    // depended on the cell->worker assignment. The decoder recomputes the
+    // correct context, so the stream desynced (volcanic.png, 4:4:4 q97: the
+    // recon is bit-identical run to run, only the coded bits move).
+    // Allocated only when there is chroma; mono never reads these.
+    let uvpal = cw > 0;
+    let mut apal_uv_plane: Vec<i32> = vec![0; if uvpal { w4 * 9 } else { 0 }];
+    let mut lpal_uv_plane: Vec<i32> = vec![0; if uvpal { h4 * 9 } else { 0 }];
     let mut atx_plane: Vec<u8> = proto_a_tx;
     let mut ltx_plane: Vec<u8> = proto_l_tx;
     // Disjoint-write views. Plane p stride: luma w, chroma cw.
@@ -1946,6 +1956,8 @@ fn wavefront_capture(
     let ibcw = PlaneWriter::new(&mut ibc_plane, w4.max(1));
     let apalw = PlaneWriter::new(&mut apal_plane, (w4 * 9).max(1));
     let lpalw = PlaneWriter::new(&mut lpal_plane, (h4 * 9).max(1));
+    let apaluvw = PlaneWriter::new(&mut apal_uv_plane, (w4 * 9).max(1));
+    let lpaluvw = PlaneWriter::new(&mut lpal_uv_plane, (h4 * 9).max(1));
     let atxw = PlaneWriter::new(&mut atx_plane, w4.max(1));
     let ltxw = PlaneWriter::new(&mut ltx_plane, h4.max(1));
     let hws: Vec<PlaneWriter<u8>> = h_arrs
@@ -2093,11 +2105,21 @@ fn wavefront_capture(
             {
                 let (ap, _al, _s1) = apalw.read_view();
                 let (lp, _ll, _s2) = lpalw.read_view();
+                let (apu, _aul, _s3) = apaluvw.read_view();
+                let (lpu, _lul, _s4) = lpaluvw.read_view();
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                // Same loop, four arrays: the UV pair is skipped entirely when
+                // there is no chroma, so mono pays nothing for this.
+                let uvn = if uvpal { 4 } else { 2 };
                 for (arr, base, ptr, lim) in [
                     (&mut t.a_palette, sbx4, ap, w4),
                     (&mut t.l_palette, sby4, lp, h4),
-                ] {
+                    (&mut t.a_palette_uv, sbx4, apu, w4),
+                    (&mut t.l_palette_uv, sby4, lpu, h4),
+                ]
+                .into_iter()
+                .take(uvn)
+                {
                     for i in 0..16usize {
                         let pos = base + i;
                         if pos >= lim {
@@ -2173,10 +2195,16 @@ fn wavefront_capture(
             }
             {
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
+                let uvn = if uvpal { 4 } else { 2 };
                 for (arr, base, w, lim) in [
                     (&t.a_palette, sbx4, &apalw, w4),
                     (&t.l_palette, sby4, &lpalw, h4),
-                ] {
+                    (&t.a_palette_uv, sbx4, &apaluvw, w4),
+                    (&t.l_palette_uv, sby4, &lpaluvw, h4),
+                ]
+                .into_iter()
+                .take(uvn)
+                {
                     let mut buf = [0i32; 9 * 16];
                     let n = 16usize.min(lim.saturating_sub(base));
                     for i in 0..n {
@@ -3526,7 +3554,6 @@ fn frame_cdef(
         .map(|&o| o - o.saturating_mul(margin) / 1000)
         .collect();
 
-    // ---- Joint (luma, chroma) strength-set search ----------------------------
     // Greedy set construction over all strength PAIRS, exactly libaom's
     // `joint_strength_search_dual`: each added entry minimizes the frame total
     // when every unit picks its best entry (with the off-fallback margin rule
@@ -3590,7 +3617,6 @@ fn frame_cdef(
         }
     }
 
-    // ---- Per-unit assignment and exact-rate R-D choice of cdef_bits ----------
     // A unit does not take its raw metric-minimizing entry: with several
     // entries available, per-unit metric errors accumulate (measured as SS2
     // regressions on detail-rich content). Instead each unit takes the MILDEST
