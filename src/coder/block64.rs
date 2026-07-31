@@ -147,7 +147,10 @@ impl LossyIbcIndex {
         }
     }
 
-    /// Candidate origins whose 4x4-prefix fingerprint matches (px, py)'s.
+    /// Candidate origins whose 4x4-prefix fingerprint matches (px, py)'s, in
+    /// raster order, truncated at `max_y` — the caller's legality rule rejects
+    /// every origin below that row, and the group is sorted by packed origin
+    /// (y-major), so cutting there drops only candidates it would have skipped.
     fn candidates<'i>(
         &'i self,
         src: &[Vec<u16>; 3],
@@ -155,6 +158,7 @@ impl LossyIbcIndex {
         cw: usize,
         px: usize,
         py: usize,
+        max_y: usize,
     ) -> impl Iterator<Item = (usize, usize)> + 'i {
         let sub = (
             self.step_x.trailing_zeros() as usize,
@@ -163,7 +167,9 @@ impl LossyIbcIndex {
         let want = Self::fingerprint(src, w, cw, self.mono, sub, px, py);
         let b = (want >> 16) as usize;
         let (s, e) = (self.offsets[b] as usize, self.offsets[b + 1] as usize);
-        self.entries[s..e]
+        let bucket = &self.entries[s..e];
+        let end = bucket.partition_point(|&(_, origin)| (origin >> 16) as usize <= max_y);
+        bucket[..end]
             .iter()
             .filter(move |&&(hh, _)| hh == want)
             .map(|&(_, origin)| ((origin & 0xffff) as usize, (origin >> 16) as usize))
@@ -398,16 +404,28 @@ impl<'a> LossyTile<'a> {
         {
             return make(rx, ry);
         }
-        // Hash-index lookup on the block's 4x4 prefix (built lazily once per
-        // tile); every hit is verified over the complete block and all planes.
-        self.ensure_ibc_index();
-        let idx = self.ibc_index.borrow();
-        let idx = idx.as_ref()?;
+        // Hash-index lookup on the block's 4x4 prefix (built once per tile);
+        // every hit is verified over the complete block and all planes.
+        let idx = self.ibc_index?.get_or_init(|| {
+            let sub = if self.mono {
+                (0, 0)
+            } else {
+                (
+                    usize::from(self.ss420 || self.ss422),
+                    usize::from(self.ss420),
+                )
+            };
+            LossyIbcIndex::build(self.src, self.w, self.h, self.cw, self.mono, sub)
+        });
         #[allow(clippy::type_complexity)]
         let mut best: Option<(usize, usize, (i16, i16), (i16, i16))> = None;
         let mut best_cost = u32::MAX;
         let mut verified = 0usize;
-        for (rx, ry) in idx.candidates(self.src, self.w, self.cw, px, py) {
+        // `legal` rejects every origin whose block leaves the current
+        // superblock row (`ry + size > sby + 64`), so the index can stop the
+        // raster-ordered group there instead of walking it to the frame bottom.
+        let max_y = (sby + 64).saturating_sub(size);
+        for (rx, ry) in idx.candidates(self.src, self.w, self.cw, px, py, max_y) {
             if (rx, ry) == (px, py) || !legal(rx, ry) {
                 continue;
             }
@@ -428,22 +446,6 @@ impl<'a> LossyTile<'a> {
             }
         }
         best
-    }
-
-    fn ensure_ibc_index(&self) {
-        if self.ibc_index.borrow().is_none() {
-            let sub = if self.mono {
-                (0, 0)
-            } else {
-                (
-                    usize::from(self.ss420 || self.ss422),
-                    usize::from(self.ss420),
-                )
-            };
-            *self.ibc_index.borrow_mut() = Some(LossyIbcIndex::build(
-                self.src, self.w, self.h, self.cw, self.mono, sub,
-            ));
-        }
     }
 
     /// R-D cost of coding a `size`-px square as a skip IntraBC copy: the
@@ -932,7 +934,7 @@ impl<'a> LossyTile<'a> {
                 + if coupled_children {
                     0.0
                 } else {
-                    self.rd_cost_chroma_partition(qx, qy, 32, Part16::None, prdo)
+                    self.rd_cost_chroma_partition(qx, qy, 32, Part16::None, prdo, false)
                 };
             rd_split_upper += child_none[i];
         }

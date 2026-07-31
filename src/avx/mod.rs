@@ -59,9 +59,9 @@ pub(crate) use kmeans::{luma_nearest_indices_avx2, uv_nearest_indices_avx2};
 pub(crate) use loopfilter::{loop_filter_avx2, loop_filter_batch_avx2};
 pub(crate) use qmatrix::apply_qmatrix_avx2;
 pub(crate) use rd::{
-    all_zero_i32_avx2, luma_satd_avx2, reconstruct_avx2, residual_dc_avx2, residual_pred_avx2,
-    satd_sad_proxy_avx2, sse_recon_avx2, sse_u16_avx2, sum_i32_avx2, sum_u16_avx2,
-    sum_u16_strided_avx2,
+    all_zero_i32_avx2, chroma_sse_avx2, luma_satd_avx2, reconstruct_avx2, residual_dc_avx2,
+    residual_pred_avx2, satd_sad_proxy_avx2, sse_recon_avx2, sse_u16_avx2, sum_i32_avx2,
+    sum_u16_avx2, sum_u16_strided_avx2,
 };
 pub(crate) use trellis::{trellis_dist_current_zero_scan_avx2, trellis_round_down_scan_avx2};
 pub(crate) use wht::fwht_raw_avx2;

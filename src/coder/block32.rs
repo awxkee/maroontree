@@ -331,7 +331,7 @@ impl<'a> LossyTile<'a> {
             // Bottom-up: the 16-level child totals already include chroma.
             0.0
         } else {
-            self.rd_cost_chroma_partition(px, py, 32, Part16::Split, prdo)
+            self.rd_cost_chroma_partition(px, py, 32, Part16::Split, prdo, false)
         };
         // Small split-favoring bias: the SATD distortion proxy undervalues the
         // detail a single 32x32 loses when it merges four busier 16x16s, so a
@@ -342,7 +342,7 @@ impl<'a> LossyTile<'a> {
             let (htr32, hbl32) = self.leaf_edge_flags(px, py, 32, thr, lhb);
             self.rd_cost_none32(px, py, prdo, htr32, hbl32)
                 + if self.speed.full_partition_rdo() && !coupled_square {
-                    self.rd_cost_chroma_partition(px, py, 32, Part16::None, prdo)
+                    self.rd_cost_chroma_partition(px, py, 32, Part16::None, prdo, false)
                 } else {
                     0.0
                 }

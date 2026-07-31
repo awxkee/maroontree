@@ -124,6 +124,13 @@ pub(crate) struct Tuning {
     pub(crate) exact_part_bits: bool,
     /// Charge the per-leaf uv_mode symbol in the chroma partition proxy.
     pub(crate) chroma_uv_mode_bits: bool,
+    /// Stage 2 of the 16-level chroma partition proxy: how many still-in-
+    /// contention candidates get the CfL trial (0 = DC-only everywhere).
+    /// 4:4:4 only -- 4:2:2 measured NEGATIVE (see `chroma_refine_topk`).
+    pub(crate) chroma_refine_topk: usize,
+    /// Ranked-path palette finalists the proxy fully prices
+    pub(crate) palette_proxy_finalists: usize,
+    pub(crate) palette_proxy_ranked: bool,
     /// Evaluate rectangles at decision time with the SAME tools the emitter uses.
     pub(crate) rect_decision_refine: bool,
     /// Exact per-symbol partition pricing at the 32x32 and 64x64 nodes.
@@ -230,6 +237,9 @@ impl Tuning {
         local_ref_blend: 0.5,
         exact_part_bits: true,
         chroma_uv_mode_bits: false,
+        chroma_refine_topk: 2,
+        palette_proxy_ranked: true,
+        palette_proxy_finalists: 2,
         rect_decision_refine: false,
         exact_part_bits_3264: false,
         exact_part_bits_3264_444: true,
@@ -380,6 +390,13 @@ mod imp {
                 "local_ref_blend" => t.local_ref_blend = num(value),
                 "exact_part_bits" => t.exact_part_bits = flag(value),
                 "chroma_uv_mode_bits" => t.chroma_uv_mode_bits = flag(value),
+                "palette_proxy_ranked" => t.palette_proxy_ranked = flag(value),
+                "palette_proxy_finalists" => {
+                    t.palette_proxy_finalists = value.parse().unwrap_or(t.palette_proxy_finalists)
+                }
+                "chroma_refine_topk" => {
+                    t.chroma_refine_topk = value.parse().unwrap_or(t.chroma_refine_topk)
+                }
                 "rect_decision_refine" => t.rect_decision_refine = flag(value),
                 "exact_part_bits_3264" => t.exact_part_bits_3264 = flag(value),
                 "exact_part_bits_3264_444" => t.exact_part_bits_3264_444 = flag(value),

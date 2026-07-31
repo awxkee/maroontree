@@ -215,6 +215,13 @@ fn quad4_bias() -> f32 {
     crate::tuning::get().quad4_bias
 }
 
+/// How many still-in-contention 16-level partition candidates get the CfL
+/// chroma trial (stage 2 of the chroma proxy). 0 = DC-only everywhere, the
+/// historical behavior.
+fn chroma_refine_topk() -> usize {
+    crate::tuning::get().chroma_refine_topk
+}
+
 /// PARTITION_HORZ_4/VERT_4 search enable.
 const fn quad4_enabled(ss420: bool) -> bool {
     ss420
@@ -283,13 +290,14 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            pal_y_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
             emit_epoch: std::cell::Cell::new(0),
-            ibc_index: std::cell::RefCell::new(None),
+            ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(1.2, q, 1.4)),
@@ -365,13 +373,14 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            pal_y_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
             emit_epoch: std::cell::Cell::new(0),
-            ibc_index: std::cell::RefCell::new(None),
+            ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(1.2, q, 0.4)),
@@ -456,13 +465,14 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            pal_y_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
             emit_epoch: std::cell::Cell::new(0),
-            ibc_index: std::cell::RefCell::new(None),
+            ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(2.45, q, 0.4)),
@@ -547,13 +557,14 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            pal_y_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
             emit_epoch: std::cell::Cell::new(0),
-            ibc_index: std::cell::RefCell::new(None),
+            ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(3.5, q, 0.7)),
@@ -1833,18 +1844,18 @@ impl<'a> LossyTile<'a> {
         // chroma geometry is unchanged and cancels from this comparison.
         if !self.ss420 && !self.ss422 {
             eff8 += self.chroma_partition_weight_at(px, py, 8, 8)
-                * self.rd_cost_chroma_block(px, py, 8, 8, prdo);
+                * self.rd_cost_chroma_block(px, py, 8, 8, prdo, false);
             for (sx, sy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)] {
                 eff4_sum += self.chroma_partition_weight_at(px + sx, py + sy, 4, 4)
-                    * self.rd_cost_chroma_block(px + sx, py + sy, 4, 4, prdo);
+                    * self.rd_cost_chroma_block(px + sx, py + sy, 4, 4, prdo, false);
             }
         } else if self.ss422 {
             // Splitting changes chroma from one 4x8 into two paired 4x4s.
             eff8 += self.chroma_partition_weight_at(px, py, 8, 8)
-                * self.rd_cost_chroma_block(px / 2, py, 4, 8, prdo);
+                * self.rd_cost_chroma_block(px / 2, py, 4, 8, prdo, false);
             for sy in [0usize, 4] {
                 eff4_sum += self.chroma_partition_weight_at(px, py + sy, 8, 4)
-                    * self.rd_cost_chroma_block(px / 2, py + sy, 4, 4, prdo);
+                    * self.rd_cost_chroma_block(px / 2, py + sy, 4, 4, prdo, false);
             }
         }
         let eff8 = eff8 + rate_cost(mlam, self.part_bl8_rate(x8, y8, 0));
@@ -2188,6 +2199,7 @@ impl<'a> LossyTile<'a> {
         cw: usize,
         ch: usize,
         prdo: f32,
+        refine: bool,
         scan: &[u32],
         pred: impl Fn(&[u16], usize, usize, usize, i32) -> i32,
         fwd: impl Fn(&[i32; N], &Quant) -> ([i32; N], [f32; N]),
@@ -2196,19 +2208,23 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
         let mlam = self.mlam_c() * prdo;
-        // Deliberately DC-only even though the emitters search CfL: a CfL
-        // trial here (source-luma AC basis, per-plane best alpha, joint
-        // two-plane decision + incremental exact uv_mode_bits signaling).
+        // Stage 1 is DC-only for every partition candidate; `refine` adds the
+        // CfL leg and is paid only for the shortlist of candidates that are
+        // still in contention (see `rd_choice_16`). A flat DC-mode fee was
+        // measured negative — the useful signal is the cost of the mode the
+        // emitter ACTUALLY picks, which on chroma-active content is CfL.
         let mut dc_total = 0.0f32;
+        let mut dc_preds = [0i32; 2];
         for plane in 1..=2 {
             let dc = pred(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
+            dc_preds[plane - 1] = dc;
             let mut resid = [0i32; N];
             self.rd
                 .residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, cw, ch, dc);
             let (mut cf, tf) = fwd(&resid, &self.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = inv(&cf, &self.cquant);
-            let distortion = crate::partition_rd::chroma_sse(
+            let distortion = self.rd.chroma_sse(
                 &self.src[plane],
                 self.cw,
                 cx,
@@ -2216,7 +2232,9 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 self.bd,
-                |i| dc + rr[i],
+                &[],
+                dc,
+                &rr,
             );
             dc_total += crate::partition_rd::rd_cost(
                 distortion,
@@ -2237,14 +2255,92 @@ impl<'a> LossyTile<'a> {
         if crate::tuning::get().chroma_uv_mode_bits {
             dc_total += rate_cost(mlam, self.uv_mode_bits(DC_PRED, DC_PRED, None));
         }
-        dc_total
+        if !refine || self.mono {
+            return dc_total;
+        }
+        // CfL trial. The proxy has no reconstructed luma for this candidate --
+        // the partition has not been coded yet -- so the AC basis comes from
+        // the SOURCE luma. `cfl_ac_sub` reads strided and its shift already
+        // covers the un-subsampled (4:4:4) case, so one path serves all
+        // formats.
+        let (sub_x, sub_y) = (
+            usize::from(self.ss420 || self.ss422),
+            usize::from(self.ss420),
+        );
+        let mut ac = [0i32; N];
+        self.intrapred.cfl_ac_sub(
+            &self.src[0][(cy << sub_y) * self.w + (cx << sub_x)..],
+            self.w,
+            cw,
+            ch,
+            sub_x == 1,
+            sub_y == 1,
+            &mut ac,
+        );
+        let mut cfl_body = 0.0f32;
+        let mut alpha = [0i32; 2];
+        for ci in 0..2 {
+            let plane = ci + 1;
+            let dc = dc_preds[ci];
+            let mut csrc = [0u16; N];
+            self.rd
+                .copy_block_u16(&mut csrc, &self.src[plane], self.cw, cx, cy, cw, ch);
+            let a = self.intrapred.cfl_best_alpha(&ac, &csrc, dc, N, self.bd);
+            alpha[ci] = a;
+            let mut cpred = [0i32; N];
+            self.intrapred.cfl_pred(&mut cpred, &ac, dc, a, self.bd);
+            let mut resid = [0i32; N];
+            self.rd
+                .residual_pred(&mut resid, &cpred, &csrc, cw, 0, 0, cw, ch);
+            let (mut cf, tf) = fwd(&resid, &self.cquant);
+            trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
+            let rr = inv(&cf, &self.cquant);
+            let distortion = self.rd.chroma_sse(
+                &self.src[plane],
+                self.cw,
+                cx,
+                cy,
+                cw,
+                ch,
+                self.bd,
+                &cpred,
+                0,
+                &rr,
+            );
+            cfl_body += crate::partition_rd::rd_cost(
+                distortion,
+                mlam,
+                self.chroma_rect_bits(&cf, scan, cw, ch, plane, cx, cy),
+            );
+        }
+        // Signaling enters as a DELTA so the two legs stay comparable on the
+        // same baseline (`dc_total` carries no uv_mode fee either). The true
+        // y_mode is unknown at proxy time; DC_PRED stands in, and the delta is
+        // far less y_mode-sensitive than the absolute would be.
+        let cfl_total = cfl_body
+            + rate_cost(mlam, self.uv_mode_bits(DC_PRED, CFL_PRED, Some(alpha)))
+            - rate_cost(mlam, self.uv_mode_bits(DC_PRED, DC_PRED, None));
+        if (alpha[0] != 0 || alpha[1] != 0) && cfl_total < dc_total {
+            cfl_total
+        } else {
+            dc_total
+        }
     }
 
-    fn rd_cost_chroma_block(&self, cx: usize, cy: usize, cw: usize, ch: usize, prdo: f32) -> f32 {
+    fn rd_cost_chroma_block(
+        &self,
+        cx: usize,
+        cy: usize,
+        cw: usize,
+        ch: usize,
+        prdo: f32,
+        refine: bool,
+    ) -> f32 {
         let key = ((cx as u128) << 96)
             | ((cy as u128) << 64)
             | ((cw as u128) << 56)
             | ((ch as u128) << 48)
+            | ((refine as u128) << 47)
             | prdo.to_bits() as u128;
         let epoch = self.emit_epoch.get();
         if let Some(&(e, cost)) = self.chroma_rd_cache.borrow().get(&key)
@@ -2259,6 +2355,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_4X4,
                 |r, st, x, y, bd| self.intrapred.dc_pred_4x4(r, st, x, y, bd),
                 |r, q| self.dct.dct4x4_t(r, q),
@@ -2270,6 +2367,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_8X4,
                 |r, st, x, y, bd| self.intrapred.dc_pred_8x4(r, st, x, y, bd),
                 |r, q| self.dct.dct8x4_t(r, q),
@@ -2281,6 +2379,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_4X8,
                 |r, st, x, y, bd| self.intrapred.dc_pred_4x8(r, st, x, y, bd),
                 |r, q| self.dct.dct4x8_t(r, q),
@@ -2292,6 +2391,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_16X4,
                 |r, st, x, y, bd| self.intrapred.dc_pred(r, st, x, y, 16, 4, bd),
                 |r, q| self.dct.dct16x4_t(r, q),
@@ -2303,6 +2403,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_4X16,
                 |r, st, x, y, bd| self.intrapred.dc_pred(r, st, x, y, 4, 16, bd),
                 |r, q| self.dct.dct4x16_t(r, q),
@@ -2314,6 +2415,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_8X8,
                 |r, st, x, y, bd| self.intrapred.dc_pred_8x8(r, st, x, y, bd),
                 |r, q| self.dct.dct8x8_t(r, q),
@@ -2325,6 +2427,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_16X8,
                 |r, st, x, y, bd| self.intrapred.dc_pred_16x8(r, st, x, y, bd),
                 |r, q| self.dct.dct16x8_t(r, q),
@@ -2336,6 +2439,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_8X16,
                 |r, st, x, y, bd| self.intrapred.dc_pred_8x16(r, st, x, y, bd),
                 |r, q| self.dct.dct8x16_t(r, q),
@@ -2347,6 +2451,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_16X16,
                 |r, st, x, y, bd| self.intrapred.dc_pred_16x16(r, st, x, y, bd),
                 |r, q| self.dct.dct16x16_t(r, q),
@@ -2358,6 +2463,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_32X16,
                 |r, st, x, y, bd| self.intrapred.dc_pred_32x16(r, st, x, y, bd),
                 |r, q| self.dct.dct32x16_t(r, q),
@@ -2369,6 +2475,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_16X32,
                 |r, st, x, y, bd| self.intrapred.dc_pred_16x32(r, st, x, y, bd),
                 |r, q| self.dct.dct16x32_t(r, q),
@@ -2380,6 +2487,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 ch,
                 prdo,
+                refine,
                 &SCAN_32X32,
                 |r, st, x, y, bd| self.intrapred.dc_pred_32x32(r, st, x, y, bd),
                 |r, q| self.dct.dct32x32_t(r, q),
@@ -2399,6 +2507,7 @@ impl<'a> LossyTile<'a> {
         luma_dim: usize,
         part: Part16,
         prdo: f32,
+        refine: bool,
     ) -> f32 {
         let sub_x = (self.ss420 || self.ss422) as usize;
         let sub_y = self.ss420 as usize;
@@ -2494,6 +2603,7 @@ impl<'a> LossyTile<'a> {
                         lw >> sub_x,
                         lh >> sub_y,
                         prdo,
+                        refine,
                     )
             })
             .sum::<f32>()
@@ -2685,7 +2795,7 @@ impl<'a> LossyTile<'a> {
         let part_lam = self.mlam() * prdo;
         let chroma_cost = |part| {
             if full_part_rdo {
-                self.rd_cost_chroma_partition(px, py, 16, part, prdo)
+                self.rd_cost_chroma_partition(px, py, 16, part, prdo, false)
             } else {
                 0.0
             }
@@ -2787,9 +2897,9 @@ impl<'a> LossyTile<'a> {
                     // splitting turns the child's one 4x8 chroma into two
                     // paired 4x4s.
                     s4 += self.chroma_partition_weight_at(bx, by, 8, 8)
-                        * (self.rd_cost_chroma_block(bx / 2, by, 4, 4, prdo)
-                            + self.rd_cost_chroma_block(bx / 2, by + 4, 4, 4, prdo)
-                            - self.rd_cost_chroma_block(bx / 2, by, 4, 8, prdo));
+                        * (self.rd_cost_chroma_block(bx / 2, by, 4, 4, prdo, false)
+                            + self.rd_cost_chroma_block(bx / 2, by + 4, 4, 4, prdo, false)
+                            - self.rd_cost_chroma_block(bx / 2, by, 4, 8, prdo, false));
                 }
                 none8.min(s4)
             } else {
@@ -2908,7 +3018,7 @@ impl<'a> LossyTile<'a> {
             if luma >= best_complete {
                 f32::INFINITY
             } else {
-                let cost = luma + self.rd_cost_chroma_partition(px, py, 16, part, prdo);
+                let cost = luma + self.rd_cost_chroma_partition(px, py, 16, part, prdo, false);
                 best_complete = best_complete.min(cost);
                 cost
             }
@@ -2986,7 +3096,7 @@ impl<'a> LossyTile<'a> {
         } else {
             f32::INFINITY
         };
-        let cands = [
+        let mut cands = [
             (rd_ibc, Part16::Intrabc),
             (rd_none, Part16::None),
             (rd_split, Part16::Split),
@@ -2999,6 +3109,46 @@ impl<'a> LossyTile<'a> {
             (rd_h4, Part16::Horz4),
             (rd_v4, Part16::Vert4),
         ];
+        // STAGE 2 of the chroma proxy. Stage 1 priced every family DC-only,
+        // which misranks whenever the emitter would actually pick CfL. Re-price
+        // the shortlist that is still in contention with the CfL trial enabled,
+        // and fold the difference back through each family's own bias -- the
+        // biases multiply the chroma leg, so a raw delta cannot just be added.
+        let mut rd_none_unbiased = rd_none_unbiased;
+        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk() > 0;
+        if full_part_rdo && chroma_refine {
+            let mut order = FixedList::<(f32, usize), 11>::new((f32::INFINITY, 0));
+            for (i, &(cost, part)) in cands.iter().enumerate() {
+                // IntraBC prices all planes inside `rd_cost_intrabc`; NONE under
+                // `coupled_square` carries no separate chroma leg to refine.
+                let refinable = part != Part16::Intrabc
+                    && !(part == Part16::None && coupled_square)
+                    && cost.is_finite();
+                if refinable {
+                    order.push((cost, i));
+                }
+            }
+            order.as_mut_slice().sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            order.truncate(chroma_refine_topk());
+            for &(_, i) in order.iter() {
+                let part = cands[i].1;
+                let delta = self.rd_cost_chroma_partition(px, py, 16, part, prdo, true)
+                    - self.rd_cost_chroma_partition(px, py, 16, part, prdo, false);
+                if delta == 0.0 {
+                    continue;
+                }
+                let bias = match part {
+                    Part16::None => none_bias,
+                    Part16::Horz | Part16::Vert => rect_bias,
+                    Part16::Horz4 | Part16::Vert4 => q4b,
+                    _ => 1.0,
+                };
+                cands[i].0 += bias * delta;
+                if part == Part16::None {
+                    rd_none_unbiased += delta;
+                }
+            }
+        }
         let chosen = cands
             .into_iter()
             .fold((f32::INFINITY, Part16::Split), |b, c| {
@@ -3053,8 +3203,13 @@ impl<'a> LossyTile<'a> {
         self.screen_content && self.speed.try_palette()
     }
 
-    fn with_intrabc(mut self, enabled: bool) -> Self {
+    fn with_intrabc(
+        mut self,
+        enabled: bool,
+        index: Option<&'a std::sync::OnceLock<LossyIbcIndex>>,
+    ) -> Self {
         self.allow_intrabc = enabled;
+        self.ibc_index = index;
         self
     }
 

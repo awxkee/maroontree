@@ -34,6 +34,7 @@ type SseReconFn = fn(&[i32], &[i32], &[u16], usize, usize, usize, usize, usize, 
 type SseU16Fn = fn(&[u16], usize, usize, usize, &[u16], usize, usize, usize, usize, usize) -> i64;
 type SatdSadFn = fn(&[u16], usize, &[i32], usize, usize, usize) -> u64;
 type LumaSatdFn = fn(&[u16], usize, usize, usize, usize, usize, i32, &[i32], i32, &[i32]) -> u64;
+type ChromaSseFn = fn(&[u16], usize, usize, usize, usize, usize, i32, &[i32], i32, &[i32]) -> i64;
 type SumI32Fn = fn(&[i32]) -> i32;
 type SumU16Fn = fn(&[u16]) -> i32;
 type SumU16StridedFn = fn(&[u16], usize, usize) -> i32;
@@ -51,6 +52,7 @@ pub(crate) struct RdDispatch {
     sse_u16: SseU16Fn,
     satd_sad: SatdSadFn,
     luma_satd: LumaSatdFn,
+    chroma_sse: ChromaSseFn,
     sum_i32: SumI32Fn,
     sum_u16: SumU16Fn,
     sum_u16_strided: SumU16StridedFn,
@@ -67,6 +69,7 @@ impl RdDispatch {
             sse_u16: sse_u16_scalar,
             satd_sad: satd_sad_proxy_scalar,
             luma_satd: crate::partition_rd::luma_satd_scalar,
+            chroma_sse: chroma_sse_scalar,
             sum_i32: sum_i32_scalar,
             sum_u16: sum_u16_scalar,
             sum_u16_strided: sum_u16_strided_scalar,
@@ -86,6 +89,7 @@ impl RdDispatch {
             dispatch.sse_u16 = sse_u16_neon_wrap;
             dispatch.satd_sad = satd_sad_proxy_neon_wrap;
             dispatch.luma_satd = luma_satd_neon_wrap;
+            dispatch.chroma_sse = chroma_sse_neon_wrap;
             dispatch.sum_i32 = sum_i32_neon_wrap;
             dispatch.sum_u16 = sum_u16_neon_wrap;
             dispatch.sum_u16_strided = sum_u16_strided_neon_wrap;
@@ -100,6 +104,7 @@ impl RdDispatch {
             dispatch.sse_u16 = sse_u16_avx2_wrap;
             dispatch.satd_sad = satd_sad_proxy_avx2_wrap;
             dispatch.luma_satd = luma_satd_avx2_wrap;
+            dispatch.chroma_sse = chroma_sse_avx2_wrap;
             dispatch.sum_i32 = sum_i32_avx2_wrap;
             dispatch.sum_u16 = sum_u16_avx2_wrap;
             dispatch.sum_u16_strided = sum_u16_strided_avx2_wrap;
@@ -282,6 +287,27 @@ impl RdDispatch {
         debug_assert!(residual.is_empty() || residual.len() >= w * h);
         debug_assert!((py + h - 1) * stride + px + w <= src.len());
         (self.luma_satd)(src, stride, px, py, w, h, (1 << bd) - 1, pred, dc, residual)
+    }
+
+    #[inline]
+    pub(crate) fn chroma_sse(
+        &self,
+        src: &[u16],
+        stride: usize,
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        bd: u8,
+        pred: &[i32],
+        dc: i32,
+        residual: &[i32],
+    ) -> f32 {
+        debug_assert!(pred.is_empty() || pred.len() >= w * h);
+        debug_assert!(residual.is_empty() || residual.len() >= w * h);
+        debug_assert!(px + w <= stride);
+        debug_assert!(h == 0 || (py + h - 1) * stride + px + w <= src.len());
+        (self.chroma_sse)(src, stride, px, py, w, h, (1 << bd) - 1, pred, dc, residual) as f32
     }
 
     #[inline]
@@ -588,6 +614,24 @@ fn luma_satd_neon_wrap(
     unsafe { crate::neon::luma_satd_neon(src, stride, px, py, w, h, max_value, pred, dc, residual) }
 }
 
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn chroma_sse_neon_wrap(
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    unsafe {
+        crate::neon::chroma_sse_neon(src, stride, px, py, w, h, max_value, pred, dc, residual)
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 fn satd_sad_proxy_avx2_wrap(
     src: &[u16],
@@ -614,6 +658,22 @@ fn luma_satd_avx2_wrap(
     residual: &[i32],
 ) -> u64 {
     unsafe { crate::avx::luma_satd_avx2(src, stride, px, py, w, h, max_value, pred, dc, residual) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn chroma_sse_avx2_wrap(
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    unsafe { crate::avx::chroma_sse_avx2(src, stride, px, py, w, h, max_value, pred, dc, residual) }
 }
 
 pub(crate) fn satd_sad_proxy_scalar(
@@ -746,6 +806,34 @@ pub(crate) fn sse_recon_scalar(
             let r = (p + e).clamp(0, maxv);
             let d = (s as i32 - r) as i64;
             sse += d * d;
+        }
+    }
+    sse
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_sse_scalar(
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    let mut sse = 0i64;
+    for y in 0..h {
+        let src_row = &src[(py + y) * stride + px..][..w];
+        let pred_row = (!pred.is_empty()).then(|| &pred[y * w..][..w]);
+        let residual_row = (!residual.is_empty()).then(|| &residual[y * w..][..w]);
+        for (x, &source) in src_row.iter().enumerate() {
+            let prediction = pred_row.map_or(dc, |row| row[x]);
+            let reconstruction = prediction + residual_row.map_or(0, |row| row[x]);
+            let delta = (i32::from(source) - reconstruction.clamp(0, max_value)) as i64;
+            sse += delta * delta;
         }
     }
     sse
@@ -963,6 +1051,81 @@ mod satd_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chroma_partition_sse_simd_matches_scalar() {
+        let dispatch = RdDispatch::selected();
+        let mut state = 0xe703_7ed1_a0b4_28dbu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &(w, h) in &[
+            (1usize, 1usize),
+            (3, 5),
+            (4, 8),
+            (7, 4),
+            (8, 8),
+            (13, 9),
+            (16, 32),
+            (31, 17),
+            (32, 32),
+        ] {
+            let stride = w + 11;
+            let (px, py) = (5usize, 3usize);
+            let src: Vec<u16> = (0..(py + h + 1) * stride)
+                .map(|_| (next() % 4096) as u16)
+                .collect();
+            let pred: Vec<i32> = (0..w * h).map(|_| (next() % 5120) as i32 - 512).collect();
+            let residual: Vec<i32> = (0..w * h).map(|_| (next() % 1536) as i32 - 768).collect();
+            let dc = (next() % 4096) as i32;
+            for &bd in &[8u8, 10, 12] {
+                let max_value = (1 << bd) - 1;
+                for (pred, dc, residual, variant) in [
+                    (&pred[..], 0, &residual[..], "pred+residual"),
+                    (&pred[..], 0, &[][..], "prediction-only"),
+                    (&[][..], dc, &residual[..], "dc+residual"),
+                    (&[][..], dc, &[][..], "dc-only"),
+                ] {
+                    let want = chroma_sse_scalar(
+                        &src, stride, px, py, w, h, max_value, pred, dc, residual,
+                    );
+                    let got =
+                        dispatch.chroma_sse(&src, stride, px, py, w, h, bd, pred, dc, residual);
+                    assert_eq!(got, want as f32, "{variant} {w}x{h} bd={bd}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_sse_dispatch_selects_active_arch_kernel() {
+        let dispatch = RdDispatch::selected();
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        assert!(std::ptr::fn_addr_eq(
+            dispatch.chroma_sse,
+            chroma_sse_neon_wrap as ChromaSseFn,
+        ));
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            let expected = if std::is_x86_feature_detected!("avx2") {
+                chroma_sse_avx2_wrap as ChromaSseFn
+            } else {
+                chroma_sse_scalar as ChromaSseFn
+            };
+            assert!(std::ptr::fn_addr_eq(dispatch.chroma_sse, expected));
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "x86_64", feature = "avx"),
+        )))]
+        assert!(std::ptr::fn_addr_eq(
+            dispatch.chroma_sse,
+            chroma_sse_scalar as ChromaSseFn,
+        ));
     }
 
     #[test]

@@ -1272,6 +1272,14 @@ struct LossyTile<'a> {
     /// k-means + map + distortion) is the costliest per-call piece, and its
     /// inputs (source, quant, decision CDFs) are immutable per tile.
     pal_est_cache: std::cell::RefCell<HashMap<u64, [(f32, f32); 3]>>,
+    /// Lazily built flat f32 cost tables for the decision `palette_y_color`
+    /// CDFs ([size-2][5 map ctx][8 symbols]): the index-map rate walk touches
+    /// one entry per map cell, and the triple-Vec `cdf_cost` pointer chase was
+    /// the walk's hottest load. Values are exactly `cdf_cost(..)`, so sums are
+    /// bit-identical. Decision CDFs are immutable per tile (the same
+    /// assumption `pal_est_cache` already relies on).
+    #[allow(clippy::type_complexity)]
+    pal_y_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
     /// Exact, epoch-stamped memo for derived chroma block RD costs shared by
     /// multiple partition families under the same perceptual multiplier.
     chroma_rd_cache: std::cell::RefCell<HashMap<u128, (u64, f32)>>,
@@ -1292,8 +1300,9 @@ struct LossyTile<'a> {
     split4_rd_cache: std::cell::RefCell<HashMap<u128, (u64, f32)>>,
     /// Bumped on every emitted (or sink-captured) leaf block.
     emit_epoch: std::cell::Cell<u64>,
-    /// Lazily built frame-wide IntraBC exact-match index (see `LossyIbcIndex`).
-    ibc_index: std::cell::RefCell<Option<LossyIbcIndex>>,
+    /// Tile-wide IntraBC exact-match index (see `LossyIbcIndex`), owned by
+    /// `encode_one_tile`.
+    ibc_index: Option<&'a std::sync::OnceLock<LossyIbcIndex>>,
     /// Wavefront-capture read view of the shared finished-recon planes.
     ibc_shared: Option<IbcSharedRecon>,
     enc: OdEcEncoder,
@@ -1826,6 +1835,7 @@ fn wavefront_capture(
     vb: &VarianceBoost,
     updating_cdf: bool,
     allow_intrabc: bool,
+    ibc_index: Option<&std::sync::OnceLock<LossyIbcIndex>>,
     screen_content: bool,
     tx: std::sync::mpsc::Sender<(usize, CapturedSb)>,
 ) -> WavefrontPlanes {
@@ -1849,7 +1859,7 @@ fn wavefront_capture(
         }
         .with_dispatch(dct, idct, intrapred, kmeans, rd)
         .with_speed(speed)
-        .with_intrabc(allow_intrabc)
+        .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
         t.frame_x0 = r.x0;
@@ -2447,6 +2457,15 @@ fn encode_one_tile(
             crop_plane(&src[2], cw8, r.cx0, r.cy0, r.ctw, r.cth),
         ]
     };
+    // The IntraBC exact-match index is a pure function of the tile source, so
+    // ONE cell is shared by every consumer instead of each building its own:
+    // the wavefront spawns a `LossyTile` per worker and the decouple check runs
+    // a second Replay pass, and all of them used to rebuild the identical table
+    // (12 threads x 34 ms on a 3450x1900 screenshot — most of the
+    // multithreaded IntraBC regression). Still lazy, because Fast prices no
+    // IntraBC candidate at all on many frames and must not pay the build.
+    let ibc_cell: std::sync::OnceLock<LossyIbcIndex> = std::sync::OnceLock::new();
+    let ibc_index = allow_intrabc.then_some(&ibc_cell);
     // One full decide+emit pass over the tile in the given decision mode.
     // `Capture` fills a fresh record; `Replay` consumes `rec_in` (skipping the
     // partition searches). Returns the coded tile plus the record so the
@@ -2466,7 +2485,7 @@ fn encode_one_tile(
         }
         .with_dispatch(dct, idct, intrapred, kmeans, rd)
         .with_speed(speed)
-        .with_intrabc(allow_intrabc)
+        .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
         tile.sb_mode = sb_mode;
@@ -2620,6 +2639,7 @@ fn encode_one_tile(
                     vb,
                     updating_cdf,
                     allow_intrabc,
+                    ibc_index,
                     screen_content,
                     tx,
                 )
@@ -2832,7 +2852,6 @@ pub(crate) fn encode_lossy_tilegroup(
             // bars measured +3.3% BD from lost deblock). Count NON-FLAT
             // aligned 16x16 blocks with an exact earlier duplicate; require
             // a meaningful fraction of the tile before paying the trade.
-            let mut seen: HashMap<u64, (usize, usize)> = HashMap::new();
             let exact16 = |ax: usize, ay: usize, bx: usize, by: usize| {
                 (0..3).all(|plane| {
                     let sx = usize::from(plane != 0 && sub_x != 0);
@@ -2847,48 +2866,77 @@ pub(crate) fn encode_lossy_tilegroup(
                     })
                 })
             };
-            let mut total = 0usize;
+            let nly = r.th.saturating_sub(15).div_ceil(16);
+            let nlx = r.tw.saturating_sub(15).div_ceil(16);
+            let total = nly * nlx;
+            if total == 0 {
+                return false;
+            }
+            // dup * 20 >= total  <=>  dup >= ceil(total / 20); with the >= 8
+            // floor this is the exact pass threshold, so the raster walk below
+            // can stop the moment it is reached (positive early-out).
+            let need = 8usize.max(total.div_ceil(20));
+            // The content hash per block is ~99% of the gate's work and each
+            // block is independent, so hash rows in parallel; the duplicate
+            // count needs raster ("earlier block") semantics and stays serial.
+            let hash_row = |row: usize| -> Vec<(bool, u64)> {
+                let ly = row * 16;
+                (0..nlx)
+                    .map(|col| {
+                        let lx = col * 16;
+                        let (x0, y0) = (r.x0 + lx, r.y0 + ly);
+                        // Flat blocks (single luma value) duplicate trivially —
+                        // black bars, blank sky — and gain nothing from a copy
+                        // that DC prediction doesn't already provide.
+                        let first = src[0][y0 * w8 + x0];
+                        let flat = (0..16).all(|row| {
+                            src[0][(y0 + row) * w8 + x0..][..16]
+                                .iter()
+                                .all(|&v| v == first)
+                        });
+                        if flat {
+                            return (true, 0);
+                        }
+                        let mut h = 0xcbf2_9ce4_8422_2325u64;
+                        for (plane, sp) in src.iter().enumerate() {
+                            let sx = usize::from(plane != 0 && sub_x != 0);
+                            let sy = usize::from(plane != 0 && sub_y != 0);
+                            let stride = if plane == 0 { w8 } else { cw8 };
+                            let (x, y) = ((r.x0 + lx) >> sx, (r.y0 + ly) >> sy);
+                            let (bw, bh) = (16 >> sx, 16 >> sy);
+                            for row in 0..bh {
+                                for &v in &sp[(y + row) * stride + x..][..bw] {
+                                    h ^= v as u64;
+                                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                                }
+                            }
+                        }
+                        (false, h)
+                    })
+                    .collect()
+            };
+            let rows = pool.map_indexed(pool.width(), nly, hash_row);
+            let mut seen: HashMap<u64, (usize, usize)> = HashMap::new();
             let mut dup = 0usize;
-            for ly in (0..r.th.saturating_sub(15)).step_by(16) {
-                for lx in (0..r.tw.saturating_sub(15)).step_by(16) {
-                    total += 1;
-                    // Flat blocks (single luma value) duplicate trivially —
-                    // black bars, blank sky — and gain nothing from a copy
-                    // that DC prediction doesn't already provide.
-                    let (x0, y0) = (r.x0 + lx, r.y0 + ly);
-                    let first = src[0][y0 * w8 + x0];
-                    let flat = (0..16).all(|row| {
-                        src[0][(y0 + row) * w8 + x0..][..16]
-                            .iter()
-                            .all(|&v| v == first)
-                    });
+            for (row, cells) in rows.iter().enumerate() {
+                for (col, &(flat, h)) in cells.iter().enumerate() {
                     if flat {
                         continue;
                     }
-                    let mut h = 0xcbf2_9ce4_8422_2325u64;
-                    for (plane, sp) in src.iter().enumerate() {
-                        let sx = usize::from(plane != 0 && sub_x != 0);
-                        let sy = usize::from(plane != 0 && sub_y != 0);
-                        let stride = if plane == 0 { w8 } else { cw8 };
-                        let (x, y) = ((r.x0 + lx) >> sx, (r.y0 + ly) >> sy);
-                        let (bw, bh) = (16 >> sx, 16 >> sy);
-                        for row in 0..bh {
-                            for &v in &sp[(y + row) * stride + x..][..bw] {
-                                h ^= v as u64;
-                                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                            }
-                        }
-                    }
+                    let (lx, ly) = (col * 16, row * 16);
                     if let Some(&(ox, oy)) = seen.get(&h) {
                         if exact16(ox, oy, lx, ly) {
                             dup += 1;
+                            if dup >= need {
+                                return true;
+                            }
                         }
                     } else {
                         seen.insert(h, (lx, ly));
                     }
                 }
             }
-            dup >= 8 && dup * 20 >= total
+            false
         });
 
     let n = rects.len();
@@ -3365,7 +3413,7 @@ fn frame_cdef(
     // Decision knobs:
     //   gate_thresh  directional-variance gate threshold (0 disables)
     //   perceptual   plain SSE vs perceptual cdef_dist
-    //   margin       per-mille distortion margin a unit must clear to filter
+    //   margin per mille distortion margin a unit must clear to filter
     let gate_thresh = UNIT_DIR_VAR_THRESH_DEFAULT;
     let perceptual = true;
     let margin = MARGIN_DEFAULT;
@@ -3674,7 +3722,7 @@ fn frame_cdef(
     // Rate deltas against the always-written noop CDEF header: each strength
     // entry past the first costs 12 header bits (6 mono), and every signaled
     // unit carries a raw `cdef_idx` literal of `cdef_bits` bits.
-    let lambda = crate::cost::mode_lambda_q(crate::quant::dc_q(base_q_idx, bd) as f32);
+    let lambda = mode_lambda_q(dc_q(base_q_idx, bd) as f32);
     let total_off: i64 = d_off.iter().sum();
     let cost_off = total_off as f32;
     let per_entry_bits = if mono { 6.0f32 } else { 12.0f32 };
@@ -4912,8 +4960,8 @@ mod aq_tests {
             }
         }
         let tile = LossyTile::new(160, 8, 32, 32, &src, QmLevels::FLAT);
-        let none = tile.rd_cost_chroma_partition(0, 0, 16, Part16::None, 1.0);
-        let split = tile.rd_cost_chroma_partition(0, 0, 16, Part16::Split, 1.0);
+        let none = tile.rd_cost_chroma_partition(0, 0, 16, Part16::None, 1.0, false);
+        let split = tile.rd_cost_chroma_partition(0, 0, 16, Part16::Split, 1.0, false);
         assert!(
             split < none,
             "four color-homogeneous chroma blocks should beat one mixed block: split={split}, none={none}"
