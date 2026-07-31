@@ -447,12 +447,12 @@ pub(crate) fn chroma_sse_avx2(
 
         for (chunk, source) in src8.iter().enumerate() {
             let prediction = pred_row.map_or(dc8, |row| {
-                load_i32x8(&row[chunk * 8..].first_chunk::<8>().unwrap())
+                load_i32x8(row[chunk * 8..].first_chunk::<8>().unwrap())
             });
             let reconstruction = residual_row.map_or(prediction, |row| {
                 _mm256_add_epi32(
                     prediction,
-                    load_i32x8(&row[chunk * 8..].first_chunk::<8>().unwrap()),
+                    load_i32x8(row[chunk * 8..].first_chunk::<8>().unwrap()),
                 )
             });
             let reconstruction = _mm256_min_epi32(_mm256_max_epi32(reconstruction, zero8), max8);
@@ -465,12 +465,9 @@ pub(crate) fn chroma_sse_avx2(
         for (chunk, source) in src4.iter().enumerate() {
             let x = x4 + chunk * 4;
             let prediction =
-                pred_row.map_or(dc4, |row| load_i32x4(&row[x..].first_chunk::<4>().unwrap()));
+                pred_row.map_or(dc4, |row| load_i32x4(row[x..].first_chunk::<4>().unwrap()));
             let reconstruction = residual_row.map_or(prediction, |row| {
-                _mm_add_epi32(
-                    prediction,
-                    load_i32x4(&row[x..].first_chunk::<4>().unwrap()),
-                )
+                _mm_add_epi32(prediction, load_i32x4(row[x..].first_chunk::<4>().unwrap()))
             });
             let reconstruction = _mm_min_epi32(_mm_max_epi32(reconstruction, zero4), max4);
             let delta = _mm_sub_epi32(load_u16x4_as_i32(source), reconstruction);
