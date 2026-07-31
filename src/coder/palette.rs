@@ -741,10 +741,13 @@ fn palette_centers(hist: &[(i32, u32)], colors: usize) -> Option<FixedList<i32, 
         let previous = centers;
         let mut sums = [0i64; 8];
         let mut cnts = [0i64; 8];
-        for &(v, c) in hist {
-            let best = nearest_center_idx(&centers, v);
-            sums[best] += i64::from(v) * i64::from(c);
-            cnts[best] += i64::from(c);
+        {
+            let mut nearest = nearest_scan(centers.as_slice());
+            for &(v, c) in hist {
+                let best = nearest(v);
+                sums[best] += i64::from(v) * i64::from(c);
+                cnts[best] += i64::from(c);
+            }
         }
         for i in 0..colors {
             if cnts[i] != 0 {
@@ -786,7 +789,9 @@ fn lossy_luma_palette(
     lossy_luma_palette_from(kmeans, &hist, src, stride, px, py, w, h, colors, top)
 }
 
-#[inline]
+/// Test-only oracle for [`nearest_scan`]: independent per-value lookup with
+/// the same tie rule (lower center wins).
+#[cfg(test)]
 fn nearest_center_idx(centers: &[i32], v: i32) -> usize {
     let idx = centers.partition_point(|&c| c < v);
     if idx == 0 {
@@ -799,6 +804,23 @@ fn nearest_center_idx(centers: &[i32], v: i32) -> usize {
         idx - 1
     } else {
         idx
+    }
+}
+
+/// Nearest-center indices for an ASCENDING value sequence against ASCENDING
+/// strictly-increasing centers, by monotone merge-scan: the nearest index is
+/// non-decreasing in `v`, and it advances only when the next center is
+/// STRICTLY closer — nearest value with ties to the LOWER center (the exact
+/// semantics of the old per-value `partition_point` lookup it replaced), at
+/// O(values + centers) instead of O(values * log(centers)).
+#[inline]
+fn nearest_scan<'c>(centers: &'c [i32]) -> impl FnMut(i32) -> usize + 'c {
+    let mut j = 0usize;
+    move |v: i32| {
+        while j + 1 < centers.len() && centers[j + 1] - v < v - centers[j] {
+            j += 1;
+        }
+        j
     }
 }
 
@@ -867,20 +889,15 @@ fn lossy_luma_palette_from_centers(
 }
 
 impl<'a> LossyTile<'a> {
-    /// Build every legal palette center set, rank it with histogram-domain
-    /// prediction error plus a compact entropy/header model, then construct
-    /// maps and run exact syntax/transform RD only for the finalists.
-    #[allow(clippy::too_many_arguments)]
-    fn rank_luma_palette_candidates<const N: usize>(
+    /// Histogram-domain ranking of every legal palette center set -- sizes
+    /// 2..=8 x {Lloyd, top-frequency} -- cheapest first. Builds NO per-pixel
+    /// map, so the partition proxy can afford the same shortlist the emitter
+    /// uses instead of guessing at Lloyd 8/4/2.
+    fn rank_palette_centers(
         &self,
         hist: &[(i32, u32)],
-        px: usize,
-        py: usize,
-        w: usize,
-        h: usize,
         mlam: f32,
-    ) -> Vec<(LossyLumaPalette, [i32; N])> {
-        debug_assert_eq!(N, w * h);
+    ) -> FixedList<(f32, usize, FixedList<i32, 8>, bool), 14> {
         let mut ranked = FixedList::<(f32, usize, FixedList<i32, 8>, bool), 14>::new((
             f32::INFINITY,
             0,
@@ -921,8 +938,9 @@ impl<'a> LossyTile<'a> {
             let mut counts = [0u32; 8];
             let mut sse = 0i64;
             let mut samples = 0u32;
+            let mut nearest = nearest_scan(centers.as_slice());
             for &(v, count) in hist {
-                let idx = nearest_center_idx(&centers, v);
+                let idx = nearest(v);
                 let d = v - centers[idx];
                 sse += i64::from(d * d) * i64::from(count);
                 counts[idx] += count;
@@ -942,6 +960,24 @@ impl<'a> LossyTile<'a> {
         ranked
             .as_mut_slice()
             .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        ranked
+    }
+
+    /// Build every legal palette center set, rank it with histogram-domain
+    /// prediction error plus a compact entropy/header model, then construct
+    /// maps and run exact syntax/transform RD only for the finalists.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_luma_palette_candidates<const N: usize>(
+        &self,
+        hist: &[(i32, u32)],
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        mlam: f32,
+    ) -> Vec<(LossyLumaPalette, [i32; N])> {
+        debug_assert_eq!(N, w * h);
+        let ranked = self.rank_palette_centers(hist, mlam);
         ranked
             .iter()
             .take(self.speed.palette_refine_budget())
@@ -964,7 +1000,36 @@ impl<'a> LossyTile<'a> {
             .collect()
     }
 
+    /// Flat per-tile `palette_y_color` decision-cost tables (see field doc).
+    fn pal_y_cost_tables(&self) -> std::cell::Ref<'_, Box<[[[f32; 8]; 5]; 7]>> {
+        {
+            let mut slot = self.pal_y_cost.borrow_mut();
+            if slot.is_none() {
+                let c = self.dcdf();
+                let mut m = Box::new([[[0f32; 8]; 5]; 7]);
+                for ns in 2..=8usize {
+                    for ctx in 0..5 {
+                        for sym in 0..ns {
+                            m[ns - 2][ctx][sym] = cdf_cost(&c.palette_y_color[ns - 2][ctx], sym);
+                        }
+                    }
+                }
+                *slot = Some(m);
+            }
+        }
+        std::cell::Ref::map(self.pal_y_cost.borrow(), |o| {
+            o.as_ref().expect("initialized above")
+        })
+    }
+
     fn palette_rate_bits(&self, px: usize, py: usize, p: &LossyLumaPalette) -> f32 {
+        self.palette_header_bits(px, py, p) + self.palette_index_bits(p)
+    }
+
+    /// Map-independent portion of [`Self::palette_rate_bits`]: mode/size
+    /// symbols, color-cache reuse flags and the color-delta header. A true
+    /// component of the exact rate (the index map only ever adds bits).
+    fn palette_header_bits(&self, px: usize, py: usize, p: &LossyLumaPalette) -> f32 {
         let (bx4, by4) = (px / 4, py / 4);
         let c = self.dcdf();
         let bctx = palette_bsize_ctx(p.width, p.height);
@@ -1020,16 +1085,24 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        // Index map: first sample uniform, rest context-coded on the diagonal.
+        bits
+    }
+
+    /// Index-map portion of [`Self::palette_rate_bits`]: first sample uniform,
+    /// rest context-coded on the diagonal (the diagonal ORDER is kept — f32
+    /// summation is order-sensitive and this must stay bit-identical).
+    fn palette_index_bits(&self, p: &LossyLumaPalette) -> f32 {
         let ns = p.colors.len();
-        bits += dirty_log2f(ns as f32);
+        let tables = self.pal_y_cost_tables();
+        let costs = &tables[ns - 2];
+        let mut bits = dirty_log2f(ns as f32);
         for diagonal in 1..p.width + p.height - 1 {
             let first_x = diagonal.min(p.width - 1);
             let last_x = diagonal.saturating_sub(p.height - 1);
             for x in (last_x..=first_x).rev() {
                 let y = diagonal - x;
                 let (ctx, symbol) = palette_color_ctx(&p.map, p.width, y, x, ns);
-                bits += cdf_cost(&c.palette_y_color[ns - 2][ctx], symbol);
+                bits += costs[ctx][symbol];
             }
         }
         bits
@@ -1391,6 +1464,16 @@ mod ctx_tests {
                         .unwrap()
                         .0;
                     assert_eq!(nearest_center_idx(centers, v), want, "{centers:?} v={v}");
+                }
+                // The merge-scan must reproduce the oracle over any ascending
+                // sweep (hist values are ascending by construction).
+                let mut scan = nearest_scan(centers);
+                for v in -1..=10 {
+                    assert_eq!(
+                        scan(v),
+                        nearest_center_idx(centers, v),
+                        "scan {centers:?} v={v}"
+                    );
                 }
             }
             if centers.len() == 8 {

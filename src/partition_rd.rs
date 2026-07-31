@@ -114,30 +114,6 @@ pub(crate) fn luma_satd_scalar(
     satd
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn chroma_sse<P: crate::intrapred::Pel>(
-    src: &[P],
-    stride: usize,
-    px: usize,
-    py: usize,
-    width: usize,
-    height: usize,
-    bit_depth: u8,
-    recon_at: impl Fn(usize) -> i32,
-) -> f32 {
-    let max_value = (1 << bit_depth) - 1;
-    let mut sse = 0i64;
-    for y in 0..height {
-        let src_row = &src[(py + y) * stride + px..(py + y) * stride + px + width];
-        for (x, &s) in src_row.iter().enumerate() {
-            let i = y * width + x;
-            let delta = (s.widen() - recon_at(i).clamp(0, max_value)) as i64;
-            sse += delta * delta;
-        }
-    }
-    sse as f32
-}
-
 #[inline]
 pub(crate) fn rd_cost(distortion: f32, lambda: f32, rate: f32) -> f32 {
     distortion + lambda * rate
@@ -152,14 +128,5 @@ mod tests {
         let src: Vec<u16> = (0..64).map(|i| i * 3).collect();
         let pred: Vec<i32> = src.iter().map(|&value| i32::from(value)).collect();
         assert_eq!(luma_satd_scalar(&src, 8, 0, 0, 8, 8, 255, &pred, 0, &[]), 0);
-    }
-
-    #[test]
-    fn chroma_sse_matches_manual_error() {
-        let src = vec![10, 20, 30, 40];
-        assert_eq!(
-            chroma_sse(&src, 2, 0, 0, 2, 2, 8, |i| [12, 17, 30, 44][i]),
-            29.0
-        );
     }
 }

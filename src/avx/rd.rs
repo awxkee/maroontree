@@ -418,6 +418,79 @@ pub(crate) fn sse_recon_avx2(
 }
 
 #[target_feature(enable = "avx2")]
+pub(crate) fn chroma_sse_avx2(
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    let zero8 = _mm256_setzero_si256();
+    let max8 = _mm256_set1_epi32(max_value);
+    let dc8 = _mm256_set1_epi32(dc);
+    let zero4 = _mm_setzero_si128();
+    let max4 = _mm_set1_epi32(max_value);
+    let dc4 = _mm_set1_epi32(dc);
+    let mut acc = _mm256_setzero_si256();
+    let mut scalar = 0i64;
+
+    for y in 0..h {
+        let src_row = image_row(src, stride, px, py, y, w);
+        let pred_row = (!pred.is_empty()).then(|| block_row(pred, y, w));
+        let residual_row = (!residual.is_empty()).then(|| block_row(residual, y, w));
+        let (src8, src_tail) = src_row.as_chunks::<8>();
+
+        for (chunk, source) in src8.iter().enumerate() {
+            let prediction = pred_row.map_or(dc8, |row| {
+                load_i32x8(&row[chunk * 8..].first_chunk::<8>().unwrap())
+            });
+            let reconstruction = residual_row.map_or(prediction, |row| {
+                _mm256_add_epi32(
+                    prediction,
+                    load_i32x8(&row[chunk * 8..].first_chunk::<8>().unwrap()),
+                )
+            });
+            let reconstruction = _mm256_min_epi32(_mm256_max_epi32(reconstruction, zero8), max8);
+            let delta = _mm256_sub_epi32(load_u16x8_as_i32(source), reconstruction);
+            acc = _mm256_add_epi64(acc, square_i32x8_to_i64(delta));
+        }
+
+        let x4 = src8.len() * 8;
+        let (src4, src_tail) = src_tail.as_chunks::<4>();
+        for (chunk, source) in src4.iter().enumerate() {
+            let x = x4 + chunk * 4;
+            let prediction =
+                pred_row.map_or(dc4, |row| load_i32x4(&row[x..].first_chunk::<4>().unwrap()));
+            let reconstruction = residual_row.map_or(prediction, |row| {
+                _mm_add_epi32(
+                    prediction,
+                    load_i32x4(&row[x..].first_chunk::<4>().unwrap()),
+                )
+            });
+            let reconstruction = _mm_min_epi32(_mm_max_epi32(reconstruction, zero4), max4);
+            let delta = _mm_sub_epi32(load_u16x4_as_i32(source), reconstruction);
+            acc = _mm256_add_epi64(acc, widen_i64x2_to_i64x4(square_i32x4_to_i64(delta)));
+        }
+
+        let scalar_x = x4 + src4.len() * 4;
+        for (lane, &source) in src_tail.iter().enumerate() {
+            let x = scalar_x + lane;
+            let prediction = pred_row.map_or(dc, |row| row[x]);
+            let reconstruction = prediction + residual_row.map_or(0, |row| row[x]);
+            let delta = (i32::from(source) - reconstruction.clamp(0, max_value)) as i64;
+            scalar += delta * delta;
+        }
+    }
+
+    reduce_i64x4(acc) + scalar
+}
+
+#[target_feature(enable = "avx2")]
 pub(crate) fn sse_u16_avx2(
     src: &[u16],
     src_stride: usize,

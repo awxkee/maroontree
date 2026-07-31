@@ -312,6 +312,57 @@ pub(crate) fn sse_recon_neon(
 }
 
 #[target_feature(enable = "neon")]
+pub(crate) fn chroma_sse_neon(
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    let zero = vdupq_n_s32(0);
+    let max_value_v = vdupq_n_s32(max_value);
+    let dc_v = vdupq_n_s32(dc);
+    let mut acc0 = vdupq_n_s64(0);
+    let mut acc1 = vdupq_n_s64(0);
+    let mut scalar = 0i64;
+
+    for y in 0..h {
+        let src_row = &src[(py + y) * stride + px..][..w];
+        let pred_row = (!pred.is_empty()).then(|| &pred[y * w..][..w]);
+        let residual_row = (!residual.is_empty()).then(|| &residual[y * w..][..w]);
+        let (src4, src_tail) = src_row.as_chunks::<4>();
+
+        for (chunk, source) in src4.iter().enumerate() {
+            let x = chunk * 4;
+            let prediction =
+                pred_row.map_or(dc_v, |row| load_i32x4(row[x..].first_chunk::<4>().unwrap()));
+            let reconstruction = residual_row.map_or(prediction, |row| {
+                vaddq_s32(prediction, load_i32x4(row[x..].first_chunk::<4>().unwrap()))
+            });
+            let reconstruction = vminq_s32(vmaxq_s32(reconstruction, zero), max_value_v);
+            let delta = vsubq_s32(load_u16x4_as_i32(source), reconstruction);
+            (acc0, acc1) = square_acc_i32x4(acc0, acc1, delta);
+        }
+
+        let scalar_x = src4.len() * 4;
+        for (lane, &source) in src_tail.iter().enumerate() {
+            let x = scalar_x + lane;
+            let prediction = pred_row.map_or(dc, |row| row[x]);
+            let reconstruction = prediction + residual_row.map_or(0, |row| row[x]);
+            let delta = (i32::from(source) - reconstruction.clamp(0, max_value)) as i64;
+            scalar += delta * delta;
+        }
+    }
+
+    reduce_i64x2x2(acc0, acc1) + scalar
+}
+
+#[target_feature(enable = "neon")]
 pub(crate) fn sse_u16_neon(
     src: &[u16],
     src_stride: usize,

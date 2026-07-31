@@ -250,14 +250,39 @@ impl<'a> LossyTile<'a> {
                 let mut pairs = [(f32::INFINITY, 0.0f32); 3];
                 let mut tried = 0usize;
                 let hist = block_color_histogram(&self.src[0], self.w, px, py, dim, dim);
-                for n in [8usize, 4, 2] {
+                let ranked = if crate::tuning::get().palette_proxy_ranked
+                    && (self.ss420 || self.ss422)
+                {
+                    hist.as_deref()
+                        .map(|hh| self.rank_palette_centers(hh, mlam))
+                } else {
+                    None
+                };
+                let plan: Vec<(usize, bool, Option<FixedList<i32, 8>>)> = match &ranked {
+                    Some(r) => r
+                        .iter()
+                        .take(crate::tuning::get().palette_proxy_finalists.min(3))
+                        .map(|&(_, _, centers, top)| (centers.len(), top, Some(centers)))
+                        .collect(),
+                    None => vec![(8, false, None), (4, false, None), (2, false, None)],
+                };
+                for (n, top, centers) in plan {
                     if tried >= 3 {
                         break;
                     }
-                    // Proxy stays Lloyd-only: it prices an upper bound and the
-                    // emitters try both families.
-                    let Some(p) = hist.as_deref().and_then(|hh| {
-                        lossy_luma_palette_from(
+                    let Some(p) = hist.as_deref().and_then(|hh| match &centers {
+                        Some(c) => Some(lossy_luma_palette_from_centers(
+                            &self.kmeans,
+                            &self.src[0],
+                            self.w,
+                            px,
+                            py,
+                            dim,
+                            dim,
+                            c.as_slice().to_vec(),
+                            top,
+                        )),
+                        None => lossy_luma_palette_from(
                             &self.kmeans,
                             hh,
                             &self.src[0],
@@ -267,8 +292,8 @@ impl<'a> LossyTile<'a> {
                             dim,
                             dim,
                             n,
-                            false,
-                        )
+                            top,
+                        ),
                     }) else {
                         continue;
                     };

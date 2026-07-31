@@ -53,7 +53,9 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/manhattan.png").unwrap().to_rgb8();
+    let img = image::open("./assets/Screenshot 2026-07-18 at 16.09.09.png")
+        .unwrap()
+        .to_rgb8();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -69,11 +71,11 @@ fn main() {
                 .with_quality(60)
                 .with_cicp(Cicp::srgb_ycbcr())
                 .with_chroma(ChromaFormat::Yuv444)
-                .with_speed(Speed::Medium)
+                .with_speed(Speed::Slow)
                 .with_threads(12)
                 .with_variance_boost(true)
                 .with_screen_content(false)
-                .with_intrabc(false),
+                .with_intrabc(true),
             // .with_cdef(true)
             // .with_wiener(true),
         )
@@ -83,7 +85,7 @@ fn main() {
             instant.elapsed(),
             out.len()
         );
-        // std::fs::write("./out.avif", out).unwrap();
+        std::fs::write("./out.avif", out).unwrap();
     }
 
     // libaom reference, same source and same thread count, in-process.
