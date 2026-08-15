@@ -31,7 +31,7 @@
 mod aq_common;
 mod chroma_rect;
 mod coder;
-mod coefs;
+mod coefs_ctx;
 mod dispatch;
 mod partition_rd;
 mod skip_tables;
@@ -46,8 +46,8 @@ mod bitwriter;
 mod cdef;
 mod cdf_tables;
 mod coef_q;
-pub mod coeff;
 mod coeffs;
+pub mod coeffs_cdf;
 mod color;
 mod cost;
 mod dct;

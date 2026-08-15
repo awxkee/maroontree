@@ -29,7 +29,7 @@
 
 use crate::Speed;
 use crate::coder::Cdfs;
-use crate::coefs::encode_coefs;
+use crate::coefs_ctx::encode_coefs;
 use crate::cost::coef_rate_bits;
 use crate::intrapred::{
     CFL_ALPHA_CDF, CFL_PRED, CFL_SIGN_CDF, INTRA_MODE_CTX, cfl_ac_444, cfl_best_alpha,
