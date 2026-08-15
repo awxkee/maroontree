@@ -30,7 +30,9 @@
 mod aom_bench;
 mod y4m2ivf;
 
-use maroontree::{BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, Speed, encode_rgb8};
+use maroontree::{
+    BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, Speed, encode_lossless, encode_rgb8,
+};
 use std::time::Instant;
 
 fn main() {
@@ -53,9 +55,8 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/Screenshot 2026-07-18 at 16.09.09.png")
-        .unwrap()
-        .to_rgb8();
+    let img = image::open("./assets/banner2.png").unwrap().to_rgb8();
+    img.save("./reload.png").unwrap();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
         img.height() as usize,
@@ -65,17 +66,17 @@ fn main() {
     .unwrap();
     for _i in 0..15 {
         let instant = Instant::now();
-        let out = encode_rgb8(
+        let out = encode_lossless(
             &planar_rgb,
             &EncodeConfig::new()
-                .with_quality(60)
-                .with_cicp(Cicp::srgb_ycbcr())
+                .with_quality(90)
+                .with_cicp(Cicp::identity_rgb())
                 .with_chroma(ChromaFormat::Yuv444)
-                .with_speed(Speed::Slow)
+                .with_speed(Speed::Fast)
                 .with_threads(12)
                 .with_variance_boost(true)
                 .with_screen_content(false)
-                .with_intrabc(true),
+                .with_intrabc(false),
             // .with_cdef(true)
             // .with_wiener(true),
         )
