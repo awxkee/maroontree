@@ -44,6 +44,10 @@ fn iclip(v: i32, lo: i32, hi: i32) -> i32 {
 
 pub(crate) type LoopFilterFn = fn(&mut [u16], usize, i32, i32, i32, isize, isize, i32, u8);
 
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
 pub(crate) static WIDE16_WEIGHTS: [[i32; 14]; 12] = [
     [7, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
     [5, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
@@ -59,6 +63,10 @@ pub(crate) static WIDE16_WEIGHTS: [[i32; 14]; 12] = [
     [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 7],
 ];
 
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
 pub(crate) static WIDE8_WEIGHTS: [[i32; 8]; 6] = [
     [3, 2, 1, 1, 1, 0, 0, 0],
     [2, 1, 2, 1, 1, 1, 0, 0],
@@ -68,6 +76,10 @@ pub(crate) static WIDE8_WEIGHTS: [[i32; 8]; 6] = [
     [0, 0, 0, 1, 1, 1, 2, 3],
 ];
 
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
 pub(crate) static WIDE6_WEIGHTS: [[i32; 6]; 4] = [
     [3, 2, 2, 1, 0, 0],
     [1, 2, 2, 2, 1, 0],

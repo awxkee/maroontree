@@ -128,9 +128,9 @@ pub(crate) fn wiener_filter_rect(
         for c in 0..rw {
             let sx = x0 as i32 + c as i32;
             let mut s = 0i32;
-            for t in 0..7 {
+            for (t, &tap) in hk.taps.iter().enumerate() {
                 let px = get(src, stride, w, h, sx + t as i32 - 3, sy);
-                s += hk.taps[t] * px;
+                s += tap * px;
             }
             let v = clamp3((s + (1 << (round0 - 1)) + offset) >> round0, 0, limit);
             inter[r * rw + c] = v;
@@ -142,9 +142,9 @@ pub(crate) fn wiener_filter_rect(
     for r in 0..rh {
         for c in 0..rw {
             let mut s = 0i32;
-            for t in 0..7 {
+            for (t, &tap) in vk.taps.iter().enumerate() {
                 let iy = r as i32 + t as i32;
-                s += vk.taps[t] * inter[iy as usize * rw + c];
+                s += tap * inter[iy as usize * rw + c];
             }
             let v = (s - offset_correction + round1_offset) >> round1;
             dst[(y0 + r - dst_y0) * stride + (x0 + c)] = v.clamp(0, maxv) as u16;

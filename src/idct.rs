@@ -1481,6 +1481,10 @@ impl IdctDequant {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     #[inline]
     fn new_flat(q: &Quant) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = q.clips();

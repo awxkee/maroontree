@@ -1874,8 +1874,12 @@ fn write_intrabc_mv_component(wr: &mut Writer, cdfs: &mut Cdfs, component: usize
     if class == 0 {
         wr.symbol_adapt(up, &mut cdfs.mv_class0[component]);
     } else {
-        for n in 0..class {
-            wr.symbol_adapt((up >> n) & 1, &mut cdfs.mv_class_n[component][n]);
+        for (n, cdf) in cdfs.mv_class_n[component]
+            .iter_mut()
+            .enumerate()
+            .take(class)
+        {
+            wr.symbol_adapt((up >> n) & 1, cdf);
         }
     }
 }
@@ -2302,12 +2306,8 @@ fn code_leaf(
     if let Some(palette) = palette {
         write_palette_map(wr, &mut st.cdfs, palette);
     }
-    for u in x4..x4 + n_tx {
-        st.a_mode[u] = y_mode as u8;
-    }
-    for u in y4..y4 + n_tx {
-        st.l_mode[u] = y_mode as u8;
-    }
+    st.a_mode[x4..x4 + n_tx].fill(y_mode as u8);
+    st.l_mode[y4..y4 + n_tx].fill(y_mode as u8);
     let stored_palette = palette.map_or_else(Vec::new, |p| p.colors.clone());
     for slot in &mut st.a_palette[x4..x4 + n_tx] {
         slot.clone_from(&stored_palette);
@@ -2550,12 +2550,8 @@ fn encode_plan(
                 *intrabc,
             );
             let pb = part_byte(sz8);
-            for u in x8..x8 + sz8 {
-                st.a_part[u] = pb;
-            }
-            for u in y8..y8 + sz8 {
-                st.l_part[u] = pb;
-            }
+            st.a_part[x8..x8 + sz8].fill(pb);
+            st.l_part[y8..y8 + sz8].fill(pb);
         }
         Plan::Split(kids) => {
             write_partition_symbol(wr, st, bl, x8, y8, 3); // PARTITION_SPLIT
@@ -3254,12 +3250,8 @@ fn code_leaf_mono(
         }
     }
     // (mono: HasChroma == false ⇒ no uv_mode symbol, no chroma residual)
-    for u in x4..x4 + n_tx {
-        st.a_mode[u] = y_mode as u8;
-    }
-    for u in y4..y4 + n_tx {
-        st.l_mode[u] = y_mode as u8;
-    }
+    st.a_mode[x4..x4 + n_tx].fill(y_mode as u8);
+    st.l_mode[y4..y4 + n_tx].fill(y_mode as u8);
     let stored_palette = palette.map_or_else(Vec::new, |p| p.colors.clone());
     for slot in &mut st.a_palette[x4..x4 + n_tx] {
         slot.clone_from(&stored_palette);
