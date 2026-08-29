@@ -1009,8 +1009,8 @@ impl<'a> LossyTile<'a> {
                 let mut m = Box::new([[[0f32; 8]; 5]; 7]);
                 for ns in 2..=8usize {
                     for ctx in 0..5 {
-                        for sym in 0..ns {
-                            m[ns - 2][ctx][sym] = cdf_cost(&c.palette_y_color[ns - 2][ctx], sym);
+                        for (sym, cost) in m[ns - 2][ctx].iter_mut().enumerate().take(ns) {
+                            *cost = cdf_cost(&c.palette_y_color[ns - 2][ctx], sym);
                         }
                     }
                 }

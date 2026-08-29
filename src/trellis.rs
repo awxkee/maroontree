@@ -78,7 +78,12 @@ pub(crate) fn trellis_optimize_ctx(
     // coefficient. `qm_row` resolves the offset once; the per-access work is a
     // byte load and a multiply, so no precomputed buffer is warranted.
     let qm_table = crate::quant::qm_row(qm_level, plane != 0, w, h);
-    let qm_full = qm_level >= 6;
+    // Full wq^2 distortion weighting from level 5 up (partial wq below).
+    // The gate used to sit at level 6 — the same boundary where the level
+    // law rounds 5 -> 6 — so both flipped at one qindex step and mid-band
+    // ladders went non-monotonic on HF-dense content (a higher quality
+    // label produced a bigger file AND lower SS2).
+    let qm_full = qm_level >= 5;
     let qm_at = |rc: usize| -> f32 {
         let wq = qm_table.map_or(32.0, |t| t[rc] as f32) / 32.0;
         if qm_full { wq * wq } else { wq }
