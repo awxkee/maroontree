@@ -75,6 +75,12 @@ pub(crate) struct Tuning {
     pub(crate) top_none_bias_420_lo: f32,
     /// 4:4:4 top-band chroma AC qindex delta (`quant::TOP_444_UAC`).
     pub(crate) top_444_uac: f32,
+    /// Scale on the 4:2:0 mid-band chroma qindex delta when applied at 4:2:2
+    /// (peak -14 at 0.5). SHIPPED 0.5 on observable quality, not metric: at
+    /// scale 0 mid-band 4:2:2 chroma ran at full luma q and turned smooth skin
+    /// Cr gradients into blotchy DC patches (ClassE_set70 face, q50-65); 0.5
+    /// is the visual knee (+2-3% bytes on the corpus, SS2-neutral BD).
+    pub(crate) uv422_mid_scale: f32,
     /// Source-domain SPLIT breakout ratio at Slow.
     pub(crate) split_breakout_slow: f32,
     pub(crate) fixed_size_fast: u32,
@@ -212,6 +218,7 @@ impl Tuning {
         top_none_bias_420_hi: 1.45,
         top_none_bias_420_lo: 1.15,
         top_444_uac: 6.0,
+        uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
         fixed_size_fast: 16,
         fixed_size_medium: 0,
@@ -365,6 +372,7 @@ mod imp {
                 "top_none_bias_420_hi" => t.top_none_bias_420_hi = num(value),
                 "top_none_bias_420_lo" => t.top_none_bias_420_lo = num(value),
                 "top_444_uac" => t.top_444_uac = num(value),
+                "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
                 "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,
                 "fixed_size_medium" => t.fixed_size_medium = num(value) as u32,

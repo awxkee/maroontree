@@ -187,10 +187,15 @@ fn top_444_uac() -> i32 {
     crate::tuning::get().top_444_uac as i32
 }
 
+fn uv422_mid_delta(base_q_idx: u8) -> i32 {
+    let s = crate::tuning::get().uv422_mid_scale;
+    (s * uv420_mid_delta(base_q_idx) as f32) as i32
+}
+
 pub(crate) fn chroma_ac_delta(base_q_idx: u8, sub: usize) -> i32 {
     match sub {
         2 => return uv420_mid_delta(base_q_idx),
-        1 => return 0,
+        1 => return uv422_mid_delta(base_q_idx),
         _ => {}
     }
     let qi = base_q_idx as i32;
@@ -213,6 +218,8 @@ pub(crate) fn chroma_dc_delta(base_q_idx: u8, sub: usize) -> i32 {
     };
     if sub == 2 {
         deep + uv420_mid_delta(base_q_idx)
+    } else if sub == 1 {
+        deep + uv422_mid_delta(base_q_idx)
     } else {
         deep
     }
