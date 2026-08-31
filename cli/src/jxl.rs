@@ -53,7 +53,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
     let mut reader = BufReader::new(Cursor::new(input_src));
 
     let mut decoder_with_image_info = match JxlDecoder::new(JxlDecoderOptions::default())
-        .process(&mut reader)
+        .process(&mut reader, None)
         .map_err(|x| JxlError::Format(format!("jxl {x}")))?
     {
         ProcessingResult::Complete { result: d } => d,
@@ -105,7 +105,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
     };
 
     let decoder_with_frame_info = match decoder_with_image_info
-        .process(&mut reader)
+        .process(&mut reader, None)
         .map_err(|x| JxlError::Format(format!("jxl {x}")))?
     {
         ProcessingResult::Complete { result: d } => d,
@@ -120,7 +120,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
             let mut buf = vec![0u8; h * stride];
             let mut out = [JxlOutputBuffer::new(buf.as_mut_slice(), h, stride)];
             decoder_with_frame_info
-                .process(&mut reader, &mut out)
+                .process(&mut reader, &mut out, None)
                 .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
             DynamicImage::$img(
                 image::ImageBuffer::from_raw(w as u32, h as u32, buf)
@@ -136,7 +136,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
                 stride_bytes,
             )];
             decoder_with_frame_info
-                .process(&mut reader, &mut out)
+                .process(&mut reader, &mut out, None)
                 .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
             DynamicImage::$img(
                 image::ImageBuffer::from_raw(w as u32, h as u32, buf)
@@ -166,7 +166,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
                 stride_bytes,
             )];
             decoder_with_frame_info
-                .process(&mut reader, &mut out)
+                .process(&mut reader, &mut out, None)
                 .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
             let rgb: Vec<f32> = buf.iter().flat_map(|&v| [v, v, v]).collect();
             DynamicImage::ImageRgb32F(
@@ -184,7 +184,7 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
                 stride_bytes,
             )];
             decoder_with_frame_info
-                .process(&mut reader, &mut out)
+                .process(&mut reader, &mut out, None)
                 .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
             let rgba: Vec<f32> = buf
                 .as_chunks::<2>()

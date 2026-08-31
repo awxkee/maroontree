@@ -56,6 +56,15 @@ pub enum HeicError {
     Lossless444(ChromaFormat),
 }
 
+fn plane_stride<T>(plane: &hpvcd::PlaneBuffer<T>) -> Result<u32, HeicError> {
+    u32::try_from(plane.stride())
+        .map_err(|_| HeicError::Format("HEIC plane stride exceeds u32".into()))
+}
+
+fn tight_plane<T: Copy>(plane: &hpvcd::PlaneBuffer<T>) -> Vec<T> {
+    plane.rows().flatten().copied().collect()
+}
+
 pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicError> {
     use hpvcd::{ChromaFormat, MatrixCoefficients};
     use yuv::{
@@ -74,21 +83,21 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
     let dec = hpvcd::decode_heic_yuv(&fs::read(file).map_err(|x| HeicError::Io(x.to_string()))?)
         .map_err(|e| HeicError::Format(format!("hpvcd: {e}")))?;
 
-    let w = dec.width;
-    let h = dec.height;
+    let w = u32::try_from(dec.width())
+        .map_err(|_| HeicError::Format("HEIC width exceeds u32".into()))?;
+    let h = u32::try_from(dec.height())
+        .map_err(|_| HeicError::Format("HEIC height exceeds u32".into()))?;
     let bit_depth = dec.bit_depth.bits() as u32;
     let high_bit = bit_depth > 8;
     let is_12 = bit_depth >= 12;
 
-    // Chroma subsampling factors → tight plane strides.
+    // Chroma subsampling factors select the conversion routine. Plane strides
+    // come from hpvcd because decoded images may retain coded padding/crops.
     let (sub_w, sub_h) = match dec.chroma {
         ChromaFormat::Yuv420 => (2u32, 2u32),
         ChromaFormat::Yuv422 => (2, 1),
         ChromaFormat::Yuv444 | ChromaFormat::Monochrome => (1, 1),
     };
-    let y_stride = w;
-    let c_stride = w.div_ceil(sub_w);
-    let _ch = h.div_ceil(sub_h);
 
     let mut matrix = YuvStandardMatrix::Bt601;
     let mut range = YuvRange::Limited;
@@ -124,30 +133,21 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
     let has_alpha = dec.alpha.is_some();
 
     let img = if high_bit {
-        let y16 = match dec.y.as_u16() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA10/RGBA12 Luma is not actually 10/12".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
-        let cb16 = match dec.cb.as_u16() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA10/RGBA12 Cb is not actually 10/12".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
-        let cr16 = match dec.cr.as_u16() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA10/RGBA12 Cr is not actually 10/12".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
+        let planes = dec.planes.as_u16().ok_or_else(|| {
+            HeicError::Format("HEIC RGBA10/RGBA12 planes are not actually 10/12-bit".into())
+        })?;
+        let cb = planes.cb.as_ref().ok_or_else(|| {
+            HeicError::Format("HEIC RGBA10/RGBA12 is missing the Cb plane".into())
+        })?;
+        let cr = planes.cr.as_ref().ok_or_else(|| {
+            HeicError::Format("HEIC RGBA10/RGBA12 is missing the Cr plane".into())
+        })?;
+        let y16 = planes.y.data();
+        let cb16 = cb.data();
+        let cr16 = cr.data();
+        let y_stride = plane_stride(&planes.y)?;
+        let cb_stride = plane_stride(cb)?;
+        let cr_stride = plane_stride(cr)?;
 
         if is_ycgco {
             if let Some(a) = dec.alpha.as_ref().and_then(|a| a.as_u16()) {
@@ -155,11 +155,11 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                     y_plane: y16,
                     y_stride,
                     u_plane: cb16,
-                    u_stride: c_stride,
+                    u_stride: cb_stride,
                     v_plane: cr16,
-                    v_stride: c_stride,
-                    a_plane: a,
-                    a_stride: y_stride,
+                    v_stride: cr_stride,
+                    a_plane: a.data(),
+                    a_stride: plane_stride(a)?,
                     width: w,
                     height: h,
                 };
@@ -180,9 +180,9 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                     y_plane: y16,
                     y_stride,
                     u_plane: cb16,
-                    u_stride: c_stride,
+                    u_stride: cb_stride,
                     v_plane: cr16,
-                    v_stride: c_stride,
+                    v_stride: cr_stride,
                     width: w,
                     height: h,
                 };
@@ -204,11 +204,11 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                 y_plane: y16,
                 y_stride,
                 u_plane: cb16,
-                u_stride: c_stride,
+                u_stride: cb_stride,
                 v_plane: cr16,
-                v_stride: c_stride,
-                a_plane: a,
-                a_stride: y_stride,
+                v_stride: cr_stride,
+                a_plane: a.data(),
+                a_stride: plane_stride(a)?,
                 width: w,
                 height: h,
             };
@@ -229,9 +229,9 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                 y_plane: y16,
                 y_stride,
                 u_plane: cb16,
-                u_stride: c_stride,
+                u_stride: cb_stride,
                 v_plane: cr16,
-                v_stride: c_stride,
+                v_stride: cr_stride,
                 width: w,
                 height: h,
             };
@@ -249,30 +249,24 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
             rgb16_image(w, h, out)?
         }
     } else {
-        let y8 = match dec.y.as_u8() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA8 Luma is not actually 8".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
-        let cb8 = match dec.cb.as_u8() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA8 Cb is not actually 8".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
-        let cr8 = match dec.cr.as_u8() {
-            None => {
-                return Err(HeicError::Format(
-                    "HEIC RGBA8 Cr is not actually 8".to_string(),
-                ));
-            }
-            Some(v) => v,
-        };
+        let planes = dec
+            .planes
+            .as_u8()
+            .ok_or_else(|| HeicError::Format("HEIC RGBA8 planes are not actually 8-bit".into()))?;
+        let cb = planes
+            .cb
+            .as_ref()
+            .ok_or_else(|| HeicError::Format("HEIC RGBA8 is missing the Cb plane".into()))?;
+        let cr = planes
+            .cr
+            .as_ref()
+            .ok_or_else(|| HeicError::Format("HEIC RGBA8 is missing the Cr plane".into()))?;
+        let y8 = planes.y.data();
+        let cb8 = cb.data();
+        let cr8 = cr.data();
+        let y_stride = plane_stride(&planes.y)?;
+        let cb_stride = plane_stride(cb)?;
+        let cr_stride = plane_stride(cr)?;
 
         if is_ycgco {
             if let Some(a) = dec.alpha.as_ref().and_then(|a| a.as_u8()) {
@@ -280,11 +274,11 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                     y_plane: y8,
                     y_stride,
                     u_plane: cb8,
-                    u_stride: c_stride,
+                    u_stride: cb_stride,
                     v_plane: cr8,
-                    v_stride: c_stride,
-                    a_plane: a,
-                    a_stride: y_stride,
+                    v_stride: cr_stride,
+                    a_plane: a.data(),
+                    a_stride: plane_stride(a)?,
                     width: w,
                     height: h,
                 };
@@ -301,9 +295,9 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                     y_plane: y8,
                     y_stride,
                     u_plane: cb8,
-                    u_stride: c_stride,
+                    u_stride: cb_stride,
                     v_plane: cr8,
-                    v_stride: c_stride,
+                    v_stride: cr_stride,
                     width: w,
                     height: h,
                 };
@@ -321,11 +315,11 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                 y_plane: y8,
                 y_stride,
                 u_plane: cb8,
-                u_stride: c_stride,
+                u_stride: cb_stride,
                 v_plane: cr8,
-                v_stride: c_stride,
-                a_plane: a,
-                a_stride: y_stride,
+                v_stride: cr_stride,
+                a_plane: a.data(),
+                a_stride: plane_stride(a)?,
                 width: w,
                 height: h,
             };
@@ -342,9 +336,9 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
                 y_plane: y8,
                 y_stride,
                 u_plane: cb8,
-                u_stride: c_stride,
+                u_stride: cb_stride,
                 v_plane: cr8,
-                v_stride: c_stride,
+                v_stride: cr_stride,
                 width: w,
                 height: h,
             };
@@ -397,50 +391,71 @@ fn finish_monochrome(
     is_12: bool,
 ) -> Result<DynamicImage, HeicError> {
     let img = if high_bit {
-        let mut y = dec.y.as_u16().expect("high-bit luma is u16").to_vec();
-        expand_to_16bit(&mut y, is_12);
-        DynamicImage::ImageLuma16(
-            image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, y.to_vec())
-                .ok_or_else(|| HeicError::Format("HEIC RGB mismatch".into()))?,
-        )
-    } else {
-        let y = dec.y.as_u8().expect("8-bit luma is u8");
-        if let Some(alpha) = dec.alpha.as_ref() {
-            let y = match dec.y.as_u8() {
-                None => {
-                    return Err(HeicError::Format(
-                        "HEIC RGBA8 luma 8 is not actually 8".into(),
-                    ));
-                }
-                Some(v) => v,
-            };
-            let alpha = match alpha.as_u8() {
-                None => {
-                    return Err(HeicError::Format(
-                        "HEIC RGBA8 alpha 8 is not actually 8".into(),
-                    ));
-                }
-                Some(v) => v,
-            };
-            let mut new_img = vec![0u8; dec.width as usize * dec.height as usize * 2];
-            for ((dst, src), alpha) in new_img
+        let planes = dec
+            .planes
+            .as_u16()
+            .ok_or_else(|| HeicError::Format("HEIC monochrome luma is not 10/12-bit".into()))?;
+        let mut y = tight_plane(&planes.y);
+        if let Some(alpha) = dec.alpha.as_ref().and_then(|a| a.as_u16()) {
+            let alpha = tight_plane(alpha);
+            if y.len() != alpha.len() {
+                return Err(HeicError::Format(
+                    "HEIC monochrome alpha dimensions do not match luma".into(),
+                ));
+            }
+            let mut ya = vec![0u16; y.len() * 2];
+            for (dst, (y, alpha)) in ya
                 .as_chunks_mut::<2>()
                 .0
                 .iter_mut()
-                .zip(y.iter())
-                .zip(alpha.iter())
+                .zip(y.into_iter().zip(alpha))
             {
-                dst[0] = *src;
-                dst[1] = *alpha;
+                dst[0] = y;
+                dst[1] = alpha;
             }
-            DynamicImage::ImageLuma8(
-                image::GrayImage::from_raw(w, h, y.to_vec())
-                    .ok_or_else(|| HeicError::Format("HEIC RGB mismatch".into()))?,
+            expand_to_16bit(&mut ya, is_12);
+            DynamicImage::ImageLumaA16(
+                image::ImageBuffer::from_raw(w, h, ya)
+                    .ok_or_else(|| HeicError::Format("HEIC LumaA16 mismatch".into()))?,
+            )
+        } else {
+            expand_to_16bit(&mut y, is_12);
+            DynamicImage::ImageLuma16(
+                image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, y)
+                    .ok_or_else(|| HeicError::Format("HEIC Luma16 mismatch".into()))?,
+            )
+        }
+    } else {
+        let planes = dec
+            .planes
+            .as_u8()
+            .ok_or_else(|| HeicError::Format("HEIC monochrome luma is not 8-bit".into()))?;
+        let y = tight_plane(&planes.y);
+        if let Some(alpha) = dec.alpha.as_ref().and_then(|a| a.as_u8()) {
+            let alpha = tight_plane(alpha);
+            if y.len() != alpha.len() {
+                return Err(HeicError::Format(
+                    "HEIC monochrome alpha dimensions do not match luma".into(),
+                ));
+            }
+            let mut ya = vec![0u8; y.len() * 2];
+            for (dst, (y, alpha)) in ya
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(y.into_iter().zip(alpha))
+            {
+                dst[0] = y;
+                dst[1] = alpha;
+            }
+            DynamicImage::ImageLumaA8(
+                image::ImageBuffer::from_raw(w, h, ya)
+                    .ok_or_else(|| HeicError::Format("HEIC LumaA8 mismatch".into()))?,
             )
         } else {
             DynamicImage::ImageLuma8(
-                image::GrayImage::from_raw(w, h, y.to_vec())
-                    .ok_or_else(|| HeicError::Format("HEIC RGB mismatch".into()))?,
+                image::GrayImage::from_raw(w, h, y)
+                    .ok_or_else(|| HeicError::Format("HEIC Luma8 mismatch".into()))?,
             )
         }
     };
