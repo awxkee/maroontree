@@ -26,7 +26,9 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{
+    Args, Chroma, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+};
 use maroontree::{
     BitDepth, ChromaFormat, ChromaSamplePosition, Cicp, EncodeConfig, MatrixCoefficients,
     PlanarImage, Primaries, TransferFunction, encode_lossless, encode_lossless_gray,
@@ -44,6 +46,7 @@ pub(crate) fn encode_av1_lossless(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -56,13 +59,15 @@ pub(crate) fn encode_av1_lossless(
         ));
     }
 
-    let color = Cicp {
-        primaries: Primaries::Bt709,
-        transfer: TransferFunction::Srgb,
-        matrix: MatrixCoefficients::YCgCo,
-        full_range: true,
-        chroma_sample_position: ChromaSamplePosition::Unknown,
-    };
+    let color = png_cicp
+        .map(|c| c.to_maroontree(MatrixCoefficients::YCgCo, true))
+        .unwrap_or(Cicp {
+            primaries: Primaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            matrix: MatrixCoefficients::YCgCo,
+            full_range: true,
+            chroma_sample_position: ChromaSamplePosition::Unknown,
+        });
 
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)

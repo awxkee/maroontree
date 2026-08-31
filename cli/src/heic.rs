@@ -462,6 +462,51 @@ fn finish_monochrome(
     Ok(apply_orientation(img, dec.orientation))
 }
 
+fn hpvca_cicp(cicp: crate::PngCicp) -> hpvca::Cicp {
+    use hpvca::{MatrixCoefficients, Primaries, TransferFunction};
+
+    let primaries = match cicp.color_primaries {
+        1 => Primaries::Bt709,
+        4 => Primaries::Bt470M,
+        5 => Primaries::Bt470Bg,
+        6 => Primaries::Bt601,
+        7 => Primaries::Smpte240,
+        8 => Primaries::GenericFilm,
+        9 => Primaries::Bt2020,
+        10 => Primaries::Xyz,
+        11 => Primaries::Smpte431,
+        12 => Primaries::Smpte432,
+        22 => Primaries::Ebu3213,
+        _ => Primaries::Unspecified,
+    };
+    let transfer = match cicp.transfer_function {
+        1 => TransferFunction::Bt709,
+        4 => TransferFunction::Bt470M,
+        5 => TransferFunction::Bt470Bg,
+        6 => TransferFunction::Bt601,
+        7 => TransferFunction::Smpte240,
+        8 => TransferFunction::Linear,
+        9 => TransferFunction::Log100,
+        10 => TransferFunction::Log100sqrt10,
+        11 => TransferFunction::Iec61966,
+        12 => TransferFunction::Bt1361,
+        13 => TransferFunction::Srgb,
+        14 => TransferFunction::Bt202010bit,
+        15 => TransferFunction::Bt202012bit,
+        16 => TransferFunction::Smpte2084,
+        17 => TransferFunction::Smpte428,
+        18 => TransferFunction::Hlg,
+        _ => TransferFunction::Unspecified,
+    };
+
+    hpvca::Cicp {
+        primaries,
+        transfer,
+        matrix: MatrixCoefficients::Bt709,
+        full_range: true,
+    }
+}
+
 pub(crate) fn encode_hevc(
     img: &DynamicImage,
     args: &Args,
@@ -469,6 +514,7 @@ pub(crate) fn encode_hevc(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<crate::PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -484,6 +530,10 @@ pub(crate) fn encode_hevc(
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
         .with_threads(args.threads);
+
+    if let Some(cicp) = png_cicp {
+        cfg = cfg.with_cicp(hpvca_cicp(cicp));
+    }
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());

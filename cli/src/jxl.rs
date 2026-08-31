@@ -26,7 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::{Args, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{Args, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use image::DynamicImage;
 use jxl::api::{JxlColorProfile, JxlColorType, JxlDataFormat};
 use jxl::headers::extra_channels::ExtraChannel;
@@ -41,6 +41,64 @@ pub enum JxlError {
     Format(String),
     #[error("Cannot read file due to an error:`{0}`")]
     Io(String),
+}
+
+fn color_encoding_from_cicp(cicp: PngCicp) -> Option<(jixel::ColorEncoding, Option<f32>)> {
+    use jixel::{Primaries, RenderingIntent, TransferFunction, WhitePoint};
+
+    // PNG sample values are RGB only when the matrix is identity and the full
+    // component range is used. Other CICP layouts need a pixel conversion that
+    // the current CLI raster path does not perform.
+    if cicp.matrix_coefficients != 0 || !cicp.full_range {
+        return None;
+    }
+
+    let (white_point, primaries) = match cicp.color_primaries {
+        1 => (WhitePoint::D65, Primaries::Bt709),
+        5 => (WhitePoint::D65, Primaries::Bt470Bg),
+        6 => (WhitePoint::D65, Primaries::Bt601),
+        7 => (WhitePoint::D65, Primaries::Smpte240),
+        9 => (WhitePoint::D65, Primaries::Bt2020),
+        10 => (WhitePoint::E, Primaries::Xyz),
+        11 => (WhitePoint::Dci, Primaries::Smpte431),
+        12 => (WhitePoint::D65, Primaries::Smpte432),
+        22 => (WhitePoint::D65, Primaries::Ebu3213),
+        _ => return None,
+    };
+    let transfer = match cicp.transfer_function {
+        1 => TransferFunction::Bt709,
+        4 => TransferFunction::Bt470M,
+        5 => TransferFunction::Bt470Bg,
+        6 => TransferFunction::Bt601,
+        7 => TransferFunction::Smpte240,
+        8 => TransferFunction::Linear,
+        9 => TransferFunction::Log100,
+        10 => TransferFunction::Log100sqrt10,
+        11 => TransferFunction::Iec61966,
+        12 => TransferFunction::Bt1361,
+        13 => TransferFunction::Srgb,
+        14 => TransferFunction::Bt202010bit,
+        15 => TransferFunction::Bt202012bit,
+        16 => TransferFunction::Smpte2084,
+        17 => TransferFunction::Smpte428,
+        18 => TransferFunction::Hlg,
+        _ => return None,
+    };
+    let intensity_target = match transfer {
+        TransferFunction::Smpte2084 => Some(10_000.0),
+        TransferFunction::Hlg => Some(1_000.0),
+        _ => None,
+    };
+
+    Some((
+        jixel::ColorEncoding {
+            white_point,
+            primaries,
+            transfer,
+            rendering_intent: RenderingIntent::Perceptual,
+        },
+        intensity_target,
+    ))
 }
 
 pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>>), JxlError> {
@@ -210,10 +268,22 @@ pub(crate) fn encode_jxl(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let mut cfg = jixel::EncodeConfig::default().with_quality(args.quality as f32);
 
-    if let Some(icc) = icc {
+    let cicp_encoding = png_cicp.and_then(color_encoding_from_cicp);
+    if let Some((encoding, intensity_target)) = cicp_encoding {
+        println!(
+            "encoding CICP {:?} intensity_target {:?}",
+            encoding, intensity_target
+        );
+
+        cfg = cfg.with_color_encoding(encoding);
+        if let Some(intensity_target) = intensity_target {
+            cfg = cfg.with_intensity_target(intensity_target);
+        }
+    } else if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());
     }
     if let Some(exif) = exif {
@@ -282,4 +352,38 @@ pub(crate) fn encode_jxl(
             &cfg,
         )?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_png_rec2100_pq_cicp() {
+        let (encoding, intensity_target) = color_encoding_from_cicp(PngCicp {
+            color_primaries: 9,
+            transfer_function: 16,
+            matrix_coefficients: 0,
+            full_range: true,
+        })
+        .expect("BT.2100 PQ must be supported");
+
+        assert_eq!(encoding.white_point, jixel::WhitePoint::D65);
+        assert_eq!(encoding.primaries, jixel::Primaries::Bt2020);
+        assert_eq!(encoding.transfer, jixel::TransferFunction::Smpte2084);
+        assert_eq!(intensity_target, Some(10_000.0));
+    }
+
+    #[test]
+    fn rejects_non_rgb_png_cicp() {
+        assert!(
+            color_encoding_from_cicp(PngCicp {
+                color_primaries: 9,
+                transfer_function: 16,
+                matrix_coefficients: 9,
+                full_range: true,
+            })
+            .is_none()
+        );
+    }
 }

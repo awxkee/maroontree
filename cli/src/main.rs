@@ -122,6 +122,103 @@ struct Args {
     intrabc: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PngCicp {
+    color_primaries: u8,
+    transfer_function: u8,
+    matrix_coefficients: u8,
+    full_range: bool,
+}
+
+impl PngCicp {
+    /// Adapt PNG RGB CICP to the matrix and range actually produced by a codec.
+    /// Primaries and transfer remain properties of the source color space.
+    fn to_maroontree(
+        self,
+        matrix: maroontree::MatrixCoefficients,
+        full_range: bool,
+    ) -> maroontree::Cicp {
+        use maroontree::{ChromaSamplePosition, Primaries, TransferFunction};
+
+        let primaries = match self.color_primaries {
+            1 => Primaries::Bt709,
+            4 => Primaries::Bt470M,
+            5 => Primaries::Bt470Bg,
+            6 => Primaries::Bt601,
+            7 => Primaries::Smpte240,
+            8 => Primaries::GenericFilm,
+            9 => Primaries::Bt2020,
+            10 => Primaries::Xyz,
+            11 => Primaries::Smpte431,
+            12 => Primaries::Smpte432,
+            22 => Primaries::Ebu3213,
+            _ => Primaries::Unspecified,
+        };
+        let transfer = match self.transfer_function {
+            1 => TransferFunction::Bt709,
+            4 => TransferFunction::Bt470M,
+            5 => TransferFunction::Bt470Bg,
+            6 => TransferFunction::Bt601,
+            7 => TransferFunction::Smpte240,
+            8 => TransferFunction::Linear,
+            9 => TransferFunction::Log100,
+            10 => TransferFunction::Log100sqrt10,
+            11 => TransferFunction::Iec61966,
+            12 => TransferFunction::Bt1361,
+            13 => TransferFunction::Srgb,
+            14 => TransferFunction::Bt202010bit,
+            15 => TransferFunction::Bt202012bit,
+            16 => TransferFunction::Smpte2084,
+            17 => TransferFunction::Smpte428,
+            18 => TransferFunction::Hlg,
+            _ => TransferFunction::Unspecified,
+        };
+
+        maroontree::Cicp {
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+            chroma_sample_position: ChromaSamplePosition::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cicp_tests {
+    use super::*;
+
+    #[test]
+    fn maps_png_rec2100_pq_to_avif_cicp() {
+        let cicp = PngCicp {
+            color_primaries: 9,
+            transfer_function: 16,
+            matrix_coefficients: 0,
+            full_range: true,
+        }
+        .to_maroontree(maroontree::MatrixCoefficients::Smpte170m, true);
+
+        assert_eq!(cicp.primaries, maroontree::Primaries::Bt2020);
+        assert_eq!(cicp.transfer, maroontree::TransferFunction::Smpte2084);
+        assert_eq!(cicp.matrix, maroontree::MatrixCoefficients::Smpte170m);
+        assert!(cicp.full_range);
+    }
+
+    #[test]
+    fn unknown_png_cicp_codes_become_unspecified() {
+        let cicp = PngCicp {
+            color_primaries: u8::MAX,
+            transfer_function: u8::MAX,
+            matrix_coefficients: 0,
+            full_range: true,
+        }
+        .to_maroontree(maroontree::MatrixCoefficients::Identity, true);
+
+        assert_eq!(cicp.primaries, maroontree::Primaries::Unspecified);
+        assert_eq!(cicp.transfer, maroontree::TransferFunction::Unspecified);
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "\
@@ -410,6 +507,36 @@ fn read_icc(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+fn read_png_cicp(path: &Path) -> Option<PngCicp> {
+    let is_png = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return None;
+    }
+
+    let raw = std::fs::read(path).ok()?;
+    let png = Png::from_bytes(raw.into()).ok()?;
+    let contents = png.chunk_by_type(*b"cICP")?.contents();
+    let &[
+        color_primaries,
+        transfer_function,
+        matrix_coefficients,
+        full_range,
+    ] = contents.as_ref()
+    else {
+        return None;
+    };
+
+    Some(PngCicp {
+        color_primaries,
+        transfer_function,
+        matrix_coefficients,
+        full_range: full_range == 1,
+    })
+}
+
 fn apply_icc_to_image(
     img: &DynamicImage,
     effective_depth: Depth,
@@ -551,17 +678,6 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
         _image_container = detect_image_container(path);
     }
 
-    println!(
-        "Image container is {:?}, ext {:?}, is heif {:?}",
-        _image_container,
-        fmt,
-        if let Some(ext) = fmt.as_ref() {
-            is_heif_format(ext)
-        } else {
-            false
-        }
-    );
-
     let img = match fmt {
         #[cfg(feature = "heic")]
         Some(_) if _image_container == ImageContainer::Heic => {
@@ -621,6 +737,9 @@ fn main() {
     } else {
         None
     };
+    let png_cicp = (!args.apply_icc)
+        .then(|| read_png_cicp(&args.input))
+        .flatten();
     if let Some(have_icc) = have_icc {
         raw_icc = Some(have_icc.to_vec());
     }
@@ -652,9 +771,18 @@ fn main() {
             None => eprintln!("exif   : none"),
         }
         match &icc_bytes {
-            Some(b) => eprintln!("icc    : {} bytes (embedded)", b.len()),
+            Some(b) => eprintln!("icc    : {} bytes (source)", b.len()),
             None if args.apply_icc => eprintln!("icc    : applied, not embedded"),
             None => eprintln!("icc    : none"),
+        }
+        if let Some(cicp) = png_cicp {
+            eprintln!(
+                "cicp   : primaries={} transfer={} matrix={} full-range={}",
+                cicp.color_primaries,
+                cicp.transfer_function,
+                cicp.matrix_coefficients,
+                cicp.full_range
+            );
         }
         eprintln!(
             "input  : {} ({}×{}, {:?}, {:?})",
@@ -678,8 +806,15 @@ fn main() {
     let t0 = Instant::now();
 
     let avif_bytes = if let Some(rf) = raster::raster_output_format(&args.output) {
-        raster::encode_raster(&img, rf, &args, icc_bytes.as_deref(), exif_bytes.as_deref())
-            .unwrap_or_else(|e| die(format!("encode failed: {e}")))
+        raster::encode_raster(
+            &img,
+            rf,
+            &args,
+            icc_bytes.as_deref(),
+            exif_bytes.as_deref(),
+            png_cicp,
+        )
+        .unwrap_or_else(|e| die(format!("encode failed: {e}")))
     } else {
         match args.encoder {
             Encoder::Av1 => encode_av1(
@@ -689,6 +824,7 @@ fn main() {
                 effective_depth,
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
+                png_cicp,
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Av2 => encode_av2(
@@ -698,6 +834,7 @@ fn main() {
                 effective_depth,
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
+                png_cicp,
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Hevc => {
@@ -715,6 +852,7 @@ fn main() {
                         effective_depth,
                         icc_bytes.as_deref(),
                         exif_bytes.as_deref(),
+                        png_cicp,
                     )
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
                 }
@@ -726,6 +864,7 @@ fn main() {
                 effective_depth,
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
+                png_cicp,
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Vvc => {
@@ -743,6 +882,7 @@ fn main() {
                         effective_depth,
                         icc_bytes.as_deref(),
                         exif_bytes.as_deref(),
+                        png_cicp,
                     )
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
                 }
