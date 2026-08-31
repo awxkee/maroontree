@@ -26,7 +26,9 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{
+    Args, Chroma, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+};
 use maroontree::{
     Av2Encoder, BitDepth, ChromaSamplePosition, Cicp, MatrixCoefficients, Orientation, PlanarImage,
     Primaries, TransferFunction, TxPart,
@@ -55,19 +57,22 @@ pub(crate) fn encode_av2_lossless_image(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     let chroma_choice = args.chroma.unwrap_or(Chroma::C444);
-    let color = Cicp {
-        primaries: Primaries::Bt709,
-        transfer: TransferFunction::Srgb,
-        matrix: MatrixCoefficients::Identity,
-        full_range: true,
-        chroma_sample_position: ChromaSamplePosition::Unknown,
-    };
+    let color = png_cicp
+        .map(|c| c.to_maroontree(MatrixCoefficients::Identity, true))
+        .unwrap_or(Cicp {
+            primaries: Primaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            matrix: MatrixCoefficients::Identity,
+            full_range: true,
+            chroma_sample_position: ChromaSamplePosition::Unknown,
+        });
 
     if chroma_choice != Chroma::C444 {
         return Err("Chroma mode is not supported for lossless".into());

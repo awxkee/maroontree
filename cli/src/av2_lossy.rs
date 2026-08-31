@@ -27,7 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::av2_lossless::encode_av2_lossless_image;
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{
+    Args, Chroma, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+};
 use maroontree::{BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage};
 
 pub(crate) fn encode_av2(
@@ -37,9 +39,18 @@ pub(crate) fn encode_av2(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if args.lossless {
-        return encode_av2_lossless_image(img, args, color_type, effective_depth, icc, exif);
+        return encode_av2_lossless_image(
+            img,
+            args,
+            color_type,
+            effective_depth,
+            icc,
+            exif,
+            png_cicp,
+        );
     };
 
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C422) {
@@ -48,10 +59,13 @@ pub(crate) fn encode_av2(
         Chroma::C420 => ChromaFormat::Yuv420,
     };
 
+    let cicp = png_cicp
+        .map(|c| c.to_maroontree(maroontree::MatrixCoefficients::Smpte170m, true))
+        .unwrap_or_else(Cicp::srgb_ycbcr);
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
-        .with_cicp(Cicp::srgb_ycbcr())
+        .with_cicp(cicp)
         .with_threads(args.threads)
         .with_speed(args.speed.to_maroontreee());
 

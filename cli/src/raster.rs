@@ -27,9 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{Args, is_gray};
+use crate::{Args, PngCicp, is_gray};
 use image::DynamicImage;
-use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png};
+use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, png::PngChunk};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -54,9 +54,9 @@ pub(crate) fn raster_output_format(path: &Path) -> Option<RasterFormat> {
     }
 }
 
-/// Encode `img` to PNG or JPEG bytes, re-attaching EXIF/ICC when present.
+/// Encode `img` to PNG or JPEG bytes, re-attaching supported metadata when present.
 ///
-/// - **PNG** keeps the image's native depth (8 or 16-bit) and alpha channel.
+/// - **PNG** keeps the image's native depth (8 or 16-bit), alpha channel, and cICP.
 /// - **JPEG** is 8-bit with no alpha, so the image is flattened to RGB8 (or
 ///   Luma8 when grayscale) and `args.quality` controls compression.
 pub(crate) fn encode_raster(
@@ -65,12 +65,13 @@ pub(crate) fn encode_raster(
     args: &Args,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     match fmt {
         RasterFormat::Png => {
             let mut pixels = Vec::new();
             img.write_to(&mut Cursor::new(&mut pixels), image::ImageFormat::Png)?;
-            if icc.is_none() && exif.is_none() {
+            if icc.is_none() && exif.is_none() && png_cicp.is_none() {
                 return Ok(pixels);
             }
             let mut png = Png::from_bytes(pixels.into())
@@ -80,6 +81,22 @@ pub(crate) fn encode_raster(
             }
             if let Some(exif) = exif {
                 png.set_exif(Some(exif.to_vec().into()));
+            }
+            if let Some(cicp) = png_cicp {
+                png.remove_chunks_by_type(*b"cICP");
+                png.chunks_mut().insert(
+                    1,
+                    PngChunk::new(
+                        *b"cICP",
+                        vec![
+                            cicp.color_primaries,
+                            cicp.transfer_function,
+                            cicp.matrix_coefficients,
+                            u8::from(cicp.full_range),
+                        ]
+                        .into(),
+                    ),
+                );
             }
             let mut out = Vec::new();
             png.encoder()

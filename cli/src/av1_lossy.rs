@@ -28,7 +28,7 @@
  */
 use crate::av1_lossless::encode_av1_lossless;
 use crate::{
-    Args, Chroma, Depth, Qmatrix, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+    Args, Chroma, Depth, PngCicp, Qmatrix, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
 };
 use maroontree::{
     BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, encode_gray8, encode_gray10,
@@ -43,6 +43,7 @@ pub(crate) fn encode_av1(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -51,13 +52,16 @@ pub(crate) fn encode_av1(
     };
 
     if args.lossless {
-        return encode_av1_lossless(img, args, color_type, effective_depth, icc, exif);
+        return encode_av1_lossless(img, args, color_type, effective_depth, icc, exif, png_cicp);
     }
 
+    let cicp = png_cicp
+        .map(|c| c.to_maroontree(maroontree::MatrixCoefficients::Smpte170m, true))
+        .unwrap_or_else(Cicp::srgb_ycbcr);
     let mut cfg = EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
-        .with_cicp(Cicp::srgb_ycbcr())
+        .with_cicp(cicp)
         .with_threads(args.threads)
         .with_speed(args.speed.to_maroontreee())
         .with_updating_cdf(args.updating_cdf)

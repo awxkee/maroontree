@@ -429,6 +429,15 @@ fn finish_monochrome(
     Ok(apply_orientation_vvc(img, dec.orientation))
 }
 
+fn garnetash_cicp(cicp: crate::PngCicp) -> garnetash::Cicp {
+    garnetash::Cicp {
+        primaries: garnetash::Primaries::from_u16(cicp.color_primaries.into()),
+        transfer: garnetash::TransferFunction::from_u16(cicp.transfer_function.into()),
+        matrix: garnetash::MatrixCoefficients::Smpte170m,
+        full_range: true,
+    }
+}
+
 pub(crate) fn encode_vvc(
     img: &DynamicImage,
     args: &Args,
@@ -436,6 +445,7 @@ pub(crate) fn encode_vvc(
     effective_depth: Depth,
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
+    png_cicp: Option<crate::PngCicp>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => garnetash::ChromaFormat::Yuv444,
@@ -455,6 +465,10 @@ pub(crate) fn encode_vvc(
         .with_dual_tree(true)
         .with_cclm(true)
         .with_deblocking(true);
+
+    if let Some(cicp) = png_cicp {
+        cfg = cfg.with_cicp(garnetash_cicp(cicp));
+    }
 
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());
