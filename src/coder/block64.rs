@@ -379,7 +379,10 @@ impl<'a> LossyTile<'a> {
             let (cr, cc) = (py / 64, px / 64);
             let c1 = (rx + size - 1) / 64;
             let (r0, r1) = (ry / 64, (ry + size - 1) / 64);
-            (r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc })
+            if !(r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc }) {
+                return false;
+            }
+            crate::tile::intrabc_dv_conformant(px, py, rx, ry, size, self.w)
         };
         let make = |rx: usize, ry: usize| {
             let dy = (ry as isize - py as isize) * 8;
