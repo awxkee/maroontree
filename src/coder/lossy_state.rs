@@ -478,7 +478,7 @@ impl<'a> LossyTile<'a> {
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(2.45, q, 0.4)),
             updating_cdf: true,
             dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
+                let mut c = Cdfs::decision_snapshot_422(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(2.45, q, 0.4);
                 c
             },

@@ -683,12 +683,14 @@ impl Cdfs {
         c
     }
 
-    /// Frozen snapshot used for DECISION-side rate estimates (`dec_cdfs`).
-    /// Mostly the frame-initial CDFs, except symbols whose default prior sits
-    /// far from its adapted steady state on real content: there a frozen
-    /// default systematically mis-prices the choice for the whole frame
-    /// (adaptive coding self-corrects; a frozen estimate cannot).
+    /// Frozen frame-initial snapshot used for decision-side rate estimates.
     pub(crate) fn decision_snapshot(qctx: usize) -> Box<Self> {
+        Box::new(Self::new(qctx))
+    }
+
+    /// 4:2:2 control: its photo ladder regressed with the size-specific prior,
+    /// so retain the historical neutral decision price for this format.
+    pub(crate) fn decision_snapshot_422(qctx: usize) -> Box<Self> {
         let mut c = Self::new(qctx);
         for e in c.filter_intra.iter_mut() {
             *e = icdf(&[16384]);
@@ -4654,6 +4656,15 @@ pub(crate) fn encode_lossless_mono_frame_obus(
 #[cfg(test)]
 mod aq_tests {
     use super::*;
+
+    #[test]
+    fn decision_snapshot_preserves_filter_intra_priors_except_422() {
+        let live = Cdfs::new(crate::coef_q::qcat(140));
+        let decision = Cdfs::decision_snapshot(crate::coef_q::qcat(140));
+        assert_eq!(decision.filter_intra, live.filter_intra);
+        let decision_422 = Cdfs::decision_snapshot_422(crate::coef_q::qcat(140));
+        assert!(decision_422.filter_intra.iter().all(|cdf| cdf[0] == 16384));
+    }
 
     fn emit_semantic_fixture(enc: &mut OdEcEncoder, cdfs: &mut Cdfs) {
         for i in 0..64 {
