@@ -1719,7 +1719,9 @@ impl<'a> LossyTile<'a> {
                 // block rate, so omitting it lets a directional mode with a
                 // tiny SSE edge win while costing several bits. The band gates
                 // below are the pre-existing tuned law, kept as the fallback.
-                let mode_bits = if crate::tuning::get().exact_8x8_mode_rate
+                let mode_bits = if (crate::tuning::get().exact_8x8_mode_rate
+                    && !self.ss422
+                    && !self.mono)
                     || top444
                     || low_mid_422
                 {

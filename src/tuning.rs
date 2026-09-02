@@ -184,6 +184,9 @@ pub(crate) struct Tuning {
     /// Source-domain SPLIT4 breakout ratio at Slow (was hardcoded 1.5).
     pub(crate) split4_breakout_slow: f32,
     pub(crate) split4_legacy_record: bool,
+    /// Price the emitted 4x4 luma mode symbols in the 8x8 NONE-vs-SPLIT4
+    /// decision and in the SPLIT4 leaf search (4:2:0/4:4:4; 4:2:2 is gated at
+    /// the call sites because it measured negative).
     pub(crate) exact_8x8_mode_rate: bool,
     pub(crate) split4_decision_txtypes: bool,
     /// Bounding probe: 0 = price skip=false (shipped), 1 = skip=true, 2 = free.
@@ -277,7 +280,7 @@ impl Tuning {
         guided16_k_slow: 0.0,
         split4_breakout_slow: 1.5,
         split4_legacy_record: false,
-        exact_8x8_mode_rate: false,
+        exact_8x8_mode_rate: true,
         split4_decision_txtypes: false,
         block_skip_price: 0,
     };

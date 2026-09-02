@@ -1831,7 +1831,7 @@ impl<'a> LossyTile<'a> {
                 distortion,
                 mlam,
                 self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1)
-                    + if crate::tuning::get().exact_8x8_mode_rate {
+                    + if crate::tuning::get().exact_8x8_mode_rate && !self.ss422 && !self.mono {
                         self.mode_bits(px, py, m)
                     } else {
                         0.0
@@ -2022,7 +2022,10 @@ impl<'a> LossyTile<'a> {
                     &rr[..],
                 );
                 // +mode/skip signaling allowance per 4x4 sub-block
-                let mode_rate = if crate::tuning::get().exact_8x8_mode_rate {
+                let mode_rate = if crate::tuning::get().exact_8x8_mode_rate
+                    && !self.ss422
+                    && !self.mono
+                {
                     self.mode_bits(bx, by, m)
                 } else {
                     4.0f32
