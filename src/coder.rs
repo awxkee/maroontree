@@ -422,6 +422,7 @@ pub(crate) struct IbcSharedRecon {
 unsafe impl Send for IbcSharedRecon {}
 unsafe impl Sync for IbcSharedRecon {}
 
+#[derive(Clone)]
 pub(crate) struct Cdfs {
     /// Trellis frequency-tilt strength for this tile's format — see
     /// `trellis_tilt_mag_cap()` in trellis.rs. Holdout-selected per chroma
@@ -1310,9 +1311,12 @@ struct LossyTile<'a> {
     enc: OdEcEncoder,
     cdfs: Cdfs,
     updating_cdf: bool,
-    /// Frozen frame-initial CDF snapshot used by every DECISION-side rate
-    /// estimate (RDOQ trellis, filter-intra / angle-delta mode costs).
-    dec_cdfs: Box<Cdfs>,
+    /// Immutable CDF snapshot used by decision-side rate estimates (RDOQ
+    /// trellis, filter-intra / angle-delta mode costs). Starts at the frame
+    /// prior and may switch once to the deterministic pilot-trained snapshot.
+    dec_cdfs: std::sync::Arc<Cdfs>,
+    /// Which of the two immutable decision snapshots this worker currently has.
+    decision_cdf_warmed: bool,
     /// Decision capture/replay mode (see `coder/replay.rs`). `Off` in
     /// production until the wavefront lands.
     sb_mode: SbMode,
@@ -1795,6 +1799,17 @@ struct WavefrontPlanes {
     pblk4t: Vec<bool>,
 }
 
+/// Whether this WPP cell is dependency-downstream of the complete top-row
+/// pilot. Above-right dependencies advance that proof one column per row.
+#[inline]
+fn use_warmed_decision_cdf(row: usize, col: usize, prefix: usize) -> bool {
+    if row == 0 {
+        col >= prefix
+    } else {
+        row + col >= prefix.saturating_sub(1)
+    }
+}
+
 /// Parallel SB-wavefront capture pass over one tile: decide every superblock's
 /// RD choices out of raster order (schedule `d = 2r + c`, so top, left AND
 /// above-right neighbors are always finished), publish final reconstruction
@@ -1807,8 +1822,9 @@ struct WavefrontPlanes {
 /// - every ctx-array read stays inside the SB's exact own column/row segment
 ///   (zero margin—neighboring `l_*` rows have a different last writer under
 ///   diagonal order than under raster order);
-/// - decisions never read the adaptive CDFs or encoder state (frozen
-///   `dec_cdfs`, Phase 1) — so each worker captures into a sink encoder.
+/// - decisions never read mutable adaptive CDFs or encoder state. They use one
+///   of two immutable, dependency-selected `dec_cdfs` snapshots, so each worker
+///   captures into a sink encoder without schedule-dependent rate estimates.
 ///
 /// Shared state is written disjointly: each cell writes only its own SB block
 /// of the `done` recon planes and its own segments of the ctx handoff arrays
@@ -1845,6 +1861,11 @@ fn wavefront_capture(
     const HB: usize = 4; // halo band thickness (AV1 intra needs 1 px; generous)
     let sb_rows = r.th.div_ceil(64);
     let sb_cols = r.tw.div_ceil(64);
+    // Only 4:4:4 passed the extended unseen-image holdout. 4:2:0 averaged a
+    // +0.28% regression there, while 4:2:2 regressed synthetic content; mono
+    // has not been trained. Retain frame-initial pricing for all three.
+    let warm_decisions = updating_cdf && !mono && sub_x == 0 && sub_y == 0;
+    let warm_prefix = if warm_decisions { sb_cols.min(4) } else { 0 };
     // `mk_tile` runs once per worker.  Computing this inside it made every
     // worker rescan the complete source tile when AQ/variance boost was on.
     // The reference activity is immutable and identical for all workers.
@@ -1886,6 +1907,9 @@ fn wavefront_capture(
     // Prototype: geometry, frame-initial ctx array contents, and the AQ grid
     // (identical to the serial pass's — bit-exact by `aq_grid_matches_serial`).
     let proto = mk_tile();
+    let initial_dec_cdfs = proto.dec_cdfs.clone();
+    let warm_dec_cdfs = std::sync::Mutex::new((*initial_dec_cdfs).clone());
+    let published_dec_cdfs = std::sync::OnceLock::<std::sync::Arc<Cdfs>>::new();
     let aq_grid = proto.precompute_aq_grid();
     let mut done = [
         vec![0u16; proto.recon[0].len()],
@@ -1995,6 +2019,22 @@ fn wavefront_capture(
         /* needs_above_right= */ true,
         mk_tile,
         |t: &mut LossyTile, row: usize, col: usize| {
+            // With above-right WPP dependencies, (row + col) >= prefix-1
+            // proves that the four top-row pilot cells are complete. This
+            // triangular boundary avoids a global startup barrier while making
+            // the selected snapshot independent of worker scheduling.
+            let use_warm = warm_decisions && use_warmed_decision_cdf(row, col, warm_prefix);
+            if use_warm != t.decision_cdf_warmed {
+                t.dec_cdfs = if use_warm {
+                    published_dec_cdfs
+                        .get()
+                        .expect("decision CDF warmup was not published")
+                        .clone()
+                } else {
+                    initial_dec_cdfs.clone()
+                };
+                t.decision_cdf_warmed = use_warm;
+            }
             let (sb_x, sb_y) = (col * 64, row * 64);
             // Per-plane geometry: (subsample x shift, subsample y shift).
             let shift = |p: usize| -> (usize, usize) {
@@ -2292,6 +2332,16 @@ fn wavefront_capture(
             let cell = CapturedSb {
                 tokens: t.enc.take_semantic(),
             };
+            if warm_decisions && row == 0 && col < warm_prefix {
+                let mut model = warm_dec_cdfs.lock().expect("decision CDF warmup poisoned");
+                let mut sink = OdEcEncoder::new();
+                sink.sink = true;
+                let mut slots = model.semantic_slots();
+                sink.replay_semantic(&cell.tokens, &mut slots);
+                if col + 1 == warm_prefix {
+                    let _ = published_dec_cdfs.set(std::sync::Arc::new(model.clone()));
+                }
+            }
             tx.send((row * sb_cols + col, cell))
                 .expect("wavefront entropy receiver dropped");
         },
@@ -2515,11 +2565,32 @@ fn encode_one_tile(
         // state. Empty when AQ is off.
         let aq_grid = tile.precompute_aq_grid();
         let sb_count = r.tw.div_ceil(64) * r.th.div_ceil(64);
+        let sb_cols = r.tw.div_ceil(64);
+        let warm_prefix = sb_cols.min(4);
+        let initial_dec_cdfs = tile.dec_cdfs.clone();
+        let mut warm_dec_cdfs: Option<std::sync::Arc<Cdfs>> = None;
         let mut pending: Vec<Option<DecisionRecord>> = vec![None; sb_count];
         let mut streamed_rec = DecisionRecord::default();
         let mut sb_i = 0usize;
         for sb_y in (0..r.th).step_by(64) {
             for sb_x in (0..r.tw).step_by(64) {
+                let (sb_row, sb_col) = (sb_y / 64, sb_x / 64);
+                let use_warm = updating_cdf
+                    && !tile.mono
+                    && !tile.ss420
+                    && !tile.ss422
+                    && use_warmed_decision_cdf(sb_row, sb_col, warm_prefix);
+                if use_warm != tile.decision_cdf_warmed {
+                    tile.dec_cdfs = if use_warm {
+                        warm_dec_cdfs
+                            .as_ref()
+                            .expect("decision CDF warmup was not captured")
+                            .clone()
+                    } else {
+                        initial_dec_cdfs.clone()
+                    };
+                    tile.decision_cdf_warmed = use_warm;
+                }
                 if let Some(rx) = stream_rx {
                     while pending[sb_i].is_none() {
                         let (i, rec) = rx.recv().expect("wavefront capture stopped early");
@@ -2551,6 +2622,17 @@ fn encode_one_tile(
                     tile.aq_begin_sb_cell(&aq_grid[sb_i]);
                 }
                 tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+                if updating_cdf
+                    && !tile.mono
+                    && !tile.ss420
+                    && !tile.ss422
+                    && sb_i + 1 == sb_cols.min(4)
+                {
+                    let band_tilt = tile.dec_cdfs.band_tilt;
+                    let mut snapshot = tile.cdfs.clone();
+                    snapshot.band_tilt = band_tilt;
+                    warm_dec_cdfs = Some(std::sync::Arc::new(snapshot));
+                }
                 if sb_mode == SbMode::Capture {
                     let mut cell_recon: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
                     blocks_geom_extract(&tile, sb_x, sb_y, &mut cell_recon);

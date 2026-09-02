@@ -305,8 +305,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(1.2, q, 1.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -388,8 +389,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(1.2, q, 0.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -480,8 +482,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot_422(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(2.45, q, 0.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -572,8 +575,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(3.5, q, 0.7);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
