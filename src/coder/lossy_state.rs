@@ -234,6 +234,36 @@ impl<'a> LossyTile<'a> {
         &self.dec_cdfs
     }
 
+    /// Install a different immutable decision-CDF snapshot. Every table
+    /// derived lazily from `dcdf()` must be dropped here, or a worker whose
+    /// FIRST cell sits past the warm-up prefix prices against the warmed
+    /// snapshot while the serial path (and workers that started in the
+    /// prefix) keep tables built from the frame-initial one — that made
+    /// `-t5..-t8` 4:4:4 output diverge from `-t1` (found 2026-09-10).
+    pub(crate) fn switch_decision_cdfs(&mut self, next: std::sync::Arc<Cdfs>, warmed: bool) {
+        if self.pal_cdfs.is_none() {
+            // Every tile starts on the frame-initial snapshot, so the first
+            // switch always leaves it: pin it for the palette cost table.
+            self.pal_cdfs = Some(self.dec_cdfs.clone());
+        }
+        self.dec_cdfs = next;
+        self.decision_cdf_warmed = warmed;
+        *self.coef_cost.borrow_mut() = None;
+    }
+
+    /// Token cost tables of the current decision snapshot (lazy).
+    pub(crate) fn coef_cost_tables(&self) -> std::cell::Ref<'_, crate::rate::CoefCostTables> {
+        {
+            let mut slot = self.coef_cost.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(Box::new(crate::rate::CoefCostTables::build(self.dcdf())));
+            }
+        }
+        std::cell::Ref::map(self.coef_cost.borrow(), |o| {
+            o.as_deref().expect("initialized above")
+        })
+    }
+
     fn new(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
         LossyTile {
             sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
@@ -291,6 +321,8 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
             pal_y_cost: std::cell::RefCell::new(None),
+            pal_cdfs: None,
+            coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
@@ -305,8 +337,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(1.2, q, 1.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -374,6 +407,8 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
             pal_y_cost: std::cell::RefCell::new(None),
+            pal_cdfs: None,
+            coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
@@ -388,8 +423,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(1.2, q, 0.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -466,6 +502,8 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
             pal_y_cost: std::cell::RefCell::new(None),
+            pal_cdfs: None,
+            coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
@@ -478,10 +516,11 @@ impl<'a> LossyTile<'a> {
             cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(2.45, q, 0.4)),
             updating_cdf: true,
             dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
+                let mut c = Cdfs::decision_snapshot_422(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(2.45, q, 0.4);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -558,6 +597,8 @@ impl<'a> LossyTile<'a> {
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
             pal_y_cost: std::cell::RefCell::new(None),
+            pal_cdfs: None,
+            coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
@@ -572,8 +613,9 @@ impl<'a> LossyTile<'a> {
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
                 c.band_tilt = ramped_tilt(3.5, q, 0.7);
-                c
+                c.into()
             },
+            decision_cdf_warmed: false,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -658,8 +700,10 @@ impl<'a> LossyTile<'a> {
             // TX_32X32 intra implies DCT_DCT — no txtp symbol is coded.
             _ => (3, &c.eob_bin_1024_l, None),
         };
+        let tables = self.coef_cost_tables();
         let ctx = crate::rate::RateCtx {
             cdfs: c,
+            tables: &tables,
             cls,
             plane: 0,
             w,
@@ -737,8 +781,10 @@ impl<'a> LossyTile<'a> {
             (512, 32) => (3, &c.eob_bin_512_l, None),
             _ => unreachable!("unsupported rectangular luma transform {w}x{h}"),
         };
+        let tables = self.coef_cost_tables();
         let ctx = crate::rate::RateCtx {
             cdfs: c,
+            tables: &tables,
             cls,
             plane: 0,
             w,
@@ -850,8 +896,10 @@ impl<'a> LossyTile<'a> {
         let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
         let ca = a[bx4..(bx4 + nw).min(a.len())].iter().any(|&x| x != 0x40) as usize;
         let cl = l[by4..(by4 + nh).min(l.len())].iter().any(|&x| x != 0x40) as usize;
+        let tables = self.coef_cost_tables();
         let ctx = crate::rate::RateCtx {
             cdfs: c,
+            tables: &tables,
             cls,
             plane: 1,
             w,
@@ -1646,6 +1694,27 @@ impl<'a> LossyTile<'a> {
             .luma_mode_budget(!self.ss420 && !self.ss422 && !self.mono)
     }
 
+    /// 4:4:4 top-band ramp weight for the 32/64 NONE biases (0 outside).
+    fn top_bias_t_444(&self) -> f32 {
+        if self.ss420 || self.ss422 || self.mono {
+            return 0.0;
+        }
+        let t = crate::tuning::get();
+        ((t.top_bias_knee_444 - self.aq.base_q as f32) / t.top_bias_width_444).clamp(0.0, 1.0)
+    }
+
+    fn none32_split_bias_at(&self) -> f32 {
+        let t = crate::tuning::get();
+        let base = t.none32_split_bias;
+        base + (t.none32_split_bias_444_top - base) * self.top_bias_t_444()
+    }
+
+    fn none64_split_bias_at(&self) -> f32 {
+        let t = crate::tuning::get();
+        let base = t.none64_split_bias;
+        base + (t.none64_split_bias_444_top - base) * self.top_bias_t_444()
+    }
+
     fn top_band(&self) -> bool {
         self.aq.enabled
             && !self.mono
@@ -1827,7 +1896,7 @@ impl<'a> LossyTile<'a> {
                 distortion,
                 mlam,
                 self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1)
-                    + if crate::tuning::get().exact_8x8_mode_rate {
+                    + if crate::tuning::get().exact_8x8_mode_rate && !self.ss422 && !self.mono {
                         self.mode_bits(px, py, m)
                     } else {
                         0.0
@@ -2018,7 +2087,10 @@ impl<'a> LossyTile<'a> {
                     &rr[..],
                 );
                 // +mode/skip signaling allowance per 4x4 sub-block
-                let mode_rate = if crate::tuning::get().exact_8x8_mode_rate {
+                let mode_rate = if crate::tuning::get().exact_8x8_mode_rate
+                    && !self.ss422
+                    && !self.mono
+                {
                     self.mode_bits(bx, by, m)
                 } else {
                     4.0f32

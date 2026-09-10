@@ -60,8 +60,8 @@ pub(crate) use loopfilter::{loop_filter_batch_neon, loop_filter_neon};
 pub(crate) use qmatrix::apply_qmatrix_neon;
 pub(crate) use rd::{
     all_zero_i32_neon, chroma_sse_neon, luma_satd_neon, reconstruct_neon, residual_dc_neon,
-    residual_pred_neon, satd_sad_proxy_neon, sse_recon_neon, sse_u16_neon, sum_i32_neon,
-    sum_u16_neon, sum_u16_strided_neon,
+    residual_moments_neon, residual_pred_neon, satd_sad_proxy_neon, sse_recon_neon, sse_u16_neon,
+    sum_i32_neon, sum_u16_neon, sum_u16_strided_neon,
 };
 pub(crate) use trellis::{trellis_dist_current_zero_scan_neon, trellis_round_down_scan_neon};
 pub(crate) use wht::fwht_raw_neon;

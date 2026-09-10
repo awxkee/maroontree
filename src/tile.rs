@@ -366,6 +366,27 @@ impl IntrabcIndex {
     }
 }
 
+pub(crate) fn intrabc_dv_conformant(
+    px: usize,
+    py: usize,
+    rx: usize,
+    ry: usize,
+    size: usize,
+    tile_w: usize,
+) -> bool {
+    const DELAY_SB64: usize = 4; // 256 px
+    let (active_row, active_col) = (py / 64, px / 64);
+    let (src_row, src_col) = ((ry + size - 1) / 64, (rx + size - 1) / 64);
+    // `((mi_cols - 1) >> 4) + 1` == ceil over the 8-px-aligned width == this.
+    let total_sb64_per_row = tile_w.div_ceil(64);
+    if src_row * total_sb64_per_row + src_col + DELAY_SB64
+        >= active_row * total_sb64_per_row + active_col
+    {
+        return false;
+    }
+    src_row <= active_row && src_col + DELAY_SB64 < active_col + 5 * (active_row - src_row)
+}
+
 /// Find an exact block match in the portion of the tile that AV1 has decoded.
 /// The default DV is tried first, followed by indexed reverse-raster lookup at
 /// every integer-pixel position. Reverse raster favours recently decoded data;
@@ -399,6 +420,7 @@ fn find_exact_intrabc(
             && ref_y + size <= height
             && ref_y + size <= sby + 64
             && (ref_y + size <= sby || ref_x + size <= sbx)
+            && intrabc_dv_conformant(px, py, ref_x, ref_y, size, width)
     };
     let make = |ref_x: usize, ref_y: usize| {
         let dy = (ref_y as isize - py as isize) * 8;
@@ -3992,7 +4014,10 @@ mod tests {
         let Some(decoder) = dav1d() else {
             return;
         };
-        let (w, h) = (128usize, 128usize);
+        // The 256-px SB64 raster delay (intrabc_dv_conformant) makes the
+        // vertical default DV legal only in tiles at least 5 SB64 columns
+        // wide, so the frame must be wider than 256 px.
+        let (w, h) = (384usize, 128usize);
         let mut first_row = vec![0u8; w * 64];
         let mut state = 0x1bc0_6400u32;
         for sample in &mut first_row {
@@ -4056,7 +4081,10 @@ mod tests {
         let Some(decoder) = dav1d() else {
             return;
         };
-        let (w, h) = (256usize, 64usize);
+        // Wide enough that the copies at x = 384/448 keep their sources'
+        // right edges 256+ px behind the active superblock column
+        // (intrabc_dv_conformant).
+        let (w, h) = (512usize, 64usize);
         let mut pixels = vec![0u8; w * h];
         for y in 0..64 {
             for x in 0..64 {
@@ -4068,13 +4096,13 @@ mod tests {
                 pixels[y * w + x] = ((x * 11 + y * 43 + 91) & 255) as u8;
             }
         }
-        // The first copy uses the deliberately unaligned integer DV -125px and
-        // therefore a +195px residual from the first-row fallback (-320px).
-        // The second uses -128px, exercising a nonzero residual from the -125px
+        // The first copy uses the deliberately unaligned integer DV -381px and
+        // therefore a -61px residual from the first-row fallback (-320px).
+        // The second uses -384px, exercising a nonzero residual from the -381px
         // spatial-stack predictor installed by the first copy.
         for y in 0..64 {
-            pixels.copy_within(y * w + 3..y * w + 67, y * w + 128);
-            pixels.copy_within(y * w + 64..y * w + 128, y * w + 192);
+            pixels.copy_within(y * w + 3..y * w + 67, y * w + 384);
+            pixels.copy_within(y * w + 64..y * w + 128, y * w + 448);
         }
         let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
         let obu = encode_lossless_gray_obu(&image, true, 1).unwrap();
@@ -4372,7 +4400,9 @@ mod tests {
         let Some(decoder) = dav1d() else {
             return;
         };
-        let (w, h) = (128usize, 128usize);
+        // Wide enough (>= 5 SB64 columns) that the vertical DV passes the
+        // 256-px SB64 raster delay of intrabc_dv_conformant.
+        let (w, h) = (384usize, 128usize);
         let mut first = vec![0u16; w * 64];
         let mut state = 0x1055_1bc0u32;
         for sample in &mut first {
@@ -4415,14 +4445,17 @@ mod tests {
         let Some(decoder) = dav1d() else {
             return;
         };
-        let (w, h) = (256usize, 64usize);
+        // Same-superblock-row references must keep their right edge at least
+        // 256 px (4 SB64 columns) behind the active superblock column
+        // (intrabc_dv_conformant), so the copies sit at x = 384 and 448.
+        let (w, h) = (512usize, 64usize);
         let mut plane = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..128 {
                 plane[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as u16;
             }
-            plane.copy_within(y * w + 3..y * w + 67, y * w + 128);
-            plane.copy_within(y * w + 64..y * w + 128, y * w + 192);
+            plane.copy_within(y * w + 3..y * w + 67, y * w + 384);
+            plane.copy_within(y * w + 64..y * w + 128, y * w + 448);
         }
         let src = [plane.clone(), plane.clone(), plane];
         crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -4451,11 +4484,11 @@ mod tests {
             for y in 0..h {
                 assert_eq!(
                     &decoded_plane[y * w + 3..y * w + 67],
-                    &decoded_plane[y * w + 128..y * w + 192]
+                    &decoded_plane[y * w + 384..y * w + 448]
                 );
                 assert_eq!(
                     &decoded_plane[y * w + 64..y * w + 128],
-                    &decoded_plane[y * w + 192..y * w + 256]
+                    &decoded_plane[y * w + 448..y * w + 512]
                 );
             }
         }

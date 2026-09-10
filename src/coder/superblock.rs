@@ -109,6 +109,16 @@ impl<'a> LossyTile<'a> {
         debug_assert_eq!(N, w * h);
         debug_assert!(modes.len() <= 13);
         let mut ranked = FixedList::<(u64, usize), 13>::new((0, DC_PRED));
+        // Sparse-residual slot (`Tuning::beam_sparse_slot`): per mode, the
+        // centred residual energy E_AC = S2 - S1^2/N is what remains after a
+        // single DC coefficient corrects the mean offset. The SATD proxy
+        // scores a constant offset c as N*|c| (only the 4x4 Hadamard DC term
+        // survives), so a predictor whose error is "right shape, wrong level"
+        // is pruned even though one coefficient codes it. The min-E_AC mode
+        // takes the LAST shortlist slot when it was pruned.
+        // Subsampled formats only.
+        let sparse = crate::tuning::get().beam_sparse_slot && (self.ss420 || self.ss422);
+        let mut best_eac: (i64, usize) = (i64::MAX, DC_PRED);
         for &mode in modes {
             let mut pred = [0i32; N];
             if mode == DC_PRED {
@@ -141,6 +151,13 @@ impl<'a> LossyTile<'a> {
             }
             let src = &self.src[0][py * self.w + px..];
             ranked.push((self.rd.satd_sad_proxy(src, self.w, &pred, w, w, h), mode));
+            if sparse {
+                let (s1, s2) = self.rd.residual_moments(src, self.w, &pred, w, w, h);
+                let eac = s2 - (s1 * s1) / (N as i64);
+                if (eac, mode) < best_eac {
+                    best_eac = (eac, mode);
+                }
+            }
         }
         ranked
             .as_mut_slice()
@@ -157,6 +174,10 @@ impl<'a> LossyTile<'a> {
             if shortlist.len() == limit {
                 break;
             }
+        }
+        if sparse && limit < modes.len() && !shortlist.contains(&best_eac.1) {
+            let last = shortlist.len() - 1;
+            shortlist.as_mut_slice()[last] = best_eac.1;
         }
         shortlist
     }

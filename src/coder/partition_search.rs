@@ -61,13 +61,6 @@ fn inv_rect_luma_128(
     }
 }
 
-/// Trellis calibration for the compact partition-proxy beam. NOT a speed
-/// knob (2026-07-24 ladder): gating it off at Medium collapsed synthetic
-/// content (x_screen +46% / x_fractal +31% vs Slow — un-RDOQ'd proxy prices
-/// overprice screen coefficients so badly the partition trees go wrong),
-/// worth -3.68% avg on the 420 tuning corpus. The time cost (~+27%) is the
-/// BETTER DECISIONS' coding work, not the DP: a one-pass lite variant saved
-/// only 0.05s of 0.40 and gave back 0.6%.
 fn proxy_candidate_rdoq(speed: Speed) -> bool {
     !matches!(speed, Speed::Fast)
 }
@@ -77,13 +70,6 @@ fn proxy_candidate_rdoq(speed: Speed) -> bool {
 /// single largest source of 4x4 transform+trellis work (4x4 is ~60% of all
 /// trellis calls), so skipping it when the source says the split cannot pay
 /// removes real work. `INFINITY` disables it.
-///
-/// Measured 2026-07-25 (420, Slow), BD-rate tuning / holdout, wall:
-///   K=1.0  +0.11% / -0.01% (worst image +0.12%)   -6.8..-11.7%
-///   K=1.5  +0.02% / -0.01%                        -4.8..-6.3%
-///   K=2.0  -0.00% / -0.02%                        -2.8..-6.0%
-/// Holdout is neutral at every margin, so Slow takes the middle setting and
-/// the speed tiers take the aggressive one — as with `split_breakout_k`.
 fn split4_breakout_k(speed: Speed) -> f32 {
     match speed {
         Speed::Slow => crate::tuning::get().split4_breakout_slow,
@@ -139,6 +125,20 @@ impl<'a> LossyTile<'a> {
         have_bl: bool,
         pred: &mut [i32; N],
     ) -> FixedList<usize, 13> {
+        // Slow 4:4:4 keeps a FIXED {DC, PAETH} pair (see the note below), so
+        // the SATD ranking would only be thrown away; return before paying
+        // for eleven predictions + proxies. Callers regenerate the winners'
+        // predictions themselves, so `pred` need not be filled.
+        if proxy_mode_beam_len(self.speed, dim) < 3
+            && self.speed == Speed::Slow
+            && !self.ss420
+            && !self.ss422
+        {
+            let mut keep = FixedList::new(DC_PRED);
+            keep.push(DC_PRED);
+            keep.push(PAETH_PRED);
+            return keep;
+        }
         let mut ranked = FixedList::<(u64, usize), 13>::new((0, DC_PRED));
         for &m in nd_modes() {
             if m == DC_PRED {
@@ -281,6 +281,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             c.as_slice().to_vec(),
                             top,
+                            self.palette_smooth_t(),
                         )),
                         None => lossy_luma_palette_from(
                             &self.kmeans,
@@ -293,6 +294,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             n,
                             top,
+                            self.palette_smooth_t(),
                         ),
                     }) else {
                         continue;
@@ -3703,6 +3705,7 @@ impl<'a> LossyTile<'a> {
                     16,
                     16,
                     r.palette as usize,
+                    self.palette_smooth_t(),
                 )
                 .expect("16x16 palette replay: candidate no longer derivable");
                 debug_assert_eq!(

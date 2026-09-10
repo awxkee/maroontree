@@ -40,10 +40,47 @@ use crate::tables::{
     COEFF_BASE_RANGE, LO_CTX_OFF, LO_CTX_OFF_WGH, LO_CTX_OFF_WLH, NUM_BASE_LEVELS, level_byte,
 };
 
+/// Per-symbol costs of the coefficient token CDFs of one immutable decision
+/// snapshot, flattened so the rate walk indexes `[cls][plane][ctx][tok]`
+/// directly instead of hashing the CDF contents per coefficient (the walk is
+/// ~17% of a 4:4:4 Slow encode; the keyed cache it replaces was a good third
+/// of that). Values are exactly `cdf_cost_with_table` /
+/// `br_cum_row_with_table` of the same CDFs, so decisions are byte-identical.
+/// Rebuilt whenever the tile switches its decision snapshot.
+pub(crate) struct CoefCostTables {
+    /// `base_tok` costs: `[cls][plane][ctx][tok]` (ctx 0..42).
+    pub(crate) bt: Box<[[[[f32; 4]; 42]; 2]; 4]>,
+    /// Cumulative base-range ladder costs: `[cls][plane][br ctx][total_br]`.
+    pub(crate) br: Box<[[[[f32; 13]; 21]; 2]; 4]>,
+}
+
+impl CoefCostTables {
+    pub(crate) fn build(cdfs: &Cdfs) -> Self {
+        let table = cost_q_table();
+        let mut bt = Box::new([[[[0f32; 4]; 42]; 2]; 4]);
+        let mut br = Box::new([[[[0f32; 13]; 21]; 2]; 4]);
+        for cls in 0..4 {
+            for pl in 0..2 {
+                for (ctx, cdf) in cdfs.base_tok[cls][pl].iter().enumerate().take(42) {
+                    for (tok, slot) in bt[cls][pl][ctx].iter_mut().enumerate() {
+                        *slot = cdf_cost_with_table(cdf, tok, table);
+                    }
+                }
+                for (bc, cdf) in cdfs.br_tok[cls][pl].iter().enumerate().take(21) {
+                    br[cls][pl][bc] = br_cum_row_with_table(cdf, table);
+                }
+            }
+        }
+        CoefCostTables { bt, br }
+    }
+}
+
 /// Everything the real coefficient coder consults for one transform
 /// block, gathered so [`real_block_bits`] can mirror it symbol for symbol.
 pub(crate) struct RateCtx<'a> {
     pub(crate) cdfs: &'a Cdfs,
+    /// Token costs of `cdfs` (see [`CoefCostTables`]).
+    pub(crate) tables: &'a CoefCostTables,
     /// Coefficient class: 0 = TX_4X4, 1 = TX_8X8, 2 = TX_16X16, 3 = TX_32X32.
     pub(crate) cls: usize,
     /// 0 = luma, 1 = chroma.
@@ -165,41 +202,9 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
         &LO_CTX_OFF
     };
 
-    thread_local! {
-        static COST_CACHE: std::cell::RefCell<CostCache> =
-            const { std::cell::RefCell::new(CostCache::new()) };
-    }
-    struct CostCache {
-        bt_c: [[f32; 4]; 32],
-        bt_key: [u64; 32],
-        bt_valid: [bool; 32],
-        br_c: [[f32; 13]; 32],
-        br_key: [u64; 32],
-        br_valid: [bool; 32],
-    }
-    impl CostCache {
-        const fn new() -> Self {
-            CostCache {
-                bt_c: [[0.0; 4]; 32],
-                bt_key: [0; 32],
-                bt_valid: [false; 32],
-                br_c: [[0.0; 13]; 32],
-                br_key: [0; 32],
-                br_valid: [false; 32],
-            }
-        }
-    }
-    #[inline]
-    fn cdf_key(cdf: &[u16]) -> u64 {
-        // Coefficient CDFs have four coded partitions; any adaptation counter
-        // after them cannot affect `cdf_cost`. Keying the four partitions keeps
-        // the cache exact even if a mutable CDF is later passed here.
-        u64::from(cdf[0])
-            | (u64::from(cdf[1]) << 16)
-            | (u64::from(cdf[2]) << 32)
-            | (u64::from(cdf[3]) << 48)
-    }
-    COST_CACHE.with_borrow_mut(|cc| {
+    let bt_c = &c.tables.bt[cls][pl];
+    let br_c = &c.tables.br[cls][pl];
+    {
         with_levels(w, h, |levels, dirty| {
             // The eob coefficient uses the eob_base CDF (not base_tok) and a br
             // context that depends only on its own position.
@@ -229,34 +234,15 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
                 let (ctx, hi_mag) = get_lo_ctx_2d(levels, x, y, offsets, stride);
                 let m = cf[rc_i].unsigned_abs();
                 let tok = m.min(3);
-                let r = &base_tok[ctx];
-                let key = cdf_key(r);
-                if !cc.bt_valid[ctx] || cc.bt_key[ctx] != key {
-                    cc.bt_valid[ctx] = true;
-                    cc.bt_key[ctx] = key;
-                    cc.bt_c[ctx] = [
-                        cdf_cost_with_table(r, 0, cost_table),
-                        cdf_cost_with_table(r, 1, cost_table),
-                        cdf_cost_with_table(r, 2, cost_table),
-                        cdf_cost_with_table(r, 3, cost_table),
-                    ];
-                }
-                bits += cc.bt_c[ctx][tok as usize];
+                bits += bt_c[ctx][tok as usize];
                 if tok == 3 {
                     let mag = hi_mag & 63;
                     let bc = (if (y | x) > 1 { 14 } else { 7 })
                         + if mag > 12 { 6 } else { (mag + 1) >> 1 };
                     let bc = bc as usize;
-                    let r = &br_tok[bc];
-                    let key = cdf_key(r);
-                    if !cc.br_valid[bc] || cc.br_key[bc] != key {
-                        cc.br_valid[bc] = true;
-                        cc.br_key[bc] = key;
-                        cc.br_c[bc] = br_cum_row_with_table(r, cost_table);
-                    }
                     let total_br =
                         (m as i32 - (NUM_BASE_LEVELS + 1)).min(COEFF_BASE_RANGE) as usize;
-                    bits += cc.br_c[bc][total_br];
+                    bits += br_c[bc][total_br];
                     if m >= 15 {
                         bits += golomb_cost(m - 15);
                     }
@@ -291,7 +277,7 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
             }
             bits
         })
-    })
+    }
 }
 
 #[cfg(test)]
@@ -299,9 +285,10 @@ mod tests {
     use super::*;
     use crate::tables::{SCAN_4X8, SCAN_8X4, SCAN_8X8};
 
-    fn ctx<'a>(cdfs: &'a Cdfs) -> RateCtx<'a> {
+    fn ctx<'a>(cdfs: &'a Cdfs, tables: &'a CoefCostTables) -> RateCtx<'a> {
         RateCtx {
             cdfs,
+            tables,
             cls: 1,
             plane: 0,
             w: 8,
@@ -318,7 +305,8 @@ mod tests {
     #[test]
     fn all_zero_is_the_skip_flag() {
         let cdfs = Cdfs::new(0);
-        let c = ctx(&cdfs);
+        let tables = CoefCostTables::build(&cdfs);
+        let c = ctx(&cdfs, &tables);
         let got = real_block_bits(&[0i32; 64], &SCAN_8X8, &c);
         assert_eq!(got, cdf_cost(&cdfs.txb_skip[1][0], 1));
     }
@@ -329,7 +317,8 @@ mod tests {
     #[test]
     fn far_eob_costs_more_than_dc() {
         let cdfs = Cdfs::new(0);
-        let c = ctx(&cdfs);
+        let tables = CoefCostTables::build(&cdfs);
+        let c = ctx(&cdfs, &tables);
         let mut dc_only = [0i32; 64];
         dc_only[0] = 3;
         let mut far = [0i32; 64];
@@ -349,7 +338,8 @@ mod tests {
     #[test]
     fn clustered_beats_scattered() {
         let cdfs = Cdfs::new(0);
-        let c = ctx(&cdfs);
+        let tables = CoefCostTables::build(&cdfs);
+        let c = ctx(&cdfs, &tables);
         let mut clustered = [0i32; 64];
         for &i in &[0usize, 1, 2, 3] {
             clustered[SCAN_8X8[i] as usize] = 2;
@@ -369,6 +359,7 @@ mod tests {
     #[test]
     fn rectangular_orientations_use_their_own_contexts() {
         let cdfs = Cdfs::new(0);
+        let tables = CoefCostTables::build(&cdfs);
         let mut a = [0i32; 32];
         let mut b = [0i32; 32];
         for &(i, level) in &[(0usize, 3), (1, -2), (4, 1), (17, 4)] {
@@ -377,6 +368,7 @@ mod tests {
         }
         let mk = |w, h| RateCtx {
             cdfs: &cdfs,
+            tables: &tables,
             cls: 1,
             plane: 1,
             w,

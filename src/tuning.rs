@@ -184,10 +184,59 @@ pub(crate) struct Tuning {
     /// Source-domain SPLIT4 breakout ratio at Slow (was hardcoded 1.5).
     pub(crate) split4_breakout_slow: f32,
     pub(crate) split4_legacy_record: bool,
+    /// Price the emitted 4x4 luma mode symbols in the 8x8 NONE-vs-SPLIT4
+    /// decision and in the SPLIT4 leaf search (4:2:0/4:4:4; 4:2:2 is gated at
+    /// the call sites because it measured negative).
     pub(crate) exact_8x8_mode_rate: bool,
     pub(crate) split4_decision_txtypes: bool,
     /// Bounding probe: 0 = price skip=false (shipped), 1 = skip=true, 2 = free.
     pub(crate) block_skip_price: u32,
+    /// Lossy luma palette index-map smoothing: a pixel takes its LEFT/ABOVE
+    /// neighbour's palette index when that center is within
+    /// `ac_q * palette_smooth / 256` (pixel units) of the nearest one. The
+    /// residual absorbs the extra error; the smoother map codes far cheaper
+    /// under the neighbour-context index coder. 0 = off (nearest only).
+    /// SHIPPED 24 at 4:4:4 ONLY (2026-09-10): 444 tuning -0.07 / holdout
+    /// -0.14 (5/5 neg) / 14 new jixel crops -0.45..-0.50 (screen crops -0.7..
+    /// -1.0); 4:2:0 tuning +0.05 (x_fractal +1.12) so subsampled formats and
+    /// mono keep nearest-only (`palette_smooth_t` gates). Known loser:
+    /// x_abstract +1.14 (bytes AND SS2 worse — SSE-vs-SS2 mismatch on sharp
+    /// synthetic edges). 32 was equal on average but not all-negative; 64 lost.
+    pub(crate) palette_smooth: u32,
+    /// With `palette_smooth`: only pixels the nearest center does NOT hit
+    /// exactly may move (protects exact palettes / exact-hit pixels).
+    pub(crate) palette_smooth_guard: bool,
+    /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
+    /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
+    /// qindex <= knee - width. Probe for the very-high-quality 4:4:4 leg (the
+    /// Optuna high-q study wanted 1.05-1.10 there but the format-blind knob
+    /// paid on 4:2:0).
+    pub(crate) none32_split_bias_444_top: f32,
+    pub(crate) none64_split_bias_444_top: f32,
+    pub(crate) top_bias_knee_444: f32,
+    pub(crate) top_bias_width_444: f32,
+    /// UV palette candidate pre-filter: skip the residual transform/trellis/
+    /// rate work when the ZERO-residual palette cost (raw prediction SSE +
+    /// header/map bits) already exceeds `k` x the incumbent chroma cost.
+    /// 0 = off.
+    pub(crate) uv_pal_gate_k: f32,
+    /// Contextual trellis: price the DC-only (eob == 0) terminal with the
+    /// emitter's contexts (`eob_base[0]`, `br_tok[0]`) instead of
+    /// `eob_base[1]` + an AC-derived br context.
+    pub(crate) trellis_dc_ctx0: bool,
+    /// Bits charged to the all-zero (txb_skip = 1) alternative in both
+    /// trellises, RELATIVE to the nonzero candidates, which omit the common
+    /// skip=0 + txtp overhead. The historical constant is 1.0; the exact
+    /// relative value is cost(skip=1) - cost(skip=0) - cost(txtp), usually
+    /// negative.
+    pub(crate) trellis_zero_bits: f32,
+    /// Contextual trellis: also scan lower DC levels for the DC-only
+    /// terminal (the Step-A DC level was optimized assuming the AC stays).
+    pub(crate) trellis_dc_only_scan: bool,
+    /// Luma mode beam: give the mode with the smallest CENTRED residual energy
+    /// (cheapest DC-only correction) the last shortlist slot when the SATD
+    /// ranking pruned it
+    pub(crate) beam_sparse_slot: bool,
 }
 
 impl Tuning {
@@ -277,9 +326,20 @@ impl Tuning {
         guided16_k_slow: 0.0,
         split4_breakout_slow: 1.5,
         split4_legacy_record: false,
-        exact_8x8_mode_rate: false,
+        exact_8x8_mode_rate: true,
         split4_decision_txtypes: false,
         block_skip_price: 0,
+        palette_smooth: 24,
+        palette_smooth_guard: true,
+        none32_split_bias_444_top: 1.03,
+        none64_split_bias_444_top: 1.03,
+        top_bias_knee_444: 40.0,
+        top_bias_width_444: 20.0,
+        uv_pal_gate_k: 1.0,
+        trellis_dc_ctx0: false,
+        trellis_zero_bits: 1.0,
+        trellis_dc_only_scan: false,
+        beam_sparse_slot: true,
     };
 }
 
@@ -438,6 +498,17 @@ mod imp {
                 "exact_8x8_mode_rate" => t.exact_8x8_mode_rate = flag(value),
                 "split4_decision_txtypes" => t.split4_decision_txtypes = flag(value),
                 "block_skip_price" => t.block_skip_price = num(value) as u32,
+                "palette_smooth" => t.palette_smooth = num(value) as u32,
+                "palette_smooth_guard" => t.palette_smooth_guard = flag(value),
+                "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
+                "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
+                "top_bias_knee_444" => t.top_bias_knee_444 = num(value),
+                "top_bias_width_444" => t.top_bias_width_444 = num(value),
+                "uv_pal_gate_k" => t.uv_pal_gate_k = num(value),
+                "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
+                "trellis_zero_bits" => t.trellis_zero_bits = num(value),
+                "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
+                "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
                 "part_budget_medium" => t.part_budget_medium = num(value) as u32,
                 "part_budget_fast" => t.part_budget_fast = num(value) as u32,
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),

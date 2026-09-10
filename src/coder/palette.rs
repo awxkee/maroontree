@@ -253,9 +253,11 @@ fn exact_uv_palette(
     })
 }
 
+/// Lex-sorted (U, V) pair histogram of one chroma block. Hoisted out of
+/// [`lossy_uv_palette`] so the four lossy candidates of a block share ONE
+/// sort instead of four (the histogram build was ~5% of a 4:4:4 encode).
 #[allow(clippy::too_many_arguments)]
-fn lossy_uv_palette(
-    kmeans: &crate::kmeans::KmeansDispatch,
+fn uv_pair_histogram(
     src_u: &[u16],
     src_v: &[u16],
     stride: usize,
@@ -263,14 +265,9 @@ fn lossy_uv_palette(
     cy: usize,
     w: usize,
     h: usize,
-    colors: usize,
-    top: bool,
-) -> Option<LossyUvPalette> {
-    debug_assert!((2..=8).contains(&colors));
-    // Pair histogram, lex-sorted.
-    let n = w * h;
-    let mut centers = LOSSY_UV_SCRATCH.with_borrow_mut(|scratch| {
-        let LossyUvScratch { all, hist, idx } = scratch;
+) -> Vec<((i32, i32), u32)> {
+    LOSSY_UV_SCRATCH.with_borrow_mut(|scratch| {
+        let LossyUvScratch { all, hist, .. } = scratch;
         all.clear();
         if all.len() != w * h {
             all.resize(w * h, (0i32, 0i32));
@@ -299,6 +296,46 @@ fn lossy_uv_palette(
                 _ => hist.push((p, 1)),
             }
         }
+        hist.clone()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lossy_uv_palette(
+    kmeans: &crate::kmeans::KmeansDispatch,
+    src_u: &[u16],
+    src_v: &[u16],
+    stride: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    colors: usize,
+    top: bool,
+) -> Option<LossyUvPalette> {
+    let hist = uv_pair_histogram(src_u, src_v, stride, cx, cy, w, h);
+    lossy_uv_palette_from_hist(kmeans, &hist, src_u, src_v, stride, cx, cy, w, h, colors, top)
+}
+
+/// [`lossy_uv_palette`] over a precomputed [`uv_pair_histogram`].
+#[allow(clippy::too_many_arguments)]
+fn lossy_uv_palette_from_hist(
+    kmeans: &crate::kmeans::KmeansDispatch,
+    hist: &[((i32, i32), u32)],
+    src_u: &[u16],
+    src_v: &[u16],
+    stride: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    colors: usize,
+    top: bool,
+) -> Option<LossyUvPalette> {
+    debug_assert!((2..=8).contains(&colors));
+    let n = w * h;
+    let mut centers = LOSSY_UV_SCRATCH.with_borrow_mut(|scratch| {
+        let LossyUvScratch { idx, .. } = scratch;
         if hist.len() < 2 || colors > hist.len() {
             return None;
         }
@@ -413,7 +450,10 @@ fn uv_palette_rederive(
         .expect("uv palette replay: lossy re-derivation failed")
 }
 
-#[inline]
+fn sum_sq(resid: &[i32]) -> i64 {
+    resid.iter().map(|&r| i64::from(r) * i64::from(r)).sum()
+}
+
 fn palette_bsize_ctx(width: usize, height: usize) -> usize {
     (width.trailing_zeros() as usize + height.trailing_zeros() as usize - 6).min(6)
 }
@@ -782,11 +822,12 @@ fn lossy_luma_palette(
     w: usize,
     h: usize,
     sel: usize,
+    smooth_t: i32,
 ) -> Option<LossyLumaPalette> {
     let hist = block_color_histogram(src, stride, px, py, w, h)?;
     let top = sel > 8;
     let colors = if top { sel - 8 } else { sel };
-    lossy_luma_palette_from(kmeans, &hist, src, stride, px, py, w, h, colors, top)
+    lossy_luma_palette_from(kmeans, &hist, src, stride, px, py, w, h, colors, top, smooth_t)
 }
 
 /// Test-only oracle for [`nearest_scan`]: independent per-value lookup with
@@ -836,6 +877,7 @@ fn lossy_luma_palette_from(
     h: usize,
     colors: usize,
     top: bool,
+    smooth_t: i32,
 ) -> Option<LossyLumaPalette> {
     let centers = if top {
         top_palette_centers(hist, colors)?
@@ -852,7 +894,59 @@ fn lossy_luma_palette_from(
         h,
         centers.as_slice().to_vec(),
         top,
+        smooth_t,
     ))
+}
+
+/// Raster-order index-map smoothing (see `Tuning::palette_smooth`): switch a
+/// pixel to its left or above neighbour's index when that center is no
+/// further than `nearest + t` from the source value (the closer of the two
+/// qualifying neighbours wins, left on ties). Left/above are already final in
+/// raster order, so the pass is a deterministic function of (src, centers, t)
+/// and replay re-derives it exactly.
+#[allow(clippy::too_many_arguments)]
+fn smooth_palette_map(
+    map: &mut [u8],
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    centers: &[i32],
+    t: i32,
+    guard: bool,
+) {
+    for y in 0..h {
+        let row = &src[(py + y) * stride + px..(py + y) * stride + px + w];
+        for x in 0..w {
+            let v = row[x] as i32;
+            let i0 = map[y * w + x] as usize;
+            let d0 = (v - centers[i0]).abs();
+            if guard && d0 == 0 {
+                continue;
+            }
+            let bar = d0 + t;
+            let mut best = i0;
+            let mut best_d = bar;
+            if x > 0 {
+                let l = map[y * w + x - 1] as usize;
+                let d = (v - centers[l]).abs();
+                if l != i0 && d <= best_d {
+                    best = l;
+                    best_d = d;
+                }
+            }
+            if y > 0 {
+                let u = map[(y - 1) * w + x] as usize;
+                let d = (v - centers[u]).abs();
+                if u != i0 && u != best && d < best_d {
+                    best = u;
+                }
+            }
+            map[y * w + x] = best as u8;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -866,10 +960,15 @@ fn lossy_luma_palette_from_centers(
     h: usize,
     centers: Vec<i32>,
     top: bool,
+    smooth_t: i32,
 ) -> LossyLumaPalette {
     let n = w * h;
     let mut map = vec![0u8; n];
     (kmeans.luma_nearest_indices)(src, stride, px, py, w, h, &centers, &mut map);
+    if smooth_t > 0 && centers.len() > 1 {
+        let guard = crate::tuning::get().palette_smooth_guard;
+        smooth_palette_map(&mut map, src, stride, px, py, w, h, &centers, smooth_t, guard);
+    }
     let mut packed_map = vec![0u8; n.div_ceil(2)];
     for (p, &idx) in map.iter().enumerate() {
         if p & 1 == 0 {
@@ -992,6 +1091,7 @@ impl<'a> LossyTile<'a> {
                     h,
                     centers.as_slice().to_vec(),
                     top,
+                    self.palette_smooth_t(),
                 );
                 let mut pred = [0i32; N];
                 palette_pred(&mut pred, w, &palette.colors, &palette.packed_map, w, h);
@@ -1000,12 +1100,36 @@ impl<'a> LossyTile<'a> {
             .collect()
     }
 
+    /// UV palette candidate pre-filter (`Tuning::uv_pal_gate_k`): true = skip
+    /// the residual coding of this candidate. The first test is a sound lower
+    /// bound (header + map bits alone already lose); the second is the
+    /// zero-residual cost heuristic.
+    fn uv_palette_gate(&self, raw_sse: i64, hdr_bits: f32, mlam: f32, best_total: f32) -> bool {
+        let k = crate::tuning::get().uv_pal_gate_k;
+        if k <= 0.0 {
+            return false;
+        }
+        if rate_cost(mlam, hdr_bits) >= best_total {
+            return true;
+        }
+        rd_cost_i64(raw_sse, mlam, hdr_bits) > k * best_total
+    }
+
+    /// Index-map smoothing tolerance in pixel units (`Tuning::palette_smooth`).
+    #[inline]
+    pub(super) fn palette_smooth_t(&self) -> i32 {
+        if self.ss420 || self.ss422 || self.mono {
+            return 0;
+        }
+        (self.quant.ac_q() * crate::tuning::get().palette_smooth as i32) >> 8
+    }
+
     /// Flat per-tile `palette_y_color` decision-cost tables (see field doc).
     fn pal_y_cost_tables(&self) -> std::cell::Ref<'_, Box<[[[f32; 8]; 5]; 7]>> {
         {
             let mut slot = self.pal_y_cost.borrow_mut();
             if slot.is_none() {
-                let c = self.dcdf();
+                let c = self.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
                 let mut m = Box::new([[[0f32; 8]; 5]; 7]);
                 for ns in 2..=8usize {
                     for ctx in 0..5 {
@@ -1411,6 +1535,7 @@ mod palette_generalization_tests {
             16,
             16,
             4,
+            0,
         )
         .expect("exact palette");
         assert_eq!(p.colors, vec![10, 80, 150, 220]);
@@ -1436,6 +1561,7 @@ mod palette_generalization_tests {
                 16,
                 16,
                 2,
+                0,
             )
             .is_some()
         );

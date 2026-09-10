@@ -379,7 +379,10 @@ impl<'a> LossyTile<'a> {
             let (cr, cc) = (py / 64, px / 64);
             let c1 = (rx + size - 1) / 64;
             let (r0, r1) = (ry / 64, (ry + size - 1) / 64);
-            (r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc })
+            if !(r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc }) {
+                return false;
+            }
+            crate::tile::intrabc_dv_conformant(px, py, rx, ry, size, self.w)
         };
         let make = |rx: usize, ry: usize| {
             let dy = (ry as isize - py as isize) * 8;
@@ -909,7 +912,7 @@ impl<'a> LossyTile<'a> {
             * if self.top_band() && self.ss420 {
                 top_none_bias_420(self.aq.base_q)
             } else {
-                none64_split_bias()
+                self.none64_split_bias_at()
             }
             + rate_cost(part_lam, self.part_rate_bl(1, x8, y8, 0));
         // First price four forced-NONE 32x32 children. This is an upper bound on

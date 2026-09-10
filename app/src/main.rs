@@ -55,7 +55,10 @@ fn main() {
     // let instant = Instant::now();
     // img.save("dst_rav.avif").unwrap();
     // println!("encoding time {:?}", instant.elapsed());
-    let img = image::open("./assets/banner2.png").unwrap().to_rgb8();
+    let img =
+        image::open("/Users/radzivon/RustroverProjects/jixel/assets/Burning_Ship_Fractal.png")
+            .unwrap()
+            .to_rgb8();
     img.save("./reload.png").unwrap();
     let planar_rgb = PlanarImage::from_interleaved_rgb(
         img.width() as usize,
@@ -66,13 +69,13 @@ fn main() {
     .unwrap();
     for _i in 0..15 {
         let instant = Instant::now();
-        let out = encode_lossless(
+        let out = encode_rgb8(
             &planar_rgb,
             &EncodeConfig::new()
-                .with_quality(90)
+                .with_quality(80)
                 .with_cicp(Cicp::identity_rgb())
                 .with_chroma(ChromaFormat::Yuv444)
-                .with_speed(Speed::Fast)
+                .with_speed(Speed::Slow)
                 .with_threads(12)
                 .with_variance_boost(true)
                 .with_screen_content(false)

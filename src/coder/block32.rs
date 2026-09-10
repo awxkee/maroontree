@@ -349,7 +349,7 @@ impl<'a> LossyTile<'a> {
         }) * if self.top_band() && self.ss420 {
             top_none_bias_420(self.aq.base_q)
         } else {
-            none32_split_bias()
+            self.none32_split_bias_at()
         } + rate_cost(self.mlam() * prdo, self.part_rate_bl(2, x8, y8, 0));
         // Flat-block SPLIT skip (aom VAR_BASED_PARTITION / SVT depth-refinement
         // analog): when the source detail in this 32x32 is small relative to the
@@ -1214,6 +1214,7 @@ impl<'a> LossyTile<'a> {
                         32,
                         32,
                         r.palette as usize,
+                        self.palette_smooth_t(),
                     )
                         .expect("32x32 palette replay: candidate no longer derivable");
                 palette_pred(&mut lpred[..], 32, &p.colors, &p.packed_map, 32, 32);
@@ -3062,11 +3063,13 @@ impl<'a> LossyTile<'a> {
                     // zero-residual lossy palettes SS2-fatal in both prior
                     // attempts. This is aom's mechanism (490 UV palettes on
                     // kodak20 q93, all carrying coefficients).
+                    let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 32, 32);
                     [(8usize, false), (4, false), (8, true), (4, true)]
                         .iter()
                         .filter_map(|&(k, top)| {
-                            lossy_uv_palette(
+                            lossy_uv_palette_from_hist(
                                 &self.kmeans,
+                                &uv_hist,
                                 &self.src[1],
                                 &self.src[2],
                                 self.w,
@@ -3097,20 +3100,28 @@ impl<'a> LossyTile<'a> {
                         + self.palette_uv_rate_bits(palette.is_some(), &up);
                     let mut sse = 0i64;
                     let mut pal_ccf = [self.sbuf_i1024(), self.sbuf_i1024()];
+                    let mut resids = [self.sbuf_i1024(), self.sbuf_i1024()];
                     for ci in 0..2 {
-                        let plane = ci + 1;
-                        let mut resid = self.sbuf_i1024();
                         self.rd.residual_pred(
-                            &mut resid[..],
+                            &mut resids[ci][..],
                             &pal_pred[ci][..],
-                            &self.src[plane],
+                            &self.src[ci + 1],
                             self.w,
                             px,
                             py,
                             32,
                             32,
                         );
-                        let (mut q, qt) = self.dct.dct32x32_t(&resid, &self.cquant);
+                    }
+                    let raw_sse = sum_sq(&resids[0][..]) + sum_sq(&resids[1][..]);
+                    let gate_ref = win.as_ref().map_or(best_total, |w| w.0.min(best_total));
+                    if self.uv_palette_gate(raw_sse, bits, mlam, gate_ref) {
+                        continue;
+                    }
+                    for ci in 0..2 {
+                        let plane = ci + 1;
+                        let resid = &resids[ci];
+                        let (mut q, qt) = self.dct.dct32x32_t(resid, &self.cquant);
                         trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_32X32, trellis_lambda());
                         let rr = self.idct.idct_dequant_32x32(&q, &self.cquant);
                         sse += self.rd.sse_recon(

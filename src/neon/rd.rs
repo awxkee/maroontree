@@ -82,6 +82,41 @@ fn src_rows(
         .map(move |row| &row[px..px + w])
 }
 
+/// `(sum, sum of squares)` of `src - pred` over a `w`x`h` block; `w` is a
+/// multiple of 4. Deltas are widened to i32 (exact for 12-bit), squares
+/// accumulate into i64 lanes via `vmlal_s32`.
+#[target_feature(enable = "neon")]
+pub(crate) fn residual_moments_neon(
+    src: &[u16],
+    src_stride: usize,
+    pred: &[i32],
+    pred_stride: usize,
+    w: usize,
+    h: usize,
+) -> (i64, i64) {
+    debug_assert_eq!(w & 3, 0);
+    let mut s1 = vdupq_n_s64(0);
+    let mut s2 = vdupq_n_s64(0);
+    for y in 0..h {
+        let sr = &src[y * src_stride..y * src_stride + w];
+        let pr = &pred[y * pred_stride..y * pred_stride + w];
+        let (sc, st) = sr.as_chunks::<4>();
+        let (pc, pt) = pr.as_chunks::<4>();
+        debug_assert!(st.is_empty() && pt.is_empty());
+        for (s4, p4) in sc.iter().zip(pc) {
+            unsafe {
+                let s = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(s4.as_ptr())));
+                let d = vsubq_s32(s, load_i32x4(p4));
+                s1 = vaddw_s32(s1, vget_low_s32(d));
+                s1 = vaddw_s32(s1, vget_high_s32(d));
+                s2 = vmlal_s32(s2, vget_low_s32(d), vget_low_s32(d));
+                s2 = vmlal_s32(s2, vget_high_s32(d), vget_high_s32(d));
+            }
+        }
+    }
+    (vaddvq_s64(s1), vaddvq_s64(s2))
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn sum_i32_neon(values: &[i32]) -> i32 {
     let (chunks, tail) = values.as_chunks::<4>();
