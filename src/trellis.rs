@@ -127,6 +127,17 @@ pub(crate) fn trellis_optimize_ctx(
         d
     };
 
+    // All-zero input has nothing to optimize: bail before the eager 21-row
+    // base-range table below (it was built and then thrown away on every
+    // zero block).
+    let eob: i32 = scan
+        .iter()
+        .rposition(|&rc| cf[rc as usize] != 0)
+        .map_or(-1, |i| i as i32);
+    if eob < 0 {
+        return;
+    }
+    let eu = eob as usize;
     // Gate lowered 256 -> 64 with the shared `br_cum_row` builder (2026-07-26
     // cost-precache pass): the eager 21-row build is ~84 cdf_cost calls, paid
     // back by any block whose candidates take the hi_tok ladder more than a
@@ -151,15 +162,6 @@ pub(crate) fn trellis_optimize_ctx(
             hi_tok_cost_with_table(m, &br_tok[bc], cost_table)
         }
     };
-    let eob: i32 = scan
-        .iter()
-        .rposition(|&rc| cf[rc as usize] != 0)
-        .map_or(-1, |i| i as i32);
-    if eob < 0 {
-        return;
-    }
-    let eu = eob as usize;
-
     thread_local! {
     static SCRATCH: std::cell::RefCell<(
         Vec<u8>,
@@ -472,22 +474,51 @@ pub(crate) fn trellis_optimize_ctx(
         }
         // EOB at DC (only DC nonzero) and the all-zero (txb_skip) alternative.
         if dc_m != 0 {
-            let ctx_e = 1usize; // e == 0
-            let tok = dc_m.min(3);
-            let mut c0 = cdf_cost_with_table(eob_bin_cdf, 0, cost_table)
-                + cdf_cost_with_table(&eob_base[ctx_e], tok as usize - 1, cost_table);
-            if tok == 3 {
-                c0 += hi_cost(dc_m, dc_brc(levels));
-            }
-            c0 += cdf_cost_with_table(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize, cost_table);
-            let total0 = rate_cost(lambda, c0) + dist_cur[0] + suf0[1];
+            // eob == 0 codes the DC token off `eob_base[0]` and its ladder off
+            // `br_tok[0]` (see `encode_dc_tail` and the rate twin); the AC
+            // levels still sitting in `levels` are exactly the ones this
+            // candidate zeroes, so an AC-derived br context is wrong here.
+            let (ctx_e, bc0) = if crate::tuning::get().trellis_dc_ctx0 {
+                (0usize, 0usize)
+            } else {
+                (1usize, dc_brc(levels))
+            };
+            let dc_only_rate = |k: u32| -> f32 {
+                let tok = k.min(3);
+                let mut c0 = cdf_cost_with_table(eob_bin_cdf, 0, cost_table)
+                    + cdf_cost_with_table(&eob_base[ctx_e], tok as usize - 1, cost_table);
+                if tok == 3 {
+                    c0 += hi_cost(k, bc0);
+                }
+                c0 + cdf_cost_with_table(&dc_sign[dcs_ctx], (cf[dc_rc] < 0) as usize, cost_table)
+            };
+            let total0 = rate_cost(lambda, dc_only_rate(dc_m)) + dist_cur[0] + suf0[1];
             if total0 < best_cost {
                 best_cost = total0;
                 best_e = 0;
                 best_m = dc_m;
             }
+            // The DC level above was chosen by Step A under the ASSUMPTION
+            // that the AC coefficients stay; as the sole coefficient it may
+            // want a different (lower) level. Independent scan k = dc_m-1..1
+            // priced in the DC-only terminal's own contexts.
+            if crate::tuning::get().trellis_dc_only_scan {
+                for k in (1..dc_m).rev() {
+                    let dk = distw(0, dc_rc, k as i32) + suf0[1];
+                    if dk >= best_cost {
+                        break;
+                    }
+                    let c = dk + rate_cost(lambda, dc_only_rate(k));
+                    if c < best_cost {
+                        best_cost = c;
+                        best_e = 0;
+                        best_m = k;
+                    }
+                }
+            }
         }
-        let skip_cost = suf0[1] + dist_zero[0] + rate_cost(lambda, 1.0f32);
+        let skip_cost =
+            suf0[1] + dist_zero[0] + rate_cost(lambda, crate::tuning::get().trellis_zero_bits);
         if best_e < 0 || skip_cost < best_cost {
             for &rc32 in scan[..m].iter() {
                 cf[rc32 as usize] = 0;
@@ -583,7 +614,7 @@ pub(crate) fn trellis_optimize(
             // folding the old prefix-building pass into candidate selection.
             pre = pre + dist_cur[e] + rate_cost(lambda, coef_rate_bits(cf[rc].unsigned_abs()));
         }
-        let skip_cost = suf0[0] + rate_cost(lambda, 1.0f32); // zero everything + the txb_skip flag
+        let skip_cost = suf0[0] + rate_cost(lambda, crate::tuning::get().trellis_zero_bits); // zero everything + the txb_skip flag
         if best_e < 0 || skip_cost < best_cost {
             for &rc32 in scan[..m].iter() {
                 cf[rc32 as usize] = 0;

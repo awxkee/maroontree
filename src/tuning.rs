@@ -218,12 +218,21 @@ pub(crate) struct Tuning {
     /// UV palette candidate pre-filter: skip the residual transform/trellis/
     /// rate work when the ZERO-residual palette cost (raw prediction SSE +
     /// header/map bits) already exceeds `k` x the incumbent chroma cost.
-    /// 0 = off. SHIPPED 1.0 (2026-09-10): probe showed EVERY winning UV
-    /// palette candidate (444, 5 images) already beat the incumbent with zero
-    /// residual (ratio < 1), and win rates are 0.08% (photo) .. 1.4% (screen)
-    /// of ~9k candidates per image; BD exactly 0.00 on 14 images x 3 corpora
-    /// at k=1.0 and 1.5, ~2% Slow 444 time.
+    /// 0 = off.
     pub(crate) uv_pal_gate_k: f32,
+    /// Contextual trellis: price the DC-only (eob == 0) terminal with the
+    /// emitter's contexts (`eob_base[0]`, `br_tok[0]`) instead of
+    /// `eob_base[1]` + an AC-derived br context.
+    pub(crate) trellis_dc_ctx0: bool,
+    /// Bits charged to the all-zero (txb_skip = 1) alternative in both
+    /// trellises, RELATIVE to the nonzero candidates, which omit the common
+    /// skip=0 + txtp overhead. The historical constant is 1.0; the exact
+    /// relative value is cost(skip=1) - cost(skip=0) - cost(txtp), usually
+    /// negative.
+    pub(crate) trellis_zero_bits: f32,
+    /// Contextual trellis: also scan lower DC levels for the DC-only
+    /// terminal (the Step-A DC level was optimized assuming the AC stays).
+    pub(crate) trellis_dc_only_scan: bool,
 }
 
 impl Tuning {
@@ -323,6 +332,9 @@ impl Tuning {
         top_bias_knee_444: 40.0,
         top_bias_width_444: 20.0,
         uv_pal_gate_k: 1.0,
+        trellis_dc_ctx0: false,
+        trellis_zero_bits: 1.0,
+        trellis_dc_only_scan: false,
     };
 }
 
@@ -488,6 +500,9 @@ mod imp {
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),
                 "top_bias_width_444" => t.top_bias_width_444 = num(value),
                 "uv_pal_gate_k" => t.uv_pal_gate_k = num(value),
+                "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
+                "trellis_zero_bits" => t.trellis_zero_bits = num(value),
+                "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
                 "part_budget_medium" => t.part_budget_medium = num(value) as u32,
                 "part_budget_fast" => t.part_budget_fast = num(value) as u32,
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),
