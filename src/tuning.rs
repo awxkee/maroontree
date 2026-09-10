@@ -233,6 +233,10 @@ pub(crate) struct Tuning {
     /// Contextual trellis: also scan lower DC levels for the DC-only
     /// terminal (the Step-A DC level was optimized assuming the AC stays).
     pub(crate) trellis_dc_only_scan: bool,
+    /// Luma mode beam: give the mode with the smallest CENTRED residual energy
+    /// (cheapest DC-only correction) the last shortlist slot when the SATD
+    /// ranking pruned it
+    pub(crate) beam_sparse_slot: bool,
 }
 
 impl Tuning {
@@ -335,6 +339,7 @@ impl Tuning {
         trellis_dc_ctx0: false,
         trellis_zero_bits: 1.0,
         trellis_dc_only_scan: false,
+        beam_sparse_slot: true,
     };
 }
 
@@ -503,6 +508,7 @@ mod imp {
                 "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
                 "trellis_zero_bits" => t.trellis_zero_bits = num(value),
                 "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
+                "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
                 "part_budget_medium" => t.part_budget_medium = num(value) as u32,
                 "part_budget_fast" => t.part_budget_fast = num(value) as u32,
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),

@@ -253,7 +253,6 @@ fn exact_uv_palette(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Lex-sorted (U, V) pair histogram of one chroma block. Hoisted out of
 /// [`lossy_uv_palette`] so the four lossy candidates of a block share ONE
 /// sort instead of four (the histogram build was ~5% of a 4:4:4 encode).

@@ -62,8 +62,8 @@ impl CoefCostTables {
         for cls in 0..4 {
             for pl in 0..2 {
                 for (ctx, cdf) in cdfs.base_tok[cls][pl].iter().enumerate().take(42) {
-                    for tok in 0..4 {
-                        bt[cls][pl][ctx][tok] = cdf_cost_with_table(cdf, tok, table);
+                    for (tok, slot) in bt[cls][pl][ctx].iter_mut().enumerate() {
+                        *slot = cdf_cost_with_table(cdf, tok, table);
                     }
                 }
                 for (bc, cdf) in cdfs.br_tok[cls][pl].iter().enumerate().take(21) {

@@ -2854,7 +2854,6 @@ fn wavefront_should_use_tiles(sb_cols: usize, sb_rows: usize, threads: usize) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossy_tilegroup(
     base_q_idx: u8,
     bd: u8,

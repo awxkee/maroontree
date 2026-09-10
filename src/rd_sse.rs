@@ -39,6 +39,8 @@ type SumI32Fn = fn(&[i32]) -> i32;
 type SumU16Fn = fn(&[u16]) -> i32;
 type SumU16StridedFn = fn(&[u16], usize, usize) -> i32;
 type AllZeroI32Fn = fn(&[i32]) -> bool;
+/// `(sum, sum of squares)` of `src - pred` over a `w`x`h` block.
+type ResidualMomentsFn = fn(&[u16], usize, &[i32], usize, usize, usize) -> (i64, i64);
 
 /// Pre-resolved low-level compute kernels used by the AV1 encoder state
 /// machines. Those state machines decide what to evaluate; this table owns the
@@ -57,6 +59,7 @@ pub(crate) struct RdDispatch {
     sum_u16: SumU16Fn,
     sum_u16_strided: SumU16StridedFn,
     all_zero_i32: AllZeroI32Fn,
+    residual_moments: ResidualMomentsFn,
 }
 
 impl RdDispatch {
@@ -74,6 +77,7 @@ impl RdDispatch {
             sum_u16: sum_u16_scalar,
             sum_u16_strided: sum_u16_strided_scalar,
             all_zero_i32: all_zero_i32_scalar,
+            residual_moments: residual_moments_scalar,
         }
     }
 
@@ -94,6 +98,7 @@ impl RdDispatch {
             dispatch.sum_u16 = sum_u16_neon_wrap;
             dispatch.sum_u16_strided = sum_u16_strided_neon_wrap;
             dispatch.all_zero_i32 = all_zero_i32_neon_wrap;
+            dispatch.residual_moments = residual_moments_neon_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::is_x86_feature_detected!("avx2") {
@@ -266,6 +271,25 @@ impl RdDispatch {
         debug_assert!((h - 1) * src_stride + w <= src.len());
         debug_assert!((h - 1) * pred_stride + w <= pred.len());
         (self.satd_sad)(src, src_stride, pred, pred_stride, w, h)
+    }
+
+    /// First two moments of the prediction residual: `(S1, S2)` with
+    /// `S1 = sum(src - pred)`, `S2 = sum((src - pred)^2)`. The centred energy
+    /// `S2 - S1^2/N` is what remains after one DC coefficient corrects the
+    /// mean offset (mode-beam sparse slot).
+    #[inline]
+    pub(crate) fn residual_moments(
+        &self,
+        src: &[u16],
+        src_stride: usize,
+        pred: &[i32],
+        pred_stride: usize,
+        w: usize,
+        h: usize,
+    ) -> (i64, i64) {
+        debug_assert!((h - 1) * src_stride + w <= src.len());
+        debug_assert!((h - 1) * pred_stride + w <= pred.len());
+        (self.residual_moments)(src, src_stride, pred, pred_stride, w, h)
     }
 
     #[inline]
@@ -587,6 +611,19 @@ fn all_zero_i32_avx2_wrap(values: &[i32]) -> bool {
 
 #[inline]
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn residual_moments_neon_wrap(
+    src: &[u16],
+    src_stride: usize,
+    pred: &[i32],
+    pred_stride: usize,
+    w: usize,
+    h: usize,
+) -> (i64, i64) {
+    unsafe { crate::neon::residual_moments_neon(src, src_stride, pred, pred_stride, w, h) }
+}
+
+#[inline]
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
 fn satd_sad_proxy_neon_wrap(
     src: &[u16],
     src_stride: usize,
@@ -674,6 +711,27 @@ fn chroma_sse_avx2_wrap(
     residual: &[i32],
 ) -> i64 {
     unsafe { crate::avx::chroma_sse_avx2(src, stride, px, py, w, h, max_value, pred, dc, residual) }
+}
+
+pub(crate) fn residual_moments_scalar(
+    src: &[u16],
+    src_stride: usize,
+    pred: &[i32],
+    pred_stride: usize,
+    w: usize,
+    h: usize,
+) -> (i64, i64) {
+    let (mut s1, mut s2) = (0i64, 0i64);
+    for y in 0..h {
+        let sr = &src[y * src_stride..y * src_stride + w];
+        let pr = &pred[y * pred_stride..y * pred_stride + w];
+        for (&s, &p) in sr.iter().zip(pr) {
+            let d = i64::from(s) - i64::from(p);
+            s1 += d;
+            s2 += d * d;
+        }
+    }
+    (s1, s2)
 }
 
 pub(crate) fn satd_sad_proxy_scalar(
@@ -887,6 +945,46 @@ pub(crate) fn all_zero_i32_scalar(values: &[i32]) -> bool {
 
 #[cfg(test)]
 mod satd_tests {
+    #[test]
+    fn residual_moments_dispatch_matches_scalar() {
+        // Sizes 4..32 (incl. the 4-wide tail), strided planes, signed deltas.
+        let stride = 37;
+        let src: Vec<u16> = (0..stride * 40)
+            .map(|i| ((i * 97 + 13) % 1021) as u16)
+            .collect();
+        let pred: Vec<i32> = (0..stride * 40)
+            .map(|i| ((i * 53) % 1100) as i32 - 40)
+            .collect();
+        let rd = RdDispatch::selected();
+        for &(w, h) in &[
+            (4usize, 4usize),
+            (8, 8),
+            (16, 8),
+            (8, 16),
+            (16, 16),
+            (32, 32),
+            (4, 16),
+        ] {
+            let a = rd.residual_moments(
+                &src[stride * 2 + 3..],
+                stride,
+                &pred[stride * 2 + 3..],
+                stride,
+                w,
+                h,
+            );
+            let b = residual_moments_scalar(
+                &src[stride * 2 + 3..],
+                stride,
+                &pred[stride * 2 + 3..],
+                stride,
+                w,
+                h,
+            );
+            assert_eq!(a, b, "{w}x{h}");
+        }
+    }
+
     use super::*;
 
     #[test]
