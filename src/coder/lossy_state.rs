@@ -332,11 +332,11 @@ impl<'a> LossyTile<'a> {
             ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(1.2, q, 1.4)),
+            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(crate::tuning::get().tilt_base_444, q, crate::tuning::get().tilt_extra_444)),
             updating_cdf: true,
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(1.2, q, 1.4);
+                c.band_tilt = ramped_tilt(crate::tuning::get().tilt_base_444, q, crate::tuning::get().tilt_extra_444);
                 c.into()
             },
             decision_cdf_warmed: false,
@@ -608,11 +608,11 @@ impl<'a> LossyTile<'a> {
             ibc_index: None,
             ibc_shared: None,
             enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(3.5, q, 0.7)),
+            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(crate::tuning::get().tilt_base_420, q, crate::tuning::get().tilt_extra_420)),
             updating_cdf: true,
             dec_cdfs: {
                 let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(3.5, q, 0.7);
+                c.band_tilt = ramped_tilt(crate::tuning::get().tilt_base_420, q, crate::tuning::get().tilt_extra_420);
                 c.into()
             },
             decision_cdf_warmed: false,
