@@ -281,6 +281,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             c.as_slice().to_vec(),
                             top,
+                            self.palette_smooth_t(),
                         )),
                         None => lossy_luma_palette_from(
                             &self.kmeans,
@@ -293,6 +294,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             n,
                             top,
+                            self.palette_smooth_t(),
                         ),
                     }) else {
                         continue;
@@ -3703,6 +3705,7 @@ impl<'a> LossyTile<'a> {
                     16,
                     16,
                     r.palette as usize,
+                    self.palette_smooth_t(),
                 )
                 .expect("16x16 palette replay: candidate no longer derivable");
                 debug_assert_eq!(

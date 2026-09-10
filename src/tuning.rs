@@ -191,6 +191,39 @@ pub(crate) struct Tuning {
     pub(crate) split4_decision_txtypes: bool,
     /// Bounding probe: 0 = price skip=false (shipped), 1 = skip=true, 2 = free.
     pub(crate) block_skip_price: u32,
+    /// Lossy luma palette index-map smoothing: a pixel takes its LEFT/ABOVE
+    /// neighbour's palette index when that center is within
+    /// `ac_q * palette_smooth / 256` (pixel units) of the nearest one. The
+    /// residual absorbs the extra error; the smoother map codes far cheaper
+    /// under the neighbour-context index coder. 0 = off (nearest only).
+    /// SHIPPED 24 at 4:4:4 ONLY (2026-09-10): 444 tuning -0.07 / holdout
+    /// -0.14 (5/5 neg) / 14 new jixel crops -0.45..-0.50 (screen crops -0.7..
+    /// -1.0); 4:2:0 tuning +0.05 (x_fractal +1.12) so subsampled formats and
+    /// mono keep nearest-only (`palette_smooth_t` gates). Known loser:
+    /// x_abstract +1.14 (bytes AND SS2 worse — SSE-vs-SS2 mismatch on sharp
+    /// synthetic edges). 32 was equal on average but not all-negative; 64 lost.
+    pub(crate) palette_smooth: u32,
+    /// With `palette_smooth`: only pixels the nearest center does NOT hit
+    /// exactly may move (protects exact palettes / exact-hit pixels).
+    pub(crate) palette_smooth_guard: bool,
+    /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
+    /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
+    /// qindex <= knee - width. Probe for the very-high-quality 4:4:4 leg (the
+    /// Optuna high-q study wanted 1.05-1.10 there but the format-blind knob
+    /// paid on 4:2:0).
+    pub(crate) none32_split_bias_444_top: f32,
+    pub(crate) none64_split_bias_444_top: f32,
+    pub(crate) top_bias_knee_444: f32,
+    pub(crate) top_bias_width_444: f32,
+    /// UV palette candidate pre-filter: skip the residual transform/trellis/
+    /// rate work when the ZERO-residual palette cost (raw prediction SSE +
+    /// header/map bits) already exceeds `k` x the incumbent chroma cost.
+    /// 0 = off. SHIPPED 1.0 (2026-09-10): probe showed EVERY winning UV
+    /// palette candidate (444, 5 images) already beat the incumbent with zero
+    /// residual (ratio < 1), and win rates are 0.08% (photo) .. 1.4% (screen)
+    /// of ~9k candidates per image; BD exactly 0.00 on 14 images x 3 corpora
+    /// at k=1.0 and 1.5, ~2% Slow 444 time.
+    pub(crate) uv_pal_gate_k: f32,
 }
 
 impl Tuning {
@@ -283,6 +316,13 @@ impl Tuning {
         exact_8x8_mode_rate: true,
         split4_decision_txtypes: false,
         block_skip_price: 0,
+        palette_smooth: 24,
+        palette_smooth_guard: true,
+        none32_split_bias_444_top: 1.03,
+        none64_split_bias_444_top: 1.03,
+        top_bias_knee_444: 40.0,
+        top_bias_width_444: 20.0,
+        uv_pal_gate_k: 1.0,
     };
 }
 
@@ -441,6 +481,13 @@ mod imp {
                 "exact_8x8_mode_rate" => t.exact_8x8_mode_rate = flag(value),
                 "split4_decision_txtypes" => t.split4_decision_txtypes = flag(value),
                 "block_skip_price" => t.block_skip_price = num(value) as u32,
+                "palette_smooth" => t.palette_smooth = num(value) as u32,
+                "palette_smooth_guard" => t.palette_smooth_guard = flag(value),
+                "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
+                "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
+                "top_bias_knee_444" => t.top_bias_knee_444 = num(value),
+                "top_bias_width_444" => t.top_bias_width_444 = num(value),
+                "uv_pal_gate_k" => t.uv_pal_gate_k = num(value),
                 "part_budget_medium" => t.part_budget_medium = num(value) as u32,
                 "part_budget_fast" => t.part_budget_fast = num(value) as u32,
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),

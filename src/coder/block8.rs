@@ -1488,6 +1488,7 @@ impl<'a> LossyTile<'a> {
                     8,
                     8,
                     r.palette as usize,
+                    self.palette_smooth_t(),
                 )
             };
         }
@@ -1871,11 +1872,13 @@ impl<'a> LossyTile<'a> {
                     let pcands: Vec<LossyUvPalette> = if let Some(u) = exact {
                         vec![u]
                     } else {
+                        let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 8, 8);
                         [(8usize, false), (4, false), (8, true), (4, true)]
                             .iter()
                             .filter_map(|&(k, top)| {
-                                lossy_uv_palette(
+                                lossy_uv_palette_from_hist(
                                     &self.kmeans,
+                                    &uv_hist,
                                     &self.src[1],
                                     &self.src[2],
                                     self.w,
@@ -1897,20 +1900,27 @@ impl<'a> LossyTile<'a> {
                             + self.palette_uv_rate_bits(false, &up);
                         let mut sse = 0i64;
                         let mut pal_ccf = [[0i32; 64]; 2];
+                        let mut resids = [[0i32; 64]; 2];
                         for ci in 0..2 {
-                            let plane = ci + 1;
-                            let mut resid = [0i32; 64];
                             self.rd.residual_pred(
-                                &mut resid,
+                                &mut resids[ci],
                                 &pal_pred[ci],
-                                &self.src[plane],
+                                &self.src[ci + 1],
                                 self.w,
                                 px,
                                 py,
                                 8,
                                 8,
                             );
-                            let (mut q, qt) = self.dct.dct8x8_t(&resid, &self.cquant);
+                        }
+                        let raw_sse = sum_sq(&resids[0]) + sum_sq(&resids[1]);
+                        if self.uv_palette_gate(raw_sse, bits, mlam, best_total) {
+                            continue;
+                        }
+                        for ci in 0..2 {
+                            let plane = ci + 1;
+                            let resid = &resids[ci];
+                            let (mut q, qt) = self.dct.dct8x8_t(resid, &self.cquant);
                             trellis_optimize(
                                 &mut q,
                                 &qt,

@@ -768,11 +768,13 @@ impl<'a> LossyTile<'a> {
                 let cands: Vec<LossyUvPalette> = if let Some(up) = exact {
                     vec![up]
                 } else {
+                    let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 16, 16);
                     [(8usize, false), (4, false), (8, true), (4, true)]
                         .iter()
                         .filter_map(|&(k, top)| {
-                            lossy_uv_palette(
+                            lossy_uv_palette_from_hist(
                                 &self.kmeans,
+                                &uv_hist,
                                 &self.src[1],
                                 &self.src[2],
                                 self.w,
@@ -798,20 +800,27 @@ impl<'a> LossyTile<'a> {
                         + self.palette_uv_rate_bits(palette.is_some(), &up);
                     let mut sse = 0i64;
                     let mut pal_ccf = [self.sbuf_i256(), self.sbuf_i256()];
+                    let mut resids = [self.sbuf_i256(), self.sbuf_i256()];
                     for ci in 0..2 {
-                        let plane = ci + 1;
-                        let mut resid = self.sbuf_i256();
                         self.rd.residual_pred(
-                            &mut resid[..],
+                            &mut resids[ci][..],
                             &pal_pred[ci][..],
-                            &self.src[plane],
+                            &self.src[ci + 1],
                             self.w,
                             px,
                             py,
                             16,
                             16,
                         );
-                        let (mut q, qt) = self.dct.dct16x16_t(&resid, &self.cquant);
+                    }
+                    let raw_sse = sum_sq(&resids[0][..]) + sum_sq(&resids[1][..]);
+                    if self.uv_palette_gate(raw_sse, bits, mlam, best_total) {
+                        continue;
+                    }
+                    for ci in 0..2 {
+                        let plane = ci + 1;
+                        let resid = &resids[ci];
+                        let (mut q, qt) = self.dct.dct16x16_t(resid, &self.cquant);
                         trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_16X16, trellis_lambda());
                         let rr = self.idct.idct_dequant_16x16(&q, &self.cquant);
                         sse += sse_recon::<256, 16>(&self.rd,

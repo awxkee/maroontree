@@ -1283,6 +1283,16 @@ struct LossyTile<'a> {
     /// assumption `pal_est_cache` already relies on).
     #[allow(clippy::type_complexity)]
     pal_y_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
+    /// Snapshot `pal_y_cost` is built from: the FRAME-INITIAL decision CDFs,
+    /// captured on the first `switch_decision_cdfs` (None until then, when
+    /// `dec_cdfs` still is that snapshot). Pinned so that every worker and the
+    /// serial path price palette maps identically regardless of which cell
+    /// they see first — and identically to the pre-warm-up encoder.
+    pal_cdfs: Option<std::sync::Arc<Cdfs>>,
+    /// Coefficient token cost tables of `dec_cdfs` (see
+    /// `crate::rate::CoefCostTables`), built lazily and dropped on every
+    /// decision-snapshot switch.
+    coef_cost: std::cell::RefCell<Option<Box<crate::rate::CoefCostTables>>>,
     /// Exact, epoch-stamped memo for derived chroma block RD costs shared by
     /// multiple partition families under the same perceptual multiplier.
     chroma_rd_cache: std::cell::RefCell<HashMap<u128, (u64, f32)>>,
@@ -1497,9 +1507,6 @@ fn vbp_thresh_420() -> f32 {
     crate::tuning::get().vbp_thresh_420
 }
 
-fn none32_split_bias() -> f32 {
-    crate::tuning::get().none32_split_bias
-}
 fn top_none_bias_420(base_q: u8) -> f32 {
     let t = crate::tuning::get();
     if base_q <= 20 {
@@ -1515,12 +1522,7 @@ fn smooth_v_uv_signal_bits() -> f32 {
 /// Required SSE improvement (in 1/1024) for the 32x32 TX-split to be accepted
 /// on a banding-risk block. See `code_block32`.
 const SPLIT32_SSE_MARGIN: i64 = 64;
-/// Same split-favoring thumb for the 64x64 SB NONE-vs-SPLIT decision (see
-/// `choose_64`). BLOCK_64X64 shares one prediction over a large area, so the
-/// distortion proxy is even coarser than at 32x32; the bias guards detail.
-fn none64_split_bias() -> f32 {
-    crate::tuning::get().none64_split_bias
-}
+
 /// Master switch for the whole-superblock BLOCK_64X64 intra path (4:2:0 only).
 pub static BLOCK64_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -2025,7 +2027,7 @@ fn wavefront_capture(
             // the selected snapshot independent of worker scheduling.
             let use_warm = warm_decisions && use_warmed_decision_cdf(row, col, warm_prefix);
             if use_warm != t.decision_cdf_warmed {
-                t.dec_cdfs = if use_warm {
+                let next = if use_warm {
                     published_dec_cdfs
                         .get()
                         .expect("decision CDF warmup was not published")
@@ -2033,7 +2035,7 @@ fn wavefront_capture(
                 } else {
                     initial_dec_cdfs.clone()
                 };
-                t.decision_cdf_warmed = use_warm;
+                t.switch_decision_cdfs(next, use_warm);
             }
             let (sb_x, sb_y) = (col * 64, row * 64);
             // Per-plane geometry: (subsample x shift, subsample y shift).
@@ -2581,7 +2583,7 @@ fn encode_one_tile(
                     && !tile.ss422
                     && use_warmed_decision_cdf(sb_row, sb_col, warm_prefix);
                 if use_warm != tile.decision_cdf_warmed {
-                    tile.dec_cdfs = if use_warm {
+                    let next = if use_warm {
                         warm_dec_cdfs
                             .as_ref()
                             .expect("decision CDF warmup was not captured")
@@ -2589,7 +2591,7 @@ fn encode_one_tile(
                     } else {
                         initial_dec_cdfs.clone()
                     };
-                    tile.decision_cdf_warmed = use_warm;
+                    tile.switch_decision_cdfs(next, use_warm);
                 }
                 if let Some(rx) = stream_rx {
                     while pending[sb_i].is_none() {
@@ -2851,6 +2853,7 @@ fn wavefront_should_use_tiles(sb_cols: usize, sb_rows: usize, threads: usize) ->
     wave_floor * 100 > tile_floor * 135
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossy_tilegroup(
     base_q_idx: u8,

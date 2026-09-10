@@ -912,7 +912,7 @@ impl<'a> LossyTile<'a> {
             * if self.top_band() && self.ss420 {
                 top_none_bias_420(self.aq.base_q)
             } else {
-                none64_split_bias()
+                self.none64_split_bias_at()
             }
             + rate_cost(part_lam, self.part_rate_bl(1, x8, y8, 0));
         // First price four forced-NONE 32x32 children. This is an upper bound on
