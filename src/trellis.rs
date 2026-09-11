@@ -43,7 +43,7 @@ fn trellis_tilt_mag_cap() -> f32 {
 
 #[inline]
 fn trellis_lambda_aom(dc_q: f32, _ac_q: f32) -> f32 {
-    TRELLIS_AOM_CALIB * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
+    TRELLIS_AOM_CALIB * crate::tuning::get().trellis_calib * dc_q * dc_q * (3.3 + 0.0015 * dc_q)
 }
 
 #[inline]

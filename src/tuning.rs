@@ -237,6 +237,13 @@ pub(crate) struct Tuning {
     /// (cheapest DC-only correction) the last shortlist slot when the SATD
     /// ranking pruned it
     pub(crate) beam_sparse_slot: bool,
+    /// Multiplier on the trellis lambda calibration (TRELLIS_AOM_CALIB)
+    pub(crate) trellis_calib: f32,
+    /// Band-tilt `ramped_tilt(base, q, extra)` per format (444 / 420)
+    pub(crate) tilt_base_444: f32,
+    pub(crate) tilt_extra_444: f32,
+    pub(crate) tilt_base_420: f32,
+    pub(crate) tilt_extra_420: f32,
 }
 
 impl Tuning {
@@ -336,10 +343,15 @@ impl Tuning {
         top_bias_knee_444: 40.0,
         top_bias_width_444: 20.0,
         uv_pal_gate_k: 1.0,
-        trellis_dc_ctx0: false,
+        trellis_dc_ctx0: true,
         trellis_zero_bits: 1.0,
         trellis_dc_only_scan: false,
         beam_sparse_slot: true,
+        trellis_calib: 1.15,
+        tilt_base_444: 1.9,
+        tilt_extra_444: 1.4,
+        tilt_base_420: 3.5,
+        tilt_extra_420: 0.7,
     };
 }
 
@@ -509,6 +521,11 @@ mod imp {
                 "trellis_zero_bits" => t.trellis_zero_bits = num(value),
                 "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
                 "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
+                "trellis_calib" => t.trellis_calib = num(value),
+                "tilt_base_444" => t.tilt_base_444 = num(value),
+                "tilt_extra_444" => t.tilt_extra_444 = num(value),
+                "tilt_base_420" => t.tilt_base_420 = num(value),
+                "tilt_extra_420" => t.tilt_extra_420 = num(value),
                 "part_budget_medium" => t.part_budget_medium = num(value) as u32,
                 "part_budget_fast" => t.part_budget_fast = num(value) as u32,
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),
