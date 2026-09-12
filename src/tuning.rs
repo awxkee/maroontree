@@ -75,6 +75,17 @@ pub(crate) struct Tuning {
     pub(crate) top_none_bias_420_lo: f32,
     /// 4:4:4 top-band chroma AC qindex delta (`quant::TOP_444_UAC`).
     pub(crate) top_444_uac: f32,
+    /// Top-band tilt of the SSIMULACRA2 mode-lambda weight
+    pub(crate) mode_lambda_lo_floor: f32,
+    pub(crate) mode_lambda_lo_full: f32,
+    /// Weight at/below `mode_lambda_lo_floor` (1.0 = SVT ramp-down; >1.56 = ramp-up).
+    pub(crate) mode_lambda_lo_w: f32,
+    /// `loop_filter_sharpness` (0..=7), see `obu::loop_filter_sharpness`. SHIPPED 7.
+    pub(crate) lf_sharpness: u32,
+    /// Scale on the q-derived deblock levels (luma / chroma / 4:2:0 chroma).
+    pub(crate) lf_level_scale: f32,
+    pub(crate) lf_uv_level_scale: f32,
+    pub(crate) lf_uv_level_scale_420: f32,
     /// Scale on the 4:2:0 mid-band chroma qindex delta when applied at 4:2:2
     /// (peak -14 at 0.5). SHIPPED 0.5 on observable quality, not metric: at
     /// scale 0 mid-band 4:2:2 chroma ran at full luma q and turned smooth skin
@@ -274,6 +285,13 @@ impl Tuning {
         top_none_bias_420_hi: 1.45,
         top_none_bias_420_lo: 1.15,
         top_444_uac: 6.0,
+        mode_lambda_lo_floor: 0.0,
+        mode_lambda_lo_full: 72.0,
+        mode_lambda_lo_w: 3.0,
+        lf_sharpness: 7,
+        lf_level_scale: 1.0,
+        lf_uv_level_scale: 1.0,
+        lf_uv_level_scale_420: 0.5,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
         fixed_size_fast: 16,
@@ -444,6 +462,13 @@ mod imp {
                 "top_none_bias_420_hi" => t.top_none_bias_420_hi = num(value),
                 "top_none_bias_420_lo" => t.top_none_bias_420_lo = num(value),
                 "top_444_uac" => t.top_444_uac = num(value),
+                "mode_lambda_lo_floor" => t.mode_lambda_lo_floor = num(value),
+                "mode_lambda_lo_full" => t.mode_lambda_lo_full = num(value),
+                "mode_lambda_lo_w" => t.mode_lambda_lo_w = num(value),
+                "lf_sharpness" => t.lf_sharpness = num(value) as u32,
+                "lf_uv_level_scale_420" => t.lf_uv_level_scale_420 = num(value),
+                "lf_level_scale" => t.lf_level_scale = num(value),
+                "lf_uv_level_scale" => t.lf_uv_level_scale = num(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
                 "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,

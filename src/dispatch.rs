@@ -246,6 +246,7 @@ fn encode_lossy_frame<T: Pixel>(
         &tiling,
         &tilegroup,
         monochrome,
+        sub_x + sub_y,
         aq,
         allow_intrabc,
         cdef_params.as_ref(),

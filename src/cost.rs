@@ -100,8 +100,17 @@ pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f32 {
 }
 
 #[inline]
-pub(crate) fn mode_lambda_weight(qindex: u8) -> f32 {
-    aom_ssimulacra2_rdmult_weight(qindex)
+/// `sub`: 0 = 4:4:4 / mono, 1 = 4:2:2 (aom law only), 2 = 4:2:0.
+pub(crate) fn mode_lambda_weight(qindex: u8, sub: usize) -> f32 {
+    let w = aom_ssimulacra2_rdmult_weight(qindex);
+    let t = crate::tuning::get();
+    if sub == 1 || t.mode_lambda_lo_full <= t.mode_lambda_lo_floor {
+        return w;
+    }
+    // Top-band tilt (see `Tuning::mode_lambda_lo_w`).
+    let r = ((qindex as f32 - t.mode_lambda_lo_floor) / (t.mode_lambda_lo_full - t.mode_lambda_lo_floor))
+        .clamp(0.0, 1.0);
+    t.mode_lambda_lo_w + (w - t.mode_lambda_lo_w) * r
 }
 
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in

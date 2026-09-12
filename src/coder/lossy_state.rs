@@ -1819,7 +1819,7 @@ impl<'a> LossyTile<'a> {
     /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
     #[inline]
     fn tune_weight(&self) -> f32 {
-        mode_lambda_weight(self.base_q_idx)
+        mode_lambda_weight(self.base_q_idx, self.chroma_sub())
     }
 
     pub(crate) fn part_bl8_rate(&self, x8: usize, y8: usize, symbol: usize) -> f32 {
