@@ -3220,7 +3220,8 @@ pub(crate) fn encode_lossy_tilegroup(
     // decoder does (deblocking is not tile-independent in AV1). `filter_plane`
     // is a no-op when the derived level is 0 (e.g. lossless).
     if !allow_intrabc {
-        let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx);
+        let (lvl_y, lvl_uv) = crate::obu::loop_filter_levels(base_q_idx, sub_x + sub_y);
+        let sharp = crate::obu::loop_filter_sharpness(base_q_idx);
         frame_deblock(
             &context.loopfilter,
             pool,
@@ -3245,6 +3246,7 @@ pub(crate) fn encode_lossy_tilegroup(
             mono,
             lvl_y,
             lvl_uv,
+            sharp,
             bd,
         );
     }
@@ -4286,6 +4288,7 @@ fn frame_deblock(
     mono: bool,
     level_y: i32,
     level_uv: i32,
+    sharp: i32,
     bd: u8,
 ) {
     if level_y > 0 {
@@ -4302,6 +4305,7 @@ fn frame_deblock(
             blk4t,
             nc4,
             level_y,
+            sharp,
             true,
             16, // 64px superblock -> 16 4-unit rows
             bd,
@@ -4374,7 +4378,7 @@ fn frame_deblock(
     for pixels in &mut recon[1..] {
         crate::loopfilter::filter_plane_parallel(
             loopfilter, pixels, cw, ch, cvis_w, cvis_h, &cbw4, &cbh4, cbv4, cbt4, cnc4, level_uv,
-            false, csb, bd, pool,
+            sharp, false, csb, bd, pool,
         );
     }
 }
@@ -4416,6 +4420,7 @@ pub(crate) fn assemble_frame_obus(
     plan: &Tiling,
     tilegroup: &[u8],
     mono: bool,
+    sub: usize,
     aq: bool,
     allow_intrabc: bool,
     cdef: Option<&crate::obu::CdefParams>,
@@ -4433,6 +4438,7 @@ pub(crate) fn assemble_frame_obus(
             plan.tcl,
             plan.trl,
             mono,
+            sub,
             aq,
             allow_intrabc,
             cdef,
@@ -4451,6 +4457,7 @@ pub(crate) fn assemble_frame_obus(
             0,
             0,
             mono,
+            sub,
             aq,
             allow_intrabc,
             cdef,

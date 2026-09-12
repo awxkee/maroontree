@@ -30,8 +30,14 @@
 /// Per-level limit LUT (dav1d `dav1d_calc_eih`, sharpness 0).
 /// Returns (E = blimit, I = limit, H = thresh) for a filter level.
 #[inline]
-fn limits(level: i32) -> (i32, i32, i32) {
-    let i = level.max(1); // sharpness 0 => limit = max(level, 1)
+fn limits(level: i32, sharp: i32) -> (i32, i32, i32) {
+    // dav1d `dav1d_calc_eih`: sharpness shrinks the interior limit I.
+    let mut i = level;
+    if sharp > 0 {
+        i >>= (sharp + 3) >> 2;
+        i = i.min(9 - sharp);
+    }
+    let i = i.max(1);
     let e = 2 * (level + 2) + i;
     let h = level >> 4;
     (e, i, h)
@@ -421,12 +427,13 @@ pub(crate) fn filter_plane(
     hedge4: &[bool],
     nc4: usize, // number of 4x4 cols in this plane's grid (== ceil(w/4))
     level: i32,
+    sharp: i32,
     is_luma: bool,
     sb_rows4: usize, // superblock height in 4-units for this plane (16 luma, 8 for 420 chroma...)
     bd: u8,
 ) {
     filter_plane_impl(
-        dispatch, px, w, h, vis_w, vis_h, bw4, bh4, vedge4, hedge4, nc4, level, is_luma, sb_rows4,
+        dispatch, px, w, h, vis_w, vis_h, bw4, bh4, vedge4, hedge4, nc4, level, sharp, is_luma, sb_rows4,
         bd, None,
     );
 }
@@ -445,6 +452,7 @@ pub(crate) fn filter_plane_parallel(
     hedge4: &[bool],
     nc4: usize,
     level: i32,
+    sharp: i32,
     is_luma: bool,
     sb_rows4: usize,
     bd: u8,
@@ -463,6 +471,7 @@ pub(crate) fn filter_plane_parallel(
         hedge4,
         nc4,
         level,
+        sharp,
         is_luma,
         sb_rows4,
         bd,
@@ -484,6 +493,7 @@ fn filter_plane_impl(
     hedge4: &[bool],
     nc4: usize,
     level: i32,
+    sharp: i32,
     is_luma: bool,
     sb_rows4: usize,
     bd: u8,
@@ -492,7 +502,7 @@ fn filter_plane_impl(
     if level <= 0 {
         return;
     }
-    let (e, i_lim, h_thresh) = limits(level);
+    let (e, i_lim, h_thresh) = limits(level, sharp);
     // Edge coverage is clipped to the VISIBLE frame (dav1d `f->w4`/`f->h4`):
     // the mult-8 coded padding is reconstructed but never deblocked, so edges
     // at or inside the padding stay unfiltered on both sides.
@@ -732,7 +742,7 @@ mod tests {
                 for wd in [4, 6, 8, 16] {
                     for level in [1, 16, 32, 63] {
                         let (input, base, stride_a, stride_b) = mixed_edge_case(bd, vertical);
-                        let (e, i_lim, h_thresh) = limits(level);
+                        let (e, i_lim, h_thresh) = limits(level, 0);
                         let mut scalar = input.clone();
                         let mut vector = input;
                         loop_filter_scalar(
@@ -785,7 +795,7 @@ mod tests {
                                 input[dst] = input[src];
                             }
                         }
-                        let (e, i_lim, h_thresh) = limits(level);
+                        let (e, i_lim, h_thresh) = limits(level, 0);
                         let mut scalar = input.clone();
                         let mut vector = input;
                         for group in 0..lanes / 4 {
@@ -843,7 +853,7 @@ mod tests {
                     std::array::from_fn(|i| 4095 - ((i + line) & 1) as i32),
                 );
             }
-            let (e, i_lim, h_thresh) = limits(63);
+            let (e, i_lim, h_thresh) = limits(63, 0);
             let mut scalar = input.clone();
             let mut vector = input;
             for group in 0..lanes / 4 {
@@ -942,6 +952,7 @@ mod tests {
             &[],
             w / 4,
             32,
+            7,
             true,
             16,
             8,
@@ -985,6 +996,7 @@ mod tests {
                 &[],
                 nc4,
                 32,
+                7,
                 is_luma,
                 16,
                 bd,
@@ -1002,6 +1014,7 @@ mod tests {
                 &[],
                 nc4,
                 32,
+                7,
                 is_luma,
                 16,
                 bd,
@@ -1049,6 +1062,7 @@ mod tests {
             &hedge4,
             nc4,
             32,
+            7,
             true,
             16,
             8,
@@ -1066,6 +1080,7 @@ mod tests {
             &hedge4,
             nc4,
             32,
+            7,
             true,
             16,
             8,

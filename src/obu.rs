@@ -224,6 +224,7 @@ pub(crate) fn frame_header_lossy_multitile(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    sub: usize,
     aq: bool,
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
@@ -242,6 +243,7 @@ pub(crate) fn frame_header_lossy_multitile(
         tile_rows_log2,
         false,
         mono,
+        sub,
         aq,
         allow_intrabc,
         cdef,
@@ -260,6 +262,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     tile_cols_log2: u32,
     tile_rows_log2: u32,
     mono: bool,
+    sub: usize,
     aq: bool,
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
@@ -278,6 +281,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         tile_rows_log2,
         true,
         mono,
+        sub,
         aq,
         allow_intrabc,
         cdef,
@@ -295,9 +299,11 @@ pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Ve
 /// Deblocking filter levels (luma, chroma) derived from the base quantizer.
 /// Gentle at high quality, stronger at low quality. The encoder applies exactly
 /// these levels to its reconstruction so the output matches the decoder.
-pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
+pub(crate) fn loop_filter_levels(base_q_idx: u8, sub: usize) -> (i32, i32) {
     let q = base_q_idx as i32;
-    let lvl_y = (q / 8).clamp(0, 40);
+    let t = crate::tuning::get();
+    let uv_scale = if sub == 2 { t.lf_uv_level_scale_420 } else { t.lf_uv_level_scale };
+    let lvl_y = (((q / 8) as f32 * t.lf_level_scale).round() as i32).clamp(0, 40);
     // Chroma deblocking must not switch off ahead of luma. In 4:2:0 the chroma
     // uses 4x4 transforms (the most block boundaries per area), so leaving its
     // loop filter at 0 while luma is still filtered (q/10 hits 0 below base_q_idx
@@ -306,11 +312,15 @@ pub(crate) fn loop_filter_levels(base_q_idx: u8) -> (i32, i32) {
     // luma is filtered. (AV1 only signals chroma filter levels when luma is
     // nonzero, so gating on lvl_y also keeps the header consistent.)
     let lvl_uv = if lvl_y > 0 {
-        (q / 10).max(1).clamp(0, 32)
+        (((q / 10) as f32 * uv_scale).round() as i32).max(1).clamp(0, 32)
     } else {
         0
     };
     (lvl_y, lvl_uv)
+}
+
+pub(crate) fn loop_filter_sharpness(_base_q_idx: u8) -> i32 {
+    crate::tuning::get().lf_sharpness.min(7) as i32
 }
 
 #[derive(Clone, Debug, Default)]
@@ -385,6 +395,7 @@ fn frame_header_lossy_impl(
     tile_rows_log2: u32,
     trailing: bool,
     mono: bool,
+    sub: usize,
     aq: bool,
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
@@ -463,14 +474,14 @@ fn frame_header_lossy_impl(
     }
     // allow_intrabc suppresses loop-filter, CDEF and loop-restoration syntax.
     if !allow_intrabc {
-        let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx);
+        let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx, sub);
         w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
         w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
         if lvl_y != 0 && !mono {
             w.f(lvl_uv as u32, 6);
             w.f(lvl_uv as u32, 6);
         }
-        w.f(0, 3); // loop_filter_sharpness = 0
+        w.f(loop_filter_sharpness(base_q_idx) as u32, 3); // loop_filter_sharpness
         w.flag(false); // loop_filter_delta_enabled = 0
 
         let noop_cdef = CdefParams {
