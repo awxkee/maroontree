@@ -167,7 +167,8 @@ pub(crate) fn qm_chroma_level_law(base_q_idx: u8, sub: usize) -> u8 {
 }
 
 const UV420_MID_D: i32 = 28;
-fn uv420_mid_delta(base_q_idx: u8) -> i32 {
+
+fn uv420_mid_delta(base_q_idx: u8, tail: i32) -> i32 {
     let qi = base_q_idx as i32;
     let d = UV420_MID_D;
     if qi <= 20 {
@@ -177,10 +178,14 @@ fn uv420_mid_delta(base_q_idx: u8) -> i32 {
     } else if qi <= 96 {
         -d
     } else if qi < 136 {
-        -(d * (136 - qi)) / 40
+        -tail - ((d - tail) * (136 - qi)) / 40
     } else {
-        0
+        -tail
     }
+}
+
+fn uv420_delta(base_q_idx: u8) -> i32 {
+    uv420_mid_delta(base_q_idx, crate::tuning::get().uv420_tail_delta as i32)
 }
 
 fn top_444_uac() -> i32 {
@@ -189,16 +194,18 @@ fn top_444_uac() -> i32 {
 
 fn uv422_mid_delta(base_q_idx: u8) -> i32 {
     let s = crate::tuning::get().uv422_mid_scale;
-    (s * uv420_mid_delta(base_q_idx) as f32) as i32
+    (s * uv420_mid_delta(base_q_idx, 0) as f32) as i32
 }
 
 pub(crate) fn chroma_ac_delta(base_q_idx: u8, sub: usize) -> i32 {
     match sub {
-        2 => return uv420_mid_delta(base_q_idx),
+        2 => return uv420_delta(base_q_idx),
         1 => return uv422_mid_delta(base_q_idx),
         _ => {}
     }
     let qi = base_q_idx as i32;
+    // +24 plateau is on its optimum at the coarse end too (2026-09-13 q25-55
+    // ladder: 0 -> +0.55, +12 -> +0.21, +40 -> +0.15, -12 -> +1.00).
     if qi <= 20 {
         top_444_uac()
     } else if qi >= 96 {
@@ -217,7 +224,7 @@ pub(crate) fn chroma_dc_delta(base_q_idx: u8, sub: usize) -> i32 {
         -((q - 160) / 3).min(32)
     };
     if sub == 2 {
-        deep + uv420_mid_delta(base_q_idx)
+        deep + uv420_delta(base_q_idx)
     } else if sub == 1 {
         deep + uv422_mid_delta(base_q_idx)
     } else {
