@@ -86,11 +86,9 @@ pub(crate) struct Tuning {
     pub(crate) lf_level_scale: f32,
     pub(crate) lf_uv_level_scale: f32,
     pub(crate) lf_uv_level_scale_420: f32,
-    /// Scale on the 4:2:0 mid-band chroma qindex delta when applied at 4:2:2
-    /// (peak -14 at 0.5). SHIPPED 0.5 on observable quality, not metric: at
-    /// scale 0 mid-band 4:2:2 chroma ran at full luma q and turned smooth skin
-    /// Cr gradients into blotchy DC patches (ClassE_set70 face, q50-65); 0.5
-    /// is the visual knee (+2-3% bytes on the corpus, SS2-neutral BD).
+    /// 4:2:0 chroma qindex delta held at qindex >= 136 (see `quant::uv420_mid_delta`).
+    /// SHIPPED 28 = the mid-band -28 never decays.
+    pub(crate) uv420_tail_delta: f32,
     pub(crate) uv422_mid_scale: f32,
     /// Source-domain SPLIT breakout ratio at Slow.
     pub(crate) split_breakout_slow: f32,
@@ -292,6 +290,7 @@ impl Tuning {
         lf_level_scale: 1.0,
         lf_uv_level_scale: 1.0,
         lf_uv_level_scale_420: 0.5,
+        uv420_tail_delta: 28.0,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
         fixed_size_fast: 16,
@@ -467,6 +466,7 @@ mod imp {
                 "mode_lambda_lo_w" => t.mode_lambda_lo_w = num(value),
                 "lf_sharpness" => t.lf_sharpness = num(value) as u32,
                 "lf_uv_level_scale_420" => t.lf_uv_level_scale_420 = num(value),
+                "uv420_tail_delta" => t.uv420_tail_delta = num(value),
                 "lf_level_scale" => t.lf_level_scale = num(value),
                 "lf_uv_level_scale" => t.lf_uv_level_scale = num(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
