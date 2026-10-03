@@ -60,6 +60,8 @@ mod av2_lossless;
 mod av2_lossy;
 mod box_walker;
 #[cfg(feature = "heic")]
+mod gainmap;
+#[cfg(feature = "heic")]
 mod heic;
 mod jxl;
 #[cfg(feature = "heic")]
@@ -71,7 +73,7 @@ mod vvc;
 use crate::av1_lossy::encode_av1;
 use crate::av2_lossy::encode_av2;
 use crate::box_walker::{ImageContainer, detect_image_container};
-use crate::jxl::{decode_jxl, encode_jxl};
+use crate::jxl::{JxlMetadata, decode_jxl, encode_jxl};
 use image::{DynamicImage, Luma, Rgb, Rgba};
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
 use std::path::{Path, PathBuf};
@@ -664,8 +666,21 @@ fn is_jxl_format(fmt: &str) -> bool {
     matches!(fmt.to_lowercase().as_str(), "jxl" | "jpegxl")
 }
 
-fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
+struct LoadedImage {
+    image: DynamicImage,
+    icc: Option<Vec<u8>>,
+    #[cfg(feature = "heic")]
+    cicp: Option<PngCicp>,
+    #[cfg(feature = "heic")]
+    gain_map: Option<gainmap::ParsedGainMap>,
+}
+
+fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
     let mut have_icc: Option<Vec<u8>> = None;
+    #[cfg(feature = "heic")]
+    let mut gain_map = None;
+    #[cfg(feature = "heic")]
+    let mut have_cicp = None;
 
     let fmt = path
         .extension()
@@ -682,8 +697,12 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
         #[cfg(feature = "heic")]
         Some(_) if _image_container == ImageContainer::Heic => {
             use crate::heic::decode_heic_file_url;
-            decode_heic_file_url(path)
-                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
+            let decoded = decode_heic_file_url(path, _load_gain_map)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
+            have_icc = decoded.icc;
+            have_cicp = decoded.cicp;
+            gain_map = decoded.gain_map;
+            decoded.image
         }
         #[cfg(feature = "vvc")]
         Some(_) if _image_container == ImageContainer::Vvc => {
@@ -709,7 +728,14 @@ fn load_image(path: &PathBuf) -> (DynamicImage, Option<Vec<u8>>) {
             .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display()))),
     };
 
-    (img, have_icc)
+    LoadedImage {
+        image: img,
+        icc: have_icc,
+        #[cfg(feature = "heic")]
+        cicp: have_cicp,
+        #[cfg(feature = "heic")]
+        gain_map,
+    }
 }
 
 fn main() {
@@ -722,7 +748,19 @@ fn main() {
         die("--lossless requires --chroma 444");
     }
 
-    let (img, have_icc) = load_image(&args.input);
+    // Raster output extensions take precedence over the selected encoder.
+    let raster_format = raster::raster_output_format(&args.output);
+    let LoadedImage {
+        image: img,
+        icc: have_icc,
+        #[cfg(feature = "heic")]
+            cicp: have_cicp,
+        #[cfg(feature = "heic")]
+        gain_map,
+    } = load_image(
+        &args.input,
+        args.encoder == Encoder::JpegXl && raster_format.is_none(),
+    );
     let color_type = img.color();
     let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
         Depth::D10
@@ -740,6 +778,8 @@ fn main() {
     let png_cicp = (!args.apply_icc)
         .then(|| read_png_cicp(&args.input))
         .flatten();
+    #[cfg(feature = "heic")]
+    let png_cicp = png_cicp.or(have_cicp.filter(|_| !args.apply_icc));
     if let Some(have_icc) = have_icc {
         raw_icc = Some(have_icc.to_vec());
     }
@@ -805,7 +845,7 @@ fn main() {
 
     let t0 = Instant::now();
 
-    let avif_bytes = if let Some(rf) = raster::raster_output_format(&args.output) {
+    let avif_bytes = if let Some(rf) = raster_format {
         raster::encode_raster(
             &img,
             rf,
@@ -862,9 +902,13 @@ fn main() {
                 &args,
                 color_type,
                 effective_depth,
-                icc_bytes.as_deref(),
-                exif_bytes.as_deref(),
-                png_cicp,
+                JxlMetadata {
+                    icc: icc_bytes.as_deref(),
+                    exif: exif_bytes.as_deref(),
+                    cicp: png_cicp,
+                    #[cfg(feature = "heic")]
+                    gain_map: gain_map.as_ref(),
+                },
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Vvc => {

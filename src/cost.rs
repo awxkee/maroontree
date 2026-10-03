@@ -108,7 +108,8 @@ pub(crate) fn mode_lambda_weight(qindex: u8, sub: usize) -> f32 {
         return w;
     }
     // Top-band tilt (see `Tuning::mode_lambda_lo_w`).
-    let r = ((qindex as f32 - t.mode_lambda_lo_floor) / (t.mode_lambda_lo_full - t.mode_lambda_lo_floor))
+    let r = ((qindex as f32 - t.mode_lambda_lo_floor)
+        / (t.mode_lambda_lo_full - t.mode_lambda_lo_floor))
         .clamp(0.0, 1.0);
     t.mode_lambda_lo_w + (w - t.mode_lambda_lo_w) * r
 }

@@ -290,7 +290,10 @@ impl<'a> LossyTile<'a> {
             chroma_part_weight: chroma_part_rd_weight(false, false, src, bd),
             allow_intrabc: false,
             screen_content: true,
+            screen_frame: false,
             ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_end4: (w / 4, h / 4),
+            ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
@@ -320,6 +323,7 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            screen_pal_est_cache: Default::default(),
             pal_y_cost: std::cell::RefCell::new(None),
             pal_cdfs: None,
             coef_cost: std::cell::RefCell::new(None),
@@ -376,7 +380,10 @@ impl<'a> LossyTile<'a> {
             chroma_part_weight: 0.0,
             allow_intrabc: false,
             screen_content: true,
+            screen_frame: false,
             ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_end4: (w / 4, h / 4),
+            ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], Vec::new(), Vec::new()],
             a_coef: [vec![0x40; w / 4], Vec::new(), Vec::new()],
@@ -406,6 +413,7 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            screen_pal_est_cache: Default::default(),
             pal_y_cost: std::cell::RefCell::new(None),
             pal_cdfs: None,
             coef_cost: std::cell::RefCell::new(None),
@@ -471,7 +479,10 @@ impl<'a> LossyTile<'a> {
             chroma_part_weight: chroma_part_rd_weight(false, true, src, bd),
             allow_intrabc: false,
             screen_content: true,
+            screen_frame: false,
             ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_end4: (w / 4, h / 4),
+            ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
@@ -501,6 +512,7 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            screen_pal_est_cache: Default::default(),
             pal_y_cost: std::cell::RefCell::new(None),
             pal_cdfs: None,
             coef_cost: std::cell::RefCell::new(None),
@@ -566,7 +578,10 @@ impl<'a> LossyTile<'a> {
             chroma_part_weight: chroma_part_rd_weight(true, false, src, bd),
             allow_intrabc: false,
             screen_content: true,
+            screen_frame: false,
             ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_end4: (w / 4, h / 4),
+            ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
             a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
@@ -596,6 +611,7 @@ impl<'a> LossyTile<'a> {
             skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
             cdef_point_marked: false,
             pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+            screen_pal_est_cache: Default::default(),
             pal_y_cost: std::cell::RefCell::new(None),
             pal_cdfs: None,
             coef_cost: std::cell::RefCell::new(None),
@@ -1906,6 +1922,46 @@ impl<'a> LossyTile<'a> {
                 eff8 = eff;
             }
         }
+        // Palette at 8x8: split4 leaves (4x4) cannot carry a palette, so a
+        // palette-blind NONE price here sends every text/UI block to 4x4 DCT
+        // before the emitter's palette search ever runs.
+        if self.screen_frame
+            && self.try_palette()
+            && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, 8, 8)
+        {
+            for (palette, pred) in self.rank_luma_palette_candidates::<64>(&hist, px, py, 8, 8, mlam) {
+                // Exact bound, as in the rect-leaf palette search.
+                let pal_bits = self.palette_rate_bits(px, py, &palette);
+                let mode = self.mode_bits(px, py, DC_PRED);
+                if rate_cost(mlam, mode + pal_bits) >= eff8 {
+                    continue;
+                }
+                let mut resid = [0i32; 64];
+                self.rd
+                    .residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, 8, 8);
+                let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
+                let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                let distortion = self.luma_partition_distortion(
+                    px,
+                    py,
+                    8,
+                    8,
+                    self.quant.ac_q() as f32,
+                    &pred[..],
+                    0,
+                    &rr[..],
+                );
+                let eff = crate::partition_rd::rd_cost(
+                    distortion,
+                    mlam,
+                    self.luma_bits(&cf, &SCAN_8X8, 8, px, py, DC_PRED, 1) + mode + pal_bits,
+                );
+                if eff < eff8 {
+                    eff8 = eff;
+                }
+            }
+        }
         let mut eff4_sum = self.rd_cost_split4_luma(px, py, lam, mlam);
         // In 4:4:4, splitting a 8x8 luma block also changes chroma from one
         // 8x8 block into four independently predicted 4x4 blocks. In 4:2:0 the
@@ -2960,7 +3016,12 @@ impl<'a> LossyTile<'a> {
         let best8 = |bx: usize, by: usize| -> f32 {
             let (cthr, clhb) = Self::child_edge_flags(bx - px, by - py, thr, lhb);
             let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);
-            let none8 = self.rd_cost_square(bx, by, 8, htr8, hbl8, prdo);
+            let mut none8 = self.rd_cost_square(bx, by, 8, htr8, hbl8, prdo);
+            if self.allow_intrabc
+                && let Some(ibc8) = self.rd_cost_intrabc(bx, by, 8, cthr, prdo)
+            {
+                none8 = none8.min(ibc8);
+            }
             if split4_ok {
                 let mut s4 =
                     self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
@@ -3056,7 +3117,21 @@ impl<'a> LossyTile<'a> {
                 .sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             modeled_parts.truncate(part_budget);
         }
-        let refine_part = |part| modeled_parts.iter().any(|&(_, p)| p == part);
+        // On screen frames, palette-eligible blocks (text/UI) keep the
+        // HORZ/VERT legs even though 4:2:0's non-square staging is off: their
+        // 16x8/8x16 leaves carry palettes, aom's dominant palette shape on
+        // text (t_dark -3.0%, t_side -2.2%). 4:4:4 stages rects natively; at
+        // 4:2:2 the admission measured a wash (text -1..-2, n_bbscreen and
+        // x_screen +1.6..+2.0) and stays off.
+        let pal_rect = self.screen_frame
+            && self.ss420
+            && part_budget == 0
+            && self.try_palette()
+            && block_color_histogram(&self.src[0], self.w, px, py, 16, 16).is_some();
+        let refine_part = |part| {
+            modeled_parts.iter().any(|&(_, p)| p == part)
+                || (pal_rect && matches!(part, Part16::Horz | Part16::Vert))
+        };
 
         // Chroma distortion/rate is non-negative. Price the luma leg first and
         // avoid coding chroma when that lower bound already loses to a complete
@@ -3163,7 +3238,7 @@ impl<'a> LossyTile<'a> {
         // IntraBC candidate: whole-16 exact-copy (all planes priced inside
         // rd_cost_intrabc, so no chroma_cost leg is added here).
         let rd_ibc = if self.allow_intrabc {
-            self.rd_cost_intrabc(px, py, 16, prdo)
+            self.rd_cost_intrabc(px, py, 16, thr, prdo)
                 .unwrap_or(f32::INFINITY)
         } else {
             f32::INFINITY

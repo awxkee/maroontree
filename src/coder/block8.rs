@@ -1479,17 +1479,7 @@ impl<'a> LossyTile<'a> {
             best_palette = if r.palette == 0 {
                 None
             } else {
-                lossy_luma_palette(
-                    &self.kmeans,
-                    &self.src[0],
-                    self.w,
-                    px,
-                    py,
-                    8,
-                    8,
-                    r.palette as usize,
-                    self.palette_smooth_t(),
-                )
+                self.rederive_luma_palette(px, py, 8, 8, r.palette as usize)
             };
         }
         if let Some(cf) = rl_cf {
@@ -1500,7 +1490,7 @@ impl<'a> LossyTile<'a> {
             delta: best_delta as i8,
             palette: best_palette
                 .as_ref()
-                .map_or(0, |p| (p.colors.len() + if p.top { 8 } else { 0 }) as u8),
+                .map_or(0, |p| p.sel),
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             tx: if best_is_txsplit4 {
                 TxSel::Split4Tx(s4_txtps)

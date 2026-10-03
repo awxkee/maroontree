@@ -1867,4 +1867,71 @@ mod tests {
         let wavefront = encode_rgb8(&image, &config(4)).unwrap();
         assert_eq!(wavefront, serial);
     }
+
+    #[test]
+    fn screen_palettes_match_serial_bytes_and_decode() {
+        let (w, h) = (512usize, 192usize);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                // Repeated glyphs with near-duplicate ink levels. Adjacent
+                // blocks offer cache colors that can merge palette centers.
+                let colors = if (x / 16 + y / 16).is_multiple_of(3) {
+                    [12, 12, 100, 160]
+                } else {
+                    [10, 14, 100, 160]
+                };
+                let value = if y % 16 < 12 {
+                    colors[(x % 16) / 4]
+                } else {
+                    160
+                };
+                rgb.extend_from_slice(&[value; 3]);
+            }
+        }
+        let image = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb).unwrap();
+        let decoder = std::env::var_os("AVIFDEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/opt/homebrew/bin/avifdec"));
+        for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
+            for intrabc in [false, true] {
+                let config = |threads| {
+                    EncodeConfig::new()
+                        .with_quality(60)
+                        .with_chroma(chroma)
+                        .with_threads(threads)
+                        .with_speed(Speed::Slow)
+                        .with_adaptive_quant(false)
+                        .with_variance_boost(false)
+                        .with_screen_content(true)
+                        .with_intrabc(intrabc)
+                };
+                let serial = encode_rgb8(&image, &config(1)).unwrap();
+                let wavefront = encode_rgb8(&image, &config(4)).unwrap();
+                assert_eq!(wavefront, serial, "{chroma:?} intrabc={intrabc}");
+                if decoder.is_file() {
+                    let tag = format!("screen-palette-{chroma:?}-{intrabc}");
+                    let input = temp_path(&tag, "avif");
+                    let output = temp_path(&tag, "png");
+                    std::fs::write(&input, serial).unwrap();
+                    let result = Command::new(&decoder)
+                        .arg(&input)
+                        .arg(&output)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "avifdec rejected {tag}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    assert_eq!(
+                        png_dimensions(&std::fs::read(&output).unwrap()),
+                        Some((w, h))
+                    );
+                    let _ = std::fs::remove_file(input);
+                    let _ = std::fs::remove_file(output);
+                }
+            }
+        }
+    }
 }

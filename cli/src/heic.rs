@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::gainmap::{ParsedGainMap, parse_apple_gain_map};
 use crate::orientation::apply_orientation;
 use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use hpvca::ChromaFormat;
@@ -65,7 +66,48 @@ fn tight_plane<T: Copy>(plane: &hpvcd::PlaneBuffer<T>) -> Vec<T> {
     plane.rows().flatten().copied().collect()
 }
 
-pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicError> {
+pub(crate) struct DecodedHeic {
+    pub image: DynamicImage,
+    pub icc: Option<Vec<u8>>,
+    pub cicp: Option<crate::PngCicp>,
+    pub gain_map: Option<ParsedGainMap>,
+}
+
+pub(crate) fn decode_heic_file_url(
+    file: &PathBuf,
+    load_gain_map: bool,
+) -> Result<DecodedHeic, HeicError> {
+    let settings = hpvcd::HeicSettings::new().with_decode_gain_map(load_gain_map);
+    let dec = hpvcd::decode_heic_yuv_with_settings(
+        &fs::read(file).map_err(|x| HeicError::Io(x.to_string()))?,
+        &settings,
+    )
+    .map_err(|e| HeicError::Format(format!("hpvcd: {e}")))?;
+    let gain_map = dec.gain_map.as_ref().and_then(|gain| {
+        match parse_apple_gain_map(gain, dec.exif.as_deref()) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                eprintln!("gainmap: skipping Apple gain map: {error:#}");
+                None
+            }
+        }
+    });
+    Ok(DecodedHeic {
+        image: heic_to_image(&dec)?,
+        // YCbCr matrix/range have already been decoded into full-range RGB.
+        // Preserve primaries and transfer for the encoder's pixel transform.
+        cicp: dec.color.cicp.map(|cicp| crate::PngCicp {
+            color_primaries: cicp.primaries as u8,
+            transfer_function: cicp.transfer as u8,
+            matrix_coefficients: 0,
+            full_range: true,
+        }),
+        icc: dec.color.icc,
+        gain_map,
+    })
+}
+
+fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
     use hpvcd::{ChromaFormat, MatrixCoefficients};
     use yuv::{
         YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, i010_alpha_to_rgba10,
@@ -79,9 +121,6 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
         yuv420_alpha_to_rgba, yuv420_to_rgb, yuv422_alpha_to_rgba, yuv422_to_rgb,
         yuv444_alpha_to_rgba, yuv444_to_rgb,
     };
-
-    let dec = hpvcd::decode_heic_yuv(&fs::read(file).map_err(|x| HeicError::Io(x.to_string()))?)
-        .map_err(|e| HeicError::Format(format!("hpvcd: {e}")))?;
 
     let w = u32::try_from(dec.width())
         .map_err(|_| HeicError::Format("HEIC width exceeds u32".into()))?;
@@ -125,7 +164,7 @@ pub(crate) fn decode_heic_file_url(file: &PathBuf) -> Result<DynamicImage, HeicE
     }
 
     if dec.chroma == ChromaFormat::Monochrome {
-        return finish_monochrome(&dec, w, h, high_bit, is_12);
+        return finish_monochrome(dec, w, h, high_bit, is_12);
     }
 
     let rgb_stride = w * 3;

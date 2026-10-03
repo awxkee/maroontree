@@ -65,65 +65,109 @@ unsafe fn sse_u16_raw_reference(
     sse
 }
 
-/// Frame-wide 4x4-prefix hash index for the lossy IntraBC exact matcher.
+/// Tile-wide IntraBC exact-match index over FULL 8x8 luma windows.
+///
+/// Every chroma-parity-grid position holds the polynomial hash of the whole
+/// 8x8 luma window starting there. A query anchors on the block's most
+/// textured 8x8 sub-block (see [`Self::anchor`]), so text and UI blocks whose
+/// top-left corner is plain background still land in a small, exact bucket.
+/// (The previous 4-corner 4x4-prefix fingerprint put every block with a flat
+/// top-left 4x4 into ONE bucket — 58% of a screenshot — and the 128-candidate
+/// verify cap expired long before reaching the real glyph match.)
 struct LossyIbcIndex {
-    step_x: usize,
-    step_y: usize,
-    mono: bool,
-    entries: Vec<(u32, u32)>, // (full hash, packed origin)
+    entries: Vec<(u32, u32)>, // (mixed 8x8 hash, packed origin)
     offsets: Vec<u32>,
 }
 
+/// Memoized IntraBC match search for one block (see `find_intrabc`).
+enum IbcMatches {
+    /// The spec default DV is a legal exact copy (searched first).
+    Default(usize, usize),
+    /// Exact copies among the first 128 legal index candidates, in order.
+    List(Vec<(u32, u32)>),
+}
+
+const IBC_HP: u32 = 0x9E37_79B1;
+const IBC_HQ: u32 = 0x85EB_CA77;
+
+#[inline]
+fn ibc_mix(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846c_a68b);
+    h ^ (h >> 16)
+}
+
 impl LossyIbcIndex {
-    fn fingerprint(
-        src: &[Vec<u16>; 3],
-        w: usize,
-        cw: usize,
-        mono: bool,
-        sub: (usize, usize),
-        x: usize,
-        y: usize,
-    ) -> u32 {
-        let mut hash = 0x811c_9dc5u32;
-        for (dx, dy) in [(0usize, 0usize), (3, 0), (0, 3), (3, 3)] {
-            hash ^= src[0][(y + dy) * w + x + dx] as u32;
-            hash = hash.wrapping_mul(0x0100_0193);
-        }
-        if !mono {
-            for plane in &src[1..3] {
-                hash ^= plane[(y >> sub.1) * cw + (x >> sub.0)] as u32;
-                hash = hash.wrapping_mul(0x0100_0193);
+    /// Direct (non-rolling) form of the window hash; equals the rolling one.
+    fn hash8(luma: &[u16], w: usize, x: usize, y: usize) -> u32 {
+        let mut c = 0u32;
+        for j in 0..8 {
+            let row = luma[(y + j) * w + x..].first_chunk::<8>().unwrap();
+            let mut r = 0u32;
+            for &v in row.iter() {
+                r = r.wrapping_mul(IBC_HP).wrapping_add(u32::from(v) + 1);
             }
+            c = c.wrapping_mul(IBC_HQ).wrapping_add(r);
         }
-        hash
+        ibc_mix(c)
     }
 
-    fn build(
-        src: &[Vec<u16>; 3],
-        w: usize,
-        h: usize,
-        cw: usize,
-        mono: bool,
-        sub: (usize, usize),
-    ) -> Self {
+    fn build(src: &[Vec<u16>; 3], w: usize, h: usize, sub: (usize, usize)) -> Self {
         const BUCKETS: usize = 1 << 16;
         let (step_x, step_y) = (1usize << sub.0, 1usize << sub.1);
         let mut offsets = vec![0u32; BUCKETS + 1];
         if w < 16 || h < 16 {
             return Self {
-                step_x,
-                step_y,
-                mono,
                 entries: Vec::new(),
                 offsets,
             };
         }
-        let xs: Vec<usize> = (0..=w - 4).step_by(step_x).collect();
-        let ys: Vec<usize> = (0..=h - 4).step_by(step_y).collect();
-        let mut hashes = Vec::with_capacity(xs.len() * ys.len());
-        for &y in &ys {
-            for &x in &xs {
-                let hh = Self::fingerprint(src, w, cw, mono, sub, x, y);
+        let luma = &src[0];
+        let nx = w - 7;
+        // Row hashes of every horizontal 8-run, then a vertical roll over
+        // them; wrapping u32 arithmetic is a ring, so the rolled value equals
+        // `hash8` exactly.
+        let p7 = (0..7).fold(1u32, |a, _| a.wrapping_mul(IBC_HP));
+        let q7 = (0..7).fold(1u32, |a, _| a.wrapping_mul(IBC_HQ));
+        let mut rows = vec![0u32; h * nx];
+        for y in 0..h {
+            let line = &luma[y * w..][..w];
+            let out = &mut rows[y * nx..][..nx];
+            let mut r = 0u32;
+            for &v in &line[..8] {
+                r = r.wrapping_mul(IBC_HP).wrapping_add(u32::from(v) + 1);
+            }
+            out[0] = r;
+            for x in 1..nx {
+                r = r
+                    .wrapping_sub((u32::from(line[x - 1]) + 1).wrapping_mul(p7))
+                    .wrapping_mul(IBC_HP)
+                    .wrapping_add(u32::from(line[x + 7]) + 1);
+                out[x] = r;
+            }
+        }
+        let ny = h - 7;
+        let mut col = vec![0u32; nx];
+        for j in 0..8 {
+            for (c, &r) in col.iter_mut().zip(&rows[j * nx..][..nx]) {
+                *c = c.wrapping_mul(IBC_HQ).wrapping_add(r);
+            }
+        }
+        let mut hashes = Vec::with_capacity((nx / step_x + 1) * (ny / step_y + 1));
+        for y in 0..ny {
+            if y > 0 {
+                let (old, new) = (&rows[(y - 1) * nx..][..nx], &rows[(y + 7) * nx..][..nx]);
+                for ((c, &o), &n) in col.iter_mut().zip(old).zip(new) {
+                    *c = c.wrapping_sub(o.wrapping_mul(q7)).wrapping_mul(IBC_HQ).wrapping_add(n);
+                }
+            }
+            if y % step_y != 0 {
+                continue;
+            }
+            for x in (0..nx).step_by(step_x) {
+                let hh = ibc_mix(col[x]);
                 hashes.push((hh, ((y as u32) << 16) | x as u32));
                 offsets[(hh >> 16) as usize + 1] += 1;
             }
@@ -138,41 +182,61 @@ impl LossyIbcIndex {
             entries[cursor[b] as usize] = (hh, origin);
             cursor[b] += 1;
         }
-        Self {
-            step_x,
-            step_y,
-            mono,
-            entries,
-            offsets,
-        }
+        Self { entries, offsets }
     }
 
-    /// Candidate origins whose 4x4-prefix fingerprint matches (px, py)'s, in
-    /// raster order, truncated at `max_y` — the caller's legality rule rejects
-    /// every origin below that row, and the group is sorted by packed origin
-    /// (y-major), so cutting there drops only candidates it would have skipped.
+    /// The 8-aligned 8x8 sub-block of a `size` square with the widest luma
+    /// range (first on ties; (0, 0) for a flat block). Offsets are multiples
+    /// of 8, so anchored origins keep the index's chroma parity.
+    fn anchor(luma: &[u16], w: usize, px: usize, py: usize, size: usize) -> (usize, usize) {
+        let mut best = (0usize, 0usize);
+        let mut best_range = 0u16;
+        for oy in (0..size).step_by(8) {
+            for ox in (0..size).step_by(8) {
+                let (mut lo, mut hi) = (u16::MAX, 0u16);
+                for j in 0..8 {
+                    for &v in &luma[(py + oy + j) * w + px + ox..][..8] {
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                }
+                if hi - lo > best_range {
+                    best_range = hi - lo;
+                    best = (ox, oy);
+                }
+            }
+        }
+        best
+    }
+
+    /// Candidate origins whose anchored 8x8 window hashes like (px, py)'s,
+    /// in raster order, truncated at `max_y` — the caller's legality rule
+    /// rejects every origin below that row, and the bucket is sorted by
+    /// packed origin (y-major), so cutting there drops only candidates it
+    /// would have skipped.
+    #[allow(clippy::too_many_arguments)]
     fn candidates<'i>(
         &'i self,
-        src: &[Vec<u16>; 3],
+        luma: &[u16],
         w: usize,
-        cw: usize,
         px: usize,
         py: usize,
+        size: usize,
         max_y: usize,
     ) -> impl Iterator<Item = (usize, usize)> + 'i {
-        let sub = (
-            self.step_x.trailing_zeros() as usize,
-            self.step_y.trailing_zeros() as usize,
-        );
-        let want = Self::fingerprint(src, w, cw, self.mono, sub, px, py);
+        let (ox, oy) = Self::anchor(luma, w, px, py, size);
+        let want = Self::hash8(luma, w, px + ox, py + oy);
         let b = (want >> 16) as usize;
         let (s, e) = (self.offsets[b] as usize, self.offsets[b + 1] as usize);
         let bucket = &self.entries[s..e];
-        let end = bucket.partition_point(|&(_, origin)| (origin >> 16) as usize <= max_y);
+        let end = bucket.partition_point(|&(_, origin)| (origin >> 16) as usize <= max_y + oy);
         bucket[..end]
             .iter()
             .filter(move |&&(hh, _)| hh == want)
-            .map(|&(_, origin)| ((origin & 0xffff) as usize, (origin >> 16) as usize))
+            .filter_map(move |&(_, origin)| {
+                let (ax, ay) = ((origin & 0xffff) as usize, (origin >> 16) as usize);
+                Some((ax.checked_sub(ox)?, ay.checked_sub(oy)?))
+            })
     }
 }
 
@@ -261,70 +325,223 @@ impl<'a> LossyTile<'a> {
         keep
     }
 
-    /// Simplified dav1d dv-stack emulation for a `size`-px square: scan the
-    /// neighbor 4x4 IntraBC-MV window; exactly one distinct MV -> that MV,
-    /// none -> the spec default DV, several distinct -> None (the candidate is
-    /// DROPPED — our scan cannot reproduce dav1d's stack ordering, and a
-    /// predictor mismatch decodes a different MV = silent corruption).
-    fn intrabc_predictor(&self, px: usize, py: usize, size: usize) -> Option<(i16, i16)> {
-        let (x4, y4, n4, stride4) = (px / 4, py / 4, size / 4, self.w / 4);
-        let x_start = x4.saturating_sub(5);
-        let x_end = (x4 + n4).min(stride4 - 1);
-        let y_start = y4.saturating_sub(5);
-        let y_end = (y4 + n4).min(self.h / 4 - 1);
-        let mut found = None;
-        for y in y_start..y4 {
-            for x in x4.saturating_sub(1)..=x_end {
-                if let Some(mv) = self.ibc_mv[y * stride4 + x] {
-                    if found.is_some_and(|old| old != mv) {
-                        return None;
-                    }
-                    found = Some(mv);
-                }
+    /// Luma prediction-block dims (in 4x4 units) and IntraBC DV of the
+    /// decoded 4x4 cell at (x4, y4), as dav1d's `refmvs_block` holds them.
+    #[inline]
+    fn ibc_cell(&self, x4: usize, y4: usize) -> (Option<(i16, i16)>, usize, usize) {
+        let i = y4 * (self.w / 4) + x4;
+        (
+            self.ibc_mv[i],
+            usize::from(self.pblk4[i]).max(1),
+            usize::from(self.pblk4h[i]).max(1),
+        )
+    }
+
+    /// dav1d `add_spatial_candidate` for the IntraBC reference (ref 0,
+    /// single): plain intra cells carry no MV and add nothing.
+    fn ibc_add_cand(stack: &mut [((i16, i16), u32); 8], cnt: &mut usize, weight: u32, mv: Option<(i16, i16)>) {
+        let Some(mv) = mv else {
+            return;
+        };
+        for slot in stack[..*cnt].iter_mut() {
+            if slot.0 == mv {
+                slot.1 += weight;
+                return;
             }
         }
-        for x in x_start..x4 {
-            for y in y4.saturating_sub(1)..=y_end {
-                if let Some(mv) = self.ibc_mv[y * stride4 + x] {
-                    if found.is_some_and(|old| old != mv) {
-                        return None;
-                    }
-                    found = Some(mv);
-                }
+        if *cnt < 8 {
+            stack[*cnt] = (mv, weight);
+            *cnt += 1;
+        }
+    }
+
+    /// dav1d `scan_row`: candidates along luma row `y4`, starting at `x4`.
+    #[allow(clippy::too_many_arguments)]
+    fn ibc_scan_row(
+        &self,
+        stack: &mut [((i16, i16), u32); 8],
+        cnt: &mut usize,
+        x4: usize,
+        y4: usize,
+        bw4: usize,
+        w4: usize,
+        max_rows: usize,
+        step: usize,
+    ) -> usize {
+        let (mv, cbw4, cbh4) = self.ibc_cell(x4, y4);
+        let mut len = step.max(bw4.min(cbw4));
+        if bw4 <= cbw4 {
+            let weight = if bw4 == 1 { 2 } else { 2usize.max((2 * max_rows).min(cbh4)) };
+            Self::ibc_add_cand(stack, cnt, (len * weight) as u32, mv);
+            return weight >> 1;
+        }
+        let mut mv = mv;
+        let mut x = 0usize;
+        loop {
+            Self::ibc_add_cand(stack, cnt, (len * 2) as u32, mv);
+            x += len;
+            if x >= w4 {
+                return 1;
+            }
+            let (m, cw, _) = self.ibc_cell(x4 + x, y4);
+            mv = m;
+            len = step.max(cw);
+        }
+    }
+
+    /// dav1d `scan_col`: candidates down luma column `x4`, starting at `y4`.
+    #[allow(clippy::too_many_arguments)]
+    fn ibc_scan_col(
+        &self,
+        stack: &mut [((i16, i16), u32); 8],
+        cnt: &mut usize,
+        x4: usize,
+        y4: usize,
+        bh4: usize,
+        h4: usize,
+        max_cols: usize,
+        step: usize,
+    ) -> usize {
+        let (mv, cbw4, cbh4) = self.ibc_cell(x4, y4);
+        let mut len = step.max(bh4.min(cbh4));
+        if bh4 <= cbh4 {
+            let weight = if bh4 == 1 { 2 } else { 2usize.max((2 * max_cols).min(cbw4)) };
+            Self::ibc_add_cand(stack, cnt, (len * weight) as u32, mv);
+            return weight >> 1;
+        }
+        let mut mv = mv;
+        let mut y = 0usize;
+        loop {
+            Self::ibc_add_cand(stack, cnt, (len * 2) as u32, mv);
+            y += len;
+            if y >= h4 {
+                return 1;
+            }
+            let (m, _, ch) = self.ibc_cell(x4, y4 + y);
+            mv = m;
+            len = step.max(ch);
+        }
+    }
+
+    /// The decoder's IntraBC DV predictor for a `size`-px square at (px, py):
+    /// an exact port of dav1d `dav1d_refmvs_find` for the IntraBC reference
+    /// (no global/temporal/extended candidates exist in an intra frame, and
+    /// its clamp cannot bind for a DV the legality rule admits), followed by
+    /// the stack[0] -> stack[1] -> default choice in `decode_b`. Reads only
+    /// decoded neighbors: `ibc_mv` plus the prediction-block dims `pblk4` /
+    /// `pblk4h`, all of which cross the wavefront handoff. `thr` is the
+    /// node's TOP_HAS_RIGHT edge flag.
+    fn intrabc_predictor(&self, px: usize, py: usize, size: usize, thr: bool) -> (i16, i16) {
+        let (bx4, by4, n4) = (px / 4, py / 4, size / 4);
+        let (end_c, end_r) = self.ibc_end4;
+        let (bw4, bh4) = (n4, n4);
+        let w4 = bw4.min(16).min(end_c.saturating_sub(bx4));
+        let h4 = bh4.min(16).min(end_r.saturating_sub(by4));
+        let mut stack = [((0i16, 0i16), 0u32); 8];
+        let mut cnt = 0usize;
+        let mut max_rows = 0usize;
+        let mut n_rows = usize::MAX;
+        if by4 > 0 {
+            max_rows = ((by4 + 1) >> 1).min(2 + usize::from(bh4 > 1));
+            n_rows = self.ibc_scan_row(
+                &mut stack,
+                &mut cnt,
+                bx4,
+                by4 - 1,
+                bw4,
+                w4,
+                max_rows,
+                if bw4 >= 16 { 4 } else { 1 },
+            );
+        }
+        let mut max_cols = 0usize;
+        let mut n_cols = usize::MAX;
+        if bx4 > 0 {
+            max_cols = ((bx4 + 1) >> 1).min(2 + usize::from(bw4 > 1));
+            n_cols = self.ibc_scan_col(
+                &mut stack,
+                &mut cnt,
+                bx4 - 1,
+                by4,
+                bh4,
+                h4,
+                max_cols,
+                if bh4 >= 16 { 4 } else { 1 },
+            );
+        }
+        // top-right: TOP_HAS_RIGHT edge flag, block <= 64, inside the tile
+        if n_rows != usize::MAX && thr && bw4.max(bh4) <= 16 && bw4 + bx4 < end_c {
+            let (mv, _, _) = self.ibc_cell(bx4 + bw4, by4 - 1);
+            Self::ibc_add_cand(&mut stack, &mut cnt, 4, mv);
+        }
+        let nearest = cnt;
+        for slot in &mut stack[..nearest] {
+            slot.1 += 640;
+        }
+        // top-left (needs both edges)
+        if n_rows != usize::MAX && n_cols != usize::MAX {
+            let (mv, _, _) = self.ibc_cell(bx4 - 1, by4 - 1);
+            Self::ibc_add_cand(&mut stack, &mut cnt, 4, mv);
+        }
+        // secondary rows/cols at 8x8 resolution (odd 4x4 positions)
+        for n in 2..=3usize {
+            if n_rows != usize::MAX && n > n_rows && n <= max_rows {
+                let row = (by4 + 1 - 2 * n) | 1;
+                n_rows += self.ibc_scan_row(
+                    &mut stack,
+                    &mut cnt,
+                    bx4 | 1,
+                    row,
+                    bw4,
+                    w4,
+                    1 + max_rows - n,
+                    if bw4 >= 16 { 4 } else { 2 },
+                );
+            }
+            if n_cols != usize::MAX && n > n_cols && n <= max_cols {
+                let col = (bx4 + 1 - 2 * n) | 1;
+                n_cols += self.ibc_scan_col(
+                    &mut stack,
+                    &mut cnt,
+                    col,
+                    by4 | 1,
+                    bh4,
+                    h4,
+                    1 + max_cols - n,
+                    if bh4 >= 16 { 4 } else { 2 },
+                );
             }
         }
-        match found {
-            None => Some(if py < 64 { (0, -2560) } else { (-512, 0) }),
-            Some(mv) => {
-                // dav1d's dv stack is built from ITS scan region (immediate
-                // above row / left column, plus outer rows and the top-right
-                // cell). Our window is a SUPERSET, so a lone MV seen only in
-                // the outer band may be invisible to dav1d — its predictor
-                // would fall back to the default and the decoded DV lands
-                // elsewhere (stream error or silent corruption). Only trust
-                // the MV when a guaranteed-scanned cell carries it.
-                let mut confirmed = false;
-                if y4 > 0 {
-                    let row = y4 - 1;
-                    for x in x4..(x4 + n4).min(stride4) {
-                        if self.ibc_mv[row * stride4 + x] == Some(mv) {
-                            confirmed = true;
-                            break;
-                        }
-                    }
+        // bubble sorts (nearest, then secondary), swapping only on strict <
+        let mut len = nearest;
+        while len > 0 {
+            let mut last = 0;
+            for n in 1..len {
+                if stack[n - 1].1 < stack[n].1 {
+                    stack.swap(n - 1, n);
+                    last = n;
                 }
-                if !confirmed && x4 > 0 {
-                    let col = x4 - 1;
-                    for y in y4..(y4 + n4).min(self.h / 4) {
-                        if self.ibc_mv[y * stride4 + col] == Some(mv) {
-                            confirmed = true;
-                            break;
-                        }
-                    }
+            }
+            len = last;
+        }
+        let mut len = cnt;
+        while len > nearest {
+            let mut last = nearest;
+            for n in nearest + 1..len {
+                if stack[n - 1].1 < stack[n].1 {
+                    stack.swap(n - 1, n);
+                    last = n;
                 }
-                if confirmed { Some(mv) } else { None }
+            }
+            len = last;
+        }
+        // decode_b: stack[0], else stack[1] (zero-filled past cnt), else default
+        for slot in stack.iter().take(cnt.min(2)) {
+            if slot.0 != (0, 0) {
+                return slot.0;
             }
         }
+        if py < 64 { (0, -2560) } else { (-512, 0) }
     }
 
     #[allow(clippy::type_complexity)]
@@ -333,11 +550,12 @@ impl<'a> LossyTile<'a> {
         px: usize,
         py: usize,
         size: usize,
+        thr: bool,
     ) -> Option<(usize, usize, (i16, i16), (i16, i16))> {
         if !self.allow_intrabc {
             return None;
         }
-        let pred = self.intrabc_predictor(px, py, size)?;
+        let pred = self.intrabc_predictor(px, py, size, thr);
         let sbx = px / 64 * 64;
         let sby = py / 64 * 64;
         // Chroma-parity restriction (see doc comment).
@@ -382,7 +600,8 @@ impl<'a> LossyTile<'a> {
             if !(r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc }) {
                 return false;
             }
-            crate::tile::intrabc_dv_conformant(px, py, rx, ry, size, self.w)
+            crate::tile::intrabc_dv_in_range(px, py, rx, ry)
+                && crate::tile::intrabc_dv_conformant(px, py, rx, ry, size, self.w)
         };
         let make = |rx: usize, ry: usize| {
             let dy = (ry as isize - py as isize) * 8;
@@ -401,51 +620,75 @@ impl<'a> LossyTile<'a> {
         } else {
             Some((px, py - 64))
         };
-        if let Some((rx, ry)) = default
-            && legal(rx, ry)
-            && exact(rx, ry)
-        {
-            return make(rx, ry);
-        }
-        // Hash-index lookup on the block's 4x4 prefix (built once per tile);
-        // every hit is verified over the complete block and all planes.
-        let idx = self.ibc_index?.get_or_init(|| {
-            let sub = if self.mono {
-                (0, 0)
-            } else {
-                (
-                    usize::from(self.ss420 || self.ss422),
-                    usize::from(self.ss420),
-                )
-            };
-            LossyIbcIndex::build(self.src, self.w, self.h, self.cw, self.mono, sub)
-        });
+        // The match search is a pure function of the source and the block
+        // geometry (index, legality, exactness); only the DV choice below
+        // depends on the neighbor-derived predictor. Bottom-up pricing, the
+        // parent's SPLIT leg, the node decision and the emitter all re-ask
+        // for the same block, so memoize the verified match set.
+        let key = ((px as u64) << 34) | ((py as u64) << 8) | size as u64;
+        let mut cache = self.ibc_match_cache.borrow_mut();
+        let matches = match cache.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                let m = if let Some((rx, ry)) = default
+                    && legal(rx, ry)
+                    && exact(rx, ry)
+                {
+                    IbcMatches::Default(rx, ry)
+                } else {
+                    // Hash-index lookup on the block's anchored 8x8 window
+                    // (built once per tile); every hit is verified over the
+                    // complete block and all planes.
+                    let idx = self.ibc_index?.get_or_init(|| {
+                        let sub = if self.mono {
+                            (0, 0)
+                        } else {
+                            (
+                                usize::from(self.ss420 || self.ss422),
+                                usize::from(self.ss420),
+                            )
+                        };
+                        LossyIbcIndex::build(self.src, self.w, self.h, sub)
+                    });
+                    let mut list = Vec::new();
+                    let mut verified = 0usize;
+                    // `legal` rejects every origin whose block leaves the
+                    // current superblock row (`ry + size > sby + 64`), so the
+                    // index can stop the raster-ordered group there.
+                    let max_y = (sby + 64).saturating_sub(size);
+                    for (rx, ry) in idx.candidates(&self.src[0], self.w, px, py, size, max_y) {
+                        if (rx, ry) == (px, py) || !legal(rx, ry) {
+                            continue;
+                        }
+                        verified += 1;
+                        if exact(rx, ry) {
+                            list.push((rx as u32, ry as u32));
+                        }
+                        // Bound worst-case work on pathological repeat content.
+                        if verified >= 128 {
+                            break;
+                        }
+                    }
+                    IbcMatches::List(list)
+                };
+                entry.insert(m)
+            }
+        };
+        let list = match matches {
+            IbcMatches::Default(rx, ry) => return make(*rx, *ry),
+            IbcMatches::List(list) => list,
+        };
         #[allow(clippy::type_complexity)]
         let mut best: Option<(usize, usize, (i16, i16), (i16, i16))> = None;
         let mut best_cost = u32::MAX;
-        let mut verified = 0usize;
-        // `legal` rejects every origin whose block leaves the current
-        // superblock row (`ry + size > sby + 64`), so the index can stop the
-        // raster-ordered group there instead of walking it to the frame bottom.
-        let max_y = (sby + 64).saturating_sub(size);
-        for (rx, ry) in idx.candidates(self.src, self.w, self.cw, px, py, max_y) {
-            if (rx, ry) == (px, py) || !legal(rx, ry) {
-                continue;
-            }
-            verified += 1;
-            if exact(rx, ry)
-                && let Some(found) = make(rx, ry)
-            {
+        for &(rx, ry) in list.iter() {
+            if let Some(found) = make(rx as usize, ry as usize) {
                 let cost = (i32::from(found.2.0) - i32::from(found.3.0)).unsigned_abs()
                     + (i32::from(found.2.1) - i32::from(found.3.1)).unsigned_abs();
                 if cost < best_cost {
                     best_cost = cost;
                     best = Some(found);
                 }
-            }
-            // Bound worst-case work on pathological repeat content.
-            if verified >= 128 {
-                break;
             }
         }
         best
@@ -454,11 +697,18 @@ impl<'a> LossyTile<'a> {
     /// R-D cost of coding a `size`-px square as a skip IntraBC copy: the
     /// residual is dropped (skip = 1), so distortion is the quantization
     /// drift already present in the reference reconstruction.
-    fn rd_cost_intrabc(&self, px: usize, py: usize, size: usize, prdo: f32) -> Option<f32> {
+    fn rd_cost_intrabc(
+        &self,
+        px: usize,
+        py: usize,
+        size: usize,
+        thr: bool,
+        prdo: f32,
+    ) -> Option<f32> {
         if size == 64 && self.aq.enabled && self.aq.pending != 0 {
             return None;
         }
-        let (rx, ry, mv, pred) = self.find_intrabc(px, py, size)?;
+        let (rx, ry, mv, pred) = self.find_intrabc(px, py, size, thr)?;
         let mut distortion = 0i64;
         for plane in 0..1 {
             let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
@@ -549,23 +799,23 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    fn code_block64_intrabc(&mut self, x8: usize, y8: usize) {
+    fn code_block64_intrabc(&mut self, x8: usize, y8: usize, thr: bool) {
         // Guarded by rd_cost_intrabc: a delta-carrying SB must never take the
         // whole-64 skip path (the decoder would not read the armed token).
         debug_assert!(!self.aq.enabled || self.aq.pending == 0);
         self.aq_cancel_skipped_sb();
-        self.code_intrabc_block(x8, y8, 64);
+        self.code_intrabc_block(x8, y8, 64, thr);
     }
 
     /// Code a `size`-px square (16/32/64) as a skip IntraBC copy: skip = 1,
     /// use_intrabc = 1, DV residual, no coefficients. Reconstruction is an
     /// integer copy of all coded planes (candidates are chroma-parity-even).
-    fn code_intrabc_block(&mut self, x8: usize, y8: usize, size: usize) {
+    fn code_intrabc_block(&mut self, x8: usize, y8: usize, size: usize, thr: bool) {
         #[cfg(test)]
         LOSSY_INTRABC_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (px, py) = (x8 * 8, y8 * 8);
         let (rx, ry, mv, pred) = self
-            .find_intrabc(px, py, size)
+            .find_intrabc(px, py, size, thr)
             .expect("legal IntraBC reference");
         let (bx4, by4, stride4, n4) = (px / 4, py / 4, self.w / 4, size / 4);
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
@@ -941,7 +1191,7 @@ impl<'a> LossyTile<'a> {
                 };
             rd_split_upper += child_none[i];
         }
-        let rd_ibc = self.rd_cost_intrabc(px, py, 64, prdo);
+        let rd_ibc = self.rd_cost_intrabc(px, py, 64, thr, prdo);
         let best_whole = rd_none.min(rd_ibc.unwrap_or(f32::INFINITY));
         if rd_split_upper < best_whole {
             return Part16::Split;
@@ -1327,5 +1577,62 @@ impl<'a> LossyTile<'a> {
             (0, 32) => (true, have_bl),
             _ => (false, false),
         }
+    }
+}
+
+#[cfg(test)]
+mod ibc_index_tests {
+    use super::LossyIbcIndex;
+
+    /// The index rolls the 8x8 window hash; queries use the direct form. They
+    /// must agree at every indexed position, or no lookup can ever hit.
+    #[test]
+    fn rolling_hash_matches_direct() {
+        let (w, h) = (37usize, 29usize);
+        let mut seed = 0x1234_5678u32;
+        let luma: Vec<u16> = (0..w * h)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed % 1024) as u16
+            })
+            .collect();
+        let src = [luma.clone(), vec![0; w * h], vec![0; w * h]];
+        for sub in [(0, 0), (1, 1), (1, 0)] {
+            let idx = LossyIbcIndex::build(&src, w, h, sub);
+            let mut n = 0;
+            for &(hash, origin) in &idx.entries {
+                let (x, y) = ((origin & 0xffff) as usize, (origin >> 16) as usize);
+                assert_eq!(x % (1 << sub.0), 0);
+                assert_eq!(y % (1 << sub.1), 0);
+                assert_eq!(hash, LossyIbcIndex::hash8(&luma, w, x, y), "({x},{y})");
+                n += 1;
+            }
+            assert_eq!(n, (w - 7).div_ceil(1 << sub.0) * (h - 7).div_ceil(1 << sub.1));
+        }
+    }
+
+    /// A glyph block whose top-left 8x8 is flat background must still find its
+    /// earlier copy through the textured anchor.
+    #[test]
+    fn anchor_finds_copy_behind_flat_corner() {
+        let (w, h) = (128usize, 64usize);
+        let mut luma = vec![200u16; w * h];
+        // a 16x16 block at (8, 8) and its copy at (72, 40): flat top-left
+        // 8x8, "ink" in the bottom-right 8x8
+        for (bx, by) in [(8usize, 8usize), (72, 40)] {
+            for j in 8..16 {
+                for i in 8..16 {
+                    luma[(by + j) * w + bx + i] = ((i * 7 + j * 13) % 50) as u16;
+                }
+            }
+        }
+        let src = [luma.clone(), vec![0; w * h], vec![0; w * h]];
+        let idx = LossyIbcIndex::build(&src, w, h, (0, 0));
+        assert_eq!(LossyIbcIndex::anchor(&luma, w, 72, 40, 16), (8, 8));
+        let hits: Vec<_> = idx.candidates(&luma, w, 72, 40, 16, h).collect();
+        assert!(hits.contains(&(8, 8)), "{hits:?}");
+        assert!(hits.len() <= 2, "flat-free anchor must give a tiny bucket: {hits:?}");
     }
 }

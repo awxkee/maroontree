@@ -478,6 +478,32 @@ impl<'a> LossyTile<'a> {
             let r8_tr = thr && y8 > 0 && (x8 * 8 + 8) < self.w;
             let r8_bl = lhb && x8 > 0 && (y8 * 8 + 8) < self.h;
             let r8 = self.part_decision(|t| {
+                // 8x8 IntraBC copy (glyph-sized repeats on text/UI): taken
+                // when it beats both the equipped NONE leaf and split4.
+                if t.allow_intrabc
+                    && let Some(ibc) = t.rd_cost_intrabc(
+                        x8 * 8,
+                        y8 * 8,
+                        8,
+                        thr,
+                        t.perceptual_rd_scale(x8 * 8, y8 * 8, 8),
+                    )
+                {
+                    let (px, py) = (x8 * 8, y8 * 8);
+                    let prdo = t.perceptual_rd_scale(px, py, 8);
+                    let mut alt = t.rd_cost_square(px, py, 8, r8_tr, r8_bl, prdo);
+                    if !t.mono && ibc < alt {
+                        alt = alt.min(t.rd_cost_split4_luma(
+                            px,
+                            py,
+                            trellis_lambda() * prdo,
+                            t.mlam() * prdo,
+                        ));
+                    }
+                    if ibc < alt {
+                        return Part16::Intrabc;
+                    }
+                }
                 let split_eligible = !t.mono;
                 let want_split = split_eligible
                     && (FORCE_SPLIT4.load(std::sync::atomic::Ordering::Relaxed)
@@ -489,6 +515,13 @@ impl<'a> LossyTile<'a> {
                     t.choose_rect8(x8, y8, r8_tr, r8_bl)
                 }
             });
+            if r8 == Part16::Intrabc {
+                self.enc.encode_symbol(0, &mut self.cdfs.part_bl8[ctx]); // NONE
+                self.code_intrabc_block(x8, y8, 8, thr);
+                self.a_part[x8] = 0x1e;
+                self.l_part[y8] = 0x1e;
+                return;
+            }
             if r8 == Part16::Split {
                 self.enc.encode_symbol(3, &mut self.cdfs.part_bl8[ctx]); // SPLIT
                 let have_tr = thr && y8 > 0 && (x8 * 8 + 8) < self.w;
@@ -535,7 +568,7 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_intrabc_block(x8, y8, 32);
+                        self.code_intrabc_block(x8, y8, 32, thr);
                         self.a_part[x8..x8 + 4].fill(0x18);
                         self.l_part[y8..y8 + 4].fill(0x18);
                         return;
@@ -688,7 +721,7 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]); // NONE
-                        self.code_intrabc_block(x8, y8, 16);
+                        self.code_intrabc_block(x8, y8, 16, thr);
                         self.a_part[x8..x8 + 2].fill(0x1c);
                         self.l_part[y8..y8 + 2].fill(0x1c);
                         return;
@@ -722,7 +755,7 @@ impl<'a> LossyTile<'a> {
                 let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                 self.enc
                     .encode_symbol(0, &mut self.cdfs.part_split[bl - 1][ctx]);
-                self.code_block64_intrabc(x8, y8);
+                self.code_block64_intrabc(x8, y8, thr);
                 self.a_part[x8..x8 + 8].fill(0x10);
                 self.l_part[y8..y8 + 8].fill(0x10);
                 return;
