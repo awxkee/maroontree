@@ -1230,7 +1230,18 @@ struct LossyTile<'a> {
     /// Search the screen-content tools (palette). Frame-level; see
     /// [`crate::EncodeConfig::with_screen_content`].
     screen_content: bool,
+    /// Frame passed the repeated-content (IntraBC coverage) test: enables the
+    /// text palette tools — palette-aware 8x8-vs-split4, 16x8/8x16 palette
+    /// leaves, a wider palette refine budget. Photos never pass it, so they
+    /// keep the photo-tuned palette behaviour bit-for-bit.
+    screen_frame: bool,
     ibc_mv: Vec<Option<(i16, i16)>>,
+    /// Per-block memo of the IntraBC match search (`find_intrabc`).
+    ibc_match_cache: std::cell::RefCell<HashMap<u64, IbcMatches>>,
+    /// Tile-local (column, row) ends in 4x4 units of dav1d's refmvs scan
+    /// window: the tile, clipped to the DISPLAY frame (`iw4 = (w + 3) >> 2`,
+    /// not the 8-aligned coded width).
+    ibc_end4: (usize, usize),
     src: &'a [Vec<u16>; 3],
     recon: [Vec<u16>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
@@ -1275,6 +1286,11 @@ struct LossyTile<'a> {
     /// k-means + map + distortion) is the costliest per-call piece, and its
     /// inputs (source, quant, decision CDFs) are immutable per tile.
     pal_est_cache: std::cell::RefCell<HashMap<u64, [(f32, f32); 3]>>,
+    /// Screen estimates additionally depend on neighbor palettes/modes and
+    /// lambda. Keep their context separate so photo cache entries stay small.
+    #[allow(clippy::type_complexity)]
+    screen_pal_est_cache:
+        std::cell::RefCell<HashMap<u64, (PaletteEstimateContext, [(f32, f32); 3])>>,
     /// Lazily built flat f32 cost tables for the decision `palette_y_color`
     /// CDFs ([size-2][5 map ctx][8 symbols]): the index-map rate walk touches
     /// one entry per map cell, and the triple-Vec `cdf_cost` pointer chase was
@@ -1840,6 +1856,7 @@ fn wavefront_capture(
     bd: u8,
     full_w: usize,
     full_h: usize,
+    disp: (usize, usize),
     sub_x: usize,
     sub_y: usize,
     mono: bool,
@@ -1857,6 +1874,7 @@ fn wavefront_capture(
     allow_intrabc: bool,
     ibc_index: Option<&std::sync::OnceLock<LossyIbcIndex>>,
     screen_content: bool,
+    screen_frame: bool,
     tx: std::sync::mpsc::Sender<(usize, CapturedSb)>,
 ) -> WavefrontPlanes {
     use crate::av2::helpers::{PlaneWriter, par_wavefront_pool_with};
@@ -1890,7 +1908,12 @@ fn wavefront_capture(
         t.frame_x0 = r.x0;
         t.frame_y0 = r.y0;
         t.frame_w = full_w;
+        t.screen_frame = screen_frame;
         t.frame_h = full_h;
+        t.ibc_end4 = (
+            (t.w / 4).min(disp.0.div_ceil(4).saturating_sub(r.x0 / 4)),
+            (t.h / 4).min(disp.1.div_ceil(4).saturating_sub(r.y0 / 4)),
+        );
         if let Some(ref_act) = ref_act {
             t.enable_aq(base_q_idx, ref_act, vb);
         }
@@ -1960,6 +1983,10 @@ fn wavefront_capture(
     // cells preload their predictor window from it (finished neighbors) so
     // the DV predictor sees exactly the serial pass's state.
     let mut ibc_plane: Vec<i32> = vec![0; if allow_ibc { w4 * h4 } else { 0 }];
+    // Companion plane: luma prediction-block dims per finished 4x4 cell
+    // ((w4 << 8) | h4, 0 = not yet coded) — the IntraBC DV predictor's
+    // refmvs scan steps by neighbor block sizes, intra blocks included.
+    let mut ibcd_plane: Vec<i32> = vec![0; if allow_ibc { w4 * h4 } else { 0 }];
     // Shared palette-context planes: the above/left neighbor palettes
     // (a_palette / l_palette), packed 9 x i32 per 4-sample position
     // ([len, c0..c7]). Handing these across cells lets the palette DECISION
@@ -1992,6 +2019,7 @@ fn wavefront_capture(
         ]
     };
     let ibcw = PlaneWriter::new(&mut ibc_plane, w4.max(1));
+    let ibcdw = PlaneWriter::new(&mut ibcd_plane, w4.max(1));
     let apalw = PlaneWriter::new(&mut apal_plane, (w4 * 9).max(1));
     let lpalw = PlaneWriter::new(&mut lpal_plane, (h4 * 9).max(1));
     let apaluvw = PlaneWriter::new(&mut apal_uv_plane, (w4 * 9).max(1));
@@ -2133,6 +2161,7 @@ fn wavefront_capture(
             // MV plane and expose the finished-recon read view ---
             if allow_ibc {
                 let (ibp, _ibl, ibs) = ibcw.read_view();
+                let (idp, _idl, ids) = ibcdw.read_view();
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
                 let x0 = sbx4.saturating_sub(8);
                 let x1 = (sbx4 + 24).min(w4);
@@ -2149,6 +2178,13 @@ fn wavefront_capture(
                         } else {
                             Some(((v >> 16) as i16, v as i16))
                         };
+                        // SAFETY: as above; 0 = not yet coded, keep the
+                        // local (initial) value exactly like serial.
+                        let d = unsafe { *idp.add(y * ids + x) };
+                        if d != 0 {
+                            t.pblk4[y * (t.w / 4) + x] = (d >> 8) as u8;
+                            t.pblk4h[y * (t.w / 4) + x] = d as u8;
+                        }
                     }
                 }
                 t.ibc_shared = Some(IbcSharedRecon {
@@ -2246,6 +2282,14 @@ fn wavefront_capture(
                 }
                 // SAFETY: own SB region — no other concurrent writer.
                 unsafe { ibcw.write_block(sby4, sbx4, bh, bw, &buf[..bw * bh]) };
+                for y in 0..bh {
+                    for x in 0..bw {
+                        let i = (sby4 + y) * (t.w / 4) + sbx4 + x;
+                        buf[y * bw + x] = (i32::from(t.pblk4[i]) << 8) | i32::from(t.pblk4h[i]);
+                    }
+                }
+                // SAFETY: own SB region — no other concurrent writer.
+                unsafe { ibcdw.write_block(sby4, sbx4, bh, bw, &buf[..bw * bh]) };
             }
             {
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
@@ -2478,6 +2522,7 @@ fn encode_one_tile(
     bd: u8,
     full_w: usize,
     full_h: usize,
+    disp: (usize, usize),
     cw8: usize,
     sub_x: usize,
     sub_y: usize,
@@ -2497,6 +2542,7 @@ fn encode_one_tile(
     allow_intrabc: bool,
     updating_cdf: bool,
     screen_content: bool,
+    screen_frame: bool,
 ) -> TileOut {
     let tsrc = if mono {
         [
@@ -2550,7 +2596,12 @@ fn encode_one_tile(
         tile.frame_x0 = r.x0;
         tile.frame_y0 = r.y0;
         tile.frame_w = full_w;
+        tile.screen_frame = screen_frame;
         tile.frame_h = full_h;
+        tile.ibc_end4 = (
+            (tile.w / 4).min(disp.0.div_ceil(4).saturating_sub(r.x0 / 4)),
+            (tile.h / 4).min(disp.1.div_ceil(4).saturating_sub(r.y0 / 4)),
+        );
         if aq {
             // Center the per-SB deltas on this tile's mean activity so the average
             // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
@@ -2710,6 +2761,7 @@ fn encode_one_tile(
                     bd,
                     full_w,
                     full_h,
+                    disp,
                     sub_x,
                     sub_y,
                     mono,
@@ -2727,6 +2779,7 @@ fn encode_one_tile(
                     allow_intrabc,
                     ibc_index,
                     screen_content,
+                    screen_frame,
                     tx,
                 )
             });
@@ -2930,7 +2983,10 @@ pub(crate) fn encode_lossy_tilegroup(
         }
     }
 
-    let allow_intrabc = intrabc_allowed
+    // Repeated non-flat 16x16 content = screen content (text, UI). Measured
+    // whenever the screen tools are on — it also gates the text palette tools
+    // (`LossyTile::screen_frame`), so it must not depend on `--no-intrabc`.
+    let repeats = (screen_content || intrabc_allowed)
         && !mono
         && rects.iter().any(|r| {
             // Coverage threshold: IntraBC costs the whole frame its loop
@@ -3024,6 +3080,8 @@ pub(crate) fn encode_lossy_tilegroup(
             }
             false
         });
+    let allow_intrabc = intrabc_allowed && repeats;
+    let screen_frame = screen_content && repeats;
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
@@ -3060,6 +3118,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 bd,
                 w8,
                 h8,
+                (disp_w, disp_h),
                 cw8,
                 sub_x,
                 sub_y,
@@ -3079,6 +3138,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 allow_intrabc,
                 updating_cdf,
                 screen_content,
+                screen_frame,
             )
         })
     } else {
@@ -3088,6 +3148,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 bd,
                 w8,
                 h8,
+                (disp_w, disp_h),
                 cw8,
                 sub_x,
                 sub_y,
@@ -3107,6 +3168,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 allow_intrabc,
                 updating_cdf,
                 screen_content,
+                screen_frame,
             )
         })
     };

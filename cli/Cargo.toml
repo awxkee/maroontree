@@ -13,14 +13,17 @@ moxcms = { version = "0.9.0" }
 hpvcd = { version = "0.3.2", optional = true }
 fast_transpose = { version = "0.2.7", optional = true }
 thiserror = "2.0.20"
-hpvca = { version = "0.1.17", optional = true }
-jixel = "0.2.22"
-jxl = "0.6.0"
+hpvca = { version = "0.2.0", optional = true }
+jixel = "0.3.3"
+jxl = "0.7.3"
 bytemuck = "1.25.2"
 garnetash = { version = "0.1.1", optional = true }
 tealdust = "0.1.5"
+gainforge = { version = "0.5.1", default-features = false, features = ["uhdr"], optional = true }
+quick-xml = { version = "0.42.0", optional = true }
+kamadak-exif = { version = "0.6.1", optional = true }
 
 [features]
 default = ["heic", "vvc"]
-heic = ["dep:hpvcd", "dep:fast_transpose", "dep:hpvca"]
+heic = ["dep:hpvcd", "dep:fast_transpose", "dep:hpvca", "dep:gainforge", "dep:quick-xml", "dep:kamadak-exif"]
 vvc = ["garnetash"]

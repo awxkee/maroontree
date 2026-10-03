@@ -433,8 +433,8 @@ pub(crate) fn filter_plane(
     bd: u8,
 ) {
     filter_plane_impl(
-        dispatch, px, w, h, vis_w, vis_h, bw4, bh4, vedge4, hedge4, nc4, level, sharp, is_luma, sb_rows4,
-        bd, None,
+        dispatch, px, w, h, vis_w, vis_h, bw4, bh4, vedge4, hedge4, nc4, level, sharp, is_luma,
+        sb_rows4, bd, None,
     );
 }
 

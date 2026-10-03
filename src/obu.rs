@@ -302,7 +302,11 @@ pub(crate) fn wrap_obu_frame_split(frame_header: &[u8], tile_group: &[u8]) -> Ve
 pub(crate) fn loop_filter_levels(base_q_idx: u8, sub: usize) -> (i32, i32) {
     let q = base_q_idx as i32;
     let t = crate::tuning::get();
-    let uv_scale = if sub == 2 { t.lf_uv_level_scale_420 } else { t.lf_uv_level_scale };
+    let uv_scale = if sub == 2 {
+        t.lf_uv_level_scale_420
+    } else {
+        t.lf_uv_level_scale
+    };
     let lvl_y = (((q / 8) as f32 * t.lf_level_scale).round() as i32).clamp(0, 40);
     // Chroma deblocking must not switch off ahead of luma. In 4:2:0 the chroma
     // uses 4x4 transforms (the most block boundaries per area), so leaving its
@@ -312,7 +316,9 @@ pub(crate) fn loop_filter_levels(base_q_idx: u8, sub: usize) -> (i32, i32) {
     // luma is filtered. (AV1 only signals chroma filter levels when luma is
     // nonzero, so gating on lvl_y also keeps the header consistent.)
     let lvl_uv = if lvl_y > 0 {
-        (((q / 10) as f32 * uv_scale).round() as i32).max(1).clamp(0, 32)
+        (((q / 10) as f32 * uv_scale).round() as i32)
+            .max(1)
+            .clamp(0, 32)
     } else {
         0
     };
