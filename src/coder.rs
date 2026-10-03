@@ -1230,7 +1230,18 @@ struct LossyTile<'a> {
     /// Search the screen-content tools (palette). Frame-level; see
     /// [`crate::EncodeConfig::with_screen_content`].
     screen_content: bool,
+    /// Frame passed the repeated-content (IntraBC coverage) test: enables the
+    /// text palette tools — palette-aware 8x8-vs-split4, 16x8/8x16 palette
+    /// leaves, a wider palette refine budget. Photos never pass it, so they
+    /// keep the photo-tuned palette behaviour bit-for-bit.
+    screen_frame: bool,
     ibc_mv: Vec<Option<(i16, i16)>>,
+    /// Per-block memo of the IntraBC match search (`find_intrabc`).
+    ibc_match_cache: std::cell::RefCell<HashMap<u64, IbcMatches>>,
+    /// Tile-local (column, row) ends in 4x4 units of dav1d's refmvs scan
+    /// window: the tile, clipped to the DISPLAY frame (`iw4 = (w + 3) >> 2`,
+    /// not the 8-aligned coded width).
+    ibc_end4: (usize, usize),
     src: &'a [Vec<u16>; 3],
     recon: [Vec<u16>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
@@ -1275,6 +1286,11 @@ struct LossyTile<'a> {
     /// k-means + map + distortion) is the costliest per-call piece, and its
     /// inputs (source, quant, decision CDFs) are immutable per tile.
     pal_est_cache: std::cell::RefCell<HashMap<u64, [(f32, f32); 3]>>,
+    /// Screen estimates additionally depend on neighbor palettes/modes and
+    /// lambda. Keep their context separate so photo cache entries stay small.
+    #[allow(clippy::type_complexity)]
+    screen_pal_est_cache:
+        std::cell::RefCell<HashMap<u64, (PaletteEstimateContext, [(f32, f32); 3])>>,
     /// Lazily built flat f32 cost tables for the decision `palette_y_color`
     /// CDFs ([size-2][5 map ctx][8 symbols]): the index-map rate walk touches
     /// one entry per map cell, and the triple-Vec `cdf_cost` pointer chase was
@@ -1840,6 +1856,7 @@ fn wavefront_capture(
     bd: u8,
     full_w: usize,
     full_h: usize,
+    disp: (usize, usize),
     sub_x: usize,
     sub_y: usize,
     mono: bool,
@@ -1857,6 +1874,7 @@ fn wavefront_capture(
     allow_intrabc: bool,
     ibc_index: Option<&std::sync::OnceLock<LossyIbcIndex>>,
     screen_content: bool,
+    screen_frame: bool,
     tx: std::sync::mpsc::Sender<(usize, CapturedSb)>,
 ) -> WavefrontPlanes {
     use crate::av2::helpers::{PlaneWriter, par_wavefront_pool_with};
@@ -1890,7 +1908,12 @@ fn wavefront_capture(
         t.frame_x0 = r.x0;
         t.frame_y0 = r.y0;
         t.frame_w = full_w;
+        t.screen_frame = screen_frame;
         t.frame_h = full_h;
+        t.ibc_end4 = (
+            (t.w / 4).min(disp.0.div_ceil(4).saturating_sub(r.x0 / 4)),
+            (t.h / 4).min(disp.1.div_ceil(4).saturating_sub(r.y0 / 4)),
+        );
         if let Some(ref_act) = ref_act {
             t.enable_aq(base_q_idx, ref_act, vb);
         }
@@ -1960,6 +1983,10 @@ fn wavefront_capture(
     // cells preload their predictor window from it (finished neighbors) so
     // the DV predictor sees exactly the serial pass's state.
     let mut ibc_plane: Vec<i32> = vec![0; if allow_ibc { w4 * h4 } else { 0 }];
+    // Companion plane: luma prediction-block dims per finished 4x4 cell
+    // ((w4 << 8) | h4, 0 = not yet coded) — the IntraBC DV predictor's
+    // refmvs scan steps by neighbor block sizes, intra blocks included.
+    let mut ibcd_plane: Vec<i32> = vec![0; if allow_ibc { w4 * h4 } else { 0 }];
     // Shared palette-context planes: the above/left neighbor palettes
     // (a_palette / l_palette), packed 9 x i32 per 4-sample position
     // ([len, c0..c7]). Handing these across cells lets the palette DECISION
@@ -1992,6 +2019,7 @@ fn wavefront_capture(
         ]
     };
     let ibcw = PlaneWriter::new(&mut ibc_plane, w4.max(1));
+    let ibcdw = PlaneWriter::new(&mut ibcd_plane, w4.max(1));
     let apalw = PlaneWriter::new(&mut apal_plane, (w4 * 9).max(1));
     let lpalw = PlaneWriter::new(&mut lpal_plane, (h4 * 9).max(1));
     let apaluvw = PlaneWriter::new(&mut apal_uv_plane, (w4 * 9).max(1));
@@ -2133,6 +2161,7 @@ fn wavefront_capture(
             // MV plane and expose the finished-recon read view ---
             if allow_ibc {
                 let (ibp, _ibl, ibs) = ibcw.read_view();
+                let (idp, _idl, ids) = ibcdw.read_view();
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
                 let x0 = sbx4.saturating_sub(8);
                 let x1 = (sbx4 + 24).min(w4);
@@ -2149,6 +2178,13 @@ fn wavefront_capture(
                         } else {
                             Some(((v >> 16) as i16, v as i16))
                         };
+                        // SAFETY: as above; 0 = not yet coded, keep the
+                        // local (initial) value exactly like serial.
+                        let d = unsafe { *idp.add(y * ids + x) };
+                        if d != 0 {
+                            t.pblk4[y * (t.w / 4) + x] = (d >> 8) as u8;
+                            t.pblk4h[y * (t.w / 4) + x] = d as u8;
+                        }
                     }
                 }
                 t.ibc_shared = Some(IbcSharedRecon {
@@ -2215,6 +2251,7 @@ fn wavefront_capture(
                 t.aq_begin_sb_cell(&aq_grid[row * sb_cols + col]);
             }
             t.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+            t.clear_sb_rd_caches();
             // --- write-out: copy each own recon block directly into the
             // finished planes, without a transient contiguous SB scratch ---
             for p in 0..3 {
@@ -2246,6 +2283,14 @@ fn wavefront_capture(
                 }
                 // SAFETY: own SB region — no other concurrent writer.
                 unsafe { ibcw.write_block(sby4, sbx4, bh, bw, &buf[..bw * bh]) };
+                for y in 0..bh {
+                    for x in 0..bw {
+                        let i = (sby4 + y) * (t.w / 4) + sbx4 + x;
+                        buf[y * bw + x] = (i32::from(t.pblk4[i]) << 8) | i32::from(t.pblk4h[i]);
+                    }
+                }
+                // SAFETY: own SB region — no other concurrent writer.
+                unsafe { ibcdw.write_block(sby4, sbx4, bh, bw, &buf[..bw * bh]) };
             }
             {
                 let (sbx4, sby4) = (sb_x / 4, sb_y / 4);
@@ -2478,6 +2523,7 @@ fn encode_one_tile(
     bd: u8,
     full_w: usize,
     full_h: usize,
+    disp: (usize, usize),
     cw8: usize,
     sub_x: usize,
     sub_y: usize,
@@ -2497,20 +2543,26 @@ fn encode_one_tile(
     allow_intrabc: bool,
     updating_cdf: bool,
     screen_content: bool,
+    screen_frame: bool,
 ) -> TileOut {
-    let tsrc = if mono {
-        [
+    // A full-frame tile already has the required contiguous source layout.
+    // Borrow it rather than duplicating every plane before worker allocation.
+    let cropped_src = if r.x0 == 0 && r.y0 == 0 && r.tw == full_w && r.th == full_h {
+        None
+    } else if mono {
+        Some([
             crop_plane(&src[0], full_w, r.x0, r.y0, r.tw, r.th),
             Vec::new(),
             Vec::new(),
-        ]
+        ])
     } else {
-        [
+        Some([
             crop_plane(&src[0], full_w, r.x0, r.y0, r.tw, r.th),
             crop_plane(&src[1], cw8, r.cx0, r.cy0, r.ctw, r.cth),
             crop_plane(&src[2], cw8, r.cx0, r.cy0, r.ctw, r.cth),
-        ]
+        ])
     };
+    let tsrc = cropped_src.as_ref().unwrap_or(src);
     // The IntraBC exact-match index is a pure function of the tile source, so
     // ONE cell is shared by every consumer instead of each building its own:
     // the wavefront spawns a `LossyTile` per worker and the decouple check runs
@@ -2529,12 +2581,12 @@ fn encode_one_tile(
                stream_rx: Option<&std::sync::mpsc::Receiver<(usize, DecisionRecord)>>|
      -> (TileOut, DecisionRecord) {
         let mut tile = if mono {
-            LossyTile::new_mono(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm)
+            LossyTile::new_mono(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm)
         } else {
             match (sub_x, sub_y) {
-                (0, 0) => LossyTile::new(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
-                (1, 0) => LossyTile::new_422(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
-                _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, &tsrc, vb.qm),
+                (0, 0) => LossyTile::new(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
+                (1, 0) => LossyTile::new_422(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
+                _ => LossyTile::new_420(base_q_idx, bd, r.tw, r.th, tsrc, vb.qm),
             }
         }
         .with_dispatch(dct, idct, intrapred, kmeans, rd)
@@ -2550,7 +2602,12 @@ fn encode_one_tile(
         tile.frame_x0 = r.x0;
         tile.frame_y0 = r.y0;
         tile.frame_w = full_w;
+        tile.screen_frame = screen_frame;
         tile.frame_h = full_h;
+        tile.ibc_end4 = (
+            (tile.w / 4).min(disp.0.div_ceil(4).saturating_sub(r.x0 / 4)),
+            (tile.h / 4).min(disp.1.div_ceil(4).saturating_sub(r.y0 / 4)),
+        );
         if aq {
             // Center the per-SB deltas on this tile's mean activity so the average
             // quantizer tracks base_q_idx (zero-mean deltas => ~rate-neutral).
@@ -2624,6 +2681,7 @@ fn encode_one_tile(
                     tile.aq_begin_sb_cell(&aq_grid[sb_i]);
                 }
                 tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
+                tile.clear_sb_rd_caches();
                 if updating_cdf
                     && !tile.mono
                     && !tile.ss420
@@ -2702,7 +2760,7 @@ fn encode_one_tile(
             // The entropy lane spends most of its life recv()-blocked on
             // capture, so capture keeps the full requested worker budget.
             let capture_threads = wf_threads;
-            let tsrc_ref = &tsrc;
+            let tsrc_ref = tsrc;
             let capture = scope.spawn(move || {
                 wavefront_capture(
                     capture_threads,
@@ -2710,6 +2768,7 @@ fn encode_one_tile(
                     bd,
                     full_w,
                     full_h,
+                    disp,
                     sub_x,
                     sub_y,
                     mono,
@@ -2727,6 +2786,7 @@ fn encode_one_tile(
                     allow_intrabc,
                     ibc_index,
                     screen_content,
+                    screen_frame,
                     tx,
                 )
             });
@@ -2930,7 +2990,10 @@ pub(crate) fn encode_lossy_tilegroup(
         }
     }
 
-    let allow_intrabc = intrabc_allowed
+    // Repeated non-flat 16x16 content = screen content (text, UI). Measured
+    // whenever the screen tools are on — it also gates the text palette tools
+    // (`LossyTile::screen_frame`), so it must not depend on `--no-intrabc`.
+    let repeats = (screen_content || intrabc_allowed)
         && !mono
         && rects.iter().any(|r| {
             // Coverage threshold: IntraBC costs the whole frame its loop
@@ -3024,6 +3087,8 @@ pub(crate) fn encode_lossy_tilegroup(
             }
             false
         });
+    let allow_intrabc = intrabc_allowed && repeats;
+    let screen_frame = screen_content && repeats;
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
@@ -3060,6 +3125,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 bd,
                 w8,
                 h8,
+                (disp_w, disp_h),
                 cw8,
                 sub_x,
                 sub_y,
@@ -3079,6 +3145,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 allow_intrabc,
                 updating_cdf,
                 screen_content,
+                screen_frame,
             )
         })
     } else {
@@ -3088,6 +3155,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 bd,
                 w8,
                 h8,
+                (disp_w, disp_h),
                 cw8,
                 sub_x,
                 sub_y,
@@ -3107,6 +3175,7 @@ pub(crate) fn encode_lossy_tilegroup(
                 allow_intrabc,
                 updating_cdf,
                 screen_content,
+                screen_frame,
             )
         })
     };
@@ -3117,32 +3186,61 @@ pub(crate) fn encode_lossy_tilegroup(
         .collect();
     let traces: Vec<_> = outs.iter_mut().map(|o| o.trace.take()).collect();
 
-    // Small per-8x8 / per-4x4 maps: stitched serially (they are tiny).
-    // Monochrome has only a luma plane; chroma recon stays empty.
-    let mut recon = if mono {
-        [vec![0u16; w8 * h8], Vec::new(), Vec::new()]
-    } else {
-        [
-            vec![0u16; w8 * h8],
-            vec![0u16; cw8 * ch8],
-            vec![0u16; cw8 * ch8],
-        ]
-    };
     let sb8w = w8.div_ceil(8);
     let sb8h = h8.div_ceil(8);
-    let mut skip8 = vec![true; sb8w * sb8h];
-    // Frame-level luma block-size map (4x4 units), assembled from every tile so
-    // the deblocking filter can run on the stitched frame (across tile edges).
     let nc4f = w8 / 4;
     let nr4f = h8 / 4;
-    let mut blk4f = vec![0u8; nc4f * nr4f];
-    let mut blk4hf = vec![0u8; nc4f * nr4f];
-    let mut blk4vf = vec![false; nc4f * nr4f];
-    let mut blk4tf = vec![false; nc4f * nr4f];
-    let mut pblk4f = vec![0u8; nc4f * nr4f];
-    let mut pblk4hf = vec![0u8; nc4f * nr4f];
-    let mut pblk4vf = vec![false; nc4f * nr4f];
-    let mut pblk4tf = vec![false; nc4f * nr4f];
+    let single_tile = outs.len() == 1;
+    let WavefrontPlanes {
+        mut recon,
+        mut skip8,
+        blk4: mut blk4f,
+        blk4h: mut blk4hf,
+        blk4v: mut blk4vf,
+        blk4t: mut blk4tf,
+        pblk4: mut pblk4f,
+        pblk4h: mut pblk4hf,
+        pblk4v: mut pblk4vf,
+        pblk4t: mut pblk4tf,
+    } = if single_tile {
+        // The tile already owns a full-frame reconstruction and filter maps.
+        // Transfer them directly instead of allocating and stitching a copy.
+        let out = outs.pop().unwrap();
+        WavefrontPlanes {
+            recon: out.recon,
+            skip8: out.skip8,
+            blk4: out.blk4,
+            blk4h: out.blk4h,
+            blk4v: out.blk4v,
+            blk4t: out.blk4t,
+            pblk4: out.pblk4,
+            pblk4h: out.pblk4h,
+            pblk4v: out.pblk4v,
+            pblk4t: out.pblk4t,
+        }
+    } else {
+        // Assemble all tiles before frame filters run across tile boundaries.
+        WavefrontPlanes {
+            recon: if mono {
+                [vec![0u16; w8 * h8], Vec::new(), Vec::new()]
+            } else {
+                [
+                    vec![0u16; w8 * h8],
+                    vec![0u16; cw8 * ch8],
+                    vec![0u16; cw8 * ch8],
+                ]
+            },
+            skip8: vec![true; sb8w * sb8h],
+            blk4: vec![0u8; nc4f * nr4f],
+            blk4h: vec![0u8; nc4f * nr4f],
+            blk4v: vec![false; nc4f * nr4f],
+            blk4t: vec![false; nc4f * nr4f],
+            pblk4: vec![0u8; nc4f * nr4f],
+            pblk4h: vec![0u8; nc4f * nr4f],
+            pblk4v: vec![false; nc4f * nr4f],
+            pblk4t: vec![false; nc4f * nr4f],
+        }
+    };
     for (r, out) in rects.iter().zip(outs.iter()) {
         let tsb8w = r.tw.div_ceil(8);
         let (ox8, oy8) = (r.x0 / 8, r.y0 / 8);
@@ -3176,7 +3274,7 @@ pub(crate) fn encode_lossy_tilegroup(
     // Pixel planes: every tile row owns a disjoint horizontal band of each
     // plane, so (plane, tile row) pairs stitch in parallel.
     let ncols = col_starts.len();
-    {
+    if !single_tile {
         let mut items: Vec<(usize, usize, &mut [u16])> = Vec::new();
         for (pl, plane) in recon.iter_mut().enumerate() {
             if plane.is_empty() {
@@ -3348,7 +3446,7 @@ fn frame_wiener_search(
     bd: u8,
     pool: &Pool,
 ) -> Option<crate::wiener::WienerUnit> {
-    use crate::wiener::{WienerKernel, wiener_filter_plane};
+    use crate::wiener::{WienerKernel, wiener_filter_plane_sse};
     let sse = |a: &[u16]| -> i64 {
         let mut s = 0i64;
         for i in 0..w * h {
@@ -3366,16 +3464,14 @@ fn frame_wiener_search(
         .iter()
         .flat_map(|h_taps| CANDS.iter().map(move |v_taps| (h_taps, v_taps)))
         .collect();
-    // Each candidate filters into its own buffer; the reduce below walks the
-    // original (h, v) order so ties break exactly as the sequential loop did.
+    // Each candidate retains one stripe; the reduce below walks the original
+    // (h, v) order so ties break exactly as the sequential loop did.
     let want = pool.width().min(cands.len());
     let sses: Vec<i64> = pool.map_indexed(want, cands.len(), |i| {
         let (h_taps, v_taps) = cands[i];
         let hk = WienerKernel::from_coded(*h_taps);
         let vk = WienerKernel::from_coded(*v_taps);
-        let mut tmp = vec![0u16; w * h];
-        wiener_filter_plane(&mut tmp, recon, w, h, &hk, &vk, bd);
-        sse(&tmp)
+        wiener_filter_plane_sse(recon, src, w, h, &hk, &vk, bd)
     });
     let mut best: Option<(i64, crate::wiener::WienerUnit)> = None;
     for (&(h_taps, v_taps), &s) in cands.iter().zip(sses.iter()) {
@@ -3990,7 +4086,8 @@ fn cdef_luma_unit_dists(
     let coeff_shift = (bd - 8) as u32;
     let filtering = pri != 0 || sec != 0;
     let mut tmp = if filtering {
-        recon.to_vec()
+        // Distortion consumes each filtered block before the next row band.
+        vec![0u16; w * 8]
     } else {
         Vec::new()
     };
@@ -4011,12 +4108,15 @@ fn cdef_luma_unit_dists(
                 // already-shifted level); scaling then shifting does not commute
                 // because of the `+8 >> 4` rounding.
                 let apri = cdef::adjust_pri(pri << (bd - 8), vars[bi]);
-                cdef::cdef_filter_8x8(
+                cdef::cdef_filter_block(
                     &mut tmp,
+                    y,
                     recon,
                     w,
                     x,
                     y,
+                    8,
+                    8,
                     apri,
                     sec << (bd - 8),
                     // Decoders pass dir 0 when the SIGNALED pri strength is 0
@@ -4026,7 +4126,17 @@ fn cdef_luma_unit_dists(
                     damping,
                     bd,
                 );
-                cdef_block_dist_vis(src, &tmp, w, disp_w, disp_h, x, y, coeff_shift, perceptual)
+                cdef_block_dist_vis(
+                    &src[y * w..],
+                    &tmp,
+                    w,
+                    disp_w,
+                    disp_h.saturating_sub(y),
+                    x,
+                    0,
+                    coeff_shift,
+                    perceptual,
+                )
             } else {
                 cdef_block_dist_vis(src, recon, w, disp_w, disp_h, x, y, coeff_shift, perceptual)
             };
@@ -4068,7 +4178,7 @@ fn cdef_chroma_unit_sse(
     let cbh = 8 >> sub_y;
     let filtering = pri != 0 || sec != 0;
     let mut tmp = if filtering {
-        recon.to_vec()
+        vec![0u16; cw * cbh]
     } else {
         Vec::new()
     };
@@ -4093,7 +4203,7 @@ fn cdef_chroma_unit_sse(
                 };
                 cdef::cdef_filter_block(
                     &mut tmp,
-                    0,
+                    cy,
                     recon,
                     cw,
                     cx,
@@ -4113,7 +4223,8 @@ fn cdef_chroma_unit_sse(
             let mut sse = 0i64;
             for yy in cy..(cy + cbh).min(ch_vis) {
                 for xx in cx..(cx + cbw).min(cw_vis) {
-                    let d = (cand[yy * cw + xx] - src[yy * cw + xx]) as i64;
+                    let row = if filtering { yy - cy } else { yy };
+                    let d = (cand[row * cw + xx] - src[yy * cw + xx]) as i64;
                     sse += d * d;
                 }
             }
@@ -4747,6 +4858,153 @@ pub(crate) fn encode_lossless_mono_frame_obus(
 #[cfg(test)]
 mod aq_tests {
     use super::*;
+
+    #[test]
+    fn cdef_row_scratch_matches_full_plane_scores() {
+        use crate::cdef;
+        for bd in [8u8, 10, 12] {
+            for (w, h, vis_w, vis_h) in [(16usize, 24usize, 13usize, 21usize), (72, 80, 69, 77)] {
+                let scale = 1u16 << (bd - 8);
+                let src: Vec<u16> = (0..w * h).map(|i| (i % 8) as u16 * scale).collect();
+                let recon: Vec<u16> = (0..w * h)
+                    .map(|i| {
+                        if i % w >= vis_w || i / w >= vis_h {
+                            cdef::CDEF_VERY_LARGE as u16
+                        } else {
+                            (64 + (i * 13 % 128) as u16) * scale
+                        }
+                    })
+                    .collect();
+                let nbx = w / 8;
+                let nby = h / 8;
+                let uc = w.div_ceil(64);
+                let n_units = uc * h.div_ceil(64);
+                let dirs: Vec<usize> = (0..nbx * nby).map(|i| i % 8).collect();
+                let vars: Vec<i32> = (0..nbx * nby)
+                    .map(|i| if i % 3 == 0 { 0 } else { 12345 })
+                    .collect();
+                let skip: Vec<bool> = (0..nbx * nby).map(|i| i % 7 == 0).collect();
+                let damping = 3 + i32::from(bd - 8);
+                for (pri, sec) in [(0, 0), (1, 0), (0, 2), (4, 2)] {
+                    let mut full = recon.clone();
+                    for y in (0..h).step_by(8) {
+                        for x in (0..w).step_by(8) {
+                            let bi = y / 8 * nbx + x / 8;
+                            if skip[bi] || x >= vis_w || y >= vis_h {
+                                continue;
+                            }
+                            if pri != 0 || sec != 0 {
+                                cdef::cdef_filter_8x8(
+                                    &mut full,
+                                    &recon,
+                                    w,
+                                    x,
+                                    y,
+                                    cdef::adjust_pri(pri << (bd - 8), vars[bi]),
+                                    sec << (bd - 8),
+                                    if pri == 0 { 0 } else { dirs[bi] },
+                                    damping,
+                                    bd,
+                                );
+                            }
+                        }
+                    }
+                    for perceptual in [false, true] {
+                        let mut expected = vec![0i64; n_units];
+                        for y in (0..h).step_by(8) {
+                            for x in (0..w).step_by(8) {
+                                if skip[y / 8 * nbx + x / 8] || x >= vis_w || y >= vis_h {
+                                    continue;
+                                }
+                                expected[y / 64 * uc + x / 64] += cdef_block_dist_vis(
+                                    &src,
+                                    &full,
+                                    w,
+                                    vis_w,
+                                    vis_h,
+                                    x,
+                                    y,
+                                    u32::from(bd - 8),
+                                    perceptual,
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            cdef_luma_unit_dists(
+                                &recon, &src, w, h, vis_w, vis_h, &dirs, &vars, &skip, nbx, uc,
+                                n_units, pri, sec, damping, bd, perceptual,
+                            ),
+                            expected,
+                            "luma {w}x{h} bd={bd} strength={pri},{sec} perceptual={perceptual}",
+                        );
+                    }
+                    for (sub_x, sub_y) in [(0, 0), (1, 0), (1, 1)] {
+                        let (cw, ch) = (w >> sub_x, h >> sub_y);
+                        let (cw_vis, ch_vis) =
+                            (vis_w.div_ceil(1 << sub_x), vis_h.div_ceil(1 << sub_y));
+                        let (bw, bh) = (8 >> sub_x, 8 >> sub_y);
+                        let uv_dir = if (sub_x, sub_y) == (1, 0) {
+                            [7, 0, 2, 4, 5, 6, 6, 6]
+                        } else {
+                            [0, 1, 2, 3, 4, 5, 6, 7]
+                        };
+                        let csrc: Vec<u16> = (0..cw * ch).map(|i| (i % 8) as u16 * scale).collect();
+                        let crecon: Vec<u16> = (0..cw * ch)
+                            .map(|i| {
+                                if i % cw >= cw_vis || i / cw >= ch_vis {
+                                    cdef::CDEF_VERY_LARGE as u16
+                                } else {
+                                    (64 + (i * 17 % 128) as u16) * scale
+                                }
+                            })
+                            .collect();
+                        let mut full = crecon.clone();
+                        let mut expected = vec![0i64; n_units];
+                        for by in 0..nby {
+                            for bx in 0..nbx {
+                                let bi = by * nbx + bx;
+                                let (x, y) = (bx * bw, by * bh);
+                                if skip[bi] || x >= cw_vis || y >= ch_vis {
+                                    continue;
+                                }
+                                if pri != 0 || sec != 0 {
+                                    cdef::cdef_filter_block(
+                                        &mut full,
+                                        0,
+                                        &crecon,
+                                        cw,
+                                        x,
+                                        y,
+                                        bw,
+                                        bh,
+                                        pri << (bd - 8),
+                                        sec << (bd - 8),
+                                        if pri == 0 { 0 } else { uv_dir[dirs[bi]] },
+                                        damping,
+                                        bd,
+                                    );
+                                }
+                                for yy in y..(y + bh).min(ch_vis) {
+                                    for xx in x..(x + bw).min(cw_vis) {
+                                        let d = (full[yy * cw + xx] - csrc[yy * cw + xx]) as i64;
+                                        expected[by / 8 * uc + bx / 8] += d * d;
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            cdef_chroma_unit_sse(
+                                &crecon, &csrc, cw, ch, cw_vis, ch_vis, &dirs, &uv_dir, &skip, nbx,
+                                nby, uc, n_units, sub_x, sub_y, pri, sec, damping, bd,
+                            ),
+                            expected,
+                            "chroma {w}x{h} bd={bd} sub={sub_x},{sub_y} strength={pri},{sec}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn decision_snapshot_preserves_filter_intra_priors_except_422() {

@@ -243,7 +243,16 @@ impl<'a> LossyTile<'a> {
         let mut best = f32::INFINITY;
         if self.try_palette() {
             let key = ((px as u64) << 34) | ((py as u64) << 8) | dim as u64;
-            let cached = self.pal_est_cache.borrow().get(&key).copied();
+            let context = self.palette_estimate_context(px, py, mlam);
+            let cached = if let Some(context) = context {
+                self.screen_pal_est_cache
+                    .borrow()
+                    .get(&key)
+                    .filter(|(saved, _)| *saved == context)
+                    .map(|&(_, pairs)| pairs)
+            } else {
+                self.pal_est_cache.borrow().get(&key).copied()
+            };
             let pairs = if let Some(pairs) = cached {
                 pairs
             } else {
@@ -254,7 +263,7 @@ impl<'a> LossyTile<'a> {
                     && (self.ss420 || self.ss422)
                 {
                     hist.as_deref()
-                        .map(|hh| self.rank_palette_centers(hh, mlam))
+                        .map(|hh| self.rank_palette_centers(hh, mlam, (px, py, dim, dim)))
                 } else {
                     None
                 };
@@ -262,7 +271,7 @@ impl<'a> LossyTile<'a> {
                     Some(r) => r
                         .iter()
                         .take(crate::tuning::get().palette_proxy_finalists.min(3))
-                        .map(|&(_, _, centers, top)| (centers.len(), top, Some(centers)))
+                        .map(|&(_, order, centers, top)| (order / 2 + 2, top, Some(centers)))
                         .collect(),
                     None => vec![(8, false, None), (4, false, None), (2, false, None)],
                 };
@@ -280,7 +289,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             dim,
                             c.as_slice().to_vec(),
-                            top,
+                            n + if top { 8 } else { 0 },
                             self.palette_smooth_t(),
                         )),
                         None => lossy_luma_palette_from(
@@ -324,7 +333,13 @@ impl<'a> LossyTile<'a> {
                     pairs[tried] = (dist, bits);
                     tried += 1;
                 }
-                self.pal_est_cache.borrow_mut().insert(key, pairs);
+                if let Some(context) = context {
+                    self.screen_pal_est_cache
+                        .borrow_mut()
+                        .insert(key, (context, pairs));
+                } else {
+                    self.pal_est_cache.borrow_mut().insert(key, pairs);
+                }
                 pairs
             };
             for &(dist, bits) in &pairs {
@@ -714,10 +729,9 @@ impl<'a> LossyTile<'a> {
         // selected partition receives the unchanged full mode/transform
         // refinement in its emitter; doing both here duplicated winner work.
         let dlam = trellis_lambda() * prdo;
-        let (y_mode, pred, resid, cf) =
+        let (y_mode, pred, resid, cf, rpal) =
             self.rect16_luma_mode_search(px, py, vert, dc, dlam, mlam, rect_dec_refine());
-        let (txtp, cf) =
-            self.rect_leaf_tx_trial(&resid, &cf, &pred, px, py, vert, y_mode, dlam, mlam, rect_dec_refine());
+        let (txtp, cf) = self.rect_leaf_tx_trial(&resid, &cf, &pred, px, py, vert, y_mode, dlam, mlam, rect_dec_refine(), rpal.is_some());
         let rr = inv_rect_luma_128(&self.idct, &cf, &self.quant, vert, txtp);
         let distortion = self.luma_partition_distortion(
             px,
@@ -735,6 +749,9 @@ impl<'a> LossyTile<'a> {
         let mut bits = cdf_cost(&self.dcdf().kf_y[yctx], y_mode);
         if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
             bits += cdf_cost(&self.dcdf().angle_delta[y_mode - V_PRED], 3);
+        }
+        if let Some(p) = rpal.as_ref() {
+            bits += self.palette_rate_bits(px, py, p);
         }
         bits += if txtp == 2 || txtp == 3 {
             self.luma_rect_bits_1d(&cf, w, txtp == 2, px, py, y_mode)
@@ -829,7 +846,7 @@ impl<'a> LossyTile<'a> {
         lam: f32,
         mlam: f32,
         refine: bool,
-    ) -> (usize, [i32; 128], [i32; 128], [i32; 128]) {
+    ) -> (usize, [i32; 128], [i32; 128], [i32; 128], Option<LossyLumaPalette>) {
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
         let scan: &[u32] = if vert { &SCAN_8X16 } else { &SCAN_16X8 };
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
@@ -942,7 +959,46 @@ impl<'a> LossyTile<'a> {
                 best = (cost, m, pred, resid, cf);
             }
         }
-        (best.1, best.2, best.3, best.4)
+        // Palette leaf: 16x8 / 8x16 is the dominant palette shape on text
+        // (one glyph-row band), and the only way a palette reaches it —
+        // SPLIT to 8x8 pays the header twice, a 16x16 spans two text bands.
+        let mut best_pal: Option<LossyLumaPalette> = None;
+        if self.screen_frame
+            && self.try_palette()
+            && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h)
+        {
+            for (palette, pred) in self.rank_luma_palette_candidates::<128>(&hist, px, py, w, h, mlam) {
+                // Exact bound: distortion and coefficient bits are >= 0, so a
+                // finalist whose signalling alone loses cannot win.
+                let pal_bits = self.palette_rate_bits(px, py, &palette);
+                if rate_cost(mlam, cdf_cost(kf, DC_PRED) + pal_bits) >= best.0 {
+                    continue;
+                }
+                let mut resid = [0i32; 128];
+                self.rd.residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, w, h);
+                let (mut cf, tf) = if vert {
+                    self.dct.dct8x16_t(&resid, &self.quant)
+                } else {
+                    self.dct.dct16x8_t(&resid, &self.quant)
+                };
+                self.luma_rect_trellis(&mut cf, &tf, dcq, acq, scan, lam, w, h, px, py);
+                let rr = if vert {
+                    self.idct.idct_dequant_8x16(&cf, &self.quant)
+                } else {
+                    self.idct.idct_dequant_16x8(&cf, &self.quant)
+                };
+                let sse = self.rd.sse_recon(&pred, &rr, &self.src[0], self.w, px, py, w, h, self.bd);
+                let bits = self.luma_rect_bits(&cf, scan, w, h, px, py, DC_PRED, 1)
+                    + cdf_cost(kf, DC_PRED)
+                    + pal_bits;
+                let cost = rd_cost_i64(sse, mlam, bits);
+                if cost < best.0 {
+                    best = (cost, DC_PRED, pred, resid, cf);
+                    best_pal = Some(palette);
+                }
+            }
+        }
+        (best.1, best.2, best.3, best.4, best_pal)
     }
 
     /// Transform-type trial for a rectangular luma leaf: ADST_ADST against the
@@ -960,8 +1016,9 @@ impl<'a> LossyTile<'a> {
         lam: f32,
         mlam: f32,
         refine: bool,
+        palette: bool,
     ) -> (usize, [i32; 128]) {
-        if !refine || self.speed != Speed::Slow {
+        if !palette && (!refine || self.speed != Speed::Slow) {
             return (1, *dct_cf);
         }
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
@@ -987,8 +1044,10 @@ impl<'a> LossyTile<'a> {
             *dct_cf,
         );
 
+        // Palette leaves: DCT vs IDTX only (see the 16x16 IDTX note).
+        let adst_types: &[usize] = if palette { &[] } else { &[ADST_ADST_TX8_IDX, 5, 6] };
         // Trellis'd 2-D candidates: ADST_ADST (4), ADST_DCT (5), DCT_ADST (6).
-        for txtp in [ADST_ADST_TX8_IDX, 5, 6] {
+        for &txtp in adst_types {
             let (mut acf, atf) = match (vert, txtp) {
                 (true, ADST_ADST_TX8_IDX) => self.dct.adst8x16_t(resid, &self.quant),
                 (true, 5) => self.dct.adstdct8x16_t(resid, &self.quant),
@@ -1034,7 +1093,8 @@ impl<'a> LossyTile<'a> {
                 best_sse = sse;
             }
         }
-        for (txtp, one_d_vertical) in [(2usize, true), (3usize, false)] {
+        for (txtp, one_d_vertical) in if palette { &[][..] } else { &[(2usize, true), (3usize, false)][..] } {
+            let (txtp, one_d_vertical) = (*txtp, *one_d_vertical);
             let (vcf, _vtf) = match (vert, one_d_vertical) {
                 (true, true) => self.dct.fvdct8x16_t(resid, &self.quant),
                 (true, false) => self.dct.fhdct8x16_t(resid, &self.quant),
@@ -1193,11 +1253,10 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf) =
+            let (y_mode, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, true, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, true, y_mode, lam, emlam, true,
-            );
+                &lresid, &lcf, &lpred_arr, px, py, true, y_mode, lam, emlam, true, rpal.is_some());
             let idct = self.idct;
             let inv8x16 = |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, true, ltxtp);
             let mut ccf = [[0i32; 128]; 2];
@@ -1301,7 +1360,7 @@ impl<'a> LossyTile<'a> {
             let luma_zero = self.rd.all_zero_i32(&lcf);
             let chroma_zero =
                 self.rd.all_zero_i32(&ccf[0]) && self.rd.all_zero_i32(&ccf[1]);
-            let block_skip = luma_zero && chroma_zero;
+            let block_skip = luma_zero && chroma_zero && rpal.is_none();
             let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
             self.code_skip_and_sb_tokens(block_skip, sctx);
             self.record_blk_rect(x8 + half, y8, 2, 4);
@@ -1315,8 +1374,13 @@ impl<'a> LossyTile<'a> {
                     .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
             }
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 8, 16);
-            self.emit_palette_mode_info(px, py, 8, 16, y_mode, !self.mono, None, None);
-            self.emit_filter_intra(y_mode, 8, 16, None);
+            self.emit_palette_mode_info(px, py, 8, 16, y_mode, !self.mono, rpal.as_ref(), None);
+            if rpal.is_none() {
+                self.emit_filter_intra(y_mode, 8, 16, None);
+            }
+            if let Some(p) = rpal.as_ref() {
+                self.emit_palette_map(p);
+            }
             self.code_tx_depth(px, py, 8, 16, 0);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 2].fill(sv);
@@ -1713,11 +1777,10 @@ impl<'a> LossyTile<'a> {
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-        let (y_mode, lpred_arr, lresid, lcf) =
+        let (y_mode, lpred_arr, lresid, lcf, rpal) =
             self.rect16_luma_mode_search(px, py, vert, dc_l, lam, emlam, true);
         let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-            &lresid, &lcf, &lpred_arr, px, py, vert, y_mode, lam, emlam, true,
-        );
+            &lresid, &lcf, &lpred_arr, px, py, vert, y_mode, lam, emlam, true, rpal.is_some());
         let idct = self.idct;
         let inv_luma = |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, vert, ltxtp);
         // chroma 8x4 (horz) or 4x8 (vert) at chroma coords.
@@ -1834,7 +1897,7 @@ impl<'a> LossyTile<'a> {
         let luma_zero = self.rd.all_zero_i32(&lcf);
         let chroma_zero =
             self.rd.all_zero_i32(&ccf[0]) && self.rd.all_zero_i32(&ccf[1]);
-        let block_skip = luma_zero && chroma_zero;
+        let block_skip = luma_zero && chroma_zero && rpal.is_none();
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.code_skip_and_sb_tokens(block_skip, sctx);
         if vert {
@@ -1858,8 +1921,13 @@ impl<'a> LossyTile<'a> {
             lw,
             lh,
         );
-        self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, None, None);
-        self.emit_filter_intra(y_mode, lw, lh, None);
+        self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, rpal.as_ref(), None);
+        if rpal.is_none() {
+            self.emit_filter_intra(y_mode, lw, lh, None);
+        }
+        if let Some(p) = rpal.as_ref() {
+            self.emit_palette_map(p);
+        }
         self.code_tx_depth(px, py, lw, lh, 0);
         let sv = block_skip as u8;
         let (aw, ah) = (lw / 4, lh / 4);
@@ -1969,11 +2037,10 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf) =
+            let (y_mode, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true,
-            );
+                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some());
             let idct = self.idct;
             let inv16x8 =
                 |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, false, ltxtp);
@@ -2058,7 +2125,7 @@ impl<'a> LossyTile<'a> {
             let luma_zero = self.rd.all_zero_i32(&lcf);
             let chroma_zero =
                 self.rd.all_zero_i32(&ccf[0]) && self.rd.all_zero_i32(&ccf[1]);
-            let block_skip = luma_zero && chroma_zero;
+            let block_skip = luma_zero && chroma_zero && rpal.is_none();
             let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
             self.code_skip_and_sb_tokens(block_skip, sctx);
             self.record_blk_rect(x8, y8 + half, 4, 2);
@@ -2077,8 +2144,13 @@ impl<'a> LossyTile<'a> {
                 16,
                 8,
             );
-            self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, None, None);
-            self.emit_filter_intra(y_mode, 16, 8, None);
+            self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, rpal.as_ref(), None);
+            if rpal.is_none() {
+                self.emit_filter_intra(y_mode, 16, 8, None);
+            }
+            if let Some(p) = rpal.as_ref() {
+                self.emit_palette_map(p);
+            }
             self.code_tx_depth(px, py, 16, 8, 0);
             let sv = block_skip as u8;
             self.a_skip[bx4..bx4 + 4].fill(sv);
@@ -2184,11 +2256,10 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf) =
+            let (y_mode, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true,
-            );
+                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some());
             let idct = self.idct;
             let inv16x8 =
                 |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, false, ltxtp);
@@ -2296,7 +2367,7 @@ impl<'a> LossyTile<'a> {
             let luma_zero = self.rd.all_zero_i32(&lcf);
             let chroma_zero =
                 self.rd.all_zero_i32(&ccf[0]) && self.rd.all_zero_i32(&ccf[1]);
-            let block_skip = luma_zero && chroma_zero;
+            let block_skip = luma_zero && chroma_zero && rpal.is_none();
             // --- header: skip, delta-q (once), y_mode (DC), uv_mode (DC) ---
             let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
             self.code_skip_and_sb_tokens(block_skip, sctx);
@@ -2312,8 +2383,13 @@ impl<'a> LossyTile<'a> {
                     .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
             }
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 16, 8);
-            self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, None, None);
-            self.emit_filter_intra(y_mode, 16, 8, None);
+            self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, rpal.as_ref(), None);
+            if rpal.is_none() {
+                self.emit_filter_intra(y_mode, 16, 8, None);
+            }
+            if let Some(p) = rpal.as_ref() {
+                self.emit_palette_map(p);
+            }
             self.code_tx_depth(px, py, 16, 8, 0);
             // footprint update: skip/mode over 4 wide x 2 tall units.
             let sv = block_skip as u8;
@@ -3387,7 +3463,9 @@ impl<'a> LossyTile<'a> {
             );
         }
         // Winner-only ADST_ADST refinement. Full and Medium try it; only Fast
-        // prunes the transform-type search to DCT_DCT (libaom-style).
+        // prunes the transform-type search to DCT_DCT (libaom-style). Palette
+        // winners skip it (ADST on palette residuals measured 4:2:0 holdout
+        // +0.13% for nothing on screenshots); they take IDTX below instead.
         if rl.is_none() && best_palette16.is_none() && self.speed.try_adst() {
             let mut resid = self.sbuf_i256();
             self.rd.residual_pred(
@@ -3554,7 +3632,14 @@ impl<'a> LossyTile<'a> {
         // SSE-non-worsening guard as ADST so low-q lambda cannot trade real
         // detail for the cheap coefficients. IDTX = symbol 0 in the 5-type
         // DTT4_IDTX intra set at TX_16X16.
-        if rl.is_none() && best_palette16.is_none() && self.speed.try_adst() {
+        //
+        // Palette winners take it too (aom searches the tx type over palette
+        // residuals, and most of its palette blocks end up residual-free). Their residual is a sparse set of anti-aliasing spikes
+        // the palette missed; under DCT it rings across the flat background
+        // the palette had reproduced exactly — the grey smudges around text
+        // that made 4:2:0 screenshots look worse WITH screen-content tools
+        // (t_dark crop: 4:2:0 -5.1%, high band now beats --no-screen-content).
+        if rl.is_none() && self.speed.try_adst() {
             let mut resid = self.sbuf_i256();
             self.rd.residual_pred(
                 &mut resid[..],
@@ -3696,20 +3781,10 @@ impl<'a> LossyTile<'a> {
             best_mode = r.mode as usize;
             best_delta = r.delta as i32;
             if r.palette > 0 {
-                let p = lossy_luma_palette(
-                    &self.kmeans,
-                    &self.src[0],
-                    self.w,
-                    px,
-                    py,
-                    16,
-                    16,
-                    r.palette as usize,
-                    self.palette_smooth_t(),
-                )
+                let p = self.rederive_luma_palette(px, py, 16, 16, r.palette as usize)
                 .expect("16x16 palette replay: candidate no longer derivable");
                 debug_assert_eq!(
-                    p.colors.len() + if p.top { 8 } else { 0 },
+                    p.sel as usize,
                     r.palette as usize
                 );
                 palette_pred(&mut lpred_arr[..], 16, &p.colors, &p.packed_map, 16, 16);
@@ -3766,7 +3841,7 @@ impl<'a> LossyTile<'a> {
             delta: best_delta as i8,
             palette: best_palette16
                 .as_ref()
-                .map_or(0, |p| (p.colors.len() + if p.top { 8 } else { 0 }) as u8),
+                .map_or(0, |p| p.sel),
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             tx: if txtp16 == 6 {
                 TxSel::Split16Tx(s16_txtps)

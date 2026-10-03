@@ -378,7 +378,7 @@ impl<'a> LossyTile<'a> {
         };
         // IntraBC candidate: whole-32 exact-copy, all planes priced inside.
         let rd_ibc = if self.allow_intrabc {
-            self.rd_cost_intrabc(px, py, 32, prdo)
+            self.rd_cost_intrabc(px, py, 32, thr, prdo)
                 .unwrap_or(f32::INFINITY)
         } else {
             f32::INFINITY
@@ -1205,17 +1205,7 @@ impl<'a> LossyTile<'a> {
             best_delta = r.delta as i32;
             if r.palette > 0 {
                 let p =
-                    lossy_luma_palette(
-                        &self.kmeans,
-                        &self.src[0],
-                        self.w,
-                        px,
-                        py,
-                        32,
-                        32,
-                        r.palette as usize,
-                        self.palette_smooth_t(),
-                    )
+                    self.rederive_luma_palette(px, py, 32, 32, r.palette as usize)
                         .expect("32x32 palette replay: candidate no longer derivable");
                 palette_pred(&mut lpred[..], 32, &p.colors, &p.packed_map, 32, 32);
                 best_palette32 = Some(p);
@@ -1241,7 +1231,7 @@ impl<'a> LossyTile<'a> {
             delta: best_delta as i8,
             palette: best_palette32
                 .as_ref()
-                .map_or(0, |p| (p.colors.len() + if p.top { 8 } else { 0 }) as u8),
+                .map_or(0, |p| p.sel),
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             // `SplitDct` marks the tx_depth=1 grid of four TX_16X16
             // (coefficients packed quadrant-major); otherwise DCT_DCT.

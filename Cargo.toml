@@ -3,7 +3,7 @@ members = ["app", "cli"]
 
 [package]
 name = "maroontree"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 description = "AV1 image & AV2 video and image encoder"
 readme = "README.md"
@@ -12,7 +12,6 @@ license = "BSD-3-Clause OR Apache-2.0"
 authors = ["Radzivon Bartoshyk"]
 documentation = "https://docs.rs/maroontree"
 categories = ["multimedia::images", "compression", "encoding", "multimedia::video"]
-homepage = "https://github.com/awxkee/maroontree"
 repository = "https://github.com/awxkee/maroontree"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.94.0"

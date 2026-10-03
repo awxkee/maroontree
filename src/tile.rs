@@ -366,6 +366,15 @@ impl IntrabcIndex {
     }
 }
 
+/// libaom `is_mv_valid` for an IntraBC DV: each component strictly inside
+/// (MV_LOW, MV_UPP) = +-2^14 eighth-pels, i.e. under 2048 px. dav1d never
+/// checks it; aomdec rejects the frame ("Invalid intrabc dv"). Reachable on
+/// frames wider or taller than 2048 px when a repeat lies that far away.
+#[inline]
+pub(crate) fn intrabc_dv_in_range(px: usize, py: usize, rx: usize, ry: usize) -> bool {
+    px.abs_diff(rx) < 2048 && py.abs_diff(ry) < 2048
+}
+
 pub(crate) fn intrabc_dv_conformant(
     px: usize,
     py: usize,
@@ -420,6 +429,7 @@ fn find_exact_intrabc(
             && ref_y + size <= height
             && ref_y + size <= sby + 64
             && (ref_y + size <= sby || ref_x + size <= sbx)
+            && intrabc_dv_in_range(px, py, ref_x, ref_y)
             && intrabc_dv_conformant(px, py, ref_x, ref_y, size, width)
     };
     let make = |ref_x: usize, ref_y: usize| {

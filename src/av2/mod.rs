@@ -884,8 +884,8 @@ impl Av2Encoder {
                 enable: [false, ccso_u_result.is_some(), ccso_v_result.is_some()],
                 planes: [
                     None,
-                    ccso_u_result.as_ref().map(&to_plane),
-                    ccso_v_result.as_ref().map(&to_plane),
+                    ccso_u_result.as_ref().map(to_plane),
+                    ccso_v_result.as_ref().map(to_plane),
                 ],
             });
         }

@@ -7,11 +7,19 @@ struct LossyLumaPalette {
     packed_map: Vec<u8>,
     width: usize,
     height: usize,
-    /// Candidate family: `false` = quantile-init Lloyd, `true` = the n most
-    /// frequent values used directly (aom/SVT "dominant colors"). Encoded in
-    /// the replay sel as `colors.len() + 8*top` so the wavefront re-derives
-    /// the exact candidate.
-    top: bool,
+    /// Requested center count, +8 for the dominant-color family, BEFORE
+    /// cache snapping. Snapping can merge centers, so the final color count
+    /// cannot identify the search candidate for wavefront replay.
+    sel: u8,
+}
+
+/// Neighbor inputs to a screen palette estimate. Keep the exact colors and
+/// lengths: cache snapping changes both the shortlist and its syntax cost.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaletteEstimateContext {
+    colors: [u16; 18], // above[0..8], left[8..16], their lengths[16..18]
+    modes: [u8; 2],
+    mlam: u32,
 }
 
 fn palette_y_mode_cdfs() -> Vec<Vec<Vec<u16>>> {
@@ -893,15 +901,15 @@ fn lossy_luma_palette_from(
         w,
         h,
         centers.as_slice().to_vec(),
-        top,
+        colors + if top { 8 } else { 0 },
         smooth_t,
     ))
 }
 
 /// Raster-order index-map smoothing (see `Tuning::palette_smooth`): switch a
-/// pixel to its left or above neighbour's index when that center is no
+/// pixel to its left or above neighbor's index when that center is no
 /// further than `nearest + t` from the source value (the closer of the two
-/// qualifying neighbours wins, left on ties). Left/above are already final in
+/// qualifying neighbors wins, left on ties). Left/above are already final in
 /// raster order, so the pass is a deterministic function of (src, centers, t)
 /// and replay re-derives it exactly.
 #[allow(clippy::too_many_arguments)]
@@ -959,7 +967,7 @@ fn lossy_luma_palette_from_centers(
     w: usize,
     h: usize,
     centers: Vec<i32>,
-    top: bool,
+    sel: usize,
     smooth_t: i32,
 ) -> LossyLumaPalette {
     let n = w * h;
@@ -983,11 +991,127 @@ fn lossy_luma_palette_from_centers(
         packed_map,
         width: w,
         height: h,
-        top,
+        sel: sel as u8,
     }
 }
 
 impl<'a> LossyTile<'a> {
+    fn palette_estimate_context(
+        &self,
+        px: usize,
+        py: usize,
+        mlam: f32,
+    ) -> Option<PaletteEstimateContext> {
+        if !self.screen_frame {
+            return None;
+        }
+        let (bx4, by4) = (px / 4, py / 4);
+        let mut colors = [0u16; 18];
+        for (i, palette) in [&self.a_palette[bx4], &self.l_palette[by4]]
+            .iter()
+            .enumerate()
+        {
+            for (dst, &color) in colors[i * 8..][..8].iter_mut().zip(palette.iter()) {
+                *dst = color as u16;
+            }
+            colors[16 + i] = palette.len() as u16;
+        }
+        Some(PaletteEstimateContext {
+            colors,
+            modes: [self.a_mode[bx4], self.l_mode[by4]],
+            mlam: mlam.to_bits(),
+        })
+    }
+
+    /// Palette finalists that get full syntax/transform RD. Screen frames
+    /// (text) afford Slow twice the photo budget: their blocks pass the
+    /// histogram gate densely and the extra finalists measured -0.4..-1.4%.
+    fn palette_refine_budget(&self) -> usize {
+        let b = self.speed.palette_refine_budget();
+        if self.screen_frame && self.speed == Speed::Slow { 4 } else { b }
+    }
+
+    /// Re-derive the selected palette (`sel` = requested centers before
+    /// snapping, +8 for the dominant-color family) as the search built it:
+    /// same centers, same cache snapping (the color cache is identical at
+    /// decision and emit — it crosses the wavefront handoff), same map.
+    fn rederive_luma_palette(
+        &self,
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        sel: usize,
+    ) -> Option<LossyLumaPalette> {
+        if !self.screen_frame {
+            return lossy_luma_palette(
+                &self.kmeans,
+                &self.src[0],
+                self.w,
+                px,
+                py,
+                w,
+                h,
+                sel,
+                self.palette_smooth_t(),
+            );
+        }
+        let hist = block_color_histogram(&self.src[0], self.w, px, py, w, h)?;
+        let top = sel > 8;
+        let colors = if top { sel - 8 } else { sel };
+        let centers = if top {
+            top_palette_centers(&hist, colors)?
+        } else {
+            palette_centers(&hist, colors)?
+        };
+        let centers = self.snap_palette_to_cache(px, py, centers)?;
+        Some(lossy_luma_palette_from_centers(
+            &self.kmeans,
+            &self.src[0],
+            self.w,
+            px,
+            py,
+            w,
+            h,
+            centers.as_slice().to_vec(),
+            sel,
+            self.palette_smooth_t(),
+        ))
+    }
+
+    /// libaom `av1_optimize_palette_colors`: move every center within 4
+    /// levels of a neighbor-cache color onto that color, so it is coded as a
+    /// 1-bit cache reuse instead of a fresh delta. Collapsed duplicates are
+    /// dropped; None if fewer than two colors remain.
+    fn snap_palette_to_cache(
+        &self,
+        px: usize,
+        py: usize,
+        mut centers: FixedList<i32, 8>,
+    ) -> Option<FixedList<i32, 8>> {
+        let (bx4, by4) = (px / 4, py / 4);
+        let cache = palette_cache(&self.a_palette[bx4], &self.l_palette[by4], !py.is_multiple_of(64));
+        if cache.is_empty() {
+            return Some(centers);
+        }
+        let thr = 4i32 << (self.bd - 8);
+        for c in centers.as_mut_slice() {
+            let mut best = (i32::MAX, *c);
+            for &k in cache.iter() {
+                let d = (*c - k).abs();
+                if d < best.0 {
+                    best = (d, k);
+                }
+            }
+            if best.0 <= thr {
+                *c = best.1;
+            }
+        }
+        centers.as_mut_slice().sort_unstable();
+        centers.dedup();
+        (centers.len() >= 2).then_some(centers)
+    }
+
     /// Histogram-domain ranking of every legal palette center set -- sizes
     /// 2..=8 x {Lloyd, top-frequency} -- cheapest first. Builds NO per-pixel
     /// map, so the partition proxy can afford the same shortlist the emitter
@@ -996,6 +1120,7 @@ impl<'a> LossyTile<'a> {
         &self,
         hist: &[(i32, u32)],
         mlam: f32,
+        at: (usize, usize, usize, usize),
     ) -> FixedList<(f32, usize, FixedList<i32, 8>, bool), 14> {
         let mut ranked = FixedList::<(f32, usize, FixedList<i32, 8>, bool), 14>::new((
             f32::INFINITY,
@@ -1030,6 +1155,25 @@ impl<'a> LossyTile<'a> {
             }) else {
                 continue;
             };
+            let centers = if self.screen_frame {
+                let (px, py, _, _) = at;
+                match self.snap_palette_to_cache(px, py, centers) {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else {
+                centers
+            };
+            // Cache snapping and the two center families often converge to
+            // the same predictor. Refine each distinct screen palette once,
+            // keeping the first selector so ties remain deterministic.
+            if self.screen_frame
+                && ranked
+                    .iter()
+                    .any(|&(_, _, c, _)| c.as_slice() == centers.as_slice())
+            {
+                continue;
+            }
             // Histogram-domain model: exact palette prediction SSE plus a
             // compact entropy/header estimate, without constructing fourteen
             // per-pixel maps and running the context rate coder for all of
@@ -1053,7 +1197,16 @@ impl<'a> LossyTile<'a> {
                     -(count as f32) * dirty_log2f(p)
                 })
                 .sum::<f32>();
-            let model_bits = centers.len() as f32 * self.bd as f32 + entropy_bits * 0.5 + 8.0;
+            // Screen frames price the header exactly (cache-aware): with
+            // snapped centers most colors are 1-bit cache reuses, and the flat
+            // `n * bd` charge ranked the 7-8 color palettes text needs out of
+            // the finalists.
+            let model_bits = if self.screen_frame {
+                let (px, py, w, h) = at;
+                self.palette_header_bits_for(px, py, w, h, centers.as_slice()) + entropy_bits * 0.5
+            } else {
+                centers.len() as f32 * self.bd as f32 + entropy_bits * 0.5 + 8.0
+            };
             ranked.push((rd_cost_i64(sse, mlam, model_bits), order, centers, top));
         }
         ranked
@@ -1076,11 +1229,11 @@ impl<'a> LossyTile<'a> {
         mlam: f32,
     ) -> Vec<(LossyLumaPalette, [i32; N])> {
         debug_assert_eq!(N, w * h);
-        let ranked = self.rank_palette_centers(hist, mlam);
+        let ranked = self.rank_palette_centers(hist, mlam, (px, py, w, h));
         ranked
             .iter()
-            .take(self.speed.palette_refine_budget())
-            .map(|&(_, _, centers, top)| {
+            .take(self.palette_refine_budget())
+            .map(|&(_, order, centers, top)| {
                 let palette = lossy_luma_palette_from_centers(
                     &self.kmeans,
                     &self.src[0],
@@ -1090,7 +1243,7 @@ impl<'a> LossyTile<'a> {
                     w,
                     h,
                     centers.as_slice().to_vec(),
-                    top,
+                    order / 2 + 2 + if top { 8 } else { 0 },
                     self.palette_smooth_t(),
                 );
                 let mut pred = [0i32; N];
@@ -1154,9 +1307,13 @@ impl<'a> LossyTile<'a> {
     /// symbols, color-cache reuse flags and the color-delta header. A true
     /// component of the exact rate (the index map only ever adds bits).
     fn palette_header_bits(&self, px: usize, py: usize, p: &LossyLumaPalette) -> f32 {
+        self.palette_header_bits_for(px, py, p.width, p.height, &p.colors)
+    }
+
+    fn palette_header_bits_for(&self, px: usize, py: usize, width: usize, height: usize, colors: &[i32]) -> f32 {
         let (bx4, by4) = (px / 4, py / 4);
         let c = self.dcdf();
-        let bctx = palette_bsize_ctx(p.width, p.height);
+        let bctx = palette_bsize_ctx(width, height);
         // Cache-AWARE: a_palette/l_palette are now carried through the
         // wavefront capture's ctx handoff (packed 9xi32 planes, coder.rs), so
         // reading them here prices identically under -t1 and -tN. The color
@@ -1166,7 +1323,7 @@ impl<'a> LossyTile<'a> {
         let mctx = usize::from(!self.a_palette[bx4].is_empty())
             + usize::from(!self.l_palette[by4].is_empty());
         let mut bits = cdf_cost(&c.palette_y_mode[bctx][mctx], 1)
-            + cdf_cost(&c.palette_y_size[bctx], p.colors.len() - 2);
+            + cdf_cost(&c.palette_y_size[bctx], colors.len() - 2);
         let cache = palette_cache(
             &self.a_palette[bx4],
             &self.l_palette[by4],
@@ -1174,14 +1331,14 @@ impl<'a> LossyTile<'a> {
         );
         let mut found = 0;
         for &cv in &cache {
-            if found == p.colors.len() {
+            if found == colors.len() {
                 break;
             }
             bits += 1.0; // reuse flag, p = 1/2 bypass
-            found += usize::from(p.colors.binary_search(&cv).is_ok());
+            found += usize::from(colors.binary_search(&cv).is_ok());
         }
         let mut out = FixedList::<u32, 8>::new(0);
-        for &color in &p.colors {
+        for &color in colors {
             if cache.binary_search(&color).is_err() {
                 out.push(color as u32);
             }
@@ -1514,6 +1671,89 @@ impl<'a> LossyTile<'a> {
 #[cfg(test)]
 mod palette_generalization_tests {
     use super::*;
+
+    #[test]
+    fn screen_palette_estimates_follow_neighbor_context() {
+        let (w, h) = (32, 32);
+        let luma = (0..w * h)
+            .map(|i| [10, 14, 100, 160][(i % w / 4) % 4])
+            .collect();
+        let src = [luma, vec![128; w * h], vec![128; w * h]];
+        let mut tile = LossyTile::new(120, 8, w, h, &src, QmLevels::FLAT);
+        tile.screen_frame = true;
+        let key = (8u64 << 34) | (8u64 << 8) | 16;
+        tile.rd_cost_square(8, 8, 16, false, false, 1.0);
+        tile.l_palette[2] = vec![12, 100, 160];
+        tile.l_mode[2] = DC_PRED as u8;
+        let cached_cost = tile.rd_cost_square(8, 8, 16, false, false, 1.25);
+        let cached_pairs = tile.screen_pal_est_cache.borrow()[&key].1;
+        tile.screen_pal_est_cache.borrow_mut().clear();
+        let fresh_cost = tile.rd_cost_square(8, 8, 16, false, false, 1.25);
+        let fresh_pairs = tile.screen_pal_est_cache.borrow()[&key].1;
+        assert_eq!(cached_cost, fresh_cost);
+        assert_eq!(cached_pairs, fresh_pairs);
+    }
+
+    #[test]
+    fn snapped_palette_replay_preserves_the_selected_candidate() {
+        let (w, h) = (64, 64);
+        for bd in [8, 10, 12] {
+            let shift = bd - 8;
+            let luma: Vec<u16> = (0..w * h)
+                .map(|i| {
+                    let value = match (i * 37 + i / w * 11) % 64 {
+                        0..24 => 10,
+                        24..44 => 14,
+                        44..56 => 100,
+                        _ => 160,
+                    };
+                    value << shift
+                })
+                .collect();
+            let src = [luma, vec![128 << shift; w * h], vec![128 << shift; w * h]];
+            let mut tile = LossyTile::new(120, bd, w, h, &src, QmLevels::FLAT);
+            tile.screen_frame = true;
+            tile.l_palette[2] = vec![12 << shift];
+            for size in [8, 16, 32] {
+                let hist = block_color_histogram(&src[0], w, 8, 8, size, size).unwrap();
+                let ranked = tile.rank_palette_centers(&hist, tile.mlam(), (8, 8, size, size));
+                assert!(!ranked.is_empty());
+                assert!(
+                    ranked
+                        .iter()
+                        .any(|&(_, order, centers, _)| centers.len() < order / 2 + 2)
+                );
+                for (i, &(_, _, centers, _)) in ranked.iter().enumerate() {
+                    assert!(
+                        ranked[..i]
+                            .iter()
+                            .all(|&(_, _, previous, _)| previous.as_slice() != centers.as_slice())
+                    );
+                }
+                for &(_, order, centers, top) in ranked.iter() {
+                    let selected = lossy_luma_palette_from_centers(
+                        &tile.kmeans,
+                        &src[0],
+                        w,
+                        8,
+                        8,
+                        size,
+                        size,
+                        centers.as_slice().to_vec(),
+                        order / 2 + 2 + if top { 8 } else { 0 },
+                        tile.palette_smooth_t(),
+                    );
+                    let selector = selected.sel as usize;
+                    let replayed = tile.rederive_luma_palette(8, 8, size, size, selector);
+                    assert_eq!(
+                        replayed.as_ref(),
+                        Some(&selected),
+                        "bd={bd} size={size} selector={selector}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn histogram_kmeans_palette_basics() {
