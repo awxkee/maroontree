@@ -152,7 +152,8 @@ pub(crate) fn wiener_filter_rect(
     }
 }
 
-pub(crate) fn wiener_filter_plane(
+#[cfg(test)]
+fn wiener_filter_plane(
     dst: &mut [u16],
     src: &[u16],
     w: usize,
@@ -188,5 +189,85 @@ pub(crate) fn wiener_filter_plane(
             bd,
         );
         ytop = ybot;
+    }
+}
+
+/// Score the same filtered samples as `wiener_filter_plane`, retaining only
+/// one output stripe. Candidate search never needs the whole filtered plane.
+pub(crate) fn wiener_filter_plane_sse(
+    src: &[u16],
+    reference: &[u16],
+    w: usize,
+    h: usize,
+    hk: &WienerKernel,
+    vk: &WienerKernel,
+    bd: u8,
+) -> i64 {
+    let mut stripe = vec![0u16; w * h.min(64)];
+    let mut sse = 0i64;
+    let mut ytop = 0usize;
+    while ytop < h {
+        let stripe_h = if ytop == 0 { 56 } else { 64 };
+        let ybot = (ytop + stripe_h).min(h);
+        let rh = ybot - ytop;
+        wiener_filter_rect(
+            &mut stripe,
+            ytop,
+            src,
+            w,
+            w,
+            h,
+            0,
+            ytop,
+            w,
+            rh,
+            ytop.saturating_sub(2),
+            (ybot + 2).min(h) - 1,
+            hk,
+            vk,
+            bd,
+        );
+        for (&filtered, &original) in stripe[..w * rh].iter().zip(&reference[ytop * w..ybot * w]) {
+            let d = (filtered - original) as i64;
+            sse += d * d;
+        }
+        ytop = ybot;
+    }
+    sse
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stripe_sse_matches_full_plane_across_stripe_boundaries() {
+        let taps = [[0, 0, 1], [-1, 2, 2], [0, 1, 3], [1, -3, 5]];
+        for bd in [8u8, 10, 12] {
+            for (w, h) in [(17, 29), (37, 56), (37, 57), (32, 120), (37, 133)] {
+                let scale = 1u16 << (bd - 8);
+                let src: Vec<u16> = (0..w * h)
+                    .map(|i| (64 + ((i * 13 + i / w * 7) % 128) as u16) * scale)
+                    .collect();
+                let reference: Vec<u16> = (0..w * h).map(|i| (i % 16) as u16 * scale).collect();
+                for ht in taps {
+                    for vt in taps {
+                        let hk = WienerKernel::from_coded(ht);
+                        let vk = WienerKernel::from_coded(vt);
+                        let mut filtered = vec![0; w * h];
+                        wiener_filter_plane(&mut filtered, &src, w, h, &hk, &vk, bd);
+                        let expected = filtered.iter().zip(&reference).fold(0i64, |s, (&a, &b)| {
+                            let d = (a - b) as i64;
+                            s + d * d
+                        });
+                        assert_eq!(
+                            wiener_filter_plane_sse(&src, &reference, w, h, &hk, &vk, bd),
+                            expected,
+                            "{w}x{h} bd={bd} h={ht:?} v={vt:?}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

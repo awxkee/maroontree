@@ -201,16 +201,10 @@ pub(crate) struct Tuning {
     /// Bounding probe: 0 = price skip=false (shipped), 1 = skip=true, 2 = free.
     pub(crate) block_skip_price: u32,
     /// Lossy luma palette index-map smoothing: a pixel takes its LEFT/ABOVE
-    /// neighbour's palette index when that center is within
+    /// neighbor's palette index when that center is within
     /// `ac_q * palette_smooth / 256` (pixel units) of the nearest one. The
     /// residual absorbs the extra error; the smoother map codes far cheaper
-    /// under the neighbour-context index coder. 0 = off (nearest only).
-    /// SHIPPED 24 at 4:4:4 ONLY (2026-09-10): 444 tuning -0.07 / holdout
-    /// -0.14 (5/5 neg) / 14 new jixel crops -0.45..-0.50 (screen crops -0.7..
-    /// -1.0); 4:2:0 tuning +0.05 (x_fractal +1.12) so subsampled formats and
-    /// mono keep nearest-only (`palette_smooth_t` gates). Known loser:
-    /// x_abstract +1.14 (bytes AND SS2 worse — SSE-vs-SS2 mismatch on sharp
-    /// synthetic edges). 32 was equal on average but not all-negative; 64 lost.
+    /// under the neighbor-context index coder. 0 = off (nearest only).
     pub(crate) palette_smooth: u32,
     /// With `palette_smooth`: only pixels the nearest center does NOT hit
     /// exactly may move (protects exact palettes / exact-hit pixels).

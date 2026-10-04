@@ -907,9 +907,9 @@ fn lossy_luma_palette_from(
 }
 
 /// Raster-order index-map smoothing (see `Tuning::palette_smooth`): switch a
-/// pixel to its left or above neighbour's index when that center is no
+/// pixel to its left or above neighbor's index when that center is no
 /// further than `nearest + t` from the source value (the closer of the two
-/// qualifying neighbours wins, left on ties). Left/above are already final in
+/// qualifying neighbors wins, left on ties). Left/above are already final in
 /// raster order, so the pass is a deterministic function of (src, centers, t)
 /// and replay re-derives it exactly.
 #[allow(clippy::too_many_arguments)]

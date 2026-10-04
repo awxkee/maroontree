@@ -504,6 +504,10 @@ pub(crate) fn encode_still_lossy_422_with_cdf<T: Pixel>(
             }
         });
     }
+    // Subsampling is complete; release the full-resolution chroma scratch
+    // before the encoder allocates its tile and worker state.
+    drop(fcb_q);
+    drop(fcr_q);
     crate::dispatch::encode_lossy_422(
         base_q_idx,
         bd.bits(),
@@ -600,6 +604,10 @@ pub(crate) fn encode_still_lossy_420_with_cdf<T: Pixel>(
             }
         });
     }
+    // Subsampling is complete; release the full-resolution chroma scratch
+    // before the encoder allocates its tile and worker state.
+    drop(fcb_q);
+    drop(fcr_q);
     crate::dispatch::encode_lossy_420(
         base_q_idx,
         bd.bits(),

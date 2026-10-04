@@ -131,10 +131,11 @@ impl LossyIbcIndex {
         // `hash8` exactly.
         let p7 = (0..7).fold(1u32, |a, _| a.wrapping_mul(IBC_HP));
         let q7 = (0..7).fold(1u32, |a, _| a.wrapping_mul(IBC_HQ));
-        let mut rows = vec![0u32; h * nx];
-        for y in 0..h {
+        // Only eight horizontal rows feed the current vertical window. Keep
+        // them in a ring instead of retaining row hashes for the whole tile.
+        let mut rows = vec![0u32; 8 * nx];
+        let hash_row = |y: usize, out: &mut [u32]| {
             let line = &luma[y * w..][..w];
-            let out = &mut rows[y * nx..][..nx];
             let mut r = 0u32;
             for &v in &line[..8] {
                 r = r.wrapping_mul(IBC_HP).wrapping_add(u32::from(v) + 1);
@@ -147,6 +148,9 @@ impl LossyIbcIndex {
                     .wrapping_add(u32::from(line[x + 7]) + 1);
                 out[x] = r;
             }
+        };
+        for y in 0..8 {
+            hash_row(y, &mut rows[y * nx..][..nx]);
         }
         let ny = h - 7;
         let mut col = vec![0u32; nx];
@@ -158,9 +162,13 @@ impl LossyIbcIndex {
         let mut hashes = Vec::with_capacity((nx / step_x + 1) * (ny / step_y + 1));
         for y in 0..ny {
             if y > 0 {
-                let (old, new) = (&rows[(y - 1) * nx..][..nx], &rows[(y + 7) * nx..][..nx]);
-                for ((c, &o), &n) in col.iter_mut().zip(old).zip(new) {
-                    *c = c.wrapping_sub(o.wrapping_mul(q7)).wrapping_mul(IBC_HQ).wrapping_add(n);
+                let row = &mut rows[((y - 1) & 7) * nx..][..nx];
+                for (c, &old) in col.iter_mut().zip(row.iter()) {
+                    *c = c.wrapping_sub(old.wrapping_mul(q7)).wrapping_mul(IBC_HQ);
+                }
+                hash_row(y + 7, row);
+                for (c, &new) in col.iter_mut().zip(row.iter()) {
+                    *c = c.wrapping_add(new);
                 }
             }
             if y % step_y != 0 {
@@ -172,6 +180,8 @@ impl LossyIbcIndex {
                 offsets[(hh >> 16) as usize + 1] += 1;
             }
         }
+        drop(rows);
+        drop(col);
         for i in 1..offsets.len() {
             offsets[i] += offsets[i - 1];
         }
@@ -1634,5 +1644,30 @@ mod ibc_index_tests {
         let hits: Vec<_> = idx.candidates(&luma, w, 72, 40, 16, h).collect();
         assert!(hits.contains(&(8, 8)), "{hits:?}");
         assert!(hits.len() <= 2, "flat-free anchor must give a tiny bucket: {hits:?}");
+    }
+
+    #[test]
+    fn hash_bucket_preserves_raster_order_after_ring_wraps() {
+        let (w, h) = (37usize, 29usize);
+        let src = [vec![200u16; w * h], Vec::new(), Vec::new()];
+        for sub in [(0, 0), (1, 0), (1, 1)] {
+            let index = LossyIbcIndex::build(&src, w, h, sub);
+            let expected: Vec<u32> = (0..h - 7)
+                .step_by(1 << sub.1)
+                .flat_map(|y| {
+                    (0..w - 7)
+                        .step_by(1 << sub.0)
+                        .map(move |x| ((y as u32) << 16) | x as u32)
+                })
+                .collect();
+            let hash = LossyIbcIndex::hash8(&src[0], w, 0, 0);
+            assert_eq!(
+                index.entries,
+                expected
+                    .into_iter()
+                    .map(|origin| (hash, origin))
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 }

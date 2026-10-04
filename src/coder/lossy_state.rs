@@ -234,6 +234,16 @@ impl<'a> LossyTile<'a> {
         &self.dec_cdfs
     }
 
+    /// Entries from a completed superblock cannot be reused: reconstruction
+    /// epochs have advanced and the next superblock has different coordinates.
+    /// Retain capacity so cache storage is bounded by one superblock's search.
+    fn clear_sb_rd_caches(&self) {
+        self.chroma_rd_cache.borrow_mut().clear();
+        self.rd16_cache.borrow_mut().clear();
+        self.rect_leaf_cache.borrow_mut().clear();
+        self.split4_rd_cache.borrow_mut().clear();
+    }
+
     /// Install a different immutable decision-CDF snapshot. Every table
     /// derived lazily from `dcdf()` must be dropped here, or a worker whose
     /// FIRST cell sits past the warm-up prefix prices against the warmed
@@ -291,7 +301,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
-            ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             ibc_match_cache: Default::default(),
             src,
@@ -381,7 +391,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
-            ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             ibc_match_cache: Default::default(),
             src,
@@ -480,7 +490,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
-            ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             ibc_match_cache: Default::default(),
             src,
@@ -579,7 +589,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
-            ibc_mv: vec![None; (w / 4) * (h / 4)],
+            ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             ibc_match_cache: Default::default(),
             src,
@@ -3356,6 +3366,9 @@ impl<'a> LossyTile<'a> {
         index: Option<&'a std::sync::OnceLock<LossyIbcIndex>>,
     ) -> Self {
         self.allow_intrabc = enabled;
+        if enabled {
+            self.ibc_mv.resize((self.w / 4) * (self.h / 4), None);
+        }
         self.ibc_index = index;
         self
     }

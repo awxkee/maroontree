@@ -1367,7 +1367,7 @@ pub(crate) fn encode_8x4_luma_coeffs(
 
 /// `RTX_16X4` luma coefficient coder (PARTITION_HORZ_4 strips).
 /// Coefficient class 1 (min dim 4 -> t_dim ctx 1), `eob_bin_64`, LO_CTX_OFF_WGH
-/// neighbour offsets at stride 4. Mirrors `encode_16x8_*_coeffs`.
+/// neighbor offsets at stride 4. Mirrors `encode_16x8_*_coeffs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_16x4_luma_coeffs(
     enc: &mut OdEcEncoder,
@@ -1472,7 +1472,7 @@ pub(crate) fn encode_16x4_luma_coeffs(
 
 /// `RTX_16X4` chroma (both planes share CDF plane 1) coefficient coder (PARTITION_HORZ_4 strips).
 /// Coefficient class 1 (min dim 4 -> t_dim ctx 1), `eob_bin_64`, LO_CTX_OFF_WGH
-/// neighbour offsets at stride 4. Mirrors `encode_16x8_*_coeffs`.
+/// neighbor offsets at stride 4. Mirrors `encode_16x8_*_coeffs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_16x4_chroma_coeffs(
     enc: &mut OdEcEncoder,
@@ -1575,7 +1575,7 @@ pub(crate) fn encode_16x4_chroma_coeffs(
 
 /// `RTX_4X16` luma coefficient coder (PARTITION_VERT_4 strips).
 /// Coefficient class 1 (min dim 4 -> t_dim ctx 1), `eob_bin_64`, LO_CTX_OFF_WLH
-/// neighbour offsets at stride 16. Mirrors `encode_16x8_*_coeffs`.
+/// neighbor offsets at stride 16. Mirrors `encode_16x8_*_coeffs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_4x16_luma_coeffs(
     enc: &mut OdEcEncoder,
@@ -1680,7 +1680,7 @@ pub(crate) fn encode_4x16_luma_coeffs(
 
 /// `RTX_4X16` chroma (both planes share CDF plane 1) coefficient coder (PARTITION_VERT_4 strips).
 /// Coefficient class 1 (min dim 4 -> t_dim ctx 1), `eob_bin_64`, LO_CTX_OFF_WLH
-/// neighbour offsets at stride 16. Mirrors `encode_16x8_*_coeffs`.
+/// neighbor offsets at stride 16. Mirrors `encode_16x8_*_coeffs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_4x16_chroma_coeffs(
     enc: &mut OdEcEncoder,
