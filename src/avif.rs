@@ -88,7 +88,12 @@ pub enum ChromaFormat {
 /// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
-    /// Highest-effort rate-distortion search.
+    /// [`Speed::Slow`] with a slightly wider search: one more luma mode
+    /// finalist, one more palette and non-square partition finalist, filter
+    /// intra candidates, and looser SPLIT breakouts. Every tuned Slow law
+    /// (biases, seams, gates) applies unchanged.
+    ExtraSlow,
+    /// Highest-effort rate-distortion search among the tuned tiers.
     #[default]
     Slow,
     /// Balanced: RDOQ is run once on the chosen mode only
@@ -98,11 +103,16 @@ pub enum Speed {
 }
 
 impl Speed {
+    /// Slow or ExtraSlow: every tuned Slow-tier law and gate applies.
+    pub(crate) fn at_least_slow(self) -> bool {
+        matches!(self, Speed::Slow | Speed::ExtraSlow)
+    }
+
     /// Slow trellis-refines the compact model-ranked beam. Medium/Fast refine
     /// only the selected winner. (AV2 paths; the AV1 coder uses
     /// [`Self::per_candidate_rdoq_av1`].)
     pub(crate) fn per_candidate_rdoq(self) -> bool {
-        matches!(self, Speed::Slow)
+        self.at_least_slow()
     }
 
     /// AV1-coder RDOQ staging. Split from [`Self::per_candidate_rdoq`] so the
@@ -116,7 +126,7 @@ impl Speed {
     /// exact-ctx RDOQ at Slow EARNS its time; winner-only IS the Medium
     /// tier, and the delta is real quality, not fat.
     pub(crate) fn per_candidate_rdoq_av1(self) -> bool {
-        matches!(self, Speed::Slow)
+        self.at_least_slow()
     }
 
     /// Whether the winning mode is refined with an ADST_ADST transform-type
@@ -139,7 +149,7 @@ impl Speed {
             return false;
         }
         match self {
-            Speed::Slow => true,
+            Speed::ExtraSlow | Speed::Slow => true,
             Speed::Medium => dim <= 16 || qidx >= 112,
             Speed::Fast => false,
         }
@@ -161,6 +171,13 @@ impl Speed {
                     3
                 }
             }
+            Speed::ExtraSlow => {
+                if full_res {
+                    6
+                } else {
+                    4
+                }
+            }
         }
     }
 
@@ -169,7 +186,7 @@ impl Speed {
         match self {
             Speed::Fast => false,
             Speed::Medium => crate::tuning::get().palette_medium,
-            Speed::Slow => true,
+            Speed::ExtraSlow | Speed::Slow => true,
         }
     }
 
@@ -178,6 +195,7 @@ impl Speed {
             Speed::Fast => 0,
             Speed::Medium => crate::tuning::get().palette_budget_medium as usize,
             Speed::Slow => 2,
+            Speed::ExtraSlow => 3,
         }
     }
 
@@ -187,7 +205,7 @@ impl Speed {
         match self {
             Speed::Fast => false,
             Speed::Medium => crate::tuning::get().full_part_rdo_medium,
-            Speed::Slow => true,
+            Speed::ExtraSlow | Speed::Slow => true,
         }
     }
 
@@ -197,13 +215,14 @@ impl Speed {
             Speed::Fast => t.part_budget_fast,
             Speed::Medium => t.part_budget_medium,
             Speed::Slow => t.part_budget_slow,
+            Speed::ExtraSlow => t.part_budget_slow + 1,
         }) as usize
     }
 
     pub(crate) fn filter_intra_refine_budget(self) -> usize {
         match self {
-            Speed::Slow => 0,
-            Speed::Medium | Speed::Fast => 0,
+            Speed::ExtraSlow => 2,
+            Speed::Slow | Speed::Medium | Speed::Fast => 0,
         }
     }
 
@@ -214,14 +233,14 @@ impl Speed {
         match self {
             Speed::Fast => false,
             Speed::Medium => crate::tuning::get().full_chroma_rdo_medium,
-            Speed::Slow => true,
+            Speed::ExtraSlow | Speed::Slow => true,
         }
     }
 
     /// Whether diagonal chroma modes (D45..D203) are searched. Medium retains
     /// the nominal V/H directionals; Slow adds the diagonal refinement beam.
     pub(crate) fn chroma_angle_directional(self) -> bool {
-        matches!(self, Speed::Slow)
+        self.at_least_slow()
     }
 
     pub(crate) fn try_directional(&self) -> bool {

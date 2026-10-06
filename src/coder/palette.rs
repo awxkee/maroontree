@@ -1028,7 +1028,11 @@ impl<'a> LossyTile<'a> {
     /// histogram gate densely and the extra finalists measured -0.4..-1.4%.
     fn palette_refine_budget(&self) -> usize {
         let b = self.speed.palette_refine_budget();
-        if self.screen_frame && self.speed == Speed::Slow { 4 } else { b }
+        match self.speed {
+            Speed::ExtraSlow if self.screen_frame => 5,
+            Speed::Slow if self.screen_frame => 4,
+            _ => b,
+        }
     }
 
     /// Re-derive the selected palette (`sel` = requested centers before

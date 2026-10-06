@@ -42,6 +42,121 @@ type AllZeroI32Fn = fn(&[i32]) -> bool;
 /// `(sum, sum of squares)` of `src - pred` over a `w`x`h` block.
 type ResidualMomentsFn = fn(&[u16], usize, &[i32], usize, usize, usize) -> (i64, i64);
 
+/// Largest block any distortion kernel sees (64x64).
+const MAX_BLOCK_PIXELS: usize = 64 * 64;
+
+/// Read-only strided view of one `w`x`h` block of a source plane — no copy.
+///
+/// The encoder codes frames on the 8-aligned AV1 block grid, so blocks on the
+/// right/bottom frame edge cover padding columns/rows the decoder crops away.
+/// `vis_w`x`vis_h` is the part that is actually displayed; every distortion
+/// measured through a `SrcBlock` covers only that part, so RD decisions never
+/// trade visible error for error on pixels nobody sees. Interior blocks have
+/// `vis == (w, h)`.
+#[derive(Clone, Copy)]
+pub(crate) struct SrcBlock<'a> {
+    /// Plane samples starting at the block origin.
+    data: &'a [u16],
+    stride: usize,
+    w: usize,
+    h: usize,
+    vis_w: usize,
+    vis_h: usize,
+}
+
+impl<'a> SrcBlock<'a> {
+    /// The `w`x`h` block at `(x, y)` of `plane` (row pitch `stride`), whose
+    /// displayed region is `plane_vis_w`x`plane_vis_h` (plane coordinates).
+    #[inline]
+    pub(crate) fn new(
+        plane: &'a [u16],
+        stride: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        plane_vis_w: usize,
+        plane_vis_h: usize,
+    ) -> Self {
+        debug_assert!(w != 0 && h != 0 && w * h <= MAX_BLOCK_PIXELS);
+        // A row running past `stride` would silently wrap into the next row;
+        // the slice below already bounds-checks the plane itself.
+        debug_assert!(
+            x + w <= stride,
+            "SrcBlock {w}x{h} at x={x} exceeds stride {stride}"
+        );
+        let start = y * stride + x;
+        Self {
+            data: &plane[start..start + (h - 1) * stride + w],
+            stride,
+            w,
+            h,
+            vis_w: plane_vis_w.saturating_sub(x).min(w),
+            vis_h: plane_vis_h.saturating_sub(y).min(h),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn w(&self) -> usize {
+        self.w
+    }
+
+    #[inline]
+    pub(crate) fn h(&self) -> usize {
+        self.h
+    }
+
+    /// Displayed `(columns, rows)` of this block.
+    #[inline]
+    pub(crate) fn vis(&self) -> (usize, usize) {
+        (self.vis_w, self.vis_h)
+    }
+
+    /// Whether part of the block lies outside the displayed frame.
+    #[inline]
+    pub(crate) fn is_clipped(&self) -> bool {
+        self.vis_w < self.w || self.vis_h < self.h
+    }
+
+    /// Row pitch of [`Self::data`].
+    #[inline]
+    pub(crate) fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Samples from the block origin, `stride`-pitched (rows are `w` long).
+    #[inline]
+    pub(crate) fn data(&self) -> &'a [u16] {
+        self.data
+    }
+
+    /// Row `y` of the block (all `w` samples, visible or not).
+    #[inline]
+    pub(crate) fn row(&self, y: usize) -> &'a [u16] {
+        assert!(y < self.h);
+        &self.data[y * self.stride..][..self.w]
+    }
+
+    /// Pack the block `w`-pitched into `out`, replacing every invisible sample
+    /// with `fill(x, y)` so it contributes nothing to a difference against
+    /// that value.
+    fn masked_into(&self, out: &mut [u16], fill: impl Fn(usize, usize) -> i32) {
+        for y in 0..self.h {
+            let dst = &mut out[y * self.w..][..self.w];
+            if y < self.vis_h {
+                dst[..self.vis_w].copy_from_slice(&self.row(y)[..self.vis_w]);
+                for (x, d) in dst.iter_mut().enumerate().skip(self.vis_w) {
+                    *d = fill(x, y) as u16;
+                }
+            } else {
+                for (x, d) in dst.iter_mut().enumerate() {
+                    *d = fill(x, y) as u16;
+                }
+            }
+        }
+    }
+}
+
 /// Pre-resolved low-level compute kernels used by the AV1 encoder state
 /// machines. Those state machines decide what to evaluate; this table owns the
 /// pixel/coefficient loops that perform the evaluation.
@@ -137,6 +252,19 @@ impl RdDispatch {
         (self.residual_pred)(&mut dst[..w * h], &pred[..w * h], src, stride, px, py, w, h);
     }
 
+    /// `src - pred` over the WHOLE `w`x`h` block (transform input: padding
+    /// included — only distortion is clipped to the visible region).
+    #[inline]
+    pub(crate) fn residual_pred_blk(&self, dst: &mut [i32], pred: &[i32], src: SrcBlock<'_>) {
+        self.residual_pred(dst, pred, src.data, src.stride, 0, 0, src.w, src.h);
+    }
+
+    /// `src - dc` over the WHOLE `w`x`h` block (transform input).
+    #[inline]
+    pub(crate) fn residual_dc_blk(&self, dst: &mut [i32], src: SrcBlock<'_>, dc: i32) {
+        self.residual_dc(dst, src.data, src.stride, 0, 0, src.w, src.h, dc);
+    }
+
     #[inline]
     pub(crate) fn residual_dc(
         &self,
@@ -203,8 +331,30 @@ impl RdDispatch {
         }
     }
 
+    /// SSE of `clamp(pred + resid)` against the VISIBLE part of `src`.
+    ///
+    /// `pred`/`resid` are packed `src.w()`-wide. Fully visible and row-clipped
+    /// blocks run the SIMD kernel; a column-clipped block (right frame edge
+    /// only) takes the strided scalar path.
     #[inline]
-    pub(crate) fn sse_recon(
+    pub(crate) fn sse_recon(&self, pred: &[i32], resid: &[i32], src: SrcBlock<'_>, bd: u8) -> i64 {
+        let (w, h) = (src.w, src.h);
+        debug_assert!(pred.len() >= w * h);
+        debug_assert!(resid.len() >= w * h);
+        let (vw, vh) = (src.vis_w, src.vis_h);
+        if vw == 0 || vh == 0 {
+            return 0;
+        }
+        let maxv = (1i32 << bd) - 1;
+        if vw == w {
+            self.sse_recon_raw(pred, resid, src.data, src.stride, 0, 0, w, vh, maxv)
+        } else {
+            sse_recon_strided_scalar(pred, resid, w, src.data, src.stride, vw, vh, maxv)
+        }
+    }
+
+    #[inline]
+    fn sse_recon_raw(
         &self,
         pred: &[i32],
         resid: &[i32],
@@ -214,7 +364,7 @@ impl RdDispatch {
         py: usize,
         w: usize,
         h: usize,
-        bd: u8,
+        maxv: i32,
     ) -> i64 {
         debug_assert!(pred.len() >= w * h);
         debug_assert!(resid.len() >= w * h);
@@ -229,12 +379,32 @@ impl RdDispatch {
             py,
             w,
             h,
-            (1i32 << bd) - 1,
+            maxv,
+        )
+    }
+
+    /// SSE of the VISIBLE part of `src` against the same-sized rectangle of
+    /// `reference` at `(ref_x, ref_y)`.
+    #[inline]
+    pub(crate) fn sse_u16(
+        &self,
+        src: SrcBlock<'_>,
+        reference: &[u16],
+        ref_stride: usize,
+        ref_x: usize,
+        ref_y: usize,
+    ) -> i64 {
+        let (vw, vh) = (src.vis_w, src.vis_h);
+        if vw == 0 || vh == 0 {
+            return 0;
+        }
+        self.sse_u16_raw(
+            src.data, src.stride, 0, 0, reference, ref_stride, ref_x, ref_y, vw, vh,
         )
     }
 
     #[inline]
-    pub(crate) fn sse_u16(
+    fn sse_u16_raw(
         &self,
         src: &[u16],
         src_stride: usize,
@@ -256,8 +426,27 @@ impl RdDispatch {
         )
     }
 
+    /// SAD + SATD/4 ranking proxy of `src - pred` over the VISIBLE part of
+    /// `src`. Hadamard tiles cannot be cut, so an edge block is scored on a
+    /// stack copy whose invisible pixels equal the prediction (zero residual).
     #[inline]
     pub(crate) fn satd_sad_proxy(
+        &self,
+        src: SrcBlock<'_>,
+        pred: &[i32],
+        pred_stride: usize,
+    ) -> u64 {
+        let (w, h) = (src.w, src.h);
+        if !src.is_clipped() {
+            return self.satd_sad_proxy_raw(src.data, src.stride, pred, pred_stride, w, h);
+        }
+        let mut masked = [0u16; MAX_BLOCK_PIXELS];
+        src.masked_into(&mut masked, |x, y| pred[y * pred_stride + x]);
+        self.satd_sad_proxy_raw(&masked, w, pred, pred_stride, w, h)
+    }
+
+    #[inline]
+    fn satd_sad_proxy_raw(
         &self,
         src: &[u16],
         src_stride: usize,
@@ -273,12 +462,33 @@ impl RdDispatch {
         (self.satd_sad)(src, src_stride, pred, pred_stride, w, h)
     }
 
-    /// First two moments of the prediction residual: `(S1, S2)` with
-    /// `S1 = sum(src - pred)`, `S2 = sum((src - pred)^2)`. The centred energy
-    /// `S2 - S1^2/N` is what remains after one DC coefficient corrects the
-    /// mean offset (mode-beam sparse slot).
+    /// First two moments of the prediction residual over the VISIBLE part of
+    /// `src`, plus that pixel count: `(S1, S2, n)` with `S1 = sum(src - pred)`,
+    /// `S2 = sum((src - pred)^2)`. The centred energy `S2 - S1^2/n` is what
+    /// remains after one DC coefficient corrects the mean offset (mode-beam
+    /// sparse slot).
     #[inline]
     pub(crate) fn residual_moments(
+        &self,
+        src: SrcBlock<'_>,
+        pred: &[i32],
+        pred_stride: usize,
+    ) -> (i64, i64, i64) {
+        let (vw, vh) = (src.vis_w, src.vis_h);
+        let n = (vw * vh) as i64;
+        if n == 0 {
+            return (0, 0, 0);
+        }
+        let (s1, s2) = if vw == src.w {
+            self.residual_moments_raw(src.data, src.stride, pred, pred_stride, vw, vh)
+        } else {
+            residual_moments_scalar(src.data, src.stride, pred, pred_stride, vw, vh)
+        };
+        (s1, s2, n)
+    }
+
+    #[inline]
+    fn residual_moments_raw(
         &self,
         src: &[u16],
         src_stride: usize,
@@ -292,8 +502,35 @@ impl RdDispatch {
         (self.residual_moments)(src, src_stride, pred, pred_stride, w, h)
     }
 
+    /// Partition-pricing SATD of `src - clamp(pred|dc + residual)` over the
+    /// VISIBLE part of `src` (edge blocks: invisible pixels are set to the
+    /// reconstruction, as in [`Self::satd_sad_proxy`]).
     #[inline]
     pub(crate) fn luma_satd(
+        &self,
+        src: SrcBlock<'_>,
+        bd: u8,
+        pred: &[i32],
+        dc: i32,
+        residual: &[i32],
+    ) -> u64 {
+        let (w, h) = (src.w, src.h);
+        if !src.is_clipped() {
+            return self.luma_satd_raw(src.data, src.stride, 0, 0, w, h, bd, pred, dc, residual);
+        }
+        let maxv = (1i32 << bd) - 1;
+        let mut masked = [0u16; MAX_BLOCK_PIXELS];
+        src.masked_into(&mut masked, |x, y| {
+            let i = y * w + x;
+            let p = if pred.is_empty() { dc } else { pred[i] };
+            let r = if residual.is_empty() { 0 } else { residual[i] };
+            (p + r).clamp(0, maxv)
+        });
+        self.luma_satd_raw(&masked, w, 0, 0, w, h, bd, pred, dc, residual)
+    }
+
+    #[inline]
+    fn luma_satd_raw(
         &self,
         src: &[u16],
         stride: usize,
@@ -313,8 +550,35 @@ impl RdDispatch {
         (self.luma_satd)(src, stride, px, py, w, h, (1 << bd) - 1, pred, dc, residual)
     }
 
+    /// SSE of `clamp(pred|dc + residual)` against the VISIBLE part of `src`
+    /// (`pred`/`residual` packed `src.w()`-wide; either may be empty).
     #[inline]
     pub(crate) fn chroma_sse(
+        &self,
+        src: SrcBlock<'_>,
+        bd: u8,
+        pred: &[i32],
+        dc: i32,
+        residual: &[i32],
+    ) -> f32 {
+        let (w, h) = (src.w, src.h);
+        debug_assert!(pred.is_empty() || pred.len() >= w * h);
+        debug_assert!(residual.is_empty() || residual.len() >= w * h);
+        let (vw, vh) = (src.vis_w, src.vis_h);
+        if vw == 0 || vh == 0 {
+            return 0.0;
+        }
+        let maxv = (1i32 << bd) - 1;
+        let sse = if vw == w {
+            self.chroma_sse_raw(src.data, src.stride, 0, 0, w, vh, maxv, pred, dc, residual)
+        } else {
+            chroma_sse_strided_scalar(src.data, src.stride, w, vw, vh, maxv, pred, dc, residual)
+        };
+        sse as f32
+    }
+
+    #[inline]
+    fn chroma_sse_raw(
         &self,
         src: &[u16],
         stride: usize,
@@ -322,16 +586,14 @@ impl RdDispatch {
         py: usize,
         w: usize,
         h: usize,
-        bd: u8,
+        maxv: i32,
         pred: &[i32],
         dc: i32,
         residual: &[i32],
-    ) -> f32 {
-        debug_assert!(pred.is_empty() || pred.len() >= w * h);
-        debug_assert!(residual.is_empty() || residual.len() >= w * h);
+    ) -> i64 {
         debug_assert!(px + w <= stride);
         debug_assert!(h == 0 || (py + h - 1) * stride + px + w <= src.len());
-        (self.chroma_sse)(src, stride, px, py, w, h, (1 << bd) - 1, pred, dc, residual) as f32
+        (self.chroma_sse)(src, stride, px, py, w, h, maxv, pred, dc, residual)
     }
 
     #[inline]
@@ -353,27 +615,6 @@ impl RdDispatch {
     #[inline]
     pub(crate) fn all_zero_i32(&self, values: &[i32]) -> bool {
         (self.all_zero_i32)(values)
-    }
-
-    /// Copy a rectangular image block into a packed scratch buffer. Row
-    /// traversal lives here so callers only describe the block they need.
-    #[inline]
-    pub(crate) fn copy_block_u16(
-        &self,
-        dst: &mut [u16],
-        src: &[u16],
-        stride: usize,
-        px: usize,
-        py: usize,
-        w: usize,
-        h: usize,
-    ) {
-        debug_assert!(dst.len() >= w * h);
-        debug_assert!(px + w <= stride);
-        debug_assert!(h == 0 || (py + h - 1) * stride + px + w <= src.len());
-        for (row, dst) in dst[..w * h].chunks_exact_mut(w).enumerate() {
-            dst.copy_from_slice(&src[(py + row) * stride + px..][..w]);
-        }
     }
 
     /// Preserve a visible residual DC component after trellis quantization.
@@ -869,6 +1110,58 @@ pub(crate) fn sse_recon_scalar(
     sse
 }
 
+/// [`sse_recon_scalar`] over a `w`x`h` sub-rectangle of `pstride`-pitched
+/// `pred`/`resid` (column-clipped edge blocks).
+fn sse_recon_strided_scalar(
+    pred: &[i32],
+    resid: &[i32],
+    pstride: usize,
+    src: &[u16],
+    stride: usize,
+    w: usize,
+    h: usize,
+    maxv: i32,
+) -> i64 {
+    let mut sse = 0i64;
+    for y in 0..h {
+        let srow = &src[y * stride..][..w];
+        let prow = &pred[y * pstride..][..w];
+        let rrow = &resid[y * pstride..][..w];
+        for ((&s, &p), &e) in srow.iter().zip(prow).zip(rrow) {
+            let d = (s as i32 - (p + e).clamp(0, maxv)) as i64;
+            sse += d * d;
+        }
+    }
+    sse
+}
+
+/// [`chroma_sse_scalar`] over a `w`x`h` sub-rectangle of `pstride`-pitched
+/// `pred`/`residual` (column-clipped edge blocks).
+fn chroma_sse_strided_scalar(
+    src: &[u16],
+    stride: usize,
+    pstride: usize,
+    w: usize,
+    h: usize,
+    max_value: i32,
+    pred: &[i32],
+    dc: i32,
+    residual: &[i32],
+) -> i64 {
+    let mut sse = 0i64;
+    for y in 0..h {
+        let src_row = &src[y * stride..][..w];
+        for (x, &source) in src_row.iter().enumerate() {
+            let i = y * pstride + x;
+            let prediction = if pred.is_empty() { dc } else { pred[i] };
+            let reconstruction = prediction + if residual.is_empty() { 0 } else { residual[i] };
+            let delta = (i32::from(source) - reconstruction.clamp(0, max_value)) as i64;
+            sse += delta * delta;
+        }
+    }
+    sse
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chroma_sse_scalar(
     src: &[u16],
@@ -965,7 +1258,7 @@ mod satd_tests {
             (32, 32),
             (4, 16),
         ] {
-            let a = rd.residual_moments(
+            let a = rd.residual_moments_raw(
                 &src[stride * 2 + 3..],
                 stride,
                 &pred[stride * 2 + 3..],
@@ -1030,7 +1323,7 @@ mod satd_tests {
             for &bd in &[8u8, 10, 12] {
                 let max = (1 << bd) - 1;
                 assert_eq!(
-                    dispatch.sse_recon(&pred, &resid, &src, stride, px, py, w, h, bd),
+                    dispatch.sse_recon_raw(&pred, &resid, &src, stride, px, py, w, h, max),
                     sse_recon_scalar(&pred, &resid, &src, stride, px, py, w, h, max),
                     "reconstruction SSE {w}x{h} bd={bd}"
                 );
@@ -1095,7 +1388,7 @@ mod satd_tests {
                 );
             }
             assert_eq!(
-                dispatch.sse_u16(&src, stride, px, py, &reference, stride, px, py, w, h,),
+                dispatch.sse_u16_raw(&src, stride, px, py, &reference, stride, px, py, w, h,),
                 sse_u16_scalar(&src, stride, px, py, &reference, stride, px, py, w, h,),
                 "u16 SSE {w}x{h}"
             );
@@ -1144,7 +1437,7 @@ mod satd_tests {
                         &src, stride, px, py, w, h, max_value, pred, dc, residual,
                     );
                     let got =
-                        dispatch.luma_satd(&src, stride, px, py, w, h, bd, pred, dc, residual);
+                        dispatch.luma_satd_raw(&src, stride, px, py, w, h, bd, pred, dc, residual);
                     assert_eq!(got, want, "{variant} {w}x{h} bd={bd}");
                 }
             }
@@ -1191,9 +1484,9 @@ mod satd_tests {
                     let want = chroma_sse_scalar(
                         &src, stride, px, py, w, h, max_value, pred, dc, residual,
                     );
-                    let got =
-                        dispatch.chroma_sse(&src, stride, px, py, w, h, bd, pred, dc, residual);
-                    assert_eq!(got, want as f32, "{variant} {w}x{h} bd={bd}");
+                    let got = dispatch
+                        .chroma_sse_raw(&src, stride, px, py, w, h, max_value, pred, dc, residual);
+                    assert_eq!(got, want, "{variant} {w}x{h} bd={bd}");
                 }
             }
         }
@@ -1254,16 +1547,6 @@ mod satd_tests {
             }
         }
 
-        let image: Vec<u16> = (0..19 * 23).map(|_| (next() % 4096) as u16).collect();
-        let mut packed = [0u16; 77];
-        dispatch.copy_block_u16(&mut packed, &image, 23, 4, 3, 11, 7);
-        for row in 0..7 {
-            assert_eq!(
-                &packed[row * 11..][..11],
-                &image[(3 + row) * 23 + 4..][..11]
-            );
-        }
-
         for &(stride, len) in &[(1usize, 0usize), (1, 17), (2, 13), (5, 9), (17, 11)] {
             let values: Vec<u16> = (0..len.saturating_sub(1) * stride + 1)
                 .map(|_| (next() % 4096) as u16)
@@ -1309,8 +1592,136 @@ mod satd_tests {
                     .map(|_| (next() % 4096) as i32)
                     .collect();
                 let want = satd_sad_proxy_scalar(&src, src_stride, &pred, pred_stride, w, h);
-                let got = dispatch.satd_sad_proxy(&src, src_stride, &pred, pred_stride, w, h);
+                let got = dispatch.satd_sad_proxy_raw(&src, src_stride, &pred, pred_stride, w, h);
                 assert_eq!(got, want, "{w}x{h} strides {src_stride}/{pred_stride}");
+            }
+        }
+    }
+
+    /// Plane of `pw`x`ph` whose displayed region is `vw`x`vh`; samples outside
+    /// it are `fill`, so two planes differing only in `fill` differ only in
+    /// pixels a decoder crops away.
+    fn edge_plane(pw: usize, ph: usize, vw: usize, vh: usize, fill: u16, seed: u32) -> Vec<u16> {
+        let mut state = seed;
+        (0..pw * ph)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let (x, y) = (i % pw, i / pw);
+                if x < vw && y < vh {
+                    ((state >> 8) % 1024) as u16
+                } else {
+                    fill
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn src_block_clips_to_displayed_region() {
+        let plane = vec![0u16; 40 * 24];
+        let b = SrcBlock::new(&plane, 40, 32, 16, 8, 8, 37, 21);
+        assert_eq!((b.w(), b.h()), (8, 8));
+        assert_eq!(b.vis(), (5, 5));
+        assert!(b.is_clipped());
+        let interior = SrcBlock::new(&plane, 40, 8, 8, 8, 8, 37, 21);
+        assert_eq!(interior.vis(), (8, 8));
+        assert!(!interior.is_clipped());
+        let rows_only = SrcBlock::new(&plane, 40, 0, 16, 16, 8, 40, 21);
+        assert_eq!(rows_only.vis(), (16, 5));
+    }
+
+    #[test]
+    fn clipped_distortion_ignores_invisible_pixels() {
+        let dispatch = RdDispatch::selected();
+        let intra = crate::intrapred::IntraPredDispatch::selected();
+        let (pw, ph) = (72usize, 40usize);
+        // (block x, y, w, h, displayed vw, vh): interior, row-clipped,
+        // column-clipped, both.
+        for &(x, y, w, h, vw, vh) in &[
+            (8usize, 8usize, 16usize, 16usize, 72usize, 40usize),
+            (0, 32, 16, 8, 72, 35),
+            (64, 0, 8, 16, 67, 40),
+            (56, 24, 16, 16, 61, 37),
+            (64, 32, 8, 8, 65, 33),
+        ] {
+            let a = edge_plane(pw, ph, vw, vh, 0, 7);
+            let b = edge_plane(pw, ph, vw, vh, 1023, 7);
+            let (ba, bb) = (
+                SrcBlock::new(&a, pw, x, y, w, h, vw, vh),
+                SrcBlock::new(&b, pw, x, y, w, h, vw, vh),
+            );
+            let n = w * h;
+            let pred: Vec<i32> = (0..n as i32).map(|i| (i * 37) % 900 + 40).collect();
+            let resid: Vec<i32> = (0..n as i32).map(|i| (i * 13) % 61 - 30).collect();
+            let (cvw, cvh) = ba.vis();
+
+            let want: i64 = (0..cvh)
+                .flat_map(|ry| (0..cvw).map(move |rx| (rx, ry)))
+                .map(|(rx, ry)| {
+                    let i = ry * w + rx;
+                    let r = (pred[i] + resid[i]).clamp(0, 1023);
+                    let d = i64::from(a[(y + ry) * pw + x + rx]) - i64::from(r);
+                    d * d
+                })
+                .sum();
+            let tag = format!("{w}x{h} at ({x},{y}) vis {cvw}x{cvh}");
+            assert_eq!(
+                dispatch.sse_recon(&pred, &resid, ba, 10),
+                want,
+                "sse_recon {tag}"
+            );
+            assert_eq!(
+                dispatch.sse_recon(&pred, &resid, bb, 10),
+                want,
+                "sse_recon {tag}"
+            );
+            assert_eq!(
+                dispatch.chroma_sse(ba, 10, &pred, 0, &resid),
+                want as f32,
+                "{tag}"
+            );
+            assert_eq!(
+                dispatch.chroma_sse(bb, 10, &pred, 0, &resid),
+                want as f32,
+                "{tag}"
+            );
+            assert_eq!(
+                dispatch.satd_sad_proxy(ba, &pred, w),
+                dispatch.satd_sad_proxy(bb, &pred, w),
+                "satd_sad_proxy {tag}"
+            );
+            assert_eq!(
+                dispatch.luma_satd(ba, 10, &pred, 0, &resid),
+                dispatch.luma_satd(bb, 10, &pred, 0, &resid),
+                "luma_satd {tag}"
+            );
+            assert_eq!(
+                dispatch.residual_moments(ba, &pred, w),
+                dispatch.residual_moments(bb, &pred, w),
+                "residual_moments {tag}"
+            );
+            assert_eq!(
+                dispatch.residual_moments(ba, &pred, w).2,
+                (cvw * cvh) as i64
+            );
+            let recon = edge_plane(pw, ph, pw, ph, 0, 99);
+            assert_eq!(
+                dispatch.sse_u16(ba, &recon, pw, x, y),
+                dispatch.sse_u16(bb, &recon, pw, x, y),
+                "sse_u16 {tag}"
+            );
+            let ac: Vec<i32> = (0..n as i32).map(|i| (i * 29) % 401 - 200).collect();
+            assert_eq!(
+                intra.cfl_best_alpha(&ac, ba, 512, 10),
+                intra.cfl_best_alpha(&ac, bb, 512, 10),
+                "cfl_best_alpha {tag}"
+            );
+            if !ba.is_clipped() {
+                // Interior: identical to the unclipped raw kernels.
+                assert_eq!(
+                    dispatch.satd_sad_proxy(ba, &pred, w),
+                    dispatch.satd_sad_proxy_raw(&a[y * pw + x..], pw, &pred, w, w, h)
+                );
             }
         }
     }

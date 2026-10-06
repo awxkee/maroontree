@@ -1075,39 +1075,91 @@ pub(crate) fn cfl_pred_avx2(dst: &mut [i32], ac: &[i32], dc: i32, alpha: i32, bd
     }
 }
 
+/// Strided [`crate::intrapred::cfl_best_alpha`] over a `w`x`h` region:
+/// `ac` rows are `ac_stride`-pitched, `src` rows `src_stride`-pitched.
 #[target_feature(enable = "avx2")]
-pub(crate) fn cfl_best_alpha_u16_avx2(ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-    debug_assert!(ac.len() >= n);
-    debug_assert!(src.len() >= n);
+pub(crate) fn cfl_best_alpha_u16_avx2(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    debug_assert!(h == 0 || ac.len() >= (h - 1) * ac_stride + w);
+    debug_assert!(h == 0 || src.len() >= (h - 1) * src_stride + w);
     debug_assert!((8..=12).contains(&bd));
     let max = (1 << bd) - 1;
     debug_assert!((0..=max).contains(&dc));
-    debug_assert!(ac[..n].iter().all(|&value| i16::try_from(value).is_ok()));
-    debug_assert!(src[..n].iter().all(|&value| i32::from(value) <= max));
 
-    let (ac8, ac_tail) = ac[..n].as_chunks::<8>();
-    let (src8, src_tail) = src[..n].as_chunks::<8>();
+    // Visit the region as 8-lane groups `(ac as i16x8, src u16x8)` plus a
+    // scalar remainder `(ac, src)`. A 4-wide region (4:2:0/4:2:2 chroma) packs
+    // two rows per group so it stays vectorized when read in place.
+    macro_rules! for_each_group {
+        (|$acv:ident, $sv:ident| $body:block, |$a:ident, $s:ident| $tail:block) => {
+            if w == 4 && h.is_multiple_of(2) {
+                for y in (0..h).step_by(2) {
+                    let (a0, s0) = (y * ac_stride, y * src_stride);
+                    let lo = ac[a0..].first_chunk::<4>().unwrap();
+                    let hi = ac[a0 + ac_stride..].first_chunk::<4>().unwrap();
+                    let r0 = src[s0..].first_chunk::<4>().unwrap();
+                    let r1 = src[s0 + src_stride..].first_chunk::<4>().unwrap();
+                    let ($acv, $sv) = unsafe {
+                        (
+                            _mm_packs_epi32(
+                                _mm_loadu_si128(lo.as_ptr().cast::<__m128i>()),
+                                _mm_loadu_si128(hi.as_ptr().cast::<__m128i>()),
+                            ),
+                            _mm_unpacklo_epi64(
+                                _mm_loadl_epi64(r0.as_ptr().cast::<__m128i>()),
+                                _mm_loadl_epi64(r1.as_ptr().cast::<__m128i>()),
+                            ),
+                        )
+                    };
+                    $body
+                }
+            } else {
+                for y in 0..h {
+                    let (ac8, ac_tail) = ac[y * ac_stride..][..w].as_chunks::<8>();
+                    let (src8, src_tail) = src[y * src_stride..][..w].as_chunks::<8>();
+                    for (a8, s8) in ac8.iter().zip(src8) {
+                        let $acv = load_i32x8_as_i16(a8);
+                        let $sv = unsafe { _mm_loadu_si128(s8.as_ptr().cast::<__m128i>()) };
+                        $body
+                    }
+                    for (&$a, &$s) in ac_tail.iter().zip(src_tail) {
+                        $tail
+                    }
+                }
+            }
+        };
+    }
+
     let dc_v = _mm_set1_epi16(dc as i16);
     let mut numerator_v = _mm256_setzero_si256();
     let mut denominator_v = _mm256_setzero_si256();
+    let mut numerator = 0i64;
+    let mut denominator = 0i64;
     // CfL AC is bounded by +/-32760 at 12-bit. PMADDWD's largest
     // denominator lane is therefore 2 * 32760^2 = 2_146_435_200, below
     // i32::MAX; each four-lane result is widened to i64 immediately.
-    for (ac_chunk, src_chunk) in ac8.iter().zip(src8) {
-        let ac_v = load_i32x8_as_i16(ac_chunk);
-        let src_v = unsafe { _mm_loadu_si128(src_chunk.as_ptr().cast::<__m128i>()) };
-        numerator_v = accumulate_i32x4_i64(
-            numerator_v,
-            _mm_madd_epi16(_mm_sub_epi16(src_v, dc_v), ac_v),
-        );
-        denominator_v = accumulate_i32x4_i64(denominator_v, _mm_madd_epi16(ac_v, ac_v));
-    }
-    let mut numerator = sum_i64x4(numerator_v);
-    let mut denominator = sum_i64x4(denominator_v);
-    for (&ac, &src) in ac_tail.iter().zip(src_tail) {
-        numerator += i64::from(i32::from(src) - dc) * i64::from(ac);
-        denominator += i64::from(ac) * i64::from(ac);
-    }
+    for_each_group!(
+        |ac_v, src_v| {
+            numerator_v = accumulate_i32x4_i64(
+                numerator_v,
+                _mm_madd_epi16(_mm_sub_epi16(src_v, dc_v), ac_v),
+            );
+            denominator_v = accumulate_i32x4_i64(denominator_v, _mm_madd_epi16(ac_v, ac_v));
+        },
+        |ac_s, src_s| {
+            numerator += i64::from(i32::from(src_s) - dc) * i64::from(ac_s);
+            denominator += i64::from(ac_s) * i64::from(ac_s);
+        }
+    );
+    numerator += sum_i64x4(numerator_v);
+    denominator += sum_i64x4(denominator_v);
     if denominator == 0 {
         return 0;
     }
@@ -1124,24 +1176,21 @@ pub(crate) fn cfl_best_alpha_u16_avx2(ac: &[i32], src: &[u16], dc: i32, n: usize
         let alpha_sign = _mm_set1_epi16(alpha as i16);
         let abs_alpha_q12 = (alpha.abs() << 9) as i16;
         let mut error_v = _mm256_setzero_si256();
-        for (ac_chunk, src_chunk) in ac8.iter().zip(src8) {
-            let pred = cfl_predict_i16(
-                load_i32x8_as_i16(ac_chunk),
-                dc_v,
-                max_v,
-                alpha_sign,
-                abs_alpha_q12,
-            );
-            let src_v = unsafe { _mm_loadu_si128(src_chunk.as_ptr().cast::<__m128i>()) };
-            let residual = _mm_sub_epi16(src_v, pred);
-            error_v = accumulate_i32x4_i64(error_v, _mm_madd_epi16(residual, residual));
-        }
-        let mut error = sum_i64x4(error_v);
-        for (&ac, &src) in ac_tail.iter().zip(src_tail) {
-            let residual =
-                i64::from(i32::from(src) - crate::intrapred::cfl_pred_pixel(dc, ac, alpha, bd));
-            error += residual * residual;
-        }
+        let mut error = 0i64;
+        for_each_group!(
+            |ac_v, src_v| {
+                let pred = cfl_predict_i16(ac_v, dc_v, max_v, alpha_sign, abs_alpha_q12);
+                let residual = _mm_sub_epi16(src_v, pred);
+                error_v = accumulate_i32x4_i64(error_v, _mm_madd_epi16(residual, residual));
+            },
+            |ac_s, src_s| {
+                let residual = i64::from(
+                    i32::from(src_s) - crate::intrapred::cfl_pred_pixel(dc, ac_s, alpha, bd),
+                );
+                error += residual * residual;
+            }
+        );
+        error += sum_i64x4(error_v);
         if error < best_error {
             best_error = error;
             best_alpha = alpha;

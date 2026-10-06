@@ -563,7 +563,7 @@ pub(crate) fn rate_bound_slack(speed: crate::avif::Speed) -> f32 {
     match speed {
         crate::avif::Speed::Fast => t.rate_bound_slack_fast,
         crate::avif::Speed::Medium => t.rate_bound_slack_medium,
-        crate::avif::Speed::Slow => t.rate_bound_slack_slow,
+        crate::avif::Speed::ExtraSlow | crate::avif::Speed::Slow => t.rate_bound_slack_slow,
     }
 }
 
@@ -574,7 +574,7 @@ pub(crate) fn min_size_16(speed: crate::avif::Speed) -> bool {
     match speed {
         crate::avif::Speed::Fast => t.min_size_16_fast,
         crate::avif::Speed::Medium => t.min_size_16_medium,
-        crate::avif::Speed::Slow => t.min_size_16_slow,
+        crate::avif::Speed::ExtraSlow | crate::avif::Speed::Slow => t.min_size_16_slow,
     }
 }
 
@@ -585,7 +585,7 @@ pub(crate) fn guided16_k(speed: crate::avif::Speed) -> f32 {
     match speed {
         crate::avif::Speed::Fast => t.guided16_k_fast,
         crate::avif::Speed::Medium => t.guided16_k_medium,
-        crate::avif::Speed::Slow => t.guided16_k_slow,
+        crate::avif::Speed::ExtraSlow | crate::avif::Speed::Slow => t.guided16_k_slow,
     }
 }
 
@@ -599,7 +599,7 @@ pub(crate) fn fixed_size(speed: crate::avif::Speed) -> u32 {
     match speed {
         crate::avif::Speed::Fast => t.fixed_size_fast,
         crate::avif::Speed::Medium => t.fixed_size_medium,
-        crate::avif::Speed::Slow => t.fixed_size_slow,
+        crate::avif::Speed::ExtraSlow | crate::avif::Speed::Slow => t.fixed_size_slow,
     }
 }
 
