@@ -3310,9 +3310,9 @@ impl<'a> LossyTile<'a> {
         let (sx, sy) = (usize::from(self.ss420 || self.ss422), usize::from(self.ss420));
         let (lw, lh) = (vis_w.min(self.w), vis_h.min(self.h));
         self.vis[0] = (lw, lh);
-        for plane in 1..=2 {
-            let (cw, ch) = self.vis[plane];
-            self.vis[plane] = (lw.div_ceil(1 << sx).min(cw), lh.div_ceil(1 << sy).min(ch));
+        for chroma in &mut self.vis[1..] {
+            let (cw, ch) = *chroma;
+            *chroma = (lw.div_ceil(1 << sx).min(cw), lh.div_ceil(1 << sy).min(ch));
         }
         self
     }
