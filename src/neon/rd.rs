@@ -76,10 +76,10 @@ fn src_rows(
     w: usize,
     h: usize,
 ) -> impl Iterator<Item = &[u16]> {
-    src[py * stride..]
-        .chunks_exact(stride)
-        .take(h)
-        .map(move |row| &row[px..px + w])
+    // Index each row directly: the slice may end right after the block's last
+    // sample (a `SrcBlock` view), so `chunks_exact(stride)` would silently drop
+    // that final, partial row.
+    (0..h).map(move |row| &src[(py + row) * stride + px..][..w])
 }
 
 /// `(sum, sum of squares)` of `src - pred` over a `w`x`h` block; `w` is a

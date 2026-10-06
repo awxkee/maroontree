@@ -149,11 +149,11 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
             }
-            let src = &self.src[0][py * self.w + px..];
-            ranked.push((self.rd.satd_sad_proxy(src, self.w, &pred, w, w, h), mode));
+            let src = self.src_blk(0, px, py, w, h);
+            ranked.push((self.rd.satd_sad_proxy(src, &pred, w), mode));
             if sparse {
-                let (s1, s2) = self.rd.residual_moments(src, self.w, &pred, w, w, h);
-                let eac = s2 - (s1 * s1) / (N as i64);
+                let (s1, s2, n) = self.rd.residual_moments(src, &pred, w);
+                let eac = if n == 0 { 0 } else { s2 - (s1 * s1) / n };
                 if (eac, mode) < best_eac {
                     best_eac = (eac, mode);
                 }
@@ -207,14 +207,7 @@ impl<'a> LossyTile<'a> {
                 &mut pred,
                 self.bd,
             );
-            let score = self.rd.satd_sad_proxy(
-                &self.src[0][py * self.w + px..],
-                self.w,
-                &pred,
-                w,
-                w,
-                h,
-            );
+            let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, w, h), &pred, w);
             ranked.push((score, order, mode));
         }
         ranked
@@ -264,14 +257,7 @@ impl<'a> LossyTile<'a> {
                 pred_bufs[2],
                 self.bd,
             );
-            let score = self.rd.satd_sad_proxy(
-                &self.src[0][py * self.w + px..],
-                self.w,
-                pred_bufs[2],
-                w,
-                w,
-                h,
-            );
+            let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, w, h), pred_bufs[2], w);
             let candidate = (score, order, delta);
             if let Some(pos) = selected[..keep]
                 .iter()
@@ -330,8 +316,7 @@ impl<'a> LossyTile<'a> {
                     &mut pred,
                     self.bd,
                 );
-                let src = &self.src[plane][cy * self.cw + cx..];
-                cost += self.rd.satd_sad_proxy(src, self.cw, &pred, w, w, h);
+                cost += self.rd.satd_sad_proxy(self.src_blk(plane, cx, cy, w, h), &pred, w);
             }
             top.insert(mode, cost);
         }

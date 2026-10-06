@@ -108,7 +108,8 @@ type FilterIntraCellsFn = fn(&mut [[i32; 33]; 33], &[[i8; 7]; 8], usize, usize, 
 type CflAc444U16Fn = fn(&[u16], usize, usize, &mut [i32]);
 type CflAcSubU16Fn = fn(&[u16], usize, usize, usize, bool, bool, &mut [i32]);
 type CflPredFn = fn(&mut [i32], &[i32], i32, i32, u8);
-type CflBestAlphaU16Fn = fn(&[i32], &[u16], i32, usize, u8) -> i32;
+/// `(ac, ac_stride, src, src_stride, w, h, dc, bd)`.
+type CflBestAlphaU16Fn = fn(&[i32], usize, &[u16], usize, usize, usize, i32, u8) -> i32;
 
 pub(crate) const DR_ZONE1: u8 = 1;
 pub(crate) const DR_ZONE2: u8 = 2;
@@ -272,10 +273,38 @@ impl IntraPredDispatch {
     }
 
     #[inline]
-    pub(crate) fn cfl_best_alpha(&self, ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-        debug_assert!(ac.len() >= n);
-        debug_assert!(src.len() >= n);
-        (self.cfl_best_alpha_u16)(&ac[..n], &src[..n], dc, n, bd)
+    /// CfL alpha fitted to the VISIBLE part of `src` (see
+    /// [`crate::rd_sse::SrcBlock`]); `ac` is packed `src.w()`-wide.
+    pub(crate) fn cfl_best_alpha(
+        &self,
+        ac: &[i32],
+        src: crate::rd_sse::SrcBlock<'_>,
+        dc: i32,
+        bd: u8,
+    ) -> i32 {
+        debug_assert!(ac.len() >= src.w() * src.h());
+        let (vw, vh) = src.vis();
+        self.cfl_best_alpha_raw(ac, src.w(), src.data(), src.stride(), vw, vh, dc, bd)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cfl_best_alpha_raw(
+        &self,
+        ac: &[i32],
+        ac_stride: usize,
+        src: &[u16],
+        src_stride: usize,
+        w: usize,
+        h: usize,
+        dc: i32,
+        bd: u8,
+    ) -> i32 {
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        debug_assert!(ac.len() >= (h - 1) * ac_stride + w);
+        debug_assert!(src.len() >= (h - 1) * src_stride + w);
+        (self.cfl_best_alpha_u16)(ac, ac_stride, src, src_stride, w, h, dc, bd)
     }
 
     dc_pred_method!(dc_pred_4x4, 4, 4);
@@ -769,8 +798,18 @@ fn cfl_ac_sub_u16_neon_dispatch(
     unsafe { crate::neon::cfl_ac_sub_u16_neon(luma_rec, lstride, cw, ch, ss_hor, ss_ver, ac) }
 }
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-fn cfl_best_alpha_u16_neon_dispatch(ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-    unsafe { crate::neon::cfl_best_alpha_u16_neon(ac, src, dc, n, bd) }
+#[allow(clippy::too_many_arguments)]
+fn cfl_best_alpha_u16_neon_dispatch(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    unsafe { crate::neon::cfl_best_alpha_u16_neon(ac, ac_stride, src, src_stride, w, h, dc, bd) }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -856,8 +895,18 @@ fn cfl_ac_sub_u16_avx2_dispatch(
     unsafe { crate::avx::cfl_ac_sub_u16_avx2(luma_rec, lstride, cw, ch, ss_hor, ss_ver, ac) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-fn cfl_best_alpha_u16_avx2_dispatch(ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-    unsafe { crate::avx::cfl_best_alpha_u16_avx2(ac, src, dc, n, bd) }
+#[allow(clippy::too_many_arguments)]
+fn cfl_best_alpha_u16_avx2_dispatch(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    unsafe { crate::avx::cfl_best_alpha_u16_avx2(ac, ac_stride, src, src_stride, w, h, dc, bd) }
 }
 
 #[inline]
@@ -1154,11 +1203,30 @@ pub(crate) fn cfl_pred_scalar(dst: &mut [i32], ac: &[i32], dc: i32, alpha: i32, 
 /// optimum and its +/-3 neighborhood by pre-quantization residual energy, clamped
 /// to the signaled range [-16, 16] (0 means "CfL useless for this plane").
 pub(crate) fn cfl_best_alpha<P: Pel>(ac: &[i32], src: &[P], dc: i32, n: usize, bd: u8) -> i32 {
+    cfl_best_alpha_strided(ac, n, src, n, n, 1, dc, bd)
+}
+
+/// [`cfl_best_alpha`] over a `w`x`h` region of `ac_stride`-pitched `ac` and
+/// `src_stride`-pitched `src`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cfl_best_alpha_strided<P: Pel>(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[P],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    let rows = || (0..h).map(|y| (&ac[y * ac_stride..][..w], &src[y * src_stride..][..w]));
     let mut num: i64 = 0;
     let mut den: i64 = 0;
-    for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
-        num += (src.widen() - dc) as i64 * ac as i64;
-        den += ac as i64 * ac as i64;
+    for (ac_row, src_row) in rows() {
+        for (&src, &ac) in src_row.iter().zip(ac_row) {
+            num += (src.widen() - dc) as i64 * ac as i64;
+            den += ac as i64 * ac as i64;
+        }
     }
     if den == 0 {
         return 0;
@@ -1171,9 +1239,11 @@ pub(crate) fn cfl_best_alpha<P: Pel>(ac: &[i32], src: &[P], dc: i32, n: usize, b
             continue;
         }
         let mut e: i64 = 0;
-        for (&src, &ac) in src[..n].iter().zip(ac[..n].iter()) {
-            let d = (src.widen() - cfl_pred_pixel(dc, ac, cand, bd)) as i64;
-            e += d * d;
+        for (ac_row, src_row) in rows() {
+            for (&src, &ac) in src_row.iter().zip(ac_row) {
+                let d = (src.widen() - cfl_pred_pixel(dc, ac, cand, bd)) as i64;
+                e += d * d;
+            }
         }
         if e < best_e {
             best_e = e;
@@ -1183,8 +1253,18 @@ pub(crate) fn cfl_best_alpha<P: Pel>(ac: &[i32], src: &[P], dc: i32, n: usize, b
     best_a
 }
 
-fn cfl_best_alpha_u16_scalar(ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-    cfl_best_alpha(ac, src, dc, n, bd)
+#[allow(clippy::too_many_arguments)]
+fn cfl_best_alpha_u16_scalar(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    cfl_best_alpha_strided(ac, ac_stride, src, src_stride, w, h, dc, bd)
 }
 
 pub(crate) fn recon_add_pred<P: Pel>(dst: &mut [P], pred: &[i32], resid: &[i32], max: i32) {
@@ -1967,8 +2047,26 @@ mod intra_edge_tests {
                     .collect();
                 for dc in [0, max >> 1, max, lcg(&mut state).clamp(0, max)] {
                     let scalar = cfl_best_alpha(&ac, &src, dc, len, bd);
-                    let selected = dispatch.cfl_best_alpha(&ac, &src, dc, len, bd);
+                    let selected = dispatch.cfl_best_alpha_raw(&ac, len, &src, len, len, 1, dc, bd);
                     assert_eq!(selected, scalar, "len={len} bd={bd} dc={dc}");
+                    // Same samples as a strided 2-D region: rows of `w`
+                    // inside a wider pitch must give the flat-region answer.
+                    for w in [1usize, 4, 7, 8, 12, 16, 32] {
+                        if w > len || len % w != 0 {
+                            continue;
+                        }
+                        let h = len / w;
+                        let pitch = w + 5;
+                        let mut ac_p = vec![0i32; h * pitch];
+                        let mut src_p = vec![0u16; h * pitch];
+                        for y in 0..h {
+                            ac_p[y * pitch..][..w].copy_from_slice(&ac[y * w..][..w]);
+                            src_p[y * pitch..][..w].copy_from_slice(&src[y * w..][..w]);
+                        }
+                        let strided =
+                            dispatch.cfl_best_alpha_raw(&ac_p, pitch, &src_p, pitch, w, h, dc, bd);
+                        assert_eq!(strided, scalar, "len={len} w={w} bd={bd} dc={dc}");
+                    }
                 }
             }
         }

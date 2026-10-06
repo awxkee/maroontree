@@ -786,37 +786,78 @@ pub(crate) fn cfl_pred_neon(dst: &mut [i32], ac: &[i32], dc: i32, alpha: i32, bd
     }
 }
 
+/// Strided [`crate::intrapred::cfl_best_alpha`] over a `w`x`h` region:
+/// `ac` rows are `ac_stride`-pitched, `src` rows `src_stride`-pitched.
 #[target_feature(enable = "neon")]
-pub(crate) fn cfl_best_alpha_u16_neon(ac: &[i32], src: &[u16], dc: i32, n: usize, bd: u8) -> i32 {
-    debug_assert!(ac.len() >= n);
-    debug_assert!(src.len() >= n);
+pub(crate) fn cfl_best_alpha_u16_neon(
+    ac: &[i32],
+    ac_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    dc: i32,
+    bd: u8,
+) -> i32 {
+    debug_assert!(h == 0 || ac.len() >= (h - 1) * ac_stride + w);
+    debug_assert!(h == 0 || src.len() >= (h - 1) * src_stride + w);
     debug_assert!((8..=12).contains(&bd));
     let max = (1 << bd) - 1;
     debug_assert!((0..=max).contains(&dc));
-    debug_assert!(ac[..n].iter().all(|&value| i16::try_from(value).is_ok()));
-    debug_assert!(src[..n].iter().all(|&value| i32::from(value) <= max));
 
-    let (ac8, ac_tail) = ac[..n].as_chunks::<8>();
-    let (src8, src_tail) = src[..n].as_chunks::<8>();
+    // Visit the region as 8-lane groups `(ac_lo, ac_hi, src)` plus a scalar
+    // remainder `(ac, src)`. A 4-wide region (4:2:0/4:2:2 chroma) packs two
+    // rows per group so it stays vectorized when read in place.
+    macro_rules! for_each_group {
+        (|$lo:ident, $hi:ident, $sv:ident| $body:block, |$a:ident, $s:ident| $tail:block) => {
+            if w == 4 && h.is_multiple_of(2) {
+                for y in (0..h).step_by(2) {
+                    let (a0, s0) = (y * ac_stride, y * src_stride);
+                    let $lo = load_i32x4(ac[a0..].first_chunk::<4>().unwrap());
+                    let $hi = load_i32x4(ac[a0 + ac_stride..].first_chunk::<4>().unwrap());
+                    let r0 = src[s0..].first_chunk::<4>().unwrap();
+                    let r1 = src[s0 + src_stride..].first_chunk::<4>().unwrap();
+                    let $sv = unsafe { vcombine_u16(vld1_u16(r0.as_ptr()), vld1_u16(r1.as_ptr())) };
+                    $body
+                }
+            } else {
+                for y in 0..h {
+                    let (ac8, ac_tail) = ac[y * ac_stride..][..w].as_chunks::<8>();
+                    let (src8, src_tail) = src[y * src_stride..][..w].as_chunks::<8>();
+                    for (a8, s8) in ac8.iter().zip(src8) {
+                        let ($lo, $hi) = load_i32x8(a8);
+                        let $sv = unsafe { vld1q_u16(s8.as_ptr()) };
+                        $body
+                    }
+                    for (&$a, &$s) in ac_tail.iter().zip(src_tail) {
+                        $tail
+                    }
+                }
+            }
+        };
+    }
+
     let dc_i32 = vdupq_n_s32(dc);
     let mut numerator_v = vdupq_n_s64(0);
     let mut denominator_v = vdupq_n_s64(0);
-    for (ac_chunk, src_chunk) in ac8.iter().zip(src8) {
-        let (ac_lo, ac_hi) = load_i32x8(ac_chunk);
-        let src_v = unsafe { vld1q_u16(src_chunk.as_ptr()) };
-        let src_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(src_v)));
-        let src_hi = vreinterpretq_s32_u32(vmovl_high_u16(src_v));
-        numerator_v = accumulate_dot_i32(numerator_v, vsubq_s32(src_lo, dc_i32), ac_lo);
-        numerator_v = accumulate_dot_i32(numerator_v, vsubq_s32(src_hi, dc_i32), ac_hi);
-        denominator_v = accumulate_dot_i32(denominator_v, ac_lo, ac_lo);
-        denominator_v = accumulate_dot_i32(denominator_v, ac_hi, ac_hi);
-    }
-    let mut numerator = vaddvq_s64(numerator_v);
-    let mut denominator = vaddvq_s64(denominator_v);
-    for (&ac, &src) in ac_tail.iter().zip(src_tail) {
-        numerator += i64::from(i32::from(src) - dc) * i64::from(ac);
-        denominator += i64::from(ac) * i64::from(ac);
-    }
+    let mut numerator = 0i64;
+    let mut denominator = 0i64;
+    for_each_group!(
+        |ac_lo, ac_hi, src_v| {
+            let src_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(src_v)));
+            let src_hi = vreinterpretq_s32_u32(vmovl_high_u16(src_v));
+            numerator_v = accumulate_dot_i32(numerator_v, vsubq_s32(src_lo, dc_i32), ac_lo);
+            numerator_v = accumulate_dot_i32(numerator_v, vsubq_s32(src_hi, dc_i32), ac_hi);
+            denominator_v = accumulate_dot_i32(denominator_v, ac_lo, ac_lo);
+            denominator_v = accumulate_dot_i32(denominator_v, ac_hi, ac_hi);
+        },
+        |ac_s, src_s| {
+            numerator += i64::from(i32::from(src_s) - dc) * i64::from(ac_s);
+            denominator += i64::from(ac_s) * i64::from(ac_s);
+        }
+    );
+    numerator += vaddvq_s64(numerator_v);
+    denominator += vaddvq_s64(denominator_v);
     if denominator == 0 {
         return 0;
     }
@@ -834,31 +875,32 @@ pub(crate) fn cfl_best_alpha_u16_neon(ac: &[i32], src: &[u16], dc: i32, n: usize
         let alpha_sign = vdupq_n_s16(alpha as i16);
         let abs_alpha_q12 = (alpha.abs() << 9) as i16;
         let mut error_v = vdupq_n_u64(0);
-        for (ac_chunk, src_chunk) in ac8.iter().zip(src8) {
-            let pred = cfl_predict_s16(
-                load_i32x8_as_s16(ac_chunk),
-                dc_v,
-                max_v,
-                alpha_sign,
-                abs_alpha_q12,
-            );
-            let src_v = vreinterpretq_s16_u16(unsafe { vld1q_u16(src_chunk.as_ptr()) });
-            let residual = vsubq_s16(src_v, pred);
-            error_v = vpadalq_u32(
-                error_v,
-                vreinterpretq_u32_s32(vmull_s16(vget_low_s16(residual), vget_low_s16(residual))),
-            );
-            error_v = vpadalq_u32(
-                error_v,
-                vreinterpretq_u32_s32(vmull_high_s16(residual, residual)),
-            );
-        }
-        let mut error = vaddvq_u64(error_v) as i64;
-        for (&ac, &src) in ac_tail.iter().zip(src_tail) {
-            let residual =
-                i64::from(i32::from(src) - crate::intrapred::cfl_pred_pixel(dc, ac, alpha, bd));
-            error += residual * residual;
-        }
+        let mut error = 0i64;
+        for_each_group!(
+            |ac_lo, ac_hi, src_v| {
+                let ac16 = vcombine_s16(vqmovn_s32(ac_lo), vqmovn_s32(ac_hi));
+                let pred = cfl_predict_s16(ac16, dc_v, max_v, alpha_sign, abs_alpha_q12);
+                let residual = vsubq_s16(vreinterpretq_s16_u16(src_v), pred);
+                error_v = vpadalq_u32(
+                    error_v,
+                    vreinterpretq_u32_s32(vmull_s16(
+                        vget_low_s16(residual),
+                        vget_low_s16(residual),
+                    )),
+                );
+                error_v = vpadalq_u32(
+                    error_v,
+                    vreinterpretq_u32_s32(vmull_high_s16(residual, residual)),
+                );
+            },
+            |ac_s, src_s| {
+                let residual = i64::from(
+                    i32::from(src_s) - crate::intrapred::cfl_pred_pixel(dc, ac_s, alpha, bd),
+                );
+                error += residual * residual;
+            }
+        );
+        error += vaddvq_u64(error_v) as i64;
         if error < best_error {
             best_error = error;
             best_alpha = alpha;

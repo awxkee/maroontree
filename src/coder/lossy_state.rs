@@ -218,8 +218,10 @@ fn quad4_bias() -> f32 {
 /// How many still-in-contention 16-level partition candidates get the CfL
 /// chroma trial (stage 2 of the chroma proxy). 0 = DC-only everywhere, the
 /// historical behavior.
-fn chroma_refine_topk() -> usize {
-    crate::tuning::get().chroma_refine_topk
+/// ExtraSlow refines one more candidate.
+fn chroma_refine_topk(speed: Speed) -> usize {
+    let k = crate::tuning::get().chroma_refine_topk;
+    if speed == Speed::ExtraSlow && k > 0 { k + 1 } else { k }
 }
 
 /// PARTITION_HORZ_4/VERT_4 search enable.
@@ -303,6 +305,7 @@ impl<'a> LossyTile<'a> {
             screen_frame: false,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
+            vis: [(w, h); 3],
             ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
@@ -393,6 +396,7 @@ impl<'a> LossyTile<'a> {
             screen_frame: false,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
+            vis: [(w, h); 3],
             ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], Vec::new(), Vec::new()],
@@ -492,6 +496,7 @@ impl<'a> LossyTile<'a> {
             screen_frame: false,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
+            vis: [(w, h), (cw, h), (cw, h)],
             ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
@@ -591,6 +596,7 @@ impl<'a> LossyTile<'a> {
             screen_frame: false,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
+            vis: [(w, h), (cw, ch), (cw, ch)],
             ibc_match_cache: Default::default(),
             src,
             recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
@@ -1745,11 +1751,11 @@ impl<'a> LossyTile<'a> {
         self.aq.enabled
             && !self.mono
             && (self.aq.base_q as u32) <= crate::tuning::get().top_band_q
-            && self.speed == Speed::Slow
+            && self.speed.at_least_slow()
     }
 
     fn partition_signal_bits(&self) -> f32 {
-        if (self.ss420 || self.ss422) && self.aq.enabled && !self.mono && self.speed == Speed::Slow
+        if (self.ss420 || self.ss422) && self.aq.enabled && !self.mono && self.speed.at_least_slow()
         {
             let tu = crate::tuning::get();
             let w = if self.ss422 {
@@ -2308,18 +2314,7 @@ impl<'a> LossyTile<'a> {
         dc: i32,
         residual: &[i32],
     ) -> f32 {
-        let satd = self.rd.luma_satd(
-            &self.src[0],
-            self.w,
-            px,
-            py,
-            w,
-            h,
-            self.bd,
-            pred,
-            dc,
-            residual,
-        );
+        let satd = self.rd.luma_satd(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
         satd as f32
             * qstep.max(1.0)
             * 0.25
@@ -2362,18 +2357,7 @@ impl<'a> LossyTile<'a> {
             let (mut cf, tf) = fwd(&resid, &self.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = inv(&cf, &self.cquant);
-            let distortion = self.rd.chroma_sse(
-                &self.src[plane],
-                self.cw,
-                cx,
-                cy,
-                cw,
-                ch,
-                self.bd,
-                &[],
-                dc,
-                &rr,
-            );
+            let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &[], dc, &rr);
             dc_total += crate::partition_rd::rd_cost(
                 distortion,
                 mlam,
@@ -2420,31 +2404,18 @@ impl<'a> LossyTile<'a> {
         for ci in 0..2 {
             let plane = ci + 1;
             let dc = dc_preds[ci];
-            let mut csrc = [0u16; N];
-            self.rd
-                .copy_block_u16(&mut csrc, &self.src[plane], self.cw, cx, cy, cw, ch);
-            let a = self.intrapred.cfl_best_alpha(&ac, &csrc, dc, N, self.bd);
+            let csrc = self.src_blk(plane, cx, cy, cw, ch);
+            let a = self.intrapred.cfl_best_alpha(&ac, csrc, dc, self.bd);
             alpha[ci] = a;
             let mut cpred = [0i32; N];
             self.intrapred.cfl_pred(&mut cpred, &ac, dc, a, self.bd);
             let mut resid = [0i32; N];
             self.rd
-                .residual_pred(&mut resid, &cpred, &csrc, cw, 0, 0, cw, ch);
+                .residual_pred_blk(&mut resid, &cpred, csrc);
             let (mut cf, tf) = fwd(&resid, &self.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = inv(&cf, &self.cquant);
-            let distortion = self.rd.chroma_sse(
-                &self.src[plane],
-                self.cw,
-                cx,
-                cy,
-                cw,
-                ch,
-                self.bd,
-                &cpred,
-                0,
-                &rr,
-            );
+            let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &cpred, 0, &rr);
             cfl_body += crate::partition_rd::rd_cost(
                 distortion,
                 mlam,
@@ -2912,7 +2883,7 @@ impl<'a> LossyTile<'a> {
 
         let full_part_rdo = self.speed.full_partition_rdo();
         let coupled_square =
-            !self.mono && self.speed == Speed::Slow && joint_luma_uv_proxy_enabled();
+            !self.mono && self.speed.at_least_slow() && joint_luma_uv_proxy_enabled();
 
         // 4:2:0 runs the rect legs at Slow; `rect16_420_medium` opens Medium
         // too. 4:4:4 is shipped OFF (the leg was disabled while the leaves were
@@ -2920,7 +2891,7 @@ impl<'a> LossyTile<'a> {
         let tune = crate::tuning::get();
         let ss444 = !self.ss420 && !self.ss422 && !self.mono;
         let rect_tier =
-            self.speed == Speed::Slow || (tune.rect16_420_medium && self.speed == Speed::Medium);
+            self.speed.at_least_slow() || (tune.rect16_420_medium && self.speed == Speed::Medium);
         let horz_on = full_part_rdo
             && (self.ss422
                 || (self.ss420 && rect_tier)
@@ -2943,7 +2914,7 @@ impl<'a> LossyTile<'a> {
             && self.aq.enabled
             && !self.mono
             && self.aq.base_q <= 20
-            && self.speed == Speed::Slow
+            && self.speed.at_least_slow()
         {
             0
         } else if crate::tuning::get().part_budget_444_only
@@ -2989,10 +2960,10 @@ impl<'a> LossyTile<'a> {
                 }
         };
         let selection_only_bias_444 = self.top_band() && !self.ss420 && !self.ss422;
-        let none_bias = if self.ss420 && self.aq.enabled && !self.mono && self.speed == Speed::Slow
+        let none_bias = if self.ss420 && self.aq.enabled && !self.mono && self.speed.at_least_slow()
         {
             1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.aq.base_q, SEAM_W_420)
-        } else if self.ss422 && self.aq.enabled && !self.mono && self.speed == Speed::Slow {
+        } else if self.ss422 && self.aq.enabled && !self.mono && self.speed.at_least_slow() {
             1.0 + (none16_top_bias_422() - 1.0) * seam_t(self.aq.base_q, SEAM_W_422)
         } else if selection_only_bias_444 {
             none16_top_bias_444()
@@ -3012,7 +2983,16 @@ impl<'a> LossyTile<'a> {
         // 64/32/16 — while cutting the expensive part: four 8x8 leaves plus
         // SPLIT4 plus the SPLIT chroma partition. NONE is still priced
         // normally, so the parent receives a real cost.
-        let floor16 = crate::tuning::min_size_16(self.speed);
+        //
+        // Screen frames (text/UI, see `screen_frame`) are exempt: glyphs need
+        // the 8x8 and smaller leaves, and the floor cost them far more than it
+        // saved — Medium x_screen 420 was +43.6% BD vs Slow (worse than Fast's
+        // +31.0%), +6.5% without the floor; n_bbscreen +15.5% -> +6.3%. Photos
+        // never pass the screen test, so their speed/quality trade is untouched.
+        // Measured and rejected gates: a <=64-colour 16x16 histogram (photos
+        // pass it too) and the moment-model SPLIT/NONE ratio (k=1 == no floor,
+        // k=1.5 == floor).
+        let floor16 = crate::tuning::min_size_16(self.speed) && !self.screen_frame;
         let skip_split = floor16
             || match guided {
                 Some((m_none, m_split))
@@ -3272,7 +3252,7 @@ impl<'a> LossyTile<'a> {
         // and fold the difference back through each family's own bias -- the
         // biases multiply the chroma leg, so a raw delta cannot just be added.
         let mut rd_none_unbiased = rd_none_unbiased;
-        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk() > 0;
+        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk(self.speed) > 0;
         if full_part_rdo && chroma_refine {
             let mut order = FixedList::<(f32, usize), 11>::new((f32::INFINITY, 0));
             for (i, &(cost, part)) in cands.iter().enumerate() {
@@ -3286,7 +3266,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             order.as_mut_slice().sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            order.truncate(chroma_refine_topk());
+            order.truncate(chroma_refine_topk(self.speed));
             for &(_, i) in order.iter() {
                 let part = cands[i].1;
                 let delta = self.rd_cost_chroma_partition(px, py, 16, part, prdo, true)
@@ -3322,6 +3302,29 @@ impl<'a> LossyTile<'a> {
     fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         self
+    }
+
+    /// Clip RD distortion to the displayed `vis_w`x`vis_h` luma region of
+    /// this tile (tile-local; larger values are capped at the tile size).
+    fn with_visible(mut self, vis_w: usize, vis_h: usize) -> Self {
+        let (sx, sy) = (usize::from(self.ss420 || self.ss422), usize::from(self.ss420));
+        let (lw, lh) = (vis_w.min(self.w), vis_h.min(self.h));
+        self.vis[0] = (lw, lh);
+        for chroma in &mut self.vis[1..] {
+            let (cw, ch) = *chroma;
+            *chroma = (lw.div_ceil(1 << sx).min(cw), lh.div_ceil(1 << sy).min(ch));
+        }
+        self
+    }
+
+    /// Zero-copy view of the `w`x`h` source block at `(x, y)` of `plane`
+    /// (plane coordinates), clipped for distortion to the displayed region.
+    #[inline]
+    fn src_blk(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> crate::rd_sse::SrcBlock<'a> {
+        let src: &'a [Vec<u16>; 3] = self.src;
+        let stride = if plane == 0 { self.w } else { self.cw };
+        let (vw, vh) = self.vis[plane];
+        crate::rd_sse::SrcBlock::new(&src[plane], stride, x, y, w, h, vw, vh)
     }
 
     fn with_dispatch(

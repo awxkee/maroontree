@@ -27,8 +27,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-fn b64_refinement_window() -> f32 {
-    crate::tuning::get().b64_refinement_window
+/// ExtraSlow narrows the early-exit window so more ambiguous 64x64 nodes get
+/// the full 32-level child search.
+fn b64_refinement_window(speed: Speed) -> f32 {
+    let w = crate::tuning::get().b64_refinement_window;
+    if speed == Speed::ExtraSlow { w * 0.9 } else { w }
 }
 fn b64_split_refinement() -> f32 {
     crate::tuning::get().b64_split_refinement
@@ -37,22 +40,19 @@ fn b64_split_refinement() -> f32 {
 /// SSE against the wavefront's raw shared reconstruction
 #[allow(clippy::too_many_arguments)]
 unsafe fn sse_u16_raw_reference(
-    src: &[u16],
-    src_stride: usize,
-    src_x: usize,
-    src_y: usize,
+    src: crate::rd_sse::SrcBlock<'_>,
     reference: *const u16,
     reference_len: usize,
     ref_stride: usize,
     ref_x: usize,
     ref_y: usize,
-    w: usize,
-    h: usize,
 ) -> i64 {
+    // Visible part only, like every other distortion (see `SrcBlock`).
+    let (w, h) = src.vis();
     debug_assert!(h == 0 || (ref_y + h - 1) * ref_stride + ref_x + w <= reference_len);
     let mut sse = 0i64;
     for row in 0..h {
-        let src_row = &src[(src_y + row) * src_stride + src_x..][..w];
+        let src_row = &src.row(row)[..w];
         let ref_offset = (ref_y + row) * ref_stride + ref_x;
         for (column, &src) in src_row.iter().enumerate() {
             // SAFETY: the caller guarantees that this finished reference
@@ -265,7 +265,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
     ) -> FixedList<usize, 13> {
-        if self.speed != Speed::Slow {
+        if !self.speed.at_least_slow() {
             let mut keep = FixedList::new(DC_PRED);
             for &mode in fast_nd_modes() {
                 keep.push(mode);
@@ -306,14 +306,7 @@ impl<'a> LossyTile<'a> {
                         self.bd,
                     );
                 }
-                score += self.rd.satd_sad_proxy(
-                    &self.src[0][by * self.w + bx..],
-                    self.w,
-                    &pred[..],
-                    32,
-                    32,
-                    32,
-                );
+                score += self.rd.satd_sad_proxy(self.src_blk(0, bx, by, 32, 32), &pred[..], 32);
             }
             ranked.push((score, mode));
         }
@@ -736,31 +729,21 @@ impl<'a> LossyTile<'a> {
                 // the IntraBC legality rule admits only finished cells.
                 distortion += unsafe {
                     sse_u16_raw_reference(
-                        &self.src[plane],
-                        stride,
-                        x,
-                        y,
+                        self.src_blk(plane, x, y, bw, bh),
                         ptr,
                         len,
                         stride,
                         ref_x,
                         ref_y,
-                        bw,
-                        bh,
                     )
                 };
             } else {
                 distortion += self.rd.sse_u16(
-                    &self.src[plane],
-                    stride,
-                    x,
-                    y,
+                    self.src_blk(plane, x, y, bw, bh),
                     &self.recon[plane],
                     stride,
                     ref_x,
                     ref_y,
-                    bw,
-                    bh,
                 );
             }
         }
@@ -1128,15 +1111,7 @@ impl<'a> LossyTile<'a> {
                     ty0,
                 );
                 let rr = self.idct.idct_dequant_32x32(&cf, &self.cquant);
-                let sse = sse_recon::<1024, 32>(&self.rd,
-                    &[dc; 1024],
-                    &rr,
-                    &self.src[plane],
-                    self.cw,
-                    tx0,
-                    ty0,
-                    self.bd,
-                );
+                let sse = sse_recon::<1024, 32>(&self.rd, &[dc; 1024], &rr, self.src_blk(plane, tx0, ty0, 32, 32), self.bd);
                 total += rd_cost_i64(
                     sse,
                     mlam,
@@ -1185,7 +1160,7 @@ impl<'a> LossyTile<'a> {
         let mut rd_split_upper = split_signal;
         let mut child_none = [0.0f32; 4];
         let coupled_children =
-            !self.mono && self.speed == Speed::Slow && joint_luma_uv_proxy_enabled();
+            !self.mono && self.speed.at_least_slow() && joint_luma_uv_proxy_enabled();
         for (i, (sx, sy)) in [(0usize, 0usize), (32, 0), (0, 32), (32, 32)]
             .into_iter()
             .enumerate()
@@ -1207,7 +1182,7 @@ impl<'a> LossyTile<'a> {
             return Part16::Split;
         }
 
-        if best_whole <= rd_split_upper * b64_refinement_window() {
+        if best_whole <= rd_split_upper * b64_refinement_window(self.speed) {
             if let Some(rd_ibc) = rd_ibc
                 && rd_ibc < rd_none.min(rd_split_upper)
             {

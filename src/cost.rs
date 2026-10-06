@@ -245,7 +245,7 @@ pub(crate) fn use_proxy_rate(speed: crate::avif::Speed) -> bool {
     match speed {
         crate::avif::Speed::Fast => t.proxy_rate_fast,
         crate::avif::Speed::Medium => t.proxy_rate_medium,
-        crate::avif::Speed::Slow => t.proxy_rate_slow,
+        crate::avif::Speed::ExtraSlow | crate::avif::Speed::Slow => t.proxy_rate_slow,
     }
 }
 

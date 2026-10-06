@@ -48,7 +48,7 @@
 //!       --no-intrabc                         Veto lossy IntraBC (keeps loop filters)
 //!       --no-exif                            Strip EXIF from output
 //!       --no-icc                             Strip ICC profile from output
-//!   -s, --speed                              Encoding effort (default = slow)
+//!   -s, --speed                              Encoding effort: extraslow|slow|medium|fast (default = slow)
 //!   -v, --verbose                            Print dimensions, timing, file size
 //!   -h, --help                               Print this help
 //! ```
@@ -245,7 +245,7 @@ Options:
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
       --qm <auto|0-15>                  Enable AV1 quantization matrices
       --no-cdf-update                   Freeze AV1 entropy CDFs
-  -s, --speed                           Encoding effort (default = slow)
+  -s, --speed                           Encoding effort: extraslow|slow|medium|fast (default = slow)
   -v, --verbose                         Print timing and file stats
   -h, --help                            Print this help"
     );
@@ -265,6 +265,7 @@ fn basic_concurrency() -> usize {
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 enum EncodingEffort {
+    ExtraSlow,
     Slow,
     Medium,
     Fast,
@@ -279,6 +280,7 @@ enum Qmatrix {
 impl EncodingEffort {
     pub(crate) fn to_maroontreee(self) -> maroontree::Speed {
         match self {
+            EncodingEffort::ExtraSlow => maroontree::Speed::ExtraSlow,
             EncodingEffort::Slow => maroontree::Speed::Slow,
             EncodingEffort::Medium => maroontree::Speed::Medium,
             EncodingEffort::Fast => maroontree::Speed::Fast,
@@ -371,11 +373,12 @@ fn parse_args() -> Args {
             }
             "-s" | "--speed" => {
                 speed = match args.next().unwrap_or_default().as_str() {
+                    "extraslow" => EncodingEffort::ExtraSlow,
                     "slow" => EncodingEffort::Slow,
                     "medium" => EncodingEffort::Medium,
                     "fast" => EncodingEffort::Fast,
                     other => die(format!(
-                        "unsupported speed '{other}'; use slow, medium, or fast"
+                        "unsupported speed '{other}'; use extraslow, slow, medium, or fast"
                     )),
                 }
             }

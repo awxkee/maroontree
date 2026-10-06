@@ -1242,6 +1242,11 @@ struct LossyTile<'a> {
     /// window: the tile, clipped to the DISPLAY frame (`iw4 = (w + 3) >> 2`,
     /// not the 8-aligned coded width).
     ibc_end4: (usize, usize),
+    /// Per-plane tile-local DISPLAYED extent `(width, height)`: the source is
+    /// padded to the 8-aligned coded grid and every RD distortion is clipped
+    /// to this region (see [`crate::rd_sse::SrcBlock`]). Equal to the plane
+    /// size for interior tiles and 8-aligned frames.
+    vis: [(usize, usize); 3],
     src: &'a [Vec<u16>; 3],
     recon: [Vec<u16>; 3],
     a_coef: [Vec<u8>; 3], // len w/4, absolute bx4
@@ -1397,14 +1402,12 @@ fn sse_recon<const N: usize, const D: usize>(
     rd: &crate::rd_sse::RdDispatch,
     pred: &[i32; N],
     resid: &[i32; N],
-    src: &[u16],
-    stride: usize,
-    px: usize,
-    py: usize,
+    src: crate::rd_sse::SrcBlock<'_>,
     bd: u8,
 ) -> i64 {
     debug_assert_eq!(N, D * D);
-    rd.sse_recon(pred, resid, src, stride, px, py, D, D, bd)
+    debug_assert!(src.w() == D && src.h() == D);
+    rd.sse_recon(pred, resid, src, bd)
 }
 
 #[inline]
@@ -1519,8 +1522,14 @@ fn prdo_upper_clamp() -> f32 {
     1.5
 }
 
-fn vbp_thresh_420() -> f32 {
-    crate::tuning::get().vbp_thresh_420
+/// ExtraSlow skips the 32-level SPLIT search only on blocks twice as flat.
+fn vbp_thresh_420(speed: Speed) -> f32 {
+    let t = crate::tuning::get().vbp_thresh_420;
+    if speed == Speed::ExtraSlow {
+        t * 0.5
+    } else {
+        t
+    }
 }
 
 fn top_none_bias_420(base_q: u8) -> f32 {
@@ -1902,6 +1911,7 @@ fn wavefront_capture(
         }
         .with_dispatch(dct, idct, intrapred, kmeans, rd)
         .with_speed(speed)
+        .with_visible(disp.0.saturating_sub(r.x0), disp.1.saturating_sub(r.y0))
         .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
@@ -2591,6 +2601,7 @@ fn encode_one_tile(
         }
         .with_dispatch(dct, idct, intrapred, kmeans, rd)
         .with_speed(speed)
+        .with_visible(disp.0.saturating_sub(r.x0), disp.1.saturating_sub(r.y0))
         .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
@@ -3643,7 +3654,7 @@ fn frame_cdef(
         if on < thr { off - on } else { 0 }
     };
 
-    let slow = speed == Speed::Slow;
+    let slow = speed.at_least_slow();
     let mut cands: Vec<(i32, i32)> = vec![(0, 0)];
     let mut ly: Vec<Vec<i64>> = vec![luma_tab(0, 0)];
     let luma_off: Vec<i64> = ly[0].clone();
@@ -5074,11 +5085,12 @@ mod aq_tests {
     fn satd_sad_proxy_is_zero_only_for_equal_blocks() {
         let rd = crate::rd_sse::RdDispatch::selected();
         let src = [7u16; 16];
+        let blk = crate::rd_sse::SrcBlock::new(&src, 4, 0, 0, 4, 4, 4, 4);
         let pred = [7i32; 16];
-        assert_eq!(rd.satd_sad_proxy(&src, 4, &pred, 4, 4, 4), 0);
+        assert_eq!(rd.satd_sad_proxy(blk, &pred, 4), 0);
         let mut pred2 = pred;
         pred2[5] += 3;
-        assert!(rd.satd_sad_proxy(&src, 4, &pred2, 4, 4, 4) > 0);
+        assert!(rd.satd_sad_proxy(blk, &pred2, 4) > 0);
     }
 
     #[test]
