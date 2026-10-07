@@ -10,10 +10,10 @@ img-parts = "0.4.0"
 yuv = "0.8.17"
 anyhow = "1.0.104"
 moxcms = { version = "0.9.0" }
-hpvcd = { version = "0.3.2", optional = true }
+hpvcd = { version = "0.3.3", optional = true }
 fast_transpose = { version = "0.2.7", optional = true }
 thiserror = "2.0.20"
-hpvca = { version = "0.2.0", optional = true }
+hpvca = { version = "0.2.1", optional = true }
 jixel = "0.3.3"
 jxl = "0.7.3"
 bytemuck = "1.25.2"

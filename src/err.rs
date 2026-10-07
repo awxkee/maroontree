@@ -56,6 +56,8 @@ pub enum EncodeError {
     },
     /// A frame changed a property fixed by the emitted sequence header.
     SequenceMismatch(&'static str),
+    /// The attached HDR gain map or its ISO 21496-1 metadata is invalid.
+    InvalidGainMap(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -91,6 +93,7 @@ impl fmt::Display for EncodeError {
             EncodeError::SequenceMismatch(field) => {
                 write!(f, "{field} changed after the sequence header was emitted")
             }
+            EncodeError::InvalidGainMap(msg) => write!(f, "invalid gain map: {msg}"),
         }
     }
 }

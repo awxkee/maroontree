@@ -753,6 +753,32 @@ fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
     }
 }
 
+/// The source's HDR gain map as an AVIF gain map item, if it has one.
+fn avif_gain_map(
+    #[cfg(feature = "heic")] gain_map: Option<&gainmap::ParsedGainMap>,
+    verbose: bool,
+) -> Option<maroontree::GainMap> {
+    #[cfg(feature = "heic")]
+    if let Some(gain_map) = gain_map {
+        match gainmap::avif_gain_map(gain_map) {
+            Ok(avif) => {
+                if verbose {
+                    eprintln!(
+                        "gainmap: encoding {}×{} ISO 21496-1 map ({:.3} stops) as AVIF tmap",
+                        gain_map.image.width(),
+                        gain_map.image.height(),
+                        gain_map.metadata.alternate_hdr_headroom(),
+                    );
+                }
+                return Some(avif);
+            }
+            Err(error) => eprintln!("gainmap: skipping gain map: {error:#}"),
+        }
+    }
+    let _ = verbose;
+    None
+}
+
 fn main() {
     let args = parse_args();
 
@@ -774,7 +800,8 @@ fn main() {
         gain_map,
     } = load_image(
         &args.input,
-        args.encoder == Encoder::JpegXl && raster_format.is_none(),
+        matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
+            && raster_format.is_none(),
     );
     let color_type = img.color();
     let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
@@ -880,6 +907,11 @@ fn main() {
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
                 png_cicp,
+                avif_gain_map(
+                    #[cfg(feature = "heic")]
+                    gain_map.as_ref(),
+                    args.verbose,
+                ),
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Av2 => encode_av2(
@@ -908,6 +940,7 @@ fn main() {
                         icc_bytes.as_deref(),
                         exif_bytes.as_deref(),
                         png_cicp,
+                        gain_map.as_ref(),
                     )
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
                 }

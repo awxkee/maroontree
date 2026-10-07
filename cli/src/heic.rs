@@ -546,6 +546,7 @@ fn hpvca_cicp(cicp: crate::PngCicp) -> hpvca::Cicp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_hevc(
     img: &DynamicImage,
     args: &Args,
@@ -554,6 +555,7 @@ pub(crate) fn encode_hevc(
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
     png_cicp: Option<crate::PngCicp>,
+    gain_map: Option<&ParsedGainMap>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -583,6 +585,23 @@ pub(crate) fn encode_hevc(
 
     if args.lossless {
         cfg = cfg.with_lossless(true);
+    }
+
+    if let Some(gain_map) = gain_map {
+        match crate::gainmap::hevc_gain_map(gain_map) {
+            Ok(heic) => {
+                if args.verbose {
+                    eprintln!(
+                        "gainmap: encoding {}×{} map ({:.3} stops) as Apple HDR gain map + ISO tmap",
+                        heic.width,
+                        heic.height,
+                        heic.headroom.log2(),
+                    );
+                }
+                cfg = cfg.with_gain_map(heic);
+            }
+            Err(error) => eprintln!("gainmap: skipping gain map: {error:#}"),
+        }
     }
 
     let gray = is_gray(color_type);

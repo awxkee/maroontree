@@ -62,7 +62,7 @@
 
 use crate::Cicp;
 use crate::err::EncodeError;
-use crate::metadata::Metadata;
+use crate::metadata::{ContentLightLevel, Metadata};
 
 #[inline]
 fn w32(buf: &mut Vec<u8>, v: u32) {
@@ -485,7 +485,10 @@ pub(crate) fn wrap_av1_image(
 /// * Item 2 = alpha (auxiliary, type `av01`)
 /// * `iref auxl`: alpha (2) → color (1)
 /// * Alpha item carries an `auxC` property with the AVIF alpha URN.
-/// * `ipma` associates {av1C,ispe,pixi,[colr]} to color and {av1C,ispe,pixi,auxC} to alpha.
+/// * Item 3 = `Exif` (`cdsc` → 1) when `metadata.exif` is set.
+/// * `ipma` associates {av1C,ispe,pixi,[colr]} to color and {av1C,ispe,pixi,auxC} to alpha;
+///   `irot`/`imir` go to both items (libavif: transforms must also be applied to alpha
+///   auxiliary items), `clli` to the color item only.
 ///
 /// `color_meta` is optional: when `None`, no `nclx` `colr` box is written and
 /// the alpha item's property indices shift down accordingly.
@@ -507,6 +510,15 @@ pub(crate) fn wrap_av1_image_with_alpha(
 
     // AVIF alpha auxiliary URN (ISO/IEC 23000-22:2019 Annex D)
     const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+
+    // EXIF item payload: 4-byte offset prefix (always 0 for us) + raw TIFF bytes.
+    let exif_payload: Option<Vec<u8>> = metadata.exif.as_ref().map(|e| {
+        let mut p = Vec::with_capacity(e.len() + 4);
+        p.extend_from_slice(&0u32.to_be_bytes()); // exif_tiff_header_offset = 0
+        p.extend_from_slice(e);
+        p
+    });
+    let item_count: u16 = if exif_payload.is_some() { 3 } else { 2 };
 
     let mut f: Vec<u8> = Vec::new();
 
@@ -548,15 +560,17 @@ pub(crate) fn wrap_av1_image_with_alpha(
         patch(&mut f, s);
     }
 
-    // iloc — two items; offsets patched after mdat. Version=0 (no construction_method).
+    // iloc — two (three with EXIF) items; offsets patched after mdat. Version=0
+    // (no construction_method).
     let color_offset_patch_pos;
     let alpha_offset_patch_pos;
+    let mut exif_offset_patch_pos = 0usize;
     {
         let s = f.len();
         write_fullbox(&mut f, b"iloc", 0, 0);
         f.push(0x44); // offset_size=4, length_size=4
         f.push(0x00); // base_offset_size=0, index_size=0
-        w16(&mut f, 2); // item_count = 2
+        w16(&mut f, item_count);
         // item 1: color
         w16(&mut f, 1);
         w16(&mut f, 0); // data_reference_index
@@ -571,20 +585,32 @@ pub(crate) fn wrap_av1_image_with_alpha(
         alpha_offset_patch_pos = f.len();
         w32(&mut f, 0);
         w32(&mut f, alpha_obu.len() as u32);
+        // item 3: EXIF
+        if let Some(p) = &exif_payload {
+            w16(&mut f, 3);
+            w16(&mut f, 0); // data_reference_index
+            w16(&mut f, 1);
+            exif_offset_patch_pos = f.len();
+            w32(&mut f, 0);
+            w32(&mut f, p.len() as u32);
+        }
         patch(&mut f, s);
     }
 
-    // iinf — two infe entries
+    // iinf — color, alpha, [EXIF]
     {
         let s = f.len();
         write_fullbox(&mut f, b"iinf", 0, 0);
-        w16(&mut f, 2); // entry_count
-        for id in [1u16, 2u16] {
+        w16(&mut f, item_count); // entry_count
+        for (id, kind) in [(1u16, b"av01"), (2, b"av01"), (3, b"Exif")]
+            .into_iter()
+            .take(item_count as usize)
+        {
             let si = f.len();
             write_fullbox(&mut f, b"infe", 2, 0);
             w16(&mut f, id);
             w16(&mut f, 0);
-            f.extend_from_slice(b"av01");
+            f.extend_from_slice(kind);
             f.push(0);
             patch(&mut f, si);
         }
@@ -599,6 +625,15 @@ pub(crate) fn wrap_av1_image_with_alpha(
             let sr = f.len();
             write_box(&mut f, b"auxl");
             w16(&mut f, 2); // from_item_ID = alpha
+            w16(&mut f, 1); // reference_count
+            w16(&mut f, 1); // to_item_ID = color
+            patch(&mut f, sr);
+        }
+        // EXIF (3) describes the color item (1) via 'cdsc' (libavif order: after auxl).
+        if exif_payload.is_some() {
+            let sr = f.len();
+            write_box(&mut f, b"cdsc");
+            w16(&mut f, 3); // from_item_ID = EXIF
             w16(&mut f, 1); // reference_count
             w16(&mut f, 1); // to_item_ID = color
             patch(&mut f, sr);
@@ -690,7 +725,8 @@ pub(crate) fn wrap_av1_image_with_alpha(
                 patch(&mut f, sh);
             }
 
-            // Optional transform + HDR properties (color item only), after auxC.
+            // Optional transform (both items) + HDR (color item only) properties,
+            // after auxC.
             let mut next_prop: u8 = next_colr + 3;
             if metadata.orientation.irot_steps() != 0 {
                 let sh = f.len();
@@ -725,29 +761,36 @@ pub(crate) fn wrap_av1_image_with_alpha(
             let si = f.len();
             write_fullbox(&mut f, b"ipma", 0, 0);
             w32(&mut f, 2); // entry_count
-            // color item 1: ispe(1), pixi(2), av1C(3,essential), colr(es) + optionals
+            // color item 1: ispe(1), pixi(2), av1C(3,essential), colr(es), clli,
+            // then irot/imir — HEIF requires descriptive before transformative.
             let mut c_assoc: Vec<u8> = vec![1, 2, 0x80 | 3];
             c_assoc.extend(colr_props.iter().copied());
+            if clli_idx != 0 {
+                c_assoc.push(clli_idx);
+            }
             if irot_idx != 0 {
                 c_assoc.push(0x80 | irot_idx);
             }
             if imir_idx != 0 {
                 c_assoc.push(0x80 | imir_idx);
             }
-            if clli_idx != 0 {
-                c_assoc.push(clli_idx);
-            }
             w16(&mut f, 1);
             f.push(c_assoc.len() as u8);
             f.extend_from_slice(&c_assoc);
             // alpha item 2: ispe(1), av1C(essential), pixi, auxC (indices shift
-            // with the number of colr boxes carried by the color item).
+            // with the number of colr boxes carried by the color item), then the
+            // color item's irot/imir: libavif applies cropping, rotation and
+            // mirroring to alpha auxiliary items too.
+            let mut a_assoc: Vec<u8> = vec![1, 0x80 | alpha_av1c_idx, alpha_pixi_idx, auxc_idx];
+            if irot_idx != 0 {
+                a_assoc.push(0x80 | irot_idx);
+            }
+            if imir_idx != 0 {
+                a_assoc.push(0x80 | imir_idx);
+            }
             w16(&mut f, 2);
-            f.push(4);
-            f.push(1); // ispe
-            f.push(0x80 | alpha_av1c_idx); // av1C alpha essential
-            f.push(alpha_pixi_idx); // pixi
-            f.push(auxc_idx); // auxC
+            f.push(a_assoc.len() as u8);
+            f.extend_from_slice(&a_assoc);
             patch(&mut f, si);
         }
         patch(&mut f, s);
@@ -762,10 +805,440 @@ pub(crate) fn wrap_av1_image_with_alpha(
     f.extend_from_slice(color_obu);
     let alpha_abs = f.len() as u32;
     f.extend_from_slice(alpha_obu);
+    let exif_abs = f.len() as u32;
+    if let Some(p) = &exif_payload {
+        f.extend_from_slice(p);
+    }
     patch(&mut f, mdat_start);
 
     f[color_offset_patch_pos..color_offset_patch_pos + 4].copy_from_slice(&color_abs.to_be_bytes());
     f[alpha_offset_patch_pos..alpha_offset_patch_pos + 4].copy_from_slice(&alpha_abs.to_be_bytes());
+    if exif_payload.is_some() {
+        f[exif_offset_patch_pos..exif_offset_patch_pos + 4]
+            .copy_from_slice(&exif_abs.to_be_bytes());
+    }
+
+    Ok(f)
+}
+
+// ─── Gain map container (item model) ─────────────────────────────────────────
+
+/// One coded AV1 image item of a gain-map file.
+pub(crate) struct CodedItem<'a> {
+    pub obu: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    /// 1 for monochrome / alpha, 3 for color.
+    pub channels: u8,
+    pub av1c: Av1cParams,
+}
+
+/// The gain map half of a gain-map file: the coded map, its `nclx`, and the
+/// `tmap` derived item's payload and alternate-rendition properties.
+pub(crate) struct GainMapItems<'a> {
+    pub gain_map: CodedItem<'a>,
+    pub gain_map_cicp: Cicp,
+    pub tmap_payload: &'a [u8],
+    pub alternate_cicp: Cicp,
+    pub alternate_icc: Option<&'a [u8]>,
+    pub alternate_clli: Option<ContentLightLevel>,
+    pub alternate_pixi: Option<(u8, u8)>,
+}
+
+/// ipco builder that, like libavif's `avifItemPropertyDedup`, writes a
+/// byte-identical property once and shares its index between items.
+struct PropertyContainer {
+    ipco: Vec<u8>,
+    props: Vec<Vec<u8>>,
+}
+
+impl PropertyContainer {
+    /// Add a complete property box; returns its ipma association byte.
+    fn add(&mut self, bx: Vec<u8>, essential: bool) -> Result<u8, EncodeError> {
+        let idx = match self.props.iter().position(|p| *p == bx) {
+            Some(i) => i + 1,
+            None => {
+                self.ipco.extend_from_slice(&bx);
+                self.props.push(bx);
+                self.props.len()
+            }
+        };
+        if idx > 0x7f {
+            return Err(EncodeError::IsobmffError(
+                "more than 127 item properties".into(),
+            ));
+        }
+        Ok(if essential { 0x80 } else { 0 } | idx as u8)
+    }
+}
+
+fn property(cc: &[u8; 4], full: Option<(u8, u32)>, body: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12 + body.len());
+    match full {
+        Some((ver, flags)) => write_fullbox(&mut b, cc, ver, flags),
+        None => write_box(&mut b, cc),
+    }
+    b.extend_from_slice(body);
+    patch(&mut b, 0);
+    b
+}
+
+fn ispe(width: u32, height: u32) -> Vec<u8> {
+    let mut body = width.to_be_bytes().to_vec();
+    body.extend_from_slice(&height.to_be_bytes());
+    property(b"ispe", Some((0, 0)), &body)
+}
+
+fn pixi(channels: u8, depth: u8) -> Vec<u8> {
+    let mut body = vec![channels];
+    body.extend(std::iter::repeat_n(depth, channels as usize));
+    property(b"pixi", Some((0, 0)), &body)
+}
+
+fn colr_prof(icc: &[u8]) -> Vec<u8> {
+    let mut body = b"prof".to_vec();
+    body.extend_from_slice(icc);
+    property(b"colr", None, &body)
+}
+
+fn coded_item_props(pc: &mut PropertyContainer, item: &CodedItem) -> Result<Vec<u8>, EncodeError> {
+    Ok(vec![
+        pc.add(ispe(item.width, item.height), false)?,
+        pc.add(pixi(item.channels, item.bit_depth), false)?,
+        pc.add(property(b"av1C", None, &build_av1c(&item.av1c)), true)?,
+    ])
+}
+
+/// `irot` / `imir` (transformative, essential) for `metadata.orientation`.
+fn transform_props(
+    pc: &mut PropertyContainer,
+    metadata: &Metadata,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut assoc = Vec::new();
+    let steps = metadata.orientation.irot_steps();
+    if steps != 0 {
+        assoc.push(pc.add(property(b"irot", None, &[steps & 0x03]), true)?);
+    }
+    if let Some(horizontal_axis) = metadata.orientation.imir_axis() {
+        assoc.push(pc.add(property(b"imir", None, &[horizontal_axis as u8]), true)?);
+    }
+    Ok(assoc)
+}
+
+/// Wrap a base image (with optional alpha) and an ISO 21496-1 gain map into an
+/// AVIF file, with the item layout libavif's `avifEncoderAddImageInternal`
+/// produces (see `crate::gain_map`):
+///
+/// * 1 `av01` base, primary; 2 `av01` alpha (`auxl` → 1) when present;
+///   then `tmap` (`dimg` → [base, gain map]); then the hidden `av01` gain map;
+///   then `Exif` (`cdsc` → 1).
+/// * `grpl`/`altr` = [tmap, base] so gain-map aware readers prefer `tmap`.
+/// * `ftyp` gains the `tmap` brand, without which libavif ignores the item.
+///
+/// Property placement follows libavif: descriptive properties before
+/// transformative ones; base/alpha/gain map items carry the `irot`/`imir`,
+/// the `tmap` item carries none; the base color `colr`/`clli` describe the
+/// base rendition, the `tmap` ones the alternate rendition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_av1_image_with_gain_map(
+    base: &CodedItem,
+    alpha: Option<&CodedItem>,
+    gain: &GainMapItems,
+    color_meta: Option<&Cicp>,
+    icc_profile: Option<&[u8]>,
+    metadata: &Metadata,
+) -> Result<Vec<u8>, EncodeError> {
+    const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+
+    let exif_payload: Option<Vec<u8>> = metadata.exif.as_ref().map(|e| {
+        let mut p = Vec::with_capacity(e.len() + 4);
+        p.extend_from_slice(&0u32.to_be_bytes()); // exif_tiff_header_offset = 0
+        p.extend_from_slice(e);
+        p
+    });
+
+    struct Item<'a> {
+        id: u16,
+        kind: &'a [u8; 4],
+        name: &'a [u8],
+        hidden: bool,
+        data: &'a [u8],
+        assoc: Vec<u8>,
+    }
+
+    let mut pc = PropertyContainer {
+        ipco: Vec::new(),
+        props: Vec::new(),
+    };
+    let mut items: Vec<Item> = Vec::new();
+    let mut next_id = 1u16;
+    let mut take_id = || {
+        let id = next_id;
+        next_id += 1;
+        id
+    };
+
+    // Base color item: ispe, pixi, av1C, colr prof, colr nclx, clli, irot/imir.
+    let base_id = take_id();
+    let mut assoc = coded_item_props(&mut pc, base)?;
+    if let Some(icc) = icc_profile {
+        assoc.push(pc.add(colr_prof(icc), false)?);
+    }
+    if let Some(cm) = color_meta {
+        assoc.push(pc.add(property(b"colr", None, &cm.nclx_payload()), false)?);
+    }
+    if let Some(cll) = metadata.content_light_level {
+        assoc.push(pc.add(property(b"clli", None, &cll.clli_payload()), false)?);
+    }
+    assoc.extend(transform_props(&mut pc, metadata)?);
+    items.push(Item {
+        id: base_id,
+        kind: b"av01",
+        name: b"Color\0",
+        hidden: false,
+        data: base.obu,
+        assoc,
+    });
+
+    // Alpha: ispe, pixi, av1C, auxC, irot/imir (transforms apply to alpha too).
+    let alpha_id = match alpha {
+        Some(a) => {
+            let id = take_id();
+            let mut assoc = coded_item_props(&mut pc, a)?;
+            assoc.push(pc.add(property(b"auxC", Some((0, 0)), ALPHA_URN), false)?);
+            assoc.extend(transform_props(&mut pc, metadata)?);
+            items.push(Item {
+                id,
+                kind: b"av01",
+                name: b"Alpha\0",
+                hidden: false,
+                data: a.obu,
+                assoc,
+            });
+            Some(id)
+        }
+        None => None,
+    };
+
+    // tmap: ispe (base size), [pixi], colr prof, colr nclx, clli — all of the
+    // alternate rendition. No transformative properties (libavif).
+    let tmap_id = take_id();
+    {
+        let mut assoc = vec![pc.add(ispe(base.width, base.height), false)?];
+        if let Some((channels, depth)) = gain.alternate_pixi {
+            assoc.push(pc.add(pixi(channels, depth), false)?);
+        }
+        if let Some(icc) = gain.alternate_icc {
+            assoc.push(pc.add(colr_prof(icc), false)?);
+        }
+        assoc.push(pc.add(
+            property(b"colr", None, &gain.alternate_cicp.nclx_payload()),
+            false,
+        )?);
+        if let Some(cll) = gain.alternate_clli {
+            assoc.push(pc.add(property(b"clli", None, &cll.clli_payload()), false)?);
+        }
+        items.push(Item {
+            id: tmap_id,
+            kind: b"tmap",
+            name: b"GMap\0",
+            hidden: false,
+            data: gain.tmap_payload,
+            assoc,
+        });
+    }
+
+    // Gain map: ispe, pixi, av1C, colr nclx, then the base's irot/imir.
+    let gain_id = take_id();
+    {
+        let mut assoc = coded_item_props(&mut pc, &gain.gain_map)?;
+        assoc.push(pc.add(
+            property(b"colr", None, &gain.gain_map_cicp.nclx_payload()),
+            false,
+        )?);
+        assoc.extend(transform_props(&mut pc, metadata)?);
+        items.push(Item {
+            id: gain_id,
+            kind: b"av01",
+            name: b"GMap\0",
+            hidden: true,
+            data: gain.gain_map.obu,
+            assoc,
+        });
+    }
+
+    let exif_id = match exif_payload.as_deref() {
+        Some(p) => {
+            let id = take_id();
+            items.push(Item {
+                id,
+                kind: b"Exif",
+                name: b"Exif\0",
+                hidden: false,
+                data: p,
+                assoc: Vec::new(),
+            });
+            Some(id)
+        }
+        None => None,
+    };
+    let group_id = take_id() as u32; // must differ from every item_ID
+
+    let mut f: Vec<u8> = Vec::new();
+
+    // ── ftyp ──────────────────────────────────────────────────────────────────
+    {
+        let s = f.len();
+        write_box(&mut f, b"ftyp");
+        f.extend_from_slice(b"avif");
+        w32(&mut f, 0);
+        for brand in [b"avif", b"mif1", b"miaf", b"tmap"] {
+            f.extend_from_slice(brand);
+        }
+        patch(&mut f, s);
+    }
+
+    // ── meta ──────────────────────────────────────────────────────────────────
+    let meta_start = f.len();
+    write_fullbox(&mut f, b"meta", 0, 0);
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"hdlr", 0, 0);
+        w32(&mut f, 0);
+        f.extend_from_slice(b"pict");
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        w32(&mut f, 0);
+        f.push(0);
+        patch(&mut f, s);
+    }
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"pitm", 0, 0);
+        w16(&mut f, base_id);
+        patch(&mut f, s);
+    }
+
+    // iloc — version 0, 4-byte offsets/lengths, one extent per item.
+    let mut offset_patches = Vec::with_capacity(items.len());
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iloc", 0, 0);
+        f.push(0x44);
+        f.push(0x00);
+        w16(&mut f, items.len() as u16);
+        for item in &items {
+            let len = u32::try_from(item.data.len())
+                .map_err(|_| EncodeError::IsobmffError("item exceeds 4 GiB".into()))?;
+            w16(&mut f, item.id);
+            w16(&mut f, 0); // data_reference_index
+            w16(&mut f, 1); // extent_count
+            offset_patches.push(f.len());
+            w32(&mut f, 0); // extent_offset — patched after mdat
+            w32(&mut f, len);
+        }
+        patch(&mut f, s);
+    }
+
+    // iinf
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iinf", 0, 0);
+        w16(&mut f, items.len() as u16);
+        for item in &items {
+            let si = f.len();
+            write_fullbox(&mut f, b"infe", 2, item.hidden as u32);
+            w16(&mut f, item.id);
+            w16(&mut f, 0); // item_protection_index
+            f.extend_from_slice(item.kind);
+            f.extend_from_slice(item.name);
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // iref — libavif order: auxl (alpha), dimg (tmap → base, gain map), cdsc.
+    {
+        let s = f.len();
+        write_fullbox(&mut f, b"iref", 0, 0);
+        let reference = |f: &mut Vec<u8>, kind: &[u8; 4], from: u16, to: &[u16]| {
+            let si = f.len();
+            write_box(f, kind);
+            w16(f, from);
+            w16(f, to.len() as u16);
+            for &t in to {
+                w16(f, t);
+            }
+            patch(f, si);
+        };
+        if let Some(a) = alpha_id {
+            reference(&mut f, b"auxl", a, &[base_id]);
+        }
+        // Order matters: the first dimg input is the base, the second the map.
+        reference(&mut f, b"dimg", tmap_id, &[base_id, gain_id]);
+        if let Some(e) = exif_id {
+            reference(&mut f, b"cdsc", e, &[base_id]);
+        }
+        patch(&mut f, s);
+    }
+
+    // iprp → ipco, ipma
+    {
+        let s = f.len();
+        write_box(&mut f, b"iprp");
+        {
+            let si = f.len();
+            write_box(&mut f, b"ipco");
+            f.extend_from_slice(&pc.ipco);
+            patch(&mut f, si);
+        }
+        {
+            let si = f.len();
+            write_fullbox(&mut f, b"ipma", 0, 0);
+            let with_props: Vec<&Item> = items.iter().filter(|i| !i.assoc.is_empty()).collect();
+            w32(&mut f, with_props.len() as u32);
+            for item in with_props {
+                w16(&mut f, item.id);
+                f.push(item.assoc.len() as u8);
+                f.extend_from_slice(&item.assoc);
+            }
+            patch(&mut f, si);
+        }
+        patch(&mut f, s);
+    }
+
+    // grpl → altr: the tone-mapped image is the preferred alternative.
+    {
+        let s = f.len();
+        write_box(&mut f, b"grpl");
+        let sa = f.len();
+        write_fullbox(&mut f, b"altr", 0, 0);
+        w32(&mut f, group_id);
+        w32(&mut f, 2); // num_entities_in_group
+        w32(&mut f, tmap_id as u32);
+        w32(&mut f, base_id as u32);
+        patch(&mut f, sa);
+        patch(&mut f, s);
+    }
+
+    patch(&mut f, meta_start);
+
+    // ── mdat ──────────────────────────────────────────────────────────────────
+    let mdat_start = f.len();
+    write_box(&mut f, b"mdat");
+    let mut offsets = Vec::with_capacity(items.len());
+    for item in &items {
+        offsets.push(
+            u32::try_from(f.len())
+                .map_err(|_| EncodeError::IsobmffError("file exceeds 4 GiB".into()))?,
+        );
+        f.extend_from_slice(item.data);
+    }
+    patch(&mut f, mdat_start);
+    for (pos, off) in offset_patches.into_iter().zip(offsets) {
+        f[pos..pos + 4].copy_from_slice(&off.to_be_bytes());
+    }
 
     Ok(f)
 }
@@ -1142,4 +1615,169 @@ mod tests {
     }
 
     const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+
+    /// Child boxes of `b[start..end]` as (fourcc, payload start, box end).
+    fn boxes(b: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = start;
+        while pos + 8 <= end {
+            let sz = u32::from_be_bytes(*b[pos..].first_chunk().unwrap()) as usize;
+            out.push((*b[pos + 4..].first_chunk().unwrap(), pos + 8, pos + sz));
+            pos += sz;
+        }
+        out
+    }
+
+    /// The (payload start, end) of the first child `cc` of `b[start..end]`.
+    fn child(b: &[u8], start: usize, end: usize, cc: &[u8; 4]) -> (usize, usize) {
+        let (_, s, e) = *boxes(b, start, end)
+            .iter()
+            .find(|(c, ..)| c == cc)
+            .unwrap_or_else(|| panic!("no {} box", String::from_utf8_lossy(cc)));
+        (s, e)
+    }
+
+    fn rd16(b: &[u8], at: usize) -> u16 {
+        u16::from_be_bytes(*b[at..].first_chunk().unwrap())
+    }
+
+    fn rd32(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(*b[at..].first_chunk().unwrap())
+    }
+
+    /// The `meta` payload range (after the full-box header).
+    fn meta(b: &[u8]) -> (usize, usize) {
+        let (s, e) = child(b, 0, b.len(), b"meta");
+        (s + 4, e)
+    }
+
+    /// ipma associations as (item_ID, association bytes); version 0, flags 0.
+    fn ipma_entries(b: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let (ms, me) = meta(b);
+        let (ps, pe) = child(b, ms, me, b"iprp");
+        let (s, _) = child(b, ps, pe, b"ipma");
+        let mut pos = s + 4;
+        let count = rd32(b, pos);
+        pos += 4;
+        (0..count)
+            .map(|_| {
+                let id = rd16(b, pos);
+                let n = b[pos + 2] as usize;
+                let assoc = b[pos + 3..pos + 3 + n].to_vec();
+                pos += 3 + n;
+                (id, assoc)
+            })
+            .collect()
+    }
+
+    /// 1-based ipco index of the first property `cc`.
+    fn ipco_index(b: &[u8], cc: &[u8; 4]) -> u8 {
+        let (ms, me) = meta(b);
+        let (ps, pe) = child(b, ms, me, b"iprp");
+        let (s, e) = child(b, ps, pe, b"ipco");
+        boxes(b, s, e).iter().position(|(c, ..)| c == cc).unwrap() as u8 + 1
+    }
+
+    fn wrap_alpha(metadata: &Metadata) -> Vec<u8> {
+        wrap_av1_image_with_alpha(
+            &[0x10, 0x11],
+            &[0x20, 0x21, 0x22],
+            16,
+            16,
+            8,
+            &dummy_av1c(),
+            &dummy_av1c(),
+            Some(&Cicp::default()),
+            None,
+            metadata,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn alpha_with_exif_writes_exif_item_and_cdsc() {
+        let exif = b"MM\0\x2a\0\0\0\x08exif-body".to_vec();
+        let b = wrap_alpha(&Metadata::new().with_exif(exif.clone()));
+        let (ms, me) = meta(&b);
+
+        // iinf: color, alpha, Exif.
+        let (is, ie) = child(&b, ms, me, b"iinf");
+        assert_eq!(rd16(&b, is + 4), 3, "iinf entry_count");
+        let infes: Vec<(u16, [u8; 4])> = boxes(&b, is + 6, ie)
+            .iter()
+            .map(|&(_, s, _)| (rd16(&b, s + 4), *b[s + 8..].first_chunk().unwrap()))
+            .collect();
+        assert_eq!(infes, vec![(1, *b"av01"), (2, *b"av01"), (3, *b"Exif")]);
+
+        // iref: auxl 2 → 1, then cdsc 3 → 1.
+        let (rs, re) = child(&b, ms, me, b"iref");
+        let refs: Vec<([u8; 4], u16, u16, u16)> = boxes(&b, rs + 4, re)
+            .iter()
+            .map(|&(c, s, _)| (c, rd16(&b, s), rd16(&b, s + 2), rd16(&b, s + 4)))
+            .collect();
+        assert_eq!(refs, vec![(*b"auxl", 2, 1, 1), (*b"cdsc", 3, 1, 1)]);
+
+        // iloc item 3 points at the 4-byte tiff offset + EXIF bytes in mdat;
+        // items 1 and 2 still point at their OBUs.
+        let (ls, _) = child(&b, ms, me, b"iloc");
+        assert_eq!(rd16(&b, ls + 6), 3, "iloc item_count");
+        let mut expected = vec![0u8; 4];
+        expected.extend_from_slice(&exif);
+        let payloads: [&[u8]; 3] = [&[0x10, 0x11], &[0x20, 0x21, 0x22], &expected];
+        for (i, want) in payloads.iter().enumerate() {
+            let at = ls + 8 + i * 14;
+            assert_eq!(rd16(&b, at) as usize, i + 1, "iloc item_ID");
+            let off = rd32(&b, at + 6) as usize;
+            let len = rd32(&b, at + 10) as usize;
+            assert_eq!(&b[off..off + len], *want, "item {} extent", i + 1);
+        }
+        let (_, md_s, md_e) = *boxes(&b, 0, b.len())
+            .iter()
+            .find(|(c, ..)| c == b"mdat")
+            .unwrap();
+        assert_eq!(md_e - md_s, 2 + 3 + expected.len(), "mdat payload size");
+    }
+
+    #[test]
+    fn alpha_transforms_associated_with_both_items() {
+        // Transpose = irot + imir; clli must stay on the color item only.
+        let md = Metadata::new()
+            .with_orientation(crate::metadata::Orientation::Transpose)
+            .with_content_light_level(crate::metadata::ContentLightLevel::new(1000, 400));
+        let b = wrap_alpha(&md);
+        let irot = 0x80 | ipco_index(&b, b"irot");
+        let imir = 0x80 | ipco_index(&b, b"imir");
+        let clli = ipco_index(&b, b"clli");
+        let auxc = ipco_index(&b, b"auxC");
+        let entries = ipma_entries(&b);
+        assert_eq!(entries.len(), 2);
+        let (color, alpha) = (&entries[0], &entries[1]);
+        assert_eq!((color.0, alpha.0), (1, 2));
+        for (id, assoc) in [color, alpha] {
+            assert!(assoc.contains(&irot), "irot not associated with item {id}");
+            assert!(assoc.contains(&imir), "imir not associated with item {id}");
+            // Transformative properties come after every descriptive one.
+            let first_tx = assoc.iter().position(|&a| a == irot).unwrap();
+            assert!(
+                assoc[first_tx..].iter().all(|&a| a == irot || a == imir),
+                "item {id}: descriptive property after a transform"
+            );
+        }
+        assert!(color.1.contains(&clli), "clli on color");
+        assert!(!alpha.1.contains(&clli), "clli must not be on alpha");
+        assert_eq!(&alpha.1[3..], &[auxc, irot, imir]);
+    }
+
+    #[test]
+    fn alpha_without_metadata_has_no_exif_or_transforms() {
+        let b = wrap_alpha(&Metadata::default());
+        let (ms, me) = meta(&b);
+        let (is, _) = child(&b, ms, me, b"iinf");
+        assert_eq!(rd16(&b, is + 4), 2, "iinf entry_count");
+        let (rs, re) = child(&b, ms, me, b"iref");
+        assert_eq!(boxes(&b, rs + 4, re).len(), 1, "auxl only");
+        let entries = ipma_entries(&b);
+        assert_eq!(entries[1].1.len(), 4, "alpha: ispe, av1C, pixi, auxC");
+        assert!(!b.array_windows::<4>().any(|w| w == b"irot" || w == b"imir"));
+    }
 }

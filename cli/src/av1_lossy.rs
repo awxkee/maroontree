@@ -36,6 +36,7 @@ use maroontree::{
     encode_rgba10_with_alpha, encode_rgba12_with_alpha,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_av1(
     img: &image::DynamicImage,
     args: &Args,
@@ -44,6 +45,7 @@ pub(crate) fn encode_av1(
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
     png_cicp: Option<PngCicp>,
+    gain_map: Option<maroontree::GainMap>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -52,7 +54,16 @@ pub(crate) fn encode_av1(
     };
 
     if args.lossless {
-        return encode_av1_lossless(img, args, color_type, effective_depth, icc, exif, png_cicp);
+        return encode_av1_lossless(
+            img,
+            args,
+            color_type,
+            effective_depth,
+            icc,
+            exif,
+            png_cicp,
+            gain_map,
+        );
     }
 
     let cicp = png_cicp
@@ -81,6 +92,7 @@ pub(crate) fn encode_av1(
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
+    cfg.gain_map = gain_map;
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;

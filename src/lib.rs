@@ -54,6 +54,7 @@ mod dct;
 mod encoder;
 mod encoding_context;
 mod err;
+mod gain_map;
 mod idct;
 mod intrapred;
 mod isobmff;
@@ -103,5 +104,6 @@ pub use encoder::{
     encode_lossless_gray_obu, encode_lossless_obu, encode_lossless_with_alpha,
 };
 pub use err::EncodeError;
+pub use gain_map::{GainMap, GainMapFloats, GainMapImage, IsoGainMap};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use pixel::{BitDepth, Pixel};
