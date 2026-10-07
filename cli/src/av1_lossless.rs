@@ -86,6 +86,11 @@ pub(crate) fn encode_av1_lossless(
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
+    // Gray sources are coded as 4:0:0; the gray+alpha entry point rejects a
+    // 4:4:4 config.
+    if gray {
+        cfg = cfg.with_chroma(ChromaFormat::Monochrome);
+    }
 
     Ok(match (effective_depth, gray, alpha) {
         (Depth::D8, true, alpha) => {
@@ -95,17 +100,17 @@ pub(crate) fn encode_av1_lossless(
                         img.width() as usize,
                         img.height() as usize,
                         BitDepth::Eight,
-                        &img.to_luma8(),
+                        &img.to_luma_alpha8(),
                     )?,
                     &cfg,
                 )?
             } else {
                 encode_lossless_gray(
-                    &PlanarImage::from_interleaved_gray_alpha(
+                    &PlanarImage::from_luma(
                         img.width() as usize,
                         img.height() as usize,
                         BitDepth::Eight,
-                        &img.to_luma_alpha8(),
+                        &img.to_luma8(),
                     )?,
                     &cfg,
                 )?

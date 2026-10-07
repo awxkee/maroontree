@@ -346,7 +346,7 @@ impl<'a> LossyTile<'a> {
                 } else {
                     0.0
                 }
-        }) * if self.top_band() && self.ss420 {
+        }) * if self.top_band() && self.ss420 && !self.palette_exact(px, py, 32) {
             top_none_bias_420(self.aq.base_q)
         } else {
             self.none32_split_bias_at()

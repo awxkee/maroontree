@@ -186,6 +186,12 @@ pub(crate) struct Tuning {
     pub(crate) full_chroma_rdo_medium: bool,
     pub(crate) min_size_16_fast: bool,
     pub(crate) min_size_16_medium: bool,
+    /// PARTITION_HORZ/VERT at the 64x64 superblock (BLOCK_64X32 / BLOCK_32X64).
+    pub(crate) rect64: bool,
+    /// R-D multiplier on the rect64 legs (1.0 = priced like whole-64 NONE).
+    pub(crate) rect64_bias: f32,
+    /// TEST ONLY: 1 forces HORZ, 2 forces VERT (where legal) at every in-frame 64x64.
+    pub(crate) rect64_force: u32,
     pub(crate) min_size_16_slow: bool,
     pub(crate) guided16_k_fast: f32,
     pub(crate) guided16_k_medium: f32,
@@ -338,6 +344,9 @@ impl Tuning {
         full_chroma_rdo_medium: true,
         min_size_16_fast: false,
         min_size_16_medium: true,
+        rect64: false,
+        rect64_bias: 1.0,
+        rect64_force: 0,
         min_size_16_slow: false,
         guided16_k_fast: 0.0,
         guided16_k_medium: 0.0,
@@ -520,6 +529,9 @@ mod imp {
                 "full_chroma_rdo_medium" => t.full_chroma_rdo_medium = flag(value),
                 "min_size_16_fast" => t.min_size_16_fast = flag(value),
                 "min_size_16_medium" => t.min_size_16_medium = flag(value),
+                "rect64" => t.rect64 = flag(value),
+                "rect64_bias" => t.rect64_bias = num(value),
+                "rect64_force" => t.rect64_force = num(value) as u32,
                 "min_size_16_slow" => t.min_size_16_slow = flag(value),
                 "guided16_k_fast" => t.guided16_k_fast = num(value),
                 "guided16_k_medium" => t.guided16_k_medium = num(value),

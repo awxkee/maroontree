@@ -2712,8 +2712,8 @@ pub(crate) fn encode_32x16_luma_coeffs(
     res_ctx
 }
 
-/// Chroma coeff coder for RTX_32X16 (32 wide x 16 tall).
-#[cfg(any())]
+/// Chroma coeff coder for RTX_32X16 (32 wide x 16 tall): 4:2:0 chroma of a
+/// 64x32 luma block.
 pub(crate) fn encode_32x16_chroma_coeffs(
     enc: &mut OdEcEncoder,
     cdfs: &mut Cdfs,

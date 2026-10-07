@@ -1394,6 +1394,7 @@ include!("coder/block16.rs");
 include!("coder/block8.rs");
 include!("coder/block32.rs");
 include!("coder/block64.rs");
+include!("coder/block64_rect.rs");
 include!("coder/superblock.rs");
 
 #[allow(clippy::too_many_arguments)]
@@ -2902,28 +2903,6 @@ pub(crate) fn resolve_threads(threads: usize) -> usize {
     }
 }
 
-/// Whether a single-tile AV1 wavefront is mathematically too narrow to feed
-/// the requested worker count. Replay owns one lane; capture is bounded by
-/// both total work and the left/above/above-right dependency chain.
-fn wavefront_should_use_tiles(sb_cols: usize, sb_rows: usize, threads: usize) -> bool {
-    if threads <= 1 || sb_cols == 0 || sb_rows == 0 {
-        return false;
-    }
-    let cells = sb_cols * sb_rows;
-    // Small frames never tile: the thread count would change the TILING PLAN
-    // and thus the bitstream (t2/t3/t8 on a 6x9-SB frame produced 2/4/8-tile
-    // grids, +6% bytes at t8), breaking the -tN == -t1 invariant for frames
-    // that encode in ~a second anyway. 256 SBs = ~1MP.
-    if cells < 256 {
-        return false;
-    }
-    let wave_work_floor = cells.div_ceil(threads - 1);
-    let wave_dependency_floor = sb_cols + 2 * sb_rows.saturating_sub(1);
-    let wave_floor = wave_work_floor.max(wave_dependency_floor);
-    let tile_floor = cells.div_ceil(threads);
-    wave_floor * 100 > tile_floor * 135
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lossy_tilegroup(
     base_q_idx: u8,
@@ -2961,18 +2940,15 @@ pub(crate) fn encode_lossy_tilegroup(
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
 
-    // Aim for ~one tile per worker so small frames can be paralleled too.
-    // `threads == 1` -> target 1 -> spec-minimum tiling (single tile for small
-    // frames, byte-identical to the untiled output).
     let want = pool.width();
-    // Prefer minimal tiling + SB wavefront when the dependency graph can feed
-    // the requested worker count. Otherwise, use ordinary parallel tiles: a
-    // narrow WPP graph cannot manufacture parallelism, and forcing it was up
-    // to 2-3x slower on small/medium images.
-    let multitile =
-        want > 1 && wavefront_should_use_tiles(sb_cols as usize, sb_rows as usize, want);
-    let tile_target = if multitile { want } else { 1 };
-    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
+    // Always the spec-minimum tiling (one tile unless the frame is wider than
+    // MAX_TILE_WIDTH), parallelized by the SB wavefront inside each tile. The
+    // tiling plan must NOT depend on the thread count: a different tile grid
+    // is a different bitstream, which broke -tN == -t1 (t2/t3 tiled every
+    // frame >= 256 SBs, t8+ most 1-3MP frames) and cost 1-4% bytes. The
+    // wavefront is narrower than tiles on medium frames at high thread
+    // counts (~+0.07s on a 1MP 444 encode at -t 12), equal or faster at t2/t3.
+    let plan = plan_tiling(sb_cols, sb_rows, 1);
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -3112,7 +3088,7 @@ pub(crate) fn encode_lossy_tilegroup(
     // the tile pool would oversubscribe — same no-nesting rule as the AV2
     // wavefront). Wide frames get mandatory column tiles (MAX_TILE_WIDTH), so
     // per-tile is the only shape that covers them.
-    let wf_threads = if want > 1 && !multitile { want } else { 0 };
+    let wf_threads = if want > 1 { want } else { 0 };
 
     // Recording the symbol trace lets a winning Wiener unit or a per-unit CDEF
     // grid be signaled by a cheap replay instead of a second full encode of
@@ -4646,6 +4622,15 @@ fn encode_one_lossless_tile(
     )
 }
 
+/// Tile count requested for a lossless frame. Lossless has no SB wavefront —
+/// independent tiles are its only parallelism — but the grid must be a
+/// function of the FRAME alone: the old one-tile-per-worker target made the
+/// bitstream depend on `-t`. At least 16 SBs per tile, at most 16 tiles (what
+/// `-t 12` already produced); tiling costs ~0.2-1% bytes over a single tile.
+fn lossless_tile_target(sb_cols: u32, sb_rows: u32) -> usize {
+    ((sb_cols as usize * sb_rows as usize) / 16).clamp(1, 16)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_lossless_tilegroup(
     bd: u8,
@@ -4660,9 +4645,7 @@ fn encode_lossless_tilegroup(
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
-    let want = pool.width();
-    let tile_target = want.min((sb_cols as usize) * (sb_rows as usize)).max(1);
-    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
+    let plan = plan_tiling(sb_cols, sb_rows, lossless_tile_target(sb_cols, sb_rows));
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -4680,7 +4663,7 @@ fn encode_lossless_tilegroup(
     }
 
     let n = rects.len();
-    let nthreads = want.clamp(1, n.max(1));
+    let nthreads = pool.width().clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
         encode_one_lossless_tile(
             bd,
@@ -4770,11 +4753,7 @@ fn encode_lossless_mono_tilegroup(
 ) -> (Vec<u8>, Tiling) {
     let sb_cols = w8.div_ceil(64) as u32;
     let sb_rows = h8.div_ceil(64) as u32;
-    let want = pool.width();
-    // One tile per worker, spec- and superblock-clamped. See
-    // `encode_lossless_tilegroup` for the full rationale.
-    let tile_target = want.min((sb_cols as usize) * (sb_rows as usize)).max(1);
-    let plan = plan_tiling(sb_cols, sb_rows, tile_target);
+    let plan = plan_tiling(sb_cols, sb_rows, lossless_tile_target(sb_cols, sb_rows));
     let col_starts = tile_starts_sb(sb_cols, plan.tcl);
     let row_starts = tile_starts_sb(sb_rows, plan.trl);
 
@@ -4791,7 +4770,7 @@ fn encode_lossless_mono_tilegroup(
     }
 
     let n = rects.len();
-    let nthreads = want.clamp(1, n.max(1));
+    let nthreads = pool.width().clamp(1, n.max(1));
     let payloads: Vec<Vec<u8>> = pool.map_indexed(nthreads, n, |i| {
         encode_one_lossless_tile_mono(
             bd,
@@ -5133,14 +5112,6 @@ mod aq_tests {
         ));
     }
 
-    #[test]
-    fn wavefront_falls_back_only_when_the_sb_graph_is_too_narrow() {
-        assert!(wavefront_should_use_tiles(24, 14, 12));
-        assert!(!wavefront_should_use_tiles(26, 17, 8));
-        assert!(!wavefront_should_use_tiles(110, 73, 12));
-        assert!(!wavefront_should_use_tiles(24, 14, 1));
-    }
-
     /// `precompute_aq_grid` must reproduce the serial `aq_begin_sb` accumulator
     /// walk bit-exactly — every cell's qindex, signaled steps, and the resulting
     /// quantizer state — on a padded (non-64-aligned) frame with mixed
@@ -5398,7 +5369,7 @@ mod aq_tests {
         let mut tile =
             LossyTile::new(160, 8, 64, 64, &src, QmLevels::FLAT).with_speed(Speed::Medium);
         let before = tile.recon[0].clone();
-        let (_, cost) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
+        let (_, _, cost) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
         assert!(cost.is_finite());
         assert_eq!(tile.recon[0], before);
     }

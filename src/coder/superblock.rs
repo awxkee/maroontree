@@ -756,6 +756,19 @@ impl<'a> LossyTile<'a> {
                 self.l_part[y8..y8 + 8].fill(0x10);
                 return;
             }
+            if choice == Part16::Horz || choice == Part16::Vert {
+                let vert = choice == Part16::Vert;
+                let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+                self.enc
+                    .encode_symbol(1 + vert as usize, &mut self.cdfs.part_split[bl - 1][ctx]);
+                self.code_block64_rect(x8, y8, vert, thr, lhb);
+                // dav1d `al_part_ctx` bl64: h -> above 0x10, left 0x18;
+                // v -> above 0x18, left 0x10.
+                let (a, l) = if vert { (0x18, 0x10) } else { (0x10, 0x18) };
+                self.a_part[x8..x8 + 8].fill(a);
+                self.l_part[y8..y8 + 8].fill(l);
+                return;
+            }
         }
         let hh = sz8 / 2;
         // content past the horizontal / vertical midpoint of this block?

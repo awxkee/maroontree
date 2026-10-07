@@ -1747,6 +1747,21 @@ impl<'a> LossyTile<'a> {
         base + (t.none64_split_bias_444_top - base) * self.top_bias_t_444()
     }
 
+    /// Whether the `dim`x`dim` luma block holds 2..=8 distinct samples, i.e.
+    /// is exactly palette-codable. The 4:2:0 top-band split pressure (NONE
+    /// bias) is skipped there.
+    ///
+    /// The colors must also SPAN a wide range (>= 64 at 8-bit): a smooth
+    /// gradient quantizes to a few ADJACENT shades per block too, and those
+    /// regions still want the split pressure (s_buddha glow +3% rate without it).
+    fn palette_exact(&self, px: usize, py: usize, dim: usize) -> bool {
+        block_color_histogram(&self.src[0], self.w, px, py, dim, dim).is_some_and(|hist| {
+            let values = hist.as_slice().iter().map(|&(v, _)| v);
+            let span = values.clone().max().unwrap_or(0) - values.min().unwrap_or(0);
+            hist.len() <= 8 && span >= 64 << (self.bd - 8)
+        })
+    }
+
     fn top_band(&self) -> bool {
         self.aq.enabled
             && !self.mono
@@ -2960,7 +2975,11 @@ impl<'a> LossyTile<'a> {
                 }
         };
         let selection_only_bias_444 = self.top_band() && !self.ss420 && !self.ss422;
-        let none_bias = if self.ss420 && self.aq.enabled && !self.mono && self.speed.at_least_slow()
+        let none_bias = if self.ss420
+            && self.aq.enabled
+            && !self.mono
+            && self.speed.at_least_slow()
+            && !self.palette_exact(px, py, 16)
         {
             1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.aq.base_q, SEAM_W_420)
         } else if self.ss422 && self.aq.enabled && !self.mono && self.speed.at_least_slow() {

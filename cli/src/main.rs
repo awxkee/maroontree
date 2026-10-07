@@ -46,6 +46,8 @@
 //!       --no-alpha                           Discard alpha channel
 //!       --no-screen-content                  Skip palette (screen-content) search
 //!       --no-intrabc                         Veto lossy IntraBC (keeps loop filters)
+//!       --cdef                               Enable AV1 CDEF (per-unit RD strength search)
+//!       --wiener                             Enable luma Wiener loop restoration
 //!       --no-exif                            Strip EXIF from output
 //!       --no-icc                             Strip ICC profile from output
 //!   -s, --speed                              Encoding effort: extraslow|slow|medium|fast (default = slow)
@@ -122,6 +124,8 @@ struct Args {
     updating_cdf: bool,
     screen_content: bool,
     intrabc: bool,
+    cdef: bool,
+    wiener: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +244,8 @@ Options:
       --no-alpha                        Discard alpha channel
       --no-screen-content               Skip palette (screen-content) search
       --no-intrabc                      Veto lossy IntraBC (keeps loop filters)
+      --cdef                            Enable AV1 CDEF (per-unit RD strength search)
+      --wiener                          Enable luma Wiener loop restoration
       --no-exif                         Strip EXIF metadata from output
       --no-icc                          Strip ICC color profile from output
       --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
@@ -301,6 +307,8 @@ fn parse_args() -> Args {
     let mut no_alpha = false;
     let mut screen_content = true;
     let mut intrabc = true;
+    let mut cdef = false;
+    let mut wiener = false;
     let mut no_exif = false;
     let mut no_icc = false;
     let mut apply_icc = false;
@@ -317,6 +325,8 @@ fn parse_args() -> Args {
             "--no-alpha" => no_alpha = true,
             "--no-screen-content" => screen_content = false,
             "--no-intrabc" => intrabc = false,
+            "--cdef" => cdef = true,
+            "--wiener" => wiener = true,
             "--no-exif" => no_exif = true,
             "--no-icc" => no_icc = true,
             "--apply-icc" => apply_icc = true,
@@ -436,6 +446,8 @@ fn parse_args() -> Args {
         no_alpha,
         screen_content,
         intrabc,
+        cdef,
+        wiener,
         no_exif,
         no_icc,
         apply_icc,

@@ -681,6 +681,8 @@ mod tests {
                 updating_cdf: false,
                 screen_content: false,
                 intrabc: false,
+                cdef: false,
+                wiener: false,
             }
         }
 
