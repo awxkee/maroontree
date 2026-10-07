@@ -303,6 +303,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
+            uv_delta: 0,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             vis: [(w, h); 3],
@@ -394,6 +395,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
+            uv_delta: 0,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             vis: [(w, h); 3],
@@ -494,6 +496,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
+            uv_delta: 0,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             vis: [(w, h), (cw, h), (cw, h)],
@@ -594,6 +597,7 @@ impl<'a> LossyTile<'a> {
             allow_intrabc: false,
             screen_content: true,
             screen_frame: false,
+            uv_delta: 0,
             ibc_mv: Vec::new(),
             ibc_end4: (w / 4, h / 4),
             vis: [(w, h), (cw, ch), (cw, ch)],
@@ -758,6 +762,30 @@ impl<'a> LossyTile<'a> {
         let slack = crate::tuning::rate_bound_slack(self.speed);
         let bound = if slack < 1.0 { bound * slack } else { bound };
         crate::rate::real_block_bits_bounded(cf, scan, &ctx, bound)
+    }
+
+    /// Exact bits of a whole-64 TX_64X64 luma transform: the coded 32x32 at
+    /// coefficient class 4, `txb_skip` ctx 0 (block == transform) and the
+    /// 16-unit DC-sign span. DCT_DCT is implied (no txtp symbol).
+    pub(crate) fn luma_bits_tx64(&self, cf: &[i32], px: usize, py: usize) -> f32 {
+        if use_proxy_rate(self.speed) {
+            return block_rate_bits(cf, &SCAN_32X32);
+        }
+        let c = self.dcdf();
+        let tables = self.coef_cost_tables();
+        let ctx = crate::rate::RateCtx {
+            cdfs: c,
+            tables: &tables,
+            cls: 4,
+            plane: 0,
+            w: 32,
+            h: 32,
+            eob_bin: &c.eob_bin_1024_l,
+            skip_ctx: 0,
+            dcs_ctx: self.dc_sign_ctx_span(0, px / 4, py / 4, 16, 16),
+            txtp: None,
+        };
+        crate::rate::real_block_bits_bounded(cf, &SCAN_32X32, &ctx, f32::INFINITY)
     }
 
     /// The coefficient result context a coded transform block leaves in
@@ -1745,6 +1773,21 @@ impl<'a> LossyTile<'a> {
         let t = crate::tuning::get();
         let base = t.none64_split_bias;
         base + (t.none64_split_bias_444_top - base) * self.top_bias_t_444()
+    }
+
+    /// Whether the `dim`x`dim` luma block holds 2..=8 distinct samples, i.e.
+    /// is exactly palette-codable. The 4:2:0 top-band split pressure (NONE
+    /// bias) is skipped there.
+    ///
+    /// The colors must also SPAN a wide range (>= 64 at 8-bit): a smooth
+    /// gradient quantizes to a few ADJACENT shades per block too, and those
+    /// regions still want the split pressure (s_buddha glow +3% rate without it).
+    fn palette_exact(&self, px: usize, py: usize, dim: usize) -> bool {
+        block_color_histogram(&self.src[0], self.w, px, py, dim, dim).is_some_and(|hist| {
+            let values = hist.as_slice().iter().map(|&(v, _)| v);
+            let span = values.clone().max().unwrap_or(0) - values.min().unwrap_or(0);
+            hist.len() <= 8 && span >= 64 << (self.bd - 8)
+        })
     }
 
     fn top_band(&self) -> bool {
@@ -2960,7 +3003,11 @@ impl<'a> LossyTile<'a> {
                 }
         };
         let selection_only_bias_444 = self.top_band() && !self.ss420 && !self.ss422;
-        let none_bias = if self.ss420 && self.aq.enabled && !self.mono && self.speed.at_least_slow()
+        let none_bias = if self.ss420
+            && self.aq.enabled
+            && !self.mono
+            && self.speed.at_least_slow()
+            && !self.palette_exact(px, py, 16)
         {
             1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.aq.base_q, SEAM_W_420)
         } else if self.ss422 && self.aq.enabled && !self.mono && self.speed.at_least_slow() {
@@ -3359,6 +3406,13 @@ impl<'a> LossyTile<'a> {
     /// Whether a palette candidate may be trialled at all: the speed tier must
     /// admit the search AND the frame must be flagged as screen content.
     #[inline]
+    /// Winner modes the square-leaf angle-delta refinement explores: the six
+    /// diagonals, plus V_PRED/H_PRED with the `ad_vh` knob.
+    pub(crate) fn angle_delta_refines(&self, mode: usize) -> bool {
+        (V_PRED..=VERT_LEFT_PRED).contains(&mode)
+            && (crate::tuning::get().ad_vh || (mode != V_PRED && mode != H_PRED))
+    }
+
     pub(crate) fn try_palette(&self) -> bool {
         self.screen_content && self.speed.try_palette()
     }

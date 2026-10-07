@@ -214,7 +214,7 @@ pub(crate) fn dc_pred_avx2(
 ) -> i32 {
     let have_top = oy > 0;
     let have_left = ox > 0;
-    let mut edges = [0u16; 64];
+    let mut edges = [0u16; 128];
     let mut len = 0;
     if have_top {
         edges[..width].copy_from_slice(&recon[(oy - 1) * stride + ox..][..width]);

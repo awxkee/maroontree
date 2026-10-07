@@ -1791,8 +1791,8 @@ mod tests {
         if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
             return None;
         }
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as usize;
+        let width = u32::from_be_bytes(*bytes[16..].first_chunk()?) as usize;
+        let height = u32::from_be_bytes(*bytes[20..].first_chunk()?) as usize;
         Some((width, height))
     }
 

@@ -543,8 +543,8 @@ macro_rules! inv_dct32_v_x8_s16 {
     unrotate5!(15, 30, 29, 27, 23);
 
     let (even, w) = c.split_at_mut(16);
-    let even: &mut [I16x8v; 16] = even.try_into().unwrap();
-    let w: &mut [I16x8v; 16] = w.try_into().unwrap();
+    let even: &mut [I16x8v; 16] = even.first_chunk_mut().unwrap();
+    let w: &mut [I16x8v; 16] = w.first_chunk_mut().unwrap();
     inv_dct16_v_x8_s16!(even);
 
     w.swap(1, 8);
@@ -1504,8 +1504,8 @@ fn inv_dct32_v_x4(c: &mut [I32x4; 32], min: i32, max: i32) {
     unrotate5!(15, 30, 29, 27, 23);
 
     let (even, w) = c.split_at_mut(16);
-    let even: &mut [I32x4; 16] = even.try_into().unwrap();
-    let w: &mut [I32x4; 16] = w.try_into().unwrap();
+    let even: &mut [I32x4; 16] = even.first_chunk_mut().unwrap();
+    let w: &mut [I32x4; 16] = w.first_chunk_mut().unwrap();
     inv_dct16_v_x4(even, min, max);
     let mn = vdupq_n_s32(min);
     let mx = vdupq_n_s32(max);
@@ -2450,7 +2450,7 @@ mod s16_real_data {
             let base = b * dim * dim * 4;
             let get = |r: usize, l: usize| {
                 let o = base + (r * dim + l) * 4;
-                i32::from_le_bytes(raw[o..o + 4].try_into().unwrap())
+                i32::from_le_bytes(*raw[o..].first_chunk().unwrap())
             };
             let mut want = vec![vec![0i32; dim]; dim];
             let mut got = vec![vec![0i32; dim]; dim];
@@ -2561,7 +2561,7 @@ mod s16_real_data {
             for r in 0..8 {
                 for l in 0..8 {
                     let o = base + (r * 8 + l) * 4;
-                    src[r][l] = i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+                    src[r][l] = i32::from_le_bytes(*raw[o..].first_chunk().unwrap());
                 }
             }
             let (min, max) = (i16::MIN as i32, i16::MAX as i32);
@@ -2635,7 +2635,7 @@ mod s16_bench {
         let (min, max) = (i16::MIN as i32, i16::MAX as i32);
         let get = |b: usize, r: usize, l: usize| {
             let o = b * per + (r * dim + l) * 4;
-            i32::from_le_bytes(raw[o..o + 4].try_into().unwrap())
+            i32::from_le_bytes(*raw[o..].first_chunk().unwrap())
         };
 
         // ---- preconvert (untimed) ----

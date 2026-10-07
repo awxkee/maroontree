@@ -186,6 +186,43 @@ pub(crate) struct Tuning {
     pub(crate) full_chroma_rdo_medium: bool,
     pub(crate) min_size_16_fast: bool,
     pub(crate) min_size_16_medium: bool,
+    /// PARTITION_HORZ/VERT at the 64x64 superblock (BLOCK_64X32 / BLOCK_32X64).
+    pub(crate) rect64: bool,
+    /// R-D multiplier on the rect64 legs (1.0 = priced like whole-64 NONE).
+    pub(crate) rect64_bias: f32,
+    /// TEST ONLY: 1 forces HORZ, 2 forces VERT (where legal) at every in-frame 64x64.
+    pub(crate) rect64_force: u32,
+    /// TX_64X64 as a whole-64 luma alternative to four TX_32X32.
+    pub(crate) tx64: bool,
+    /// R-D multiplier on the TX_64X64 candidate (1.0 = priced like 4xTX_32X32).
+    pub(crate) tx64_bias: f32,
+    /// TEST ONLY: code every whole-64 luma as TX_64X64.
+    pub(crate) tx64_force: bool,
+    /// Also offer the DC TX_64X64 leg to the whole-64 NONE-vs-SPLIT estimator.
+    pub(crate) tx64_none: bool,
+    /// Square-leaf angle-delta refinement also on V_PRED / H_PRED winners
+    /// (was diagonals-only; 2026-10-07: 420 synth -0.86 / tuning -0.44,
+    /// 422 tuning -0.40, 444 synth -0.22 / tuning -0.09).
+    pub(crate) ad_vh: bool,
+    /// Rect16 leaves also search V_PRED +1..3 / H_PRED -1..-3 angle deltas
+    /// (444 synth -0.36 / tuning -0.10 on top of `ad_vh`; 420/422 inert).
+    pub(crate) rect_ad: bool,
+    /// 16x16 leaves also refine the runner-up directional mode's deltas
+    pub(crate) ad_runner: bool,
+    /// Zone-2 chroma angle-delta refinement of a directional uv winner at the
+    pub(crate) uv_ad: bool,
+    /// Rect16 leaves also search the zone-2 diagonals D113/D135/D157 x 7 deltas.
+    pub(crate) rect_diag: bool,
+    /// `uv_ad` also at the 32x32 leaf (420 16x16 chroma).
+    pub(crate) uv_ad32: bool,
+    /// 4:2:2 16x16 leaf: full directional/smooth chroma mode search + zone-2
+    /// deltas (was DC/CfL only).
+    pub(crate) uv422_modes: bool,
+    /// Per-format multiplier on the mode lambda (decisions: modes, partitions,
+    /// palettes; not the trellis)
+    pub(crate) mlam_scale_420: f32,
+    pub(crate) mlam_scale_422: f32,
+    pub(crate) mlam_scale_444: f32,
     pub(crate) min_size_16_slow: bool,
     pub(crate) guided16_k_fast: f32,
     pub(crate) guided16_k_medium: f32,
@@ -338,6 +375,23 @@ impl Tuning {
         full_chroma_rdo_medium: true,
         min_size_16_fast: false,
         min_size_16_medium: true,
+        rect64: false,
+        rect64_bias: 1.0,
+        rect64_force: 0,
+        tx64: false,
+        tx64_bias: 1.0,
+        tx64_force: false,
+        tx64_none: false,
+        ad_vh: true,
+        rect_ad: true,
+        ad_runner: true,
+        uv_ad: true,
+        rect_diag: true,
+        uv_ad32: true,
+        uv422_modes: true,
+        mlam_scale_420: 0.8,
+        mlam_scale_422: 0.65,
+        mlam_scale_444: 0.6,
         min_size_16_slow: false,
         guided16_k_fast: 0.0,
         guided16_k_medium: 0.0,
@@ -520,6 +574,23 @@ mod imp {
                 "full_chroma_rdo_medium" => t.full_chroma_rdo_medium = flag(value),
                 "min_size_16_fast" => t.min_size_16_fast = flag(value),
                 "min_size_16_medium" => t.min_size_16_medium = flag(value),
+                "rect64" => t.rect64 = flag(value),
+                "rect64_bias" => t.rect64_bias = num(value),
+                "rect64_force" => t.rect64_force = num(value) as u32,
+                "tx64" => t.tx64 = flag(value),
+                "tx64_bias" => t.tx64_bias = num(value),
+                "tx64_force" => t.tx64_force = flag(value),
+                "tx64_none" => t.tx64_none = flag(value),
+                "ad_vh" => t.ad_vh = flag(value),
+                "rect_ad" => t.rect_ad = flag(value),
+                "ad_runner" => t.ad_runner = flag(value),
+                "uv_ad" => t.uv_ad = flag(value),
+                "rect_diag" => t.rect_diag = flag(value),
+                "uv_ad32" => t.uv_ad32 = flag(value),
+                "uv422_modes" => t.uv422_modes = flag(value),
+                "mlam_scale_420" => t.mlam_scale_420 = num(value),
+                "mlam_scale_422" => t.mlam_scale_422 = num(value),
+                "mlam_scale_444" => t.mlam_scale_444 = num(value),
                 "min_size_16_slow" => t.min_size_16_slow = flag(value),
                 "guided16_k_fast" => t.guided16_k_fast = num(value),
                 "guided16_k_medium" => t.guided16_k_medium = num(value),

@@ -39,7 +39,7 @@ fn brand_matches(brand: &[u8], table: &[&[u8; 4]]) -> bool {
 }
 
 fn ftyp_box_size(bytes: &[u8]) -> Option<usize> {
-    let size = u32::from_be_bytes(bytes[0..4].try_into().ok()?) as usize;
+    let size = u32::from_be_bytes(*bytes.first_chunk()?) as usize;
     if size >= 16 && size <= bytes.len() {
         Some(size)
     } else {
@@ -72,8 +72,8 @@ fn parse_box(data: &[u8]) -> Option<(HeifBox<'_>, usize)> {
     if data.len() < 8 {
         return None;
     }
-    let size_field = u32::from_be_bytes(data[0..4].try_into().unwrap());
-    let kind: [u8; 4] = data[4..8].try_into().unwrap();
+    let size_field = u32::from_be_bytes(*data.first_chunk().unwrap());
+    let kind: [u8; 4] = *data[4..].first_chunk().unwrap();
 
     let (header, total) = match size_field {
         0 => (8, data.len()), // box extends to end of file
@@ -82,7 +82,7 @@ fn parse_box(data: &[u8]) -> Option<(HeifBox<'_>, usize)> {
             if data.len() < 16 {
                 return None;
             }
-            let large = u64::from_be_bytes(data[8..16].try_into().unwrap()) as usize;
+            let large = u64::from_be_bytes(*data[8..].first_chunk().unwrap()) as usize;
             if large < 16 || large > data.len() {
                 return None;
             }
@@ -166,7 +166,7 @@ fn detect_container(bytes: &[u8]) -> ImageContainer {
     }
 
     if &bytes[4..8] == b"ftyp" {
-        let major: &[u8; 4] = bytes[8..12].try_into().unwrap();
+        let major: &[u8; 4] = bytes[8..].first_chunk().unwrap();
 
         if brand_matches(major, HEVC_MAJOR_BRANDS) {
             return ImageContainer::Heic;

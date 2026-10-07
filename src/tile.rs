@@ -761,6 +761,7 @@ fn predict_lossless_4x4(
     block_x: usize,
     block_y: usize,
     block_size: usize,
+    edges: LeafEdges,
     out: &mut [i32; 16],
     base: i32,
     bit_depth: u8,
@@ -769,9 +770,8 @@ fn predict_lossless_4x4(
         let tx = (ox - block_x) / 4;
         let ty = (oy - block_y) / 4;
         let n = block_size / 4;
-        let (outer_tr, outer_bl) = lossless_leaf_edge_flags(block_x, block_y, block_size);
-        let have_tr = tx + 1 < n || (ty == 0 && outer_tr);
-        let have_bl = tx == 0 && (ty + 1 < n || outer_bl);
+        let have_tr = tx + 1 < n || (ty == 0 && edges.tr);
+        let have_bl = tx == 0 && (ty + 1 < n || edges.bl);
         intra_predict_nd_ad_i16(
             mode,
             angle_delta,
@@ -827,6 +827,59 @@ fn lossless_leaf_edge_flags(block_x: usize, block_y: usize, block_size: usize) -
     (top_has_right, left_has_bottom)
 }
 
+/// Outer top-right / bottom-left availability of a square lossless leaf: the
+/// I444 bits of dav1d's per-block `EdgeFlags`. Leaves reached through
+/// SPLIT/NONE follow [`lossless_leaf_edge_flags`]; two square children of the
+/// T-shaped partitions differ because of their rectangular sibling's coding
+/// order, and an encoder that predicts from the SPLIT-tree flags there codes
+/// residuals the decoder reconstructs differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeafEdges {
+    tr: bool,
+    bl: bool,
+}
+
+impl LeafEdges {
+    /// For non-directional predictors, which never read the extended edges.
+    const UNUSED: Self = Self {
+        tr: false,
+        bl: false,
+    };
+
+    fn split_tree(block_x: usize, block_y: usize, block_size: usize) -> Self {
+        let (tr, bl) = lossless_leaf_edge_flags(block_x, block_y, block_size);
+        Self { tr, bl }
+    }
+
+    /// Edges of the `size`-px square at `(dx, dy)` inside partition `symbol`
+    /// of the `2 * size` parent at `(parent_x, parent_y)` (dav1d `decode_sb`).
+    fn partition_child(
+        symbol: usize,
+        parent_x: usize,
+        parent_y: usize,
+        dx: usize,
+        dy: usize,
+        size: usize,
+    ) -> Self {
+        let parent = Self::split_tree(parent_x, parent_y, 2 * size);
+        match (symbol, dx > 0, dy > 0) {
+            // VERT_A (`node->h[1]`): the right rectangle is coded after the
+            // lower-left square, so its above-right is not yet available.
+            (6, false, true) => Self {
+                tr: false,
+                bl: parent.bl,
+            },
+            // VERT_B (`node->h[0]`): the left rectangle is coded before the
+            // upper-right square, so its below-left is already available.
+            (7, true, false) => Self {
+                tr: parent.tr,
+                bl: true,
+            },
+            _ => Self::split_tree(parent_x + dx, parent_y + dy, size),
+        }
+    }
+}
+
 /// Partition context for a node, from the above/left partition-context arrays
 /// (absolute 8px-unit indexing). Matches dav1d `get_partition_ctx`.
 fn get_partition_ctx(a: &[u8], l: &[u8], bl: usize, x8: usize, y8: usize) -> usize {
@@ -869,6 +922,7 @@ fn encode_plane_block(
     l: &mut [u8],
     palette: Option<&LumaPalette>,
     cfl: Option<(&[i16], i32)>,
+    edges: LeafEdges,
 ) {
     let mut pred = [0i32; 16];
     let mut resid = [0i32; 16];
@@ -928,6 +982,7 @@ fn encode_plane_block(
                     bx,
                     by,
                     n_tx * 4,
+                    LeafEdges::UNUSED,
                     &mut pred,
                     base,
                     bit_depth,
@@ -954,6 +1009,7 @@ fn encode_plane_block(
                     bx,
                     by,
                     n_tx * 4,
+                    edges,
                     &mut pred,
                     base,
                     bit_depth,
@@ -1062,6 +1118,7 @@ fn plane_cfl_bits(
                 bx,
                 by,
                 n_tx * 4,
+                LeafEdges::UNUSED,
                 &mut dc,
                 base,
                 bit_depth,
@@ -1139,7 +1196,19 @@ fn cfl_alpha_candidates(
     }
     let mut dc = [0i32; 16];
     predict_lossless_4x4(
-        0, 0, chroma, stride, px, py, px, py, 4, &mut dc, base, bit_depth,
+        0,
+        0,
+        chroma,
+        stride,
+        px,
+        py,
+        px,
+        py,
+        4,
+        LeafEdges::UNUSED,
+        &mut dc,
+        base,
+        bit_depth,
     );
     let mut luma_rec = [0i32; 16];
     let mut src = [0i32; 16];
@@ -1175,6 +1244,7 @@ fn plane_leaf_bits(
     n_tx: usize,
     base: i32,
     bit_depth: u8,
+    edges: LeafEdges,
 ) -> f32 {
     let mut bits = 0f32;
     let mut pred = [0i32; 16];
@@ -1193,6 +1263,7 @@ fn plane_leaf_bits(
                 bx,
                 by,
                 n_tx * 4,
+                edges,
                 &mut pred,
                 base,
                 bit_depth,
@@ -1350,6 +1421,7 @@ fn best_leaf(
     visible_h: usize,
     angle_delta_rdo: bool,
     intrabc_index: &IntrabcIndex,
+    edges: LeafEdges,
 ) -> (
     f32,
     usize,
@@ -1371,7 +1443,9 @@ fn best_leaf(
         &LL_MODES[..]
     };
     for &m in modes {
-        let mut b = plane_leaf_bits(m, 0, planes[0], stride, px, py, n_tx, base, bit_depth);
+        let mut b = plane_leaf_bits(
+            m, 0, planes[0], stride, px, py, n_tx, base, bit_depth, edges,
+        );
         if angle_allowed && (1..=8).contains(&m) {
             b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
             y_directional[m - 1] = (b, m);
@@ -1386,8 +1460,9 @@ fn best_leaf(
         y_directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         for &(_, m) in &y_directional[..3] {
             for delta in [-3, -2, -1, 1, 2, 3] {
-                let b = plane_leaf_bits(m, delta, planes[0], stride, px, py, n_tx, base, bit_depth)
-                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                let b = plane_leaf_bits(
+                    m, delta, planes[0], stride, px, py, n_tx, base, bit_depth, edges,
+                ) + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
                 if b < yb {
                     yb = b;
                     y_mode = m;
@@ -1405,8 +1480,11 @@ fn best_leaf(
     // prediction block equals the forced TX_4X4 transform size.
     let cfl_allowed = n_tx == 1;
     for &m in modes {
-        let mut b = plane_leaf_bits(m, 0, planes[1], stride, px, py, n_tx, base, bit_depth)
-            + plane_leaf_bits(m, 0, planes[2], stride, px, py, n_tx, base, bit_depth);
+        let mut b = plane_leaf_bits(
+            m, 0, planes[1], stride, px, py, n_tx, base, bit_depth, edges,
+        ) + plane_leaf_bits(
+            m, 0, planes[2], stride, px, py, n_tx, base, bit_depth, edges,
+        );
         b += raw_symbol_cost(
             if cfl_allowed {
                 &UV_MODE_CFL_CDF[y_mode]
@@ -1429,17 +1507,18 @@ fn best_leaf(
         uv_directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         for &(_, m) in &uv_directional[..3] {
             for delta in [-3, -2, -1, 1, 2, 3] {
-                let b = plane_leaf_bits(m, delta, planes[1], stride, px, py, n_tx, base, bit_depth)
-                    + plane_leaf_bits(m, delta, planes[2], stride, px, py, n_tx, base, bit_depth)
-                    + raw_symbol_cost(
-                        if cfl_allowed {
-                            &UV_MODE_CFL_CDF[y_mode]
-                        } else {
-                            &UV_MODE_NOCFL_CDF[y_mode]
-                        },
-                        m,
-                    )
-                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                let b = plane_leaf_bits(
+                    m, delta, planes[1], stride, px, py, n_tx, base, bit_depth, edges,
+                ) + plane_leaf_bits(
+                    m, delta, planes[2], stride, px, py, n_tx, base, bit_depth, edges,
+                ) + raw_symbol_cost(
+                    if cfl_allowed {
+                        &UV_MODE_CFL_CDF[y_mode]
+                    } else {
+                        &UV_MODE_NOCFL_CDF[y_mode]
+                    },
+                    m,
+                ) + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
                 if b < ub {
                     ub = b;
                     uv_mode = m;
@@ -1530,6 +1609,7 @@ fn best_leaf(
 fn best_partition_block(
     planes: [&[i16]; 3],
     stride: usize,
+    symbol: usize,
     parent_x: usize,
     parent_y: usize,
     dx: usize,
@@ -1557,6 +1637,7 @@ fn best_partition_block(
             visible_h,
             angle_delta_rdo,
             intrabc_index,
+            LeafEdges::partition_child(symbol, parent_x, parent_y, dx, dy, width),
         );
         (
             bits,
@@ -1649,6 +1730,7 @@ fn plan_full(
         visible_h,
         angle_delta_rdo,
         intrabc_index,
+        LeafEdges::split_tree(px, py, sz8 * 8),
     );
     let none = PART_NONE_BITS + bits_leaf;
     let eval_partition = |symbol: usize, geometry: &[(usize, usize, usize, usize)]| {
@@ -1658,6 +1740,7 @@ fn plan_full(
             let (block_bits, block) = best_partition_block(
                 planes,
                 stride,
+                symbol,
                 px,
                 py,
                 dx,
@@ -1695,6 +1778,7 @@ fn plan_full(
                 visible_h,
                 false,
                 intrabc_index,
+                LeafEdges::split_tree(cx, cy, 4),
             );
             split += b;
             kids[i] = Some(Plan::Leaf {
@@ -2163,6 +2247,7 @@ fn palette_wins_live(
     y_delta: i32,
     uv: Option<(usize, i32, [i32; 2])>,
     palette: &LumaPalette,
+    edges: LeafEdges,
 ) -> bool {
     let (x4, y4, n_tx) = (px / 4, py / 4, size / 4);
     let bsize_ctx = palette_bsize_ctx(size);
@@ -2182,6 +2267,7 @@ fn palette_wins_live(
         n_tx,
         st.base,
         st.bit_depth,
+        edges,
     ) + raw_symbol_cost(kf_raw, y_mode)
         + angle_delta_bits(y_mode, y_delta);
     if y_mode == 0 {
@@ -2217,6 +2303,7 @@ fn code_leaf(
     uv_alpha: [i32; 2],
     palette: Option<&LumaPalette>,
     intrabc: bool,
+    edges: LeafEdges,
 ) {
     let n_tx = size / 4;
     let (x4, y4) = (px / 4, py / 4);
@@ -2267,6 +2354,7 @@ fn code_leaf(
             y_delta,
             Some((uv_mode, uv_delta, uv_alpha)),
             palette,
+            edges,
         )
     });
     let (y_mode, y_delta) = if palette.is_some() {
@@ -2371,6 +2459,7 @@ fn code_leaf(
             } else {
                 Some((planes[0], uv_alpha[plane - 1]))
             },
+            edges,
         );
     }
 }
@@ -2506,6 +2595,7 @@ fn code_partition_block(
     wr: &mut Writer,
     planes: [&[i16]; 3],
     st: &mut LlState,
+    symbol: usize,
     parent_x: usize,
     parent_y: usize,
     block: &BlockDecision,
@@ -2526,6 +2616,7 @@ fn code_partition_block(
             block.uv_alpha,
             block.palette.as_ref(),
             block.intrabc,
+            LeafEdges::partition_child(symbol, parent_x, parent_y, block.dx, block.dy, block.width),
         );
     } else {
         code_leaf_rect(
@@ -2580,6 +2671,7 @@ fn encode_plan(
                 *uv_alpha,
                 palette.as_ref(),
                 *intrabc,
+                LeafEdges::split_tree(px, py, sz8 * 8),
             );
             let pb = part_byte(sz8);
             st.a_part[x8..x8 + sz8].fill(pb);
@@ -2618,6 +2710,7 @@ fn encode_plan(
                         *uv_alpha,
                         palette.as_ref(),
                         *intrabc,
+                        LeafEdges::split_tree(cx, cy, 4),
                     );
                 }
                 st.a_part[x8] = 0x1f;
@@ -2633,7 +2726,7 @@ fn encode_plan(
         Plan::Partition { symbol, blocks } => {
             write_partition_symbol(wr, st, bl, x8, y8, *symbol);
             for block in blocks {
-                code_partition_block(wr, planes, st, px, py, block);
+                code_partition_block(wr, planes, st, *symbol, px, py, block);
             }
             mark_rect_partition(st, x8, y8, sz8, *symbol);
         }
@@ -2688,6 +2781,7 @@ fn decode_sb_ll(
             st.visible_h,
             st.angle_delta_rdo,
             &st.intrabc_index,
+            LeafEdges::split_tree(px, py, 8),
         );
         code_leaf(
             wr,
@@ -2703,6 +2797,7 @@ fn decode_sb_ll(
             uva,
             palette.as_ref(),
             intrabc,
+            LeafEdges::split_tree(px, py, 8),
         );
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
@@ -2813,6 +2908,7 @@ fn best_leaf_mono(
     visible_h: usize,
     angle_delta_rdo: bool,
     intrabc_index: &IntrabcIndex,
+    edges: LeafEdges,
 ) -> (f32, usize, i32, Option<LumaPalette>, bool) {
     let mut y_mode = 0usize;
     let mut y_delta = 0i32;
@@ -2825,7 +2921,7 @@ fn best_leaf_mono(
         &LL_MODES[..]
     };
     for &m in modes {
-        let mut b = plane_leaf_bits(m, 0, luma, stride, px, py, n_tx, base, bit_depth);
+        let mut b = plane_leaf_bits(m, 0, luma, stride, px, py, n_tx, base, bit_depth, edges);
         if angle_allowed && (1..=8).contains(&m) {
             b += raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], 3);
             directional[m - 1] = (b, m);
@@ -2840,8 +2936,9 @@ fn best_leaf_mono(
         directional.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         for &(_, m) in &directional[..3] {
             for delta in [-3, -2, -1, 1, 2, 3] {
-                let b = plane_leaf_bits(m, delta, luma, stride, px, py, n_tx, base, bit_depth)
-                    + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
+                let b =
+                    plane_leaf_bits(m, delta, luma, stride, px, py, n_tx, base, bit_depth, edges)
+                        + raw_symbol_cost(&ANGLE_DELTA_CDF[m - 1], (delta + 3) as usize);
                 if b < yb {
                     yb = b;
                     y_mode = m;
@@ -2888,6 +2985,7 @@ fn best_leaf_mono(
 fn best_partition_block_mono(
     luma: &[i16],
     stride: usize,
+    symbol: usize,
     parent_x: usize,
     parent_y: usize,
     dx: usize,
@@ -2903,7 +3001,7 @@ fn best_partition_block_mono(
 ) -> (f32, BlockDecision) {
     let (px, py) = (parent_x + dx, parent_y + dy);
     if width == height {
-        let (mut bits, mut ym, yd, palette, intrabc) = best_leaf_mono(
+        let (bits, ym, yd, palette, intrabc) = best_leaf_mono(
             luma,
             stride,
             px,
@@ -2915,27 +3013,8 @@ fn best_partition_block_mono(
             visible_h,
             false,
             intrabc_index,
+            LeafEdges::partition_child(symbol, parent_x, parent_y, dx, dy, width),
         );
-        // A/B rectangular partitions give their square children different
-        // top-right/bottom-left availability from the ordinary SPLIT tree.
-        // Until those directional edge flags are carried in BlockDecision,
-        // keep these children on predictors that need no extended diagonal
-        // edge. Palette and IntraBC remain independently eligible.
-        if palette.is_none() && !intrabc && (3..=8).contains(&ym) {
-            let mut safe = (f32::INFINITY, 0usize);
-            for &mode in &LL_RECT_FAST_MODES {
-                let mut candidate =
-                    plane_leaf_bits(mode, 0, luma, stride, px, py, width / 4, base, bit_depth);
-                if (1..=2).contains(&mode) {
-                    candidate += raw_symbol_cost(&ANGLE_DELTA_CDF[mode - 1], 3);
-                }
-                if candidate < safe.0 {
-                    safe = (candidate, mode);
-                }
-            }
-            bits = safe.0 + 4.0;
-            ym = safe.1;
-        }
         (
             bits,
             BlockDecision {
@@ -3065,6 +3144,7 @@ fn plan_full_mono(
         visible_h,
         angle_delta_rdo,
         intrabc_index,
+        LeafEdges::split_tree(px, py, sz8 * 8),
     );
     let none = PART_NONE_BITS + bits_leaf;
     let mut best = (
@@ -3086,6 +3166,7 @@ fn plan_full_mono(
             let (block_bits, block) = best_partition_block_mono(
                 luma,
                 stride,
+                symbol,
                 px,
                 py,
                 dx,
@@ -3124,6 +3205,7 @@ fn plan_full_mono(
                     visible_h,
                     false,
                     intrabc_index,
+                    LeafEdges::split_tree(cx, cy, 4),
                 );
                 split += b;
                 kids[i] = Some(Plan::Leaf {
@@ -3217,6 +3299,7 @@ fn code_leaf_mono(
     y_delta: i32,
     palette: Option<&LumaPalette>,
     intrabc: bool,
+    edges: LeafEdges,
 ) {
     let n_tx = size / 4;
     let (x4, y4) = (px / 4, py / 4);
@@ -3251,7 +3334,9 @@ fn code_leaf_mono(
         return;
     }
     let palette = palette.filter(|palette| {
-        palette_wins_live(st, luma, px, py, size, y_mode, y_delta, None, palette)
+        palette_wins_live(
+            st, luma, px, py, size, y_mode, y_delta, None, palette, edges,
+        )
     });
     let (y_mode, y_delta) = if palette.is_some() {
         (0, 0)
@@ -3308,6 +3393,7 @@ fn code_leaf_mono(
         &mut st.l_coef[0],
         palette,
         None,
+        edges,
     );
 }
 
@@ -3365,6 +3451,7 @@ fn code_partition_block_mono(
     wr: &mut Writer,
     luma: &[i16],
     st: &mut LlState,
+    symbol: usize,
     parent_x: usize,
     parent_y: usize,
     block: &BlockDecision,
@@ -3382,6 +3469,7 @@ fn code_partition_block_mono(
             block.y_delta,
             block.palette.as_ref(),
             block.intrabc,
+            LeafEdges::partition_child(symbol, parent_x, parent_y, block.dx, block.dy, block.width),
         );
     } else {
         code_leaf_rect_mono(
@@ -3429,6 +3517,7 @@ fn encode_plan_mono(
                 *y_delta,
                 palette.as_ref(),
                 *intrabc,
+                LeafEdges::split_tree(px, py, sz8 * 8),
             );
             let pb = part_byte(sz8);
             st.a_part[x8..x8 + sz8].fill(pb);
@@ -3462,6 +3551,7 @@ fn encode_plan_mono(
                         *y_delta,
                         palette.as_ref(),
                         *intrabc,
+                        LeafEdges::split_tree(cx, cy, 4),
                     );
                 }
                 st.a_part[x8] = 0x1f;
@@ -3477,7 +3567,7 @@ fn encode_plan_mono(
         Plan::Partition { symbol, blocks } => {
             write_partition_symbol(wr, st, bl, x8, y8, *symbol);
             for block in blocks {
-                code_partition_block_mono(wr, luma, st, px, py, block);
+                code_partition_block_mono(wr, luma, st, *symbol, px, py, block);
             }
             mark_rect_partition(st, x8, y8, sz8, *symbol);
         }
@@ -3528,8 +3618,21 @@ fn decode_sb_ll_mono(
             st.visible_h,
             st.angle_delta_rdo,
             &st.intrabc_index,
+            LeafEdges::split_tree(px, py, 8),
         );
-        code_leaf_mono(wr, luma, st, px, py, 8, ym, yd, palette.as_ref(), intrabc);
+        code_leaf_mono(
+            wr,
+            luma,
+            st,
+            px,
+            py,
+            8,
+            ym,
+            yd,
+            palette.as_ref(),
+            intrabc,
+            LeafEdges::split_tree(px, py, 8),
+        );
         st.a_part[x8] = 0x1e;
         st.l_part[y8] = 0x1e;
         return;
@@ -3662,13 +3765,37 @@ mod tests {
 
         for mode in 1..=8 {
             for delta in -3..=3 {
-                let bits = plane_leaf_bits(mode, delta, &luma, w, 16, 16, 2, 128, 8);
+                let bits = plane_leaf_bits(
+                    mode,
+                    delta,
+                    &luma,
+                    w,
+                    16,
+                    16,
+                    2,
+                    128,
+                    8,
+                    LeafEdges::split_tree(16, 16, 8),
+                );
                 assert!(bits.is_finite(), "mode={mode} delta={delta}");
             }
         }
 
         let index = IntrabcIndex::new(&[&luma], w, h);
-        let (_, _, delta, _, _) = best_leaf_mono(&luma, w, 16, 16, 2, 128, 8, w, h, false, &index);
+        let (_, _, delta, _, _) = best_leaf_mono(
+            &luma,
+            w,
+            16,
+            16,
+            2,
+            128,
+            8,
+            w,
+            h,
+            false,
+            &index,
+            LeafEdges::split_tree(16, 16, 2 * 4),
+        );
         assert_eq!(delta, 0, "Medium/Fast must not perform angle-delta RDO");
     }
 
@@ -3710,8 +3837,20 @@ mod tests {
         let planes = [&yi[..], &ui[..], &vi[..]];
 
         let index = IntrabcIndex::new(&planes, w, h);
-        let (_, _, _, uv_mode, _, alpha, _, intrabc) =
-            best_leaf(planes, w, 0, 0, 1, 128, 8, w, h, false, &index);
+        let (_, _, _, uv_mode, _, alpha, _, intrabc) = best_leaf(
+            planes,
+            w,
+            0,
+            0,
+            1,
+            128,
+            8,
+            w,
+            h,
+            false,
+            &index,
+            LeafEdges::split_tree(0, 0, 1 * 4),
+        );
         assert_eq!(uv_mode, CFL_PRED);
         assert_eq!(alpha, [8, -8]);
         assert!(!intrabc);
@@ -3800,8 +3939,20 @@ mod tests {
                 })
                 .collect();
             let index = IntrabcIndex::new(&[&luma], w, h);
-            let (_, mode, _, palette, _) =
-                best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h, true, &index);
+            let (_, mode, _, palette, _) = best_leaf_mono(
+                &luma,
+                w,
+                0,
+                0,
+                16,
+                128,
+                8,
+                w,
+                h,
+                true,
+                &index,
+                LeafEdges::split_tree(0, 0, 16 * 4),
+            );
             assert_eq!(mode, 0);
             assert_eq!(palette.map(|p| p.colors.len()), Some(size), "size {size}");
         }
@@ -3817,8 +3968,20 @@ mod tests {
         luma[w * h - 1] = 129;
 
         let index = IntrabcIndex::new(&[&luma], w, h);
-        let (_, mode, _, palette, intrabc) =
-            best_leaf_mono(&luma, w, 0, 0, 16, 128, 8, w, h, true, &index);
+        let (_, mode, _, palette, intrabc) = best_leaf_mono(
+            &luma,
+            w,
+            0,
+            0,
+            16,
+            128,
+            8,
+            w,
+            h,
+            true,
+            &index,
+            LeafEdges::split_tree(0, 0, 16 * 4),
+        );
         assert_eq!(mode, 0);
         assert!(palette.is_none());
         assert!(!intrabc);
@@ -4150,8 +4313,20 @@ mod tests {
         let index = IntrabcIndex::new(&[&luma], w, h);
         let found = find_exact_intrabc(&[&luma], w, 192, 64, 8, w, h, &index).unwrap();
         assert_eq!((found.ref_x, found.ref_y), (3, 0));
-        let (_, _, _, _, selected) =
-            best_leaf_mono(&luma, w, 192, 64, 2, 128, 8, w, h, false, &index);
+        let (_, _, _, _, selected) = best_leaf_mono(
+            &luma,
+            w,
+            192,
+            64,
+            2,
+            128,
+            8,
+            w,
+            h,
+            false,
+            &index,
+            LeafEdges::split_tree(192, 64, 2 * 4),
+        );
         assert!(selected, "the indexed 8x8 match must enter lossless RDO");
 
         let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
@@ -4236,6 +4411,57 @@ mod tests {
             FORCE_LL_PARTITION.with(|forced| forced.set(0));
             assert_eq!(
                 decode_obu(&decoder, &obu, &format!("lossless-mono-partition-{symbol}")),
+                planes[0],
+                "monochrome partition symbol {symbol}"
+            );
+        }
+    }
+
+    /// VERT_A's lower-left square has no top-right (its right rectangle is
+    /// decoded after it) and VERT_B's upper-right square has a bottom-left (its
+    /// left rectangle is decoded before it) — unlike the same squares under
+    /// SPLIT. Anti-diagonal content makes the edge-hungry D45/D203 family win
+    /// there, so a wrong flag desyncs (kodak20 gray, Slow: 19 px off by one).
+    #[test]
+    fn lossless_vertical_t_partition_edges_are_bit_exact() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        let (w, h) = (64usize, 64usize);
+        let diag = |x: usize, y: usize, salt: usize| {
+            let t = x + y + salt;
+            ((t * t * 7 + t * 13) & 255) as u8
+        };
+        let planes: [Vec<u8>; 3] =
+            std::array::from_fn(|p| (0..w * h).map(|i| diag(i % w, i / w, p * 5)).collect());
+        let image = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [
+                planes[0].clone(),
+                planes[1].clone(),
+                planes[2].clone(),
+                Vec::new(),
+            ],
+        };
+        let mono = PlanarImage::from_luma(w, h, BitDepth::Eight, &planes[0]).unwrap();
+        for symbol in [6, 7] {
+            FORCE_LL_PARTITION.with(|forced| forced.set(symbol));
+            let obu = encode_lossless_obu(&image, None, 1).unwrap();
+            let mono_obu = encode_lossless_gray_obu(&mono, true, 1).unwrap();
+            FORCE_LL_PARTITION.with(|forced| forced.set(0));
+            assert_eq!(
+                decode_obu(&decoder, &obu, &format!("lossless-t-edges-{symbol}")),
+                planes.concat(),
+                "partition symbol {symbol}"
+            );
+            assert_eq!(
+                decode_obu(
+                    &decoder,
+                    &mono_obu,
+                    &format!("lossless-mono-t-edges-{symbol}")
+                ),
                 planes[0],
                 "monochrome partition symbol {symbol}"
             );
@@ -4381,6 +4607,7 @@ mod tests {
                     8,
                     0,
                     8,
+                    LeafEdges::split_tree(8, 0, 8),
                     &mut pred,
                     128,
                     8,
@@ -4393,8 +4620,20 @@ mod tests {
             }
         }
         let index = IntrabcIndex::new(&[&luma], w, h);
-        let (_, mode, delta, palette, intrabc) =
-            best_leaf_mono(&luma, w, 8, 0, 2, 128, 8, w, h, true, &index);
+        let (_, mode, delta, palette, intrabc) = best_leaf_mono(
+            &luma,
+            w,
+            8,
+            0,
+            2,
+            128,
+            8,
+            w,
+            h,
+            true,
+            &index,
+            LeafEdges::split_tree(8, 0, 2 * 4),
+        );
         assert_eq!(
             (mode, delta, palette.is_some(), intrabc),
             (7, 0, false, false)

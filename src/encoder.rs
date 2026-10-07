@@ -717,14 +717,12 @@ pub(crate) fn encode_lossless_gray_obu_with_cdf<T: Pixel>(
     )
 }
 
-/// Encode a lossless grayscale (monochrome) AVIF still.
-pub fn encode_lossless_gray<T: Pixel>(
+/// Raw lossless monochrome frame OBUs for `img` (no container).
+fn lossless_gray_obu<T: Pixel>(
     img: &PlanarImage<T>,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    validate_dims(img.width as u32, img.height as u32)?;
-    img.validate_400()?;
-    let obu = encode_lossy_gray_obu(
+    encode_lossy_gray_obu(
         img,
         img.bit_depth,
         0,
@@ -738,7 +736,17 @@ pub fn encode_lossless_gray<T: Pixel>(
         cfg.updating_cdf,
         cfg.screen_content,
         cfg.intrabc,
-    )?;
+    )
+}
+
+/// Encode a lossless grayscale (monochrome) AVIF still.
+pub fn encode_lossless_gray<T: Pixel>(
+    img: &PlanarImage<T>,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_dims(img.width as u32, img.height as u32)?;
+    img.validate_400()?;
+    let obu = lossless_gray_obu(img, cfg)?;
     finalize_color(
         obu,
         img.width as u32,
@@ -760,8 +768,10 @@ pub fn encode_lossless_gray_alpha<T: Pixel>(
     if cfg.chroma != ChromaFormat::Monochrome {
         return Err(EncodeError::UnsupportedChromaFormat(cfg.chroma));
     }
-    let luma_obu = encode_lossless_gray(&img.packed_1(), cfg)?;
-    let alpha_obu = encode_lossless_gray(&img.packed_alpha_2(), cfg)?;
+    // Both items are muxed by `finalize_with_alpha`: pass raw OBUs, not the
+    // finished single-item AVIFs `encode_lossless_gray` returns.
+    let luma_obu = lossless_gray_obu(&img.packed_1(), cfg)?;
+    let alpha_obu = lossless_gray_obu(&img.packed_alpha_2(), cfg)?;
     finalize_with_alpha(
         luma_obu,
         alpha_obu,

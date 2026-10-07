@@ -106,7 +106,7 @@ pub(crate) fn trellis_optimize_ctx(
     // Hoist the per-(class, plane) CDF tables once for clarity (and to avoid
     // re-walking the nested arrays on every coefficient).
     let base_tok = &cdfs.base_tok[cls][plane];
-    let br_tok = &cdfs.br_tok[cls][plane];
+    let br_tok = &cdfs.br_tok[cls.min(3)][plane];
     let eob_hi = &cdfs.eob_hi[cls][plane];
     let eob_base = &cdfs.eob_base[cls][plane];
     let dc_sign = &cdfs.dc_sign[plane];

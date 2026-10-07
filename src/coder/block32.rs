@@ -346,7 +346,7 @@ impl<'a> LossyTile<'a> {
                 } else {
                     0.0
                 }
-        }) * if self.top_band() && self.ss420 {
+        }) * if self.top_band() && self.ss420 && !self.palette_exact(px, py, 32) {
             top_none_bias_420(self.aq.base_q)
         } else {
             self.none32_split_bias_at()
@@ -578,8 +578,8 @@ impl<'a> LossyTile<'a> {
         // Progressive sub-transform contexts (external review round 2,
         // finding 3): each TX_16X16 sees the previous quadrant's result.
         let (bx4_0, by4_0) = (px / 4, py / 4);
-        let saved_a: [u8; 8] = self.a_coef[0][bx4_0..bx4_0 + 8].try_into().unwrap();
-        let saved_l: [u8; 8] = self.l_coef[0][by4_0..by4_0 + 8].try_into().unwrap();
+        let saved_a: [u8; 8] = *self.a_coef[0][bx4_0..].first_chunk().unwrap();
+        let saved_l: [u8; 8] = *self.l_coef[0][by4_0..].first_chunk().unwrap();
         let mut cf4 = self.sbuf_i1024();
         let mut sse_sum = 0i64;
         let mut bits_sum = 0.0f32;
@@ -1051,9 +1051,7 @@ impl<'a> LossyTile<'a> {
         let mut best_delta: i32 = 0;
         if rl.is_none()
             && self.speed.try_angle_deltas_av1(32, self.base_q_idx)
-            && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
-            && best_mode != V_PRED
-            && best_mode != H_PRED
+            && self.angle_delta_refines(best_mode)
         {
             let mut ad_cdf = [0u16; 7];
             ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
@@ -2303,6 +2301,9 @@ impl<'a> LossyTile<'a> {
             self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, None, None);
             self.emit_filter_intra(y_mode, lw, lh, None);
             self.code_tx_depth(px, py, lw, lh, tx_split as usize);
+            // Neighbor-mode smooth flag, read before this leaf's own mode
+            // lands in a_mode/l_mode (the skipped-split recon below needs it).
+            let emit_ftype = self.luma_filter_type(px, py);
             let sv = block_skip as u8;
             let (aw, ah) = (lw / 4, lh / 4);
             self.a_skip[bx4..bx4 + aw].fill(sv);
@@ -2347,7 +2348,7 @@ impl<'a> LossyTile<'a> {
                 // with-residual recon. Recompute the sequential prediction.
                 self.a_coef[0][bx4..bx4 + aw].fill(0x40);
                 self.l_coef[0][by4..by4 + ah].fill(0x40);
-                let block_ftype = self.luma_filter_type(px, py);
+                let block_ftype = emit_ftype;
                 let subs: [(usize, usize); 2] = if vert {
                     [(0, 0), (0, 16)]
                 } else {
@@ -2777,6 +2778,7 @@ impl<'a> LossyTile<'a> {
         let mut cf_use_owned: [SBuf<[i32; 1024]>; 2];
         let mut sv_preds32 = [self.sbuf_i1024(), self.sbuf_i1024()];
         let mut uv_pal32: Option<LossyUvPalette> = None;
+        let mut uv_delta32 = 0i32;
         let (final_cf, chosen_uv_32) = 'sv: {
             // Pure-emit replay: the captured coefficients were installed above
             // (into cfl_ccf for CfL, ccf otherwise); no search runs at all.
@@ -2798,6 +2800,7 @@ impl<'a> LossyTile<'a> {
                     break 'sv (cf_use, DC_PRED);
                 }
                 cfl_opt = None;
+                uv_delta32 = r.delta as i32;
                 break 'sv (cf_use, r.uv as usize);
             }
             if !self.speed.full_chroma_rdo() {
@@ -2936,6 +2939,56 @@ impl<'a> LossyTile<'a> {
                     best_pred = cand_pred;
                 }
             }
+            // Chroma angle-delta refinement (`uv_ad`, zone-2; see code_block16).
+            if crate::tuning::get().uv_ad
+                && crate::tuning::get().uv_ad32
+                && self.speed.try_angle_deltas_av1(32, self.base_q_idx)
+                && (V_PRED..=VERT_LEFT_PRED).contains(&best_mode)
+            {
+                let cand = best_mode;
+                let ad = &self.dcdf().angle_delta[cand - V_PRED];
+                let base_sig = self.uv_mode_bits(y_mode, cand, None) - cdf_cost(ad, 3);
+                for &d in uv_zone2_deltas(cand) {
+                    let mut cand_ccf = [self.sbuf_i1024(), self.sbuf_i1024()];
+                    let mut cand_pred = [self.sbuf_i1024(), self.sbuf_i1024()];
+                    let mut cand_total = rate_cost(mlam, base_sig + cdf_cost(ad, (d + 3) as usize));
+                    for ci in 0..2 {
+                        let plane = ci + 1;
+                        self.intrapred.predict_nd_ad(
+                            cand,
+                            d,
+                            &self.recon[plane],
+                            self.w,
+                            px,
+                            py,
+                            32,
+                            32,
+                            false,
+                            false,
+                            self.w,
+                            self.h,
+                            self.chroma_filter_type(px, py),
+                            &mut cand_pred[ci][..],
+                            self.bd,
+                        );
+                        let mut resid = self.sbuf_i1024();
+                        self.rd.residual_pred(&mut resid[..], &cand_pred[ci][..], &self.src[plane], self.w, px, py, 32, 32);
+                        let (mut q, qt) = self.dct.dct32x32_t(&resid, &self.cquant);
+                        self.chroma_rect_trellis(&mut q, &qt, dcq2, acq2, &SCAN_32X32, lam2, 32, 32, plane, px, py);
+                        self.rd.preserve_dc(&mut q[0], &resid[..]);
+                        let rr = self.idct.idct_dequant_32x32(&q, &self.cquant);
+                        let sse = sse_recon::<1024, 32>(&self.rd, &cand_pred[ci], &rr, self.src_blk(plane, px, py, 32, 32), self.bd);
+                        *cand_ccf[ci] = q;
+                        cand_total += rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_32X32, 32, plane, px, py));
+                    }
+                    if cand_total < best_total {
+                        best_total = cand_total;
+                        uv_delta32 = d;
+                        best_ccf = cand_ccf;
+                        best_pred = cand_pred;
+                    }
+                }
+            }
             if best_mode != DC_PRED {
                 cfl_opt = None; // a non-DC chroma mode overrides CfL if it wins
                 cf_use_owned = best_ccf;
@@ -3047,6 +3100,7 @@ impl<'a> LossyTile<'a> {
             palette: uv_pal32
                 .as_ref()
                 .map_or(0, |p| (p.u.len() + if p.top { 8 } else { 0 }) as u8),
+            delta: if chosen_uv_32 != DC_PRED { uv_delta32 as i8 } else { 0 },
         });
         self.push_uv_cf(
             &final_cf[0][..],
@@ -3058,6 +3112,7 @@ impl<'a> LossyTile<'a> {
             && luma_zero
             && self.rd.all_zero_i32(&final_cf[0][..])
             && self.rd.all_zero_i32(&final_cf[1][..]);
+        self.uv_delta = if chosen_uv_32 != DC_PRED { uv_delta32 } else { 0 };
         self.code_header_luma32(
             x8,
             y8,
@@ -3377,6 +3432,65 @@ impl<'a> LossyTile<'a> {
                 sv_preds = cand_pred;
             }
         }
+        // Chroma angle-delta refinement (`uv_ad`, zone-2 deltas; see code_block16).
+        let mut uv_delta = 0i32;
+        if ru.is_none()
+            && !use_cfl
+            && crate::tuning::get().uv_ad
+            && crate::tuning::get().uv_ad32
+            && self.speed.try_angle_deltas_av1(32, self.base_q_idx)
+            && (V_PRED..=VERT_LEFT_PRED).contains(&chosen_uv)
+        {
+            let cand = chosen_uv;
+            let tx = chroma_tx_for_mode(cand);
+            let ad = &self.dcdf().angle_delta[cand - V_PRED];
+            let base_sig = self.uv_mode_bits(y_mode, cand, None) - cdf_cost(ad, 3);
+            for &d in uv_zone2_deltas(cand) {
+                let mut cand_ccf = [self.sbuf_i256(), self.sbuf_i256()];
+                let mut cand_rr = [self.sbuf_i256(), self.sbuf_i256()];
+                let mut cand_pred = [self.sbuf_i256(), self.sbuf_i256()];
+                let mut cand_total = rate_cost(mlam, base_sig + cdf_cost(ad, (d + 3) as usize));
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    self.intrapred.predict_nd_ad(
+                        cand,
+                        d,
+                        &self.recon[plane],
+                        self.cw,
+                        cx,
+                        cy,
+                        16,
+                        16,
+                        false,
+                        false,
+                        self.cw,
+                        self.h,
+                        self.chroma_filter_type(px, py),
+                        &mut cand_pred[ci][..],
+                        self.bd,
+                    );
+                    let mut resid = self.sbuf_i256();
+                    self.rd.residual_pred(&mut resid[..], &cand_pred[ci][..], &self.src[plane], self.cw, cx, cy, 16, 16);
+                    let (mut q, qt) = fwd_chroma_16x16(&self.dct, tx, &resid, &self.cquant);
+                    self.chroma_rect_trellis(&mut q, &qt, dcq, acq, &SCAN_16X16, lam, 16, 16, plane, cx, cy);
+                    self.rd.preserve_dc(&mut q[0], &resid[..]);
+                    *cand_ccf[ci] = q;
+                    *cand_rr[ci] = inv_chroma_16x16(&self.idct, tx, &q, &self.cquant);
+                    let sse = sse_recon::<256, 16>(&self.rd, &cand_pred[ci], &cand_rr[ci], self.src_blk(plane, cx, cy, 16, 16), self.bd);
+                    cand_total += rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_16X16, 16, plane, cx, cy));
+                }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    uv_delta = d;
+                    best_ccf = cand_ccf;
+                    best_rr = cand_rr;
+                    sv_preds = cand_pred;
+                }
+            }
+        }
+        if let Some(r) = ru {
+            uv_delta = r.delta as i32;
+        }
         // Pure-emit replay: install the captured chroma winner (mode + coeffs).
         if let Some(r) = ru
             && let Some((cf, al)) = ru_cf.as_ref()
@@ -3400,6 +3514,7 @@ impl<'a> LossyTile<'a> {
                 chosen_uv as u8
             },
             palette: 0,
+            delta: uv_delta as i8,
         });
         self.push_uv_cf(
             &ccf[0][..],
@@ -3410,6 +3525,7 @@ impl<'a> LossyTile<'a> {
             && luma_zero
             && self.rd.all_zero_i32(&ccf[0][..])
             && self.rd.all_zero_i32(&ccf[1][..]);
+        self.uv_delta = uv_delta;
         self.code_header_luma32(
             x8,
             y8,
@@ -3772,6 +3888,7 @@ impl<'a> LossyTile<'a> {
         self.push_uv_sel(UvSel {
             uv: chosen_uv as u8,
             palette: 0,
+            delta: 0,
         });
         self.push_uv_cf(
             &ccf[0][..],

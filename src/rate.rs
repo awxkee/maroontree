@@ -49,7 +49,7 @@ use crate::tables::{
 /// Rebuilt whenever the tile switches its decision snapshot.
 pub(crate) struct CoefCostTables {
     /// `base_tok` costs: `[cls][plane][ctx][tok]` (ctx 0..42).
-    pub(crate) bt: Box<[[[[f32; 4]; 42]; 2]; 4]>,
+    pub(crate) bt: Box<[[[[f32; 4]; 42]; 2]; 5]>,
     /// Cumulative base-range ladder costs: `[cls][plane][br ctx][total_br]`.
     pub(crate) br: Box<[[[[f32; 13]; 21]; 2]; 4]>,
 }
@@ -57,14 +57,17 @@ pub(crate) struct CoefCostTables {
 impl CoefCostTables {
     pub(crate) fn build(cdfs: &Cdfs) -> Self {
         let table = cost_q_table();
-        let mut bt = Box::new([[[[0f32; 4]; 42]; 2]; 4]);
+        let mut bt = Box::new([[[[0f32; 4]; 42]; 2]; 5]);
         let mut br = Box::new([[[[0f32; 13]; 21]; 2]; 4]);
-        for cls in 0..4 {
+        for cls in 0..5 {
             for pl in 0..2 {
                 for (ctx, cdf) in cdfs.base_tok[cls][pl].iter().enumerate().take(42) {
                     for (tok, slot) in bt[cls][pl][ctx].iter_mut().enumerate() {
                         *slot = cdf_cost_with_table(cdf, tok, table);
                     }
+                }
+                if cls == 4 {
+                    continue; // TX_64X64 shares the class-3 br CDFs
                 }
                 for (bc, cdf) in cdfs.br_tok[cls][pl].iter().enumerate().take(21) {
                     br[cls][pl][bc] = br_cum_row_with_table(cdf, table);
@@ -81,7 +84,8 @@ pub(crate) struct RateCtx<'a> {
     pub(crate) cdfs: &'a Cdfs,
     /// Token costs of `cdfs` (see [`CoefCostTables`]).
     pub(crate) tables: &'a CoefCostTables,
-    /// Coefficient class: 0 = TX_4X4, 1 = TX_8X8, 2 = TX_16X16, 3 = TX_32X32.
+    /// Coefficient class: 0 = TX_4X4, 1 = TX_8X8, 2 = TX_16X16, 3 = TX_32X32,
+    /// 4 = TX_64X64 (coded as its top-left 32x32; br shares class 3).
     pub(crate) cls: usize,
     /// 0 = luma, 1 = chroma.
     pub(crate) plane: usize,
@@ -150,7 +154,7 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
     };
 
     let base_tok = &c.cdfs.base_tok[cls][pl];
-    let br_tok = &c.cdfs.br_tok[cls][pl];
+    let br_tok = &c.cdfs.br_tok[cls.min(3)][pl];
     let eob_base = &c.cdfs.eob_base[cls][pl];
     let eob_hi = &c.cdfs.eob_hi[cls][pl];
     let dc_sign = &c.cdfs.dc_sign[pl][c.dcs_ctx];
@@ -203,7 +207,7 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
     };
 
     let bt_c = &c.tables.bt[cls][pl];
-    let br_c = &c.tables.br[cls][pl];
+    let br_c = &c.tables.br[cls.min(3)][pl];
     {
         with_levels(w, h, |levels, dirty| {
             // The eob coefficient uses the eob_base CDF (not base_tok) and a br

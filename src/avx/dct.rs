@@ -656,12 +656,12 @@ fn adst1d_8_v_i32(c: &mut [I32x8; 8]) {
 #[target_feature(enable = "avx2")]
 fn tx1d_v_i32(c: &mut [I32x8], adst: bool) {
     match (c.len(), adst) {
-        (4, false) => dct1d_4_v_i32(c.try_into().unwrap()),
-        (4, true) => adst1d_4_v_i32(c.try_into().unwrap()),
-        (8, false) => dct1d_8_v_i32(c.try_into().unwrap()),
-        (8, true) => adst1d_8_v_i32(c.try_into().unwrap()),
-        (16, false) => dct1d_16_v_i32(c.try_into().unwrap()),
-        (16, true) => adst1d_16_v_i32(c.try_into().unwrap()),
+        (4, false) => dct1d_4_v_i32(c.first_chunk_mut().unwrap()),
+        (4, true) => adst1d_4_v_i32(c.first_chunk_mut().unwrap()),
+        (8, false) => dct1d_8_v_i32(c.first_chunk_mut().unwrap()),
+        (8, true) => adst1d_8_v_i32(c.first_chunk_mut().unwrap()),
+        (16, false) => dct1d_16_v_i32(c.first_chunk_mut().unwrap()),
+        (16, true) => adst1d_16_v_i32(c.first_chunk_mut().unwrap()),
         _ => unreachable!("unsupported AVX2 forward-transform length"),
     }
 }
@@ -820,7 +820,7 @@ pub(crate) fn dct8x4_avx2_quant_t(
     transpose_8x8_i32(&mut rows);
     dct1d_8_v_i32(&mut rows);
     transpose_8x8_i32(&mut rows);
-    dct1d_4_v_i32((&mut rows[..4]).try_into().unwrap());
+    dct1d_4_v_i32(rows.first_chunk_mut().unwrap());
     transpose_8x8_i32(&mut rows);
 
     let mut cf = MaybeUninit::<[i32; 32]>::uninit();
@@ -1118,8 +1118,8 @@ pub(crate) fn dct8x16_avx2_coeffs(input: &[i32; 128]) -> [i32; 128] {
     let mut rows = load16_i32(input, 8);
     dct1d_16_v_i32(&mut rows);
 
-    let mut a: [I32x8; 8] = rows[..8].try_into().unwrap();
-    let mut b: [I32x8; 8] = rows[8..16].try_into().unwrap();
+    let mut a: [I32x8; 8] = *rows.first_chunk().unwrap();
+    let mut b: [I32x8; 8] = *rows[8..].first_chunk().unwrap();
     transpose_8x8_i32(&mut a);
     transpose_8x8_i32(&mut b);
     dct1d_8_v_i32(&mut a);
@@ -1145,8 +1145,8 @@ pub(crate) fn dct8x16_avx2_quant_t(
     let mut rows = load16_i32(input, 8);
     dct1d_16_v_i32(&mut rows);
 
-    let mut a: [I32x8; 8] = rows[..8].try_into().unwrap();
-    let mut b: [I32x8; 8] = rows[8..16].try_into().unwrap();
+    let mut a: [I32x8; 8] = *rows.first_chunk().unwrap();
+    let mut b: [I32x8; 8] = *rows[8..].first_chunk().unwrap();
     transpose_8x8_i32(&mut a);
     transpose_8x8_i32(&mut b);
     dct1d_8_v_i32(&mut a);

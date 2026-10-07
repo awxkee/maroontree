@@ -67,6 +67,9 @@ enum TxSel {
     /// 4=ADST_ADST) in raster order, and the coefficient record packs the
     /// four 4x4s quadrant-major.
     Split4Tx([u8; 4]),
+    /// Whole-64 luma coded as one TX_64X64 (`tx_depth = 0`); the coefficient
+    /// record carries the coded 32x32 in its first 1024 entries.
+    Tx64,
 }
 
 impl TxSel {
@@ -112,6 +115,8 @@ struct UvSel {
     uv: u8,
     /// Selected UV palette size, or zero (4:4:4 exact chroma palette).
     palette: u8,
+    /// Chroma angle delta of a directional `uv` (0 otherwise).
+    delta: i8,
 }
 
 /// Call-order log of one tile's RD decisions. Sequences are independent

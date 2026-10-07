@@ -982,7 +982,7 @@ mod tests {
             &Metadata::default(),
         )
         .unwrap();
-        let ftyp_start = u32::from_be_bytes(b[0..4].try_into().unwrap()) as usize;
+        let ftyp_start = u32::from_be_bytes(*b.first_chunk().unwrap()) as usize;
         assert_eq!(&b[4..8], b"ftyp", "first box must be ftyp");
         assert_eq!(&b[8..12], b"avif", "major brand must be avif");
         // meta follows ftyp
@@ -1075,7 +1075,7 @@ mod tests {
             "AVIF alpha URN must be present"
         );
         let ipma_pos = s.array_windows::<4>().position(|w| w == b"ipma").unwrap();
-        let entry_count = u32::from_be_bytes(s[ipma_pos + 8..ipma_pos + 12].try_into().unwrap());
+        let entry_count = u32::from_be_bytes(*s[ipma_pos + 8..].first_chunk().unwrap());
         assert_eq!(entry_count, 2, "ipma must have 2 entries (color + alpha)");
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         let mut pos = 0;
         let mut mdat_payload_start = 0u32;
         while pos + 8 <= b.len() {
-            let sz = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            let sz = u32::from_be_bytes(*b[pos..].first_chunk().unwrap()) as usize;
             if &b[pos + 4..pos + 8] == b"mdat" {
                 mdat_payload_start = (pos + 8) as u32;
                 break;
@@ -1111,7 +1111,7 @@ mod tests {
         // iloc: 8(box) + 4(fullbox) + 2(fields) + 2(item_count) = 16 bytes before first item
         // first item v0: 2(id)+2(ref)+2(cnt) = 6, then extent_offset (4)
         let off_pos = iloc_pos + 16 + 6;
-        let extent_off = u32::from_be_bytes(b[off_pos..off_pos + 4].try_into().unwrap());
+        let extent_off = u32::from_be_bytes(*b[off_pos..].first_chunk().unwrap());
         assert_eq!(
             extent_off, mdat_payload_start,
             "iloc extent_offset must point into mdat"

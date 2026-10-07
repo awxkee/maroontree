@@ -799,7 +799,7 @@ fn g_dot<V: Lane>(mat: &[i8], v: &[V]) -> V {
 
 #[allow(dead_code)]
 fn g_dct4<V: Lane>(c: &mut [V]) {
-    let c: &mut [V; 4] = c.try_into().expect("dct4 needs len 4");
+    let c: &mut [V; 4] = c.first_chunk_mut().expect("dct4 needs len 4");
     let (c0, c1, c2, c3) = (c[0], c[1], c[2], c[3]);
     let a0 = c0.mul_n(64).add(c2.mul_n(64));
     let a1 = c0.mul_n(64).sub(c2.mul_n(64));
@@ -1093,7 +1093,7 @@ fn inv_txfm_passes_lanes<V: Lane>(
     // Column pass: 4 columns per group.
     for xg in (0..sw).step_by(4) {
         for (lane, row) in lanes[..sh].iter_mut().zip(tmp.chunks_exact(sw)) {
-            let q: [i32; 4] = row[xg..xg + 4].try_into().unwrap();
+            let q: [i32; 4] = *row[xg..].first_chunk().unwrap();
             *lane = V::from4(q);
         }
         second(&mut lanes[..sh]);

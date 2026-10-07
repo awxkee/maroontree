@@ -2264,6 +2264,400 @@ pub(crate) fn idct_dequant_32x32_scalar(
     tmp
 }
 
+/// dav1d `inv_dct64_1d_c`. Only the first 32 inputs may be nonzero (AV1 codes
+/// the low half of a 64-point transform); dav1d's `tx64` shortcut paths in the
+/// inner 4/8/16/32 butterflies are exactly the generic ones with zero upper
+/// inputs (each is the same rounding of a single product), so the even half
+/// reuses [`inv_dct32_1d`] at stride `2 s`.
+#[allow(clippy::identity_op, clippy::erasing_op)]
+pub(crate) fn inv_dct64_1d(c: &mut [i32], s: usize, min: i32, max: i32) {
+    let clip = |x: i32| x.clamp(min, max);
+    inv_dct32_1d(c, 2 * s, min, max); // tx64 shortcut == generic with zero upper half
+    let in1 = c[1 * s];
+    let in3 = c[3 * s];
+    let in5 = c[5 * s];
+    let in7 = c[7 * s];
+    let in9 = c[9 * s];
+    let in11 = c[11 * s];
+    let in13 = c[13 * s];
+    let in15 = c[15 * s];
+    let in17 = c[17 * s];
+    let in19 = c[19 * s];
+    let in21 = c[21 * s];
+    let in23 = c[23 * s];
+    let in25 = c[25 * s];
+    let in27 = c[27 * s];
+    let in29 = c[29 * s];
+    let in31 = c[31 * s];
+    let mut t32a = (in1 * 101 + 2048) >> 12;
+    let mut t33a = (in31 * -2824 + 2048) >> 12;
+    let mut t34a = (in17 * 1660 + 2048) >> 12;
+    let mut t35a = (in15 * -1474 + 2048) >> 12;
+    let mut t36a = (in9 * 897 + 2048) >> 12;
+    let mut t37a = (in23 * -2191 + 2048) >> 12;
+    let mut t38a = (in25 * 2359 + 2048) >> 12;
+    let mut t39a = (in7 * -700 + 2048) >> 12;
+    let mut t40a = (in5 * 501 + 2048) >> 12;
+    let mut t41a = (in27 * -2520 + 2048) >> 12;
+    let mut t42a = (in21 * 2019 + 2048) >> 12;
+    let mut t43a = (in11 * -1092 + 2048) >> 12;
+    let mut t44a = (in13 * 1285 + 2048) >> 12;
+    let mut t45a = (in19 * -1842 + 2048) >> 12;
+    let mut t46a = (in29 * 2675 + 2048) >> 12;
+    let mut t47a = (in3 * -301 + 2048) >> 12;
+    let mut t48a = (in3 * 4085 + 2048) >> 12;
+    let mut t49a = (in29 * 3102 + 2048) >> 12;
+    let mut t50a = (in19 * 3659 + 2048) >> 12;
+    let mut t51a = (in13 * 3889 + 2048) >> 12;
+    let mut t52a = (in11 * 3948 + 2048) >> 12;
+    let mut t53a = (in21 * 3564 + 2048) >> 12;
+    let mut t54a = (in27 * 3229 + 2048) >> 12;
+    let mut t55a = (in5 * 4065 + 2048) >> 12;
+    let mut t56a = (in7 * 4036 + 2048) >> 12;
+    let mut t57a = (in25 * 3349 + 2048) >> 12;
+    let mut t58a = (in23 * 3461 + 2048) >> 12;
+    let mut t59a = (in9 * 3996 + 2048) >> 12;
+    let mut t60a = (in15 * 3822 + 2048) >> 12;
+    let mut t61a = (in17 * 3745 + 2048) >> 12;
+    let mut t62a = (in31 * 2967 + 2048) >> 12;
+    let mut t63a = (in1 * 4095 + 2048) >> 12;
+    let mut t32 = clip(t32a + t33a);
+    let mut t33 = clip(t32a - t33a);
+    let mut t34 = clip(t35a - t34a);
+    let mut t35 = clip(t35a + t34a);
+    let mut t36 = clip(t36a + t37a);
+    let mut t37 = clip(t36a - t37a);
+    let mut t38 = clip(t39a - t38a);
+    let mut t39 = clip(t39a + t38a);
+    let mut t40 = clip(t40a + t41a);
+    let mut t41 = clip(t40a - t41a);
+    let mut t42 = clip(t43a - t42a);
+    let mut t43 = clip(t43a + t42a);
+    let mut t44 = clip(t44a + t45a);
+    let mut t45 = clip(t44a - t45a);
+    let mut t46 = clip(t47a - t46a);
+    let mut t47 = clip(t47a + t46a);
+    let mut t48 = clip(t48a + t49a);
+    let mut t49 = clip(t48a - t49a);
+    let mut t50 = clip(t51a - t50a);
+    let mut t51 = clip(t51a + t50a);
+    let mut t52 = clip(t52a + t53a);
+    let mut t53 = clip(t52a - t53a);
+    let mut t54 = clip(t55a - t54a);
+    let mut t55 = clip(t55a + t54a);
+    let mut t56 = clip(t56a + t57a);
+    let mut t57 = clip(t56a - t57a);
+    let mut t58 = clip(t59a - t58a);
+    let mut t59 = clip(t59a + t58a);
+    let mut t60 = clip(t60a + t61a);
+    let mut t61 = clip(t60a - t61a);
+    let mut t62 = clip(t63a - t62a);
+    let mut t63 = clip(t63a + t62a);
+    t33a = ((t33 * (4096 - 4076) + t62 * 401 + 2048) >> 12) - t33;
+    t34a = ((t34 * -401 + t61 * (4096 - 4076) + 2048) >> 12) - t61;
+    t37a = (t37 * -1299 + t58 * 1583 + 1024) >> 11;
+    t38a = (t38 * -1583 + t57 * -1299 + 1024) >> 11;
+    t41a = ((t41 * (4096 - 3612) + t54 * 1931 + 2048) >> 12) - t41;
+    t42a = ((t42 * -1931 + t53 * (4096 - 3612) + 2048) >> 12) - t53;
+    t45a = ((t45 * -1189 + t50 * (3920 - 4096) + 2048) >> 12) + t50;
+    t46a = ((t46 * (4096 - 3920) + t49 * -1189 + 2048) >> 12) - t46;
+    t49a = ((t46 * -1189 + t49 * (3920 - 4096) + 2048) >> 12) + t49;
+    t50a = ((t45 * (3920 - 4096) + t50 * 1189 + 2048) >> 12) + t45;
+    t53a = ((t42 * (4096 - 3612) + t53 * 1931 + 2048) >> 12) - t42;
+    t54a = ((t41 * 1931 + t54 * (3612 - 4096) + 2048) >> 12) + t54;
+    t57a = (t38 * -1299 + t57 * 1583 + 1024) >> 11;
+    t58a = (t37 * 1583 + t58 * 1299 + 1024) >> 11;
+    t61a = ((t34 * (4096 - 4076) + t61 * 401 + 2048) >> 12) - t34;
+    t62a = ((t33 * 401 + t62 * (4076 - 4096) + 2048) >> 12) + t62;
+    t32a = clip(t32 + t35);
+    t33 = clip(t33a + t34a);
+    t34 = clip(t33a - t34a);
+    t35a = clip(t32 - t35);
+    t36a = clip(t39 - t36);
+    t37 = clip(t38a - t37a);
+    t38 = clip(t38a + t37a);
+    t39a = clip(t39 + t36);
+    t40a = clip(t40 + t43);
+    t41 = clip(t41a + t42a);
+    t42 = clip(t41a - t42a);
+    t43a = clip(t40 - t43);
+    t44a = clip(t47 - t44);
+    t45 = clip(t46a - t45a);
+    t46 = clip(t46a + t45a);
+    t47a = clip(t47 + t44);
+    t48a = clip(t48 + t51);
+    t49 = clip(t49a + t50a);
+    t50 = clip(t49a - t50a);
+    t51a = clip(t48 - t51);
+    t52a = clip(t55 - t52);
+    t53 = clip(t54a - t53a);
+    t54 = clip(t54a + t53a);
+    t55a = clip(t55 + t52);
+    t56a = clip(t56 + t59);
+    t57 = clip(t57a + t58a);
+    t58 = clip(t57a - t58a);
+    t59a = clip(t56 - t59);
+    t60a = clip(t63 - t60);
+    t61 = clip(t62a - t61a);
+    t62 = clip(t62a + t61a);
+    t63a = clip(t63 + t60);
+    t34a = ((t34 * (4096 - 4017) + t61 * 799 + 2048) >> 12) - t34;
+    t35 = ((t35a * (4096 - 4017) + t60a * 799 + 2048) >> 12) - t35a;
+    t36 = ((t36a * -799 + t59a * (4096 - 4017) + 2048) >> 12) - t59a;
+    t37a = ((t37 * -799 + t58 * (4096 - 4017) + 2048) >> 12) - t58;
+    t42a = (t42 * -1138 + t53 * 1703 + 1024) >> 11;
+    t43 = (t43a * -1138 + t52a * 1703 + 1024) >> 11;
+    t44 = (t44a * -1703 + t51a * -1138 + 1024) >> 11;
+    t45a = (t45 * -1703 + t50 * -1138 + 1024) >> 11;
+    t50a = (t45 * -1138 + t50 * 1703 + 1024) >> 11;
+    t51 = (t44a * -1138 + t51a * 1703 + 1024) >> 11;
+    t52 = (t43a * 1703 + t52a * 1138 + 1024) >> 11;
+    t53a = (t42 * 1703 + t53 * 1138 + 1024) >> 11;
+    t58a = ((t37 * (4096 - 4017) + t58 * 799 + 2048) >> 12) - t37;
+    t59 = ((t36a * (4096 - 4017) + t59a * 799 + 2048) >> 12) - t36a;
+    t60 = ((t35a * 799 + t60a * (4017 - 4096) + 2048) >> 12) + t60a;
+    t61a = ((t34 * 799 + t61 * (4017 - 4096) + 2048) >> 12) + t61;
+    t32 = clip(t32a + t39a);
+    t33a = clip(t33 + t38);
+    t34 = clip(t34a + t37a);
+    t35a = clip(t35 + t36);
+    t36a = clip(t35 - t36);
+    t37 = clip(t34a - t37a);
+    t38a = clip(t33 - t38);
+    t39 = clip(t32a - t39a);
+    t40 = clip(t47a - t40a);
+    t41a = clip(t46 - t41);
+    t42 = clip(t45a - t42a);
+    t43a = clip(t44 - t43);
+    t44a = clip(t44 + t43);
+    t45 = clip(t45a + t42a);
+    t46a = clip(t46 + t41);
+    t47 = clip(t47a + t40a);
+    t48 = clip(t48a + t55a);
+    t49a = clip(t49 + t54);
+    t50 = clip(t50a + t53a);
+    t51a = clip(t51 + t52);
+    t52a = clip(t51 - t52);
+    t53 = clip(t50a - t53a);
+    t54a = clip(t49 - t54);
+    t55 = clip(t48a - t55a);
+    t56 = clip(t63a - t56a);
+    t57a = clip(t62 - t57);
+    t58 = clip(t61a - t58a);
+    t59a = clip(t60 - t59);
+    t60a = clip(t60 + t59);
+    t61 = clip(t61a + t58a);
+    t62a = clip(t62 + t57);
+    t63 = clip(t63a + t56a);
+    t36 = ((t36a * (4096 - 3784) + t59a * 1567 + 2048) >> 12) - t36a;
+    t37a = ((t37 * (4096 - 3784) + t58 * 1567 + 2048) >> 12) - t37;
+    t38 = ((t38a * (4096 - 3784) + t57a * 1567 + 2048) >> 12) - t38a;
+    t39a = ((t39 * (4096 - 3784) + t56 * 1567 + 2048) >> 12) - t39;
+    t40a = ((t40 * -1567 + t55 * (4096 - 3784) + 2048) >> 12) - t55;
+    t41 = ((t41a * -1567 + t54a * (4096 - 3784) + 2048) >> 12) - t54a;
+    t42a = ((t42 * -1567 + t53 * (4096 - 3784) + 2048) >> 12) - t53;
+    t43 = ((t43a * -1567 + t52a * (4096 - 3784) + 2048) >> 12) - t52a;
+    t52 = ((t43a * (4096 - 3784) + t52a * 1567 + 2048) >> 12) - t43a;
+    t53a = ((t42 * (4096 - 3784) + t53 * 1567 + 2048) >> 12) - t42;
+    t54 = ((t41a * (4096 - 3784) + t54a * 1567 + 2048) >> 12) - t41a;
+    t55a = ((t40 * (4096 - 3784) + t55 * 1567 + 2048) >> 12) - t40;
+    t56a = ((t39 * 1567 + t56 * (3784 - 4096) + 2048) >> 12) + t56;
+    t57 = ((t38a * 1567 + t57a * (3784 - 4096) + 2048) >> 12) + t57a;
+    t58a = ((t37 * 1567 + t58 * (3784 - 4096) + 2048) >> 12) + t58;
+    t59 = ((t36a * 1567 + t59a * (3784 - 4096) + 2048) >> 12) + t59a;
+    t32a = clip(t32 + t47);
+    t33 = clip(t33a + t46a);
+    t34a = clip(t34 + t45);
+    t35 = clip(t35a + t44a);
+    t36a = clip(t36 + t43);
+    t37 = clip(t37a + t42a);
+    t38a = clip(t38 + t41);
+    t39 = clip(t39a + t40a);
+    t40 = clip(t39a - t40a);
+    t41a = clip(t38 - t41);
+    t42 = clip(t37a - t42a);
+    t43a = clip(t36 - t43);
+    t44 = clip(t35a - t44a);
+    t45a = clip(t34 - t45);
+    t46 = clip(t33a - t46a);
+    t47a = clip(t32 - t47);
+    t48a = clip(t63 - t48);
+    t49 = clip(t62a - t49a);
+    t50a = clip(t61 - t50);
+    t51 = clip(t60a - t51a);
+    t52a = clip(t59 - t52);
+    t53 = clip(t58a - t53a);
+    t54a = clip(t57 - t54);
+    t55 = clip(t56a - t55a);
+    t56 = clip(t56a + t55a);
+    t57a = clip(t57 + t54);
+    t58 = clip(t58a + t53a);
+    t59a = clip(t59 + t52);
+    t60 = clip(t60a + t51a);
+    t61a = clip(t61 + t50);
+    t62 = clip(t62a + t49a);
+    t63a = clip(t63 + t48);
+    t40a = ((t55 - t40) * 181 + 128) >> 8;
+    t41 = ((t54a - t41a) * 181 + 128) >> 8;
+    t42a = ((t53 - t42) * 181 + 128) >> 8;
+    t43 = ((t52a - t43a) * 181 + 128) >> 8;
+    t44a = ((t51 - t44) * 181 + 128) >> 8;
+    t45 = ((t50a - t45a) * 181 + 128) >> 8;
+    t46a = ((t49 - t46) * 181 + 128) >> 8;
+    t47 = ((t48a - t47a) * 181 + 128) >> 8;
+    t48 = ((t47a + t48a) * 181 + 128) >> 8;
+    t49a = ((t46 + t49) * 181 + 128) >> 8;
+    t50 = ((t45a + t50a) * 181 + 128) >> 8;
+    t51a = ((t44 + t51) * 181 + 128) >> 8;
+    t52 = ((t43a + t52a) * 181 + 128) >> 8;
+    t53a = ((t42 + t53) * 181 + 128) >> 8;
+    t54 = ((t41a + t54a) * 181 + 128) >> 8;
+    t55a = ((t40 + t55) * 181 + 128) >> 8;
+    let t0 = c[0];
+    let t1 = c[2 * s];
+    let t2 = c[4 * s];
+    let t3 = c[6 * s];
+    let t4 = c[8 * s];
+    let t5 = c[10 * s];
+    let t6 = c[12 * s];
+    let t7 = c[14 * s];
+    let t8 = c[16 * s];
+    let t9 = c[18 * s];
+    let t10 = c[20 * s];
+    let t11 = c[22 * s];
+    let t12 = c[24 * s];
+    let t13 = c[26 * s];
+    let t14 = c[28 * s];
+    let t15 = c[30 * s];
+    let t16 = c[32 * s];
+    let t17 = c[34 * s];
+    let t18 = c[36 * s];
+    let t19 = c[38 * s];
+    let t20 = c[40 * s];
+    let t21 = c[42 * s];
+    let t22 = c[44 * s];
+    let t23 = c[46 * s];
+    let t24 = c[48 * s];
+    let t25 = c[50 * s];
+    let t26 = c[52 * s];
+    let t27 = c[54 * s];
+    let t28 = c[56 * s];
+    let t29 = c[58 * s];
+    let t30 = c[60 * s];
+    let t31 = c[62 * s];
+    c[0] = clip(t0 + t63a);
+    c[1 * s] = clip(t1 + t62);
+    c[2 * s] = clip(t2 + t61a);
+    c[3 * s] = clip(t3 + t60);
+    c[4 * s] = clip(t4 + t59a);
+    c[5 * s] = clip(t5 + t58);
+    c[6 * s] = clip(t6 + t57a);
+    c[7 * s] = clip(t7 + t56);
+    c[8 * s] = clip(t8 + t55a);
+    c[9 * s] = clip(t9 + t54);
+    c[10 * s] = clip(t10 + t53a);
+    c[11 * s] = clip(t11 + t52);
+    c[12 * s] = clip(t12 + t51a);
+    c[13 * s] = clip(t13 + t50);
+    c[14 * s] = clip(t14 + t49a);
+    c[15 * s] = clip(t15 + t48);
+    c[16 * s] = clip(t16 + t47);
+    c[17 * s] = clip(t17 + t46a);
+    c[18 * s] = clip(t18 + t45);
+    c[19 * s] = clip(t19 + t44a);
+    c[20 * s] = clip(t20 + t43);
+    c[21 * s] = clip(t21 + t42a);
+    c[22 * s] = clip(t22 + t41);
+    c[23 * s] = clip(t23 + t40a);
+    c[24 * s] = clip(t24 + t39);
+    c[25 * s] = clip(t25 + t38a);
+    c[26 * s] = clip(t26 + t37);
+    c[27 * s] = clip(t27 + t36a);
+    c[28 * s] = clip(t28 + t35);
+    c[29 * s] = clip(t29 + t34a);
+    c[30 * s] = clip(t30 + t33);
+    c[31 * s] = clip(t31 + t32a);
+    c[32 * s] = clip(t31 - t32a);
+    c[33 * s] = clip(t30 - t33);
+    c[34 * s] = clip(t29 - t34a);
+    c[35 * s] = clip(t28 - t35);
+    c[36 * s] = clip(t27 - t36a);
+    c[37 * s] = clip(t26 - t37);
+    c[38 * s] = clip(t25 - t38a);
+    c[39 * s] = clip(t24 - t39);
+    c[40 * s] = clip(t23 - t40a);
+    c[41 * s] = clip(t22 - t41);
+    c[42 * s] = clip(t21 - t42a);
+    c[43 * s] = clip(t20 - t43);
+    c[44 * s] = clip(t19 - t44a);
+    c[45 * s] = clip(t18 - t45);
+    c[46 * s] = clip(t17 - t46a);
+    c[47 * s] = clip(t16 - t47);
+    c[48 * s] = clip(t15 - t48);
+    c[49 * s] = clip(t14 - t49a);
+    c[50 * s] = clip(t13 - t50);
+    c[51 * s] = clip(t12 - t51a);
+    c[52 * s] = clip(t11 - t52);
+    c[53 * s] = clip(t10 - t53a);
+    c[54 * s] = clip(t9 - t54);
+    c[55 * s] = clip(t8 - t55a);
+    c[56 * s] = clip(t7 - t56);
+    c[57 * s] = clip(t6 - t57a);
+    c[58 * s] = clip(t5 - t58);
+    c[59 * s] = clip(t4 - t59a);
+    c[60 * s] = clip(t3 - t60);
+    c[61 * s] = clip(t2 - t61a);
+    c[62 * s] = clip(t1 - t62);
+    c[63 * s] = clip(t0 - t63a);
+}
+
+/// dav1d's exact TX_64X64 DCT_DCT inverse (`inv_txfm_add_c`, shift 2): the
+/// coded 32x32 levels (`levels[x * 32 + y]`, 32x32 QM) dequantized with
+/// `dq_shift = 2`, rows via the 64-point DCT on the 32 coded rows, the
+/// inter-pass `(t + 2) >> 2` clamp, 64-point columns, final `(t + 8) >> 4`.
+/// Writes the 64x64 residual row-major into `out`.
+pub(crate) fn idct_dequant_64x64(levels: &[i32; 1024], q: &Quant, out: &mut [i32; 4096]) {
+    let dequant = IdctDequant::new(q, 32, 32);
+    let (rmin, rmax, cmin, cmax, cf_max) = (
+        dequant.rmin,
+        dequant.rmax,
+        dequant.cmin,
+        dequant.cmax,
+        dequant.cf_max,
+    );
+    out.fill(0);
+    // Row pass over the 32 coded rows (dav1d skips the all-zero tail rows;
+    // a zero row transforms to zero, so running them is equivalent).
+    for y in 0..32 {
+        let row = &mut out[y * 64..y * 64 + 64];
+        let mut any = false;
+        for x in 0..32 {
+            let lvl = levels[x * 32 + y];
+            if lvl == 0 {
+                continue;
+            }
+            any = true;
+            let q = dequant.step(x * 32 + y);
+            // mask to 24 bits, dq_shift = 2, clamp to cf_max
+            let mag = (((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) >> 2) as i32;
+            let mag = mag.min(cf_max + (lvl < 0) as i32);
+            row[x] = if lvl < 0 { -mag } else { mag };
+        }
+        if any {
+            inv_dct64_1d(row, 1, rmin, rmax);
+        }
+    }
+    for t in out[..32 * 64].iter_mut() {
+        *t = ((*t + 2) >> 2).clamp(cmin, cmax);
+    }
+    for x in 0..64 {
+        inv_dct64_1d(&mut out[x..], 64, cmin, cmax);
+    }
+    for t in out.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+}
+
 pub(crate) fn iidentity_dequant_4x4(levels: &[i32; 16], q: &Quant) -> [i32; 16] {
     let q = &crate::quant::FlatDct(q); // identity family: QM not applied
     let (_rmin, _rmax, cmin, cmax, cf_max) = q.clips();
