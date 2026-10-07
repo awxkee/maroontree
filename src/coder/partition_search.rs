@@ -733,7 +733,7 @@ impl<'a> LossyTile<'a> {
         // selected partition receives the unchanged full mode/transform
         // refinement in its emitter; doing both here duplicated winner work.
         let dlam = trellis_lambda() * prdo;
-        let (y_mode, pred, resid, cf, rpal) =
+        let (y_mode, _, pred, resid, cf, rpal) =
             self.rect16_luma_mode_search(px, py, vert, dc, dlam, mlam, rect_dec_refine());
         let (txtp, cf) = self.rect_leaf_tx_trial(&resid, &cf, &pred, px, py, vert, y_mode, dlam, mlam, rect_dec_refine(), rpal.is_some());
         let rr = inv_rect_luma_128(&self.idct, &cf, &self.quant, vert, txtp);
@@ -850,7 +850,7 @@ impl<'a> LossyTile<'a> {
         lam: f32,
         mlam: f32,
         refine: bool,
-    ) -> (usize, [i32; 128], [i32; 128], [i32; 128], Option<LossyLumaPalette>) {
+    ) -> (usize, i32, [i32; 128], [i32; 128], [i32; 128], Option<LossyLumaPalette>) {
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
         let scan: &[u32] = if vert { &SCAN_8X16 } else { &SCAN_16X8 };
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
@@ -874,14 +874,36 @@ impl<'a> LossyTile<'a> {
         // SATD and run the full pipeline on the top RECT_LEAF_BEAM only (DC
         // always retained as the safe fallback). Same pruning the square
         // proxy beam and the AV2 intra search use.
-        let mut cands = FixedList::<(u64, usize), 7>::new((0, DC_PRED));
+        // `rect_ad`: V_PRED with positive and H_PRED with negative angle
+        // deltas join the candidate set — zone-2 angles that read neither the
+        // top-right nor the bottom-left edge, so the leaf's tr/bl-free edge
+        // setup stays exact.
+        let rect_ad = refine && self.speed.at_least_slow() && crate::tuning::get().rect_ad;
+        let mut all = FixedList::<(usize, i32), 13>::new((DC_PRED, 0));
         for &m in modes {
-            let mut pred = [0i32; 128];
+            all.push((m, 0));
+        }
+        if rect_ad {
+            for d in 1..=3 {
+                all.push((V_PRED, d));
+                all.push((H_PRED, -d));
+            }
+        }
+        let mut all_diag = FixedList::<(usize, i32), 21>::new((DC_PRED, 0));
+        if rect_ad && crate::tuning::get().rect_diag {
+            for m in [D113_PRED, D135_PRED, D157_PRED] {
+                for d in -3..=3 {
+                    all_diag.push((m, d));
+                }
+            }
+        }
+        let predict = |m: usize, d: i32, dc: i32, pred: &mut [i32; 128]| {
             if m == DC_PRED {
-                pred = [dc; 128];
+                pred.fill(dc);
             } else {
-                self.intrapred.predict_nd(
+                self.intrapred.predict_nd_ad(
                     m,
+                    d,
                     &self.recon[0],
                     self.w,
                     px,
@@ -893,19 +915,24 @@ impl<'a> LossyTile<'a> {
                     self.w,
                     self.h,
                     ftype,
-                    &mut pred,
+                    &mut pred[..],
                     self.bd,
                 );
             }
+        };
+        let mut cands = FixedList::<(u64, usize, i32), 34>::new((0, DC_PRED, 0));
+        for &(m, d) in all.iter().chain(all_diag.iter()) {
+            let mut pred = [0i32; 128];
+            predict(m, d, dc, &mut pred);
             let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, w, h), &pred, w);
-            cands.push((score, m));
+            cands.push((score, m, d));
         }
         const RECT_LEAF_BEAM: usize = 3;
         if cands.len() > RECT_LEAF_BEAM {
             cands
                 .as_mut_slice()
-                .sort_unstable_by_key(|&(score, mode)| (score, mode));
-            let dc_pos = cands.iter().position(|&(_, m)| m == DC_PRED).unwrap();
+                .sort_unstable_by_key(|&(score, mode, d)| (score, mode, d));
+            let dc_pos = cands.iter().position(|&(_, m, _)| m == DC_PRED).unwrap();
             if dc_pos >= RECT_LEAF_BEAM {
                 cands.as_mut_slice().swap(RECT_LEAF_BEAM - 1, dc_pos);
             }
@@ -918,29 +945,11 @@ impl<'a> LossyTile<'a> {
             [0i32; 128],
             [0i32; 128],
             [0i32; 128],
+            0i32,
         );
-        for &(_, m) in &cands {
+        for &(_, m, d) in &cands {
             let mut pred = [0i32; 128];
-            if m == DC_PRED {
-                pred.fill(dc);
-            } else {
-                self.intrapred.predict_nd(
-                    m,
-                    &self.recon[0],
-                    self.w,
-                    px,
-                    py,
-                    w,
-                    h,
-                    false,
-                    false,
-                    self.w,
-                    self.h,
-                    ftype,
-                    &mut pred,
-                    self.bd,
-                );
-            }
+            predict(m, d, dc, &mut pred);
             let mut resid = [0i32; 128];
             self.rd.residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, w, h);
             let (mut cf, tf) = if vert {
@@ -957,10 +966,13 @@ impl<'a> LossyTile<'a> {
             };
             let sse =
                 self.rd.sse_recon(&pred, &rr, self.src_blk(0, px, py, w, h), self.bd);
-            let bits = self.luma_rect_bits(&cf, scan, w, h, px, py, m, 1) + cdf_cost(kf, m);
+            let mut bits = self.luma_rect_bits(&cf, scan, w, h, px, py, m, 1) + cdf_cost(kf, m);
+            if rect_ad && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                bits += cdf_cost(&self.dcdf().angle_delta[m - V_PRED], (d + 3) as usize);
+            }
             let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best.0 {
-                best = (cost, m, pred, resid, cf);
+                best = (cost, m, pred, resid, cf, d);
             }
         }
         // Palette leaf: 16x8 / 8x16 is the dominant palette shape on text
@@ -997,12 +1009,12 @@ impl<'a> LossyTile<'a> {
                     + pal_bits;
                 let cost = rd_cost_i64(sse, mlam, bits);
                 if cost < best.0 {
-                    best = (cost, DC_PRED, pred, resid, cf);
+                    best = (cost, DC_PRED, pred, resid, cf, 0);
                     best_pal = Some(palette);
                 }
             }
         }
-        (best.1, best.2, best.3, best.4, best_pal)
+        (best.1, best.5, best.2, best.3, best.4, best_pal)
     }
 
     /// Transform-type trial for a rectangular luma leaf: ADST_ADST against the
@@ -1247,7 +1259,7 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf, rpal) =
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, true, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
                 &lresid, &lcf, &lpred_arr, px, py, true, y_mode, lam, emlam, true, rpal.is_some());
@@ -1363,7 +1375,7 @@ impl<'a> LossyTile<'a> {
             // bitstream. This search only offers delta 0.
             if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
                 self.enc
-                    .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
+                    .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
             }
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 8, 16);
             self.emit_palette_mode_info(px, py, 8, 16, y_mode, !self.mono, rpal.as_ref(), None);
@@ -1769,7 +1781,7 @@ impl<'a> LossyTile<'a> {
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-        let (y_mode, lpred_arr, lresid, lcf, rpal) =
+        let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
             self.rect16_luma_mode_search(px, py, vert, dc_l, lam, emlam, true);
         let (ltxtp, lcf) = self.rect_leaf_tx_trial(
             &lresid, &lcf, &lpred_arr, px, py, vert, y_mode, lam, emlam, true, rpal.is_some());
@@ -1890,7 +1902,7 @@ impl<'a> LossyTile<'a> {
         self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
         if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
             self.enc
-                .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
+                .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
         }
         self.emit_uv_mode(
             y_mode,
@@ -2017,7 +2029,7 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf, rpal) =
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
                 &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some());
@@ -2111,7 +2123,7 @@ impl<'a> LossyTile<'a> {
             self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
             if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
                 self.enc
-                    .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
+                    .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
             }
             self.emit_uv_mode(
                 y_mode,
@@ -2234,7 +2246,7 @@ impl<'a> LossyTile<'a> {
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, lpred_arr, lresid, lcf, rpal) =
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
                 self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
                 &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some());
@@ -2354,7 +2366,7 @@ impl<'a> LossyTile<'a> {
             // offers delta 0).
             if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
                 self.enc
-                    .encode_symbol(3, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
+                    .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
             }
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 16, 8);
             self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, rpal.as_ref(), None);
@@ -2484,8 +2496,8 @@ impl<'a> LossyTile<'a> {
         // coefficient result context. Simulate that progression here and
         // restore it before returning (external review round 2, finding 3).
         let (bx4_0, by4_0) = (px / 4, py / 4);
-        let saved_a: [u8; 4] = self.a_coef[0][bx4_0..bx4_0 + 4].try_into().unwrap();
-        let saved_l: [u8; 4] = self.l_coef[0][by4_0..by4_0 + 4].try_into().unwrap();
+        let saved_a: [u8; 4] = *self.a_coef[0][bx4_0..].first_chunk().unwrap();
+        let saved_l: [u8; 4] = *self.l_coef[0][by4_0..].first_chunk().unwrap();
         let mut cf4 = self.sbuf_i256();
         let mut rec = self.sbuf_u256();
         let mut sse_sum = 0i64;
@@ -3015,6 +3027,7 @@ impl<'a> LossyTile<'a> {
         let rl_cf = self.luma_cf_replay();
         let joint_large =
             rl.is_none() && !self.mono && self.speed.at_least_slow() && joint_luma_uv_large_enabled();
+        let mut dir_top = [(f32::INFINITY, DC_PRED); 2];
         let mode_shortlist = if rl.is_none() {
             self.rank_luma_modes::<256>(
                 modes,
@@ -3100,6 +3113,14 @@ impl<'a> LossyTile<'a> {
                 0.0
             };
             let cost = rd_cost_i64(sse, mlam, bits + self.mode_bits(px, py, m) + filter_bits);
+            if (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                if cost < dir_top[0].0 {
+                    dir_top[1] = dir_top[0];
+                    dir_top[0] = (cost, m);
+                } else if cost < dir_top[1].0 {
+                    dir_top[1] = (cost, m);
+                }
+            }
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
@@ -3349,9 +3370,7 @@ impl<'a> LossyTile<'a> {
         let mut best_delta: i32 = 0;
         if rl.is_none()
             && self.speed.try_angle_deltas_av1(16, self.base_q_idx)
-            && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
-            && best_mode != V_PRED
-            && best_mode != H_PRED
+            && self.angle_delta_refines(best_mode)
         {
             let mut ad_cdf = [0u16; 7];
             ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
@@ -3405,6 +3424,84 @@ impl<'a> LossyTile<'a> {
                 let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
                 if rl.is_some() || cost < best_ad_cost {
                     best_ad_cost = cost;
+                    best_delta = d;
+                    *lpred_arr = *pred;
+                    *lcf = cf;
+                    *ltf = tf;
+                    best_dct_sse = sse;
+                    best_dct_bits = bits;
+                }
+            }
+        }
+        // Runner-up angle-delta refinement (`ad_runner`): the best directional
+        // mode that did NOT win (the winner may be non-directional) tries its
+        // two SATD-ranked deltas against the winner's full cost.
+        let runner = if dir_top[0].1 == best_mode { dir_top[1] } else { dir_top[0] };
+        if rl.is_none()
+            && crate::tuning::get().ad_runner
+            && self.speed.try_angle_deltas_av1(16, self.base_q_idx)
+            && runner.0.is_finite()
+            && self.angle_delta_refines(runner.1)
+            && best_filter_intra.is_none()
+            && best_palette16.is_none()
+        {
+            let m2 = runner.1;
+            let cur_extra = if (V_PRED..=VERT_LEFT_PRED).contains(&best_mode) {
+                cdf_cost(&self.dcdf().angle_delta[best_mode - V_PRED], (best_delta + 3) as usize)
+            } else if best_mode == DC_PRED {
+                cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(16, 16)], 0)
+            } else {
+                0.0
+            };
+            let mut best_cost = rd_cost_i64(
+                best_dct_sse,
+                mlam,
+                best_dct_bits + self.mode_bits(px, py, best_mode) + cur_extra,
+            );
+            let mut ad_cdf = [0u16; 7];
+            ad_cdf.copy_from_slice(&self.dcdf().angle_delta[m2 - V_PRED]);
+            let m2_bits = self.mode_bits(px, py, m2);
+            let mut ad_pred0 = self.sbuf_i256();
+            let mut ad_pred1 = self.sbuf_i256();
+            let mut ad_scratch = self.sbuf_i256();
+            let mut ad_preds = [&mut *ad_pred0, &mut *ad_pred1, &mut *ad_scratch];
+            for (di, &d) in self
+                .rank_angle_deltas::<256>(m2, px, py, 16, 16, have_tr, have_bl, 2, &mut ad_preds)
+                .iter()
+                .enumerate()
+            {
+                let pred: &[i32; 256] = &*ad_preds[di];
+                let mut resid = self.sbuf_i256();
+                self.rd
+                    .residual_pred(&mut resid[..], &pred[..], &self.src[0], self.w, px, py, 16, 16);
+                let (mut cf, tf) = self.dct.dct16x16_t(&resid, &self.quant);
+                if self.speed.per_candidate_rdoq_av1() {
+                    trellis_optimize_ctx(
+                        &mut cf,
+                        &tf,
+                        dcq,
+                        acq,
+                        &SCAN_16X16,
+                        lam,
+                        16,
+                        16,
+                        self.dcdf(),
+                        2,
+                        0,
+                        &self.dcdf().eob_bin_256_l,
+                        dcs16,
+                        self.quant.qm_level(),
+                        self.quant.qidx() as i32,
+                    );
+                }
+                let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
+                let sse = sse_recon::<256, 16>(&self.rd, pred, &rr, self.src_blk(0, px, py, 16, 16), self.bd);
+                let bits = self.luma_bits(&cf, &SCAN_16X16, 16, px, py, m2, 1);
+                let cost =
+                    rd_cost_i64(sse, mlam, bits + m2_bits + cdf_cost(&ad_cdf, (d + 3) as usize));
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = m2;
                     best_delta = d;
                     *lpred_arr = *pred;
                     *lcf = cf;

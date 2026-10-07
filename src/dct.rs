@@ -292,7 +292,7 @@ fn dct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64],
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for r in 0..8usize {
-        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let mut row: [i32; 8] = *tmp[r * 8..].first_chunk().unwrap();
         dct1d_8_i32(&mut row);
         for u in 0..8 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, row[u], dc_q, ac_q);
@@ -542,7 +542,7 @@ pub(crate) fn dct16x16_coeffs(input: &[i32; 256]) -> [i32; 256] {
     // Row-wise 1D DCT
     let mut out = [0i32; 256];
     for v in 0..16 {
-        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let mut row: [i32; 16] = *tmp[v * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut row);
         // Normalize the integer DCT-16 gain (sqrt(16) per pass -> 16x; the
         // pipeline expects the orthonormal*8 scale) by 1/2.
@@ -570,7 +570,7 @@ fn dct16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 2
     let mut cf = [0i32; 256];
     let mut tf = [0.0f32; 256];
     for v in 0..16 {
-        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let mut row: [i32; 16] = *tmp[v * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut row);
         for u in 0..16 {
             let coeff = mul_q16(row[u], 32768);
@@ -691,7 +691,7 @@ pub(crate) fn dct32x32_coeffs(input: &[i32; 1024]) -> [i32; 1024] {
     // Row-wise 1D DCT
     let mut out = [0i32; 1024];
     for v in 0..32 {
-        let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
+        let mut row: [i32; 32] = *tmp[v * 32..].first_chunk().unwrap();
         dct1d_32_i32(&mut row);
         for u in 0..32 {
             let prod = (row[u] as i64) * 16384;
@@ -723,7 +723,7 @@ fn dct32x32_quant_t_direct(
     let mut cf = [0i32; 1024];
     let mut tf = [0.0f32; 1024];
     for v in 0..32 {
-        let mut row: [i32; 32] = tmp[v * 32..v * 32 + 32].try_into().unwrap();
+        let mut row: [i32; 32] = *tmp[v * 32..].first_chunk().unwrap();
         dct1d_32_i32(&mut row);
         for u in 0..32 {
             let prod = (row[u] as i64) * 16384;
@@ -798,7 +798,7 @@ pub(crate) fn dct8x16_coeffs(input: &[i32; 128]) -> [i32; 128] {
     // Pass 2: DCT-8 across each of the 16 rows (horizontal).
     let mut out = [0i32; 128];
     for fy in 0..16usize {
-        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let mut r: [i32; 8] = *tmp[fy * 8..].first_chunk().unwrap();
         dct1d_8_i32(&mut r);
         // Normalize the integer 8x16 gain sqrt(8*16)=sqrt(128) to orthonormal*8
         // by 1/sqrt(2) (round(65536/sqrt2) = 46341).
@@ -824,7 +824,7 @@ fn adst8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 1
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..16usize {
-        let r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let r: [i32; 8] = *tmp[fy * 8..].first_chunk().unwrap();
         let r = fwd_adst8_1d(&r);
         for fx in 0..8 {
             let coeff = mul_q16(r[fx], 46341);
@@ -849,7 +849,7 @@ fn adst16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 1
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..8usize {
-        let r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let r: [i32; 16] = *tmp[fy * 16..].first_chunk().unwrap();
         let r = fwd_adst16_1d(&r);
         for fx in 0..16 {
             let coeff = mul_q16(r[fx], 46341);
@@ -878,7 +878,7 @@ fn adstdct16x8_quant_t_direct(
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..8usize {
-        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let mut r: [i32; 16] = *tmp[fy * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut r);
         for fx in 0..16 {
             let coeff = mul_q16(r[fx], 46341);
@@ -908,7 +908,7 @@ fn dctadst16x8_quant_t_direct(
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..8usize {
-        let r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let r: [i32; 16] = *tmp[fy * 16..].first_chunk().unwrap();
         let r = fwd_adst16_1d(&r);
         for fx in 0..16 {
             let coeff = mul_q16(r[fx], 46341);
@@ -938,7 +938,7 @@ fn adstdct8x16_quant_t_direct(
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..16usize {
-        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let mut r: [i32; 8] = *tmp[fy * 8..].first_chunk().unwrap();
         dct1d_8_i32(&mut r);
         for fx in 0..8 {
             let coeff = mul_q16(r[fx], 46341);
@@ -967,7 +967,7 @@ fn dctadst8x16_quant_t_direct(
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..16usize {
-        let r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let r: [i32; 8] = *tmp[fy * 8..].first_chunk().unwrap();
         let r = fwd_adst8_1d(&r);
         for fx in 0..8 {
             let coeff = mul_q16(r[fx], 46341);
@@ -1174,7 +1174,7 @@ fn dct8x16_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 12
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..16usize {
-        let mut r: [i32; 8] = tmp[fy * 8..fy * 8 + 8].try_into().unwrap();
+        let mut r: [i32; 8] = *tmp[fy * 8..].first_chunk().unwrap();
         dct1d_8_i32(&mut r);
         for fx in 0..8 {
             let coeff = mul_q16(r[fx], 46341);
@@ -1234,7 +1234,7 @@ fn adst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64]
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for r in 0..8usize {
-        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let row: [i32; 8] = *tmp[r * 8..].first_chunk().unwrap();
         let rr = fwd_adst8_1d(&row);
         for u in 0..8 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, rr[u], dc_q, ac_q);
@@ -1258,7 +1258,7 @@ fn adstdct8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for r in 0..8usize {
-        let mut row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let mut row: [i32; 8] = *tmp[r * 8..].first_chunk().unwrap();
         dct1d_8_i32(&mut row);
         for u in 0..8 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, row[u], dc_q, ac_q);
@@ -1282,7 +1282,7 @@ fn dctadst8x8_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for r in 0..8usize {
-        let row: [i32; 8] = tmp[r * 8..r * 8 + 8].try_into().unwrap();
+        let row: [i32; 8] = *tmp[r * 8..].first_chunk().unwrap();
         let rr = fwd_adst8_1d(&row);
         for u in 0..8 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 8 + r, rr[u], dc_q, ac_q);
@@ -1307,7 +1307,7 @@ fn adst16x16_quant_t_direct(input: &[i32; 256], dc_q: i32, ac_q: i32) -> ([i32; 
     let mut cf = [0i32; 256];
     let mut tf = [0.0f32; 256];
     for v in 0..16 {
-        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let row: [i32; 16] = *tmp[v * 16..].first_chunk().unwrap();
         let rr = fwd_adst16_1d(&row);
         for u in 0..16 {
             store_quant_target_scalar(
@@ -1343,7 +1343,7 @@ fn adstdct16x16_quant_t_direct(
     let mut cf = [0i32; 256];
     let mut tf = [0.0f32; 256];
     for v in 0..16 {
-        let mut row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let mut row: [i32; 16] = *tmp[v * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut row);
         for u in 0..16 {
             store_quant_target_scalar(
@@ -1379,7 +1379,7 @@ fn dctadst16x16_quant_t_direct(
     let mut cf = [0i32; 256];
     let mut tf = [0.0f32; 256];
     for v in 0..16 {
-        let row: [i32; 16] = tmp[v * 16..v * 16 + 16].try_into().unwrap();
+        let row: [i32; 16] = *tmp[v * 16..].first_chunk().unwrap();
         let rr = fwd_adst16_1d(&row);
         for u in 0..16 {
             store_quant_target_scalar(
@@ -1410,7 +1410,7 @@ fn adst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 16]
     let mut cf = [0i32; 16];
     let mut tf = [0.0f32; 16];
     for r in 0..4usize {
-        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let row: [i32; 4] = *tmp[r * 4..].first_chunk().unwrap();
         let rr = fwd_adst4_1d(&row);
         for u in 0..4 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, rr[u], dc_q, ac_q);
@@ -1434,7 +1434,7 @@ fn adstdct4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 
     let mut cf = [0i32; 16];
     let mut tf = [0.0f32; 16];
     for r in 0..4usize {
-        let mut row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let mut row: [i32; 4] = *tmp[r * 4..].first_chunk().unwrap();
         dct1d_4_i32(&mut row);
         for u in 0..4 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, row[u], dc_q, ac_q);
@@ -1459,7 +1459,7 @@ fn dctadst4x4_quant_t_direct(input: &[i32; 16], dc_q: i32, ac_q: i32) -> ([i32; 
     let mut cf = [0i32; 16];
     let mut tf = [0.0f32; 16];
     for r in 0..4usize {
-        let row: [i32; 4] = tmp[r * 4..r * 4 + 4].try_into().unwrap();
+        let row: [i32; 4] = *tmp[r * 4..].first_chunk().unwrap();
         let rr = fwd_adst4_1d(&row);
         for u in 0..4 {
             store_quant_target_scalar(&mut cf, &mut tf, u * 4 + r, rr[u], dc_q, ac_q);
@@ -2787,6 +2787,29 @@ impl DctDispatch {
         )
     }
 
+    /// TX_64X64 forward transform + quantization. AV1 codes only the
+    /// top-left 32x32 of a 64-point DCT (the high half is zeroed), with the
+    /// 32x32 QM and the same coefficient scale as [`Self::dct32x32_t`]: the
+    /// decoder's 64-point inverse has twice the 2-D gain of the 32-point one
+    /// and `dq_shift = 2` halves the dequantized level, so the level->pixel
+    /// map is identical (8 x the orthonormal DCT, as `dct32x32_coeffs`).
+    /// Input is the 64x64 residual row-major; output is `cf[u * 32 + v]`
+    /// (u = horizontal frequency), the coded 1024.
+    pub(crate) fn dct64x64_t(
+        &self,
+        residual: &[i32; 4096],
+        quant: &impl Dct,
+    ) -> ([i32; 1024], [f32; 1024]) {
+        let coeffs = dct64x64_coeffs(residual);
+        let (q_dc, q_ac) = (quant.q_mult_dc(), quant.q_mult_ac());
+        let mut cf = [0i32; 1024];
+        let mut tf = [0.0f32; 1024];
+        for (i, &c) in coeffs.iter().enumerate() {
+            store_quant_target_scalar(&mut cf, &mut tf, i, c, q_dc, q_ac);
+        }
+        apply_qmatrix_result((cf, tf), quant, 32, 32, self.apply_qmatrix)
+    }
+
     pub(crate) fn dct32x32_t(
         &self,
         residual: &[i32; 1024],
@@ -2892,7 +2915,7 @@ fn dct16x4_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64]
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for fy in 0..4usize {
-        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let mut r: [i32; 16] = *tmp[fy * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut r);
         for fx in 0..16 {
             store_quant_target_scalar(&mut cf, &mut tf, fx * 4 + fy, r[fx], dc_q, ac_q);
@@ -2917,7 +2940,7 @@ fn dct4x16_quant_t_direct(input: &[i32; 64], dc_q: i32, ac_q: i32) -> ([i32; 64]
     let mut cf = [0i32; 64];
     let mut tf = [0.0f32; 64];
     for fy in 0..16usize {
-        let mut r: [i32; 4] = tmp[fy * 4..fy * 4 + 4].try_into().unwrap();
+        let mut r: [i32; 4] = *tmp[fy * 4..].first_chunk().unwrap();
         dct1d_4_i32(&mut r);
         for fx in 0..4 {
             store_quant_target_scalar(&mut cf, &mut tf, fx * 16 + fy, r[fx], dc_q, ac_q);
@@ -2974,7 +2997,7 @@ fn dct16x8_quant_t_direct(input: &[i32; 128], dc_q: i32, ac_q: i32) -> ([i32; 12
     let mut cf = [0i32; 128];
     let mut tf = [0.0f32; 128];
     for fy in 0..8usize {
-        let mut r: [i32; 16] = tmp[fy * 16..fy * 16 + 16].try_into().unwrap();
+        let mut r: [i32; 16] = *tmp[fy * 16..].first_chunk().unwrap();
         dct1d_16_i32(&mut r);
         for fx in 0..16 {
             let coeff = mul_q16(r[fx], 46341);
@@ -3621,7 +3644,7 @@ mod tests {
     fn dct16x4_and_4x16_pair_with_inverse() {
         use crate::idct::{idct_dequant_4x16, idct_dequant_16x4};
         let q = Quant::new(8, 8);
-        let r: [i32; 64] = pat(64).try_into().unwrap();
+        let r: [i32; 64] = *pat(64).first_chunk().unwrap();
         for wide in [true, false] {
             let (cf, rec) = if wide {
                 let (cf, _) = dct16x4_t(&r, &q);
@@ -3648,7 +3671,7 @@ mod tests {
         use crate::idct::idct_dequant_16x8;
         let q = Quant::new(32, 8);
         // residual laid out 8 tall x 16 wide: rw[row*16 + col]
-        let rw: [i32; 128] = pat(128).try_into().unwrap();
+        let rw: [i32; 128] = *pat(128).first_chunk().unwrap();
         let (lw, _) = dct16x8_t(&rw, &q);
         let rec = idct_dequant_16x8(&lw, &q);
         // The mean should be preserved closely and the reconstruction should
@@ -3872,7 +3895,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_8_f64(&mut ref_buf);
 
-        let mut got: [i32; 8] = fixed.as_slice().try_into().unwrap();
+        let mut got: [i32; 8] = *fixed.as_slice().first_chunk().unwrap();
         dct1d_8_i32(&mut got);
 
         for k in 0..8 {
@@ -3937,7 +3960,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_16_f64(&mut ref_buf);
 
-        let mut got: [i32; 16] = fixed.as_slice().try_into().unwrap();
+        let mut got: [i32; 16] = *fixed.as_slice().first_chunk().unwrap();
         dct1d_16_i32(&mut got);
 
         for k in 0..16 {
@@ -3976,7 +3999,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_32_f64(&mut ref_buf);
 
-        let mut got: [i32; 32] = fixed.as_slice().try_into().unwrap();
+        let mut got: [i32; 32] = *fixed.as_slice().first_chunk().unwrap();
         dct1d_32_i32(&mut got);
 
         for k in 0..32 {
@@ -3987,6 +4010,110 @@ mod tests {
                 got[k],
                 (got[k] - exp).abs()
             );
+        }
+    }
+}
+
+/// `8 x` the orthonormal DCT-II basis for the 32 coded frequencies of a
+/// 64-point transform: `[k][i]`, k < 32, i < 64.
+fn dct64_basis() -> &'static [[f64; 64]; 32] {
+    static B: OnceLock<Box<[[f64; 64]; 32]>> = OnceLock::new();
+    B.get_or_init(|| {
+        let mut b = Box::new([[0f64; 64]; 32]);
+        for (k, row) in b.iter_mut().enumerate() {
+            let a = if k == 0 {
+                (1.0f64 / 64.0).sqrt()
+            } else {
+                (2.0f64 / 64.0).sqrt()
+            };
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = a * (std::f64::consts::PI * (2 * i + 1) as f64 * k as f64 / 128.0).cos();
+            }
+        }
+        b
+    })
+}
+
+/// Coded (low 32x32) coefficients of a 64x64 DCT, in the
+/// [`dct32x32_coeffs`] scale and layout (`out[u * 32 + v]`, 8 x orthonormal).
+/// Float separable: this runs only for the few TX_64X64 candidates per
+/// whole-64 block, so exactness of the integer butterflies is not needed —
+/// the decoder side is the bit-exact inverse.
+pub(crate) fn dct64x64_coeffs(input: &[i32; 4096]) -> [i32; 1024] {
+    let b = dct64_basis();
+    // Vertical pass: tmp[v][x] for v < 32.
+    let mut tmp = vec![0f64; 32 * 64];
+    for (v, bv) in b.iter().enumerate() {
+        let row = &mut tmp[v * 64..v * 64 + 64];
+        for (y, &w) in bv.iter().enumerate() {
+            let src = &input[y * 64..y * 64 + 64];
+            for (t, &s) in row.iter_mut().zip(src) {
+                *t += w * s as f64;
+            }
+        }
+    }
+    let mut out = [0i32; 1024];
+    for v in 0..32 {
+        let row = &tmp[v * 64..v * 64 + 64];
+        for (u, bu) in b.iter().enumerate() {
+            let s: f64 = row.iter().zip(bu).map(|(&t, &w)| t * w).sum();
+            out[u * 32 + v] = (s * 8.0).round() as i32;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tx64_tests {
+    use super::*;
+    use crate::quant::Quant;
+
+    fn smooth_residual(seed: u32) -> [i32; 4096] {
+        let mut r = [0i32; 4096];
+        let mut s = seed;
+        let mut noise = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s % 9) as i32 - 4
+        };
+        for y in 0..64 {
+            for x in 0..64 {
+                let fx = x as f64 / 64.0;
+                let fy = y as f64 / 64.0;
+                let v = 60.0 * (fx * 3.1).sin() * (fy * 2.3).cos() + 25.0 * fx - 30.0 * fy;
+                r[y * 64 + x] = v.round() as i32 + noise();
+            }
+        }
+        r
+    }
+
+    /// Low-frequency content survives the forward 64 + exact dav1d inverse
+    /// with an error bounded by the quantizer and the dropped high band.
+    #[test]
+    fn tx64_round_trip_matches_scale() {
+        let d = DctDispatch::selected();
+        for (qidx, max_mse) in [(0u8, 6.0f64), (40, 12.0), (120, 60.0)] {
+            let q = Quant::new(qidx.max(1), 8);
+            let resid = smooth_residual(0x9e37 + qidx as u32);
+            let (cf, _tf) = d.dct64x64_t(&resid, &q);
+            let mut rec = [0i32; 4096];
+            crate::idct::idct_dequant_64x64(&cf, &q, &mut rec);
+            let mse = resid
+                .iter()
+                .zip(rec.iter())
+                .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                .sum::<f64>()
+                / 4096.0;
+            let mean_bias = resid
+                .iter()
+                .zip(rec.iter())
+                .map(|(&a, &b)| (a - b) as f64)
+                .sum::<f64>()
+                / 4096.0;
+            println!("qidx {qidx}: mse {mse:.3} bias {mean_bias:.3} dc {}", cf[0]);
+            assert!(mse < max_mse, "qidx {qidx}: mse {mse}");
+            assert!(mean_bias.abs() < 0.6, "qidx {qidx}: bias {mean_bias}");
         }
     }
 }

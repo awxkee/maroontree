@@ -705,11 +705,11 @@ mod tests {
 
         fn box_payload<'a>(mut data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
             while data.len() >= 8 {
-                let size = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+                let size = u32::from_be_bytes(*data.first_chunk().unwrap()) as usize;
                 let (size, header) = match size {
                     0 => (data.len(), 8),
                     1 => (
-                        u64::from_be_bytes(data[8..16].try_into().unwrap()) as usize,
+                        u64::from_be_bytes(*data[8..].first_chunk().unwrap()) as usize,
                         16,
                     ),
                     size => (size, 8),
@@ -726,13 +726,12 @@ mod tests {
         fn gain_bundle(data: &[u8]) -> (gainforge::IsoGainMap, &[u8]) {
             let bundle = box_payload(data, b"jhgm").expect("missing gain-map box");
             assert_eq!(bundle[0], 0); // JxlGainMapBundle version
-            let metadata_end = 3 + u16::from_be_bytes(bundle[1..3].try_into().unwrap()) as usize;
+            let metadata_end = 3 + u16::from_be_bytes(*bundle[1..].first_chunk().unwrap()) as usize;
             let metadata = gainforge::IsoGainMap::from_metadata(&bundle[3..metadata_end]).unwrap();
             let icc_offset = metadata_end + 1 + bundle[metadata_end] as usize;
             let image_offset = icc_offset
                 + 4
-                + u32::from_be_bytes(bundle[icc_offset..icc_offset + 4].try_into().unwrap())
-                    as usize;
+                + u32::from_be_bytes(*bundle[icc_offset..].first_chunk().unwrap()) as usize;
             (metadata, &bundle[image_offset..])
         }
 

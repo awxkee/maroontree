@@ -1,3 +1,31 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 //! Rate / cost estimation used by the mode search and trellis: calibrated
 //! per-level token costs, CDF costs, and lambda helpers. Extracted from `av1real`.
 
@@ -102,16 +130,22 @@ pub(crate) fn aom_ssimulacra2_rdmult_weight(qindex: u8) -> f32 {
 #[inline]
 /// `sub`: 0 = 4:4:4 / mono, 1 = 4:2:2 (aom law only), 2 = 4:2:0.
 pub(crate) fn mode_lambda_weight(qindex: u8, sub: usize) -> f32 {
-    let w = aom_ssimulacra2_rdmult_weight(qindex);
     let t = crate::tuning::get();
+    // Per-format operating point of the mode lambda (`Tuning::mlam_scale_*`).
+    let scale = match sub {
+        2 => t.mlam_scale_420,
+        1 => t.mlam_scale_422,
+        _ => t.mlam_scale_444,
+    };
+    let w = aom_ssimulacra2_rdmult_weight(qindex);
     if sub == 1 || t.mode_lambda_lo_full <= t.mode_lambda_lo_floor {
-        return w;
+        return w * scale;
     }
     // Top-band tilt (see `Tuning::mode_lambda_lo_w`).
     let r = ((qindex as f32 - t.mode_lambda_lo_floor)
         / (t.mode_lambda_lo_full - t.mode_lambda_lo_floor))
         .clamp(0.0, 1.0);
-    t.mode_lambda_lo_w + (w - t.mode_lambda_lo_w) * r
+    (t.mode_lambda_lo_w + (w - t.mode_lambda_lo_w) * r) * scale
 }
 
 /// Q22 fixed point (1/2^22 bit units) for every CDF partition `p` in

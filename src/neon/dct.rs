@@ -361,8 +361,8 @@ fn dct1d_32_v4_i32(c: &mut [I32x4; 32]) {
     }
 
     let (even, odd) = c.split_at_mut(16);
-    let even: &mut [I32x4; 16] = even.try_into().unwrap();
-    let odd: &mut [I32x4; 16] = odd.try_into().unwrap();
+    let even: &mut [I32x4; 16] = even.first_chunk_mut().unwrap();
+    let odd: &mut [I32x4; 16] = odd.first_chunk_mut().unwrap();
     dct1d_16_v4_i32(even);
     dct1d_16_v4_i32(odd);
 
@@ -667,12 +667,12 @@ fn adst1d_8_v4_i32(c: &mut [I32x4; 8]) {
 #[target_feature(enable = "neon")]
 fn tx1d_v4_i32(c: &mut [I32x4], adst: bool) {
     match (c.len(), adst) {
-        (4, false) => dct1d_4_v4_i32(c.try_into().unwrap()),
-        (4, true) => adst1d_4_v4_i32(c.try_into().unwrap()),
-        (8, false) => dct1d_8_v4_i32(c.try_into().unwrap()),
-        (8, true) => adst1d_8_v4_i32(c.try_into().unwrap()),
-        (16, false) => dct1d_16_v4_i32(c.try_into().unwrap()),
-        (16, true) => adst1d_16_v4_i32(c.try_into().unwrap()),
+        (4, false) => dct1d_4_v4_i32(c.first_chunk_mut().unwrap()),
+        (4, true) => adst1d_4_v4_i32(c.first_chunk_mut().unwrap()),
+        (8, false) => dct1d_8_v4_i32(c.first_chunk_mut().unwrap()),
+        (8, true) => adst1d_8_v4_i32(c.first_chunk_mut().unwrap()),
+        (16, false) => dct1d_16_v4_i32(c.first_chunk_mut().unwrap()),
+        (16, true) => adst1d_16_v4_i32(c.first_chunk_mut().unwrap()),
         _ => unreachable!("unsupported NEON forward-transform length"),
     }
 }

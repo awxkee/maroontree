@@ -460,11 +460,11 @@ pub(crate) struct Cdfs {
     pub(crate) txtp: Vec<Vec<u16>>,             // intra txtp TX_8X8 luma, per intra mode [13]
     pub(crate) txtp4: Vec<Vec<u16>>,            // intra txtp TX_4X4 luma, per intra mode [13]
     pub(crate) txtp16: Vec<Vec<u16>>,           // intra txtp TX_16X16 luma, per intra mode [13]
-    pub(crate) txb_skip: [Vec<Vec<u16>>; 4],    // [class][13 ctx] (class 3 = TX_32X32)
-    pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][41/42 ctx]
-    pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][21 ctx]
-    pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][4 ctx]
-    pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][11 bins], each a 2-sym CDF
+    pub(crate) txb_skip: [Vec<Vec<u16>>; 5], // [class][13 ctx] (class 3 = TX_32X32, 4 = TX_64X64)
+    pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 5], // [class][plane][41/42 ctx]
+    pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][21 ctx]; TX_64X64 shares class 3 (dav1d min(ctx, 3))
+    pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 5], // [class][plane][4 ctx]
+    pub(crate) eob_hi: [[Vec<Vec<u16>>; 2]; 5], // [class][plane][11 bins], each a 2-sym CDF
     pub(crate) dc_sign: [Vec<Vec<u16>>; 2],     // [plane][3 ctx]
     pub(crate) eob_bin_16_c: Vec<u16>,          // chroma, 4x4
     pub(crate) eob_bin_16_l: Vec<u16>,          // luma, 4x4
@@ -722,7 +722,13 @@ impl Cdfs {
                 .iter()
                 .map(|&v| icdf(&[v]))
                 .collect::<Vec<_>>(),
+            Q::SKIP_TX64[qctx]
+                .iter()
+                .map(|&v| icdf(&[v]))
+                .collect::<Vec<_>>(),
         ];
+        // Class 4 (TX_64X64) is luma-only: chroma transforms clamp to 32, so
+        // its chroma slot is an unused placeholder.
         // base/br/eob_base/eob_hi per [class][plane]
         let base_tok = [
             [
@@ -741,6 +747,7 @@ impl Cdfs {
                 rows(&Q::BASE_TOK_TX32_LUMA_Q[qctx]),
                 rows(&Q::BASE_TOK_TX32_CHROMA_Q[qctx]),
             ],
+            [rows(&Q::BASE_TOK_TX64_LUMA_Q[qctx]), Vec::new()],
         ];
         let br_tok = [
             [
@@ -777,6 +784,7 @@ impl Cdfs {
                 rows2(&Q::EOB_BASE_TX32_LUMA_Q[qctx]),
                 rows2(&Q::EOB_BASE_TX32_CHROMA_Q[qctx]),
             ],
+            [rows2(&Q::EOB_BASE_TX64_LUMA_Q[qctx]), Vec::new()],
         ];
         let eob_hi = [
             [
@@ -795,6 +803,7 @@ impl Cdfs {
                 his(&Q::EOB_HI_TX32_LUMA[qctx]),
                 his(&Q::EOB_HI_TX32_CHROMA[qctx]),
             ],
+            [his(&Q::EOB_HI_TX64_LUMA[qctx]), Vec::new()],
         ];
         Cdfs {
             band_tilt: 0.0,
@@ -1235,6 +1244,9 @@ struct LossyTile<'a> {
     /// leaves, a wider palette refine budget. Photos never pass it, so they
     /// keep the photo-tuned palette behaviour bit-for-bit.
     screen_frame: bool,
+    /// Chroma angle delta the next `emit_uv_mode` codes for a directional
+    /// uv mode (set by the searching site, reset by the emit).
+    uv_delta: i32,
     ibc_mv: Vec<Option<(i16, i16)>>,
     /// Per-block memo of the IntraBC match search (`find_intrabc`).
     ibc_match_cache: std::cell::RefCell<HashMap<u64, IbcMatches>>,
@@ -5369,7 +5381,7 @@ mod aq_tests {
         let mut tile =
             LossyTile::new(160, 8, 64, 64, &src, QmLevels::FLAT).with_speed(Speed::Medium);
         let before = tile.recon[0].clone();
-        let (_, _, cost) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
+        let (_, _, cost, _) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
         assert!(cost.is_finite());
         assert_eq!(tile.recon[0], before);
     }

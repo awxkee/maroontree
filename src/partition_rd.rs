@@ -73,12 +73,12 @@ pub(crate) fn luma_satd_scalar(
     dc: i32,
     residual: &[i32],
 ) -> u64 {
-    debug_assert!(width * height <= 32 * 32);
+    debug_assert!(width * height <= 64 * 64);
     debug_assert!(width.is_multiple_of(4) && height.is_multiple_of(4));
     debug_assert!(pred.is_empty() || pred.len() >= width * height);
     debug_assert!(residual.is_empty() || residual.len() >= width * height);
 
-    let mut error = [0i32; 32 * 32];
+    let mut error = [0i32; 64 * 64];
     for y in 0..height {
         let src_row = &src[(py + y) * stride + px..(py + y) * stride + px + width];
         for (x, &s) in src_row.iter().enumerate() {

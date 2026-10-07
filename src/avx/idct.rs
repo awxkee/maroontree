@@ -599,8 +599,8 @@ macro_rules! inv_dct32_v_s16 {
     unrotate5!(15, 30, 29, 27, 23);
 
     let (even, w) = c.split_at_mut(16);
-    let even: &mut [I16x16; 16] = even.try_into().unwrap();
-    let w: &mut [I16x16; 16] = w.try_into().unwrap();
+    let even: &mut [I16x16; 16] = even.first_chunk_mut().unwrap();
+    let w: &mut [I16x16; 16] = w.first_chunk_mut().unwrap();
     inv_dct16_v_s16!(even);
     w.swap(1, 8);
     w.swap(2, 4);

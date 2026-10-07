@@ -260,7 +260,7 @@ impl<'a> LossyTile<'a> {
             *rr = self.idct.idct_dequant_32x32(&q, &self.cquant);
             *cf = q;
         } else {
-            let r512: &[i32; 512] = resid[..512].try_into().unwrap();
+            let r512: &[i32; 512] = resid.first_chunk().unwrap();
             let (mut q, tf) = if tw == 32 {
                 self.dct.dct32x16_t(r512, &self.cquant)
             } else {
@@ -435,7 +435,7 @@ impl<'a> LossyTile<'a> {
             *rr = self.idct.idct_dequant_32x32(&q, &self.cquant);
             *cf = q;
         } else {
-            let r512: &[i32; 512] = resid[..512].try_into().unwrap();
+            let r512: &[i32; 512] = resid.first_chunk().unwrap();
             let (mut q, tf) = if tw == 32 {
                 self.dct.dct32x16_t(r512, &self.cquant)
             } else {
@@ -904,6 +904,7 @@ impl<'a> LossyTile<'a> {
         self.push_uv_sel(UvSel {
             uv: uv_mode as u8,
             palette: 0,
+            delta: 0,
         });
         self.push_uv_cf(&uv[0][..ng * n], &uv[1][..ng * n], [0, 0]);
 

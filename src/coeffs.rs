@@ -837,12 +837,41 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     skip_ctx: usize,
     dcs_ctx: usize,
 ) -> u8 {
+    encode_tx32_coeffs_cls(enc, cdfs, cf, chroma, skip_ctx, dcs_ctx, 3)
+}
+
+/// TX_64X64 luma coefficient coder. AV1 codes a 64x64 transform exactly like
+/// a 32x32 one over its top-left 32x32 (`slw = slh = min(lw, 3)`, the 32x32
+/// scan, `eob_bin_1024`, the same eob-ctx thresholds) but with the coef CDFs
+/// of class `t_dim->ctx = 4` — except the base-range ladder, which dav1d
+/// takes from `br_tok[min(ctx, 3)]`. Chroma never reaches 64 (`get_tx_size`
+/// clamps to 32). DCT_DCT is implied; no txtp symbol.
+pub(crate) fn encode_tx64_luma_coeffs_adapt(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 1024],
+    skip_ctx: usize,
+    dcs_ctx: usize,
+) -> u8 {
+    encode_tx32_coeffs_cls(enc, cdfs, cf, false, skip_ctx, dcs_ctx, 4)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tx32_coeffs_cls(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 1024],
+    chroma: bool,
+    skip_ctx: usize,
+    dcs_ctx: usize,
+    cls: usize,
+) -> u8 {
     let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X32) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 1
+        enc.encode_symbol(1, &mut cdfs.txb_skip[cls][skip_ctx]); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]); // all_zero = 0
+    enc.encode_symbol(0, &mut cdfs.txb_skip[cls][skip_ctx]); // all_zero = 0
     // NO txtp symbol for intra TX_32X32 (DCT_DCT implied).
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -862,7 +891,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
             enc,
             cf[0],
             eb,
-            &mut cdfs.eob_base[3][pl][0],
+            &mut cdfs.eob_base[cls][pl][0],
             &mut cdfs.dc_sign[pl][dcs_ctx],
             &mut cdfs.br_tok[3][pl][0],
         );
@@ -885,7 +914,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     if eob_bin > 1 {
         let nbits = eob_bin - 2;
         let hi = (eob >> nbits) & 1;
-        enc.encode_symbol(hi, &mut cdfs.eob_hi[3][pl][eob_bin]);
+        enc.encode_symbol(hi, &mut cdfs.eob_hi[cls][pl][eob_bin]);
         for b in (0..nbits).rev() {
             enc.encode_bool((eob >> b) & 1 == 1, 16384);
         }
@@ -896,7 +925,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     let (ex, ey) = (rc >> 5, rc & 31);
     let m = cf[rc].unsigned_abs();
     let eob_tok = m.min(3) - 1; // 0,1,2
-    enc.encode_symbol(eob_tok as usize, &mut cdfs.eob_base[3][pl][ctx_e]);
+    enc.encode_symbol(eob_tok as usize, &mut cdfs.eob_base[cls][pl][ctx_e]);
     if eob_tok == 2 {
         let bc = if (ex | ey) > 1 { 14 } else { 7 };
         encode_hi_tok(enc, m, &mut cdfs.br_tok[3][pl][bc]);
@@ -908,7 +937,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
         let (ctx, hi_mag) = get_lo_ctx_2d(&levels, x, y, &LO_CTX_OFF, 32);
         let m = cf[rc_i].unsigned_abs();
         let tok = m.min(3);
-        enc.encode_symbol(tok as usize, &mut cdfs.base_tok[3][pl][ctx]);
+        enc.encode_symbol(tok as usize, &mut cdfs.base_tok[cls][pl][ctx]);
         if tok == 3 {
             let mag = hi_mag & 63;
             let bc = (if (y | x) > 1 { 14 } else { 7 }) + if mag > 12 { 6 } else { (mag + 1) >> 1 };
@@ -918,7 +947,7 @@ pub(crate) fn encode_tx32_coeffs_adapt(
     }
     let dm = cf[0].unsigned_abs();
     let dc_tok = dm.min(3);
-    enc.encode_symbol(dc_tok as usize, &mut cdfs.base_tok[3][pl][0]);
+    enc.encode_symbol(dc_tok as usize, &mut cdfs.base_tok[cls][pl][0]);
     if dc_tok == 3 {
         let mag = (levels[1] as u32 + levels[32] as u32 + levels[33] as u32) & 63;
         let bc = if mag > 12 { 6 } else { (mag + 1) >> 1 };

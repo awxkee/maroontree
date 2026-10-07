@@ -1033,9 +1033,7 @@ impl<'a> LossyTile<'a> {
         outline_block8(|| {
             if rl.is_none()
                 && self.speed.try_angle_deltas_av1(8, self.base_q_idx)
-                && (D45_PRED..=VERT_LEFT_PRED).contains(&best_mode)
-                && best_mode != V_PRED
-                && best_mode != H_PRED
+                && self.angle_delta_refines(best_mode)
             {
                 let mut ad_cdf = [0u16; 7];
                 ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
@@ -2434,6 +2432,7 @@ impl<'a> LossyTile<'a> {
                 palette: uv_pal8
                     .as_ref()
                     .map_or(0, |p| (p.u.len() + if p.top { 8 } else { 0 }) as u8),
+                delta: 0,
             });
             let cfl_rec = if use_cfl { cfl_alpha_uv } else { [0, 0] };
             if self.mono {
@@ -2517,6 +2516,10 @@ impl<'a> LossyTile<'a> {
         self.a_skip[bx4 + 1] = sv;
         self.l_skip[by4] = sv;
         self.l_skip[by4 + 1] = sv;
+        // The intra-edge smooth flag is a function of the NEIGHBOR modes:
+        // read it before this block's own mode overwrites a_mode/l_mode (the
+        // skipped tx-split recon below re-predicts and needs it).
+        let emit_ftype = self.luma_filter_type(px, py);
         let mv = best_mode as u8;
         self.a_mode[bx4] = mv;
         self.a_mode[bx4 + 1] = mv;
@@ -2619,7 +2622,7 @@ impl<'a> LossyTile<'a> {
                 // Skipped split block: the decoder predicts per TX with ZERO
                 // residual — recompute the sequential prediction (the trial
                 // recon carries residual feedback the decoder never sees).
-                let block_ftype = self.luma_filter_type(px, py);
+                let block_ftype = emit_ftype;
                 for &(sx, sy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)].iter() {
                     let (bx, by) = (px + sx, py + sy);
                     let (tr, bl) = match (sx, sy) {

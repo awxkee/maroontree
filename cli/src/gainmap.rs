@@ -268,18 +268,18 @@ fn apple_maker_stops(maker: &[u8]) -> Result<f64> {
     );
     let u16_at = |offset: usize| -> Result<u16> {
         Ok(u16::from_be_bytes(
-            maker
-                .get(offset..offset + 2)
-                .context("truncated Apple MakerNote")?
-                .try_into()?,
+            *maker
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk)
+                .context("truncated Apple MakerNote")?,
         ))
     };
     let u32_at = |offset: usize| -> Result<u32> {
         Ok(u32::from_be_bytes(
-            maker
-                .get(offset..offset + 4)
-                .context("truncated Apple MakerNote")?
-                .try_into()?,
+            *maker
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk)
+                .context("truncated Apple MakerNote")?,
         ))
     };
     let count = u16_at(APPLE_MAKER_HEADER.len())? as usize;
