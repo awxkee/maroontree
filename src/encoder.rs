@@ -36,6 +36,7 @@ use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
 use crate::{BitDepth, ChromaFormat, EncodeConfig, isobmff};
 
+#[derive(Clone)]
 pub struct PlanarImage<T: Pixel> {
     pub width: usize,
     pub height: usize,

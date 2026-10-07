@@ -39,6 +39,7 @@ use yuv::{
     rgba_to_ycgco444, rgba12_to_icgc412,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_av1_lossless(
     img: &image::DynamicImage,
     args: &Args,
@@ -47,6 +48,7 @@ pub(crate) fn encode_av1_lossless(
     icc: Option<&[u8]>,
     exif: Option<&[u8]>,
     png_cicp: Option<PngCicp>,
+    gain_map: Option<maroontree::GainMap>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let chroma_fmt = match args.chroma.unwrap_or(Chroma::C420) {
         Chroma::C444 => ChromaFormat::Yuv444,
@@ -83,6 +85,7 @@ pub(crate) fn encode_av1_lossless(
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
+    cfg.gain_map = gain_map;
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;

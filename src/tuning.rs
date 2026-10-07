@@ -166,8 +166,6 @@ pub(crate) struct Tuning {
     /// Threshold for the non-4:2:0 formats (4:2:0 uses `vbp_thresh_420`).
     pub(crate) vbp_thresh_hi: f32,
     // --- Medium leaf-work gates (mode budgets / transform + chroma trials) ---
-    /// `Speed::Medium` luma mode-search budget (shipped 2; Slow is 3, or 5 at 4:4:4).
-    /// Cheap magnitude-based rate proxy instead of the exact CDF walk.
     pub(crate) proxy_rate_fast: bool,
     pub(crate) proxy_rate_medium: bool,
     pub(crate) proxy_rate_slow: bool,
@@ -200,12 +198,9 @@ pub(crate) struct Tuning {
     pub(crate) tx64_force: bool,
     /// Also offer the DC TX_64X64 leg to the whole-64 NONE-vs-SPLIT estimator.
     pub(crate) tx64_none: bool,
-    /// Square-leaf angle-delta refinement also on V_PRED / H_PRED winners
-    /// (was diagonals-only; 2026-10-07: 420 synth -0.86 / tuning -0.44,
-    /// 422 tuning -0.40, 444 synth -0.22 / tuning -0.09).
+    /// Square-leaf angle-delta refinement also on V_PRED / H_PRED
     pub(crate) ad_vh: bool,
-    /// Rect16 leaves also search V_PRED +1..3 / H_PRED -1..-3 angle deltas
-    /// (444 synth -0.36 / tuning -0.10 on top of `ad_vh`; 420/422 inert).
+    /// Rect16 leaves also search V_PRED / H_PRED angle deltas
     pub(crate) rect_ad: bool,
     /// 16x16 leaves also refine the runner-up directional mode's deltas
     pub(crate) ad_runner: bool,
@@ -248,9 +243,7 @@ pub(crate) struct Tuning {
     pub(crate) palette_smooth_guard: bool,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
-    /// qindex <= knee - width. Probe for the very-high-quality 4:4:4 leg (the
-    /// Optuna high-q study wanted 1.05-1.10 there but the format-blind knob
-    /// paid on 4:2:0).
+    /// qindex <= knee - width.
     pub(crate) none32_split_bias_444_top: f32,
     pub(crate) none64_split_bias_444_top: f32,
     pub(crate) top_bias_knee_444: f32,

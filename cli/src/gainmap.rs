@@ -122,6 +122,89 @@ pub(crate) fn parse_apple_gain_map(
     Ok(ParsedGainMap { image, metadata })
 }
 
+/// AVIF gain map item for `gain_map`. libavif caps gain maps at 12 bits, so
+/// the 16-bit normalized gains are rounded to a 10-bit monochrome map (the
+/// Apple source maps are 8-bit, so nothing is lost). The rationals are copied
+/// exactly; an AVIF `tmap` cannot signal the Ultra HDR backward-direction flag.
+pub(crate) fn avif_gain_map(gain_map: &ParsedGainMap) -> Result<maroontree::GainMap> {
+    let m = gain_map.metadata;
+    ensure!(
+        !m.backward_direction,
+        "backward-direction gain maps are not representable in AVIF"
+    );
+    let metadata = maroontree::IsoGainMap {
+        gain_map_min_n: m.gain_map_min_n,
+        gain_map_min_d: m.gain_map_min_d,
+        gain_map_max_n: m.gain_map_max_n,
+        gain_map_max_d: m.gain_map_max_d,
+        gain_map_gamma_n: m.gain_map_gamma_n,
+        gain_map_gamma_d: m.gain_map_gamma_d,
+        base_offset_n: m.base_offset_n,
+        base_offset_d: m.base_offset_d,
+        alternate_offset_n: m.alternate_offset_n,
+        alternate_offset_d: m.alternate_offset_d,
+        base_hdr_headroom_n: m.base_hdr_headroom_n,
+        base_hdr_headroom_d: m.base_hdr_headroom_d,
+        alternate_hdr_headroom_n: m.alternate_hdr_headroom_n,
+        alternate_hdr_headroom_d: m.alternate_hdr_headroom_d,
+        use_base_color_space: m.use_base_color_space,
+    };
+    let samples: Vec<u16> = gain_map
+        .image
+        .as_raw()
+        .iter()
+        .map(|&v| ((v as u32 * 1023 + 32767) / 65535) as u16)
+        .collect();
+    let image = maroontree::PlanarImage::from_luma(
+        gain_map.image.width() as usize,
+        gain_map.image.height() as usize,
+        maroontree::BitDepth::Ten,
+        &samples,
+    )?;
+    Ok(maroontree::GainMap::gray16(image, metadata))
+}
+
+/// HEIC gain map for `gain_map`; hpvca writes it both as an Apple HDR gain
+/// map and as an ISO 21496-1 `tmap`. hpvca takes Apple-encoded samples, so
+/// each ISO gain `2^L` is mapped back onto Apple's curve with headroom
+/// `2^max`: Rec.709-coded `(2^L - 1) / (headroom - 1)`. For an 8-bit Apple
+/// source this exactly inverts [`parse_apple_gain_map`]. Apple's form has no
+/// offsets (they are dropped) and cannot darken (gains below 1 clamp to 1).
+pub(crate) fn hevc_gain_map(gain_map: &ParsedGainMap) -> Result<hpvca::GainMap> {
+    let m = gain_map.metadata;
+    ensure!(
+        !m.backward_direction,
+        "backward-direction gain maps are not representable in HEIC"
+    );
+    let (min, max, gamma) = (m.map_min()[0], m.map_max()[0], m.gain_map_gamma()[0]);
+    ensure!(
+        min.is_finite() && max.is_finite() && max > 0.0 && gamma > 0.0,
+        "gain map has no HDR headroom"
+    );
+    let headroom = max.exp2();
+    let lookup: Vec<u8> = (0..=u16::MAX)
+        .map(|v| {
+            let g = (v as f64 / u16::MAX as f64).powf(1.0 / gamma);
+            let multiplier = (min + (max - min) * g).exp2();
+            let linear = ((multiplier - 1.0) / (headroom - 1.0)).clamp(0.0, 1.0);
+            ((TransferFunction::Rec709.gamma(linear as f32) * 255.0) + 0.5)
+                .clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    let samples = gain_map
+        .image
+        .as_raw()
+        .iter()
+        .map(|&v| lookup[v as usize])
+        .collect();
+    Ok(hpvca::GainMap::gray8(
+        samples,
+        gain_map.image.width(),
+        gain_map.image.height(),
+        headroom as f32,
+    ))
+}
+
 fn apple_metadata(xmp: &[u8], base_exif: Option<&[u8]>) -> Result<IsoGainMap> {
     let headroom = apple_xmp_headroom(xmp)?;
     let stops = match headroom {
@@ -548,6 +631,22 @@ mod tests {
                 assert!((iso_multiplier - apple_multiplier).abs() < 0.00005);
             }
             assert_eq!(parsed.image.as_raw()[0], 0);
+        }
+    }
+
+    #[test]
+    fn hevc_gain_map_inverts_the_apple_import() {
+        let mut gain = decoded_gain(8);
+        gain.color.cicp.as_mut().unwrap().full_range = true;
+        let parsed = parse_apple_gain_map(&gain, None).unwrap();
+        let heic = hevc_gain_map(&parsed).unwrap();
+        assert_eq!((heic.width, heic.height), (17, 16));
+        assert!((heic.headroom - 4.0).abs() < 1e-5);
+        let hpvca::GainMapPixels::Gray8(samples) = &heic.pixels else {
+            panic!("expected an 8-bit gain map");
+        };
+        for (index, &sample) in samples.iter().enumerate() {
+            assert_eq!(sample as usize, index % 256, "sample {index}");
         }
     }
 

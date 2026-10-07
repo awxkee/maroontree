@@ -62,6 +62,7 @@ use crate::encoder::{
     encode_yuv422_obu, encode_yuv444_obu,
 };
 use crate::err::EncodeError;
+use crate::gain_map::GainMap;
 use crate::metadata::{ContentLightLevel, Metadata, Orientation};
 use crate::{BitDepth, PlanarImage, isobmff};
 use std::num::NonZeroUsize;
@@ -308,6 +309,10 @@ pub struct EncodeConfig {
     /// tuning validated on the Jixel still-image corpus. Lower levels weight
     /// high frequencies more strongly; level 15 is flat.
     pub qmatrix_level: Option<u8>,
+    /// Optional ISO 21496-1 HDR gain map, written as a hidden gain map item
+    /// plus a `tmap` derived item (see [`GainMap`]). Applies to every lossy
+    /// and lossless entry point; the image being encoded is the base rendition.
+    pub gain_map: Option<GainMap>,
 }
 
 impl Default for EncodeConfig {
@@ -332,6 +337,7 @@ impl Default for EncodeConfig {
             screen_content: true,
             intrabc: true,
             qmatrix_level: None,
+            gain_map: None,
         }
     }
 }
@@ -457,6 +463,13 @@ impl EncodeConfig {
 
     /// Use one explicit matrix level for luma and chroma. This also enables
     /// quantization matrices. Level 15 is the flat/no-reshaping matrix.
+    /// Attach an HDR gain map (see [`GainMap`]). The encoded image becomes the
+    /// base rendition; the map and its metadata reconstruct the alternate one.
+    pub fn with_gain_map(mut self, gain_map: GainMap) -> Self {
+        self.gain_map = Some(gain_map);
+        self
+    }
+
     pub fn with_qmatrix_level(mut self, level: u8) -> Self {
         self.quantization_matrices = true;
         self.qmatrix_level = Some(level);
@@ -502,6 +515,9 @@ impl EncodeConfig {
         validate_quality(self.quality)?;
         if self.qmatrix_level.is_some_and(|level| level > 15) {
             return Err(EncodeError::InvalidQuality);
+        }
+        if let Some(gain_map) = &self.gain_map {
+            gain_map.validate()?;
         }
         Ok(())
     }
@@ -558,7 +574,7 @@ pub(crate) fn checked_buffer_size<T>(w: usize, h: usize, ch: usize) -> Result<us
 /// comparisons were at parity). Labels are now comparable across encoders;
 /// BD curves are unaffected (pure re-labeling of the same RD curve).
 /// q100 stays near-lossless (qindex 1) by design; parity resumes at q98.
-fn quality_to_q(quality: u8) -> u8 {
+pub(crate) fn quality_to_q(quality: u8) -> u8 {
     const ANCHORS: [(u8, u8); 14] = [
         (1, 215),
         (30, 140),
@@ -638,12 +654,23 @@ pub(crate) fn finalize_color(
     chroma: ChromaFormat,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    let av1c = make_av1c(&av1_obu, bit_depth, width, height, chroma);
     let channels: u8 = if matches!(chroma, ChromaFormat::Monochrome) {
         1
     } else {
         3
     };
+    if let Some(gain_map) = &cfg.gain_map {
+        let base = isobmff::CodedItem {
+            obu: &av1_obu,
+            width,
+            height,
+            bit_depth,
+            channels,
+            av1c: make_av1c(&av1_obu, bit_depth, width, height, chroma),
+        };
+        return finalize_gain_map(&base, None, gain_map, cfg);
+    }
+    let av1c = make_av1c(&av1_obu, bit_depth, width, height, chroma);
     isobmff::wrap_av1_image(
         &av1_obu,
         width,
@@ -667,6 +694,35 @@ pub(crate) fn finalize_with_alpha(
     chroma: ChromaFormat,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if let Some(gain_map) = &cfg.gain_map {
+        let base = isobmff::CodedItem {
+            obu: &color_obu,
+            width,
+            height,
+            bit_depth,
+            channels: if matches!(chroma, ChromaFormat::Monochrome) {
+                1
+            } else {
+                3
+            },
+            av1c: make_av1c(&color_obu, bit_depth, width, height, chroma),
+        };
+        let alpha = isobmff::CodedItem {
+            obu: &alpha_obu,
+            width,
+            height,
+            bit_depth,
+            channels: 1,
+            av1c: make_av1c(
+                &alpha_obu,
+                bit_depth,
+                width,
+                height,
+                ChromaFormat::Monochrome,
+            ),
+        };
+        return finalize_gain_map(&base, Some(&alpha), gain_map, cfg);
+    }
     let av1c_color = make_av1c(&color_obu, bit_depth, width, height, chroma);
     let av1c_alpha = make_av1c(
         &alpha_obu,
@@ -689,8 +745,48 @@ pub(crate) fn finalize_with_alpha(
     )
 }
 
+/// Code the gain map and wrap base [+ alpha] + gain map + `tmap` together.
+fn finalize_gain_map(
+    base: &isobmff::CodedItem,
+    alpha: Option<&isobmff::CodedItem>,
+    gain_map: &GainMap,
+    cfg: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    let coded = crate::gain_map::encode_gain_map(gain_map, cfg)?;
+    let items = isobmff::GainMapItems {
+        gain_map: isobmff::CodedItem {
+            obu: &coded.obu,
+            width: coded.width,
+            height: coded.height,
+            bit_depth: coded.bit_depth,
+            channels: gain_map.image.channels(),
+            av1c: make_av1c(
+                &coded.obu,
+                coded.bit_depth,
+                coded.width,
+                coded.height,
+                coded.chroma,
+            ),
+        },
+        gain_map_cicp: coded.cicp,
+        tmap_payload: &coded.tmap_payload,
+        alternate_cicp: gain_map.alternate_cicp.unwrap_or(Cicp::unspecified()),
+        alternate_icc: gain_map.alternate_icc_profile.as_deref(),
+        alternate_clli: gain_map.alternate_content_light_level,
+        alternate_pixi: gain_map.alternate_pixel_info,
+    };
+    isobmff::wrap_av1_image_with_gain_map(
+        base,
+        alpha,
+        &items,
+        cfg.color_encoding.as_ref(),
+        cfg.icc.as_deref(),
+        &cfg.metadata,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
-fn dispatch_lossy<T: crate::Pixel>(
+pub(crate) fn dispatch_lossy<T: crate::Pixel>(
     img: &PlanarImage<T>,
     q: u8,
     chroma: ChromaFormat,
