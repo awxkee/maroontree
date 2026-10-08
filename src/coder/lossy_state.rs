@@ -218,10 +218,8 @@ fn quad4_bias() -> f32 {
 /// How many still-in-contention 16-level partition candidates get the CfL
 /// chroma trial (stage 2 of the chroma proxy). 0 = DC-only everywhere, the
 /// historical behavior.
-/// ExtraSlow refines one more candidate.
-fn chroma_refine_topk(speed: Speed) -> usize {
-    let k = crate::tuning::get().chroma_refine_topk;
-    if speed == Speed::ExtraSlow && k > 0 { k + 1 } else { k }
+fn chroma_refine_topk() -> usize {
+    crate::tuning::get().chroma_refine_topk
 }
 
 /// PARTITION_HORZ_4/VERT_4 search enable.
@@ -3299,7 +3297,7 @@ impl<'a> LossyTile<'a> {
         // and fold the difference back through each family's own bias -- the
         // biases multiply the chroma leg, so a raw delta cannot just be added.
         let mut rd_none_unbiased = rd_none_unbiased;
-        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk(self.speed) > 0;
+        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk() > 0;
         if full_part_rdo && chroma_refine {
             let mut order = FixedList::<(f32, usize), 11>::new((f32::INFINITY, 0));
             for (i, &(cost, part)) in cands.iter().enumerate() {
@@ -3313,7 +3311,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             order.as_mut_slice().sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            order.truncate(chroma_refine_topk(self.speed));
+            order.truncate(chroma_refine_topk());
             for &(_, i) in order.iter() {
                 let part = cands[i].1;
                 let delta = self.rd_cost_chroma_partition(px, py, 16, part, prdo, true)

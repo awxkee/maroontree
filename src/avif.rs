@@ -89,10 +89,9 @@ pub enum ChromaFormat {
 /// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
-    /// [`Speed::Slow`] with a slightly wider search: one more luma mode
-    /// finalist, one more palette and non-square partition finalist, filter
-    /// intra candidates, and looser SPLIT breakouts. Every tuned Slow law
-    /// (biases, seams, gates) applies unchanged.
+    /// [`Speed::Slow`]'s exact search plus per-unit RD CDEF. Wider searches
+    /// (more mode/palette/partition finalists, looser breakouts) all measured
+    /// worse than Slow: they exploit decision-cost errors rather than fix them.
     ExtraSlow,
     /// Highest-effort rate-distortion search among the tuned tiers.
     #[default]
@@ -165,18 +164,11 @@ impl Speed {
         match self {
             Speed::Fast => 1,
             Speed::Medium => crate::tuning::get().mode_budget_medium as usize,
-            Speed::Slow => {
+            Speed::Slow | Speed::ExtraSlow => {
                 if full_res {
                     5
                 } else {
                     3
-                }
-            }
-            Speed::ExtraSlow => {
-                if full_res {
-                    6
-                } else {
-                    4
                 }
             }
         }
@@ -195,8 +187,7 @@ impl Speed {
         match self {
             Speed::Fast => 0,
             Speed::Medium => crate::tuning::get().palette_budget_medium as usize,
-            Speed::Slow => 2,
-            Speed::ExtraSlow => 3,
+            Speed::Slow | Speed::ExtraSlow => 2,
         }
     }
 
@@ -215,16 +206,14 @@ impl Speed {
         (match self {
             Speed::Fast => t.part_budget_fast,
             Speed::Medium => t.part_budget_medium,
-            Speed::Slow => t.part_budget_slow,
-            Speed::ExtraSlow => t.part_budget_slow + 1,
+            Speed::Slow | Speed::ExtraSlow => t.part_budget_slow,
         }) as usize
     }
 
+    /// Filter-intra finalists given full RD. 0 on every tier: a budget of 2
+    /// measured +-1% with no consistent sign even as an ExtraSlow-only extra.
     pub(crate) fn filter_intra_refine_budget(self) -> usize {
-        match self {
-            Speed::ExtraSlow => 2,
-            Speed::Slow | Speed::Medium | Speed::Fast => 0,
-        }
+        0
     }
 
     /// Fast codes chroma with the baseline DC predictor. CfL and directional
@@ -441,6 +430,12 @@ impl EncodeConfig {
     pub fn with_dark_aq(mut self, v: bool) -> Self {
         self.dark_aq = v;
         self
+    }
+
+    /// CDEF as actually coded: on when requested, and always at
+    /// [`Speed::ExtraSlow`], whose extra effort is the per-unit CDEF RD search.
+    pub(crate) fn cdef_enabled(&self) -> bool {
+        self.cdef || self.speed == Speed::ExtraSlow
     }
 
     /// Enable the in-loop CDEF filter
@@ -868,7 +863,7 @@ pub fn encode_rgb8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -899,7 +894,7 @@ pub fn encode_rgba8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -936,7 +931,7 @@ pub fn encode_rgba8_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -994,7 +989,7 @@ pub fn encode_rgb10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1032,7 +1027,7 @@ pub fn encode_rgba10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1072,7 +1067,7 @@ pub fn encode_rgba10_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1127,7 +1122,7 @@ pub fn encode_rgb12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1165,7 +1160,7 @@ pub fn encode_rgba12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1208,7 +1203,7 @@ pub fn encode_rgba12_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1262,7 +1257,7 @@ pub fn encode_gray8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1298,7 +1293,7 @@ pub fn encode_gray10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1334,7 +1329,7 @@ pub fn encode_gray12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1371,7 +1366,7 @@ pub fn encode_yuv8(img: &PlanarImage<u8>, cfg: &EncodeConfig) -> Result<Vec<u8>,
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1401,7 +1396,7 @@ pub fn encode_yuv10(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1438,7 +1433,7 @@ pub fn encode_yuv12(img: &PlanarImage<u16>, cfg: &EncodeConfig) -> Result<Vec<u8
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1479,7 +1474,7 @@ pub fn encode_yuva8_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1525,7 +1520,7 @@ pub fn encode_yuva10_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1572,7 +1567,7 @@ pub fn encode_yuva12_with_alpha(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1617,7 +1612,7 @@ pub fn encode_gray_alpha8(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1662,7 +1657,7 @@ pub fn encode_gray_alpha10(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,
@@ -1707,7 +1702,7 @@ pub fn encode_gray_alpha12(
         cfg.speed,
         cfg.adaptive_quant,
         cfg.vb(quality_to_q(cfg.quality)),
-        cfg.cdef,
+        cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
         cfg.screen_content,

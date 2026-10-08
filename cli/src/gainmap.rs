@@ -187,8 +187,7 @@ pub(crate) fn hevc_gain_map(gain_map: &ParsedGainMap) -> Result<hpvca::GainMap> 
             let g = (v as f64 / u16::MAX as f64).powf(1.0 / gamma);
             let multiplier = (min + (max - min) * g).exp2();
             let linear = ((multiplier - 1.0) / (headroom - 1.0)).clamp(0.0, 1.0);
-            ((TransferFunction::Rec709.gamma(linear as f32) * 255.0) + 0.5)
-                .clamp(0.0, 255.0) as u8
+            ((TransferFunction::Rec709.gamma(linear as f32) * 255.0) + 0.5).clamp(0.0, 255.0) as u8
         })
         .collect();
     let samples = gain_map

@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod cdef;
 mod dct;
 mod idct;
 mod intrapred;
@@ -36,6 +37,9 @@ mod rd;
 mod trellis;
 mod wht;
 
+pub(crate) use cdef::{
+    cdef_block_candidates_8x8_neon, cdef_cand_sums_8x8_neon, cdef_direction_partials_8x8_neon,
+};
 pub(crate) use dct::{
     adst4x4_neon_quant_t, adst4x8_neon_quant_t, adst8x8_neon_quant_t, adst8x16_neon_quant_t,
     adst16x8_neon_quant_t, adst16x16_neon_quant_t, adstdct4x4_neon_quant_t,

@@ -86,6 +86,23 @@ pub(crate) struct Tuning {
     pub(crate) lf_level_scale: f32,
     pub(crate) lf_uv_level_scale: f32,
     pub(crate) lf_uv_level_scale_420: f32,
+    /// Frame-level deblock level search (aom `LPF_PICK_FROM_FULL_IMAGE_NON_DUAL`
+    /// style bisection on the stitched recon, SSE vs source) instead of the q-law.
+    pub(crate) lf_search: bool,
+    /// Scale on aom's bias against raising the level (1.0 = aom).
+    pub(crate) lf_search_bias: f32,
+    /// 0 = search starts at the q-law levels, 1 = starts at 0 (aom intra).
+    pub(crate) lf_search_start0: bool,
+    /// 0 = SSE, 1 = libaom perceptual `cdef_dist_8x8` on luma (chroma stays SSE).
+    pub(crate) lf_search_metric: u32,
+    /// CDEF per-unit distortion margin (per mille) a unit must clear to filter.
+    /// SHIPPED 40 (2026-10-08, re-fit after the chroma SSE wrap fix: synth 420
+    /// -0.95 / 444 -1.37 vs off, 4 photos -0.09; 22 was -0.82 / -1.33 / +0.05).
+    pub(crate) cdef_margin: f32,
+    /// CDEF global-mode directional-variance trust gate (0 disables).
+    pub(crate) cdef_gate: f32,
+    /// Weight on the chroma SSE in the joint (luma perceptual + chroma) CDEF metric.
+    pub(crate) cdef_chroma_w: f32,
     /// 4:2:0 chroma qindex delta held at qindex >= 136 (see `quant::uv420_mid_delta`).
     /// SHIPPED 28 = the mid-band -28 never decays.
     pub(crate) uv420_tail_delta: f32,
@@ -314,6 +331,13 @@ impl Tuning {
         lf_level_scale: 1.0,
         lf_uv_level_scale: 1.0,
         lf_uv_level_scale_420: 0.5,
+        lf_search: false,
+        lf_search_bias: 1.0,
+        lf_search_start0: false,
+        lf_search_metric: 0,
+        cdef_margin: 40.0,
+        cdef_gate: 15000.0,
+        cdef_chroma_w: 1.0,
         uv420_tail_delta: 28.0,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
@@ -510,6 +534,13 @@ mod imp {
                 "uv420_tail_delta" => t.uv420_tail_delta = num(value),
                 "lf_level_scale" => t.lf_level_scale = num(value),
                 "lf_uv_level_scale" => t.lf_uv_level_scale = num(value),
+                "lf_search" => t.lf_search = flag(value),
+                "lf_search_bias" => t.lf_search_bias = num(value),
+                "lf_search_start0" => t.lf_search_start0 = flag(value),
+                "lf_search_metric" => t.lf_search_metric = num(value) as u32,
+                "cdef_margin" => t.cdef_margin = num(value),
+                "cdef_gate" => t.cdef_gate = num(value),
+                "cdef_chroma_w" => t.cdef_chroma_w = num(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
                 "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,
