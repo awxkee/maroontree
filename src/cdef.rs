@@ -33,7 +33,7 @@ pub(crate) const CDEF_VERY_LARGE: i32 = 0x4000;
 /// Per-direction primary tap offsets (2 taps per direction, mirrored).
 /// `cdef_directions[dir][k]` is a (row, col) offset; the mirrored tap is the
 /// negation. Matches the spec table `Cdef_Directions` (8 directions, 2 taps).
-static CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
+pub(crate) static CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
     [(-1, 1), (-2, 2)],
     [(0, 1), (-1, 2)],
     [(0, 1), (0, 2)],
@@ -45,9 +45,9 @@ static CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
 ];
 
 /// Primary tap weights, selected by `pri_strength & 1` (spec `Cdef_Pri_Taps`).
-static CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+pub(crate) static CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 /// Secondary tap weights (spec `Cdef_Sec_Taps`), one row used for all strengths.
-static CDEF_SEC_TAPS: [i32; 2] = [2, 1];
+pub(crate) static CDEF_SEC_TAPS: [i32; 2] = [2, 1];
 
 /// Constrain a difference `diff` between a tap and the centre by `strength` and
 /// `damping` — see [`constrain_spec`]. Thin wrapper kept for readability at the
@@ -59,7 +59,7 @@ fn constrain(diff: i32, strength: i32, damping: i32) -> i32 {
 }
 
 #[inline]
-fn log2_floor(v: i32) -> i32 {
+pub(crate) fn log2_floor(v: i32) -> i32 {
     if v <= 0 {
         0
     } else {
@@ -93,15 +93,25 @@ pub(crate) fn cdef_direction<P: crate::intrapred::Pel>(
     y: usize,
     bd: u8,
 ) -> (usize, i32) {
+    cdef_direction_cost(&cdef_direction_partials(plane, stride, x, y, bd))
+}
+
+/// The eight line-projection partial sums of spec `cdef_find_dir` for the 8x8
+/// block at (x, y). Any block position: samples are clamped to the plane so
+/// partial-edge chroma blocks (e.g. 4:2:0 chroma whose width isn't a multiple
+/// of 8) replicate the edge sample instead of reading out of bounds.
+pub(crate) fn cdef_direction_partials<P: crate::intrapred::Pel>(
+    plane: &[P],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bd: u8,
+) -> [[i32; 15]; 8] {
     let coeff_shift = (bd - 8) as i32;
-    let mut cost = [0i64; 8];
     let mut partial = [[0i32; 15]; 8];
     let rows = plane.len() / stride;
     for i in 0..8 {
         for j in 0..8 {
-            // Clamp to the plane so partial-edge chroma blocks (e.g. 4:2:0 chroma
-            // whose width isn't a multiple of 8) don't read out of bounds; the
-            // edge sample is replicated, which is a reasonable direction estimate.
             let yy = (y + i).min(rows - 1);
             let xx = (x + j).min(stride - 1);
             let p = (plane[yy * stride + xx].widen() >> coeff_shift) - 128;
@@ -115,6 +125,13 @@ pub(crate) fn cdef_direction<P: crate::intrapred::Pel>(
             partial[7][i / 2 + j] += p;
         }
     }
+    partial
+}
+
+/// Direction cost / argmax step of spec `cdef_find_dir` from the eight
+/// line-projection partial sums; returns `(best_dir, var)`.
+pub(crate) fn cdef_direction_cost(partial: &[[i32; 15]; 8]) -> (usize, i32) {
+    let mut cost = [0i64; 8];
     #[allow(clippy::needless_range_loop)]
     for i in 0..8 {
         cost[2] += (partial[2][i] as i64) * (partial[2][i] as i64);
@@ -610,6 +627,236 @@ pub(crate) fn cdef_block_candidates<P: crate::intrapred::Pel>(
     }
 }
 
+/// Per-candidate `(sum d, sum d^2, sum s*d)` over a full 8x8 block (the inputs
+/// of [`cdef_dist_from_sums`]; the source-only sums are the caller's).
+pub(crate) fn cdef_cand_sums_8x8_scalar(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    cand: &[[i32; 64]; N_CAND],
+    out: &mut [[i64; 3]; N_CAND],
+) {
+    for (cb, o) in cand.iter().zip(out.iter_mut()) {
+        let (mut sd, mut sd2, mut ssd) = (0i64, 0i64, 0i64);
+        for i in 0..8 {
+            let srow = &src[(y + i) * stride + x..][..8];
+            for (&sv, &d) in srow.iter().zip(&cb[i * 8..i * 8 + 8]) {
+                let d = d as i64;
+                sd += d;
+                sd2 += d * d;
+                ssd += sv as i64 * d;
+            }
+        }
+        *o = [sd, sd2, ssd];
+    }
+}
+
+/// Interior-8x8 strength-pair filter: `out[c]` as [`cdef_block_candidates`]
+/// writes it for `bw == bh == 8` with every tap inside the plane.
+pub(crate) type CdefCandidatesFn =
+    fn(&[u16], usize, usize, usize, usize, Option<i32>, i32, u8, &mut [[i32; 64]; N_CAND]);
+/// Interior-8x8 [`cdef_direction_partials`].
+pub(crate) type CdefDirPartialsFn = fn(&[u16], usize, usize, usize, u8) -> [[i32; 15]; 8];
+/// [`cdef_cand_sums_8x8_scalar`].
+pub(crate) type CdefCandSumsFn =
+    fn(&[u16], usize, usize, usize, &[[i32; 64]; N_CAND], &mut [[i64; 3]; N_CAND]);
+
+#[allow(clippy::too_many_arguments)]
+fn cdef_block_candidates_8x8_scalar(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    dir: usize,
+    var: Option<i32>,
+    damping: i32,
+    bd: u8,
+    out: &mut [[i32; 64]; N_CAND],
+) {
+    cdef_block_candidates(src, stride, x, y, 8, 8, dir, var, damping, bd, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn cdef_block_candidates_8x8_neon_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    dir: usize,
+    var: Option<i32>,
+    damping: i32,
+    bd: u8,
+    out: &mut [[i32; 64]; N_CAND],
+) {
+    unsafe {
+        crate::neon::cdef_block_candidates_8x8_neon(src, stride, x, y, dir, var, damping, bd, out)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn cdef_direction_partials_8x8_neon_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bd: u8,
+) -> [[i32; 15]; 8] {
+    unsafe { crate::neon::cdef_direction_partials_8x8_neon(src, stride, x, y, bd) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn cdef_cand_sums_8x8_neon_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    cand: &[[i32; 64]; N_CAND],
+    out: &mut [[i64; 3]; N_CAND],
+) {
+    unsafe { crate::neon::cdef_cand_sums_8x8_neon(src, stride, x, y, cand, out) }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn cdef_block_candidates_8x8_avx2_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    dir: usize,
+    var: Option<i32>,
+    damping: i32,
+    bd: u8,
+    out: &mut [[i32; 64]; N_CAND],
+) {
+    unsafe {
+        crate::avx::cdef_block_candidates_8x8_avx2(src, stride, x, y, dir, var, damping, bd, out)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn cdef_direction_partials_8x8_avx2_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bd: u8,
+) -> [[i32; 15]; 8] {
+    unsafe { crate::avx::cdef_direction_partials_8x8_avx2(src, stride, x, y, bd) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn cdef_cand_sums_8x8_avx2_wrap(
+    src: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    cand: &[[i32; 64]; N_CAND],
+    out: &mut [[i64; 3]; N_CAND],
+) {
+    unsafe { crate::avx::cdef_cand_sums_8x8_avx2(src, stride, x, y, cand, out) }
+}
+
+/// SIMD-selected CDEF encoder-search kernels (NEON / AVX2 / scalar), carried by
+/// `EncodingContext` like the other per-run dispatch tables. The 8x8 kernels
+/// only take interior blocks; the methods below route everything else to the
+/// generic scalar code, so callers never see the distinction.
+#[derive(Clone, Copy)]
+pub(crate) struct CdefDispatch {
+    candidates_8x8: CdefCandidatesFn,
+    direction_partials_8x8: CdefDirPartialsFn,
+    cand_sums_8x8: CdefCandSumsFn,
+}
+
+impl CdefDispatch {
+    pub(crate) const fn scalar() -> Self {
+        Self {
+            candidates_8x8: cdef_block_candidates_8x8_scalar,
+            direction_partials_8x8: cdef_direction_partials::<u16>,
+            cand_sums_8x8: cdef_cand_sums_8x8_scalar,
+        }
+    }
+
+    pub(crate) fn selected() -> Self {
+        #[allow(unused_mut)]
+        let mut dispatch = Self::scalar();
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            dispatch.candidates_8x8 = cdef_block_candidates_8x8_neon_wrap;
+            dispatch.direction_partials_8x8 = cdef_direction_partials_8x8_neon_wrap;
+            dispatch.cand_sums_8x8 = cdef_cand_sums_8x8_neon_wrap;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") {
+            dispatch.candidates_8x8 = cdef_block_candidates_8x8_avx2_wrap;
+            dispatch.direction_partials_8x8 = cdef_direction_partials_8x8_avx2_wrap;
+            dispatch.cand_sums_8x8 = cdef_cand_sums_8x8_avx2_wrap;
+        }
+        dispatch
+    }
+
+    /// [`cdef_block_candidates`] on a `u16` plane; interior 8x8 blocks take
+    /// the selected kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_candidates(
+        &self,
+        src: &[u16],
+        stride: usize,
+        x: usize,
+        y: usize,
+        bw: usize,
+        bh: usize,
+        dir: usize,
+        var: Option<i32>,
+        damping: i32,
+        bd: u8,
+        out: &mut [[i32; 64]; N_CAND],
+    ) {
+        let rows = src.len() / stride;
+        if bw == 8 && bh == 8 && x >= 2 && y >= 2 && x + 10 <= stride && y + 10 <= rows {
+            (self.candidates_8x8)(src, stride, x, y, dir, var, damping, bd, out)
+        } else {
+            cdef_block_candidates(src, stride, x, y, bw, bh, dir, var, damping, bd, out)
+        }
+    }
+
+    /// [`cdef_direction`] on a `u16` plane of REAL pixels (`< 1 << bd`; the
+    /// 16-bit-lane kernels overflow on `CDEF_VERY_LARGE`, which the decoder's
+    /// frame buffer never holds); blocks fully inside the plane take the
+    /// selected partial-sum kernel (the cost step is shared).
+    pub(crate) fn direction(
+        &self,
+        plane: &[u16],
+        stride: usize,
+        x: usize,
+        y: usize,
+        bd: u8,
+    ) -> (usize, i32) {
+        if x + 8 <= stride && y + 8 <= plane.len() / stride {
+            cdef_direction_cost(&(self.direction_partials_8x8)(plane, stride, x, y, bd))
+        } else {
+            cdef_direction(plane, stride, x, y, bd)
+        }
+    }
+
+    /// [`cdef_cand_sums_8x8_scalar`]; the 8x8 block must lie inside the plane
+    /// and `cand` must hold real pixels (`< 1 << bd`, see [`Self::direction`]).
+    pub(crate) fn cand_sums(
+        &self,
+        src: &[u16],
+        stride: usize,
+        x: usize,
+        y: usize,
+        cand: &[[i32; 64]; N_CAND],
+        out: &mut [[i64; 3]; N_CAND],
+    ) {
+        debug_assert!(x + 8 <= stride && y + 8 <= src.len() / stride);
+        (self.cand_sums_8x8)(src, stride, x, y, cand, out)
+    }
+}
+
 /// Candidate primary strengths searched per 64x64 (kept small for speed).
 pub(crate) static PRI_CANDIDATES: [i32; 4] = [0, 1, 2, 4];
 /// Candidate secondary strengths (spec values 0,1,2,4).
@@ -694,6 +941,250 @@ pub(crate) fn cdef_dist_from_sums(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xorshift(seed: &mut u64, m: u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed % m
+    }
+
+    /// The selected (NEON / AVX2) kernels against the generic scalar code on
+    /// random planes with `CDEF_VERY_LARGE` sprinkled in, all bit depths,
+    /// interior and edge positions, luma (variance-scaled) and chroma strengths.
+    #[test]
+    fn dispatch_candidates_match_generic() {
+        let dsp = CdefDispatch::selected();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for bd in [8u8, 10, 12] {
+            let (stride, rows) = (40usize, 24usize);
+            for trial in 0..600 {
+                let maxv = (1u64 << bd) - 1;
+                let base = xorshift(&mut seed, maxv + 1);
+                let src: Vec<u16> = (0..stride * rows)
+                    .map(|_| {
+                        if trial % 4 == 0 && xorshift(&mut seed, 19) == 0 {
+                            CDEF_VERY_LARGE as u16
+                        } else if xorshift(&mut seed, 4) == 0 {
+                            xorshift(&mut seed, maxv + 1) as u16
+                        } else {
+                            (base as i64 + xorshift(&mut seed, 41) as i64 - 20)
+                                .clamp(0, maxv as i64) as u16
+                        }
+                    })
+                    .collect();
+                let (bw, bh) = [(8, 8), (8, 8), (4, 8), (4, 4)][xorshift(&mut seed, 4) as usize];
+                let x = xorshift(&mut seed, (stride - bw + 1) as u64) as usize;
+                let y = xorshift(&mut seed, (rows - bh + 1) as u64) as usize;
+                let dir = xorshift(&mut seed, 8) as usize;
+                let damping = 3 + xorshift(&mut seed, 4) as i32 + (bd as i32 - 8);
+                let var = [0, 7, 100, 5000, 1 << 20][xorshift(&mut seed, 5) as usize];
+                let luma = xorshift(&mut seed, 2) == 0;
+                let mut want = [[0i32; 64]; N_CAND];
+                let mut got = [[0i32; 64]; N_CAND];
+                cdef_block_candidates(
+                    &src,
+                    stride,
+                    x,
+                    y,
+                    bw,
+                    bh,
+                    dir,
+                    luma.then_some(var),
+                    damping,
+                    bd,
+                    &mut want,
+                );
+                dsp.block_candidates(
+                    &src,
+                    stride,
+                    x,
+                    y,
+                    bw,
+                    bh,
+                    dir,
+                    luma.then_some(var),
+                    damping,
+                    bd,
+                    &mut got,
+                );
+                let n = bw * bh;
+                for c in 0..N_CAND {
+                    assert_eq!(
+                        &got[c][..n],
+                        &want[c][..n],
+                        "bd={bd} trial={trial} cand={c} dir={dir} var={var} luma={luma} {bw}x{bh} at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_direction_matches_generic() {
+        let dsp = CdefDispatch::selected();
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        for bd in [8u8, 10, 12] {
+            let (stride, rows) = (37usize, 21usize);
+            for trial in 0..500 {
+                let maxv = (1u64 << bd) - 1;
+                let base = xorshift(&mut seed, maxv + 1);
+                let spread = [3u64, 41, 400, maxv + 1][xorshift(&mut seed, 4) as usize];
+                let src: Vec<u16> = (0..stride * rows)
+                    .map(|_| {
+                        (base as i64 + xorshift(&mut seed, spread) as i64 - (spread / 2) as i64)
+                            .clamp(0, maxv as i64) as u16
+                    })
+                    .collect();
+                let x = xorshift(&mut seed, (stride - 4) as u64) as usize;
+                let y = xorshift(&mut seed, (rows - 4) as u64) as usize;
+                assert_eq!(
+                    dsp.direction(&src, stride, x, y, bd),
+                    cdef_direction(&src, stride, x, y, bd),
+                    "bd={bd} trial={trial} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_cand_sums_match_scalar() {
+        let dsp = CdefDispatch::selected();
+        let mut seed = 0x0f0f_1e1e_2d2d_3c3cu64;
+        for bd in [8u8, 10, 12] {
+            let (stride, rows) = (24usize, 16usize);
+            for _ in 0..200 {
+                let maxv = (1u64 << bd) - 1;
+                let src: Vec<u16> = (0..stride * rows)
+                    .map(|_| xorshift(&mut seed, maxv + 1) as u16)
+                    .collect();
+                let mut cand = [[0i32; 64]; N_CAND];
+                for c in cand.iter_mut() {
+                    for v in c.iter_mut() {
+                        *v = xorshift(&mut seed, maxv + 1) as i32;
+                    }
+                }
+                let x = xorshift(&mut seed, (stride - 7) as u64) as usize;
+                let y = xorshift(&mut seed, (rows - 7) as u64) as usize;
+                let mut got = [[0i64; 3]; N_CAND];
+                let mut want = [[0i64; 3]; N_CAND];
+                dsp.cand_sums(&src, stride, x, y, &cand, &mut got);
+                cdef_cand_sums_8x8_scalar(&src, stride, x, y, &cand, &mut want);
+                assert_eq!(got, want, "bd={bd}");
+                for (c, cb) in cand.iter().enumerate() {
+                    let (mut sd, mut sd2, mut ssd) = (0i64, 0i64, 0i64);
+                    for i in 0..8 {
+                        for j in 0..8 {
+                            let s = src[(y + i) * stride + x + j] as i64;
+                            let d = cb[i * 8 + j] as i64;
+                            sd += d;
+                            sd2 += d * d;
+                            ssd += s * d;
+                        }
+                    }
+                    assert_eq!(want[c], [sd, sd2, ssd], "bd={bd} cand={c}");
+                }
+            }
+        }
+    }
+
+    /// The AVX2 kernels called directly (no runtime detection), for hosts
+    /// where `is_x86_feature_detected!` is conservative, e.g. emulators.
+    /// Run with `cargo test --target x86_64-... -- --ignored`.
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    #[ignore]
+    fn avx2_kernels_forced_match_scalar() {
+        let dsp = CdefDispatch {
+            candidates_8x8: cdef_block_candidates_8x8_avx2_wrap,
+            direction_partials_8x8: cdef_direction_partials_8x8_avx2_wrap,
+            cand_sums_8x8: cdef_cand_sums_8x8_avx2_wrap,
+        };
+        let mut seed = 0x7777_1234_abcd_0001u64;
+        for bd in [8u8, 10, 12] {
+            let (stride, rows) = (40usize, 24usize);
+            for trial in 0..600 {
+                let maxv = (1u64 << bd) - 1;
+                let base = xorshift(&mut seed, maxv + 1);
+                let src: Vec<u16> = (0..stride * rows)
+                    .map(|_| {
+                        if trial % 4 == 0 && xorshift(&mut seed, 19) == 0 {
+                            CDEF_VERY_LARGE as u16
+                        } else if xorshift(&mut seed, 4) == 0 {
+                            xorshift(&mut seed, maxv + 1) as u16
+                        } else {
+                            (base as i64 + xorshift(&mut seed, 41) as i64 - 20)
+                                .clamp(0, maxv as i64) as u16
+                        }
+                    })
+                    .collect();
+                let x = 2 + xorshift(&mut seed, (stride - 10 - 2 + 1) as u64) as usize;
+                let y = 2 + xorshift(&mut seed, (rows - 10 - 2 + 1) as u64) as usize;
+                let dir = xorshift(&mut seed, 8) as usize;
+                let damping = 3 + xorshift(&mut seed, 4) as i32 + (bd as i32 - 8);
+                let var = [0, 7, 100, 5000, 1 << 20][xorshift(&mut seed, 5) as usize];
+                let luma = xorshift(&mut seed, 2) == 0;
+                let mut want = [[0i32; 64]; N_CAND];
+                let mut got = [[0i32; 64]; N_CAND];
+                cdef_block_candidates(
+                    &src,
+                    stride,
+                    x,
+                    y,
+                    8,
+                    8,
+                    dir,
+                    luma.then_some(var),
+                    damping,
+                    bd,
+                    &mut want,
+                );
+                dsp.block_candidates(
+                    &src,
+                    stride,
+                    x,
+                    y,
+                    8,
+                    8,
+                    dir,
+                    luma.then_some(var),
+                    damping,
+                    bd,
+                    &mut got,
+                );
+                assert_eq!(
+                    got, want,
+                    "candidates bd={bd} trial={trial} dir={dir} var={var} luma={luma}"
+                );
+                // Direction / sums read real pixels only (no CDEF_VERY_LARGE).
+                let clean: Vec<u16> = src.iter().map(|&p| p.min(maxv as u16)).collect();
+                assert_eq!(
+                    dsp.direction(&clean, stride, x, y, bd),
+                    cdef_direction(&clean, stride, x, y, bd),
+                    "direction bd={bd} trial={trial}"
+                );
+                let mut cand = [[0i32; 64]; N_CAND];
+                cdef_block_candidates(
+                    &clean,
+                    stride,
+                    x,
+                    y,
+                    8,
+                    8,
+                    dir,
+                    luma.then_some(var),
+                    damping,
+                    bd,
+                    &mut cand,
+                );
+                let mut sg = [[0i64; 3]; N_CAND];
+                let mut sw = [[0i64; 3]; N_CAND];
+                dsp.cand_sums(&clean, stride, x, y, &cand, &mut sg);
+                cdef_cand_sums_8x8_scalar(&clean, stride, x, y, &cand, &mut sw);
+                assert_eq!(sg, sw, "sums bd={bd} trial={trial}");
+            }
+        }
+    }
 
     #[test]
     fn fast_paths_match_generic_filter() {

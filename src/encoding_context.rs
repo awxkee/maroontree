@@ -28,6 +28,7 @@
  */
 
 use crate::Speed;
+use crate::cdef::CdefDispatch;
 use crate::coder::VarianceBoost;
 use crate::dct::{ApplyQmatrixFn, DctDispatch, DctFn};
 use crate::idct::IdctDispatch;
@@ -41,6 +42,7 @@ pub(crate) struct EncodingContext<'a> {
     pub(crate) thread_pool: &'a Pool,
     pub(crate) speed: Speed,
     pub(crate) boost: VarianceBoost,
+    pub(crate) cdef: CdefDispatch,
     pub(crate) idct: IdctDispatch,
     pub(crate) intrapred: IntraPredDispatch,
     pub(crate) kmeans: KmeansDispatch,
@@ -101,10 +103,12 @@ impl<'a> EncodingContext<'a> {
         let kmeans = KmeansDispatch::selected();
         let loopfilter = LoopFilterDispatch::selected();
         let rd = RdDispatch::selected();
+        let cdef = CdefDispatch::selected();
         Self {
             thread_pool,
             speed,
             boost,
+            cdef,
             idct,
             intrapred,
             kmeans,

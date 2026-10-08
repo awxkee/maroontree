@@ -215,7 +215,7 @@ fn encode_lossy_frame<T: Pixel>(
     }
 
     let context = EncodingContext::new(pool, speed, variance_boost);
-    let (tilegroup, tiling, cdef_params, restoration_params, allow_intrabc) =
+    let (tilegroup, tiling, cdef_params, restoration_params, allow_intrabc, lf_levels) =
         encode_lossy_tilegroup(
             base_q_idx,
             bit_depth,
@@ -252,6 +252,7 @@ fn encode_lossy_frame<T: Pixel>(
         cdef_params.as_ref(),
         restoration_params.as_ref(),
         updating_cdf,
+        lf_levels,
     ));
     bytes
 }

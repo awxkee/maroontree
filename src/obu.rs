@@ -230,6 +230,7 @@ pub(crate) fn frame_header_lossy_multitile(
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
     updating_cdf: bool,
+    lf: Option<(i32, i32, i32)>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -248,6 +249,7 @@ pub(crate) fn frame_header_lossy_multitile(
         allow_intrabc,
         cdef,
         lr,
+        lf,
     )
 }
 
@@ -268,6 +270,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
     updating_cdf: bool,
+    lf: Option<(i32, i32, i32)>,
 ) -> Vec<u8> {
     frame_header_lossy_impl(
         base_q_idx,
@@ -286,6 +289,7 @@ pub(crate) fn frame_header_lossy_multitile_th(
         allow_intrabc,
         cdef,
         lr,
+        lf,
     )
 }
 
@@ -406,6 +410,7 @@ fn frame_header_lossy_impl(
     allow_intrabc: bool,
     cdef: Option<&CdefParams>,
     lr: Option<&LrParams>,
+    lf: Option<(i32, i32, i32)>,
 ) -> Vec<u8> {
     debug_assert!(base_q_idx != 0, "use frame_header_lossless() for q=0");
     let mut w = BitWriter::new();
@@ -480,12 +485,16 @@ fn frame_header_lossy_impl(
     }
     // allow_intrabc suppresses loop-filter, CDEF and loop-restoration syntax.
     if !allow_intrabc {
-        let (lvl_y, lvl_uv) = loop_filter_levels(base_q_idx, sub);
+        // Searched levels (see `coder::frame_lf_search`) or the q-law.
+        let (lvl_y, lvl_u, lvl_v) = lf.unwrap_or_else(|| {
+            let (y, uv) = loop_filter_levels(base_q_idx, sub);
+            (y, uv, uv)
+        });
         w.f(lvl_y as u32, 6); // loop_filter_level[0] (luma vertical)
         w.f(lvl_y as u32, 6); // loop_filter_level[1] (luma horizontal)
         if lvl_y != 0 && !mono {
-            w.f(lvl_uv as u32, 6);
-            w.f(lvl_uv as u32, 6);
+            w.f(lvl_u as u32, 6);
+            w.f(lvl_v as u32, 6);
         }
         w.f(loop_filter_sharpness(base_q_idx) as u32, 3); // loop_filter_sharpness
         w.flag(false); // loop_filter_delta_enabled = 0
