@@ -367,7 +367,7 @@ impl<'a> LossyTile<'a> {
             false
         };
         let vbp_thresh = if self.ss420 {
-            vbp_thresh_420(self.speed)
+            vbp_thresh_420()
         } else {
             crate::tuning::get().vbp_thresh_hi
         };

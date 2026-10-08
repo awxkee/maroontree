@@ -1535,14 +1535,8 @@ fn prdo_upper_clamp() -> f32 {
     1.5
 }
 
-/// ExtraSlow skips the 32-level SPLIT search only on blocks twice as flat.
-fn vbp_thresh_420(speed: Speed) -> f32 {
-    let t = crate::tuning::get().vbp_thresh_420;
-    if speed == Speed::ExtraSlow {
-        t * 0.5
-    } else {
-        t
-    }
+fn vbp_thresh_420() -> f32 {
+    crate::tuning::get().vbp_thresh_420
 }
 
 fn top_none_bias_420(base_q: u8) -> f32 {
@@ -3629,11 +3623,15 @@ fn frame_cdef(
     // Slow: two-stage full search — all 15 primary-only strengths, then the
     // top-K primaries crossed with every secondary (libaom pickcdef coverage).
     // Fast: the small legacy set. Index 0 is always (0,0) = unfiltered.
+    // Every candidate strength pair is filtered in one pass over the frame;
+    // the staged search below only reads these tables.
+    let luma_all = cdef_luma_unit_dists_all(
+        &snap_y, &src[0], w8, h8, disp_w, disp_h, &ldirs, &lvars, &lskip, nbx, uc, damping, bd,
+        perceptual, pool,
+    );
     let luma_tab = |pri: i32, sec: i32| -> Vec<i64> {
-        cdef_luma_unit_dists(
-            &snap_y, &src[0], w8, h8, disp_w, disp_h, &ldirs, &lvars, &lskip, nbx, uc, n_units,
-            pri, sec, damping, bd, perceptual,
-        )
+        let c = cdef::cand_index(pri, sec);
+        luma_all.iter().map(|u| u[c]).collect()
     };
     // A unit only counts as gained when filtering clears the margin: a small
     // guaranteed improvement, standing in for the SSE/SSIMULACRA2 mismatch.
@@ -3652,8 +3650,7 @@ fn frame_cdef(
         // smoothing (SSIMULACRA2 regressions up to −0.4 when pri 5..15 entries
         // were offered), matching the legacy candidate cap.
         let pri_list: Vec<i32> = vec![1, 2, 4];
-        let want = pool.width().min(pri_list.len());
-        let tabs = pool.map_indexed(want, pri_list.len(), |i| luma_tab(pri_list[i], 0));
+        let tabs: Vec<Vec<i64>> = pri_list.iter().map(|&p| luma_tab(p, 0)).collect();
         let mut ranked: Vec<(i64, usize)> = tabs
             .iter()
             .enumerate()
@@ -3679,10 +3676,7 @@ fn frame_cdef(
                 }
             }
         }
-        let want = pool.width().min(stage_b.len().max(1));
-        let tabs = pool.map_indexed(want, stage_b.len(), |i| {
-            luma_tab(stage_b[i].0, stage_b[i].1)
-        });
+        let tabs: Vec<Vec<i64>> = stage_b.iter().map(|&(p, s)| luma_tab(p, s)).collect();
         for (i, t) in tabs.into_iter().enumerate() {
             cands.push(stage_b[i]);
             ly.push(t);
@@ -3693,8 +3687,7 @@ fn frame_cdef(
             .flat_map(|&pri| cdef::SEC_CANDIDATES.iter().map(move |&sec| (pri, sec)))
             .filter(|&(pri, sec)| !(pri == 0 && sec == 0))
             .collect();
-        let want = pool.width().min(list.len().max(1));
-        let tabs = pool.map_indexed(want, list.len(), |i| luma_tab(list[i].0, list[i].1));
+        let tabs: Vec<Vec<i64>> = list.iter().map(|&(p, s)| luma_tab(p, s)).collect();
         for (i, t) in tabs.into_iter().enumerate() {
             cands.push(list[i]);
             ly.push(t);
@@ -3721,12 +3714,11 @@ fn frame_cdef(
     let (c_cands, lc): (Vec<(i32, i32)>, Vec<Vec<i64>>) = if mono {
         (vec![(0, 0)], vec![vec![0; n_units]])
     } else {
-        let unit_sse = |pri: i32, sec: i32| -> Vec<i64> {
-            let u = cdef_chroma_unit_sse(
-                &snap_uv[0],
-                &src[1],
+        let plane_all = |pl: usize| {
+            cdef_chroma_unit_sse_all(
+                &snap_uv[pl],
+                &src[1 + pl],
                 cw8,
-                ch8,
                 cw_vis,
                 ch_vis,
                 &ldirs,
@@ -3735,45 +3727,21 @@ fn frame_cdef(
                 nbx,
                 nby,
                 uc,
-                n_units,
                 sub_x,
                 sub_y,
-                pri,
-                sec,
                 chroma_damping,
                 bd,
-            );
-            let v = cdef_chroma_unit_sse(
-                &snap_uv[1],
-                &src[2],
-                cw8,
-                ch8,
-                cw_vis,
-                ch_vis,
-                &ldirs,
-                &uv_dir,
-                &lskip,
-                nbx,
-                nby,
-                uc,
-                n_units,
-                sub_x,
-                sub_y,
-                pri,
-                sec,
-                chroma_damping,
-                bd,
-            );
-            (0..n_units).map(|i| u[i] + v[i]).collect()
+                pool,
+            )
         };
-        let want = pool.width().min(cands.len().max(1));
-        let tabs = pool.map_indexed(want, cands.len(), |i| {
-            if i == 0 {
-                unit_sse(0, 0)
-            } else {
-                unit_sse(cands[i].0, cands[i].1)
-            }
-        });
+        let (u_all, v_all) = (plane_all(0), plane_all(1));
+        let tabs: Vec<Vec<i64>> = cands
+            .iter()
+            .map(|&(pri, sec)| {
+                let c = cdef::cand_index(pri, sec);
+                (0..n_units).map(|i| u_all[i][c] + v_all[i][c]).collect()
+            })
+            .collect();
         (cands.clone(), tabs)
     };
     let chroma_off: Vec<i64> = lc[0].clone();
@@ -4035,6 +4003,7 @@ fn frame_cdef(
     Some(decision)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn cdef_block_dist_vis(
     src: &[u16],
@@ -4054,13 +4023,169 @@ fn cdef_block_dist_vis(
     let mut s = 0i64;
     for yy in y..(y + 8).min(vis_h) {
         for xx in x..(x + 8).min(vis_w) {
-            let d = (dst[yy * stride + xx] - src[yy * stride + xx]) as i64;
+            let d = dst[yy * stride + xx] as i64 - src[yy * stride + xx] as i64;
             s += d * d;
         }
     }
     s
 }
 
+/// Per-64x64-unit luma distortion for every [`crate::cdef::cand_index`] strength
+/// pair in one pass: entry `[u][c]` equals `cdef_luma_unit_dists(.., pri,
+/// sec, ..)[u]` for candidate `c`. Unit rows are independent, so they run in
+/// parallel.
+#[allow(clippy::too_many_arguments)]
+fn cdef_luma_unit_dists_all(
+    recon: &[u16],
+    src: &[u16],
+    w: usize,
+    h: usize,
+    disp_w: usize,
+    disp_h: usize,
+    dirs: &[usize],
+    vars: &[i32],
+    skip: &[bool],
+    nbx: usize,
+    uc: usize,
+    damping: i32,
+    bd: u8,
+    perceptual: bool,
+    pool: &Pool,
+) -> Vec<[i64; crate::cdef::N_CAND]> {
+    let coeff_shift = (bd - 8) as u32;
+    let ur = h.div_ceil(64);
+    let rows = pool.map_indexed(pool.width().min(ur), ur, |uy| {
+        let mut out = vec![[0i64; crate::cdef::N_CAND]; uc];
+        let mut cand = [[0i32; 64]; crate::cdef::N_CAND];
+        for y in (uy * 64..(uy * 64 + 64).min(h)).step_by(8) {
+            if y >= disp_h {
+                break;
+            }
+            for x in (0..w).step_by(8) {
+                let bi = (y / 8) * nbx + x / 8;
+                if skip.get(bi).copied().unwrap_or(true) || x >= disp_w {
+                    continue;
+                }
+                crate::cdef::cdef_block_candidates(
+                    recon,
+                    w,
+                    x,
+                    y,
+                    8,
+                    8,
+                    dirs[bi],
+                    Some(vars[bi]),
+                    damping,
+                    bd,
+                    &mut cand,
+                );
+                let full = perceptual && x + 8 <= disp_w && y + 8 <= disp_h;
+                let (vw, vh) = ((disp_w - x).min(8), (disp_h - y).min(8));
+                let (mut ss, mut ss2) = (0i64, 0i64);
+                if full {
+                    for i in 0..8 {
+                        for &s in &src[(y + i) * w + x..][..8] {
+                            ss += s as i64;
+                            ss2 += s as i64 * s as i64;
+                        }
+                    }
+                }
+                let acc = &mut out[x / 64];
+                for (a, cb) in acc.iter_mut().zip(cand.iter()) {
+                    *a += if full {
+                        let (mut sd, mut sd2, mut ssd) = (0i64, 0i64, 0i64);
+                        for i in 0..8 {
+                            let srow = &src[(y + i) * w + x..][..8];
+                            for (&s, &d) in srow.iter().zip(&cb[i * 8..i * 8 + 8]) {
+                                let d = d as i64;
+                                sd += d;
+                                sd2 += d * d;
+                                ssd += s as i64 * d;
+                            }
+                        }
+                        crate::cdef::cdef_dist_from_sums(ss, sd, ss2, sd2, ssd, coeff_shift)
+                    } else {
+                        let mut s = 0i64;
+                        for i in 0..vh {
+                            let srow = &src[(y + i) * w + x..][..vw];
+                            for (&sv, &d) in srow.iter().zip(&cb[i * 8..i * 8 + vw]) {
+                                let e = d as i64 - sv as i64;
+                                s += e * e;
+                            }
+                        }
+                        s
+                    };
+                }
+            }
+        }
+        out
+    });
+    rows.into_iter().flatten().collect()
+}
+
+/// Per-64x64-unit chroma SSE for every [`crate::cdef::cand_index`] strength pair of
+/// one chroma plane: entry `[u][c]` equals `cdef_chroma_unit_sse(.., pri,
+/// sec, ..)[u]` for candidate `c`.
+#[allow(clippy::too_many_arguments)]
+fn cdef_chroma_unit_sse_all(
+    recon: &[u16],
+    src: &[u16],
+    cw: usize,
+    cw_vis: usize,
+    ch_vis: usize,
+    ldirs: &[usize],
+    uv_dir: &[usize; 8],
+    lskip: &[bool],
+    nbx: usize,
+    nby: usize,
+    uc: usize,
+    sub_x: usize,
+    sub_y: usize,
+    damping: i32,
+    bd: u8,
+    pool: &Pool,
+) -> Vec<[i64; crate::cdef::N_CAND]> {
+    let (cbw, cbh) = (8 >> sub_x, 8 >> sub_y);
+    let ur = nby.div_ceil(8);
+    let rows = pool.map_indexed(pool.width().min(ur), ur, |uy| {
+        let mut out = vec![[0i64; crate::cdef::N_CAND]; uc];
+        let mut cand = [[0i32; 64]; crate::cdef::N_CAND];
+        for lby in uy * 8..(uy * 8 + 8).min(nby) {
+            let cy = (lby * 8) >> sub_y;
+            if cy >= ch_vis {
+                break;
+            }
+            for lbx in 0..nbx {
+                let bi = lby * nbx + lbx;
+                let cx = (lbx * 8) >> sub_x;
+                if lskip.get(bi).copied().unwrap_or(true) || cx >= cw_vis {
+                    continue;
+                }
+                let dir = uv_dir[ldirs.get(bi).copied().unwrap_or(0)];
+                crate::cdef::cdef_block_candidates(
+                    recon, cw, cx, cy, cbw, cbh, dir, None, damping, bd, &mut cand,
+                );
+                let (vw, vh) = ((cw_vis - cx).min(cbw), (ch_vis - cy).min(cbh));
+                let acc = &mut out[lbx / 8];
+                for (a, cb) in acc.iter_mut().zip(cand.iter()) {
+                    let mut s = 0i64;
+                    for i in 0..vh {
+                        let srow = &src[(cy + i) * cw + cx..][..vw];
+                        for (&sv, &d) in srow.iter().zip(&cb[i * cbw..i * cbw + vw]) {
+                            let e = d as i64 - sv as i64;
+                            s += e * e;
+                        }
+                    }
+                    *a += s;
+                }
+            }
+        }
+        out
+    });
+    rows.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn cdef_luma_unit_dists(
     recon: &[u16],
@@ -4150,6 +4275,7 @@ fn cdef_luma_unit_dists(
 /// One chroma sub-block per non-skip luma 8x8: 8x8 (4:4:4), 4x8 (4:2:2),
 /// 4x4 (4:2:0). Plain SSE — chroma sub-blocks are too small for the 8x8
 /// variance calibration of the perceptual metric (libaom also uses MSE here).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn cdef_chroma_unit_sse(
     recon: &[u16],
@@ -4223,7 +4349,7 @@ fn cdef_chroma_unit_sse(
             for yy in cy..(cy + cbh).min(ch_vis) {
                 for xx in cx..(cx + cbw).min(cw_vis) {
                     let row = if filtering { yy - cy } else { yy };
-                    let d = (cand[row * cw + xx] - src[yy * cw + xx]) as i64;
+                    let d = cand[row * cw + xx] as i64 - src[yy * cw + xx] as i64;
                     sse += d * d;
                 }
             }
@@ -4862,6 +4988,109 @@ mod aq_tests {
     use super::*;
 
     #[test]
+    fn cdef_all_candidate_tables_match_per_candidate() {
+        use crate::cdef;
+        let pool = Pool::new(3);
+        for bd in [8u8, 10] {
+            let maxv = (1u32 << bd) - 1;
+            for (w, h, vis_w, vis_h) in [(72usize, 136usize, 69usize, 133usize), (128, 64, 128, 64)]
+            {
+                let px = |i: usize, k: usize| {
+                    ((i * k + (i * i) % 97 + (i / w) * 7) as u32 % (maxv + 1)) as u16
+                };
+                let src: Vec<u16> = (0..w * h).map(|i| px(i, 31)).collect();
+                // Recon close to the source, sometimes above and sometimes
+                // below it, so the SSE sees errors of both signs.
+                let recon: Vec<u16> = (0..w * h)
+                    .map(|i| (src[i] as i32 + (i % 11) as i32 - 5).clamp(0, maxv as i32) as u16)
+                    .collect();
+                let (nbx, nby) = (w / 8, h / 8);
+                let uc = w.div_ceil(64);
+                let n_units = uc * h.div_ceil(64);
+                let dirs: Vec<usize> = (0..nbx * nby).map(|i| (i * 5) % 8).collect();
+                let vars: Vec<i32> = (0..nbx * nby).map(|i| [0, 40, 900, 70000][i % 4]).collect();
+                let skip: Vec<bool> = (0..nbx * nby).map(|i| i % 9 == 0).collect();
+                let damping = 3 + i32::from(bd - 8);
+                for perceptual in [false, true] {
+                    let all = cdef_luma_unit_dists_all(
+                        &recon, &src, w, h, vis_w, vis_h, &dirs, &vars, &skip, nbx, uc, damping,
+                        bd, perceptual, &pool,
+                    );
+                    for c in 0..cdef::N_CAND {
+                        let (pri, sec) = (cdef::CAND_PRI[c % 4], cdef::CAND_SEC[c / 4]);
+                        let want = cdef_luma_unit_dists(
+                            &recon, &src, w, h, vis_w, vis_h, &dirs, &vars, &skip, nbx, uc,
+                            n_units, pri, sec, damping, bd, perceptual,
+                        );
+                        let got: Vec<i64> = all.iter().map(|u| u[c]).collect();
+                        assert_eq!(
+                            got, want,
+                            "luma {w}x{h} bd={bd} ({pri},{sec}) p={perceptual}"
+                        );
+                    }
+                }
+                for (sub_x, sub_y) in [(0, 0), (1, 0), (1, 1)] {
+                    let (cw, ch) = (w >> sub_x, h >> sub_y);
+                    let (cw_vis, ch_vis) = (vis_w.div_ceil(1 << sub_x), vis_h.div_ceil(1 << sub_y));
+                    let uv_dir = if (sub_x, sub_y) == (1, 0) {
+                        [7, 0, 2, 4, 5, 6, 6, 6]
+                    } else {
+                        [0, 1, 2, 3, 4, 5, 6, 7]
+                    };
+                    let csrc: Vec<u16> = (0..cw * ch).map(|i| px(i, 17)).collect();
+                    let crec: Vec<u16> = (0..cw * ch)
+                        .map(|i| (csrc[i] as i32 + (i % 7) as i32 - 3).clamp(0, maxv as i32) as u16)
+                        .collect();
+                    let all = cdef_chroma_unit_sse_all(
+                        &crec,
+                        &csrc,
+                        cw,
+                        cw_vis,
+                        ch_vis,
+                        &dirs,
+                        &uv_dir,
+                        &skip,
+                        nbx,
+                        nby,
+                        uc,
+                        sub_x,
+                        sub_y,
+                        damping - 1,
+                        bd,
+                        &pool,
+                    );
+                    for c in 0..cdef::N_CAND {
+                        let (pri, sec) = (cdef::CAND_PRI[c % 4], cdef::CAND_SEC[c / 4]);
+                        let want = cdef_chroma_unit_sse(
+                            &crec,
+                            &csrc,
+                            cw,
+                            ch,
+                            cw_vis,
+                            ch_vis,
+                            &dirs,
+                            &uv_dir,
+                            &skip,
+                            nbx,
+                            nby,
+                            uc,
+                            n_units,
+                            sub_x,
+                            sub_y,
+                            pri,
+                            sec,
+                            damping - 1,
+                            bd,
+                        );
+                        let got: Vec<i64> = all.iter().map(|u| u[c]).collect();
+                        assert_eq!(got, want, "chroma {sub_x}{sub_y} bd={bd} ({pri},{sec})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cdef_row_scratch_matches_full_plane_scores() {
         use crate::cdef;
         for bd in [8u8, 10, 12] {
@@ -4988,7 +5217,8 @@ mod aq_tests {
                                 }
                                 for yy in y..(y + bh).min(ch_vis) {
                                     for xx in x..(x + bw).min(cw_vis) {
-                                        let d = (full[yy * cw + xx] - csrc[yy * cw + xx]) as i64;
+                                        let d =
+                                            full[yy * cw + xx] as i64 - csrc[yy * cw + xx] as i64;
                                         expected[by / 8 * uc + bx / 8] += d * d;
                                     }
                                 }

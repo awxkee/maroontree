@@ -72,9 +72,7 @@ fn proxy_candidate_rdoq(speed: Speed) -> bool {
 /// removes real work. `INFINITY` disables it.
 fn split4_breakout_k(speed: Speed) -> f32 {
     match speed {
-        Speed::Slow => crate::tuning::get().split4_breakout_slow,
-        // ExtraSlow keeps the breakout but only for decisively flat blocks.
-        Speed::ExtraSlow => 2.0 * crate::tuning::get().split4_breakout_slow,
+        Speed::Slow | Speed::ExtraSlow => crate::tuning::get().split4_breakout_slow,
         Speed::Medium | Speed::Fast => 1.0,
     }
 }
@@ -93,18 +91,14 @@ fn rect_dec_refine() -> bool {
 
 fn split_breakout_k(speed: Speed) -> f32 {
     match speed {
-        Speed::Slow => crate::tuning::get().split_breakout_slow,
-        Speed::ExtraSlow => 2.0 * crate::tuning::get().split_breakout_slow,
+        Speed::Slow | Speed::ExtraSlow => crate::tuning::get().split_breakout_slow,
         Speed::Medium | Speed::Fast => 1.0,
     }
 }
 
-/// Ranked palette candidates the proxy fully prices (capped at 3);
-/// ExtraSlow prices one more.
-fn palette_proxy_finalists(speed: Speed) -> usize {
-    let n = crate::tuning::get().palette_proxy_finalists;
-    let n = if speed == Speed::ExtraSlow { n + 1 } else { n };
-    n.min(3)
+/// Ranked palette candidates the proxy fully prices (capped at 3).
+fn palette_proxy_finalists() -> usize {
+    crate::tuning::get().palette_proxy_finalists.min(3)
 }
 
 fn proxy_mode_beam_len(speed: Speed, _dim: usize) -> usize {
@@ -274,7 +268,7 @@ impl<'a> LossyTile<'a> {
                 let plan: Vec<(usize, bool, Option<FixedList<i32, 8>>)> = match &ranked {
                     Some(r) => r
                         .iter()
-                        .take(palette_proxy_finalists(self.speed))
+                        .take(palette_proxy_finalists())
                         .map(|&(_, order, centers, top)| (order / 2 + 2, top, Some(centers)))
                         .collect(),
                     None => vec![(8, false, None), (4, false, None), (2, false, None)],

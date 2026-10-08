@@ -27,11 +27,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/// ExtraSlow narrows the early-exit window so more ambiguous 64x64 nodes get
-/// the full 32-level child search.
-fn b64_refinement_window(speed: Speed) -> f32 {
-    let w = crate::tuning::get().b64_refinement_window;
-    if speed == Speed::ExtraSlow { w * 0.9 } else { w }
+fn b64_refinement_window() -> f32 {
+    crate::tuning::get().b64_refinement_window
 }
 fn b64_split_refinement() -> f32 {
     crate::tuning::get().b64_split_refinement
@@ -1401,7 +1398,7 @@ impl<'a> LossyTile<'a> {
             return Part16::Split;
         }
 
-        if best_whole <= rd_split_upper * b64_refinement_window(self.speed) {
+        if best_whole <= rd_split_upper * b64_refinement_window() {
             if let Some(rd_ibc) = rd_ibc
                 && rd_ibc < rd_leaf.min(rd_split_upper)
             {

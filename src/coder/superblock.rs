@@ -192,6 +192,9 @@ impl<'a> LossyTile<'a> {
         budget: usize,
     ) -> FixedList<FilterIntraMode, 5> {
         debug_assert_eq!(N, w * h);
+        if budget == 0 {
+            return FixedList::new(FILTER_INTRA_MODES[0]);
+        }
         let mut ranked =
             FixedList::<(u64, usize, FilterIntraMode), 5>::new((0, 0, FILTER_INTRA_MODES[0]));
         for (order, mode) in FILTER_INTRA_MODES.into_iter().enumerate() {

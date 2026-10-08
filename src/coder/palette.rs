@@ -1029,8 +1029,7 @@ impl<'a> LossyTile<'a> {
     fn palette_refine_budget(&self) -> usize {
         let b = self.speed.palette_refine_budget();
         match self.speed {
-            Speed::ExtraSlow if self.screen_frame => 5,
-            Speed::Slow if self.screen_frame => 4,
+            Speed::Slow | Speed::ExtraSlow if self.screen_frame => 4,
             _ => b,
         }
     }
