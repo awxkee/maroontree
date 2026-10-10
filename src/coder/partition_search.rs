@@ -1273,7 +1273,7 @@ impl<'a> LossyTile<'a> {
             // --- CfL: predict chroma from this sub-block's reconstructed luma.
             // Allowed here (8x16 <= 32x32); at 4:4:4 chroma is full resolution
             // so chroma-from-luma is worth far more than a luma mode search.
-            let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let mut cfl_ccf = [[0i32; 128]; 2];
             let mut cfl_pred = [[0i32; 128]; 2];
             let mut cfl_a = [0i32; 2];
@@ -1807,7 +1807,7 @@ impl<'a> LossyTile<'a> {
         let mut cfl_alpha = [0i32; 2];
         let mut cfl_px = [[0i32; 32]; 2];
         if !self.mono {
-            let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let lrr_cfl = inv_luma(&lcf, &self.quant);
             let mut luma_rec = [0u16; 128];
             recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, maxval);
@@ -2050,7 +2050,7 @@ impl<'a> LossyTile<'a> {
             let mut cfl_alpha = [0i32; 2];
             let mut cfl_px = [[0i32; 64]; 2];
             if !self.mono {
-                let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+                let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
                 let lrr_cfl = inv16x8(&lcf, &self.quant);
                 let mut luma_rec = [0u16; 128];
                 recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, maxval);
@@ -2263,7 +2263,7 @@ impl<'a> LossyTile<'a> {
             // --- CfL: predict chroma from this sub-block's reconstructed luma.
             // Allowed here (16x8 <= 32x32); at 4:4:4 chroma is full resolution
             // so chroma-from-luma is worth far more than a luma mode search.
-            let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let mut cfl_ccf = [[0i32; 128]; 2];
             let mut cfl_pred = [[0i32; 128]; 2];
             let mut cfl_a = [0i32; 2];

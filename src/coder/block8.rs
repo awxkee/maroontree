@@ -1530,6 +1530,7 @@ impl<'a> LossyTile<'a> {
                 }
                 // joint signaling cost estimate (sign symbol + 1 magnitude per non-zero plane)
                 let sig = self.uv_mode_bits(best_mode, CFL_PRED, Some(cfl_a));
+                let mlam = self.emit_mlam_c(px, py, 8);
                 let dc_total = rd_cost_i64(
                     dc_sse[0] + dc_sse[1],
                     mlam,
@@ -1595,6 +1596,7 @@ impl<'a> LossyTile<'a> {
                 && ru.is_none()
             {
                 // DC reference cost (current `ccf8`).
+                let mlam = self.emit_mlam_c(px, py, 8);
                 let mut dc_total = 0f32;
                 let src_planes = [1, 2].map(|plane| self.src_blk(plane, px, py, 8, 8));
                 for ci in 0..2 {
@@ -2039,6 +2041,7 @@ impl<'a> LossyTile<'a> {
                 && ru.is_none()
             {
                 let src_planes = [1, 2].map(|plane| self.src_blk(plane, cx, cy, 4, 4));
+                let mlam = self.emit_mlam_c(px, py, 8);
                 let mut dc_total = 0f32;
                 for ci in 0..2 {
                     let plane = ci + 1;
@@ -2229,6 +2232,7 @@ impl<'a> LossyTile<'a> {
                 && ru.is_none()
             {
                 let src_planes = [1, 2].map(|plane| self.src_blk(plane, cx, py, 4, 8));
+                let mlam = self.emit_mlam_c(px, py, 8);
                 let mut dc_total = 0f32;
                 for ci in 0..2 {
                     let plane = ci + 1;

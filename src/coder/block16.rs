@@ -526,7 +526,6 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f32,
                 trellis_lambda(),
             );
-            let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
             let mut cfl_ccf = [self.sbuf_i256(), self.sbuf_i256()];
             let mut cfl_a = [0i32; 2];
             let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f32; 2]);
@@ -567,6 +566,7 @@ impl<'a> LossyTile<'a> {
                 *cpred16[ci] = *cpr;
             }
             let sig = self.uv_mode_bits(y_mode, CFL_PRED, Some(cfl_a));
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let dc_total = rd_cost_i64(
                 dc_sse[0] + dc_sse[1],
                 mlam,
@@ -1056,8 +1056,8 @@ impl<'a> LossyTile<'a> {
             self.rd.preserve_dc(&mut ccf_dc[ci][0], &resid[..]);
         }
         // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits, summed over U+V).
-        let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
         let mut rr_dc = [[0i32; 64]; 2];
+        let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
         let mut dc_total = 0f32;
         for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
             let plane = ci + 1;
@@ -1410,7 +1410,7 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f32,
             trellis_lambda(),
         );
-        let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+        let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
         let mut ccf = [[0i32; 128]; 2];
         let mut cpred = [0i32; 2];
         // Per-pixel chroma prediction (DC broadcast, or CfL dc+alpha*ac).
@@ -1526,6 +1526,7 @@ impl<'a> LossyTile<'a> {
                 cpred_px[ci] = cpr;
             }
             let sig = self.uv_mode_bits(y_mode, CFL_PRED, Some(cfl_a));
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let dc_total = rd_cost_i64(
                 dc_sse[0] + dc_sse[1],
                 mlam,
@@ -2113,6 +2114,7 @@ impl<'a> LossyTile<'a> {
                 // including the joint signaling cost (sign symbol + a magnitude
                 // per non-zero plane), mirroring the 8x8 4:4:4 path.
                 let sig = self.uv_mode_bits(best_mode, CFL_PRED, Some(cfl_a));
+                let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 8);
                 let dc_total = rd_cost_i64(
                     dc_sse[0] + dc_sse[1],
                     mlam,
