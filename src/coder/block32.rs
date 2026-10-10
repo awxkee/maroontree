@@ -2628,7 +2628,7 @@ impl<'a> LossyTile<'a> {
         let mut cfl_pred = [self.sbuf_i1024(), self.sbuf_i1024()];
         let mut cfl_a = [0i32; 2];
         let (mut dc_cost, mut cfl_cost) = ([0f32; 2], [0f32; 2]);
-        let mlam = self.emit_mlam(x8 * 8, y8 * 8, 32);
+        let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 32);
         // Pure-emit replay never evaluates CfL; the use_cfl decision below
         // replays from the record and the winner state installs after this.
         if self.speed.full_chroma_rdo() && ru.is_none() {
@@ -3207,7 +3207,7 @@ impl<'a> LossyTile<'a> {
         // decoder's derived chroma txtp. Offered at every quality; the Lagrangian
         // R-D decision below selects it only when it truly wins.
         // DC baseline R-D (libaom-style: SSE + mlam*coeff_bits over U+V).
-        let mlam = self.emit_mlam(x8 * 8, y8 * 8, 32);
+        let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 32);
         let mut rr_dc = [self.sbuf_i256(), self.sbuf_i256()];
         let mut dc_total = 0f32;
         for ci in 0..(if ru.is_some() { 0 } else { 2 }) {
@@ -3586,7 +3586,7 @@ impl<'a> LossyTile<'a> {
             self.cquant.ac_q() as f32,
             trellis_lambda(),
         );
-        let mlam = self.emit_mlam(x8 * 8, y8 * 8, 32);
+        let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 32);
         let mut ccf = [self.sbuf_i512(), self.sbuf_i512()];
         let mut cpred = [0i32; 2];
         let mut cpred_px = [self.sbuf_i512(), self.sbuf_i512()];

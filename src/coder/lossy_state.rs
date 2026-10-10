@@ -3850,6 +3850,30 @@ impl<'a> LossyTile<'a> {
 
     /// Emit-time masking weight: the same per-block activity scale as
     /// [`Self::perceptual_rd_scale`], raised to the emit strength.
+    /// Chroma-plane counterpart of [`Self::emit_mlam`]: the chroma mode lambda
+    /// (`mlam_c`, from the chroma quantizer step) with the same masking scale.
+    /// The chroma proxies always used `mlam_c`, but the final chroma decisions
+    /// (DC / directional / CfL at every size) priced rate with the LUMA lambda
+    /// although the chroma quantizer is 20-28 qindex finer at 4:2:0 — a ~2.4x
+    /// overcharge on chroma bits (found 2026-10-10: chroma PSNR-BD -1.5%,
+    /// SS2 -0.45% on 4 images, luma untouched, bytes unchanged).
+    /// Asymmetric on purpose: where chroma is coarser than luma (4:4:4 mid band,
+    /// uac +24) the step-squared law would RAISE the chroma lambda and measured
+    /// +0.07 / +0.08 (444 tuning / new444), so the chroma lambda is capped at the
+    /// luma one; 4:2:2 (delta 0) and 4:4:4 stay byte-identical, 4:2:0 gets the
+    /// correction (tuning -0.27, holdout -0.35 (5/5), synth -0.30).
+    /// On top of the step law, 4:2:0 wants its chroma decisions priced even
+    /// lower (SSIMULACRA2 weighs chroma at 1:8-1:16 scale, where smooth chroma
+    /// wins): x0.5 measured a further 420 tuning -0.11 / holdout -0.12 / synth
+    /// -0.11 over the plain law (cumulative vs the luma lambda -0.38 / -0.47 /
+    /// -0.41). 4:2:2 untested at 0.5 and kept at the plain law.
+    #[inline]
+    fn emit_mlam_c(&self, px: usize, py: usize, dim: usize) -> f32 {
+        let scale = if self.ss420 { 0.5 } else { 1.0 };
+        self.mlam().min(self.mlam_c()) * scale * self.emit_scale(px, py, dim)
+    }
+
+
     fn emit_mlam(&self, px: usize, py: usize, dim: usize) -> f32 {
         self.mlam() * self.emit_scale(px, py, dim)
     }
@@ -4014,3 +4038,4 @@ mod tests {
         );
     }
 }
+

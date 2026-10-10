@@ -4202,3 +4202,66 @@ mod adst_roundtrip_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tx_domain_scale_probe {
+    //! Ratio pixel-SSE / sum((target-level)*step)^2 per transform size: the
+    //! Parseval constant that puts a transform-domain distortion into pixel units.
+    use super::*;
+    use crate::idct::IdctDispatch;
+    use crate::quant::Quant;
+
+    #[test]
+    fn tx_domain_to_pixel_sse_ratio() {
+        let d = DctDispatch::scalar();
+        let id = IdctDispatch::scalar();
+        let mut rng = 777u32;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        for &qi in &[60u8, 104] {
+            let q = Quant::new(qi, 8);
+            let (dcq, acq) = (q.dc_q() as f64, q.ac_q() as f64);
+            macro_rules! probe {
+                ($name:expr, $n:expr, $w:expr, $fwd:ident, $inv:ident) => {{
+                    let (mut sp, mut st) = (0f64, 0f64);
+                    for _ in 0..200 {
+                        let mut r = [0i32; $n];
+                        for v in r.iter_mut() {
+                            *v = (next() % 161) as i32 - 80;
+                        }
+                        let (cf, tf) = d.$fwd(&r, &q);
+                        let rec = id.$inv(&cf, &q);
+                        sp += r
+                            .iter()
+                            .zip(rec.iter())
+                            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                            .sum::<f64>();
+                        st += cf
+                            .iter()
+                            .zip(tf.iter())
+                            .enumerate()
+                            .map(|(i, (&c, &t))| {
+                                let step = if i == 0 { dcq } else { acq };
+                                ((t as f64 - c as f64) * step).powi(2)
+                            })
+                            .sum::<f64>();
+                    }
+                    let ratio = sp / st;
+                    assert!(
+                        (0.0150..0.0170).contains(&ratio),
+                        "{}: pixel_sse / tx_err = {ratio:.4}, expected ~1/64",
+                        $name
+                    );
+                }};
+            }
+            probe!("4x4", 16, 4, dct4x4_t, idct_dequant_4x4);
+            probe!("8x8", 64, 8, dct8x8_t, idct_dequant_8x8);
+            probe!("16x16", 256, 16, dct16x16_t, idct_dequant_16x16);
+            probe!("32x32", 1024, 32, dct32x32_t, idct_dequant_32x32);
+        }
+    }
+}
