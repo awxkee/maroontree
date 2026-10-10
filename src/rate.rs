@@ -102,6 +102,9 @@ pub(crate) struct RateCtx<'a> {
     /// Luma only: the per-intra-mode txtp CDF and the chosen type. Chroma codes
     /// no transform-type symbol, so it passes `None`.
     pub(crate) txtp: Option<(&'a [u16], usize)>,
+    /// Adaptive all-zero pricing (`LossyTile::skip_bits`): `(cost of all_zero=1,
+    /// cost of all_zero=0)` in bits, replacing the frozen-snapshot `txb_skip` CDF.
+    pub(crate) skip_bits: Option<(f32, f32)>,
 }
 
 /// Scratch `levels` plane, reused across calls (this runs in every R-D
@@ -150,7 +153,10 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
 
     let Some(eob) = scan.iter().rposition(|&rc| cf[rc as usize] != 0) else {
         // All-zero: the block costs exactly one `all_zero = 1` symbol.
-        return cdf_cost_with_table(skip_cdf, 1, cost_table);
+        return match c.skip_bits {
+            Some((one, _)) => one,
+            None => cdf_cost_with_table(skip_cdf, 1, cost_table),
+        };
     };
 
     let base_tok = &c.cdfs.base_tok[cls][pl];
@@ -159,7 +165,10 @@ pub(crate) fn real_block_bits_bounded(cf: &[i32], scan: &[u32], c: &RateCtx, bou
     let eob_hi = &c.cdfs.eob_hi[cls][pl];
     let dc_sign = &c.cdfs.dc_sign[pl][c.dcs_ctx];
 
-    let mut bits = cdf_cost_with_table(skip_cdf, 0, cost_table);
+    let mut bits = match c.skip_bits {
+        Some((_, zero)) => zero,
+        None => cdf_cost_with_table(skip_cdf, 0, cost_table),
+    };
     if let Some((txtp_cdf, txtp)) = c.txtp {
         bits += cdf_cost_with_table(txtp_cdf, txtp, cost_table);
     }
@@ -301,6 +310,7 @@ mod tests {
             skip_ctx: 0,
             dcs_ctx: 0,
             txtp: None,
+            skip_bits: None,
         }
     }
 
@@ -381,6 +391,7 @@ mod tests {
             skip_ctx: 7,
             dcs_ctx: 0,
             txtp: None,
+            skip_bits: None,
         };
         let ar = real_block_bits(&a, &SCAN_4X8, &mk(4, 8));
         let br = real_block_bits(&b, &SCAN_8X4, &mk(8, 4));

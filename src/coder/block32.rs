@@ -1026,15 +1026,7 @@ impl<'a> LossyTile<'a> {
                     + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
                 if rl.is_some()
-                    || raw_sse_guard_choice(
-                        "filter32",
-                        RawSseGuard::FilterIntra,
-                        best_dct_sse,
-                        sse,
-                        best_eff,
-                        cost,
-                        sse <= best_dct_sse && cost < best_eff,
-                    )
+                    || (sse <= best_dct_sse && cost < best_eff)
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;
@@ -1151,35 +1143,16 @@ impl<'a> LossyTile<'a> {
             && self.banding_risk(px, py, 32)
         {
             let none_sse = sse_recon::<1024, 32>(&self.rd, &lpred, &self.idct.idct_dequant_32x32(&lcf, &self.quant), self.src_blk(0, px, py, 32, 32), self.bd);
-            let none_bits = self.luma_bits(&lcf[..], &SCAN_32X32, 32, px, py, best_mode, 0);
-            let (cf4, sse_s, bits_s) =
+            let (cf4, sse_s, _bits_s) =
                 self.split32_luma_try(px, py, best_mode, best_delta, have_tr, have_bl, lam);
             // Acceptance: the split must genuinely improve SSE. block16 uses a
             // permissive +25% tolerance at 16x16, but four TX_16X16 cost far more
             // syntax than four TX_8X8 do, so copying that tolerance here lets in
             // bad splits — measured +6.7% BD-rate on detailed content. Requiring
             // a real improvement keeps the banding win and removes the loss.
-            let base_rd = rd_cost_i64(
-                none_sse,
-                mlam,
-                none_bits + self.tx_depth_bits(px, py, 32, 32, 0),
-            );
-            let candidate_rd = rd_cost_i64(
-                sse_s,
-                mlam,
-                bits_s + self.tx_depth_bits(px, py, 32, 32, 1),
-            );
             let guarded_take =
                 (sse_s as i128) * 1024 <= (none_sse as i128) * (1024 - SPLIT32_SSE_MARGIN as i128);
-            if raw_sse_guard_choice(
-                "split-tx32",
-                RawSseGuard::TxSplit,
-                none_sse,
-                sse_s,
-                base_rd,
-                candidate_rd,
-                guarded_take,
-            ) {
+            if guarded_take {
                 tx_split = true;
                 *lcf = cf4;
             }

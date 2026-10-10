@@ -689,11 +689,7 @@ impl<'a> LossyTile<'a> {
         best
             + rate_cost(
                 mlam,
-                match crate::tuning::get().block_skip_price {
-                    1 => self.block_skip_bits(px, py, true),
-                    2 => 0.0,
-                    _ => self.block_skip_bits(px, py, false),
-                },
+                self.block_skip_bits(px, py, false),
             )
     }
 
@@ -3338,15 +3334,7 @@ impl<'a> LossyTile<'a> {
                     + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
                 if rl.is_some()
-                    || raw_sse_guard_choice(
-                        "filter16",
-                        RawSseGuard::FilterIntra,
-                        best_dct_sse,
-                        sse,
-                        best_eff,
-                        cost,
-                        sse <= best_dct_sse && cost < best_eff,
-                    )
+                    || (sse <= best_dct_sse && cost < best_eff)
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;
@@ -3580,15 +3568,7 @@ impl<'a> LossyTile<'a> {
             );
             let candidate_rd = rd_cost_i64(asse, mlam, abits);
             if rl.is_some()
-                || raw_sse_guard_choice(
-                    "adst16",
-                    RawSseGuard::TxType,
-                    best_dct_sse,
-                    asse,
-                    base_rd,
-                    candidate_rd,
-                    asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd,
-                )
+                || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
             {
                 *lcf = acf;
                 txtp16 = 1;
@@ -3671,15 +3651,7 @@ impl<'a> LossyTile<'a> {
                 let base_rd = rd_cost_i64(best_txtp16_sse, mlam, best_txtp16_bits);
                 let candidate_rd = rd_cost_i64(asse, mlam, abits);
                 if rl.is_some()
-                    || raw_sse_guard_choice(
-                        "asym-adst16",
-                        RawSseGuard::TxType,
-                        best_txtp16_sse,
-                        asse,
-                        base_rd,
-                        candidate_rd,
-                        asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd,
-                    )
+                    || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
                 {
                     *lcf = acf;
                     txtp16 = if inv_dctadst { 3 } else { 2 };
@@ -3747,15 +3719,7 @@ impl<'a> LossyTile<'a> {
             };
             let base_rd = rd_cost_i64(cur_sse, mlam, cur_bits);
             let candidate_rd = rd_cost_i64(isse, mlam, ibits);
-            if raw_sse_guard_choice(
-                "idtx16",
-                RawSseGuard::TxType,
-                cur_sse,
-                isse,
-                base_rd,
-                candidate_rd,
-                isse <= cur_sse + (cur_sse >> 5) && candidate_rd < base_rd,
-            ) {
+            if isse <= cur_sse + (cur_sse >> 5) && candidate_rd < base_rd {
                 *lcf = icf;
                 txtp16 = 5;
             }
@@ -3804,16 +3768,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 candidate_rd < base_rd
             };
-            let take = raw_sse_guard_choice(
-                "split-tx16",
-                RawSseGuard::TxSplit,
-                none_sse,
-                sse_s,
-                base_rd,
-                candidate_rd,
-                guarded_take,
-            );
-            if take {
+            if guarded_take {
                 txtp16 = 4;
                 s8_txtps = split_txtps;
                 *lcf = cf4;

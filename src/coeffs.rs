@@ -124,12 +124,12 @@ pub(crate) fn encode_tx8_coeffs_1d(
     let eob = match (0..64).rev().find(|&i| cf[pos_rc(i)] != 0) {
         Some(e) => e,
         None => {
-            enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]);
+            cdfs.encode_skip(enc, 1, skip_ctx, 1);
             return 0x40;
         }
     };
     let cul: u32 = (0..=eob).map(|i| cf[pos_rc(i)].unsigned_abs()).sum();
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]);
+    cdfs.encode_skip(enc, 1, skip_ctx, 0);
     enc.encode_symbol(
         if vertical { 2 } else { 3 }, // V_DCT = 2, H_DCT = 3 (7-type intra set)
         &mut cdfs.txtp[y_mode],
@@ -278,12 +278,12 @@ pub(crate) fn encode_tx4_coeffs_1d(
     let eob = match (0..16).rev().find(|&i| cf[pos_rc(i)] != 0) {
         Some(e) => e,
         None => {
-            enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
+            cdfs.encode_skip(enc, 0, skip_ctx, 1);
             return 0x40;
         }
     };
     let cul: u32 = (0..=eob).map(|i| cf[pos_rc(i)].unsigned_abs()).sum();
-    enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
+    cdfs.encode_skip(enc, 0, skip_ctx, 0);
     enc.encode_symbol(
         if vertical { 2 } else { 3 }, // V_DCT = 2, H_DCT = 3 (7-type intra set)
         &mut cdfs.txtp4[y_mode],
@@ -450,12 +450,12 @@ pub(crate) fn encode_rect_coeffs_1d(
     let eob = match (0..128).rev().find(|&i| cf[pos_rc(i)] != 0) {
         Some(e) => e,
         None => {
-            enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]);
+            cdfs.encode_skip(enc, 2, skip_ctx, 1);
             return 0x40;
         }
     };
     let cul: u32 = (0..=eob).map(|i| cf[pos_rc(i)].unsigned_abs()).sum();
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]);
+    cdfs.encode_skip(enc, 2, skip_ctx, 0);
     enc.encode_symbol(
         if vertical { 2 } else { 3 }, // V_DCT = 2, H_DCT = 3 (7-type intra set)
         &mut cdfs.txtp[y_mode],
@@ -592,10 +592,10 @@ pub(crate) fn encode_tx8_coeffs_adapt(
 ) -> u8 {
     let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X8) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]); // luma: 1=DCT_DCT, 4=ADST_ADST
     }
@@ -716,10 +716,10 @@ pub(crate) fn encode_tx16_coeffs_adapt(
 ) -> u8 {
     let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 2, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 2, skip_ctx, 0); // all_zero = 0
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp16[y_mode]); // luma TX_16X16: 1=DCT_DCT, 2=ADST_ADST
     }
@@ -868,10 +868,10 @@ fn encode_tx32_coeffs_cls(
 ) -> u8 {
     let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X32) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[cls][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, cls, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[cls][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, cls, skip_ctx, 0); // all_zero = 0
     // NO txtp symbol for intra TX_32X32 (DCT_DCT implied).
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -985,10 +985,10 @@ pub(crate) fn encode_4x8_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X8) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     // chroma infers txtp (no symbol)
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1090,10 +1090,10 @@ pub(crate) fn encode_4x8_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X8) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]);
     // chroma infers txtp (no symbol)
 
@@ -1194,10 +1194,10 @@ pub(crate) fn encode_8x4_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     // chroma infers txtp (no symbol)
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1299,10 +1299,10 @@ pub(crate) fn encode_8x4_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]);
     // chroma infers txtp (no symbol)
 
@@ -1408,10 +1408,10 @@ pub(crate) fn encode_16x4_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]); // min-dim-4 luma set
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1511,10 +1511,10 @@ pub(crate) fn encode_16x4_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     // chroma infers txtp (no symbol)
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1616,10 +1616,10 @@ pub(crate) fn encode_4x16_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]); // min-dim-4 luma set
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1719,10 +1719,10 @@ pub(crate) fn encode_4x16_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 1, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[1][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 1, skip_ctx, 0); // all_zero = 0
     // chroma infers txtp (no symbol)
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1829,10 +1829,10 @@ pub(crate) fn encode_16x8_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X8) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 2, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 2, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]); // luma signals txtp
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -1931,10 +1931,10 @@ pub(crate) fn encode_16x8_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X8) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]);
+        cdfs.encode_skip(enc, 2, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]);
+    cdfs.encode_skip(enc, 2, skip_ctx, 0);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2034,10 +2034,10 @@ pub(crate) fn encode_8x16_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 2, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 2, skip_ctx, 0); // all_zero = 0
     // chroma infers txtp (no symbol)
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -2139,10 +2139,10 @@ pub(crate) fn encode_8x16_luma_coeffs(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_8X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 1
+        cdfs.encode_skip(enc, 2, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[2][skip_ctx]); // all_zero = 0
+    cdfs.encode_skip(enc, 2, skip_ctx, 0); // all_zero = 0
     enc.encode_symbol(txtp, &mut cdfs.txtp[y_mode]);
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -2241,10 +2241,10 @@ pub(crate) fn encode_4x4_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
+        cdfs.encode_skip(enc, 0, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
+    cdfs.encode_skip(enc, 0, skip_ctx, 0);
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
@@ -2347,10 +2347,10 @@ pub(crate) fn encode_tx4_luma_coeffs_adapt(
     txtp: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_4X4) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[0][skip_ctx]);
+        cdfs.encode_skip(enc, 0, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[0][skip_ctx]);
+    cdfs.encode_skip(enc, 0, skip_ctx, 0);
     enc.encode_symbol(txtp, &mut cdfs.txtp4[y_mode]); // luma TX_4X4: 0=IDTX,1=DCT_DCT,4=ADST_ADST
 
     let dc_sign_bits: u8 = if cf[0] == 0 {
@@ -2454,10 +2454,10 @@ pub(crate) fn encode_16x32_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X32) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
+        cdfs.encode_skip(enc, 3, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
+    cdfs.encode_skip(enc, 3, skip_ctx, 0);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2553,10 +2553,10 @@ pub(crate) fn encode_16x32_luma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X32) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
+        cdfs.encode_skip(enc, 3, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
+    cdfs.encode_skip(enc, 3, skip_ctx, 0);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2652,10 +2652,10 @@ pub(crate) fn encode_32x16_luma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
+        cdfs.encode_skip(enc, 3, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
+    cdfs.encode_skip(enc, 3, skip_ctx, 0);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -2751,10 +2751,10 @@ pub(crate) fn encode_32x16_chroma_coeffs(
     dcs_ctx: usize,
 ) -> u8 {
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X16) else {
-        enc.encode_symbol(1, &mut cdfs.txb_skip[3][skip_ctx]);
+        cdfs.encode_skip(enc, 3, skip_ctx, 1);
         return 0x40;
     };
-    enc.encode_symbol(0, &mut cdfs.txb_skip[3][skip_ctx]);
+    cdfs.encode_skip(enc, 3, skip_ctx, 0);
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {

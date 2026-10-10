@@ -1774,24 +1774,14 @@ impl<'a> LossyTile<'a> {
         // MEASURED QUALITY-NEUTRAL (Slow, 20 crops x 6 q): 444 +0.0016,
         // 420 -0.0022, spread -0.12..+0.15. Expected for a correctness fix that
         // removes stale-cache reuse — it makes decisions right, not better on
-        // average. The legacy arm is kept only to reproduce that measurement.
-        if crate::tuning::get().split4_legacy_record {
-            let nc4 = self.w / 4;
-            for uy in 0..2 {
-                for ux in 0..2 {
-                    self.blk4[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = 1;
-                    self.blk4h[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = 1;
-                    self.blk4v[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = true;
-                    self.blk4t[(y8 * 2 + uy) * nc4 + (x8 * 2 + ux)] = true;
-                }
-            }
-        } else {
-            for uy in 0..2 {
-                for ux in 0..2 {
-                    self.record_blk_rect4(x8 * 2 + ux, y8 * 2 + uy, 1, 1);
-                }
+        // average.
+        for uy in 0..2 {
+            for ux in 0..2 {
+                self.record_blk_rect4(x8 * 2 + ux, y8 * 2 + uy, 1, 1);
             }
         }
+
+
         // Chroma layout differs by subsampling:
         //   4:2:0 -> the four 4x4 luma units share ONE 4x4 chroma block, coded on
         //            the bottom-right sub-block (origin px/2, py/2).
@@ -2009,15 +1999,7 @@ impl<'a> LossyTile<'a> {
                         ),
                     };
                     let candidate_rd = rd_cost_i64(asse, mlam, abits);
-                    if raw_sse_guard_choice(
-                        "tx4",
-                        RawSseGuard::TxType,
-                        best_txtp_sse,
-                        asse,
-                        base_rd,
-                        candidate_rd,
-                        asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd,
-                    ) {
+                    if asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd {
                         lcf = acf;
                         tx4 = sel;
                         best_txtp_sse = asse;

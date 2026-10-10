@@ -343,15 +343,13 @@ impl Quant {
         Self::new_with_qm(base_q_idx, bd, QM_FLAT_LEVEL)
     }
 
-    pub(crate) fn luma_dc_delta_probe(base_q_idx: u8) -> i32 {
-        let _ = base_q_idx;
+    pub(crate) const fn luma_dc_delta() -> i32 {
         -8
     }
 
     pub(crate) fn new_with_qm(base_q_idx: u8, bd: u8, qm_level: u8) -> Self {
         let (rmin, rmax, cmin, cmax, cf_max) = itx_clips(bd);
-        let dc_idx =
-            (base_q_idx as i32 + Self::luma_dc_delta_probe(base_q_idx)).clamp(0, 255) as u8;
+        let dc_idx = (base_q_idx as i32 + Self::luma_dc_delta()).clamp(0, 255) as u8;
         let dc = dc_q(dc_idx, bd) as i32;
         let ac = ac_q(base_q_idx, bd) as i32;
         Quant {

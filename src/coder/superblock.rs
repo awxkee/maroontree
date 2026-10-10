@@ -493,10 +493,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let split_eligible = !t.mono;
-                let want_split = split_eligible
-                    && (FORCE_SPLIT4.load(std::sync::atomic::Ordering::Relaxed)
-                        || (SPLIT4_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-                            && !t.prefer_8x8_none(x8, y8)));
+                let want_split = split_eligible && !t.prefer_8x8_none(x8, y8);
                 if want_split {
                     Part16::Split
                 } else {
@@ -585,18 +582,7 @@ impl<'a> LossyTile<'a> {
             let have_h = (x8 + 1) * 8 < self.w;
             let have_v = (y8 + 1) * 8 < self.h;
             if have_h && have_v {
-                // FORCE_HORZ (test) overrides the RD decision for 4:4:4.
-                let choice = self.part_decision(|t| {
-                    let forced_horz = !t.ss420
-                        && !t.ss422
-                        && !t.mono
-                        && FORCE_HORZ.load(std::sync::atomic::Ordering::Relaxed);
-                    if forced_horz {
-                        Part16::Horz
-                    } else {
-                        t.partition_choice_16(x8, y8, thr, lhb)
-                    }
-                });
+                let choice = self.part_decision(|t| t.partition_choice_16(x8, y8, thr, lhb));
                 match choice {
                     Part16::Horz => {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
@@ -734,7 +720,6 @@ impl<'a> LossyTile<'a> {
         // is in-frame. Compared against SPLIT by real R-D in `choose_64`.
         if sz8 == 8
             && !self.mono
-            && BLOCK64_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
             && (x8 + 8) * 8 <= self.w
             && (y8 + 8) * 8 <= self.h
         {

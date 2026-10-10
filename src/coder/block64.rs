@@ -1070,7 +1070,6 @@ impl<'a> LossyTile<'a> {
                     + crate::partition_rd::rd_cost(dist, mlam, bits)
                     + tx64_depth_rate)
                     * crate::tuning::get().tx64_bias;
-                let t64 = if crate::tuning::get().tx64_force { f32::MIN } else { t64 };
                 if t64 < best.2 {
                     best = (mode, delta, t64, true);
                 }
@@ -1311,12 +1310,6 @@ impl<'a> LossyTile<'a> {
             _ => return Part16::Split,
         }
         let (px, py) = (x8 * 8, y8 * 8);
-        // TEST hook: force the rect64 emitters wherever legal.
-        match crate::tuning::get().rect64_force {
-            1 if self.rect64_allowed(false) => return Part16::Horz,
-            2 if self.rect64_allowed(true) => return Part16::Vert,
-            _ => {}
-        }
         let prdo = self.perceptual_rd_scale(px, py, 64);
         if self.prefer_split64_from_source(px, py, prdo) {
             return Part16::Split;

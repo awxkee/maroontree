@@ -437,7 +437,7 @@ fn frame_header_lossy_impl(
     // quantization_params()
     w.f(base_q_idx as u32, 8); // base_q_idx (non-zero -> lossy)
     {
-        let ydc = crate::quant::Quant::luma_dc_delta_probe(base_q_idx);
+        let ydc = crate::quant::Quant::luma_dc_delta();
         if ydc != 0 {
             w.flag(true);
             w.f((ydc & 0x7f) as u32, 7);

@@ -228,6 +228,36 @@ const fn quad4_enabled(ss420: bool) -> bool {
 }
 
 impl<'a> LossyTile<'a> {
+    pub(crate) fn adaptive_skip_price_enabled(&self) -> bool {
+        self.speed.at_least_slow()
+    }
+
+    /// Rebuild the all-zero price table from the dependency-cone counts `cone`,
+    /// blended with the frame-initial snapshot `prior` with 24 pseudo-observations.
+    pub(crate) fn set_skip_price(&mut self, cone: &SkipStats, prior: &Cdfs) {
+        const PRIOR_COUNT: f32 = 24.0;
+        let mut tbl = Box::new([[[0f32; 2]; 13]; 5]);
+        for cls in 0..5 {
+            for ctx in 0..13 {
+                let cdf = &prior.txb_skip[cls][ctx];
+                let one_bits = cdf_cost(cdf, 1);
+                let p_def = (-one_bits).exp2().clamp(1.0 / 4096.0, 1.0 - 1.0 / 4096.0);
+                let n0 = cone[cls][ctx][0] as f32;
+                let n1 = cone[cls][ctx][1] as f32;
+                let p1 = (n1 + PRIOR_COUNT * p_def) / (n0 + n1 + PRIOR_COUNT);
+                let p1 = p1.clamp(1.0 / 4096.0, 1.0 - 1.0 / 4096.0);
+                tbl[cls][ctx][1] = -dirty_log2f(p1);
+                tbl[cls][ctx][0] = -dirty_log2f(1.0 - p1);
+            }
+        }
+        self.skip_price = Some(tbl);
+    }
+
+    #[inline]
+    fn skip_bits(&self, cls: usize, ctx: usize) -> Option<(f32, f32)> {
+        self.skip_price.as_ref().map(|t| (t[cls][ctx][1], t[cls][ctx][0]))
+    }
+
     /// Frozen decision CDFs keep RDO independent of superblock coding order.
     #[inline]
     fn dcdf(&self) -> &Cdfs {
@@ -356,6 +386,7 @@ impl<'a> LossyTile<'a> {
                 c.into()
             },
             decision_cdf_warmed: false,
+            skip_price: None,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -448,6 +479,7 @@ impl<'a> LossyTile<'a> {
                 c.into()
             },
             decision_cdf_warmed: false,
+            skip_price: None,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -549,6 +581,7 @@ impl<'a> LossyTile<'a> {
                 c.into()
             },
             decision_cdf_warmed: false,
+            skip_price: None,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -650,6 +683,7 @@ impl<'a> LossyTile<'a> {
                 c.into()
             },
             decision_cdf_warmed: false,
+            skip_price: None,
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
@@ -746,6 +780,7 @@ impl<'a> LossyTile<'a> {
             skip_ctx,
             dcs_ctx,
             txtp: txtp_cdf.map(|cd| (cd, txtp)),
+            skip_bits: self.skip_bits(cls, skip_ctx),
         };
         // Bound slack: the shipped abort is EXACT (bits only accumulate, so
         // aborting past `bound` cannot change a decision). Scaling below 1.0
@@ -782,6 +817,7 @@ impl<'a> LossyTile<'a> {
             skip_ctx: 0,
             dcs_ctx: self.dc_sign_ctx_span(0, px / 4, py / 4, 16, 16),
             txtp: None,
+            skip_bits: self.skip_bits(4, 0),
         };
         crate::rate::real_block_bits_bounded(cf, &SCAN_32X32, &ctx, f32::INFINITY)
     }
@@ -851,6 +887,7 @@ impl<'a> LossyTile<'a> {
             skip_ctx: 0,
             dcs_ctx: self.dc_sign_ctx_span(0, px / 4, py / 4, w / 4, h / 4),
             txtp: txtp_cdf.map(|cd| (cd, txtp)),
+            skip_bits: self.skip_bits(cls, 0),
         };
         crate::rate::real_block_bits(cf, scan, &ctx)
     }
@@ -966,6 +1003,7 @@ impl<'a> LossyTile<'a> {
             skip_ctx: 7 + ca + cl,
             dcs_ctx: self.dc_sign_ctx_span(plane, bx4, by4, nw, nh),
             txtp: None,
+            skip_bits: self.skip_bits(cls, 7 + ca + cl),
         };
         crate::rate::real_block_bits(cf, scan, &ctx)
     }
@@ -2936,8 +2974,7 @@ impl<'a> LossyTile<'a> {
         let horz_on = full_part_rdo
             && (self.ss422
                 || (self.ss420 && rect_tier)
-                || (ss444 && tune.rect16_horz_444 && rect_tier))
-            && HORZ_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+                || (ss444 && tune.rect16_horz_444 && rect_tier));
 
         // Anchor the perceptual R-D scale ONCE at the parent 16x16 region and use
         // it for every candidate so all costs share one lambda axis.
@@ -3047,7 +3084,7 @@ impl<'a> LossyTile<'a> {
                 }
                 _ => false,
             };
-        let split4_ok = !self.mono && SPLIT4_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let split4_ok = !self.mono;
         let best8 = |bx: usize, by: usize| -> f32 {
             let (cthr, clhb) = Self::child_edge_flags(bx - px, by - py, thr, lhb);
             let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);
@@ -3115,8 +3152,7 @@ impl<'a> LossyTile<'a> {
         // block size) — that gate is conformance, never a tuning knob.
         let vert_on = RECT16_VERT_ENABLED
             && full_part_rdo
-            && ((self.ss420 && rect_tier) || (ss444 && tune.rect16_vert_444 && rect_tier))
-            && VERT_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+            && ((self.ss420 && rect_tier) || (ss444 && tune.rect16_vert_444 && rect_tier));
         let quad4_on = quad4_enabled(self.ss420) && full_part_rdo;
 
         // Source-domain partition staging: rank every legal non-square family
@@ -3590,6 +3626,7 @@ impl<'a> LossyTile<'a> {
             (base_q + delta).clamp(1, 255)
         }
     }
+
 
     /// Serial reference for the per-SB AQ state advance: compute the target,
     /// quantize it against the running `cur_qidx` accumulator, and retarget the
