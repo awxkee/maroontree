@@ -23,8 +23,6 @@ hashbrown = "0.17"
 default = ["neon", "avx"]
 neon = []
 avx = []
-# Offline parameter study only (see src/tuning.rs + parameters_fit/)
-tuning = []
 
 [profile.release]
 debug = "line-tables-only"

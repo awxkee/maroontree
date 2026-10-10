@@ -1002,15 +1002,7 @@ impl<'a> LossyTile<'a> {
                         + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                     let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
                     if rl.is_some()
-                        || raw_sse_guard_choice(
-                            "filter8",
-                            RawSseGuard::FilterIntra,
-                            best_dct_sse,
-                            sse,
-                            best_eff,
-                            cost,
-                            sse <= best_dct_sse && cost < best_eff,
-                        )
+                        || (sse <= best_dct_sse && cost < best_eff)
                     {
                         best_eff = cost;
                         best_mode = DC_PRED;
@@ -1163,15 +1155,7 @@ impl<'a> LossyTile<'a> {
             );
             let candidate_rd = rd_cost_i64(asse, mlam, abits);
             if rl.is_some()
-                || raw_sse_guard_choice(
-                    "adst8",
-                    RawSseGuard::TxType,
-                    best_dct_sse,
-                    asse,
-                    base_rd,
-                    candidate_rd,
-                    asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd,
-                )
+                || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
             {
                 lcf = acf;
                 best_is_adst = true;
@@ -1238,15 +1222,7 @@ impl<'a> LossyTile<'a> {
                 );
                 let candidate_rd = rd_cost_i64(asse, mlam, abits);
                 if rl.is_some()
-                    || raw_sse_guard_choice(
-                        "asym-adst8",
-                        RawSseGuard::TxType,
-                        best_txtp_sse,
-                        asse,
-                        base_rd,
-                        candidate_rd,
-                        asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd,
-                    )
+                    || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
                 {
                     lcf = acf;
                     best_is_adst = false;
@@ -1274,15 +1250,7 @@ impl<'a> LossyTile<'a> {
             let base_rd = rd_cost_i64(best_txtp_sse, mlam, best_txtp_bits);
             let candidate_rd = rd_cost_i64(isse, mlam, ibits);
             if rl.is_some()
-                || raw_sse_guard_choice(
-                    "idtx8",
-                    RawSseGuard::TxType,
-                    best_txtp_sse,
-                    isse,
-                    base_rd,
-                    candidate_rd,
-                    isse <= best_txtp_sse + (best_txtp_sse >> 5) && candidate_rd < base_rd,
-                )
+                || (isse <= best_txtp_sse + (best_txtp_sse >> 5) && candidate_rd < base_rd)
             {
                 lcf = icf;
                 best_is_adst = false;
@@ -1314,18 +1282,10 @@ impl<'a> LossyTile<'a> {
                 let vbits = self.luma_bits_1d_8x8(&vcf, vertical, px, py, best_mode);
                 let base_rd = rd_cost_i64(best_txtp_sse, mlam, best_txtp_bits);
                 let candidate_rd = rd_cost_i64(vsse, mlam, vbits);
-                if raw_sse_guard_choice(
-                    if vertical { "vdct8" } else { "hdct8" },
-                    RawSseGuard::TxType,
-                    best_txtp_sse,
-                    vsse,
-                    base_rd,
-                    candidate_rd,
-                    // Strict SSE-non-worsening vs the running winner: the +3%
-                    // tolerance used by the 2-D refinements measurably trades
-                    // SSIMU2 for rate on screen content when a 1-D class wins.
-                    vsse <= best_txtp_sse && candidate_rd < base_rd,
-                ) {
+                // Strict SSE-non-worsening vs the running winner: the +3%
+                // tolerance used by the 2-D refinements measurably trades
+                // SSIMU2 for rate on screen content when a 1-D class wins.
+                if vsse <= best_txtp_sse && candidate_rd < base_rd {
                     lcf = vcf;
                     best_is_adst = false;
                     best_is_idtx = false;

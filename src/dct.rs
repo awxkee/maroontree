@@ -4117,3 +4117,88 @@ mod tx64_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod adst_roundtrip_tests {
+    use super::*;
+    use crate::idct::{
+        IdctDispatch, iadst_dequant_8x8, iadstdct_dequant_8x8, idctadst_dequant_8x8,
+    };
+    use crate::quant::Quant;
+
+    fn energy(r: &[i32]) -> f64 {
+        r.iter().map(|&a| (a as f64) * (a as f64)).sum()
+    }
+    fn sse(a: &[i32], b: &[i32]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| ((x - y) as f64).powi(2))
+            .sum()
+    }
+    fn max_round_gap(cf: &[i32], tf: &[f32]) -> f32 {
+        cf.iter()
+            .zip(tf)
+            .map(|(&c, &t)| (c as f32 - t).abs())
+            .fold(0f32, f32::max)
+    }
+
+    #[test]
+    fn adst8x8_kernels_are_consistent() {
+        let sc = DctDispatch::scalar();
+        let sel = DctDispatch::selected();
+        let isc = IdctDispatch::scalar();
+        let mut rng = 12345u32;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let mut pats: Vec<[i32; 64]> = Vec::new();
+        let mut ramp0 = [0i32; 64];
+        let mut vramp0 = [0i32; 64];
+        let mut rnd = [0i32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                ramp0[y * 8 + x] = ((x + y) as i32) * 6;
+                vramp0[y * 8 + x] = (y as i32) * 10;
+                rnd[y * 8 + x] = (next() % 121) as i32 - 60;
+            }
+        }
+        pats.push(ramp0);
+        pats.push(vramp0);
+        pats.push(rnd);
+        for &qi in &[4u8, 40, 104] {
+            let q = Quant::new(qi, 8);
+            for r in &pats {
+                let en = energy(r);
+                let (cd, td) = sc.dct8x8_t(r, &q);
+                let (ca, ta) = sc.adst8x8_t(r, &q);
+                let (cad, tad) = sc.adstdct8x8_t(r, &q);
+                let (cda, tda) = sc.dctadst8x8_t(r, &q);
+                for (c, t) in [(&cd, &td), (&ca, &ta), (&cad, &tad), (&cda, &tda)] {
+                    assert!(
+                        max_round_gap(c, t) <= 0.5 + 1e-3,
+                        "levels are not the rounded targets"
+                    );
+                }
+                assert_eq!(sel.dct8x8_t(r, &q).0, cd, "SIMD dct8x8 != scalar");
+                assert_eq!(sel.adst8x8_t(r, &q).0, ca, "SIMD adst8x8 != scalar");
+                assert_eq!(sel.adstdct8x8_t(r, &q).0, cad, "SIMD adstdct8x8 != scalar");
+                assert_eq!(sel.dctadst8x8_t(r, &q).0, cda, "SIMD dctadst8x8 != scalar");
+                if qi == 4 {
+                    let rd = isc.idct_dequant_8x8(&cd, &q);
+                    let ra = iadst_dequant_8x8(&ca, &q);
+                    let rad = iadstdct_dequant_8x8(&cad, &q);
+                    let rda = idctadst_dequant_8x8(&cda, &q);
+                    for rec in [&rd, &ra, &rad, &rda] {
+                        assert!(
+                            sse(r, rec) / en < 2e-3,
+                            "forward/inverse pair does not round-trip"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

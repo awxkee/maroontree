@@ -42,10 +42,6 @@ use crate::par::Pool;
 use crate::quant::QmLevels;
 use hashbrown::HashMap;
 #[cfg(test)]
-pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
 pub(crate) static LOSSY_PALETTE_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -54,51 +50,6 @@ pub(crate) static LOSSY_PALETTE_RESIDUAL_EMITTED: std::sync::atomic::AtomicUsize
 #[cfg(test)]
 pub(crate) static LOSSY_INTRABC_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-#[cfg(not(test))]
-pub(crate) static FORCE_SPLIT4: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) static SPLIT4_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-pub(crate) static FORCE_HORZ: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub static HORZ_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-pub static VERT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RawSseGuard {
-    FilterIntra,
-    TxType,
-    TxSplit,
-}
-
-fn raw_sse_guard_disabled(kind: RawSseGuard) -> bool {
-    let _ = kind;
-    false
-}
-
-/// Apply one heuristic SSE policy while retaining the pure-RD choice as a
-/// shadow decision.
-fn raw_sse_guard_choice(
-    _tag: &'static str,
-    kind: RawSseGuard,
-    _baseline_sse: i64,
-    _candidate_sse: i64,
-    baseline_rd: f32,
-    candidate_rd: f32,
-    guarded_choice: bool,
-) -> bool {
-    let rd_choice = candidate_rd < baseline_rd;
-    if raw_sse_guard_disabled(kind) {
-        rd_choice
-    } else {
-        guarded_choice
-    }
-}
-
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Part16 {
@@ -422,6 +373,50 @@ pub(crate) struct IbcSharedRecon {
 unsafe impl Send for IbcSharedRecon {}
 unsafe impl Sync for IbcSharedRecon {}
 
+/// Emitted `all_zero` symbol counts `[tx class][ctx][symbol]`.
+pub(crate) type SkipStats = [[[u32; 2]; 13]; 5];
+
+pub(crate) fn skip_stats_add(acc: &mut SkipStats, a: &SkipStats) {
+    for (ac, ar) in acc.iter_mut().zip(a.iter()) {
+        for (bc, br) in ac.iter_mut().zip(ar.iter()) {
+            bc[0] += br[0];
+            bc[1] += br[1];
+        }
+    }
+}
+
+pub(crate) fn skip_stats_sub(a: &SkipStats, b: &SkipStats) -> SkipStats {
+    let mut out = [[[0u32; 2]; 13]; 5];
+    for cls in 0..5 {
+        for ctx in 0..13 {
+            out[cls][ctx][0] = a[cls][ctx][0] - b[cls][ctx][0];
+            out[cls][ctx][1] = a[cls][ctx][1] - b[cls][ctx][1];
+        }
+    }
+    out
+}
+
+/// Deterministic all-zero statistics available to the decision of SB `(row, col)`:
+/// every SB the wavefront guarantees finished (left, top and above-right
+/// dependencies, transitively `(row - k, <= col + k)`), summed from per-row
+/// prefix sums. The serial path uses the same cone so `-t1 == -tN` holds.
+pub(crate) fn skip_stats_cone(
+    prefix: &[SkipStats],
+    row: usize,
+    col: usize,
+    cols: usize,
+) -> SkipStats {
+    let mut acc = [[[0u32; 2]; 13]; 5];
+    if col > 0 {
+        skip_stats_add(&mut acc, &prefix[row * cols + col - 1]);
+    }
+    for k in 1..=row {
+        let c = (col + k).min(cols - 1);
+        skip_stats_add(&mut acc, &prefix[(row - k) * cols + c]);
+    }
+    acc
+}
+
 #[derive(Clone)]
 pub(crate) struct Cdfs {
     /// Trellis frequency-tilt strength for this tile's format — see
@@ -461,6 +456,9 @@ pub(crate) struct Cdfs {
     pub(crate) txtp4: Vec<Vec<u16>>,            // intra txtp TX_4X4 luma, per intra mode [13]
     pub(crate) txtp16: Vec<Vec<u16>>,           // intra txtp TX_16X16 luma, per intra mode [13]
     pub(crate) txb_skip: [Vec<Vec<u16>>; 5], // [class][13 ctx] (class 3 = TX_32X32, 4 = TX_64X64)
+    /// Running count of emitted `all_zero` symbols `[class][ctx][symbol]` (see
+    /// `SkipStats`); the superblock drivers difference it per SB.
+    pub(crate) skip_stats: SkipStats,
     pub(crate) base_tok: [[Vec<Vec<u16>>; 2]; 5], // [class][plane][41/42 ctx]
     pub(crate) br_tok: [[Vec<Vec<u16>>; 2]; 4], // [class][plane][21 ctx]; TX_64X64 shares class 3 (dav1d min(ctx, 3))
     pub(crate) eob_base: [[Vec<Vec<u16>>; 2]; 5], // [class][plane][4 ctx]
@@ -488,6 +486,15 @@ pub(crate) struct Cdfs {
     pub(crate) eob_bin_512_l: Vec<u16>,
     pub(crate) delta_q: Vec<u16>, // superblock delta-q magnitude (4 symbols)
     pub(crate) wiener_restore: Vec<u16>, // use_wiener flag (2-symbol)
+}
+
+impl Cdfs {
+    /// Code one `all_zero` flag and count it for the adaptive skip price.
+    #[inline]
+    pub(crate) fn encode_skip(&mut self, enc: &mut OdEcEncoder, cls: usize, ctx: usize, s: usize) {
+        self.skip_stats[cls][ctx][s] += 1;
+        enc.encode_symbol(s, &mut self.txb_skip[cls][ctx]);
+    }
 }
 
 impl Cdfs {
@@ -882,6 +889,7 @@ impl Cdfs {
             txtp16: TXTP_INTRA2_TX16.iter().map(|r| icdf(r)).collect(),
             txtp4: TXTP_INTRA1_TX4.iter().map(|r| icdf(r)).collect(),
             txb_skip,
+            skip_stats: [[[0u32; 2]; 13]; 5],
             base_tok,
             br_tok,
             eob_base,
@@ -1360,6 +1368,8 @@ struct LossyTile<'a> {
     dec_cdfs: std::sync::Arc<Cdfs>,
     /// Which of the two immutable decision snapshots this worker currently has.
     decision_cdf_warmed: bool,
+    /// Adaptive all-zero price table `[cls][ctx][symbol]` for the SB being decided.
+    pub(crate) skip_price: Option<Box<[[[f32; 2]; 13]; 5]>>,
     /// Decision capture/replay mode (see `coder/replay.rs`). `Off` in
     /// production until the wavefront lands.
     sb_mode: SbMode,
@@ -1554,10 +1564,6 @@ fn smooth_v_uv_signal_bits() -> f32 {
 /// Required SSE improvement (in 1/1024) for the 32x32 TX-split to be accepted
 /// on a banding-risk block. See `code_block32`.
 const SPLIT32_SSE_MARGIN: i64 = 64;
-
-/// Master switch for the whole-superblock BLOCK_64X64 intra path (4:2:0 only).
-pub static BLOCK64_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
 
 #[inline]
 fn chroma_part_rd_weight(ss420: bool, ss422: bool, _src: &[Vec<u16>; 3], _bd: u8) -> f32 {
@@ -1952,6 +1958,10 @@ fn wavefront_capture(
     let initial_dec_cdfs = proto.dec_cdfs.clone();
     let warm_dec_cdfs = std::sync::Mutex::new((*initial_dec_cdfs).clone());
     let published_dec_cdfs = std::sync::OnceLock::<std::sync::Arc<Cdfs>>::new();
+    // Per-SB prefix sums (along each row) of emitted all-zero counts, for the
+    // adaptive skip price. A cell writes its own slot once; readers only touch
+    // slots of cells the wavefront has already finished.
+    let skip_prefix = std::sync::Mutex::new(vec![[[[0u32; 2]; 13]; 5]; sb_rows * sb_cols]);
     let aq_grid = proto.precompute_aq_grid();
     let mut done = [
         vec![0u16; proto.recon[0].len()],
@@ -2267,8 +2277,27 @@ fn wavefront_capture(
             if !aq_grid.is_empty() {
                 t.aq_begin_sb_cell(&aq_grid[row * sb_cols + col]);
             }
+            if t.adaptive_skip_price_enabled() {
+                let cone = {
+                    let pf = skip_prefix.lock().expect("skip prefix poisoned");
+                    skip_stats_cone(&pf, row, col, sb_cols)
+                };
+                t.set_skip_price(&cone, &initial_dec_cdfs);
+            }
+            let skip_stats0 = t.cdfs.skip_stats;
             t.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
             t.clear_sb_rd_caches();
+            {
+                let own = skip_stats_sub(&t.cdfs.skip_stats, &skip_stats0);
+                let mut pf = skip_prefix.lock().expect("skip prefix poisoned");
+                let mut acc = if col > 0 {
+                    pf[row * sb_cols + col - 1]
+                } else {
+                    [[[0u32; 2]; 13]; 5]
+                };
+                skip_stats_add(&mut acc, &own);
+                pf[row * sb_cols + col] = acc;
+            }
             // --- write-out: copy each own recon block directly into the
             // finished planes, without a transient contiguous SB scratch ---
             for p in 0..3 {
@@ -2646,6 +2675,7 @@ fn encode_one_tile(
         let warm_prefix = sb_cols.min(4);
         let initial_dec_cdfs = tile.dec_cdfs.clone();
         let mut warm_dec_cdfs: Option<std::sync::Arc<Cdfs>> = None;
+        let mut skip_prefix: Vec<SkipStats> = vec![[[[0u32; 2]; 13]; 5]; sb_count];
         let mut pending: Vec<Option<DecisionRecord>> = vec![None; sb_count];
         let mut streamed_rec = DecisionRecord::default();
         let mut sb_i = 0usize;
@@ -2698,8 +2728,23 @@ fn encode_one_tile(
                 if !aq_grid.is_empty() {
                     tile.aq_begin_sb_cell(&aq_grid[sb_i]);
                 }
+                if tile.adaptive_skip_price_enabled() {
+                    let cone = skip_stats_cone(&skip_prefix, sb_row, sb_col, sb_cols);
+                    tile.set_skip_price(&cone, &initial_dec_cdfs);
+                }
+                let skip_stats0 = tile.cdfs.skip_stats;
                 tile.decode_sb(1, sb_x / 8, sb_y / 8, 8, true, false);
                 tile.clear_sb_rd_caches();
+                {
+                    let own = skip_stats_sub(&tile.cdfs.skip_stats, &skip_stats0);
+                    let mut acc = if sb_col > 0 {
+                        skip_prefix[sb_i - 1]
+                    } else {
+                        [[[0u32; 2]; 13]; 5]
+                    };
+                    skip_stats_add(&mut acc, &own);
+                    skip_prefix[sb_i] = acc;
+                }
                 if updating_cdf
                     && !tile.mono
                     && !tile.ss420
@@ -3423,31 +3468,6 @@ pub(crate) fn encode_lossy_tilegroup(
         });
     }
     let lr = lr_unit.map(|_| crate::obu::LrParams { luma_wiener: true });
-
-    // Debug: dump the final reconstruction (post-deblock/CDEF) for the
-    // dav1d conformance oracle (bench/rd/oscan.sh + oraclecmp.py). This
-    // hook was lost in a refactor once (2026-07-26) and the oracle failed
-    // 0/90 silently — keep it adjacent to tilegroup assembly.
-    if let Ok(path) = std::env::var("MT_DUMP_RECON") {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            // ceil, not floor: for odd display dims the last chroma col/row
-            // is real coded content (AV1 chroma dims are ceil(w >> sub)).
-            let (cdw, cdh) = (disp_w.div_ceil(1 << sub_x), disp_h.div_ceil(1 << sub_y));
-            let planes: [(usize, usize, usize); 3] =
-                [(disp_w, disp_h, w8), (cdw, cdh, cw8), (cdw, cdh, cw8)];
-            let np = if mono { 1 } else { 3 };
-            let _ = writeln!(f, "MTREC {disp_w} {disp_h} {cdw} {cdh} {np}");
-            for (pl, &(pw, ph, stride)) in planes.iter().enumerate().take(np) {
-                for y in 0..ph {
-                    let row: Vec<u8> = (0..pw)
-                        .map(|x| (recon[pl][y * stride + x] >> (bd - 8)).clamp(0, 255) as u8)
-                        .collect();
-                    let _ = f.write_all(&row);
-                }
-            }
-        }
-    }
 
     let tilegroup = assemble_tilegroup(payloads);
     (
@@ -4890,12 +4910,7 @@ fn frame_lf_search(
             t.lf_search_bias,
         );
     }
-    if std::env::var_os("MT_LF_DEBUG").is_some() {
-        eprintln!(
-            "lf_search: law ({law_y},{law_uv}) -> ({lvl_y},{},{})",
-            lvls[0], lvls[1]
-        );
-    }
+
     (lvl_y, lvls[0], lvls[1])
 }
 
@@ -5628,28 +5643,6 @@ mod aq_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn raw_sse_guard_tracks_the_shadow_rd_choice() {
-        assert!(raw_sse_guard_choice(
-            "test",
-            RawSseGuard::FilterIntra,
-            100,
-            99,
-            20.0,
-            10.0,
-            true,
-        ));
-        assert!(!raw_sse_guard_choice(
-            "test",
-            RawSseGuard::FilterIntra,
-            100,
-            101,
-            20.0,
-            10.0,
-            false,
-        ));
     }
 
     /// `precompute_aq_grid` must reproduce the serial `aq_begin_sb` accumulator
