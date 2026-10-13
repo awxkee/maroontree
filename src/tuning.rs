@@ -52,6 +52,22 @@ pub(crate) struct Tuning {
     pub(crate) part_budget_qmin: u32,
     /// Restrict the non-square partition budget to 4:4:4.
     pub(crate) part_budget_444_only: bool,
+    /// 4:2:0 rect16 leaf: allow RTX_16X8/8X16 -> two TX_8X8 (tx_depth 1) in
+    /// the luma transform trial (estimator and emitter).
+    pub(crate) rect_tx_split: bool,
+    /// 4:2:0 rect16 leaf: full chroma uv-mode search on the 8x4/4x8 chroma
+    /// (was DC/CfL only).
+    pub(crate) rect_uv_search: bool,
+    /// Pre-fill the tile reconstruction with the source so decision-stage
+    /// predictions of not-yet-coded neighbours (later leaves of a candidate
+    /// partition) see a proxy of the eventual reconstruction, not zeros.
+    pub(crate) recon_src_init: bool,
+    /// Multiplier on the 16-level SPLIT leg (all bands; `none16_top_bias_*`
+    /// is the top-band NONE-side counterpart).
+    pub(crate) split16_bias: f32,
+    /// Multiplier on the 8x8 SPLIT4 (four BLOCK_4X4) leg inside the 16-level
+    /// decision.
+    pub(crate) split4_bias: f32,
     pub(crate) part_budget_medium: u32,
     pub(crate) part_budget_fast: u32,
 
@@ -304,6 +320,11 @@ impl Tuning {
         part_budget_slow: 3,
         part_budget_qmin: 0,
         part_budget_444_only: true,
+        rect_tx_split: false,
+        rect_uv_search: false,
+        recon_src_init: false,
+        split16_bias: 1.0,
+        split4_bias: 1.0,
         part_budget_medium: 0,
         part_budget_fast: 0,
         top_ease: 1.0,
@@ -426,11 +447,214 @@ impl Tuning {
     };
 }
 
-/// Fixed, calibrated encoder constants. Encoding has no runtime overrides.
-#[inline(always)]
-pub(crate) const fn get() -> &'static Tuning {
-    &Tuning::SHIPPED
+/// Fixed, calibrated encoder constants. Without the `tuning` feature there is
+/// no runtime state; with it, `MT_TUNING_JSON` (offline parameter study only,
+/// see parameters_fit/) overrides fields from a flat JSON object.
+#[cfg(not(feature = "tuning"))]
+mod imp {
+    use super::Tuning;
+
+    #[inline(always)]
+    pub(crate) const fn get() -> &'static Tuning {
+        &Tuning::SHIPPED
+    }
 }
+
+#[cfg(feature = "tuning")]
+mod imp {
+    use super::Tuning;
+    use std::sync::OnceLock;
+
+    static TUNING: OnceLock<Tuning> = OnceLock::new();
+
+    pub(crate) fn get() -> &'static Tuning {
+        TUNING.get_or_init(|| {
+            let Ok(path) = std::env::var("MT_TUNING_JSON") else {
+                return Tuning::SHIPPED;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                panic!("MT_TUNING_JSON={path}: unreadable");
+            };
+            parse(&text)
+        })
+    }
+
+    /// Minimal reader for a *flat* JSON object of numbers and booleans. Any
+    /// unknown key is a hard error so a typo can never become a silent no-op
+    /// trial. The key list is every field of `Tuning`, in declaration order.
+    fn parse(text: &str) -> Tuning {
+        let mut t = Tuning::SHIPPED;
+        let body = text
+            .trim()
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or_else(|| panic!("MT_TUNING_JSON: expected a flat JSON object"));
+        for entry in body.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (key, value) = entry
+                .split_once(':')
+                .unwrap_or_else(|| panic!("MT_TUNING_JSON: malformed entry {entry:?}"));
+            let key = key.trim().trim_matches('"');
+            let value = value.trim();
+            let num = |v: &str| -> f32 {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("MT_TUNING_JSON: {key}: not a number: {v:?}"))
+            };
+            let flag = |v: &str| -> bool {
+                match v {
+                    "true" => true,
+                    "false" => false,
+                    _ => panic!("MT_TUNING_JSON: {key}: not a bool: {v:?}"),
+                }
+            };
+            match key {
+                "rect16_bias" => t.rect16_bias = num(value),
+                "rect16_bias_422" => t.rect16_bias_422 = num(value),
+                "rect16_horz_444" => t.rect16_horz_444 = flag(value),
+                "rect16_vert_444" => t.rect16_vert_444 = flag(value),
+                "rect16_420_medium" => t.rect16_420_medium = flag(value),
+                "none16_top_bias_420" => t.none16_top_bias_420 = num(value),
+                "none16_top_bias_422" => t.none16_top_bias_422 = num(value),
+                "none16_top_bias_444" => t.none16_top_bias_444 = num(value),
+                "quad4_bias" => t.quad4_bias = num(value),
+                "part_budget_slow" => t.part_budget_slow = num(value) as u32,
+                "part_budget_qmin" => t.part_budget_qmin = num(value) as u32,
+                "part_budget_444_only" => t.part_budget_444_only = flag(value),
+                "rect_tx_split" => t.rect_tx_split = flag(value),
+                "rect_uv_search" => t.rect_uv_search = flag(value),
+                "recon_src_init" => t.recon_src_init = flag(value),
+                "split16_bias" => t.split16_bias = num(value),
+                "split4_bias" => t.split4_bias = num(value),
+                "part_budget_medium" => t.part_budget_medium = num(value) as u32,
+                "part_budget_fast" => t.part_budget_fast = num(value) as u32,
+                "top_ease" => t.top_ease = num(value),
+                "top_ease_knee" => t.top_ease_knee = num(value),
+                "top_ease_width" => t.top_ease_width = num(value),
+                "qm_hq_knee" => t.qm_hq_knee = num(value),
+                "qm_hq_width" => t.qm_hq_width = num(value),
+                "top_band_q" => t.top_band_q = num(value) as u32,
+                "none32_split_bias" => t.none32_split_bias = num(value),
+                "none64_split_bias" => t.none64_split_bias = num(value),
+                "top_none_bias_420_hi" => t.top_none_bias_420_hi = num(value),
+                "top_none_bias_420_lo" => t.top_none_bias_420_lo = num(value),
+                "top_444_uac" => t.top_444_uac = num(value),
+                "mode_lambda_lo_floor" => t.mode_lambda_lo_floor = num(value),
+                "mode_lambda_lo_full" => t.mode_lambda_lo_full = num(value),
+                "mode_lambda_lo_w" => t.mode_lambda_lo_w = num(value),
+                "lf_sharpness" => t.lf_sharpness = num(value) as u32,
+                "lf_level_scale" => t.lf_level_scale = num(value),
+                "lf_uv_level_scale" => t.lf_uv_level_scale = num(value),
+                "lf_uv_level_scale_420" => t.lf_uv_level_scale_420 = num(value),
+                "lf_search" => t.lf_search = flag(value),
+                "lf_search_bias" => t.lf_search_bias = num(value),
+                "lf_search_start0" => t.lf_search_start0 = flag(value),
+                "lf_search_metric" => t.lf_search_metric = num(value) as u32,
+                "cdef_margin" => t.cdef_margin = num(value),
+                "cdef_gate" => t.cdef_gate = num(value),
+                "cdef_chroma_w" => t.cdef_chroma_w = num(value),
+                "uv420_tail_delta" => t.uv420_tail_delta = num(value),
+                "uv422_mid_scale" => t.uv422_mid_scale = num(value),
+                "split_breakout_slow" => t.split_breakout_slow = num(value),
+                "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,
+                "fixed_size_medium" => t.fixed_size_medium = num(value) as u32,
+                "fixed_size_slow" => t.fixed_size_slow = num(value) as u32,
+                "part_signal_bits" => t.part_signal_bits = num(value),
+                "part_signal_seam_drop" => t.part_signal_seam_drop = num(value),
+                "split32_signal_mult" => t.split32_signal_mult = num(value),
+                "b64_refinement_window" => t.b64_refinement_window = num(value),
+                "b64_split_refinement" => t.b64_split_refinement = num(value),
+                "vbp_thresh_420" => t.vbp_thresh_420 = num(value),
+                "seam_w_420" => t.seam_w_420 = num(value),
+                "seam_w_422" => t.seam_w_422 = num(value),
+                "joint_large_gain" => t.joint_large_gain = num(value),
+                "satd_base" => t.satd_base = num(value),
+                "satd_top" => t.satd_top = num(value),
+                "satd_knee_lo" => t.satd_knee_lo = num(value),
+                "satd_knee_hi" => t.satd_knee_hi = num(value),
+                "aq_slope" => t.aq_slope = num(value),
+                "aq_max_delta" => t.aq_max_delta = num(value),
+                "aq_r" => t.aq_r = num(value),
+                "trellis_tilt_mag_cap" => t.trellis_tilt_mag_cap = num(value),
+                "smooth_v_uv_signal_bits" => t.smooth_v_uv_signal_bits = num(value),
+                "local_ref_blend" => t.local_ref_blend = num(value),
+                "exact_part_bits" => t.exact_part_bits = flag(value),
+                "chroma_uv_mode_bits" => t.chroma_uv_mode_bits = flag(value),
+                "chroma_refine_topk" => t.chroma_refine_topk = num(value) as usize,
+                "palette_proxy_finalists" => t.palette_proxy_finalists = num(value) as usize,
+                "palette_proxy_ranked" => t.palette_proxy_ranked = flag(value),
+                "rect_decision_refine" => t.rect_decision_refine = flag(value),
+                "exact_part_bits_3264" => t.exact_part_bits_3264 = flag(value),
+                "exact_part_bits_3264_444" => t.exact_part_bits_3264_444 = flag(value),
+                "exact_part_bits_8" => t.exact_part_bits_8 = flag(value),
+                "rect8_enabled" => t.rect8_enabled = flag(value),
+                "rect8_bias" => t.rect8_bias = num(value),
+                "vbp_medium_420" => t.vbp_medium_420 = flag(value),
+                "vbp_444" => t.vbp_444 = flag(value),
+                "vbp_422" => t.vbp_422 = flag(value),
+                "vbp_thresh_hi" => t.vbp_thresh_hi = num(value),
+                "proxy_rate_fast" => t.proxy_rate_fast = flag(value),
+                "proxy_rate_medium" => t.proxy_rate_medium = flag(value),
+                "proxy_rate_slow" => t.proxy_rate_slow = flag(value),
+                "rate_bound_slack_fast" => t.rate_bound_slack_fast = num(value),
+                "rate_bound_slack_medium" => t.rate_bound_slack_medium = num(value),
+                "rate_bound_slack_slow" => t.rate_bound_slack_slow = num(value),
+                "mode_budget_medium" => t.mode_budget_medium = num(value) as u32,
+                "full_part_rdo_medium" => t.full_part_rdo_medium = flag(value),
+                "palette_medium" => t.palette_medium = flag(value),
+                "palette_budget_medium" => t.palette_budget_medium = num(value) as u32,
+                "angle_deltas_medium" => t.angle_deltas_medium = flag(value),
+                "full_chroma_rdo_medium" => t.full_chroma_rdo_medium = flag(value),
+                "min_size_16_fast" => t.min_size_16_fast = flag(value),
+                "min_size_16_medium" => t.min_size_16_medium = flag(value),
+                "rect64" => t.rect64 = flag(value),
+                "rect64_bias" => t.rect64_bias = num(value),
+                "tx64" => t.tx64 = flag(value),
+                "tx64_bias" => t.tx64_bias = num(value),
+                "tx64_none" => t.tx64_none = flag(value),
+                "ad_vh" => t.ad_vh = flag(value),
+                "rect_ad" => t.rect_ad = flag(value),
+                "ad_runner" => t.ad_runner = flag(value),
+                "uv_ad" => t.uv_ad = flag(value),
+                "rect_diag" => t.rect_diag = flag(value),
+                "uv_ad32" => t.uv_ad32 = flag(value),
+                "uv422_modes" => t.uv422_modes = flag(value),
+                "mlam_scale_420" => t.mlam_scale_420 = num(value),
+                "mlam_scale_422" => t.mlam_scale_422 = num(value),
+                "mlam_scale_444" => t.mlam_scale_444 = num(value),
+                "min_size_16_slow" => t.min_size_16_slow = flag(value),
+                "guided16_k_fast" => t.guided16_k_fast = num(value),
+                "guided16_k_medium" => t.guided16_k_medium = num(value),
+                "guided16_k_slow" => t.guided16_k_slow = num(value),
+                "split4_breakout_slow" => t.split4_breakout_slow = num(value),
+                "exact_8x8_mode_rate" => t.exact_8x8_mode_rate = flag(value),
+                "split4_decision_txtypes" => t.split4_decision_txtypes = flag(value),
+                "palette_smooth" => t.palette_smooth = num(value) as u32,
+                "palette_smooth_guard" => t.palette_smooth_guard = flag(value),
+                "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
+                "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
+                "top_bias_knee_444" => t.top_bias_knee_444 = num(value),
+                "top_bias_width_444" => t.top_bias_width_444 = num(value),
+                "uv_pal_gate_k" => t.uv_pal_gate_k = num(value),
+                "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
+                "trellis_zero_bits" => t.trellis_zero_bits = num(value),
+                "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
+                "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
+                "trellis_calib" => t.trellis_calib = num(value),
+                "tilt_base_444" => t.tilt_base_444 = num(value),
+                "tilt_extra_444" => t.tilt_extra_444 = num(value),
+                "tilt_base_420" => t.tilt_base_420 = num(value),
+                "tilt_extra_420" => t.tilt_extra_420 = num(value),
+                other => panic!("MT_TUNING_JSON: unknown key {other:?}"),
+            }
+        }
+        t
+    }
+}
+
+pub(crate) use imp::get;
 
 /// Abort-bound multiplier for the exact rate estimator (1.0 = exact).
 #[inline]

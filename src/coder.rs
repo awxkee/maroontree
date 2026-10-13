@@ -352,6 +352,29 @@ fn fwd_chroma_4x8(
     }
 }
 
+fn fwd_chroma_8x4(
+    dct: &DctDispatch,
+    tx: ChromaTx,
+    resid: &[i32; 32],
+    q: &Quant,
+) -> ([i32; 32], [f32; 32]) {
+    match tx {
+        ChromaTx::DctDct => dct.dct8x4_t(resid, q),
+        ChromaTx::AdstAdst => dct.adst8x4_t(resid, q),
+        ChromaTx::AdstDct => dct.adstdct8x4_t(resid, q),
+        ChromaTx::DctAdst => dct.dctadst8x4_t(resid, q),
+    }
+}
+
+fn inv_chroma_8x4(idct: &IdctDispatch, tx: ChromaTx, levels: &[i32; 32], q: &Quant) -> [i32; 32] {
+    match tx {
+        ChromaTx::DctDct => idct.idct_dequant_8x4(levels, q),
+        ChromaTx::AdstAdst => crate::idct::iadst_dequant_8x4(levels, q),
+        ChromaTx::AdstDct => crate::idct::iadstdct_dequant_8x4(levels, q),
+        ChromaTx::DctAdst => crate::idct::idctadst_dequant_8x4(levels, q),
+    }
+}
+
 fn inv_chroma_4x8(idct: &IdctDispatch, tx: ChromaTx, levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     match tx {
         ChromaTx::DctDct => idct.idct_dequant_4x8(levels, q),
@@ -1963,10 +1986,14 @@ fn wavefront_capture(
     // slots of cells the wavefront has already finished.
     let skip_prefix = std::sync::Mutex::new(vec![[[[0u32; 2]; 13]; 5]; sb_rows * sb_cols]);
     let aq_grid = proto.precompute_aq_grid();
+    // Unfinished regions of the shared planes must hold exactly what a serial
+    // tile's uncoded regions hold (the `recon_src_init` estimate, or zeros),
+    // or wavefront decisions diverge from -t1.
+    let est_init: std::sync::Arc<[Vec<u16>; 3]> = std::sync::Arc::new(proto.recon.clone());
     let mut done = [
-        vec![0u16; proto.recon[0].len()],
-        vec![0u16; proto.recon[1].len()],
-        vec![0u16; proto.recon[2].len()],
+        proto.recon[0].clone(),
+        proto.recon[1].clone(),
+        proto.recon[2].clone(),
     ];
     let stride4 = r.tw / 4;
     let h4 = r.th / 4;
@@ -2119,7 +2146,8 @@ fn wavefront_capture(
                 // top and left halos are overwritten from `done` below; zeroing
                 // them as part of the previous cell's teardown was redundant.
                 for row2 in by..(by + bh).min(ph) {
-                    t.recon[p][row2 * pw + bx..row2 * pw + x1].fill(0);
+                    t.recon[p][row2 * pw + bx..row2 * pw + x1]
+                        .copy_from_slice(&est_init[p][row2 * pw + bx..row2 * pw + x1]);
                 }
                 // SAFETY: halo regions belong to earlier diagonals (finished,
                 // not being written); regions are in-plane.

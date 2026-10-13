@@ -3106,7 +3106,7 @@ impl<'a> LossyTile<'a> {
                             + self.rd_cost_chroma_block(bx / 2, by + 4, 4, 4, prdo, false)
                             - self.rd_cost_chroma_block(bx / 2, by, 4, 8, prdo, false));
                 }
-                none8.min(s4)
+                none8.min(s4 * crate::tuning::get().split4_bias)
             } else {
                 none8
             }
@@ -3138,7 +3138,8 @@ impl<'a> LossyTile<'a> {
         let rd_split = if split_pruned {
             f32::INFINITY
         } else {
-            split_signal + square8.iter().sum::<f32>() + chroma_cost(Part16::Split)
+            (split_signal + square8.iter().sum::<f32>() + chroma_cost(Part16::Split))
+                * crate::tuning::get().split16_bias
         };
         let rect_bias = if self.ss422 {
             tune.rect16_bias_422
@@ -3382,7 +3383,64 @@ impl<'a> LossyTile<'a> {
 
     fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        // Decision-stage estimators predict the LATER leaves of a candidate
+        // partition (SPLIT children 1-3, the second rect half, 4x4 siblings)
+        // from `recon`, which still holds pre-block pixels there. Zero-filled,
+        // those edges are black and every multi-leaf candidate is priced
+        // against a fake edge; pre-filled with the source, the stale reads
+        // return a close proxy of the eventual reconstruction. The emitter
+        // never reads an uncoded region, so coding is unaffected.
+        if crate::tuning::get().recon_src_init {
+            self.fill_recon_estimate();
+        }
         self
+    }
+
+    /// Pre-fill `recon` with an ESTIMATE of the eventual reconstruction: the
+    /// source coded per 4x4 as DC + quantised DCT residual at the frame
+    /// quantiser. Pristine source there makes every multi-leaf candidate
+    /// optimistic (children predict from perfect edges: measured +8.5% BD,
+    /// 4x4 count x6); zeros make them pessimistic (black edges).
+    pub(crate) fn fill_recon_estimate(&mut self) {
+        let maxv = (1i32 << self.bd) - 1;
+        for p in 0..3 {
+            if self.recon[p].is_empty() {
+                continue;
+            }
+            let (pw, q) = if p == 0 { (self.w, &self.quant) } else { (self.cw, &self.cquant) };
+            let ph = self.recon[p].len() / pw;
+            let src = &self.src[p];
+            for by in (0..ph).step_by(4) {
+                for bx in (0..pw).step_by(4) {
+                    let (bw, bh) = ((pw - bx).min(4), (ph - by).min(4));
+                    let mut blk = [0i32; 16];
+                    let mut sum = 0i32;
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            let v = src[(by + y) * pw + bx + x] as i32;
+                            blk[y * 4 + x] = v;
+                            sum += v;
+                        }
+                    }
+                    let n = (bw * bh) as i32;
+                    let mean = (sum + n / 2) / n;
+                    let mut resid = [0i32; 16];
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            resid[y * 4 + x] = blk[y * 4 + x] - mean;
+                        }
+                    }
+                    let (cf, _) = self.dct.dct4x4_t(&resid, q);
+                    let rr = self.idct.idct_dequant_4x4(&cf, q);
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            self.recon[p][(by + y) * pw + bx + x] =
+                                (mean + rr[y * 4 + x]).clamp(0, maxv) as u16;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Clip RD distortion to the displayed `vis_w`x`vis_h` luma region of
