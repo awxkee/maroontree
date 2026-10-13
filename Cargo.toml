@@ -23,6 +23,7 @@ hashbrown = "0.17"
 default = ["neon", "avx"]
 neon = []
 avx = []
+tuning = []
 
 [profile.release]
 debug = "line-tables-only"

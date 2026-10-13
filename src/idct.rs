@@ -1333,6 +1333,64 @@ pub(crate) fn idct_dequant_8x4(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     tmp
 }
 
+/// 8x4 ADST family inverse (dav1d-exact structure of `idct_dequant_8x4`:
+/// is_rect2 prescale, width-8 row pass, clamp, height-4 column pass, >>4).
+fn iadst8x4_family(levels: &[i32; 32], q: &Quant, row_adst: bool, col_adst: bool) -> [i32; 32] {
+    let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
+    let mut coeff = [0i32; 32];
+    for rc in 0..32 {
+        let lvl = levels[rc];
+        if lvl == 0 {
+            continue;
+        }
+        let q = q.dequant_step(rc, 8, 4);
+        let mag = ((lvl.unsigned_abs() as u64 * q as u64) & 0xff_ffff) as i32;
+        let mag = mag.min(cf_max + (lvl < 0) as i32);
+        coeff[rc] = if lvl < 0 { -mag } else { mag };
+    }
+    let mut tmp = [0i32; 32];
+    for row in 0..4 {
+        for col in 0..8 {
+            tmp[row * 8 + col] = (coeff[col * 4 + row] * 181 + 128) >> 8;
+        }
+    }
+    for row in 0..4 {
+        if row_adst {
+            inv_adst8_1d(&mut tmp[row * 8..], 1, rmin, rmax);
+        } else {
+            inv_dct8_1d(&mut tmp[row * 8..], 1, rmin, rmax);
+        }
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t).clamp(cmin, cmax);
+    }
+    for col in 0..8 {
+        if col_adst {
+            inv_adst4_1d(&mut tmp[col..], 8, cmin, cmax);
+        } else {
+            inv_dct4_1d(&mut tmp[col..], 8, cmin, cmax);
+        }
+    }
+    for t in tmp.iter_mut() {
+        *t = (*t + 8) >> 4;
+    }
+    tmp
+}
+
+pub(crate) fn iadst_dequant_8x4(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
+    iadst8x4_family(levels, q, true, true)
+}
+
+/// ADST_DCT: vertical (column) ADST, horizontal (row) DCT.
+pub(crate) fn iadstdct_dequant_8x4(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
+    iadst8x4_family(levels, q, false, true)
+}
+
+/// DCT_ADST: vertical (column) DCT, horizontal (row) ADST.
+pub(crate) fn idctadst_dequant_8x4(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
+    iadst8x4_family(levels, q, true, false)
+}
+
 pub(crate) fn idct_dequant_4x8(levels: &[i32; 32], q: &Quant) -> [i32; 32] {
     let (rmin, rmax, cmin, cmax, cf_max) = q.clips();
     let mut coeff = [0i32; 32];

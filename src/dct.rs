@@ -2671,6 +2671,39 @@ impl DctDispatch {
         )
     }
 
+    /// Scalar-only 8x4 ADST-family forward (no SIMD dispatch field).
+    pub(crate) fn adst8x4_t(
+        &self,
+        residual: &[i32; 32],
+        quant: &impl Dct,
+    ) -> ([i32; 32], [f32; 32]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+        apply_qmatrix_result(adst8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+    }
+
+    /// Scalar-only 8x4 ADST-family forward (no SIMD dispatch field).
+    pub(crate) fn adstdct8x4_t(
+        &self,
+        residual: &[i32; 32],
+        quant: &impl Dct,
+    ) -> ([i32; 32], [f32; 32]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+        apply_qmatrix_result(adstdct8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+    }
+
+    /// Scalar-only 8x4 ADST-family forward (no SIMD dispatch field).
+    pub(crate) fn dctadst8x4_t(
+        &self,
+        residual: &[i32; 32],
+        quant: &impl Dct,
+    ) -> ([i32; 32], [f32; 32]) {
+        let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
+        let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
+        apply_qmatrix_result(dctadst8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+    }
+
     pub(crate) fn dct4x16_t(
         &self,
         residual: &[i32; 64],
@@ -3227,6 +3260,66 @@ fn dct8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32],
         }
     }
     (cf, tf)
+}
+
+/// 8x4 ADST family (scalar only; chroma of the 4:2:0 16x8 rect leaf). Rows
+/// (width 8) first, then columns (height 4), like `dct8x4_quant_t_direct`.
+/// ADST_DCT = vertical ADST / horizontal DCT, matching the 4x8 kernels.
+fn adst8x4_family_direct(
+    input: &[i32; 32],
+    dc_q: i32,
+    ac_q: i32,
+    row_adst: bool,
+    col_adst: bool,
+) -> ([i32; 32], [f32; 32]) {
+    let mut tmp = [0i32; 32];
+    for row in 0..4 {
+        let mut c = [0i32; 8];
+        for col in 0..8 {
+            c[col] = input[row * 8 + col];
+        }
+        let out = if row_adst {
+            fwd_adst8_1d(&c)
+        } else {
+            dct1d_8_i32(&mut c);
+            c
+        };
+        for fx in 0..8 {
+            tmp[fx * 4 + row] = out[fx];
+        }
+    }
+    let mut cf = [0i32; 32];
+    let mut tf = [0.0f32; 32];
+    for fx in 0..8 {
+        let mut r = [0i32; 4];
+        for row in 0..4 {
+            r[row] = tmp[fx * 4 + row];
+        }
+        let out = if col_adst {
+            fwd_adst4_1d(&r)
+        } else {
+            dct1d_4_i32(&mut r);
+            r
+        };
+        for fy in 0..4 {
+            store_quant_target_scalar(&mut cf, &mut tf, fx * 4 + fy, out[fy], dc_q, ac_q);
+        }
+    }
+    (cf, tf)
+}
+
+fn adst8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    adst8x4_family_direct(input, dc_q, ac_q, true, true)
+}
+
+/// ADST_DCT: vertical (column) ADST, horizontal (row) DCT.
+fn adstdct8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    adst8x4_family_direct(input, dc_q, ac_q, false, true)
+}
+
+/// DCT_ADST: vertical (column) DCT, horizontal (row) ADST.
+fn dctadst8x4_quant_t_direct(input: &[i32; 32], dc_q: i32, ac_q: i32) -> ([i32; 32], [f32; 32]) {
+    adst8x4_family_direct(input, dc_q, ac_q, true, false)
 }
 
 #[inline]
@@ -4140,6 +4233,59 @@ mod adst_roundtrip_tests {
             .zip(tf)
             .map(|(&c, &t)| (c as f32 - t).abs())
             .fold(0f32, f32::max)
+    }
+
+    /// The scalar-only 8x4 ADST family (4:2:0 rect16 chroma): levels are
+    /// the rounded targets, each forward/inverse pair round-trips, and the
+    /// orientation matches the 4x8 kernels (ADST_DCT = vertical ADST): a
+    /// vertical ramp must land in the first coefficient column of the
+    /// vertical-DCT variant and NOT be DC-only under vertical ADST.
+    #[test]
+    fn adst8x4_kernels_round_trip() {
+        let sc = DctDispatch::scalar();
+        let mut rng = 777u32;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let mut ramp = [0i32; 32];
+        let mut vramp = [0i32; 32];
+        let mut rnd = [0i32; 32];
+        for y in 0..4 {
+            for x in 0..8 {
+                ramp[y * 8 + x] = ((x + y) as i32) * 6;
+                vramp[y * 8 + x] = (y as i32) * 20;
+                rnd[y * 8 + x] = (next() % 121) as i32 - 60;
+            }
+        }
+        let q = Quant::new(4, 8);
+        for r in [&ramp, &vramp, &rnd] {
+            let en = energy(r);
+            let (ca, ta) = sc.adst8x4_t(r, &q);
+            let (cad, tad) = sc.adstdct8x4_t(r, &q);
+            let (cda, tda) = sc.dctadst8x4_t(r, &q);
+            for (c, t) in [(&ca, &ta), (&cad, &tad), (&cda, &tda)] {
+                assert!(max_round_gap(c, t) <= 0.5 + 1e-3, "levels are not the rounded targets");
+            }
+            let ra = crate::idct::iadst_dequant_8x4(&ca, &q);
+            let rad = crate::idct::iadstdct_dequant_8x4(&cad, &q);
+            let rda = crate::idct::idctadst_dequant_8x4(&cda, &q);
+            for rec in [&ra, &rad, &rda] {
+                assert!(sse(r, rec) / en < 2e-3, "8x4 forward/inverse pair does not round-trip");
+            }
+        }
+        // Orientation (a vertical ramp has constant rows): under ADST_DCT the
+        // horizontal pass is a DCT, so every coefficient outside fx == 0 is
+        // zero; under DCT_ADST the horizontal pass is an ADST, whose basis
+        // does not contain the constant, so energy leaks to fx > 0.
+        let (cad, _) = sc.adstdct8x4_t(&vramp, &q);
+        let off_fx0: i64 = (4..32).map(|i| (cad[i] as i64).abs()).sum();
+        assert_eq!(off_fx0, 0, "ADST_DCT must be horizontal DCT (fx==0 only for a vertical ramp)");
+        let (cda, _) = sc.dctadst8x4_t(&vramp, &q);
+        let rest: i64 = (4..32).map(|i| (cda[i] as i64).abs()).sum();
+        assert!(rest > 0, "DCT_ADST must be horizontal ADST (energy leaks past fx==0)");
     }
 
     #[test]
