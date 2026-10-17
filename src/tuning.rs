@@ -183,10 +183,12 @@ pub(crate) struct Tuning {
     pub(crate) proxy_ad: bool,
     /// 16x16 leaf (winner + `ad_runner`) prices all six angle deltas.
     pub(crate) ad16_full: bool,
-    /// 4:2:0 8x8 leaf: directional chroma candidates compete against CfL too.
+    /// 4:2:0 8x8 leaf: directional chroma candidates compete against CfL
     pub(crate) uv8_vs_cfl: bool,
     /// 4:2:0 8x8 leaf: CfL-vs-DC decided on the chroma lambda (emit_mlam_c).
     pub(crate) uv8_cfl_mlam_c: bool,
+    /// 4:2:0 8x8 leaf: zone-2 chroma angle deltas for the directional winner
+    pub(crate) uv8_ad: bool,
     /// 32x32 luma leaf: price `tx_depth = 2` (sixteen TX_8X8, per-TX txtp)
     /// against the whole / depth-1 transform by RD. Illustrations: a 32x32 DC
     /// block with one outline edge in a corner coded its residual with one
@@ -443,8 +445,9 @@ impl Tuning {
         trial_edge_lo: 0.0,
         proxy_ad: false,
         ad16_full: false,
-        uv8_vs_cfl: false,
+        uv8_vs_cfl: true,
         uv8_cfl_mlam_c: false,
+        uv8_ad: true,
         tx32_depth2: true,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
@@ -671,6 +674,7 @@ mod imp {
                 "ad16_full" => t.ad16_full = flag(value),
                 "uv8_vs_cfl" => t.uv8_vs_cfl = flag(value),
                 "uv8_cfl_mlam_c" => t.uv8_cfl_mlam_c = flag(value),
+                "uv8_ad" => t.uv8_ad = flag(value),
                 "tx32_depth2" => t.tx32_depth2 = flag(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
