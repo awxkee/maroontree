@@ -458,6 +458,13 @@ impl<'a> LossyTile<'a> {
     }
 
     fn decode_sb(&mut self, bl: usize, x8: usize, y8: usize, sz8: usize, thr: bool, lhb: bool) {
+        if sz8 == 8
+            && self.sb_mode != SbMode::Replay
+            && crate::tuning::get().edge_fill
+            && self.edge_in_flat(x8 * 8, y8 * 8, 64)
+        {
+            self.fill_recon_estimate_region(x8 * 8, y8 * 8, 64, 64);
+        }
         if sz8 == 1 {
             // BL_8X8 leaf (always fully in-frame for multiple-of-8 dimensions):
             // emit PARTITION_NONE, then the block. When the split scaffold is
@@ -493,7 +500,7 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 let split_eligible = !t.mono;
-                let want_split = split_eligible && !t.prefer_8x8_none(x8, y8);
+                let want_split = split_eligible && !t.prefer_8x8_none(x8, y8, r8_tr, r8_bl);
                 if want_split {
                     Part16::Split
                 } else {
@@ -545,6 +552,21 @@ impl<'a> LossyTile<'a> {
             let full_h = (x8 + 4) * 8 <= self.w;
             let full_v = (y8 + 4) * 8 <= self.h;
             if full_h && full_v {
+                if self.trial_level_on(4) && self.trial_src_gate(x8 * 8, y8 * 8, 32) {
+                    // Real-R-D NONE-vs-SPLIT (trial encode). The proxy still
+                    // arbitrates the whole-32 IntraBC copy where it exists,
+                    // and `trial_gate` can let one of its verdicts stand.
+                    let gate = crate::tuning::get().trial_gate;
+                    let pinned = (self.allow_intrabc || gate != 0) && {
+                        let proxy = self.choose_rect32(x8, y8, thr, lhb);
+                        self.force_part = (!Self::trial_may_overturn(proxy, gate)).then_some(proxy);
+                        self.force_part.is_some()
+                    };
+                    if !pinned {
+                        self.trial_partition(bl, x8, y8, 4, thr, lhb);
+                        return;
+                    }
+                }
                 let choice = self.part_decision(|t| t.choose_rect32(x8, y8, thr, lhb));
                 let have_tr = thr && y8 > 0 && (x8 * 8 + 32) < self.w;
                 let have_bl = lhb && x8 > 0 && (y8 * 8 + 32) < self.h;
@@ -582,6 +604,16 @@ impl<'a> LossyTile<'a> {
             let have_h = (x8 + 1) * 8 < self.w;
             let have_v = (y8 + 1) * 8 < self.h;
             if have_h && have_v {
+                if self.trial_level_on(2) && self.trial_src_gate(x8 * 8, y8 * 8, 16) {
+                    // Real-R-D NONE-vs-SPLIT; a non-square proxy winner
+                    // (rects, quads, IntraBC) is kept as decided.
+                    let proxy = self.partition_choice_16(x8, y8, thr, lhb);
+                    if Self::trial_may_overturn(proxy, crate::tuning::get().trial_gate) {
+                        self.trial_partition(bl, x8, y8, 2, thr, lhb);
+                        return;
+                    }
+                    self.force_part = Some(proxy);
+                }
                 let choice = self.part_decision(|t| t.partition_choice_16(x8, y8, thr, lhb));
                 match choice {
                     Part16::Horz => {
@@ -723,6 +755,15 @@ impl<'a> LossyTile<'a> {
             && (x8 + 8) * 8 <= self.w
             && (y8 + 8) * 8 <= self.h
         {
+            if self.trial_level_on(8) && self.trial_src_gate(x8 * 8, y8 * 8, 64) {
+                // Real-R-D whole-64 vs SPLIT; rect64 / IntraBC verdicts stand.
+                let proxy = self.choose_64(x8, y8, thr, lhb);
+                if Self::trial_may_overturn(proxy, crate::tuning::get().trial_gate) {
+                    self.trial_partition(bl, x8, y8, 8, thr, lhb);
+                    return;
+                }
+                self.force_part = Some(proxy);
+            }
             let choice = self.part_decision(|t| t.choose_64(x8, y8, thr, lhb));
             if choice == Part16::Intrabc {
                 let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);

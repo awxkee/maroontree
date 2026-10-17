@@ -1162,6 +1162,7 @@ fn aq_sb_subblock_variances(
 /// Per-tile adaptive-quantization state held on the [`LossyTile`]. When
 /// `enabled` is false every method is a no-op and the tile quantizes at the
 /// fixed base, byte-identical to the pre-AQ encoder.
+#[derive(Clone)]
 struct AqCtx {
     enabled: bool,
     /// frame `base_q_idx`: the anchor the per-SB deltas are measured from and the
@@ -1400,6 +1401,17 @@ struct LossyTile<'a> {
     rec: DecisionRecord,
     /// Replay read positions into `rec`.
     cur: RecordCursor,
+    /// One-shot forced partition choice, consumed by the next `part_decision`
+    /// (the trial-encode legs, see `coder/trial.rs`).
+    force_part: Option<Part16>,
+    /// Scratch semantic-token sink the trial legs encode into (lazily
+    /// created, reused across nodes).
+    trial_enc: Option<OdEcEncoder>,
+    /// Slot-tagged CDF copy the trial legs key their tokens by.
+    trial_cdfs: Option<Box<Cdfs>>,
+    /// Per-slot copies of the decision CDF tables that price trial tokens;
+    /// dropped on every decision-snapshot switch.
+    trial_cost: std::cell::RefCell<Option<Vec<Vec<u16>>>>,
     /// RDO effort: [`Speed::Slow`] (default) or [`Speed::Fast`] (winner-only
     /// RDOQ, DCT-only transform choice, reduced intra mode set).
     speed: Speed,
@@ -1441,6 +1453,7 @@ include!("coder/block32.rs");
 include!("coder/block64.rs");
 include!("coder/block64_rect.rs");
 include!("coder/superblock.rs");
+include!("coder/trial.rs");
 
 #[allow(clippy::too_many_arguments)]
 #[inline]

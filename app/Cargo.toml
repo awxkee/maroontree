@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 maroontree = {path = "../", default-features = true}
 image = {version = "0.25.10", default-features = false, features = ["jpeg", "png", "avif"]}
-criterion = "0.8.2"
 
 # In-process libaom timing reference for speed comparisons (see src/aom_bench.rs).
 # Links the same libaom that `avifenc` uses. Disable with --no-default-features

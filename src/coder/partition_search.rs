@@ -274,6 +274,54 @@ impl<'a> LossyTile<'a> {
         keep
     }
 
+    /// 16x16 angle-delta candidates: the two SATD-ranked deltas (shipped) or
+    /// all six under `ad16_full`, each with its prediction.
+    fn ad16_candidates(
+        &self,
+        mode: usize,
+        px: usize,
+        py: usize,
+        have_tr: bool,
+        have_bl: bool,
+        ad_preds: &mut [&mut [i32; 256]; 3],
+    ) -> Vec<(i32, SBuf<[i32; 256]>)> {
+        let mut out = Vec::with_capacity(6);
+        if crate::tuning::get().ad16_full {
+            for d in [-3i32, -2, -1, 1, 2, 3] {
+                let mut b = self.sbuf_i256();
+                self.intrapred.predict_nd_ad(
+                    mode,
+                    d,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    16,
+                    16,
+                    have_tr,
+                    have_bl,
+                    self.w,
+                    self.h,
+                    self.luma_filter_type(px, py),
+                    &mut b[..],
+                    self.bd,
+                );
+                out.push((d, b));
+            }
+            return out;
+        }
+        for (di, &d) in self
+            .rank_angle_deltas::<256>(mode, px, py, 16, 16, have_tr, have_bl, 2, ad_preds)
+            .iter()
+            .enumerate()
+        {
+            let mut b = self.sbuf_i256();
+            *b = *ad_preds[di];
+            out.push((d, b));
+        }
+        out
+    }
+
     fn rd_cost_square(
         &self,
         px: usize,
@@ -468,6 +516,60 @@ impl<'a> LossyTile<'a> {
                         win = Some((m, pred, resid));
                     }
                 }
+                // `proxy_ad`: price the winner's angle deltas too. The emitted
+                // 8x8 leaf refines deltas, so a delta-less proxy undervalues
+                // the 8x8 children of every edge 16x16 (same hole as split4).
+                if crate::tuning::get().proxy_ad
+                    && let Some((m, _, _)) = win
+                    && self.angle_delta_refines(m)
+                {
+                    let ad_cdf = &self.dcdf().angle_delta[m - V_PRED];
+                    for d in [-3i32, -2, -1, 1, 2, 3] {
+                        let mut pred = [0i32; 64];
+                        self.intrapred.predict_nd_ad(
+                            m,
+                            d,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            8,
+                            8,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            self.luma_filter_type(px, py),
+                            &mut pred,
+                            self.bd,
+                        );
+                        let mut resid = [0i32; 64];
+                        self.rd.residual_pred(&mut resid, &pred[..], &self.src[0], self.w, px, py, 8, 8);
+                        let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                        if proxy_candidate_rdoq(self.speed) {
+                            trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
+                        }
+                        let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                        let distortion = self.luma_partition_distortion(
+                            px,
+                            py,
+                            8,
+                            8,
+                            self.quant.ac_q() as f32,
+                            &pred,
+                            0,
+                            &rr[..],
+                        );
+                        let bits = self.luma_bits(&cf, scan, 8, px, py, m, 1)
+                            + self.mode_bits(px, py, m)
+                            + cdf_cost(ad_cdf, (d + 3) as usize);
+                        let cost = crate::partition_rd::rd_cost(distortion, mlam, bits);
+                        if cost < best {
+                            best = cost;
+                            win = Some((m, pred, resid));
+                        }
+                    }
+                }
                 // Transform refinement on the winner, mirroring the final
                 // block's winner-only ADST/IDTX pass. Without it the proxy
                 // prices every leaf as DCT-only while the real block may code it
@@ -594,6 +696,67 @@ impl<'a> LossyTile<'a> {
                             }
                             joint_beam[pos] = Some((cost, m, pred, resid, beam_cf));
                         }
+                    }
+                }
+                // `proxy_ad` (16x16): the winner's six angle deltas, priced
+                // like the loop above (plus the joint chroma term when coupled).
+                // (joint beam is const-off; when coupled the delta pass is skipped.)
+                let mut ad16: Option<(f32, usize, [i32; 256], [i32; 256])> = None;
+                if crate::tuning::get().proxy_ad
+                    && !coupled
+                    && let Some((m, _, _)) = win16
+                    && self.angle_delta_refines(m)
+                {
+                    let ad_cdf = &self.dcdf().angle_delta[m - V_PRED];
+                    for d in [-3i32, -2, -1, 1, 2, 3] {
+                        let mut pred = [0i32; 256];
+                        self.intrapred.predict_nd_ad(
+                            m,
+                            d,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            16,
+                            16,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            self.luma_filter_type(px, py),
+                            &mut pred,
+                            self.bd,
+                        );
+                        let mut resid = [0i32; 256];
+                        self.rd.residual_pred(&mut resid, &pred[..], &self.src[0], self.w, px, py, 16, 16);
+                        let (mut cf, tf) = self.dct.dct16x16_t(&resid, &self.quant);
+                        if proxy_candidate_rdoq(self.speed) {
+                            trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
+                        }
+                        let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
+                        let distortion = self.luma_partition_distortion(
+                            px,
+                            py,
+                            16,
+                            16,
+                            self.quant.ac_q() as f32,
+                            &pred[..],
+                            0,
+                            &rr[..],
+                        );
+                        let bits = self.luma_bits(&cf, scan, 16, px, py, m, 1)
+                            + self.mode_bits(px, py, m)
+                            + cdf_cost(ad_cdf, (d + 3) as usize);
+                        let cost = crate::partition_rd::rd_cost(distortion, mlam, bits);
+                        if ad16.as_ref().is_none_or(|a| cost < a.0) {
+                            ad16 = Some((cost, m, pred, resid));
+                        }
+                    }
+                    if let Some((cost, m, pred, resid)) = ad16.as_ref()
+                        && *cost < best
+                    {
+                        best = *cost;
+                        win16 = Some((*m, *pred, *resid));
                     }
                 }
                 if coupled {
@@ -3725,13 +3888,10 @@ impl<'a> LossyTile<'a> {
             let mut ad_pred1 = self.sbuf_i256();
             let mut ad_scratch = self.sbuf_i256();
             let mut ad_preds = [&mut *ad_pred0, &mut *ad_pred1, &mut *ad_scratch];
-            for (di, &d) in self.rank_angle_deltas::<256>(
-                    best_mode, px, py, 16, 16, have_tr, have_bl, 2, &mut ad_preds,
-                )
-                .iter()
-                .enumerate()
-            {
-                let pred: &[i32; 256] = &*ad_preds[di];
+            let ad_cands = self.ad16_candidates(best_mode, px, py, have_tr, have_bl, &mut ad_preds);
+            for (d, pred) in &ad_cands {
+                let d = *d;
+                let pred: &[i32; 256] = pred;
                 let mut resid = self.sbuf_i256();
                 self.rd.residual_pred(
                     &mut resid[..],
@@ -3810,12 +3970,10 @@ impl<'a> LossyTile<'a> {
             let mut ad_pred1 = self.sbuf_i256();
             let mut ad_scratch = self.sbuf_i256();
             let mut ad_preds = [&mut *ad_pred0, &mut *ad_pred1, &mut *ad_scratch];
-            for (di, &d) in self
-                .rank_angle_deltas::<256>(m2, px, py, 16, 16, have_tr, have_bl, 2, &mut ad_preds)
-                .iter()
-                .enumerate()
-            {
-                let pred: &[i32; 256] = &*ad_preds[di];
+            let ad_cands = self.ad16_candidates(m2, px, py, have_tr, have_bl, &mut ad_preds);
+            for (d, pred) in &ad_cands {
+                let d = *d;
+                let pred: &[i32; 256] = pred;
                 let mut resid = self.sbuf_i256();
                 self.rd
                     .residual_pred(&mut resid[..], &pred[..], &self.src[0], self.w, px, py, 16, 16);

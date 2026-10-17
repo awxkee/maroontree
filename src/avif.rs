@@ -89,7 +89,8 @@ pub enum ChromaFormat {
 /// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
-    /// [`Speed::Slow`]'s exact search plus per-unit RD CDEF. Wider searches
+    /// [`Speed::Slow`]'s exact search plus per-unit RD CDEF and the real-R-D
+    /// trial-encode partition decision (`coder/trial.rs`). Wider searches
     /// (more mode/palette/partition finalists, looser breakouts) all measured
     /// worse than Slow: they exploit decision-cost errors rather than fix them.
     ExtraSlow,
@@ -168,7 +169,7 @@ impl Speed {
                 if full_res {
                     5
                 } else {
-                    3
+                    crate::tuning::get().mode_budget_slow_sub as usize
                 }
             }
         }
@@ -1976,6 +1977,76 @@ mod tests {
         let serial = encode_rgb8(&image, &config(1)).unwrap();
         let wavefront = encode_rgb8(&image, &config(4)).unwrap();
         assert_eq!(wavefront, serial);
+    }
+
+    /// Serial vs wavefront byte identity at ExtraSlow on a frame whose 32x32
+    /// nodes mix flat fills with hard edges, where the trial-encode partition
+    /// decision (`coder/trial.rs`, on at ExtraSlow) flips NONE to SPLIT. The
+    /// debug-build restore self-check runs inside it.
+    #[test]
+    fn trial_partition_matches_serial_bytes_and_decodes() {
+        let (w, h) = (256usize, 192usize);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                // Cel-shaded look: flat regions, a few hard outlines at
+                // non-block-aligned positions, one soft gradient band.
+                let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+                let mut c = [200u8, 180, 150];
+                if (x + 3) % 71 < 2 || (y + 5) % 53 < 2 {
+                    c = [20, 20, 30];
+                } else if fx > 0.6 && fy < 0.5 {
+                    c = [90, 140, 200];
+                } else if fy > 0.7 {
+                    let g = (fx * 255.0) as u8;
+                    c = [g, 120, 255 - g];
+                }
+                rgb.extend_from_slice(&c);
+            }
+        }
+        let image = PlanarImage::from_interleaved_rgb(w, h, BitDepth::Eight, &rgb).unwrap();
+        let decoder = std::env::var_os("AVIFDEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/opt/homebrew/bin/avifdec"));
+        for chroma in [
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv444,
+            ChromaFormat::Yuv422,
+        ] {
+            for aq in [false, true] {
+                let config = |threads| {
+                    EncodeConfig::new()
+                        .with_quality(62)
+                        .with_chroma(chroma)
+                        .with_threads(threads)
+                        .with_speed(Speed::ExtraSlow)
+                        .with_adaptive_quant(aq)
+                        .with_variance_boost(aq)
+                        .with_updating_cdf(true)
+                };
+                let serial = encode_rgb8(&image, &config(1)).unwrap();
+                let wavefront = encode_rgb8(&image, &config(4)).unwrap();
+                assert_eq!(wavefront, serial, "{chroma:?} aq={aq}");
+                if decoder.is_file() {
+                    let tag = format!("trial-part-{chroma:?}-{aq}");
+                    let input = temp_path(&tag, "avif");
+                    let output = temp_path(&tag, "png");
+                    std::fs::write(&input, serial).unwrap();
+                    let result = Command::new(&decoder)
+                        .arg(&input)
+                        .arg(&output)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "avifdec rejected {chroma:?} aq={aq}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let _ = std::fs::remove_file(input);
+                    let _ = std::fs::remove_file(output);
+                }
+            }
+        }
     }
 
     #[test]

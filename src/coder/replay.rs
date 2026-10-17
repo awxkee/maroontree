@@ -59,6 +59,10 @@ enum TxSel {
     /// payload = per-TX txtp4 symbols, coefficient record packs the sixteen
     /// 4x4s TX-raster-major.
     Split16Tx([u8; 16]),
+    /// 32x32 luma coded as SIXTEEN TX_8X8 (`tx_depth = 2`, raster order);
+    /// payload = per-TX txtp in the TX_8X8 7-type set, coefficient record
+    /// packs the sixteen 8x8s TX-raster-major (64 each).
+    Split32D2([u8; 16]),
     /// 1-D hybrids (V_DCT / H_DCT), TX_8X8 and TX_4X4.
     VDct,
     HDct,
@@ -163,6 +167,10 @@ impl<'a> LossyTile<'a> {
     /// pre-gates folded in) so a replayed value fully determines the branch.
     #[inline]
     fn part_decision(&mut self, f: impl Fn(&Self) -> Part16) -> Part16 {
+        // A trial-encode leg pins this node's choice (see `coder/trial.rs`).
+        if let Some(c) = self.force_part.take() {
+            return c;
+        }
         match self.sb_mode {
             SbMode::Off => f(self),
             SbMode::Capture => {

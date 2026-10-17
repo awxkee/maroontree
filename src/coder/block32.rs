@@ -1137,13 +1137,14 @@ impl<'a> LossyTile<'a> {
         // the same `banding_risk` trigger block16 uses and accept whenever the
         // distortion is not meaningfully worse.
         let mut tx_split = false;
+        let mut d1_rd: Option<f32> = None;
         if rl.is_none()
             && best_filter_intra.is_none()
             && best_palette32.is_none()
             && self.banding_risk(px, py, 32)
         {
             let none_sse = sse_recon::<1024, 32>(&self.rd, &lpred, &self.idct.idct_dequant_32x32(&lcf, &self.quant), self.src_blk(0, px, py, 32, 32), self.bd);
-            let (cf4, sse_s, _bits_s) =
+            let (cf4, sse_s, bits_s) =
                 self.split32_luma_try(px, py, best_mode, best_delta, have_tr, have_bl, lam);
             // Acceptance: the split must genuinely improve SSE. block16 uses a
             // permissive +25% tolerance at 16x16, but four TX_16X16 cost far more
@@ -1154,7 +1155,46 @@ impl<'a> LossyTile<'a> {
                 (sse_s as i128) * 1024 <= (none_sse as i128) * (1024 - SPLIT32_SSE_MARGIN as i128);
             if guarded_take {
                 tx_split = true;
+                d1_rd = Some(rd_cost_i64(
+                    sse_s,
+                    mlam,
+                    bits_s + self.tx_depth_bits(px, py, 32, 32, 1),
+                ));
                 *lcf = cf4;
+            }
+        }
+        // tx_depth = 2 (`tx32_depth2`): sixteen TX_8X8 with per-TX txtp,
+        // against the current winner (whole or depth-1) on plain RD. A 32x32
+        // whose only detail is one hard edge in a corner codes that edge in
+        // one or two 8x8 transforms instead of ringing a TX_32X32 across the
+        // whole block (illustrations: our non-skipped 32x32s cost ~45 B each).
+        let mut tx_d2: Option<[u8; 16]> = None;
+        if rl.is_none()
+            && crate::tuning::get().tx32_depth2
+            && best_filter_intra.is_none()
+            && best_palette32.is_none()
+        {
+            let cur_rd = match d1_rd {
+                Some(r) => r,
+                None => {
+                    let whole_sse = sse_recon::<1024, 32>(
+                        &self.rd,
+                        &lpred,
+                        &self.idct.idct_dequant_32x32(&lcf, &self.quant),
+                        self.src_blk(0, px, py, 32, 32),
+                        self.bd,
+                    );
+                    let whole_bits = self.luma_bits(&lcf[..], &SCAN_32X32, 32, px, py, best_mode, 0);
+                    rd_cost_i64(whole_sse, mlam, whole_bits + self.tx_depth_bits(px, py, 32, 32, 0))
+                }
+            };
+            let (cf16, sse_2, bits_2, d2_txtps) =
+                self.split32_depth2_try(px, py, best_mode, best_delta, have_tr, have_bl, lam, mlam);
+            let d2_rd = rd_cost_i64(sse_2, mlam, bits_2 + self.tx_depth_bits(px, py, 32, 32, 2));
+            if d2_rd < cur_rd {
+                tx_d2 = Some(d2_txtps);
+                tx_split = false;
+                *lcf = cf16;
             }
         }
         // Pure-emit replay: install the recorded winner and its captured
@@ -1174,11 +1214,21 @@ impl<'a> LossyTile<'a> {
                 .copied()
                 .find(|&f| f as u8 == r.filter);
             tx_split = matches!(r.tx, TxSel::SplitDct(_));
+            if let TxSel::Split32D2(t) = r.tx {
+                tx_d2 = Some(t);
+            }
         }
         if let Some(cf) = rl_cf {
             lcf.copy_from_slice(&cf);
         }
-        if tx_split {
+        if tx_d2.is_some() {
+            // Deblock works on TRANSFORM edges: sixteen TX_8X8 tiles.
+            for j in 0..4 {
+                for i in 0..4 {
+                    self.record_tx_blk(x8 + i, y8 + j, 2);
+                }
+            }
+        } else if tx_split {
             // Deblock works on TRANSFORM edges: re-record as four TX_16X16 tiles.
             self.record_tx_blk(x8, y8, 4);
             self.record_tx_blk(x8 + 2, y8, 4);
@@ -1193,8 +1243,11 @@ impl<'a> LossyTile<'a> {
                 .map_or(0, |p| p.sel),
             filter: best_filter_intra.map_or(NO_FILTER, |f| f as u8),
             // `SplitDct` marks the tx_depth=1 grid of four TX_16X16
-            // (coefficients packed quadrant-major); otherwise DCT_DCT.
-            tx: if tx_split {
+            // (coefficients packed quadrant-major); `Split32D2` the tx_depth=2
+            // grid of sixteen TX_8X8; otherwise DCT_DCT.
+            tx: if let Some(t) = tx_d2 {
+                TxSel::Split32D2(t)
+            } else if tx_split {
                 TxSel::SplitDct([1; 4])
             } else {
                 TxSel::from_flags(false, false, false, false)
@@ -1214,6 +1267,7 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra,
                 best_palette32.as_ref(),
                 tx_split,
+                tx_d2,
                 have_tr,
                 have_bl,
             );
@@ -1229,6 +1283,7 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra,
                 best_palette32.as_ref(),
                 tx_split,
+                tx_d2,
                 have_tr,
                 have_bl,
             );
@@ -1244,6 +1299,7 @@ impl<'a> LossyTile<'a> {
                 best_filter_intra,
                 best_palette32.as_ref(),
                 tx_split,
+                tx_d2,
                 have_tr,
                 have_bl,
             );
@@ -1270,6 +1326,7 @@ impl<'a> LossyTile<'a> {
         palette: Option<&LossyLumaPalette>,
         uv_palette: Option<&LossyUvPalette>,
         tx_split: bool,
+        tx_d2: Option<[u8; 16]>,
         have_tr: bool,
         have_bl: bool,
     ) {
@@ -1298,7 +1355,7 @@ impl<'a> LossyTile<'a> {
         if let Some(up) = uv_palette {
             self.emit_palette_uv_map(up);
         }
-        self.code_tx_depth(px, py, 32, 32, tx_split as usize);
+        self.code_tx_depth(px, py, 32, 32, if tx_d2.is_some() { 2 } else { tx_split as usize });
         // Derived ONCE at the block origin (dav1d), before a_mode/l_mode are filled.
         let block_ftype = self.luma_filter_type(px, py);
         let sv = block_skip as u8;
@@ -1307,6 +1364,111 @@ impl<'a> LossyTile<'a> {
         self.l_skip[by4..by4 + 8].fill(sv);
         self.a_mode[bx4..bx4 + 8].fill(mv);
         self.l_mode[by4..by4 + 8].fill(mv);
+        if let Some(txtps) = tx_d2 {
+            // tx_depth = 2: SIXTEEN TX_8X8 in raster order, per-TX prediction
+            // from the running recon (grid edge-flag rule, as the 16x16 depth-2
+            // path) and per-TX txtp from the TX_8X8 intra set.
+            for j in 0..4usize {
+                for i in 0..4usize {
+                    let ti = j * 4 + i;
+                    let (bx, by) = (px + i * 8, py + j * 8);
+                    let (qbx4, qby4) = (bx / 4, by / 4);
+                    let mut cfq = [0i32; 64];
+                    cfq.copy_from_slice(&lcf[ti * 64..ti * 64 + 64]);
+                    let res_ctx = if block_skip {
+                        0x40
+                    } else {
+                        let sk = self.skip_ctx_split(qbx4, qby4, 2, 2);
+                        let ds = self.dc_sign_ctx(0, qbx4, qby4);
+                        let t = txtps[ti];
+                        if t == 2 || t == 3 {
+                            encode_tx8_coeffs_1d(
+                                &mut self.enc,
+                                &mut self.cdfs,
+                                &cfq,
+                                t == 2,
+                                sk,
+                                ds,
+                                filter_intra_tx_mode(None, y_mode),
+                            )
+                        } else {
+                            encode_tx8_coeffs_adapt(
+                                &mut self.enc,
+                                &mut self.cdfs,
+                                &cfq,
+                                false,
+                                sk,
+                                ds,
+                                filter_intra_tx_mode(None, y_mode),
+                                t as usize,
+                            )
+                        }
+                    };
+                    self.a_coef[0][qbx4..qbx4 + 2].fill(res_ctx);
+                    self.l_coef[0][qby4..qby4 + 2].fill(res_ctx);
+                    if self.sb_mode == SbMode::Replay {
+                        continue;
+                    }
+                    let tr = if j == 0 {
+                        py > 0 && (i < 3 || have_tr)
+                    } else {
+                        i < 3
+                    };
+                    let bl = if i == 0 {
+                        px > 0 && (j < 3 || have_bl)
+                    } else {
+                        false
+                    };
+                    let mut pred = [0i32; 64];
+                    if y_mode == DC_PRED && angle_delta == 0 {
+                        let d = self.intrapred.dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                        pred = [d; 64];
+                    } else {
+                        self.intrapred.predict_nd_ad(
+                            y_mode,
+                            angle_delta,
+                            &self.recon[0],
+                            self.w,
+                            bx,
+                            by,
+                            8,
+                            8,
+                            tr,
+                            bl,
+                            self.w,
+                            self.h,
+                            block_ftype,
+                            &mut pred,
+                            self.bd,
+                        );
+                    }
+                    let rr = if block_skip {
+                        [0i32; 64]
+                    } else {
+                        match txtps[ti] {
+                            4 => self.idct.iadst_dequant_8x8(&cfq, &self.quant),
+                            5 => self.idct.iadstdct_dequant_8x8(&cfq, &self.quant),
+                            6 => self.idct.idctadst_dequant_8x8(&cfq, &self.quant),
+                            0 => self.idct.iidentity_dequant_8x8(&cfq, &self.quant),
+                            2 => self.idct.ivdct_dequant_8x8(&cfq, &self.quant),
+                            3 => self.idct.ihdct_dequant_8x8(&cfq, &self.quant),
+                            _ => self.idct.idct_dequant_8x8(&cfq, &self.quant),
+                        }
+                    };
+                    self.rd.reconstruct(
+                        &mut self.recon[0][by * self.w + bx..],
+                        self.w,
+                        None,
+                        &pred,
+                        &rr,
+                        8,
+                        8,
+                        self.bd,
+                    );
+                }
+            }
+            return;
+        }
         if tx_split {
             let maxv = (1i32 << self.bd) - 1;
             for (qi, &(sx, sy)) in Self::Q32.iter().enumerate() {
@@ -2489,6 +2651,289 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    /// Trial-code the 32x32 as SIXTEEN TX_8X8 (`tx_depth = 2`, raster order):
+    /// per-TX prediction from the running recon with the grid edge-flag rule,
+    /// per-TX txtp from the TX_8X8 intra set (DCT, ADST_ADST, ADST_DCT,
+    /// DCT_ADST, IDTX, V_DCT, H_DCT), progressive coefficient contexts.
+    /// Returns (coefficients packed TX-raster-major, SSE, bits, per-TX txtps).
+    /// Restores `self.recon` and the coefficient contexts.
+    #[allow(clippy::too_many_arguments)]
+    fn split32_depth2_try(
+        &mut self,
+        px: usize,
+        py: usize,
+        mode: usize,
+        delta: i32,
+        have_tr: bool,
+        have_bl: bool,
+        lam: f32,
+        rd_lam: f32,
+    ) -> ([i32; 1024], i64, f32, [u8; 16]) {
+        let mut saved = self.sbuf_u1024();
+        for ry in 0..32 {
+            saved[ry * 32..ry * 32 + 32]
+                .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..32]);
+        }
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let block_ftype = self.luma_filter_type(px, py);
+        let (bx4_0, by4_0) = (px / 4, py / 4);
+        let saved_a: [u8; 8] = *self.a_coef[0][bx4_0..].first_chunk().unwrap();
+        let saved_l: [u8; 8] = *self.l_coef[0][by4_0..].first_chunk().unwrap();
+        let mut cf16 = self.sbuf_i1024();
+        let mut sse_sum = 0i64;
+        let mut bits_sum = 0f32;
+        let mut txtps = [1u8; 16];
+        for j in 0..4usize {
+            for i in 0..4usize {
+                let ti = j * 4 + i;
+                let (bx, by) = (px + i * 8, py + j * 8);
+                let tr = if j == 0 {
+                    py > 0 && (i < 3 || have_tr)
+                } else {
+                    i < 3
+                };
+                let bl = if i == 0 {
+                    px > 0 && (j < 3 || have_bl)
+                } else {
+                    false
+                };
+                let mut pred = [0i32; 64];
+                if mode == DC_PRED && delta == 0 {
+                    let d = self.intrapred.dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                    pred = [d; 64];
+                } else {
+                    self.intrapred.predict_nd_ad(
+                        mode,
+                        delta,
+                        &self.recon[0],
+                        self.w,
+                        bx,
+                        by,
+                        8,
+                        8,
+                        tr,
+                        bl,
+                        self.w,
+                        self.h,
+                        block_ftype,
+                        &mut pred,
+                        self.bd,
+                    );
+                }
+                let mut resid = [0i32; 64];
+                self.rd.residual_pred(&mut resid, &pred, &self.src[0], self.w, bx, by, 8, 8);
+                let (qbx4, qby4) = (bx / 4, by / 4);
+                let sk = self.skip_ctx_split(qbx4, qby4, 2, 2);
+                let ds = self.dc_sign_ctx_span(0, qbx4, qby4, 2, 2);
+                let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                trellis_optimize_ctx(
+                    &mut cf,
+                    &tf,
+                    dcq,
+                    acq,
+                    &SCAN_8X8,
+                    lam,
+                    8,
+                    8,
+                    self.dcdf(),
+                    1,
+                    0,
+                    &self.dcdf().eob_bin_64_l,
+                    ds,
+                    self.quant.qm_level(),
+                    self.quant.qidx() as i32,
+                );
+                let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                let dct_sse = sse_recon::<64, 8>(&self.rd, &pred, &rr, self.src_blk(0, bx, by, 8, 8), self.bd);
+                let dct_bits =
+                    self.luma_bits_ctx_bounded(&cf, &SCAN_8X8, 8, bx, by, mode, 1, sk, ds, f32::INFINITY);
+                let mut best = (cf, rr, dct_sse, dct_bits, 1u8);
+                for txtp in [4u8, 5, 6, 0, 2, 3] {
+                    let (mut acf, atf) = match txtp {
+                        4 => self.dct.adst8x8_t(&resid, &self.quant),
+                        5 => self.dct.adstdct8x8_t(&resid, &self.quant),
+                        6 => self.dct.dctadst8x8_t(&resid, &self.quant),
+                        0 => self.dct.idtx8x8_t(&resid, &self.quant),
+                        2 => self.dct.fvdct8x8_t(&resid, &self.quant),
+                        _ => self.dct.fhdct8x8_t(&resid, &self.quant),
+                    };
+                    if txtp >= 4 {
+                        trellis_optimize_ctx(
+                            &mut acf,
+                            &atf,
+                            dcq,
+                            acq,
+                            &SCAN_8X8,
+                            lam,
+                            8,
+                            8,
+                            self.dcdf(),
+                            1,
+                            0,
+                            &self.dcdf().eob_bin_64_l,
+                            ds,
+                            self.quant.qm_level(),
+                            self.quant.qidx() as i32,
+                        );
+                    }
+                    let arr = match txtp {
+                        4 => self.idct.iadst_dequant_8x8(&acf, &self.quant),
+                        5 => self.idct.iadstdct_dequant_8x8(&acf, &self.quant),
+                        6 => self.idct.idctadst_dequant_8x8(&acf, &self.quant),
+                        0 => self.idct.iidentity_dequant_8x8(&acf, &self.quant),
+                        2 => self.idct.ivdct_dequant_8x8(&acf, &self.quant),
+                        _ => self.idct.ihdct_dequant_8x8(&acf, &self.quant),
+                    };
+                    let asse = sse_recon::<64, 8>(&self.rd, &pred, &arr, self.src_blk(0, bx, by, 8, 8), self.bd);
+                    let gate = if txtp >= 4 {
+                        asse <= dct_sse + (dct_sse >> 5)
+                    } else {
+                        asse <= best.2
+                    };
+                    if !gate {
+                        continue;
+                    }
+                    let bits_bound = (rd_cost_i64(best.2, rd_lam, best.3) - asse as f32) / rd_lam;
+                    let abits = if txtp == 2 || txtp == 3 {
+                        self.luma_bits_1d_8x8(&acf, txtp == 2, bx, by, mode)
+                    } else {
+                        self.luma_bits_ctx_bounded(
+                            &acf,
+                            &SCAN_8X8,
+                            8,
+                            bx,
+                            by,
+                            mode,
+                            txtp as usize,
+                            sk,
+                            ds,
+                            bits_bound,
+                        )
+                    };
+                    if rd_cost_i64(asse, rd_lam, abits) < rd_cost_i64(best.2, rd_lam, best.3) {
+                        best = (acf, arr, asse, abits, txtp);
+                    }
+                }
+                let (bcf, brr, bsse, bbits, btxtp) = best;
+                txtps[ti] = btxtp;
+                sse_sum += bsse;
+                bits_sum += bbits;
+                let res_ctx = Self::coef_res_ctx(&bcf, &SCAN_8X8);
+                self.a_coef[0][qbx4..qbx4 + 2].fill(res_ctx);
+                self.l_coef[0][qby4..qby4 + 2].fill(res_ctx);
+                self.rd.reconstruct(
+                    &mut self.recon[0][by * self.w + bx..],
+                    self.w,
+                    None,
+                    &pred,
+                    &brr,
+                    8,
+                    8,
+                    self.bd,
+                );
+                cf16[ti * 64..ti * 64 + 64].copy_from_slice(&bcf);
+            }
+        }
+        for ry in 0..32 {
+            self.recon[0][(py + ry) * self.w + px..][..32]
+                .copy_from_slice(&saved[ry * 32..ry * 32 + 32]);
+        }
+        self.a_coef[0][bx4_0..bx4_0 + 8].copy_from_slice(&saved_a);
+        self.l_coef[0][by4_0..by4_0 + 8].copy_from_slice(&saved_l);
+        (*cf16, sse_sum, bits_sum, txtps)
+    }
+
+    /// Decoder-exact reconstruction of a depth-2 (sixteen TX_8X8) 32x32 from
+    /// committed coefficients: raster per-TX prediction from the running recon
+    /// with the grid edge-flag rule and the per-TX inverse. Used by the CfL
+    /// luma reference. Restores `self.recon`.
+    #[allow(clippy::too_many_arguments)]
+    fn split32_depth2_recon_from_cf(
+        &mut self,
+        px: usize,
+        py: usize,
+        mode: usize,
+        delta: i32,
+        have_tr: bool,
+        have_bl: bool,
+        lcf: &[i32; 1024],
+        txtps: [u8; 16],
+    ) -> Box<[u16; 1024]> {
+        let mut saved = self.sc().take_u1024();
+        for ry in 0..32 {
+            saved[ry * 32..ry * 32 + 32]
+                .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..32]);
+        }
+        let block_ftype = self.luma_filter_type(px, py);
+        let mut rec = self.sc().take_u1024();
+        for j in 0..4usize {
+            for i in 0..4usize {
+                let ti = j * 4 + i;
+                let (bx, by) = (px + i * 8, py + j * 8);
+                let tr = if j == 0 {
+                    py > 0 && (i < 3 || have_tr)
+                } else {
+                    i < 3
+                };
+                let bl = if i == 0 {
+                    px > 0 && (j < 3 || have_bl)
+                } else {
+                    false
+                };
+                let mut pred = [0i32; 64];
+                if mode == DC_PRED && delta == 0 {
+                    let d = self.intrapred.dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
+                    pred = [d; 64];
+                } else {
+                    self.intrapred.predict_nd_ad(
+                        mode,
+                        delta,
+                        &self.recon[0],
+                        self.w,
+                        bx,
+                        by,
+                        8,
+                        8,
+                        tr,
+                        bl,
+                        self.w,
+                        self.h,
+                        block_ftype,
+                        &mut pred,
+                        self.bd,
+                    );
+                }
+                let mut cfq = [0i32; 64];
+                cfq.copy_from_slice(&lcf[ti * 64..ti * 64 + 64]);
+                let rr = match txtps[ti] {
+                    4 => self.idct.iadst_dequant_8x8(&cfq, &self.quant),
+                    5 => self.idct.iadstdct_dequant_8x8(&cfq, &self.quant),
+                    6 => self.idct.idctadst_dequant_8x8(&cfq, &self.quant),
+                    0 => self.idct.iidentity_dequant_8x8(&cfq, &self.quant),
+                    2 => self.idct.ivdct_dequant_8x8(&cfq, &self.quant),
+                    3 => self.idct.ihdct_dequant_8x8(&cfq, &self.quant),
+                    _ => self.idct.idct_dequant_8x8(&cfq, &self.quant),
+                };
+                self.rd.reconstruct(
+                    &mut self.recon[0][by * self.w + bx..],
+                    self.w,
+                    Some((&mut rec[j * 8 * 32 + i * 8..], 32)),
+                    &pred,
+                    &rr,
+                    8,
+                    8,
+                    self.bd,
+                );
+            }
+        }
+        for ry in 0..32 {
+            self.recon[0][(py + ry) * self.w + px..][..32]
+                .copy_from_slice(&saved[ry * 32..ry * 32 + 32]);
+        }
+        self.sc().put_u1024(saved);
+        rec
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn split32_luma_recon_from_cf(
         &mut self,
@@ -2573,6 +3018,7 @@ impl<'a> LossyTile<'a> {
         filter_intra: Option<FilterIntraMode>,
         palette: Option<&LossyLumaPalette>,
         tx_split: bool,
+        tx_d2: Option<[u8; 16]>,
         have_tr: bool,
         have_bl: bool,
     ) {
@@ -2633,7 +3079,11 @@ impl<'a> LossyTile<'a> {
         // replays from the record and the winner state installs after this.
         if self.speed.full_chroma_rdo() && ru.is_none() {
             let mut luma_rec = self.sbuf_u1024();
-            if tx_split {
+            if let Some(t) = tx_d2 {
+                let r = self.split32_depth2_recon_from_cf(px, py, y_mode, angle_delta, have_tr, have_bl, lcf, t);
+                luma_rec.copy_from_slice(&r[..]);
+                self.sc().put_u1024(r);
+            } else if tx_split {
                 let r = self.split32_luma_recon_from_cf(
                     px,
                     py,
@@ -3100,6 +3550,7 @@ impl<'a> LossyTile<'a> {
             palette,
             uv_pal32.as_ref(),
             tx_split,
+            tx_d2,
             have_tr,
             have_bl,
         );
@@ -3149,6 +3600,7 @@ impl<'a> LossyTile<'a> {
         filter_intra: Option<FilterIntraMode>,
         palette: Option<&LossyLumaPalette>,
         tx_split: bool,
+        tx_d2: Option<[u8; 16]>,
         have_tr: bool,
         have_bl: bool,
     ) {
@@ -3232,7 +3684,11 @@ impl<'a> LossyTile<'a> {
         let mut cfl_alpha = [0i32; 2];
         if ru.is_none() && !self.mono {
             let mut luma_rec = self.sbuf_u1024();
-            if tx_split {
+            if let Some(t) = tx_d2 {
+                let r = self.split32_depth2_recon_from_cf(px, py, y_mode, angle_delta, have_tr, have_bl, lcf, t);
+                luma_rec.copy_from_slice(&r[..]);
+                self.sc().put_u1024(r);
+            } else if tx_split {
                 let r = self.split32_luma_recon_from_cf(
                     px,
                     py,
@@ -3513,6 +3969,7 @@ impl<'a> LossyTile<'a> {
             palette,
             None,
             tx_split,
+            tx_d2,
             have_tr,
             have_bl,
         );
@@ -3570,6 +4027,7 @@ impl<'a> LossyTile<'a> {
         filter_intra: Option<FilterIntraMode>,
         palette: Option<&LossyLumaPalette>,
         tx_split: bool,
+        tx_d2: Option<[u8; 16]>,
         have_tr: bool,
         have_bl: bool,
     ) {
@@ -3633,7 +4091,11 @@ impl<'a> LossyTile<'a> {
         // below.
         if ru.is_none() {
             let mut luma_rec = self.sbuf_u1024();
-            if tx_split {
+            if let Some(t) = tx_d2 {
+                let r = self.split32_depth2_recon_from_cf(px, py, y_mode, angle_delta, have_tr, have_bl, lcf, t);
+                luma_rec.copy_from_slice(&r[..]);
+                self.sc().put_u1024(r);
+            } else if tx_split {
                 // Same root cause as the 4:4:4 fix: TX-split luma must be
                 // reconstructed per sub-TX for the CfL AC reference.
                 let r = self.split32_luma_recon_from_cf(
@@ -3886,6 +4348,7 @@ impl<'a> LossyTile<'a> {
             palette,
             None,
             tx_split,
+            tx_d2,
             have_tr,
             have_bl,
         );

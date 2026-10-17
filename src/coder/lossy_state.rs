@@ -289,6 +289,7 @@ impl<'a> LossyTile<'a> {
         self.dec_cdfs = next;
         self.decision_cdf_warmed = warmed;
         *self.coef_cost.borrow_mut() = None;
+        *self.trial_cost.borrow_mut() = None;
     }
 
     /// Token cost tables of the current decision snapshot (lazy).
@@ -390,6 +391,10 @@ impl<'a> LossyTile<'a> {
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
+            force_part: None,
+            trial_enc: None,
+            trial_cdfs: None,
+            trial_cost: std::cell::RefCell::new(None),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -483,6 +488,10 @@ impl<'a> LossyTile<'a> {
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
+            force_part: None,
+            trial_enc: None,
+            trial_cdfs: None,
+            trial_cost: std::cell::RefCell::new(None),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -585,6 +594,10 @@ impl<'a> LossyTile<'a> {
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
+            force_part: None,
+            trial_enc: None,
+            trial_cdfs: None,
+            trial_cost: std::cell::RefCell::new(None),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -687,6 +700,10 @@ impl<'a> LossyTile<'a> {
             sb_mode: SbMode::Off,
             rec: DecisionRecord::default(),
             cur: RecordCursor::default(),
+            force_part: None,
+            trial_enc: None,
+            trial_cdfs: None,
+            trial_cost: std::cell::RefCell::new(None),
             speed: Speed::Slow,
             aq: AqCtx::off(),
             wiener: None,
@@ -1945,11 +1962,17 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    fn prefer_8x8_none(&self, x8: usize, y8: usize) -> bool {
+    fn prefer_8x8_none(&self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) -> bool {
         if self.mono {
             return true;
         }
         let (px, py) = (x8 * 8, y8 * 8);
+        // `split4_ad`: price the 8x8 side with the leaf's real top-right /
+        // bottom-left availability and its angle deltas. Without it an edge
+        // 8x8 that needs a delta looks worse than four delta-less 4x4s (4x4
+        // cannot signal angle_delta at all) and the edge is coded 3-9x worse.
+        let s4ad = crate::tuning::get().split4_ad;
+        let (ptr, pbl) = if s4ad { (have_tr, have_bl) } else { (false, false) };
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let lam = trellis_lambda() * prdo;
@@ -1978,8 +2001,8 @@ impl<'a> LossyTile<'a> {
                     py,
                     8,
                     8,
-                    false,
-                    false,
+                    ptr,
+                    pbl,
                     self.w,
                     self.h,
                     self.luma_filter_type(px, py),
@@ -1987,34 +2010,63 @@ impl<'a> LossyTile<'a> {
                     self.bd,
                 );
             }
-            let mut resid = [0i32; 64];
-            self.rd
-                .residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, 8, 8);
-            let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
-            trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
-            let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
-            let distortion = self.luma_partition_distortion(
-                px,
-                py,
-                8,
-                8,
-                self.quant.ac_q() as f32,
-                &pred[..],
-                0,
-                &rr[..],
-            );
-            let eff = crate::partition_rd::rd_cost(
-                distortion,
-                mlam,
-                self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1)
-                    + if crate::tuning::get().exact_8x8_mode_rate && !self.ss422 && !self.mono {
-                        self.mode_bits(px, py, m)
-                    } else {
-                        0.0
-                    },
-            );
+            let mode_rate = if crate::tuning::get().exact_8x8_mode_rate && !self.ss422 && !self.mono {
+                self.mode_bits(px, py, m)
+            } else {
+                0.0
+            };
+            let price8 = |pred: &[i32; 64], extra: f32| -> f32 {
+                let mut resid = [0i32; 64];
+                self.rd
+                    .residual_pred(&mut resid, pred, &self.src[0], self.w, px, py, 8, 8);
+                let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
+                let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                let distortion = self.luma_partition_distortion(
+                    px,
+                    py,
+                    8,
+                    8,
+                    self.quant.ac_q() as f32,
+                    &pred[..],
+                    0,
+                    &rr[..],
+                );
+                crate::partition_rd::rd_cost(
+                    distortion,
+                    mlam,
+                    self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1) + mode_rate + extra,
+                )
+            };
+            let eff = price8(&pred, 0.0);
             if eff < eff8 {
                 eff8 = eff;
+            }
+            if s4ad && self.angle_delta_refines(m) {
+                let ad_cdf = &self.dcdf().angle_delta[m - V_PRED];
+                for d in [-3i32, -2, -1, 1, 2, 3] {
+                    self.intrapred.predict_nd_ad(
+                        m,
+                        d,
+                        &self.recon[0],
+                        self.w,
+                        px,
+                        py,
+                        8,
+                        8,
+                        ptr,
+                        pbl,
+                        self.w,
+                        self.h,
+                        self.luma_filter_type(px, py),
+                        &mut pred,
+                        self.bd,
+                    );
+                    let eff = price8(&pred, cdf_cost(ad_cdf, (d + 3) as usize));
+                    if eff < eff8 {
+                        eff8 = eff;
+                    }
+                }
             }
         }
         // Palette at 8x8: split4 leaves (4x4) cannot carry a palette, so a
@@ -3402,17 +3454,71 @@ impl<'a> LossyTile<'a> {
     /// optimistic (children predict from perfect edges: measured +8.5% BD,
     /// 4x4 count x6); zeros make them pessimistic (black edges).
     pub(crate) fn fill_recon_estimate(&mut self) {
+        self.fill_recon_estimate_region(0, 0, self.w, self.h);
+    }
+
+    /// Whether the `dim`x`dim` luma region at `(px, py)` holds a hard edge
+    /// inside otherwise flat content (see `Tuning::edge_fill`): at least one
+    /// 8x8 with std >= `edge_fill_hi` and at least `edge_fill_frac` of the 8x8s
+    /// with std <= `edge_fill_lo`.
+    pub(crate) fn edge_in_flat(&self, px: usize, py: usize, dim: usize) -> bool {
+        let t = crate::tuning::get();
+        let (hi, lo) = (t.edge_fill_hi * t.edge_fill_hi, t.edge_fill_lo * t.edge_fill_lo);
+        let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
+        let (mut n, mut n_hi, mut n_lo) = (0usize, 0usize, 0usize);
+        for y in (0..bh).step_by(8) {
+            for x in (0..bw).step_by(8) {
+                let (w, h) = ((bw - x).min(8), (bh - y).min(8));
+                let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px + x, py + y, w, h);
+                let cnt = (w * h) as f32;
+                let mean = sum as f32 / cnt;
+                let var = (sum_sq as f32 / cnt - mean * mean).max(0.0);
+                n += 1;
+                if var >= hi {
+                    n_hi += 1;
+                } else if var <= lo {
+                    n_lo += 1;
+                }
+            }
+        }
+        n_hi >= 1 && n_lo as f32 >= t.edge_fill_frac * n as f32
+    }
+
+    /// `fill_recon_estimate` over one luma region (chroma follows the
+    /// subsampling). Used per superblock by the `edge_fill` gate.
+    pub(crate) fn fill_recon_estimate_region(&mut self, px: usize, py: usize, rw: usize, rh: usize) {
         let maxv = (1i32 << self.bd) - 1;
+        let (sx, sy) = (usize::from(self.ss420 || self.ss422), usize::from(self.ss420));
         for p in 0..3 {
             if self.recon[p].is_empty() {
                 continue;
             }
             let (pw, q) = if p == 0 { (self.w, &self.quant) } else { (self.cw, &self.cquant) };
             let ph = self.recon[p].len() / pw;
+            let (x0, y0, x1, y1) = if p == 0 {
+                (px, py, (px + rw).min(pw), (py + rh).min(ph))
+            } else {
+                (px >> sx, py >> sy, ((px + rw) >> sx).min(pw), ((py + rh) >> sy).min(ph))
+            };
             let src = &self.src[p];
-            for by in (0..ph).step_by(4) {
-                for bx in (0..pw).step_by(4) {
-                    let (bw, bh) = ((pw - bx).min(4), (ph - by).min(4));
+            let fk = crate::tuning::get().recon_fill_k;
+            if crate::tuning::get().recon_fill_dim == 8 {
+                for by in (y0..y1).step_by(8) {
+                    for bx in (x0..x1).step_by(8) {
+                        let (bw, bh) = ((x1 - bx).min(8), (y1 - by).min(8));
+                        let (sum, _) = block_moments_i32(src, pw, bx, by, bw, bh);
+                        let n = (bw * bh) as i64;
+                        let mean = ((sum + n / 2) / n).clamp(0, maxv as i64) as u16;
+                        for y in 0..bh {
+                            self.recon[p][(by + y) * pw + bx..][..bw].fill(mean);
+                        }
+                    }
+                }
+                continue;
+            }
+            for by in (y0..y1).step_by(4) {
+                for bx in (x0..x1).step_by(4) {
+                    let (bw, bh) = ((x1 - bx).min(4), (y1 - by).min(4));
                     let mut blk = [0i32; 16];
                     let mut sum = 0i32;
                     for y in 0..bh {
@@ -3435,7 +3541,7 @@ impl<'a> LossyTile<'a> {
                     for y in 0..bh {
                         for x in 0..bw {
                             self.recon[p][(by + y) * pw + bx + x] =
-                                (mean + rr[y * 4 + x]).clamp(0, maxv) as u16;
+                                (mean + (rr[y * 4 + x] as f32 * fk) as i32).clamp(0, maxv) as u16;
                         }
                     }
                 }
