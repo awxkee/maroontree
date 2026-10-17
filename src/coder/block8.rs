@@ -701,6 +701,8 @@ impl<'a> LossyTile<'a> {
         let mut best_dct_bits = 0f32;
         let mut best_filter_intra = None;
         let mut best_palette: Option<LossyLumaPalette> = None;
+        // Two cheapest directional candidates (cost, mode) for `ad8_runner`.
+        let mut dir_top: [(f32, usize); 2] = [(f32::INFINITY, DC_PRED); 2];
         let mut luma_beam: [Option<Luma8BeamCandidate>; JOINT_LUMA_BEAM] =
             std::array::from_fn(|_| None);
         let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
@@ -802,6 +804,14 @@ impl<'a> LossyTile<'a> {
                     0.0
                 };
                 let cost = rd_cost_i64(sse, mlam, bits + self.mode_bits(px, py, m) + filter_bits);
+                if (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                    if cost < dir_top[0].0 {
+                        dir_top[1] = dir_top[0];
+                        dir_top[0] = (cost, m);
+                    } else if cost < dir_top[1].0 {
+                        dir_top[1] = (cost, m);
+                    }
+                }
                 let candidate = Luma8BeamCandidate {
                     luma_cost: cost,
                     mode: m,
@@ -1022,34 +1032,99 @@ impl<'a> LossyTile<'a> {
         // best by SSE + lambda*(coeff bits + angle_delta symbol bits). V/H and the
         // non-directional modes stay at delta 0. ~6 extra predictions per block.
         let mut best_delta: i32 = 0;
+        // Angle-delta winner refinement: if the winning luma mode is directional
+        // (the six diagonals, plus V/H under `ad_vh`), try angle_delta in
+        // -3..=3 (3 deg steps) and keep the best by SSE + lambda*(coeff bits +
+        // angle_delta symbol bits). Shipped: the two SATD-ranked deltas;
+        // `ad8_full` prices all six. `ad8_runner` then gives the best
+        // directional that did NOT win the same refinement against the
+        // winner's full cost (the 16x16 `ad_runner` analog): on hard outline
+        // edges the right (mode, delta) pair loses at delta 0 and was never
+        // evaluated otherwise (illustrations: our prediction error at units
+        // where aom codes a delta and we do not was 2-5x aom's).
         outline_block8(|| {
-            if rl.is_none()
-                && self.speed.try_angle_deltas_av1(8, self.base_q_idx)
-                && self.angle_delta_refines(best_mode)
-            {
+            if rl.is_some() || !self.speed.try_angle_deltas_av1(8, self.base_q_idx) {
+                return;
+            }
+            let tune = crate::tuning::get();
+            let runner = if dir_top[0].1 == best_mode { dir_top[1] } else { dir_top[0] };
+            let try_runner = tune.ad8_runner
+                && runner.0.is_finite()
+                && runner.1 != best_mode
+                && self.angle_delta_refines(runner.1)
+                && best_filter_intra.is_none()
+                && best_palette.is_none();
+            if !self.angle_delta_refines(best_mode) && !try_runner {
+                return;
+            }
+            // Winner's full cost (mode bits + its delta/filter symbol) so the
+            // runner-up can be compared on the same basis.
+            let winner_extra = |mode: usize, delta: i32| -> f32 {
+                if (V_PRED..=VERT_LEFT_PRED).contains(&mode) {
+                    cdf_cost(&self.dcdf().angle_delta[mode - V_PRED], (delta + 3) as usize)
+                } else if mode == DC_PRED {
+                    cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(8, 8)], 0)
+                } else {
+                    0.0
+                }
+            };
+            let mut ad_pred0 = self.sbuf_i64();
+            let mut ad_pred1 = self.sbuf_i64();
+            let mut ad_scratch = self.sbuf_i64();
+            for (mode, is_runner) in [(best_mode, false), (runner.1, true)] {
+                if is_runner {
+                    if !try_runner {
+                        continue;
+                    }
+                } else if !self.angle_delta_refines(best_mode) {
+                    continue;
+                }
                 let mut ad_cdf = [0u16; 7];
-                ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
-                let mut best_ad_cost =
-                    rd_cost_i64(best_dct_sse, mlam, best_dct_bits + cdf_cost(&ad_cdf, 3));
-                let mut ad_pred0 = self.sbuf_i64();
-                let mut ad_pred1 = self.sbuf_i64();
-                let mut ad_scratch = self.sbuf_i64();
-                let mut ad_preds = [&mut *ad_pred0, &mut *ad_pred1, &mut *ad_scratch];
-                for (di, &d) in self.rank_angle_deltas::<64>(
-                        best_mode,
-                        px,
-                        py,
-                        8,
-                        8,
-                        have_tr,
-                        have_bl,
-                        2,
-                        &mut ad_preds,
-                    )
-                .iter()
-                .enumerate()
-            {
-                let pred: &[i32; 64] = &*ad_preds[di];
+                ad_cdf.copy_from_slice(&self.dcdf().angle_delta[mode - V_PRED]);
+                let mode_extra = self.mode_bits(px, py, mode);
+                // Running best on the FULL basis (coeff + mode + delta/filter bits).
+                let mut best_cost = rd_cost_i64(
+                    best_dct_sse,
+                    mlam,
+                    best_dct_bits + self.mode_bits(px, py, best_mode) + winner_extra(best_mode, best_delta),
+                );
+                let mut cands: [(i32, [i32; 64]); 6] = [(0, [0i32; 64]); 6];
+                let mut ncand = 0usize;
+                if tune.ad8_full {
+                    for d in [-3i32, -2, -1, 1, 2, 3] {
+                        self.intrapred.predict_nd_ad(
+                            mode,
+                            d,
+                            &self.recon[0],
+                            self.w,
+                            px,
+                            py,
+                            8,
+                            8,
+                            have_tr,
+                            have_bl,
+                            self.w,
+                            self.h,
+                            self.luma_filter_type(px, py),
+                            &mut cands[ncand].1,
+                            self.bd,
+                        );
+                        cands[ncand].0 = d;
+                        ncand += 1;
+                    }
+                } else {
+                    let mut ad_preds = [&mut *ad_pred0, &mut *ad_pred1, &mut *ad_scratch];
+                    for (di, &d) in self
+                        .rank_angle_deltas::<64>(mode, px, py, 8, 8, have_tr, have_bl, 2, &mut ad_preds)
+                        .iter()
+                        .enumerate()
+                    {
+                        cands[ncand] = (d, *ad_preds[di]);
+                        ncand += 1;
+                    }
+                }
+                for (d, pred) in &cands[..ncand] {
+                    let d = *d;
                     let mut resid = [0i32; 64];
                     self.rd
                         .residual_pred(&mut resid, pred, &self.src[0], self.w, px, py, 8, 8);
@@ -1075,16 +1150,23 @@ impl<'a> LossyTile<'a> {
                     }
                     let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
                     let sse = sse_recon::<64, 8>(&self.rd, pred, &rr, self.src_blk(0, px, py, 8, 8), self.bd);
-                    let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, best_mode, 1);
-                    let cost = rd_cost_i64(sse, mlam, bits + cdf_cost(&ad_cdf, (d + 3) as usize));
-                    if rl.is_some() || cost < best_ad_cost {
-                        best_ad_cost = cost;
+                    let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, mode, 1);
+                    let cost = rd_cost_i64(
+                        sse,
+                        mlam,
+                        bits + mode_extra + cdf_cost(&ad_cdf, (d + 3) as usize),
+                    );
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_mode = mode;
                         best_delta = d;
                         lpred_arr = *pred;
                         lcf = cf;
                         ltf = tf;
                         best_dct_sse = sse;
                         best_dct_bits = bits;
+                        best_filter_intra = None;
+                        best_palette = None;
                     }
                 }
             }
@@ -1461,6 +1543,9 @@ impl<'a> LossyTile<'a> {
         let mut cpred422 = [[0i32; 32]; 2];
         let mut use_cfl = false;
         let mut cfl_alpha_uv = [0i32; 2];
+        // 4:2:0 CfL winner's (sse, coef bits + sig bits) so `uv8_vs_cfl` can
+        // re-price it on the directional closure's chroma lambda.
+        let mut cfl_rd_420 = (0i64, f32::INFINITY);
         // Pure-emit replay never evaluates CfL; the captured winner installs
         // below (recon comes preinstalled from the record).
         outline_block8(|| {
@@ -1949,6 +2034,13 @@ impl<'a> LossyTile<'a> {
                     self.cquant.ac_q() as f32,
                     trellis_lambda(),
                 );
+                // `uv8_cfl_mlam_c`: decide CfL-vs-DC on the chroma lambda (the
+                // directional closure below already does), not the luma one.
+                let mlam = if crate::tuning::get().uv8_cfl_mlam_c {
+                    self.emit_mlam_c(px, py, 8)
+                } else {
+                    mlam
+                };
                 let lrr = if best_is_vdct {
                     self.idct.ivdct_dequant_8x8(&lcf, &self.quant)
                 } else if best_is_hdct {
@@ -2024,6 +2116,7 @@ impl<'a> LossyTile<'a> {
                 if ru.is_some() || (cfl_total < cur_total && (cfl_a[0] != 0 || cfl_a[1] != 0)) {
                     use_cfl = true;
                     cfl_alpha_uv = cfl_a;
+                    cfl_rd_420 = (cfl_sse, cfl_bits + sig);
                     ccf44[..2].copy_from_slice(&cfl_ccf[..2]);
                 }
             }
@@ -2033,10 +2126,15 @@ impl<'a> LossyTile<'a> {
         // tracks chroma edges/gradients that plain DC over-smooths. Considered
         // only when CfL did not win; chosen on a real RD margin over DC.
         outline_block8(|| {
+            // `uv8_vs_cfl`: the directional candidates also compete against a
+            // CfL winner (illustrations: aom picks a directional chroma mode on
+            // 25-34% of 8x8 blocks, we picked DC/CfL with 2.5-20x the
+            // prediction error where it mattered).
+            let vs_cfl = crate::tuning::get().uv8_vs_cfl;
             if self.speed.full_chroma_rdo()
                 && !self.mono
                 && self.ss420
-                && !use_cfl
+                && (!use_cfl || vs_cfl)
                 && self.cquant.ac_q() < 120
                 && ru.is_none()
             {
@@ -2054,7 +2152,11 @@ impl<'a> LossyTile<'a> {
                         self.chroma_bits(&ccf44[ci], &SCAN_4X4, 4, plane, cx, cy),
                     );
                 }
-                let mut best_total = dc_total;
+                let mut best_total = if use_cfl {
+                    rd_cost_i64(cfl_rd_420.0, mlam, cfl_rd_420.1)
+                } else {
+                    dc_total
+                };
                 let mut best_mode_uv = DC_PRED;
                 let mut best_ccf = ccf44;
                 let mut best_pred = [[0i32; 16]; 2];
@@ -2140,6 +2242,8 @@ impl<'a> LossyTile<'a> {
                     chosen_uv_420 = best_mode_uv;
                     ccf44[..2].copy_from_slice(&best_ccf[..2]);
                     paeth_pred420[..2].copy_from_slice(&best_pred[..2]);
+                    // A directional beat the CfL winner: CfL is out.
+                    use_cfl = false;
                 }
             }
         });

@@ -107,6 +107,38 @@ pub(crate) struct EntropyTokens {
     pub(crate) cdef_point: Option<u32>,
 }
 
+impl EntropyTokens {
+    /// Estimated size in bits of this stream priced against the immutable
+    /// `tables` (one copy per semantic slot, in `Cdfs::semantic_slots` order;
+    /// no adaptation). Used by the trial-encode partition decision, so it
+    /// must depend on nothing but the tokens and the decision snapshot.
+    pub(crate) fn estimate_bits(&self, tables: &[Vec<u16>]) -> f32 {
+        let q = crate::cost::cost_q_table();
+        let mass_bits =
+            |p: i32| q[p.clamp(1, 32768) as usize] as f32 * crate::cost::COST_Q_SCALE_INV;
+        let mut bits = 0.0f32;
+        for &token in &self.ops {
+            let tag = token & TOKEN_TAG_MASK;
+            if tag == 0 || tag == TOKEN_NOUPDATE {
+                let cdf = ((token >> 8) & 0xffff) as usize;
+                let s = (token & 0xff) as usize;
+                bits += crate::cost::cdf_cost_with_table(&tables[cdf], s, q);
+            } else if tag == TOKEN_BOOL {
+                let f = ((token >> 1) & 0xffff) as i32;
+                bits += mass_bits(if token & 1 != 0 { f } else { 32768 - f });
+            } else {
+                let cdf = ((token >> 1) & 0xffff) as usize;
+                let top = token & 1 != 0;
+                bits += mass_bits(i32::from(crate::coeffs::gather_split_prob_icdf(
+                    &tables[cdf],
+                    top,
+                )));
+            }
+        }
+        bits
+    }
+}
+
 /// Raw `store` ops with per-superblock `mark`s; replaying through a fresh
 /// encoder reproduces the exact bytes while any recorded (fl, fh, nms) holds.
 #[derive(Default)]

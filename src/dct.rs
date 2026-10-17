@@ -2472,9 +2472,7 @@ macro_rules! dispatch_qm_ratio_methods {
             ) -> ([i32; $n], [f32; $n]) {
                 // Transform-gain compensation for the 4-wide family — the
                 // pre-dispatch wrappers applied this and the refactor dropped
-                // it (bisected 2026-07-26: +1.77% BD, x_fractal +5.70 — the
-                // mis-scaled forward made ADST-4x4/4x8 candidates falsely
-                // cheap).
+                // it.
                 let dc = mul_q16(quant.q_mult_dc(), $ratio);
                 let ac = mul_q16(quant.q_mult_ac(), $ratio);
                 apply_qmatrix_result(
@@ -2679,7 +2677,13 @@ impl DctDispatch {
     ) -> ([i32; 32], [f32; 32]) {
         let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
         let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-        apply_qmatrix_result(adst8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+        apply_qmatrix_result(
+            adst8x4_quant_t_direct(residual, dc, ac),
+            quant,
+            8,
+            4,
+            self.apply_qmatrix,
+        )
     }
 
     /// Scalar-only 8x4 ADST-family forward (no SIMD dispatch field).
@@ -2690,7 +2694,13 @@ impl DctDispatch {
     ) -> ([i32; 32], [f32; 32]) {
         let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
         let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-        apply_qmatrix_result(adstdct8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+        apply_qmatrix_result(
+            adstdct8x4_quant_t_direct(residual, dc, ac),
+            quant,
+            8,
+            4,
+            self.apply_qmatrix,
+        )
     }
 
     /// Scalar-only 8x4 ADST-family forward (no SIMD dispatch field).
@@ -2701,7 +2711,13 @@ impl DctDispatch {
     ) -> ([i32; 32], [f32; 32]) {
         let dc = mul_q16(quant.q_mult_dc(), RATIO_4X8_Q16);
         let ac = mul_q16(quant.q_mult_ac(), RATIO_4X8_Q16);
-        apply_qmatrix_result(dctadst8x4_quant_t_direct(residual, dc, ac), quant, 8, 4, self.apply_qmatrix)
+        apply_qmatrix_result(
+            dctadst8x4_quant_t_direct(residual, dc, ac),
+            quant,
+            8,
+            4,
+            self.apply_qmatrix,
+        )
     }
 
     pub(crate) fn dct4x16_t(
@@ -4267,13 +4283,19 @@ mod adst_roundtrip_tests {
             let (cad, tad) = sc.adstdct8x4_t(r, &q);
             let (cda, tda) = sc.dctadst8x4_t(r, &q);
             for (c, t) in [(&ca, &ta), (&cad, &tad), (&cda, &tda)] {
-                assert!(max_round_gap(c, t) <= 0.5 + 1e-3, "levels are not the rounded targets");
+                assert!(
+                    max_round_gap(c, t) <= 0.5 + 1e-3,
+                    "levels are not the rounded targets"
+                );
             }
             let ra = crate::idct::iadst_dequant_8x4(&ca, &q);
             let rad = crate::idct::iadstdct_dequant_8x4(&cad, &q);
             let rda = crate::idct::idctadst_dequant_8x4(&cda, &q);
             for rec in [&ra, &rad, &rda] {
-                assert!(sse(r, rec) / en < 2e-3, "8x4 forward/inverse pair does not round-trip");
+                assert!(
+                    sse(r, rec) / en < 2e-3,
+                    "8x4 forward/inverse pair does not round-trip"
+                );
             }
         }
         // Orientation (a vertical ramp has constant rows): under ADST_DCT the
@@ -4282,10 +4304,16 @@ mod adst_roundtrip_tests {
         // does not contain the constant, so energy leaks to fx > 0.
         let (cad, _) = sc.adstdct8x4_t(&vramp, &q);
         let off_fx0: i64 = (4..32).map(|i| (cad[i] as i64).abs()).sum();
-        assert_eq!(off_fx0, 0, "ADST_DCT must be horizontal DCT (fx==0 only for a vertical ramp)");
+        assert_eq!(
+            off_fx0, 0,
+            "ADST_DCT must be horizontal DCT (fx==0 only for a vertical ramp)"
+        );
         let (cda, _) = sc.dctadst8x4_t(&vramp, &q);
         let rest: i64 = (4..32).map(|i| (cda[i] as i64).abs()).sum();
-        assert!(rest > 0, "DCT_ADST must be horizontal ADST (energy leaks past fx==0)");
+        assert!(
+            rest > 0,
+            "DCT_ADST must be horizontal ADST (energy leaks past fx==0)"
+        );
     }
 
     #[test]

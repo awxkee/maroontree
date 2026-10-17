@@ -122,6 +122,76 @@ pub(crate) struct Tuning {
     /// 4:2:0 chroma qindex delta held at qindex >= 136 (see `quant::uv420_mid_delta`).
     /// SHIPPED 28 = the mid-band -28 never decays.
     pub(crate) uv420_tail_delta: f32,
+    /// 4:2:0 chroma qindex delta in the mid band (qindex 64..=96), probe knob for
+    /// the shipped `quant::UV420_MID_D` = 28 (aom uses -16 at every qindex).
+    pub(crate) uv420_mid_d: f32,
+    /// Slow-tier luma mode shortlist budget for subsampled formats (shipped 3; 444 = 5).
+    pub(crate) mode_budget_slow_sub: u32,
+    /// Per-superblock realistic-edge fill for the decision proxies, gated on the
+    /// source: a hard edge (8x8 std >= `edge_fill_hi`) inside a mostly flat
+    /// superblock (>= `edge_fill_frac` of the 8x8s with std <= `edge_fill_lo`).
+    /// Without it the SPLIT children predict from zero-filled recon and the
+    /// edge is swallowed by one big DC block.
+    pub(crate) edge_fill: bool,
+    pub(crate) edge_fill_hi: f32,
+    pub(crate) edge_fill_lo: f32,
+    pub(crate) edge_fill_frac: f32,
+    /// Realism of the recon estimate the proxies see (`fill_recon_estimate_region`):
+    /// `recon_fill_k` scales the quantized 4x4 residual added to the 4x4 mean
+    /// (1.0 = shipped estimate, 0.0 = 4x4 means only); `recon_fill_dim` 8 fills
+    /// flat 8x8 means instead (k ignored). Lower realism = less 4x4 over-split.
+    pub(crate) recon_fill_k: f32,
+    pub(crate) recon_fill_dim: u32,
+    /// 8x8 leaf angle deltas: `ad8_full` prices all six deltas (not the SATD
+    /// top-2); `ad8_runner` also refines the runner-up directional mode.
+    /// SHIPPED true/true with `split4_ad` (2026-10-16): illustrations 420
+    /// tori -4.4 / top -3.3 / jake -1.7, 444 -1.9, 422 -3.6; tuning -0.28,
+    /// synth -0.56, holdout -0.08; ~+10-15% Slow time.
+    pub(crate) ad8_full: bool,
+    pub(crate) ad8_runner: bool,
+    /// 8x8-vs-split4 decision prices the 8x8 side with angle deltas + real
+    /// tr/bl. Without it edge 8x8s went to four 4x4s, which cannot signal
+    /// angle_delta (spec: bsize >= 8x8) and predict outlines 3-9x worse.
+    pub(crate) split4_ad: bool,
+    /// Real-R-D trial-encode partition decision (`coder/trial.rs`): bitmask
+    /// of square nodes whose NONE-vs-SPLIT choice codes BOTH legs for real
+    /// (children with their own decisions) and keeps the cheaper one.
+    /// 8 = the 64x64 node, 4 = the 32x32 node, 2 = the 16x16 node.
+    /// 0 = the proxy decision everywhere.
+    pub(crate) trial_part: u32,
+    /// Same bitmask, additionally applied at ExtraSlow. SHIPPED 6.
+    pub(crate) trial_part_xslow: u32,
+    /// Trial comparison axis: false = both legs priced on the node's own
+    /// perceptual scale; true = each 16x16 quadrant's distortion normalized by
+    /// that quadrant's own lambda (what the bottom-up proxy sum does).
+    pub(crate) trial_child_prdo: bool,
+    /// Multiplier on the SPLIT leg's trial cost (1.0 = pure R-D).
+    pub(crate) trial_split_bias: f32,
+    /// Which proxy verdicts the trial may overturn: 0 = always trial (the
+    /// proxy is skipped where it is not needed), 1 = trial only where the
+    /// proxy chose NONE (the swallowed-edge defect; a proxy SPLIT stands),
+    /// 2 = trial only where the proxy chose SPLIT.
+    pub(crate) trial_gate: u32,
+    /// Source gate on the trial (0 = none): run it only where some 8x8 of the
+    /// node has std >= `trial_edge_hi` (there is structure a big block could
+    /// swallow) and, when `trial_edge_lo` > 0, some 8x8 has std <= it (the
+    /// structure sits in otherwise flat content: an outline, not texture).
+    pub(crate) trial_edge_hi: f32,
+    pub(crate) trial_edge_lo: f32,
+    /// Partition proxies (`rd_cost_square` 8/16) price the winner's six angle
+    /// deltas. Measured inert on top of the three above (-1.4 alone, +8% time).
+    pub(crate) proxy_ad: bool,
+    /// 16x16 leaf (winner + `ad_runner`) prices all six angle deltas.
+    pub(crate) ad16_full: bool,
+    /// 4:2:0 8x8 leaf: directional chroma candidates compete against CfL too.
+    pub(crate) uv8_vs_cfl: bool,
+    /// 4:2:0 8x8 leaf: CfL-vs-DC decided on the chroma lambda (emit_mlam_c).
+    pub(crate) uv8_cfl_mlam_c: bool,
+    /// 32x32 luma leaf: price `tx_depth = 2` (sixteen TX_8X8, per-TX txtp)
+    /// against the whole / depth-1 transform by RD. Illustrations: a 32x32 DC
+    /// block with one outline edge in a corner coded its residual with one
+    /// TX_32X32 (~45 B per non-skipped 32x32 on jake_cat vs aom's 0.9 B).
+    pub(crate) tx32_depth2: bool,
     pub(crate) uv422_mid_scale: f32,
     /// Source-domain SPLIT breakout ratio at Slow.
     pub(crate) split_breakout_slow: f32,
@@ -353,6 +423,29 @@ impl Tuning {
         cdef_gate: 15000.0,
         cdef_chroma_w: 1.0,
         uv420_tail_delta: 28.0,
+        uv420_mid_d: 28.0,
+        mode_budget_slow_sub: 3,
+        edge_fill: false,
+        edge_fill_hi: 12.0,
+        edge_fill_lo: 4.0,
+        edge_fill_frac: 0.5,
+        recon_fill_k: 1.0,
+        recon_fill_dim: 4,
+        ad8_full: true,
+        ad8_runner: true,
+        split4_ad: true,
+        trial_part: 0,
+        trial_part_xslow: 6,
+        trial_child_prdo: false,
+        trial_split_bias: 1.0,
+        trial_gate: 1,
+        trial_edge_hi: 16.0,
+        trial_edge_lo: 0.0,
+        proxy_ad: false,
+        ad16_full: false,
+        uv8_vs_cfl: false,
+        uv8_cfl_mlam_c: false,
+        tx32_depth2: true,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 1.5,
         fixed_size_fast: 16,
@@ -556,6 +649,29 @@ mod imp {
                 "cdef_gate" => t.cdef_gate = num(value),
                 "cdef_chroma_w" => t.cdef_chroma_w = num(value),
                 "uv420_tail_delta" => t.uv420_tail_delta = num(value),
+                "uv420_mid_d" => t.uv420_mid_d = num(value),
+                "mode_budget_slow_sub" => t.mode_budget_slow_sub = num(value) as u32,
+                "edge_fill" => t.edge_fill = flag(value),
+                "edge_fill_hi" => t.edge_fill_hi = num(value),
+                "edge_fill_lo" => t.edge_fill_lo = num(value),
+                "edge_fill_frac" => t.edge_fill_frac = num(value),
+                "recon_fill_k" => t.recon_fill_k = num(value),
+                "recon_fill_dim" => t.recon_fill_dim = num(value) as u32,
+                "ad8_full" => t.ad8_full = flag(value),
+                "ad8_runner" => t.ad8_runner = flag(value),
+                "split4_ad" => t.split4_ad = flag(value),
+                "trial_part" => t.trial_part = num(value) as u32,
+                "trial_part_xslow" => t.trial_part_xslow = num(value) as u32,
+                "trial_child_prdo" => t.trial_child_prdo = flag(value),
+                "trial_split_bias" => t.trial_split_bias = num(value),
+                "trial_gate" => t.trial_gate = num(value) as u32,
+                "trial_edge_hi" => t.trial_edge_hi = num(value),
+                "trial_edge_lo" => t.trial_edge_lo = num(value),
+                "proxy_ad" => t.proxy_ad = flag(value),
+                "ad16_full" => t.ad16_full = flag(value),
+                "uv8_vs_cfl" => t.uv8_vs_cfl = flag(value),
+                "uv8_cfl_mlam_c" => t.uv8_cfl_mlam_c = flag(value),
+                "tx32_depth2" => t.tx32_depth2 = flag(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
                 "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,

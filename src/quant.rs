@@ -170,7 +170,11 @@ const UV420_MID_D: i32 = 28;
 
 fn uv420_mid_delta(base_q_idx: u8, tail: i32) -> i32 {
     let qi = base_q_idx as i32;
-    let d = UV420_MID_D;
+    let d = if tail == 0 {
+        UV420_MID_D
+    } else {
+        crate::tuning::get().uv420_mid_d as i32
+    };
     if qi <= 20 {
         0
     } else if qi < 64 {
@@ -259,11 +263,11 @@ pub(crate) trait Dct {
     fn ac_q(&self) -> i32;
     /// Inverse-transform clips `(row_min, row_max, col_min, col_max, cf_max)`.
     fn clips(&self) -> (i32, i32, i32, i32, i32);
-    /// Forward-quantisation multiplier for DC, `round(65536 / dc_q)`, so that the
+    /// Forward-quantization multiplier for DC, `round(65536 / dc_q)`, so that the
     /// integer forward DCT's `mul_q16(coeff, q_mult_dc()) ≈ coeff / dc_q` (the
     /// inverse multiplies the level back by `dc_q`, so this round-trips).
     fn q_mult_dc(&self) -> i32;
-    /// Forward-quantisation multiplier for AC, `round(65536 / ac_q)`.
+    /// Forward-quantization multiplier for AC, `round(65536 / ac_q)`.
     fn q_mult_ac(&self) -> i32;
     fn qm_level(&self) -> u8;
     fn qm_chroma(&self) -> bool;
