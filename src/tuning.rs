@@ -52,8 +52,8 @@ pub(crate) struct Tuning {
     pub(crate) part_budget_qmin: u32,
     /// Restrict the non-square partition budget to 4:4:4.
     pub(crate) part_budget_444_only: bool,
-    /// 4:2:0 rect16 leaf: allow RTX_16X8/8X16 -> two TX_8X8 (tx_depth 1) in
-    /// the luma transform trial (estimator and emitter).
+    /// Rect16 leaf (every chroma format): allow RTX_16X8/8X16 -> two TX_8X8
+    /// (tx_depth 1) in the luma transform trial (estimator and emitter).
     pub(crate) rect_tx_split: bool,
     /// 4:2:0 rect16 leaf: full chroma uv-mode search on the 8x4/4x8 chroma
     /// (was DC/CfL only).
@@ -170,7 +170,9 @@ pub(crate) struct Tuning {
     /// Which proxy verdicts the trial may overturn: 0 = always trial (the
     /// proxy is skipped where it is not needed), 1 = trial only where the
     /// proxy chose NONE (the swallowed-edge defect; a proxy SPLIT stands),
-    /// 2 = trial only where the proxy chose SPLIT.
+    /// 2 = trial only where the proxy chose SPLIT, 3 = as 1, plus at a 16x16
+    /// node where the proxy chose SPLIT the rect legs (`trial_rect`) are
+    /// trialled against SPLIT (NONE stands rejected).
     pub(crate) trial_gate: u32,
     /// Source gate on the trial (0 = none): run it only where some 8x8 of the
     /// node has std >= `trial_edge_hi` (there is structure a big block could
@@ -178,6 +180,45 @@ pub(crate) struct Tuning {
     /// structure sits in otherwise flat content: an outline, not texture).
     pub(crate) trial_edge_hi: f32,
     pub(crate) trial_edge_lo: f32,
+    /// 16x16 trial also codes PARTITION_HORZ / PARTITION_VERT for real
+    /// (where the chroma format has the emitter: VERT is spec-forbidden at
+    /// 4:2:2) and keeps the cheapest of the four legs.
+    pub(crate) trial_rect: bool,
+    /// Multiplier on the HORZ/VERT legs' trial cost (1.0 = pure R-D). SS2
+    /// penalises marginal rect wins that trade luma SSE for a few bits.
+    pub(crate) trial_rect_bias: f32,
+    /// A HORZ/VERT leg may win only if its luma SSE is not above a square
+    /// leg's: 0 = off, 1 = the best-cost square leg's, 2 = the lower of the
+    /// two square legs' (rect wins that trade luma SSE for bits lose SS2).
+    pub(crate) trial_rect_sse_gate: u32,
+    /// Weight on the HORZ/VERT legs' luma distortion in the trial cost.
+    pub(crate) trial_rect_dy_w: f32,
+    /// Structural penalty on every trial leg: k * sum over 8x8 cells of
+    /// (std_src - std_recon)^2 * 64, in luma-SSE units (0 = off). Charges
+    /// lost or invented fine detail that plain SSE prices too cheaply.
+    pub(crate) trial_struct_k: f32,
+    /// ExtraSlow package (applied on top of the three knobs above at that
+    /// tier only, like `trial_part_xslow`): rect legs with luma-SSE gate 1 and
+    /// structural penalty 1.0. Measured at real ExtraSlow vs the gated trial
+    /// alone: 420 15 images -0.25 (11/15), 444 -0.40, 422 -0.29, +5..10% time.
+    pub(crate) trial_rect_xslow: bool,
+    pub(crate) trial_rect_sse_gate_xslow: u32,
+    pub(crate) trial_struct_k_xslow: f32,
+    /// Proxy-margin gate on the trial (0 = off): a square node is trialed
+    /// only where the proxy's relative NONE-vs-SPLIT margin
+    /// |none - split| / min(none, split) is below this (a pruned leg counts
+    /// as an infinite margin: the proxy verdict stands). Bounds the real-R-D
+    /// work to the nodes the proxy is unsure about, the way jixel's layout DP
+    /// scores a piece in full only inside its bound slack.
+    pub(crate) trial_margin: f32,
+    /// What the margin gate does at a node whose margin is UNKNOWN (the proxy
+    /// never priced the other leg: 32-level flat-block SPLIT skip, 16-level
+    /// moment breakout): 0 = trial it, 1 = the proxy verdict stands, 2 = trial
+    /// it only where some 8x8 has source std >= `trial_margin_edge`. A leg
+    /// pruned by the exact branch-and-bound keeps its bound as a conservative
+    /// (lower-bound) margin and is not "unknown".
+    pub(crate) trial_margin_pruned: u32,
+    pub(crate) trial_margin_edge: f32,
     /// Partition proxies (`rd_cost_square` 8/16) price the winner's six angle
     /// deltas. Measured inert on top of the three above (-1.4 alone, +8% time).
     pub(crate) proxy_ad: bool,
@@ -185,6 +226,18 @@ pub(crate) struct Tuning {
     pub(crate) ad16_full: bool,
     /// 4:2:0 8x8 leaf: directional chroma candidates compete against CfL
     pub(crate) uv8_vs_cfl: bool,
+    /// Rate-aware CfL alpha refinement at the square leaves (8/16/32, every
+    /// chroma format): from the energy-optimal alpha, step at most this many
+    /// alphas toward zero while the realised per-plane RD cost (recon SSE +
+    /// lambda x coef bits + the plane's alpha-signal bits) keeps falling, else
+    /// the same away from zero (aom `cfl_pick_plane_rd`). 0 = energy pick only.
+    pub(crate) cfl_alpha_rd_steps: u32,
+    /// What the alpha walk scores: 0 = recon SSE + lambda x (coef + alpha
+    /// bits), 1 = SSE + lambda x coef bits only, 2 = realised SSE only.
+    pub(crate) cfl_alpha_rd_mode: u32,
+    /// Filter-intra finalists given full RD at the square leaves (SATD-ranked
+    /// shortlist of the five filter modes); 0 = FILTER_DC only.
+    pub(crate) filter_intra_budget: u32,
     /// 4:2:0 8x8 leaf: CfL-vs-DC decided on the chroma lambda (emit_mlam_c).
     pub(crate) uv8_cfl_mlam_c: bool,
     /// 4:2:0 8x8 leaf: zone-2 chroma angle deltas for the directional winner
@@ -263,6 +316,13 @@ pub(crate) struct Tuning {
     pub(crate) rect8_enabled: bool,
     /// Rectangle-vs-square balance at the 8x8 node (analogue of `rect16_bias`).
     pub(crate) rect8_bias: f32,
+    /// Frame-edge 16x16 nodes (exactly one dimension runs past the coded
+    /// frame): decide PARTITION_HORZ / VERT (one fully in-frame 16x8 / 8x16
+    /// leaf; the other half is never coded) against the SPLIT into the two
+    /// in-frame 8x8s by real R-D, instead of always coding SPLIT there.
+    pub(crate) edge_rect: bool,
+    /// Rect-vs-split balance at those edge nodes (1.0 = unbiased R-D).
+    pub(crate) edge_rect_bias: f32,
     /// Guided partitioning at the 16 node: commit to SPLIT without pricing NONE
     /// when `m_split * k < m_none` in the source model. 0 = off (full R-D).
     pub(crate) vbp_medium_420: bool,
@@ -299,6 +359,9 @@ pub(crate) struct Tuning {
     pub(crate) tx64_bias: f32,
     /// Also offer the DC TX_64X64 leg to the whole-64 NONE-vs-SPLIT estimator.
     pub(crate) tx64_none: bool,
+    /// Whole-64 luma also tries tx_depth 2 (sixteen TX_16X16) on the winning
+    /// mode, against the four TX_32X32 (and TX_64X64) legs.
+    pub(crate) tx64_depth2: bool,
     /// Square-leaf angle-delta refinement also on V_PRED / H_PRED
     pub(crate) ad_vh: bool,
     /// Rect16 leaves also search V_PRED / H_PRED angle deltas
@@ -339,6 +402,26 @@ pub(crate) struct Tuning {
     /// With `palette_smooth`: only pixels the nearest center does NOT hit
     /// exactly may move (protects exact palettes / exact-hit pixels).
     pub(crate) palette_smooth_guard: bool,
+    /// Row-wise Viterbi over the lossy luma palette index map (replaces the
+    /// `palette_smooth` pass when > 0): with the rows above final, each row is
+    /// an exact chain (state = the left pixel's index) minimizing squared
+    /// center error + lambda * the real `palette_y_color` context bits.
+    /// The value multiplies the tile's mode lambda; 0 = off. Per format
+    /// (`_444` = 4:4:4, `_420` = 4:2:0 / 4:2:2 / mono). SHIPPED 1.0 / 0.5
+    /// behind the `screen_frame` gate (2026-10-24): x_screen -1.94 / -0.45,
+    /// n_bbscreen -1.10 / -3.40, every non-screen frame byte-identical;
+    /// lam >= 2.0 over-merges and loses on every image.
+    pub(crate) palette_viterbi_444: f32,
+    pub(crate) palette_viterbi_420: f32,
+    /// Also build the partition proxy's palette estimates (`rd_cost_square`
+    /// bracket) with the Viterbi; false keeps nearest + smoothing there and
+    /// runs the Viterbi only for the emitter's candidates.
+    pub(crate) palette_viterbi_proxy: bool,
+    /// Where the Viterbi runs: 0 = every frame, 1 = `screen_frame` only
+    /// (screen content WITH exact 16x16 repeats), 2 = `screen_content` only.
+    /// Ungated, photos measured BD-neutral (+-0.8 per image, ~0 avg) for ~10%
+    /// time and synthetic edges lose (x_fractal +1.0..1.3).
+    pub(crate) palette_viterbi_screen_only: u32,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -392,7 +475,7 @@ impl Tuning {
         part_budget_slow: 3,
         part_budget_qmin: 0,
         part_budget_444_only: true,
-        rect_tx_split: false,
+        rect_tx_split: true,
         rect_uv_search: false,
         recon_src_init: false,
         split16_bias: 1.0,
@@ -443,9 +526,23 @@ impl Tuning {
         trial_gate: 1,
         trial_edge_hi: 16.0,
         trial_edge_lo: 0.0,
+        trial_rect: false,
+        trial_rect_bias: 1.0,
+        trial_rect_sse_gate: 0,
+        trial_rect_dy_w: 1.0,
+        trial_struct_k: 0.0,
+        trial_rect_xslow: true,
+        trial_rect_sse_gate_xslow: 1,
+        trial_struct_k_xslow: 1.0,
+        trial_margin: 0.0,
+        trial_margin_pruned: 0,
+        trial_margin_edge: 16.0,
         proxy_ad: false,
         ad16_full: false,
         uv8_vs_cfl: true,
+        cfl_alpha_rd_steps: 0,
+        cfl_alpha_rd_mode: 0,
+        filter_intra_budget: 0,
         uv8_cfl_mlam_c: false,
         uv8_ad: true,
         tx32_depth2: true,
@@ -484,6 +581,8 @@ impl Tuning {
         exact_part_bits_8: false,
         rect8_enabled: false,
         rect8_bias: 1.0,
+        edge_rect: true,
+        edge_rect_bias: 1.0,
         vbp_medium_420: false,
         vbp_444: false,
         vbp_422: false,
@@ -507,6 +606,7 @@ impl Tuning {
         tx64: false,
         tx64_bias: 1.0,
         tx64_none: false,
+        tx64_depth2: true,
         ad_vh: true,
         rect_ad: true,
         ad_runner: true,
@@ -526,6 +626,10 @@ impl Tuning {
         split4_decision_txtypes: false,
         palette_smooth: 24,
         palette_smooth_guard: true,
+        palette_viterbi_444: 1.0,
+        palette_viterbi_420: 0.5,
+        palette_viterbi_proxy: true,
+        palette_viterbi_screen_only: 1,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -670,9 +774,23 @@ mod imp {
                 "trial_gate" => t.trial_gate = num(value) as u32,
                 "trial_edge_hi" => t.trial_edge_hi = num(value),
                 "trial_edge_lo" => t.trial_edge_lo = num(value),
+                "trial_rect" => t.trial_rect = flag(value),
+                "trial_rect_bias" => t.trial_rect_bias = num(value),
+                "trial_rect_sse_gate" => t.trial_rect_sse_gate = num(value) as u32,
+                "trial_rect_dy_w" => t.trial_rect_dy_w = num(value),
+                "trial_struct_k" => t.trial_struct_k = num(value),
+                "trial_rect_xslow" => t.trial_rect_xslow = flag(value),
+                "trial_rect_sse_gate_xslow" => t.trial_rect_sse_gate_xslow = num(value) as u32,
+                "trial_struct_k_xslow" => t.trial_struct_k_xslow = num(value),
+                "trial_margin" => t.trial_margin = num(value),
+                "trial_margin_pruned" => t.trial_margin_pruned = num(value) as u32,
+                "trial_margin_edge" => t.trial_margin_edge = num(value),
                 "proxy_ad" => t.proxy_ad = flag(value),
                 "ad16_full" => t.ad16_full = flag(value),
                 "uv8_vs_cfl" => t.uv8_vs_cfl = flag(value),
+                "cfl_alpha_rd_steps" => t.cfl_alpha_rd_steps = num(value) as u32,
+                "cfl_alpha_rd_mode" => t.cfl_alpha_rd_mode = num(value) as u32,
+                "filter_intra_budget" => t.filter_intra_budget = num(value) as u32,
                 "uv8_cfl_mlam_c" => t.uv8_cfl_mlam_c = flag(value),
                 "uv8_ad" => t.uv8_ad = flag(value),
                 "tx32_depth2" => t.tx32_depth2 = flag(value),
@@ -711,6 +829,8 @@ mod imp {
                 "exact_part_bits_8" => t.exact_part_bits_8 = flag(value),
                 "rect8_enabled" => t.rect8_enabled = flag(value),
                 "rect8_bias" => t.rect8_bias = num(value),
+                "edge_rect" => t.edge_rect = flag(value),
+                "edge_rect_bias" => t.edge_rect_bias = num(value),
                 "vbp_medium_420" => t.vbp_medium_420 = flag(value),
                 "vbp_444" => t.vbp_444 = flag(value),
                 "vbp_422" => t.vbp_422 = flag(value),
@@ -734,6 +854,7 @@ mod imp {
                 "tx64" => t.tx64 = flag(value),
                 "tx64_bias" => t.tx64_bias = num(value),
                 "tx64_none" => t.tx64_none = flag(value),
+                "tx64_depth2" => t.tx64_depth2 = flag(value),
                 "ad_vh" => t.ad_vh = flag(value),
                 "rect_ad" => t.rect_ad = flag(value),
                 "ad_runner" => t.ad_runner = flag(value),
@@ -753,6 +874,10 @@ mod imp {
                 "split4_decision_txtypes" => t.split4_decision_txtypes = flag(value),
                 "palette_smooth" => t.palette_smooth = num(value) as u32,
                 "palette_smooth_guard" => t.palette_smooth_guard = flag(value),
+                "palette_viterbi_444" => t.palette_viterbi_444 = num(value),
+                "palette_viterbi_420" => t.palette_viterbi_420 = num(value),
+                "palette_viterbi_proxy" => t.palette_viterbi_proxy = flag(value),
+                "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),

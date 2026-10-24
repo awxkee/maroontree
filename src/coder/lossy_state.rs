@@ -372,6 +372,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -469,6 +470,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -575,6 +577,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -681,6 +684,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -1880,6 +1884,21 @@ impl<'a> LossyTile<'a> {
         cdf_cost(&self.dcdf().part_split[bl - 1][ctx], symbol)
     }
 
+    /// Bits of the cropped-edge partition boolean at a `bl` node
+    /// (`split_or_horz` when `top`, else `split_or_vert`), from the gathered
+    /// probability of the live frozen decision CDF — exactly what the emitter
+    /// pays (`encode_gathered_partition`): symbol 1 (SPLIT) carries mass `p`,
+    /// symbol 0 (HORZ / VERT) carries `32768 - p`.
+    fn edge_partition_bits(&self, bl: usize, x8: usize, y8: usize, top: bool, split: bool) -> f32 {
+        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+        let p = i32::from(crate::coeffs::gather_split_prob_icdf(
+            &self.dcdf().part_split[bl - 1][ctx],
+            top,
+        ));
+        let mass = if split { p } else { 32768 - p };
+        crate::cost::cost_q_table()[mass.max(1) as usize] as f32 * crate::cost::COST_Q_SCALE_INV
+    }
+
     /// Partition-symbol rate at the 32x32 / 64x64 nodes. Same defect the 16
     /// level had: NONE was free while SPLIT paid the flat fee.
     pub(crate) fn part_rate_bl(&self, bl: usize, x8: usize, y8: usize, symbol: usize) -> f32 {
@@ -2976,6 +2995,81 @@ impl<'a> LossyTile<'a> {
         self.rd_choice_16(x8, y8, thr, lhb).0
     }
 
+    /// Partition decision at a 16x16 node that straddles ONE frame edge. The
+    /// spec reads a boolean there, not the full symbol: with content past the
+    /// right midpoint only (`horz`, bottom edge) the choices are SPLIT and
+    /// HORZ, with content past the bottom midpoint only they are SPLIT and
+    /// VERT. The coded frame is 8-aligned, so the rect's first half is fully
+    /// in-frame and its second half lies entirely outside (never coded); SPLIT
+    /// codes the two in-frame 8x8 children. Priced like the in-frame node:
+    /// equipped 8x8 children (IntraBC / SPLIT4 alternatives included, as in
+    /// `rd_choice_16_inner`'s `best8`) vs the equipped rect leaf, each with its
+    /// chroma, plus the exact cropped-edge boolean rate.
+    fn edge_choice_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool, horz: bool) -> Part16 {
+        let tune = crate::tuning::get();
+        // Mono codes 8x8 luma blocks only (see `rd_choice_16`); every vertical
+        // partition is SPEC-FORBIDDEN at 4:2:2; the fixed-size tiers and Fast
+        // never run the node R-D.
+        if !tune.edge_rect
+            || self.mono
+            || (!horz && self.ss422)
+            || !self.speed.full_partition_rdo()
+            || crate::tuning::fixed_size(self.speed) != 0
+        {
+            return Part16::Split;
+        }
+        let (px, py) = (x8 * 8, y8 * 8);
+        let prdo = self.perceptual_rd_scale(px, py, 16);
+        let part_lam = self.mlam() * prdo;
+        let (sub_x, sub_y) = ((self.ss420 || self.ss422) as usize, self.ss420 as usize);
+        let chroma = |ox: usize, oy: usize, lw: usize, lh: usize| {
+            self.chroma_partition_weight_at(px + ox, py + oy, lw, lh)
+                * self.rd_cost_chroma_block(
+                    (px + ox) >> sub_x,
+                    (py + oy) >> sub_y,
+                    lw >> sub_x,
+                    lh >> sub_y,
+                    prdo,
+                    false,
+                )
+        };
+        let child = |ox: usize, oy: usize| -> f32 {
+            let (bx, by) = (px + ox, py + oy);
+            let (cthr, clhb) = Self::child_edge_flags(ox, oy, thr, lhb);
+            let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);
+            let mut best = self.rd_cost_square(bx, by, 8, htr8, hbl8, prdo);
+            if self.allow_intrabc
+                && let Some(ibc) = self.rd_cost_intrabc(bx, by, 8, cthr, prdo)
+            {
+                best = best.min(ibc);
+            }
+            let mut s4 =
+                self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
+            if self.ss422 && s4.is_finite() {
+                // 4:2:2 pair conversion the luma-only split4 price misses.
+                s4 += self.chroma_partition_weight_at(bx, by, 8, 8)
+                    * (self.rd_cost_chroma_block(bx / 2, by, 4, 4, prdo, false)
+                        + self.rd_cost_chroma_block(bx / 2, by + 4, 4, 4, prdo, false)
+                        - self.rd_cost_chroma_block(bx / 2, by, 4, 8, prdo, false));
+            }
+            best.min(s4 * tune.split4_bias) + chroma(ox, oy, 8, 8)
+        };
+        let (c1x, c1y) = if horz { (8, 0) } else { (0, 8) };
+        let rd_split = rate_cost(part_lam, self.edge_partition_bits(3, x8, y8, horz, true))
+            + child(0, 0)
+            + child(c1x, c1y);
+        let (lw, lh) = if horz { (16, 8) } else { (8, 16) };
+        let rd_rect = (rate_cost(part_lam, self.edge_partition_bits(3, x8, y8, horz, false))
+            + self.rd_cost_rect16_leaf(px, py, !horz, prdo)
+            + chroma(0, 0, lw, lh))
+            * tune.edge_rect_bias;
+        if rd_rect < rd_split {
+            if horz { Part16::Horz } else { Part16::Vert }
+        } else {
+            Part16::Split
+        }
+    }
+
     /// Full 16x16 partition decision returning the winner AND its total R-D
     /// cost (luma + chroma, priced under this block's own perceptual scale).
     /// The cost is what a parent SPLIT leg should charge for this child — the
@@ -2988,7 +3082,7 @@ impl<'a> LossyTile<'a> {
         // different intra-edge availability prices differently.
         let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
         let epoch = self.emit_epoch.get();
-        if let Some(&(e, p, c)) = self.rd16_cache.borrow().get(&key)
+        if let Some(&(e, p, c, _)) = self.rd16_cache.borrow().get(&key)
             && e == epoch
         {
             return (p, c);
@@ -2996,19 +3090,32 @@ impl<'a> LossyTile<'a> {
         let out = self.rd_choice_16_inner(x8, y8, thr, lhb);
         self.rd16_cache
             .borrow_mut()
-            .insert(key, (epoch, out.0, out.1));
-        out
+            .insert(key, (epoch, out.0, out.1, out.2));
+        (out.0, out.1)
     }
 
-    fn rd_choice_16_inner(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32) {
+    /// Relative NONE-vs-SPLIT margin of the 16-level proxy decision (see
+    /// `trial_margin`); INFINITY when either leg was pruned or nothing is
+    /// memoised for the node.
+    fn proxy_margin_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> f32 {
+        self.rd_choice_16(x8, y8, thr, lhb);
+        let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
+        let epoch = self.emit_epoch.get();
+        match self.rd16_cache.borrow().get(&key) {
+            Some(&(e, _, _, m)) if e == epoch => m,
+            _ => f32::INFINITY,
+        }
+    }
+
+    fn rd_choice_16_inner(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32, f32) {
         let (px, py) = (x8 * 8, y8 * 8);
         // Fixed-partition mode: no R-D at this level either. See the matching
         // comment in `rd_choice_rect32` for why returning a placeholder cost is
         // sound (nothing compares it).
         match crate::tuning::fixed_size(self.speed) {
             0 => {}
-            16 => return (Part16::None, 0.0),
-            n if n < 16 => return (Part16::Split, 0.0),
+            16 => return (Part16::None, 0.0, f32::INFINITY),
+            n if n < 16 => return (Part16::Split, 0.0, f32::INFINITY),
             _ => {}
         }
 
@@ -3168,6 +3275,9 @@ impl<'a> LossyTile<'a> {
         // `do_square_split` and `do_rectangular_split` together).
         let split_signal = rate_cost(part_lam, self.part16_rate(x8, y8, 3));
         let mut split_pruned = skip_split;
+        // Margin of a SPLIT leg the exact branch-and-bound below prunes: its
+        // luma lower bound against NONE (a lower bound on the true margin).
+        let mut split_bound_margin = f32::INFINITY;
         let mut square8 = [0.0f32; 4];
         if !split_pruned {
             let mut luma_lower_bound = split_signal;
@@ -3183,6 +3293,7 @@ impl<'a> LossyTile<'a> {
                 // affect the decision and need not be searched.
                 if part_budget == 0 && luma_lower_bound >= rd_none {
                     split_pruned = true;
+                    split_bound_margin = Self::proxy_margin(rd_none, luma_lower_bound);
                     break;
                 }
             }
@@ -3430,7 +3541,12 @@ impl<'a> LossyTile<'a> {
         } else {
             chosen.0
         };
-        (chosen.1, chosen_cost)
+        let margin = if cands[2].0.is_finite() {
+            Self::proxy_margin(cands[1].0, cands[2].0)
+        } else {
+            split_bound_margin
+        };
+        (chosen.1, chosen_cost, margin)
     }
 
     fn with_speed(mut self, speed: Speed) -> Self {

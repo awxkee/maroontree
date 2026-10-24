@@ -74,6 +74,10 @@ enum TxSel {
     /// Whole-64 luma coded as one TX_64X64 (`tx_depth = 0`); the coefficient
     /// record carries the coded 32x32 in its first 1024 entries.
     Tx64,
+    /// Whole-64 luma coded as SIXTEEN TX_16X16 (`tx_depth = 2`, raster
+    /// order, DCT_DCT); the coefficient record packs the sixteen 16x16s
+    /// TX-raster-major (256 each).
+    Split64D2,
 }
 
 impl TxSel {

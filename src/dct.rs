@@ -3546,6 +3546,7 @@ mod tests {
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[allow(clippy::type_complexity)]
     fn assert_forward_neon_matches_scalar<const N: usize>(
         name: &str,
         scalar_fn: fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]),

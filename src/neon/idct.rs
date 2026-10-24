@@ -2468,9 +2468,7 @@ mod s16_real_data {
                         for r in 0..16 {
                             let mut o = [0i32; 4];
                             vst1q_s32(o.as_mut_ptr(), cc[r].0);
-                            for l in 0..4 {
-                                want[r][b0 + l] = o[l];
-                            }
+                            want[r][b0..b0 + 4].copy_from_slice(&o);
                         }
                     } else {
                         let mut cc: [I32x4; 32] = std::array::from_fn(|r| {
@@ -2483,9 +2481,7 @@ mod s16_real_data {
                         for r in 0..32 {
                             let mut o = [0i32; 4];
                             vst1q_s32(o.as_mut_ptr(), cc[r].0);
-                            for l in 0..4 {
-                                want[r][b0 + l] = o[l];
-                            }
+                            want[r][b0..b0 + 4].copy_from_slice(&o);
                         }
                     }
                 }

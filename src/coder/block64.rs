@@ -34,6 +34,15 @@ fn b64_split_refinement() -> f32 {
     crate::tuning::get().b64_split_refinement
 }
 
+/// How a whole-64 luma is transformed: `tx_depth` 1 (four TX_32X32, the
+/// default), 0 (one TX_64X64, `tx64`) or 2 (sixteen TX_16X16, `tx64_depth2`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Luma64Tx {
+    Quad32,
+    Tx64,
+    Grid16,
+}
+
 /// SSE against the wavefront's raw shared reconstruction
 #[allow(clippy::too_many_arguments)]
 unsafe fn sse_u16_raw_reference(
@@ -1003,6 +1012,153 @@ impl<'a> LossyTile<'a> {
         (dist, bits)
     }
 
+    /// Code a whole-64 luma as sixteen raster-order TX_16X16 (`tx_depth` 2)
+    /// in (`mode`, `delta`): each transform is predicted from the RUNNING
+    /// reconstruction with dav1d's per-transform edge rule (the grid rule of
+    /// `split32_depth2_try`), DCT_DCT, the class-2 context trellis with
+    /// progressive coefficient contexts. Writes the reconstruction into
+    /// `recon[0]` and the levels TX-raster-major (256 each) into `cf`;
+    /// returns (distortion, bits) in the units of the 4xTX_32X32 pass.
+    /// `commit` keeps the reconstruction (the emitter re-sets the coefficient
+    /// contexts from the coded symbols); otherwise it is restored. The
+    /// coefficient contexts are always restored.
+    #[allow(clippy::too_many_arguments)]
+    fn grid16_luma_pass(
+        &mut self,
+        px: usize,
+        py: usize,
+        mode: usize,
+        delta: i32,
+        have_tr: bool,
+        have_bl: bool,
+        ftype: bool,
+        lam: f32,
+        cf: &mut [i32; 4096],
+        commit: bool,
+    ) -> (f32, f32) {
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let maxv = (1i32 << self.bd) - 1;
+        let (bx4_0, by4_0) = (px / 4, py / 4);
+        let saved_a: [u8; 16] = *self.a_coef[0][bx4_0..].first_chunk().unwrap();
+        let saved_l: [u8; 16] = *self.l_coef[0][by4_0..].first_chunk().unwrap();
+        let mut saved = if commit {
+            None
+        } else {
+            Some(self.sc().take_u4096())
+        };
+        if let Some(sv) = saved.as_mut() {
+            for row in 0..64 {
+                sv[row * 64..row * 64 + 64]
+                    .copy_from_slice(&self.recon[0][(py + row) * self.w + px..][..64]);
+            }
+        }
+        let mut dist = 0f32;
+        let mut bits = 0f32;
+        for j in 0..4usize {
+            for i in 0..4usize {
+                let ti = j * 4 + i;
+                let (bx, by) = (px + i * 16, py + j * 16);
+                let tr = if j == 0 {
+                    py > 0 && (i < 3 || have_tr)
+                } else {
+                    i < 3
+                };
+                let bl = if i == 0 {
+                    px > 0 && (j < 3 || have_bl)
+                } else {
+                    false
+                };
+                let mut pred = self.sbuf_i256();
+                if mode == DC_PRED && delta == 0 {
+                    let d = self.intrapred.dc_pred_16x16(&self.recon[0], self.w, bx, by, self.bd as i32);
+                    *pred = [d; 256];
+                } else {
+                    self.intrapred.predict_nd_ad(
+                        mode,
+                        delta,
+                        &self.recon[0],
+                        self.w,
+                        bx,
+                        by,
+                        16,
+                        16,
+                        tr,
+                        bl,
+                        self.w,
+                        self.h,
+                        ftype,
+                        &mut pred[..],
+                        self.bd,
+                    );
+                }
+                let mut resid = self.sbuf_i256();
+                self.rd.residual_pred(
+                    &mut resid[..],
+                    &pred[..],
+                    &self.src[0],
+                    self.w,
+                    bx,
+                    by,
+                    16,
+                    16,
+                );
+                let (qbx4, qby4) = (bx / 4, by / 4);
+                let sk = self.skip_ctx_split(qbx4, qby4, 4, 4);
+                let ds = self.dc_sign_ctx_span(0, qbx4, qby4, 4, 4);
+                let (mut q, tf) = self.dct.dct16x16_t(&resid, &self.quant);
+                trellis_optimize_ctx(
+                    &mut q,
+                    &tf,
+                    dcq,
+                    acq,
+                    &SCAN_16X16,
+                    lam,
+                    16,
+                    16,
+                    self.dcdf(),
+                    2,
+                    0,
+                    &self.dcdf().eob_bin_256_l,
+                    ds,
+                    self.quant.qm_level(),
+                    self.quant.qidx() as i32,
+                );
+                let rr = self.idct.idct_dequant_16x16(&q, &self.quant);
+                dist += self.luma_partition_distortion(bx, by, 16, 16, acq, &pred[..], 0, &rr[..]);
+                bits += self.luma_bits_ctx_bounded(
+                    &q,
+                    &SCAN_16X16,
+                    16,
+                    bx,
+                    by,
+                    mode,
+                    1,
+                    sk,
+                    ds,
+                    f32::INFINITY,
+                );
+                let res_ctx = Self::coef_res_ctx(&q, &SCAN_16X16);
+                self.a_coef[0][qbx4..qbx4 + 4].fill(res_ctx);
+                self.l_coef[0][qby4..qby4 + 4].fill(res_ctx);
+                for ry in 0..16 {
+                    let drow = &mut self.recon[0][(by + ry) * self.w + bx..];
+                    recon_add_pred(&mut drow[..16], &pred[ry * 16..], &rr[ry * 16..], maxv);
+                }
+                cf[ti * 256..ti * 256 + 256].copy_from_slice(&q[..]);
+            }
+        }
+        self.a_coef[0][bx4_0..bx4_0 + 16].copy_from_slice(&saved_a);
+        self.l_coef[0][by4_0..by4_0 + 16].copy_from_slice(&saved_l);
+        if let Some(sv) = saved {
+            for row in 0..64 {
+                self.recon[0][(py + row) * self.w + px..][..64]
+                    .copy_from_slice(&sv[row * 64..row * 64 + 64]);
+            }
+            self.sc().put_u4096(sv);
+        }
+        (dist, bits)
+    }
+
     /// Trial the exact luma shape used by `code_block64`: one shared prediction
     /// mode and four raster-order TX_32X32 transforms. Each quadrant is
     /// reconstructed before the next prediction, then the 64x64 region is
@@ -1015,7 +1171,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
         prdo: f32,
-    ) -> (usize, i32, f32, bool) {
+    ) -> (usize, i32, f32, Luma64Tx) {
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
         let tx64 = self.tx64_allowed();
@@ -1041,7 +1197,7 @@ impl<'a> LossyTile<'a> {
                     .copy_from_slice(&saved[row * 64..row * 64 + 64]);
             }
         };
-        let mut best = (DC_PRED, 0i32, f32::INFINITY, false);
+        let mut best = (DC_PRED, 0i32, f32::INFINITY, Luma64Tx::Quad32);
         // Stage 1: the ranked modes at angle delta 0. Stage 2: the six other
         // deltas of a directional winner (the quadrant edge flags are the
         // dav1d per-transform ones, so extension-reading angles stay exact).
@@ -1071,7 +1227,7 @@ impl<'a> LossyTile<'a> {
                     + tx64_depth_rate)
                     * crate::tuning::get().tx64_bias;
                 if t64 < best.2 {
-                    best = (mode, delta, t64, true);
+                    best = (mode, delta, t64, Luma64Tx::Tx64);
                 }
                 restore(&mut self.recon[0]);
             }
@@ -1152,7 +1308,7 @@ impl<'a> LossyTile<'a> {
                 }
             }
             if total < best.2 {
-                best = (mode, delta, total, false);
+                best = (mode, delta, total, Luma64Tx::Quad32);
             }
             }
             stage += 1;
@@ -1162,6 +1318,32 @@ impl<'a> LossyTile<'a> {
                 && self.speed.try_angle_deltas_av1(64, self.base_q_idx)
             {
                 cands.extend([-3, -2, -1, 1, 2, 3].map(|d| (best.0, d)));
+            }
+        }
+        // tx_depth 2 (`tx64_depth2`): sixteen TX_16X16 on the winning mode,
+        // against its four-TX_32X32 (or TX_64X64) total — a 64 whose detail
+        // sits in a few corners codes it in a few 16x16s instead of ringing
+        // four TX_32X32. Not at Fast: its candidate loop prices the quadrants
+        // with the plain trellis, so the ctx-trellis leg would not compare.
+        if crate::tuning::get().tx64_depth2 && self.speed != Speed::Fast && best.2.is_finite() {
+            restore(&mut self.recon[0]);
+            let (mode, delta) = (best.0, best.1);
+            let mut mode_cost = rate_cost(mlam, self.mode_bits(px, py, mode));
+            if (V_PRED..=VERT_LEFT_PRED).contains(&mode) {
+                mode_cost += rate_cost(
+                    mlam,
+                    cdf_cost(&self.dcdf().angle_delta[mode - V_PRED], (delta + 3) as usize),
+                );
+            }
+            let mut cf = self.sbuf_i4096();
+            let (dist, bits) = self.grid16_luma_pass(
+                px, py, mode, delta, have_tr, have_bl, block_ftype, lam, &mut cf, false,
+            );
+            let t2 = mode_cost
+                + crate::partition_rd::rd_cost(dist, mlam, bits)
+                + rate_cost(mlam, self.tx_depth64_bits(px, py, 2) - self.tx_depth64_bits(px, py, 1));
+            if t2 < best.2 {
+                best = (mode, delta, t2, Luma64Tx::Grid16);
             }
         }
         restore(&mut self.recon[0]);
@@ -1465,11 +1647,15 @@ impl<'a> LossyTile<'a> {
             self.sbuf_i1024(),
             self.sbuf_i1024(),
         ];
-        let (y_mode, y_delta, tx64);
+        let (y_mode, y_delta, ltx);
         if let Some(r) = rl {
             y_mode = r.mode as usize;
             y_delta = r.delta as i32;
-            tx64 = r.tx == TxSel::Tx64;
+            ltx = match r.tx {
+                TxSel::Tx64 => Luma64Tx::Tx64,
+                TxSel::Split64D2 => Luma64Tx::Grid16,
+                _ => Luma64Tx::Quad32,
+            };
             if let Some(cf) = rl_cf {
                 for qi in 0..4 {
                     lcf[qi].copy_from_slice(&cf[qi * 1024..qi * 1024 + 1024]);
@@ -1477,14 +1663,22 @@ impl<'a> LossyTile<'a> {
             }
         } else {
             let pick = self.rd_pick_luma64(px, py, have_tr, have_bl, prdo);
-            (y_mode, y_delta, tx64) = (pick.0, pick.1, pick.3);
+            (y_mode, y_delta, ltx) = (pick.0, pick.1, pick.3);
         }
+        let tx64 = ltx == Luma64Tx::Tx64;
+        let grid16 = ltx == Luma64Tx::Grid16;
         self.record_pred_blk(x8, y8, 16);
-        // Deblock footprint: the luma transform grid — one TX_64X64, or four
-        // TX_32X32 so the filter sees the interior 32-sample transform edges
-        // (mirrors block16's tx-split re-record).
+        // Deblock footprint: the luma transform grid — one TX_64X64, sixteen
+        // TX_16X16, or four TX_32X32 so the filter sees the interior
+        // transform edges (mirrors block16's tx-split re-record).
         if tx64 {
             self.record_tx_blk(x8, y8, 16);
+        } else if grid16 {
+            for j in 0..4 {
+                for i in 0..4 {
+                    self.record_tx_blk(x8 + i * 2, y8 + j * 2, 4);
+                }
+            }
         } else {
             for (sx, sy) in Self::Q64 {
                 self.record_tx_blk((px + sx) / 8, (py + sy) / 8, 8);
@@ -1499,6 +1693,14 @@ impl<'a> LossyTile<'a> {
             *lcf[0] = *cf;
             for q in &mut lcf[1..] {
                 q.fill(0);
+            }
+        } else if rl.is_none() && grid16 {
+            // Sixteen TX_16X16 in raster order, packed 256 each across the
+            // four 1024-entry records (TX `ti` = `lcf[ti / 4][(ti % 4) * 256..]`).
+            let mut cf = self.sbuf_i4096();
+            self.grid16_luma_pass(px, py, y_mode, y_delta, have_tr, have_bl, block_ftype, lam, &mut cf, true);
+            for (qi, q) in lcf.iter_mut().enumerate() {
+                q.copy_from_slice(&cf[qi * 1024..qi * 1024 + 1024]);
             }
         } else if rl.is_none() {
             for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
@@ -1620,7 +1822,13 @@ impl<'a> LossyTile<'a> {
             delta: y_delta as i8,
             palette: 0,
             filter: NO_FILTER,
-            tx: if tx64 { TxSel::Tx64 } else { TxSel::SplitDct([1; 4]) },
+            tx: if tx64 {
+                TxSel::Tx64
+            } else if grid16 {
+                TxSel::Split64D2
+            } else {
+                TxSel::SplitDct([1; 4])
+            },
         });
         let mut flat = self.sbuf_i4096();
         for qi in 0..4 {
@@ -1660,7 +1868,7 @@ impl<'a> LossyTile<'a> {
         self.commit_uv_mode(px, py, 64, 64, uv_mode);
         self.emit_palette_mode_info(px, py, 64, 64, y_mode, !self.mono, None, None);
         // filter_intra is disallowed for max(w,h) > 32, so no symbol here.
-        self.code_tx_depth(px, py, 64, 64, if tx64 { 0 } else { 1 });
+        self.code_tx_depth(px, py, 64, 64, if tx64 { 0 } else if grid16 { 2 } else { 1 });
         let sv = block_skip as u8;
         let mv = y_mode as u8;
         self.a_skip[bx4..bx4 + 16].fill(sv);
@@ -1683,8 +1891,32 @@ impl<'a> LossyTile<'a> {
             self.a_coef[0][bx4..bx4 + 16].fill(res_ctx);
             self.l_coef[0][by4..by4 + 16].fill(res_ctx);
         }
+        // Sixteen TX_16X16 in raster order (split contexts over the 4-unit
+        // footprint, the intra TX_16X16 txtp symbol = DCT_DCT); the
+        // reconstruction happened in `grid16_luma_pass` (or is preinstalled).
+        if grid16 {
+            for ti in 0..16usize {
+                let (bx, by) = (px + (ti % 4) * 16, py + (ti / 4) * 16);
+                let (qbx4, qby4) = (bx / 4, by / 4);
+                let cfq: &[i32; 256] = lcf[ti / 4][(ti % 4) * 256..].first_chunk::<256>().unwrap();
+                let sk = self.skip_ctx_split(qbx4, qby4, 4, 4);
+                let ds = self.dc_sign_ctx_16(0, qbx4, qby4);
+                let res_ctx = encode_tx16_coeffs_adapt(
+                    &mut self.enc,
+                    &mut self.cdfs,
+                    cfq,
+                    false,
+                    sk,
+                    ds,
+                    y_mode,
+                    1, // DCT_DCT
+                );
+                self.a_coef[0][qbx4..qbx4 + 4].fill(res_ctx);
+                self.l_coef[0][qby4..qby4 + 4].fill(res_ctx);
+            }
+        }
         for (qi, &(sx, sy)) in Self::Q64.iter().enumerate() {
-            if tx64 {
+            if tx64 || grid16 {
                 break;
             }
             let (qbx4, qby4) = ((px + sx) / 4, (py + sy) / 4);

@@ -336,14 +336,15 @@ impl OdEcEncoder {
                 let probability = ((token >> 1) & 0xffff) as u16;
                 self.encode_bool(value, probability);
             } else if token & TOKEN_TAG_MASK == TOKEN_GATHERED_PARTITION {
-                let cdf = ((token >> 1) & 0xffff) as usize;
+                let cdf = ((token >> 2) & 0xffff) as usize;
                 let top = token & 1 != 0;
+                let split = token & 2 != 0;
                 let (ptr, len) = cdfs[cdf];
                 // SAFETY: same slot lifetime argument as the adaptive arm;
                 // this operation reads but deliberately does not adapt it.
                 let table = unsafe { std::slice::from_raw_parts(ptr, len) };
                 let p = crate::coeffs::gather_split_prob_icdf(table, top);
-                self.encode_bool(true, p);
+                self.encode_bool(split, p);
             } else {
                 let cdf = ((token >> 8) & 0xffff) as usize;
                 let symbol = (token & 0xff) as usize;
@@ -436,17 +437,20 @@ impl OdEcEncoder {
 
     /// Encode an AV1 cropped-edge partition boolean whose probability is
     /// gathered from a live multi-symbol partition CDF without adapting it.
-    pub(crate) fn encode_gathered_partition(&mut self, top: bool, cdf: &[u16]) {
+    /// `top` selects `split_or_horz` (content past the right midpoint) vs
+    /// `split_or_vert`; `split` is the coded value (false = HORZ / VERT).
+    pub(crate) fn encode_gathered_partition(&mut self, top: bool, split: bool, cdf: &[u16]) {
         if let Some(t) = self.semantic.as_mut() {
             let key = *cdf.last().expect("empty partition CDF");
-            t.ops
-                .push(TOKEN_GATHERED_PARTITION | ((key as u32) << 1) | top as u32);
+            t.ops.push(
+                TOKEN_GATHERED_PARTITION | ((key as u32) << 2) | ((split as u32) << 1) | top as u32,
+            );
             if self.sink {
                 return;
             }
         }
         let p = crate::coeffs::gather_split_prob_icdf(cdf, top);
-        let s = 1u32;
+        let s = split as u32;
         let fixed = [p as u32, 0u32];
         let nms = 2 - s;
         let fl = if s > 0 {

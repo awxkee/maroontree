@@ -213,8 +213,10 @@ impl Speed {
 
     /// Filter-intra finalists given full RD. 0 on every tier: a budget of 2
     /// measured +-1% with no consistent sign even as an ExtraSlow-only extra.
+    /// (`filter_intra_budget` re-opens it for offline studies; 0 keeps the
+    /// FILTER_DC-only trial.)
     pub(crate) fn filter_intra_refine_budget(self) -> usize {
-        0
+        crate::tuning::get().filter_intra_budget as usize
     }
 
     /// Fast codes chroma with the baseline DC predictor. CfL and directional

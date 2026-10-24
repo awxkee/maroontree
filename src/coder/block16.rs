@@ -530,6 +530,19 @@ impl<'a> LossyTile<'a> {
             let mut cfl_a = [0i32; 2];
             let (mut dc_sse, mut dc_bits) = ([0i64; 2], [0f32; 2]);
             let (mut cfl_sse, mut cfl_bits) = ([0i64; 2], [0f32; 2]);
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
+            let steps = crate::tuning::get().cfl_alpha_rd_steps;
+            // Energy-optimal alphas for both planes up front: the rate-aware
+            // walk prices each plane's alpha bits against the other plane's
+            // current alpha (one coordinate-descent pass).
+            let a_e = [0, 1].map(|ci| {
+                self.intrapred.cfl_best_alpha(
+                    &ac[..],
+                    self.src_blk(ci + 1, px, py, 16, 16),
+                    cpred[ci],
+                    self.bd,
+                )
+            });
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = cpred[ci];
@@ -537,36 +550,48 @@ impl<'a> LossyTile<'a> {
                 let dcrr = self.idct.idct_dequant_16x16(&ccf[ci], &self.cquant);
                 dc_sse[ci] = sse_recon::<256, 16>(&self.rd, &[dc; 256], &dcrr, src, self.bd);
                 dc_bits[ci] = self.chroma_bits(&ccf[ci][..], &SCAN_16X16, 16, plane, px, py);
-                let a = self
-                    .intrapred
-                    .cfl_best_alpha(&ac[..], src, dc, self.bd);
+                let other = if ci == 0 { a_e[1] } else { cfl_a[0] };
+                let realise = |a: i32| {
+                    let mut cpr = self.sbuf_i256();
+                    self.intrapred.cfl_pred(&mut cpr[..], &ac[..256], dc, a, self.bd);
+                    let mut resid = self.sbuf_i256();
+                    self.rd.residual_pred_blk(&mut resid[..], &cpr[..], src);
+                    let (mut q, qt) = self.dct.dct16x16_t(&resid, &self.cquant);
+                    self.chroma_rect_trellis(
+                        &mut q,
+                        &qt,
+                        dcq,
+                        acq,
+                        &SCAN_16X16,
+                        lam,
+                        16,
+                        16,
+                        plane,
+                        px,
+                        py,
+                    );
+                    let rr = self.idct.idct_dequant_16x16(&q, &self.cquant);
+                    let sse = sse_recon::<256, 16>(&self.rd, &cpr, &rr, src, self.bd);
+                    let bits = self.chroma_bits(&q, &SCAN_16X16, 16, plane, px, py);
+                    let pair = if ci == 0 { [a, other] } else { [other, a] };
+                    let cost = cfl_alpha_walk_cost(
+                        sse,
+                        mlam,
+                        bits,
+                        self.uv_mode_bits(y_mode, CFL_PRED, Some(pair)),
+                    );
+                    (cost, (q, cpr, sse, bits))
+                };
+                let (c0, p0) = realise(a_e[ci]);
+                let (a, (q, cpr, sse, bits)) =
+                    cfl_alpha_rd_refine(a_e[ci], c0, p0, steps, realise);
                 cfl_a[ci] = a;
-                let mut cpr = self.sbuf_i256();
-                self.intrapred.cfl_pred(&mut cpr[..], &ac[..256], dc, a, self.bd);
-                let mut resid = self.sbuf_i256();
-                self.rd.residual_pred_blk(&mut resid[..], &cpr[..], src);
-                let (mut q, qt) = self.dct.dct16x16_t(&resid, &self.cquant);
-                self.chroma_rect_trellis(
-                    &mut q,
-                    &qt,
-                    dcq,
-                    acq,
-                    &SCAN_16X16,
-                    lam,
-                    16,
-                    16,
-                    plane,
-                    px,
-                    py,
-                );
-                let rr = self.idct.idct_dequant_16x16(&q, &self.cquant);
                 *cfl_ccf[ci] = q;
-                cfl_sse[ci] = sse_recon::<256, 16>(&self.rd, &cpr, &rr, src, self.bd);
-                cfl_bits[ci] = self.chroma_bits(&q, &SCAN_16X16, 16, plane, px, py);
+                cfl_sse[ci] = sse;
+                cfl_bits[ci] = bits;
                 *cpred16[ci] = *cpr;
             }
             let sig = self.uv_mode_bits(y_mode, CFL_PRED, Some(cfl_a));
-            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let dc_total = rd_cost_i64(
                 dc_sse[0] + dc_sse[1],
                 mlam,
@@ -1113,29 +1138,44 @@ impl<'a> LossyTile<'a> {
             let mut cfl_px = [[0i32; 64]; 2];
             let mut cfl_a = [0i32; 2];
             let mut cfl_body = 0f32;
+            let steps = crate::tuning::get().cfl_alpha_rd_steps;
+            let a_e = [0, 1].map(|ci| {
+                self.intrapred.cfl_best_alpha(&ac, self.src_blk(ci + 1, cx, cy, 8, 8), dc_preds[ci], self.bd)
+            });
             for ci in 0..2 {
                 let plane = ci + 1;
                 let dc = dc_preds[ci];
                 let src = self.src_blk(plane, cx, cy, 8, 8);
-                let a = self
-                    .intrapred
-                    .cfl_best_alpha(&ac, src, dc, self.bd);
+                let other = if ci == 0 { a_e[1] } else { cfl_a[0] };
+                let realise = |a: i32| {
+                    let mut cpr = [0i32; 64];
+                    self.intrapred.cfl_pred(&mut cpr, &ac[..64], dc, a, self.bd);
+                    let mut resid = [0i32; 64];
+                    self.rd.residual_pred_blk(&mut resid, &cpr, src);
+                    let (mut q, qt) = self.dct.dct8x8_t(&resid, &self.cquant);
+                    self.chroma_rect_trellis(
+                        &mut q, &qt, dcq, acq, &SCAN_8X8, lam, 8, 8, plane, cx, cy,
+                    );
+                    let rr = self.idct.idct_dequant_8x8(&q, &self.cquant);
+                    let sse = sse_recon::<64, 8>(&self.rd, &cpr, &rr, src, self.bd);
+                    let bits = self.chroma_bits(&q, &SCAN_8X8, 8, plane, cx, cy);
+                    let pair = if ci == 0 { [a, other] } else { [other, a] };
+                    let cost = cfl_alpha_walk_cost(
+                        sse,
+                        mlam,
+                        bits,
+                        self.uv_mode_bits(y_mode, CFL_PRED, Some(pair)),
+                    );
+                    (cost, (q, rr, cpr, sse, bits))
+                };
+                let (c0, p0) = realise(a_e[ci]);
+                let (a, (q, rr, cpr, sse, bits)) =
+                    cfl_alpha_rd_refine(a_e[ci], c0, p0, steps, realise);
                 cfl_a[ci] = a;
-                let mut cpr = [0i32; 64];
-                self.intrapred.cfl_pred(&mut cpr, &ac[..64], dc, a, self.bd);
-                let mut resid = [0i32; 64];
-                self.rd.residual_pred_blk(&mut resid, &cpr, src);
-                let (mut q, qt) = self.dct.dct8x8_t(&resid, &self.cquant);
-                self.chroma_rect_trellis(
-                    &mut q, &qt, dcq, acq, &SCAN_8X8, lam, 8, 8, plane, cx, cy,
-                );
-                let rr = self.idct.idct_dequant_8x8(&q, &self.cquant);
-                let sse = sse_recon::<64, 8>(&self.rd, &cpr, &rr, src, self.bd);
                 cfl_ccf[ci] = q;
                 cfl_rr[ci] = rr;
                 cfl_px[ci] = cpr;
-                cfl_body +=
-                    rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_8X8, 8, plane, cx, cy));
+                cfl_body += rd_cost_i64(sse, mlam, bits);
             }
             let cfl_total = cfl_body
                 + rate_cost(mlam, self.uv_mode_bits(y_mode, CFL_PRED, Some(cfl_a)))
@@ -1494,39 +1534,56 @@ impl<'a> LossyTile<'a> {
             let mut cfl_a = [0i32; 2];
             let mut cfl_sse = [0i64; 2];
             let mut cfl_bits = [0f32; 2];
+            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
+            let steps = crate::tuning::get().cfl_alpha_rd_steps;
+            let a_e = [0, 1].map(|ci| {
+                self.intrapred.cfl_best_alpha(&ac, src_planes[ci], cpred[ci], self.bd)
+            });
             for ci in 0..2 {
                 let dc = cpred[ci];
                 let src = src_planes[ci];
-                let a = self
-                    .intrapred
-                    .cfl_best_alpha(&ac, src, dc, self.bd);
+                let other = if ci == 0 { a_e[1] } else { cfl_a[0] };
+                let realise = |a: i32| {
+                    let mut cpr = [0i32; 128];
+                    self.intrapred.cfl_pred(&mut cpr, &ac[..128], dc, a, self.bd);
+                    let mut resid = [0i32; 128];
+                    self.rd.residual_pred_blk(&mut resid, &cpr, src);
+                    let (mut q, qt) = self.dct.dct8x16_t(&resid, &self.cquant);
+                    self.chroma_rect_trellis(
+                        &mut q,
+                        &qt,
+                        dcq,
+                        acq,
+                        &SCAN_8X16,
+                        lam,
+                        8,
+                        16,
+                        ci + 1,
+                        cx,
+                        py,
+                    );
+                    let rr = self.idct.idct_dequant_8x16(&q, &self.cquant);
+                    let sse = self.rd.sse_recon(&cpr, &rr, src, self.bd);
+                    let bits = self.chroma_rect_bits(&q, &SCAN_8X16, 8, 16, ci + 1, cx, py);
+                    let pair = if ci == 0 { [a, other] } else { [other, a] };
+                    let cost = cfl_alpha_walk_cost(
+                        sse,
+                        mlam,
+                        bits,
+                        self.uv_mode_bits(y_mode, CFL_PRED, Some(pair)),
+                    );
+                    (cost, (q, cpr, sse, bits))
+                };
+                let (c0, p0) = realise(a_e[ci]);
+                let (a, (q, cpr, sse, bits)) =
+                    cfl_alpha_rd_refine(a_e[ci], c0, p0, steps, realise);
                 cfl_a[ci] = a;
-                let mut cpr = [0i32; 128];
-                self.intrapred.cfl_pred(&mut cpr, &ac[..128], dc, a, self.bd);
-                let mut resid = [0i32; 128];
-                self.rd.residual_pred_blk(&mut resid, &cpr, src);
-                let (mut q, qt) = self.dct.dct8x16_t(&resid, &self.cquant);
-                self.chroma_rect_trellis(
-                    &mut q,
-                    &qt,
-                    dcq,
-                    acq,
-                    &SCAN_8X16,
-                    lam,
-                    8,
-                    16,
-                    ci + 1,
-                    cx,
-                    py,
-                );
-                let rr = self.idct.idct_dequant_8x16(&q, &self.cquant);
                 cfl_ccf[ci] = q;
-                cfl_sse[ci] = self.rd.sse_recon(&cpr, &rr, src, self.bd);
-                cfl_bits[ci] = self.chroma_rect_bits(&q, &SCAN_8X16, 8, 16, ci + 1, cx, py);
+                cfl_sse[ci] = sse;
+                cfl_bits[ci] = bits;
                 cpred_px[ci] = cpr;
             }
             let sig = self.uv_mode_bits(y_mode, CFL_PRED, Some(cfl_a));
-            let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let dc_total = rd_cost_i64(
                 dc_sse[0] + dc_sse[1],
                 mlam,
@@ -2074,6 +2131,7 @@ impl<'a> LossyTile<'a> {
                 let mut cfl_px = [[0i32; 16]; 2];
                 let mut cfl_sse = [0i64; 2];
                 let mut cfl_bits = [0f32; 2];
+                let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 8);
                 if cfl_eligible {
                     let lrr_cfl = match tx4 {
                         TxSel::Adst => self.idct.iadst_dequant_4x4(&lcf, &self.quant),
@@ -2088,25 +2146,41 @@ impl<'a> LossyTile<'a> {
                     recon_add_pred(&mut luma_rec, &lpred, &lrr_cfl, maxv);
                     let mut ac = [0i32; 16];
                     self.intrapred.cfl_ac_444(&luma_rec, 4, 4, &mut ac);
+                    let steps = crate::tuning::get().cfl_alpha_rd_steps;
+                    let a_e = [0, 1].map(|ci| {
+                        self.intrapred.cfl_best_alpha(&ac, src_planes[ci], cpred[ci], self.bd)
+                    });
                     for ci in 0..2 {
                         let dc = cpred[ci];
                         let src = src_planes[ci];
-                        let a = self
-                            .intrapred
-                            .cfl_best_alpha(&ac, src, dc, self.bd);
+                        let other = if ci == 0 { a_e[1] } else { cfl_a[0] };
+                        let realise = |a: i32| {
+                            let mut cpr = [0i32; 16];
+                            self.intrapred.cfl_pred(&mut cpr, &ac[..16], dc, a, self.bd);
+                            let mut resid = [0i32; 16];
+                            self.rd.residual_pred_blk(&mut resid, &cpr, src);
+                            let (mut q, qt) = self.dct.dct4x4_t(&resid, &self.cquant);
+                            trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
+                            let rr = self.idct.idct_dequant_4x4(&q, &self.cquant);
+                            let sse = sse_recon::<16, 4>(&self.rd, &cpr, &rr, src, self.bd);
+                            let bits = self.chroma_bits(&q, &SCAN_4X4, 4, ci + 1, chx, chy);
+                            let pair = if ci == 0 { [a, other] } else { [other, a] };
+                            let cost = cfl_alpha_walk_cost(
+                        sse,
+                        mlam,
+                        bits,
+                        self.uv_mode_bits(best_mode, CFL_PRED, Some(pair)),
+                    );
+                            (cost, (q, cpr, sse, bits))
+                        };
+                        let (c0, p0) = realise(a_e[ci]);
+                        let (a, (q, cpr, sse, bits)) =
+                            cfl_alpha_rd_refine(a_e[ci], c0, p0, steps, realise);
                         cfl_a[ci] = a;
-                        let mut cpr = [0i32; 16];
-                        self.intrapred.cfl_pred(&mut cpr, &ac[..16], dc, a, self.bd);
-                        let mut resid = [0i32; 16];
-                        self.rd.residual_pred_blk(&mut resid, &cpr, src);
-                        let (mut q, qt) = self.dct.dct4x4_t(&resid, &self.cquant);
-                        trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_4X4, lam);
-                        let rr = self.idct.idct_dequant_4x4(&q, &self.cquant);
                         cfl_ccf[ci] = q;
-                        cfl_a[ci] = a;
                         cfl_px[ci] = cpr;
-                        cfl_sse[ci] = sse_recon::<16, 4>(&self.rd, &cpr, &rr, src, self.bd);
-                        cfl_bits[ci] = self.chroma_bits(&q, &SCAN_4X4, 4, ci + 1, chx, chy);
+                        cfl_sse[ci] = sse;
+                        cfl_bits[ci] = bits;
                     }
                 }
 
@@ -2114,7 +2188,6 @@ impl<'a> LossyTile<'a> {
                 // including the joint signaling cost (sign symbol + a magnitude
                 // per non-zero plane), mirroring the 8x8 4:4:4 path.
                 let sig = self.uv_mode_bits(best_mode, CFL_PRED, Some(cfl_a));
-                let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 8);
                 let dc_total = rd_cost_i64(
                     dc_sse[0] + dc_sse[1],
                     mlam,

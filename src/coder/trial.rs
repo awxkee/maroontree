@@ -175,6 +175,40 @@ impl<'a> LossyTile<'a> {
         m
     }
 
+    /// Rect legs in the 16x16 trial: the study knob, or the ExtraSlow package.
+    #[inline]
+    fn trial_rect_on(&self) -> bool {
+        let t = crate::tuning::get();
+        t.trial_rect || (self.speed == Speed::ExtraSlow && t.trial_rect_xslow)
+    }
+
+    /// Effective `trial_rect_sse_gate` (study knob first, else the ExtraSlow
+    /// package value at that tier).
+    #[inline]
+    fn trial_sse_gate(&self) -> u32 {
+        let t = crate::tuning::get();
+        if t.trial_rect_sse_gate != 0 {
+            t.trial_rect_sse_gate
+        } else if self.speed == Speed::ExtraSlow && t.trial_rect_xslow {
+            t.trial_rect_sse_gate_xslow
+        } else {
+            0
+        }
+    }
+
+    /// Effective `trial_struct_k` (same precedence).
+    #[inline]
+    fn trial_struct_k(&self) -> f64 {
+        let t = crate::tuning::get();
+        if t.trial_struct_k > 0.0 {
+            t.trial_struct_k as f64
+        } else if self.speed == Speed::ExtraSlow && t.trial_rect_xslow {
+            t.trial_struct_k_xslow as f64
+        } else {
+            0.0
+        }
+    }
+
     /// Whether the node of size `sz8` at this call takes the trial path:
     /// enabled for the level, a plain decide+emit tile (no capture/replay),
     /// not already inside a forced leg at this node, chroma present (mono has
@@ -194,20 +228,62 @@ impl<'a> LossyTile<'a> {
     fn trial_may_overturn(proxy: Part16, gate: u32) -> bool {
         match proxy {
             Part16::None => gate != 2,
-            Part16::Split => gate != 1,
+            Part16::Split => gate != 1 && gate != 3,
             _ => false,
+        }
+    }
+
+    /// Gate 3 at the 16x16 node: a proxy SPLIT verdict is re-decided against
+    /// the rect legs only (NONE was already rejected by the proxy).
+    #[inline]
+    fn trial_rect_vs_split(&self, proxy: Part16, gate: u32, sz8: usize) -> bool {
+        gate == 3 && sz8 == 2 && proxy == Part16::Split && self.trial_rect_on()
+    }
+
+    /// Relative margin between two proxy leg costs (`trial_margin` axis);
+    /// INFINITY when either leg is pruned, so the proxy verdict stands.
+    #[inline]
+    fn proxy_margin(a: f32, b: f32) -> f32 {
+        if a.is_finite() && b.is_finite() {
+            (a - b).abs() / a.min(b).max(f32::EPSILON)
+        } else {
+            f32::INFINITY
+        }
+    }
+
+    /// Proxy-margin gate (`trial_margin`, 0 = off): trial only where the
+    /// proxy's relative NONE-vs-SPLIT margin is below the knob.
+    #[inline]
+    fn trial_margin_ok(&self, margin: f32, px: usize, py: usize, dim: usize) -> bool {
+        let t = crate::tuning::get();
+        let m = t.trial_margin;
+        if m <= 0.0 || margin < m {
+            return true;
+        }
+        if margin.is_finite() {
+            return false;
+        }
+        match t.trial_margin_pruned {
+            0 => true,
+            1 => false,
+            _ => self.trial_src_gate_std(px, py, dim, t.trial_margin_edge, 0.0),
         }
     }
 
     /// Source gate (`trial_edge_hi` / `trial_edge_lo`): see the knobs.
     fn trial_src_gate(&self, px: usize, py: usize, dim: usize) -> bool {
         let t = crate::tuning::get();
-        if t.trial_edge_hi <= 0.0 {
+        self.trial_src_gate_std(px, py, dim, t.trial_edge_hi, t.trial_edge_lo)
+    }
+
+    /// [`Self::trial_src_gate`] with explicit std thresholds.
+    fn trial_src_gate_std(&self, px: usize, py: usize, dim: usize, edge_hi: f32, edge_lo: f32) -> bool {
+        if edge_hi <= 0.0 {
             return true;
         }
-        let (hi, lo) = (t.trial_edge_hi * t.trial_edge_hi, t.trial_edge_lo * t.trial_edge_lo);
+        let (hi, lo) = (edge_hi * edge_hi, edge_lo * edge_lo);
         let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
-        let (mut any_hi, mut any_lo) = (false, t.trial_edge_lo <= 0.0);
+        let (mut any_hi, mut any_lo) = (false, edge_lo <= 0.0);
         for y in (0..bh).step_by(8) {
             for x in (0..bw).step_by(8) {
                 let (w, h) = ((bw - x).min(8), (bh - y).min(8));
@@ -452,6 +528,35 @@ impl<'a> LossyTile<'a> {
     /// `sum_q lam * (Dy_q / lam_y(q) + Dc_q / lam_c(q)) + lam * bits`, where
     /// the per-quadrant lambdas are the node's own (default) or each 16x16
     /// quadrant's (`trial_child_prdo`, mirroring the bottom-up proxy sum).
+    /// Structural penalty of the current reconstruction over the node
+    /// (`trial_struct_k`): per visible 8x8 luma cell, the squared difference
+    /// of source and reconstruction standard deviation times the cell area,
+    /// i.e. lost (blurred) or invented (ringing) local contrast in SSE units.
+    fn trial_struct_penalty(&self, px: usize, py: usize, dim: usize) -> f64 {
+        let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
+        let mut pen = 0f64;
+        for y in (0..bh).step_by(8) {
+            for x in (0..bw).step_by(8) {
+                let (w, h) = ((bw - x).min(8), (bh - y).min(8));
+                let n = (w * h) as f64;
+                let sd = |plane: &[u16]| {
+                    let (sum, sq) = block_moments_i32(plane, self.w, px + x, py + y, w, h);
+                    let mean = sum as f64 / n;
+                    (sq as f64 / n - mean * mean).max(0.0).sqrt()
+                };
+                let d = sd(&self.src[0]) - sd(&self.recon[0]);
+                pen += d * d * n;
+            }
+        }
+        pen
+    }
+
+    /// Luma SSE of a leg summed over the node's quadrants.
+    fn trial_luma_sse(d: &[(i64, i64); 4]) -> i64 {
+        d.iter().map(|&(dy, _)| dy).sum()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn trial_cost(
         &self,
         d: &[(i64, i64); 4],
@@ -459,6 +564,8 @@ impl<'a> LossyTile<'a> {
         px: usize,
         py: usize,
         dim: usize,
+        dy_w: f64,
+        extra_dy: f64,
     ) -> f64 {
         let child = crate::tuning::get().trial_child_prdo;
         let lam = (self.mlam() * self.perceptual_rd_scale(px, py, dim)) as f64;
@@ -475,8 +582,11 @@ impl<'a> LossyTile<'a> {
             } else {
                 (lam, lam_c)
             };
-            j += lam * (dy as f64 / ly + if self.mono { 0.0 } else { dc as f64 / lc });
+            j += lam * (dy_w * dy as f64 / ly + if self.mono { 0.0 } else { dc as f64 / lc });
         }
+        // Extra luma-SSE-unit distortion (structural penalty), on the node's
+        // own luma axis.
+        j += extra_dy;
         j + lam * bits as f64
     }
 
@@ -484,7 +594,17 @@ impl<'a> LossyTile<'a> {
     /// units at (x8, y8): codes both legs for real into scratch state, keeps
     /// the cheaper leg's reconstruction/contexts and commits its symbols to
     /// the live entropy coder. On return the node is fully emitted.
-    fn trial_partition(&mut self, bl: usize, x8: usize, y8: usize, sz8: usize, thr: bool, lhb: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn trial_partition(
+        &mut self,
+        bl: usize,
+        x8: usize,
+        y8: usize,
+        sz8: usize,
+        thr: bool,
+        lhb: bool,
+        skip_none: bool,
+    ) {
         let (px, py, dim) = (x8 * 8, y8 * 8, sz8 * 8);
         let e0 = self.emit_epoch.get();
         let snap0 = self.trial_snapshot(x8, y8, sz8);
@@ -509,53 +629,102 @@ impl<'a> LossyTile<'a> {
         std::mem::swap(&mut self.cdfs, &mut *cdfs);
         let stats0 = self.cdfs.skip_stats;
 
-        // Leg A: PARTITION_NONE.
-        self.force_part = Some(Part16::None);
-        self.decode_sb(bl, x8, y8, sz8, thr, lhb);
-        debug_assert!(self.force_part.is_none(), "forced NONE leg was not consumed");
-        let tok_a = self.enc.take_semantic();
-        let stats_a = skip_stats_sub(&self.cdfs.skip_stats, &stats0);
-        let d_a = self.trial_distortion(px, py, dim);
-        let snap_a = self.trial_snapshot(x8, y8, sz8);
-        let e_a = self.emit_epoch.get();
+        // Every leg codes the node for real from the same pre-trial state.
+        let legs = self.trial_legs(sz8, skip_none);
+        let mut tokens: Vec<crate::odec::EntropyTokens> = Vec::with_capacity(legs.len());
+        let mut stats: Vec<SkipStats> = Vec::with_capacity(legs.len());
+        let mut dists: Vec<[(i64, i64); 4]> = Vec::with_capacity(legs.len());
+        let mut pens: Vec<f64> = Vec::with_capacity(legs.len());
+        let struct_k = self.trial_struct_k();
+        let mut snaps: Vec<Option<TrialSnap>> = Vec::with_capacity(legs.len());
+        let mut e_max = e0;
+        for (i, &leg) in legs.iter().enumerate() {
+            if i > 0 {
+                // Back to the pre-trial state, memos included.
+                self.trial_restore(x8, y8, sz8, &snap0);
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    full0 == self.trial_full_state(),
+                    "trial snapshot does not cover everything the {:?} leg mutated",
+                    legs[i - 1]
+                );
+                self.trial_purge_caches(e0);
+                self.emit_epoch.set(e0);
+                self.cdfs.skip_stats = stats0;
+                self.enc.begin_semantic_sink();
+            }
+            self.force_part = Some(leg);
+            self.decode_sb(bl, x8, y8, sz8, thr, lhb);
+            debug_assert!(self.force_part.is_none(), "forced {leg:?} leg was not consumed");
+            tokens.push(self.enc.take_semantic());
+            stats.push(skip_stats_sub(&self.cdfs.skip_stats, &stats0));
+            dists.push(self.trial_distortion(px, py, dim));
+            pens.push(if struct_k > 0.0 { struct_k * self.trial_struct_penalty(px, py, dim) } else { 0.0 });
+            // The last leg's state is live; earlier legs need a snapshot to
+            // be restorable if they win.
+            snaps.push((i + 1 < legs.len()).then(|| self.trial_snapshot(x8, y8, sz8)));
+            e_max = e_max.max(self.emit_epoch.get());
+        }
 
-        // Back to the pre-trial state, memos included.
-        self.trial_restore(x8, y8, sz8, &snap0);
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            full0 == self.trial_full_state(),
-            "trial snapshot does not cover everything the NONE leg mutated"
-        );
-        self.trial_purge_caches(e0);
-        self.emit_epoch.set(e0);
-        self.cdfs.skip_stats = stats0;
-        self.enc.begin_semantic_sink();
-
-        // Leg B: PARTITION_SPLIT (children decide themselves).
-        self.force_part = Some(Part16::Split);
-        self.decode_sb(bl, x8, y8, sz8, thr, lhb);
-        debug_assert!(self.force_part.is_none(), "forced SPLIT leg was not consumed");
-        let tok_b = self.enc.take_semantic();
-        let stats_b = skip_stats_sub(&self.cdfs.skip_stats, &stats0);
-        let d_b = self.trial_distortion(px, py, dim);
-        let e_b = self.emit_epoch.get();
-
-        let (bits_a, bits_b) = {
+        let bits: Vec<f32> = {
             let tables = self.trial_cost_tables();
-            (tok_a.estimate_bits(&tables), tok_b.estimate_bits(&tables))
+            tokens.iter().map(|t| t.estimate_bits(&tables)).collect()
         };
-        let j_a = self.trial_cost(&d_a, bits_a, px, py, dim);
-        let j_b = self.trial_cost(&d_b, bits_b, px, py, dim)
-            * crate::tuning::get().trial_split_bias as f64;
-        let (tokens, stats) = if j_a <= j_b {
-            self.trial_restore(x8, y8, sz8, &snap_a);
-            (tok_a, stats_a)
-        } else {
-            (tok_b, stats_b)
-        };
+        let tune = crate::tuning::get();
+        let split_bias = tune.trial_split_bias as f64;
+        let rect_bias = tune.trial_rect_bias as f64;
+        let rect_dy_w = tune.trial_rect_dy_w as f64;
+        let is_rect = |leg: Part16| matches!(leg, Part16::Horz | Part16::Vert);
+        let mut costs: Vec<f64> = legs
+            .iter()
+            .enumerate()
+            .map(|(i, &leg)| {
+                let dy_w = if is_rect(leg) { rect_dy_w } else { 1.0 };
+                let j = self.trial_cost(&dists[i], bits[i], px, py, dim, dy_w, pens[i]);
+                match leg {
+                    Part16::Split => j * split_bias,
+                    Part16::Horz | Part16::Vert => j * rect_bias,
+                    _ => j,
+                }
+            })
+            .collect();
+        let sse_gate = self.trial_sse_gate();
+        if sse_gate != 0 && legs.iter().any(|&l| is_rect(l)) {
+            // A square leg's luma SSE bounds what a rect may spend: the
+            // best-cost square's (1) or the lower of the squares' (2).
+            let squares = (0..legs.len()).filter(|&i| !is_rect(legs[i]));
+            let sq_dy = if sse_gate == 1 {
+                let best_sq = squares
+                    .min_by(|&a, &b| costs[a].total_cmp(&costs[b]))
+                    .expect("a square leg is always present");
+                Self::trial_luma_sse(&dists[best_sq])
+            } else {
+                squares
+                    .map(|i| Self::trial_luma_sse(&dists[i]))
+                    .min()
+                    .expect("a square leg is always present")
+            };
+            for i in 0..legs.len() {
+                if is_rect(legs[i]) && Self::trial_luma_sse(&dists[i]) > sq_dy {
+                    costs[i] = f64::INFINITY;
+                }
+            }
+        }
+        let mut win = 0usize;
+        for i in 1..legs.len() {
+            if costs[i] < costs[win] {
+                win = i;
+            }
+        }
+        if win + 1 < legs.len() {
+            let snap = snaps[win].take().expect("non-final leg has a snapshot");
+            self.trial_restore(x8, y8, sz8, &snap);
+        }
+        let tokens = tokens.swap_remove(win);
+        let stats = stats[win];
         // Every memo entry now refers to a superseded reconstruction, exactly
         // as after any emitted block.
-        self.emit_epoch.set(e_a.max(e_b) + 1);
+        self.emit_epoch.set(e_max + 1);
 
         // Live entropy state back; commit the winner's symbols through it.
         std::mem::swap(&mut self.enc, &mut enc);
@@ -566,4 +735,20 @@ impl<'a> LossyTile<'a> {
         self.enc.replay_semantic(&tokens, &mut slots);
         skip_stats_add(&mut self.cdfs.skip_stats, &stats);
     }
+
+    /// The partitions the trial codes for real at a node of `sz8` 8px units:
+    /// NONE and SPLIT always; with `trial_rect`, HORZ and VERT at the 16x16
+    /// node where this chroma format has the emitter (VERT is spec-forbidden
+    /// at 4:2:2).
+    fn trial_legs(&self, sz8: usize, skip_none: bool) -> Vec<Part16> {
+        let mut legs = if skip_none { vec![Part16::Split] } else { vec![Part16::None, Part16::Split] };
+        if sz8 == 2 && self.trial_rect_on() {
+            legs.push(Part16::Horz);
+            if !self.ss422 {
+                legs.push(Part16::Vert);
+            }
+        }
+        legs
+    }
 }
+

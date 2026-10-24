@@ -830,12 +830,12 @@ fn lossy_luma_palette(
     w: usize,
     h: usize,
     sel: usize,
-    smooth_t: i32,
+    opts: &PalMapOpts,
 ) -> Option<LossyLumaPalette> {
     let hist = block_color_histogram(src, stride, px, py, w, h)?;
     let top = sel > 8;
     let colors = if top { sel - 8 } else { sel };
-    lossy_luma_palette_from(kmeans, &hist, src, stride, px, py, w, h, colors, top, smooth_t)
+    lossy_luma_palette_from(kmeans, &hist, src, stride, px, py, w, h, colors, top, opts)
 }
 
 /// Test-only oracle for [`nearest_scan`]: independent per-value lookup with
@@ -885,7 +885,7 @@ fn lossy_luma_palette_from(
     h: usize,
     colors: usize,
     top: bool,
-    smooth_t: i32,
+    opts: &PalMapOpts,
 ) -> Option<LossyLumaPalette> {
     let centers = if top {
         top_palette_centers(hist, colors)?
@@ -902,8 +902,177 @@ fn lossy_luma_palette_from(
         h,
         centers.as_slice().to_vec(),
         colors + if top { 8 } else { 0 },
-        smooth_t,
+        opts,
     ))
+}
+
+/// How a lossy luma index map is built after the centers are fixed: the
+/// `palette_smooth` tolerance and, when the row Viterbi is on, its cost
+/// tables (`palette_y_color` decision costs, all sizes) and lambda. Built by
+/// `palette_map_opts`; every builder is a deterministic function of
+/// (src, centers, opts), which the wavefront replay relies on.
+#[derive(Clone, Copy)]
+struct PalMapOpts {
+    smooth_t: i32,
+    viterbi: Option<([[[f32; 8]; 5]; 7], f32)>,
+}
+
+impl PalMapOpts {
+    #[cfg(test)]
+    fn plain(smooth_t: i32) -> Self {
+        Self { smooth_t, viterbi: None }
+    }
+}
+
+/// [`palette_color_ctx`] from neighbour VALUES instead of a map: `l` / `u`
+/// are the left / above indices where they exist, `ul` the above-left one
+/// (read only when both exist). Lets the Viterbi price a candidate index
+/// under a hypothetical left neighbour. Bit-identical to the map version
+/// (`palette_color_ctx_nb_matches_map`).
+#[inline]
+fn palette_color_ctx_nb(l: Option<usize>, u: Option<usize>, ul: usize, current: usize) -> (usize, usize) {
+    let (n, ctx, r0, r1, r2) = match (l, u) {
+        (Some(l), Some(u)) => {
+            if l == u {
+                if l == ul {
+                    (1, 4, l, 0, 0)
+                } else {
+                    (2, 3, l, ul, 0)
+                }
+            } else if l == ul {
+                (2, 2, l, u, 0)
+            } else if u == ul {
+                (2, 2, u, l, 0)
+            } else {
+                (3, 1, l.min(u), l.max(u), ul)
+            }
+        }
+        (Some(v), None) | (None, Some(v)) => (1, 0, v, 0, 0),
+        (None, None) => return (0, current),
+    };
+    let symbol = if current == r0 {
+        0
+    } else if n >= 2 && current == r1 {
+        1
+    } else if n >= 3 && current == r2 {
+        2
+    } else {
+        let mut scored_below = usize::from(r0 < current);
+        if n >= 2 {
+            scored_below += usize::from(r1 < current);
+        }
+        if n >= 3 {
+            scored_below += usize::from(r2 < current);
+        }
+        n + current - scored_below
+    };
+    (ctx, symbol)
+}
+
+/// Row-wise Viterbi over the index map (`Tuning::palette_viterbi_*`). With
+/// the rows above final, a row is an exact chain whose state is the left
+/// pixel's index: a pixel's cost is its squared center error plus `lam` times
+/// the real `palette_y_color` bits of its symbol under the (left, above,
+/// above-left) context (the map is coded in wavefront order, but no context
+/// looks right or down, so row-major decision matches the dependence). The
+/// first map entry is a literal and prices as a constant. Ties keep the
+/// lower index. O(w * n^2) per row, n <= 8.
+#[allow(clippy::too_many_arguments)]
+fn viterbi_palette_map(
+    map: &mut [u8],
+    src: &[u16],
+    stride: usize,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    centers: &[i32],
+    costs: &[[f32; 8]; 5],
+    lam: f32,
+) {
+    let n = centers.len();
+    debug_assert!((2..=8).contains(&n));
+    // Weighted transition bits, tabulated once per block: `trans[u][ul][j][i]`
+    // for interior pixels (left j, above u, above-left ul), `top[j][i]` on the
+    // first row, `col[u][i]` in the first column. The per-pixel work is then
+    // an n^2 add-and-compare.
+    let mut trans = [0f32; 8 * 8 * 8 * 8];
+    let mut top = [[0f32; 8]; 8];
+    let mut col = [[0f32; 8]; 8];
+    for i in 0..n {
+        for j in 0..n {
+            let (ctx, sym) = palette_color_ctx_nb(Some(j), None, 0, i);
+            top[j][i] = lam * costs[ctx][sym];
+            let (ctx, sym) = palette_color_ctx_nb(None, Some(j), 0, i);
+            col[j][i] = lam * costs[ctx][sym];
+            for u in 0..n {
+                for ul in 0..n {
+                    let (ctx, sym) = palette_color_ctx_nb(Some(j), Some(u), ul, i);
+                    trans[((u * 8 + ul) * 8 + j) * 8 + i] = lam * costs[ctx][sym];
+                }
+            }
+        }
+    }
+    let mut prev = [0f32; 8];
+    let mut cur = [0f32; 8];
+    let mut dist = [0f32; 8];
+    let mut back = vec![0u8; w * 8];
+    for y in 0..h {
+        let row = &src[(py + y) * stride + px..(py + y) * stride + px + w];
+        for x in 0..w {
+            let v = row[x] as i32;
+            for (d, &c) in dist.iter_mut().zip(centers) {
+                let e = (v - c) as f32;
+                *d = e * e;
+            }
+            if x == 0 {
+                if y > 0 {
+                    let u = map[(y - 1) * w] as usize;
+                    for i in 0..n {
+                        cur[i] = dist[i] + col[u][i];
+                    }
+                } else {
+                    cur[..n].copy_from_slice(&dist[..n]);
+                }
+            } else {
+                let t: &[f32] = if y > 0 {
+                    let u = map[(y - 1) * w + x] as usize;
+                    let ul = map[(y - 1) * w + x - 1] as usize;
+                    &trans[(u * 8 + ul) * 64..(u * 8 + ul) * 64 + 64]
+                } else {
+                    top.as_flattened()
+                };
+                for i in 0..n {
+                    let mut best = f32::INFINITY;
+                    let mut arg = 0u8;
+                    for j in 0..n {
+                        let c = prev[j] + t[j * 8 + i];
+                        if c < best {
+                            best = c;
+                            arg = j as u8;
+                        }
+                    }
+                    cur[i] = best + dist[i];
+                    back[x * 8 + i] = arg;
+                }
+            }
+            prev = cur;
+        }
+        let mut bi = 0usize;
+        let mut bc = f32::INFINITY;
+        for (i, &c) in prev.iter().enumerate().take(n) {
+            if c < bc {
+                bc = c;
+                bi = i;
+            }
+        }
+        for x in (0..w).rev() {
+            map[y * w + x] = bi as u8;
+            if x > 0 {
+                bi = back[x * 8 + bi] as usize;
+            }
+        }
+    }
 }
 
 /// Raster-order index-map smoothing (see `Tuning::palette_smooth`): switch a
@@ -968,14 +1137,21 @@ fn lossy_luma_palette_from_centers(
     h: usize,
     centers: Vec<i32>,
     sel: usize,
-    smooth_t: i32,
+    opts: &PalMapOpts,
 ) -> LossyLumaPalette {
     let n = w * h;
     let mut map = vec![0u8; n];
-    (kmeans.luma_nearest_indices)(src, stride, px, py, w, h, &centers, &mut map);
-    if smooth_t > 0 && centers.len() > 1 {
-        let guard = crate::tuning::get().palette_smooth_guard;
-        smooth_palette_map(&mut map, src, stride, px, py, w, h, &centers, smooth_t, guard);
+    match &opts.viterbi {
+        Some((tables, lam)) if centers.len() > 1 => {
+            viterbi_palette_map(&mut map, src, stride, px, py, w, h, &centers, &tables[centers.len() - 2], *lam);
+        }
+        _ => {
+            (kmeans.luma_nearest_indices)(src, stride, px, py, w, h, &centers, &mut map);
+            if opts.smooth_t > 0 && centers.len() > 1 {
+                let guard = crate::tuning::get().palette_smooth_guard;
+                smooth_palette_map(&mut map, src, stride, px, py, w, h, &centers, opts.smooth_t, guard);
+            }
+        }
     }
     let mut packed_map = vec![0u8; n.div_ceil(2)];
     for (p, &idx) in map.iter().enumerate() {
@@ -1056,7 +1232,7 @@ impl<'a> LossyTile<'a> {
                 w,
                 h,
                 sel,
-                self.palette_smooth_t(),
+                &self.palette_map_opts(),
             );
         }
         let hist = block_color_histogram(&self.src[0], self.w, px, py, w, h)?;
@@ -1078,7 +1254,7 @@ impl<'a> LossyTile<'a> {
             h,
             centers.as_slice().to_vec(),
             sel,
-            self.palette_smooth_t(),
+            &self.palette_map_opts(),
         ))
     }
 
@@ -1247,7 +1423,7 @@ impl<'a> LossyTile<'a> {
                     h,
                     centers.as_slice().to_vec(),
                     order / 2 + 2 + if top { 8 } else { 0 },
-                    self.palette_smooth_t(),
+                    &self.palette_map_opts(),
                 );
                 let mut pred = [0i32; N];
                 palette_pred(&mut pred, w, &palette.colors, &palette.packed_map, w, h);
@@ -1278,6 +1454,37 @@ impl<'a> LossyTile<'a> {
             return 0;
         }
         (self.quant.ac_q() * crate::tuning::get().palette_smooth as i32) >> 8
+    }
+
+    /// Index-map construction options for this tile (see [`PalMapOpts`]).
+    /// The Viterbi lambda is `mlam()` (quantiser only, no perceptual anchor)
+    /// so the map stays a function of (position, selector): the lambda-free
+    /// palette memos and the wavefront replay both depend on that.
+    fn palette_map_opts(&self) -> PalMapOpts {
+        let t = crate::tuning::get();
+        let k = if self.ss420 || self.ss422 || self.mono {
+            t.palette_viterbi_420
+        } else {
+            t.palette_viterbi_444
+        };
+        let on = k > 0.0
+            && match t.palette_viterbi_screen_only {
+                0 => true,
+                1 => self.screen_frame,
+                _ => self.screen_content,
+            };
+        let viterbi = on.then(|| (**self.pal_y_cost_tables(), self.mlam() * k));
+        PalMapOpts { smooth_t: self.palette_smooth_t(), viterbi }
+    }
+
+    /// [`Self::palette_map_opts`] for the partition proxy's palette estimates
+    /// (`palette_viterbi_proxy` false keeps nearest + smoothing there).
+    fn palette_map_opts_proxy(&self) -> PalMapOpts {
+        let mut o = self.palette_map_opts();
+        if !crate::tuning::get().palette_viterbi_proxy {
+            o.viterbi = None;
+        }
+        o
     }
 
     /// Flat per-tile `palette_y_color` decision-cost tables (see field doc).
@@ -1744,7 +1951,7 @@ mod palette_generalization_tests {
                         size,
                         centers.as_slice().to_vec(),
                         order / 2 + 2 + if top { 8 } else { 0 },
-                        tile.palette_smooth_t(),
+                        &tile.palette_map_opts(),
                     );
                     let selector = selected.sel as usize;
                     let replayed = tile.rederive_luma_palette(8, 8, size, size, selector);
@@ -1778,7 +1985,7 @@ mod palette_generalization_tests {
             16,
             16,
             4,
-            0,
+            &PalMapOpts::plain(0),
         )
         .expect("exact palette");
         assert_eq!(p.colors, vec![10, 80, 150, 220]);
@@ -1804,7 +2011,7 @@ mod palette_generalization_tests {
                 16,
                 16,
                 2,
-                0,
+                &PalMapOpts::plain(0),
             )
             .is_some()
         );
@@ -1860,6 +2067,39 @@ mod ctx_tests {
     /// The specialized `palette_color_ctx` must match the generic
     /// (score/insertion-sort) implementation bit for bit on every reachable
     /// input: all sizes 2..=8, every neighbor color combination, both edges.
+    #[test]
+    fn palette_color_ctx_nb_matches_map() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for n in 2..=8usize {
+            for &(w, h) in &[(4usize, 4usize), (8, 4), (4, 8), (16, 16)] {
+                for _ in 0..8 {
+                    let map: Vec<u8> = (0..w * h).map(|_| (rnd() % n as u32) as u8).collect();
+                    for y in 0..h {
+                        for x in 0..w {
+                            if x == 0 && y == 0 {
+                                continue;
+                            }
+                            let l = (x > 0).then(|| map[y * w + x - 1] as usize);
+                            let u = (y > 0).then(|| map[(y - 1) * w + x] as usize);
+                            let ul = if x > 0 && y > 0 { map[(y - 1) * w + x - 1] as usize } else { 0 };
+                            assert_eq!(
+                                palette_color_ctx_nb(l, u, ul, map[y * w + x] as usize),
+                                palette_color_ctx(&map, w, y, x, n),
+                                "n={n} w={w} h={h} ({x},{y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn palette_color_ctx_matches_generic() {
         for size in 2..=8usize {

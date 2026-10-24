@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(U16_CONVERSIONS.load(Ordering::Relaxed), src.len());
         assert_eq!(&padded[..8], &[12, 255, 255, 255, 255, 255, 255, 255]);
         assert_eq!(&padded[8..16], &[5, 40, 40, 40, 40, 40, 40, 40]);
-        for row in padded[16..].chunks_exact(8) {
+        for row in padded[16..].as_chunks::<8>().0 {
             assert_eq!(row, &padded[8..16]);
         }
     }
