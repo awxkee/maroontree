@@ -447,6 +447,25 @@ pub(crate) struct Tuning {
     /// Contextual trellis: also scan lower DC levels for the DC-only
     /// terminal (the Step-A DC level was optimized assuming the AC stays).
     pub(crate) trellis_dc_only_scan: bool,
+    /// Contextual trellis: price every EOB candidate in ITS OWN contexts.
+    /// The prefix costs were built once from the post-Step-A level map and
+    /// reused for every shorter EOB, although zeroing the suffix lowers the
+    /// base/br contexts of up to five earlier coefficients per removed
+    /// position. On, Step B walks the EOB downward, zeroes one position per
+    /// step and re-prices only its (<= 5) earlier stencil dependants.
+    pub(crate) trellis_eob_reprice: bool,
+    /// With `trellis_eob_reprice`: also offer positions Step A zeroed as the
+    /// EOB coefficient (terminals are priced off `eob_base`, not the
+    /// neighbour context that made the interior level-0 win).
+    pub(crate) trellis_eob_zero_term: bool,
+    /// Contextual trellis: pad the level-map stride to `h + 2`. The emitter
+    /// fills its map progressively in reverse scan, so its stencil reads past
+    /// the last row (`y + 1`, `y + 2`) land on not-yet-written zeros, as in
+    /// the decoder. The trellis fills the whole map up front at stride `h`,
+    /// so for the last two rows those reads WRAP onto earlier coefficients'
+    /// real levels and inflate their contexts. The buffer was already sized
+    /// `(w + 2) * (h + 2)`.
+    pub(crate) trellis_pad_stride: bool,
     /// Luma mode beam: give the mode with the smallest CENTRED residual energy
     /// (cheapest DC-only correction) the last shortlist slot when the SATD
     /// ranking pruned it
@@ -638,6 +657,9 @@ impl Tuning {
         trellis_dc_ctx0: true,
         trellis_zero_bits: 1.0,
         trellis_dc_only_scan: false,
+        trellis_eob_reprice: false,
+        trellis_eob_zero_term: false,
+        trellis_pad_stride: false,
         beam_sparse_slot: true,
         trellis_calib: 1.15,
         tilt_base_444: 1.9,
@@ -886,6 +908,9 @@ mod imp {
                 "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
                 "trellis_zero_bits" => t.trellis_zero_bits = num(value),
                 "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
+                "trellis_eob_reprice" => t.trellis_eob_reprice = flag(value),
+                "trellis_eob_zero_term" => t.trellis_eob_zero_term = flag(value),
+                "trellis_pad_stride" => t.trellis_pad_stride = flag(value),
                 "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
                 "trellis_calib" => t.trellis_calib = num(value),
                 "tilt_base_444" => t.tilt_base_444 = num(value),
