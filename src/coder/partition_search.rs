@@ -386,7 +386,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             c.as_slice().to_vec(),
                             n + if top { 8 } else { 0 },
-                            self.palette_smooth_t(),
+                            &self.palette_map_opts_proxy(),
                         )),
                         None => lossy_luma_palette_from(
                             &self.kmeans,
@@ -399,7 +399,7 @@ impl<'a> LossyTile<'a> {
                             dim,
                             n,
                             top,
-                            self.palette_smooth_t(),
+                            &self.palette_map_opts_proxy(),
                         ),
                     }) else {
                         continue;

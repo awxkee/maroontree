@@ -402,6 +402,22 @@ pub(crate) struct Tuning {
     /// With `palette_smooth`: only pixels the nearest center does NOT hit
     /// exactly may move (protects exact palettes / exact-hit pixels).
     pub(crate) palette_smooth_guard: bool,
+    /// Row-wise Viterbi over the lossy luma palette index map (replaces the
+    /// `palette_smooth` pass when > 0): with the rows above final, each row is
+    /// an exact chain (state = the left pixel's index) minimizing squared
+    /// center error + lambda * the real `palette_y_color` context bits.
+    /// The value multiplies the tile's mode lambda; 0 = off. Per format
+    /// (`_444` = 4:4:4, `_420` = 4:2:0 / 4:2:2 / mono).
+    pub(crate) palette_viterbi_444: f32,
+    pub(crate) palette_viterbi_420: f32,
+    /// Also build the partition proxy's palette estimates (`rd_cost_square`
+    /// bracket) with the Viterbi; false keeps nearest + smoothing there and
+    /// runs the Viterbi only for the emitter's candidates.
+    pub(crate) palette_viterbi_proxy: bool,
+    /// Run the Viterbi only on screen frames (`screen_frame`): photos measured
+    /// BD-neutral (+-0.8 per image, ~0 avg) for ~10% time, synthetic edges
+    /// lose (x_fractal +1.0..1.3); the gain is confined to screen content.
+    pub(crate) palette_viterbi_screen_only: bool,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -606,6 +622,10 @@ impl Tuning {
         split4_decision_txtypes: false,
         palette_smooth: 24,
         palette_smooth_guard: true,
+        palette_viterbi_444: 0.0,
+        palette_viterbi_420: 0.0,
+        palette_viterbi_proxy: true,
+        palette_viterbi_screen_only: true,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -850,6 +870,10 @@ mod imp {
                 "split4_decision_txtypes" => t.split4_decision_txtypes = flag(value),
                 "palette_smooth" => t.palette_smooth = num(value) as u32,
                 "palette_smooth_guard" => t.palette_smooth_guard = flag(value),
+                "palette_viterbi_444" => t.palette_viterbi_444 = num(value),
+                "palette_viterbi_420" => t.palette_viterbi_420 = num(value),
+                "palette_viterbi_proxy" => t.palette_viterbi_proxy = flag(value),
+                "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = flag(value),
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),
