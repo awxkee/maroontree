@@ -556,6 +556,7 @@ impl<'a> LossyTile<'a> {
         d.iter().map(|&(dy, _)| dy).sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trial_cost(
         &self,
         d: &[(i64, i64); 4],
@@ -593,6 +594,7 @@ impl<'a> LossyTile<'a> {
     /// units at (x8, y8): codes both legs for real into scratch state, keeps
     /// the cheaper leg's reconstruction/contexts and commits its symbols to
     /// the live entropy coder. On return the node is fully emitted.
+    #[allow(clippy::too_many_arguments)]
     fn trial_partition(
         &mut self,
         bl: usize,

@@ -3849,7 +3849,7 @@ mod tests {
             h,
             false,
             &index,
-            LeafEdges::split_tree(0, 0, 1 * 4),
+            LeafEdges::split_tree(0, 0, 4),
         );
         assert_eq!(uv_mode, CFL_PRED);
         assert_eq!(alpha, [8, -8]);

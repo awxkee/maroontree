@@ -1467,7 +1467,12 @@ impl<'a> LossyTile<'a> {
         } else {
             t.palette_viterbi_444
         };
-        let on = k > 0.0 && (self.screen_frame || !t.palette_viterbi_screen_only);
+        let on = k > 0.0
+            && match t.palette_viterbi_screen_only {
+                0 => true,
+                1 => self.screen_frame,
+                _ => self.screen_content,
+            };
         let viterbi = on.then(|| (**self.pal_y_cost_tables(), self.mlam() * k));
         PalMapOpts { smooth_t: self.palette_smooth_t(), viterbi }
     }

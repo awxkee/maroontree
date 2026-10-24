@@ -443,10 +443,7 @@ impl OdEcEncoder {
         if let Some(t) = self.semantic.as_mut() {
             let key = *cdf.last().expect("empty partition CDF");
             t.ops.push(
-                TOKEN_GATHERED_PARTITION
-                    | ((key as u32) << 2)
-                    | ((split as u32) << 1)
-                    | top as u32,
+                TOKEN_GATHERED_PARTITION | ((key as u32) << 2) | ((split as u32) << 1) | top as u32,
             );
             if self.sink {
                 return;

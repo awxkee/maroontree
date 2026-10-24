@@ -407,17 +407,21 @@ pub(crate) struct Tuning {
     /// an exact chain (state = the left pixel's index) minimizing squared
     /// center error + lambda * the real `palette_y_color` context bits.
     /// The value multiplies the tile's mode lambda; 0 = off. Per format
-    /// (`_444` = 4:4:4, `_420` = 4:2:0 / 4:2:2 / mono).
+    /// (`_444` = 4:4:4, `_420` = 4:2:0 / 4:2:2 / mono). SHIPPED 1.0 / 0.5
+    /// behind the `screen_frame` gate (2026-10-24): x_screen -1.94 / -0.45,
+    /// n_bbscreen -1.10 / -3.40, every non-screen frame byte-identical;
+    /// lam >= 2.0 over-merges and loses on every image.
     pub(crate) palette_viterbi_444: f32,
     pub(crate) palette_viterbi_420: f32,
     /// Also build the partition proxy's palette estimates (`rd_cost_square`
     /// bracket) with the Viterbi; false keeps nearest + smoothing there and
     /// runs the Viterbi only for the emitter's candidates.
     pub(crate) palette_viterbi_proxy: bool,
-    /// Run the Viterbi only on screen frames (`screen_frame`): photos measured
-    /// BD-neutral (+-0.8 per image, ~0 avg) for ~10% time, synthetic edges
-    /// lose (x_fractal +1.0..1.3); the gain is confined to screen content.
-    pub(crate) palette_viterbi_screen_only: bool,
+    /// Where the Viterbi runs: 0 = every frame, 1 = `screen_frame` only
+    /// (screen content WITH exact 16x16 repeats), 2 = `screen_content` only.
+    /// Ungated, photos measured BD-neutral (+-0.8 per image, ~0 avg) for ~10%
+    /// time and synthetic edges lose (x_fractal +1.0..1.3).
+    pub(crate) palette_viterbi_screen_only: u32,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -622,10 +626,10 @@ impl Tuning {
         split4_decision_txtypes: false,
         palette_smooth: 24,
         palette_smooth_guard: true,
-        palette_viterbi_444: 0.0,
-        palette_viterbi_420: 0.0,
+        palette_viterbi_444: 1.0,
+        palette_viterbi_420: 0.5,
         palette_viterbi_proxy: true,
-        palette_viterbi_screen_only: true,
+        palette_viterbi_screen_only: 1,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -873,7 +877,7 @@ mod imp {
                 "palette_viterbi_444" => t.palette_viterbi_444 = num(value),
                 "palette_viterbi_420" => t.palette_viterbi_420 = num(value),
                 "palette_viterbi_proxy" => t.palette_viterbi_proxy = flag(value),
-                "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = flag(value),
+                "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),

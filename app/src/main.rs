@@ -27,12 +27,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #[cfg(feature = "aom-compare")]
+#[allow(dead_code)] // call site in main() is commented out
 mod aom_bench;
 mod y4m2ivf;
 
-use maroontree::{
-    BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, Speed, encode_lossless, encode_rgb8,
-};
+use maroontree::{BitDepth, ChromaFormat, Cicp, EncodeConfig, PlanarImage, Speed, encode_rgb8};
 use std::time::Instant;
 
 fn main() {
