@@ -563,7 +563,7 @@ impl<'a> LossyTile<'a> {
                         self.force_part.is_some()
                     };
                     if !pinned {
-                        self.trial_partition(bl, x8, y8, 4, thr, lhb);
+                        self.trial_partition(bl, x8, y8, 4, thr, lhb, false);
                         return;
                     }
                 }
@@ -608,8 +608,13 @@ impl<'a> LossyTile<'a> {
                     // Real-R-D NONE-vs-SPLIT; a non-square proxy winner
                     // (rects, quads, IntraBC) is kept as decided.
                     let proxy = self.partition_choice_16(x8, y8, thr, lhb);
-                    if Self::trial_may_overturn(proxy, crate::tuning::get().trial_gate) {
-                        self.trial_partition(bl, x8, y8, 2, thr, lhb);
+                    let gate = crate::tuning::get().trial_gate;
+                    if Self::trial_may_overturn(proxy, gate) {
+                        self.trial_partition(bl, x8, y8, 2, thr, lhb, false);
+                        return;
+                    }
+                    if self.trial_rect_vs_split(proxy, gate, 2) {
+                        self.trial_partition(bl, x8, y8, 2, thr, lhb, true);
                         return;
                     }
                     self.force_part = Some(proxy);
@@ -623,9 +628,9 @@ impl<'a> LossyTile<'a> {
                         if self.ss420 {
                             self.code_block16_rect_420(x8, y8, false);
                         } else if self.ss422 {
-                            self.code_block16_horz_422(x8, y8);
+                            self.code_block16_horz_422(x8, y8, 2);
                         } else {
-                            self.code_block16_horz_444(x8, y8);
+                            self.code_block16_horz_444(x8, y8, 2);
                         }
                         self.a_part[x8..x8 + 2].fill(0x1c);
                         self.l_part[y8..y8 + 2].fill(0x1e);
@@ -638,7 +643,7 @@ impl<'a> LossyTile<'a> {
                         if self.ss420 {
                             self.code_block16_rect_420(x8, y8, true);
                         } else {
-                            self.code_block16_vert_444(x8, y8);
+                            self.code_block16_vert_444(x8, y8, 2);
                         }
                         self.a_part[x8..x8 + 2].fill(0x1e);
                         self.l_part[y8..y8 + 2].fill(0x1c);
@@ -745,6 +750,39 @@ impl<'a> LossyTile<'a> {
                     }
                     Part16::Split => { /* fall through to the SPLIT path below */ }
                 }
+            } else if have_h != have_v {
+                // Exactly one frame edge crosses this node: the spec codes a
+                // boolean, SPLIT vs HORZ (edge below) / VERT (edge right).
+                // The rect's first half is fully in-frame (8-aligned coded
+                // frame); its second half is never coded.
+                let horz = have_h;
+                let choice = self.part_decision(|t| t.edge_choice_16(x8, y8, thr, lhb, horz));
+                if choice != Part16::Split {
+                    let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+                    self.enc
+                        .encode_gathered_partition(horz, false, &self.cdfs.part_split[bl - 1][ctx]);
+                    if horz {
+                        if self.ss420 {
+                            self.code_block16_rect_leaf_420(x8, y8, false);
+                        } else if self.ss422 {
+                            self.code_block16_horz_422(x8, y8, 1);
+                        } else {
+                            self.code_block16_horz_444(x8, y8, 1);
+                        }
+                    } else if self.ss420 {
+                        self.code_block16_rect_leaf_420(x8, y8, true);
+                    } else {
+                        self.code_block16_vert_444(x8, y8, 1);
+                    }
+                    // dav1d `al_part_ctx` bl16 h / v, clipped to the in-frame
+                    // context entries (the out-of-frame ones are never read).
+                    let (a, l) = if horz { (0x1c, 0x1e) } else { (0x1e, 0x1c) };
+                    let ae = (x8 + 2).min(self.a_part.len());
+                    let le = (y8 + 2).min(self.l_part.len());
+                    self.a_part[x8..ae].fill(a);
+                    self.l_part[y8..le].fill(l);
+                    return;
+                }
             }
         }
         // BL_64X64 whole-superblock PARTITION_NONE (all chroma formats; 4:0:0
@@ -759,7 +797,7 @@ impl<'a> LossyTile<'a> {
                 // Real-R-D whole-64 vs SPLIT; rect64 / IntraBC verdicts stand.
                 let proxy = self.choose_64(x8, y8, thr, lhb);
                 if Self::trial_may_overturn(proxy, crate::tuning::get().trial_gate) {
-                    self.trial_partition(bl, x8, y8, 8, thr, lhb);
+                    self.trial_partition(bl, x8, y8, 8, thr, lhb, false);
                     return;
                 }
                 self.force_part = Some(proxy);
@@ -813,10 +851,10 @@ impl<'a> LossyTile<'a> {
             // edge: dav1d codes a NON-adapting bool from a gathered probability;
             // read the live (possibly already-adapted) icdf CDF, do not adapt it.
             self.enc
-                .encode_gathered_partition(true, &self.cdfs.part_split[bl - 1][ctx]);
+                .encode_gathered_partition(true, true, &self.cdfs.part_split[bl - 1][ctx]);
         } else if have_v {
             self.enc
-                .encode_gathered_partition(false, &self.cdfs.part_split[bl - 1][ctx]);
+                .encode_gathered_partition(false, true, &self.cdfs.part_split[bl - 1][ctx]);
         }
         // else: neither -> implicit split, no symbol
         // recurse the children whose top-left is in-frame, propagating the

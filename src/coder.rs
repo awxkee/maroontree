@@ -5610,7 +5610,7 @@ mod aq_tests {
             let part_ctx = i % cdfs.part_split[0].len();
             let part_n = cdfs.part_split[0][part_ctx].len() - 1;
             enc.encode_symbol(i % part_n, &mut cdfs.part_split[0][part_ctx]);
-            enc.encode_gathered_partition(i & 4 != 0, &cdfs.part_split[0][part_ctx]);
+            enc.encode_gathered_partition(i & 4 != 0, i & 8 == 0, &cdfs.part_split[0][part_ctx]);
 
             enc.encode_symbol_noupdate(i & 1, &cdfs.intrabc);
         }

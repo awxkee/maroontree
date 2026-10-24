@@ -297,6 +297,66 @@ pub(crate) fn rd_cost_i64(distortion: i64, lambda: f32, rate: f32) -> f32 {
     distortion as f32 + rate_cost(lambda, rate)
 }
 
+/// Rate-aware CfL alpha refinement (aom `cfl_pick_plane_rd` analogue). `a0`
+/// is the pre-quantisation energy optimum, already realised by the caller as
+/// `(cost0, payload0)`. `eval(a)` realises alpha `a` for ONE plane (predict,
+/// transform, trellis, reconstruct) and returns its full RD cost — recon
+/// distortion + lambda x (coefficient bits + this plane's alpha-signal bits) —
+/// with whatever the caller needs to install that alpha. Steps toward zero
+/// while the cost keeps falling, otherwise away from zero, at most `steps`
+/// either way. The payload returned belongs to the alpha returned.
+/// Score of one alpha candidate inside [`cfl_alpha_rd_refine`]'s walk
+/// (`cfl_alpha_rd_mode`): full RD, coefficient-bits-only, or realised SSE.
+#[inline]
+pub(crate) fn cfl_alpha_walk_cost(dist: i64, lambda: f32, coef_bits: f32, sig_bits: f32) -> f32 {
+    match crate::tuning::get().cfl_alpha_rd_mode {
+        1 => rd_cost_i64(dist, lambda, coef_bits),
+        2 => dist as f32,
+        _ => rd_cost_i64(dist, lambda, coef_bits + sig_bits),
+    }
+}
+
+pub(crate) fn cfl_alpha_rd_refine<T>(
+    a0: i32,
+    cost0: f32,
+    payload0: T,
+    steps: u32,
+    mut eval: impl FnMut(i32) -> (f32, T),
+) -> (i32, T) {
+    if steps == 0 || a0 == 0 {
+        return (a0, payload0);
+    }
+    let (mut best_a, mut best_c, mut best_p) = (a0, cost0, payload0);
+    let dir = a0.signum();
+    for s in 1..=steps as i32 {
+        let a = a0 - dir * s;
+        if a * dir < 0 {
+            break;
+        }
+        let (c, p) = eval(a);
+        if c < best_c {
+            (best_a, best_c, best_p) = (a, c, p);
+        } else {
+            break;
+        }
+    }
+    if best_a == a0 {
+        for s in 1..=steps as i32 {
+            let a = a0 + dir * s;
+            if a.abs() > 16 {
+                break;
+            }
+            let (c, p) = eval(a);
+            if c < best_c {
+                (best_a, best_c, best_p) = (a, c, p);
+            } else {
+                break;
+            }
+        }
+    }
+    (best_a, best_p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
