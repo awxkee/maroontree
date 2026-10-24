@@ -557,9 +557,12 @@ impl<'a> LossyTile<'a> {
                     // arbitrates the whole-32 IntraBC copy where it exists,
                     // and `trial_gate` can let one of its verdicts stand.
                     let gate = crate::tuning::get().trial_gate;
-                    let pinned = (self.allow_intrabc || gate != 0) && {
+                    let margin_on = crate::tuning::get().trial_margin > 0.0;
+                    let pinned = (self.allow_intrabc || gate != 0 || margin_on) && {
                         let proxy = self.choose_rect32(x8, y8, thr, lhb);
-                        self.force_part = (!Self::trial_may_overturn(proxy, gate)).then_some(proxy);
+                        let stands = !Self::trial_may_overturn(proxy, gate)
+                            || !self.trial_margin_ok(self.proxy_margin32.get(), x8 * 8, y8 * 8, 32);
+                        self.force_part = stands.then_some(proxy);
                         self.force_part.is_some()
                     };
                     if !pinned {
@@ -609,7 +612,14 @@ impl<'a> LossyTile<'a> {
                     // (rects, quads, IntraBC) is kept as decided.
                     let proxy = self.partition_choice_16(x8, y8, thr, lhb);
                     let gate = crate::tuning::get().trial_gate;
-                    if Self::trial_may_overturn(proxy, gate) {
+                    if Self::trial_may_overturn(proxy, gate)
+                        && self.trial_margin_ok(
+                            self.proxy_margin_16(x8, y8, thr, lhb),
+                            x8 * 8,
+                            y8 * 8,
+                            16,
+                        )
+                    {
                         self.trial_partition(bl, x8, y8, 2, thr, lhb, false);
                         return;
                     }

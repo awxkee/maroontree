@@ -301,6 +301,7 @@ impl<'a> LossyTile<'a> {
         // Monochrome has no whole-32 emitter (`code_block32` dispatches to the
         // 4:4:4 helper, which indexes the absent chroma planes), so 4:0:0 always
         // splits — as it did before the NONE-vs-SPLIT R-D rework.
+        self.proxy_margin32.set(f32::INFINITY);
         if self.mono {
             let (px, py) = (x8 * 8, y8 * 8);
             return (Part16::Split, self.rd_cost_split32(px, py, prdo, thr, lhb));
@@ -386,6 +387,7 @@ impl<'a> LossyTile<'a> {
         if rd_ibc < rd_none.min(rd_split) {
             return (Part16::Intrabc, rd_ibc);
         }
+        self.proxy_margin32.set(Self::proxy_margin(rd_none, rd_split));
         if !self.speed.full_partition_rdo() {
             return if rd_none <= rd_split {
                 (Part16::None, rd_none)

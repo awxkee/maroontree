@@ -372,6 +372,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -469,6 +470,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -575,6 +577,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -681,6 +684,7 @@ impl<'a> LossyTile<'a> {
             coef_cost: std::cell::RefCell::new(None),
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
+            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -3078,7 +3082,7 @@ impl<'a> LossyTile<'a> {
         // different intra-edge availability prices differently.
         let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
         let epoch = self.emit_epoch.get();
-        if let Some(&(e, p, c)) = self.rd16_cache.borrow().get(&key)
+        if let Some(&(e, p, c, _)) = self.rd16_cache.borrow().get(&key)
             && e == epoch
         {
             return (p, c);
@@ -3086,19 +3090,32 @@ impl<'a> LossyTile<'a> {
         let out = self.rd_choice_16_inner(x8, y8, thr, lhb);
         self.rd16_cache
             .borrow_mut()
-            .insert(key, (epoch, out.0, out.1));
-        out
+            .insert(key, (epoch, out.0, out.1, out.2));
+        (out.0, out.1)
     }
 
-    fn rd_choice_16_inner(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32) {
+    /// Relative NONE-vs-SPLIT margin of the 16-level proxy decision (see
+    /// `trial_margin`); INFINITY when either leg was pruned or nothing is
+    /// memoised for the node.
+    fn proxy_margin_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> f32 {
+        self.rd_choice_16(x8, y8, thr, lhb);
+        let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
+        let epoch = self.emit_epoch.get();
+        match self.rd16_cache.borrow().get(&key) {
+            Some(&(e, _, _, m)) if e == epoch => m,
+            _ => f32::INFINITY,
+        }
+    }
+
+    fn rd_choice_16_inner(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32, f32) {
         let (px, py) = (x8 * 8, y8 * 8);
         // Fixed-partition mode: no R-D at this level either. See the matching
         // comment in `rd_choice_rect32` for why returning a placeholder cost is
         // sound (nothing compares it).
         match crate::tuning::fixed_size(self.speed) {
             0 => {}
-            16 => return (Part16::None, 0.0),
-            n if n < 16 => return (Part16::Split, 0.0),
+            16 => return (Part16::None, 0.0, f32::INFINITY),
+            n if n < 16 => return (Part16::Split, 0.0, f32::INFINITY),
             _ => {}
         }
 
@@ -3258,6 +3275,9 @@ impl<'a> LossyTile<'a> {
         // `do_square_split` and `do_rectangular_split` together).
         let split_signal = rate_cost(part_lam, self.part16_rate(x8, y8, 3));
         let mut split_pruned = skip_split;
+        // Margin of a SPLIT leg the exact branch-and-bound below prunes: its
+        // luma lower bound against NONE (a lower bound on the true margin).
+        let mut split_bound_margin = f32::INFINITY;
         let mut square8 = [0.0f32; 4];
         if !split_pruned {
             let mut luma_lower_bound = split_signal;
@@ -3273,6 +3293,7 @@ impl<'a> LossyTile<'a> {
                 // affect the decision and need not be searched.
                 if part_budget == 0 && luma_lower_bound >= rd_none {
                     split_pruned = true;
+                    split_bound_margin = Self::proxy_margin(rd_none, luma_lower_bound);
                     break;
                 }
             }
@@ -3520,7 +3541,12 @@ impl<'a> LossyTile<'a> {
         } else {
             chosen.0
         };
-        (chosen.1, chosen_cost)
+        let margin = if cands[2].0.is_finite() {
+            Self::proxy_margin(cands[1].0, cands[2].0)
+        } else {
+            split_bound_margin
+        };
+        (chosen.1, chosen_cost, margin)
     }
 
     fn with_speed(mut self, speed: Speed) -> Self {

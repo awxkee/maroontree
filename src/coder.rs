@@ -1365,7 +1365,11 @@ struct LossyTile<'a> {
     /// bottom-up pricing evaluates each 16-block up to ~3x (64-level refine,
     /// 32-level SPLIT leg, then decode_sb's own descend). Epoch stamping keeps
     /// reuse bit-exact after any emitted block changes prediction context.
-    rd16_cache: std::cell::RefCell<HashMap<u32, (u64, Part16, f32)>>,
+    rd16_cache: std::cell::RefCell<HashMap<u32, (u64, Part16, f32, f32)>>,
+    /// Relative NONE-vs-SPLIT margin of the last `rd_choice_rect32` call
+    /// (INFINITY when a leg was pruned or IntraBC won); read by the 32-node
+    /// trial gate right after `choose_rect32`.
+    proxy_margin32: std::cell::Cell<f32>,
     /// Epoch-stamped memo for the decision-stage rect16 leaf proxy
     #[allow(clippy::type_complexity)]
     rect_leaf_cache: std::cell::RefCell<HashMap<(u64, u32), (u64, f32, f32)>>,

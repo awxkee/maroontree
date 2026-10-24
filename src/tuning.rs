@@ -204,6 +204,21 @@ pub(crate) struct Tuning {
     pub(crate) trial_rect_xslow: bool,
     pub(crate) trial_rect_sse_gate_xslow: u32,
     pub(crate) trial_struct_k_xslow: f32,
+    /// Proxy-margin gate on the trial (0 = off): a square node is trialed
+    /// only where the proxy's relative NONE-vs-SPLIT margin
+    /// |none - split| / min(none, split) is below this (a pruned leg counts
+    /// as an infinite margin: the proxy verdict stands). Bounds the real-R-D
+    /// work to the nodes the proxy is unsure about, the way jixel's layout DP
+    /// scores a piece in full only inside its bound slack.
+    pub(crate) trial_margin: f32,
+    /// What the margin gate does at a node whose margin is UNKNOWN (the proxy
+    /// never priced the other leg: 32-level flat-block SPLIT skip, 16-level
+    /// moment breakout): 0 = trial it, 1 = the proxy verdict stands, 2 = trial
+    /// it only where some 8x8 has source std >= `trial_margin_edge`. A leg
+    /// pruned by the exact branch-and-bound keeps its bound as a conservative
+    /// (lower-bound) margin and is not "unknown".
+    pub(crate) trial_margin_pruned: u32,
+    pub(crate) trial_margin_edge: f32,
     /// Partition proxies (`rd_cost_square` 8/16) price the winner's six angle
     /// deltas. Measured inert on top of the three above (-1.4 alone, +8% time).
     pub(crate) proxy_ad: bool,
@@ -499,6 +514,9 @@ impl Tuning {
         trial_rect_xslow: true,
         trial_rect_sse_gate_xslow: 1,
         trial_struct_k_xslow: 1.0,
+        trial_margin: 0.0,
+        trial_margin_pruned: 0,
+        trial_margin_edge: 16.0,
         proxy_ad: false,
         ad16_full: false,
         uv8_vs_cfl: true,
@@ -740,6 +758,9 @@ mod imp {
                 "trial_rect_xslow" => t.trial_rect_xslow = flag(value),
                 "trial_rect_sse_gate_xslow" => t.trial_rect_sse_gate_xslow = num(value) as u32,
                 "trial_struct_k_xslow" => t.trial_struct_k_xslow = num(value),
+                "trial_margin" => t.trial_margin = num(value),
+                "trial_margin_pruned" => t.trial_margin_pruned = num(value) as u32,
+                "trial_margin_edge" => t.trial_margin_edge = num(value),
                 "proxy_ad" => t.proxy_ad = flag(value),
                 "ad16_full" => t.ad16_full = flag(value),
                 "uv8_vs_cfl" => t.uv8_vs_cfl = flag(value),

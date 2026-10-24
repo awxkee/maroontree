@@ -240,15 +240,50 @@ impl<'a> LossyTile<'a> {
         gate == 3 && sz8 == 2 && proxy == Part16::Split && self.trial_rect_on()
     }
 
+    /// Relative margin between two proxy leg costs (`trial_margin` axis);
+    /// INFINITY when either leg is pruned, so the proxy verdict stands.
+    #[inline]
+    fn proxy_margin(a: f32, b: f32) -> f32 {
+        if a.is_finite() && b.is_finite() {
+            (a - b).abs() / a.min(b).max(f32::EPSILON)
+        } else {
+            f32::INFINITY
+        }
+    }
+
+    /// Proxy-margin gate (`trial_margin`, 0 = off): trial only where the
+    /// proxy's relative NONE-vs-SPLIT margin is below the knob.
+    #[inline]
+    fn trial_margin_ok(&self, margin: f32, px: usize, py: usize, dim: usize) -> bool {
+        let t = crate::tuning::get();
+        let m = t.trial_margin;
+        if m <= 0.0 || margin < m {
+            return true;
+        }
+        if margin.is_finite() {
+            return false;
+        }
+        match t.trial_margin_pruned {
+            0 => true,
+            1 => false,
+            _ => self.trial_src_gate_std(px, py, dim, t.trial_margin_edge, 0.0),
+        }
+    }
+
     /// Source gate (`trial_edge_hi` / `trial_edge_lo`): see the knobs.
     fn trial_src_gate(&self, px: usize, py: usize, dim: usize) -> bool {
         let t = crate::tuning::get();
-        if t.trial_edge_hi <= 0.0 {
+        self.trial_src_gate_std(px, py, dim, t.trial_edge_hi, t.trial_edge_lo)
+    }
+
+    /// [`Self::trial_src_gate`] with explicit std thresholds.
+    fn trial_src_gate_std(&self, px: usize, py: usize, dim: usize, edge_hi: f32, edge_lo: f32) -> bool {
+        if edge_hi <= 0.0 {
             return true;
         }
-        let (hi, lo) = (t.trial_edge_hi * t.trial_edge_hi, t.trial_edge_lo * t.trial_edge_lo);
+        let (hi, lo) = (edge_hi * edge_hi, edge_lo * edge_lo);
         let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
-        let (mut any_hi, mut any_lo) = (false, t.trial_edge_lo <= 0.0);
+        let (mut any_hi, mut any_lo) = (false, edge_lo <= 0.0);
         for y in (0..bh).step_by(8) {
             for x in (0..bw).step_by(8) {
                 let (w, h) = ((bw - x).min(8), (bh - y).min(8));
