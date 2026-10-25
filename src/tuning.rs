@@ -440,6 +440,18 @@ pub(crate) struct Tuning {
     /// x_screen -9.0 (444) / -11.5 (420), n_bbscreen -4.1 / -4.9, n_scmap 420
     /// -2.4; the 48 non-screen corpus images are BD-neutral (-0.01 / +0.03).
     pub(crate) palette_dp_centers: bool,
+    /// `screen_frame_gate`: IntraBC pays when the copied texture mass exceeds
+    /// this fraction of the photo-like mass that loses the loop filters.
+    pub(crate) ibc_gate_beta: f32,
+    /// `screen_frame_gate`: per-copy DV overhead in SAD units, as a multiple of
+    /// the frame's AC dequant step.
+    pub(crate) ibc_gate_dv: f32,
+    /// `screen_frame_gate`: build the copy index only when at least this share
+    /// of 16x16 blocks has <= 16 luma values (photos never do).
+    pub(crate) ibc_gate_prescreen: f32,
+    /// `screen_frame_gate`: palette-exact 16x16 share that turns the text
+    /// palette tools on (libaom's screen-content test uses 10%).
+    pub(crate) screen_few_share: f32,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -670,6 +682,10 @@ impl Tuning {
         palette_viterbi_screen_only: 1,
         palette_viterbi_uv: 0.0,
         palette_dp_centers: true,
+        ibc_gate_beta: 32.0,
+        ibc_gate_dv: 1.0,
+        ibc_gate_prescreen: 0.02,
+        screen_few_share: 0.10,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -924,6 +940,10 @@ mod imp {
                 "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
                 "palette_viterbi_uv" => t.palette_viterbi_uv = num(value),
                 "palette_dp_centers" => t.palette_dp_centers = flag(value),
+                "ibc_gate_beta" => t.ibc_gate_beta = num(value),
+                "ibc_gate_dv" => t.ibc_gate_dv = num(value),
+                "ibc_gate_prescreen" => t.ibc_gate_prescreen = num(value),
+                "screen_few_share" => t.screen_few_share = num(value),
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),

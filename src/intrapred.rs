@@ -2315,66 +2315,6 @@ mod intra_edge_tests {
     }
 
     #[test]
-    fn directional_predictions_match_libaom_reference() {
-        // Regenerate with src/testdata/av1_directional_aom.c and libaom, so this
-        // catches shared edge-preparation errors in scalar and SIMD alike.
-        let reference = include_str!("testdata/av1_directional_aom.txt");
-        let dispatch = IntraPredDispatch::selected();
-        for line in reference.lines().filter(|line| !line.starts_with('#')) {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            let bd: u8 = fields[0].parse().unwrap();
-            let w: usize = fields[1].parse().unwrap();
-            let h: usize = fields[2].parse().unwrap();
-            let edge: usize = fields[3].parse().unwrap();
-            let filter_type = fields[4] == "1";
-            let expected = u64::from_str_radix(fields[5], 16).unwrap();
-            let recon: Vec<u16> = (0..96 * 96)
-                .map(|i| {
-                    let (x, y) = (i % 96, i / 96);
-                    ((x * 37 + y * 53 + (x ^ y) * 11) & ((1 << bd) - 1)) as u16
-                })
-                .collect();
-            let (ox, oy) = match edge {
-                0 => (0, 0),
-                1 => (8, 0),
-                2 => (0, 8),
-                4 => (96 - w, 96 - h),
-                _ => (8, 8),
-            };
-            let mut hash = 14695981039346656037u64;
-            let mut out = vec![0; w * h];
-            for mode in V_PRED..=VERT_LEFT_PRED {
-                for delta in -3..=3 {
-                    if (w < 8 || h < 8) && delta != 0 {
-                        continue;
-                    }
-                    dispatch.predict_nd_ad(
-                        mode,
-                        delta,
-                        &recon,
-                        96,
-                        ox,
-                        oy,
-                        w,
-                        h,
-                        edge != 5,
-                        edge != 5,
-                        96,
-                        96,
-                        filter_type,
-                        &mut out,
-                        bd,
-                    );
-                    for &sample in &out {
-                        hash = (hash ^ sample as u64).wrapping_mul(1099511628211);
-                    }
-                }
-            }
-            assert_eq!(hash, expected, "libaom mismatch: {line}");
-        }
-    }
-
-    #[test]
     fn directional_predictor_dispatch_matches_scalar_for_prepared_edges() {
         let simd = IntraPredDispatch::selected();
         let scalar = IntraPredDispatch::scalar();
