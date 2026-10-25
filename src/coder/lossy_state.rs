@@ -822,6 +822,39 @@ impl<'a> LossyTile<'a> {
         crate::rate::real_block_bits_bounded(cf, scan, &ctx, bound)
     }
 
+    /// Exact bits of the luma transform of an INTER block (IntraBC with a
+    /// coded residual) covering the whole block: `txb_skip` ctx 0, the
+    /// block-span DC-sign ctx and the INTER tx-type symbol (TX_16X16:
+    /// `txtp_inter2`, DCT_DCT; TX_32X32: `txtp_inter3[3]`, DCT_DCT = 1)
+    /// instead of the intra per-mode CDF.
+    pub(crate) fn luma_bits_inter(&self, cf: &[i32], scan: &[u32], w: usize, px: usize, py: usize) -> f32 {
+        if use_proxy_rate(self.speed) {
+            return block_rate_bits(cf, scan);
+        }
+        let (bx4, by4) = (px / 4, py / 4);
+        let dcs = self.dc_sign_ctx_span(0, bx4, by4, w / 4, w / 4);
+        let c = self.dcdf();
+        let (cls, eob_bin, txtp): (usize, &[u16], (&[u16], usize)) = match w {
+            16 => (2, &c.eob_bin_256_l, (&c.txtp_inter2, crate::coeffs::TXTP_INTER2_DCT)),
+            _ => (3, &c.eob_bin_1024_l, (&c.txtp_inter3[3], 1)),
+        };
+        let tables = self.coef_cost_tables();
+        let ctx = crate::rate::RateCtx {
+            cdfs: c,
+            tables: &tables,
+            cls,
+            plane: 0,
+            w,
+            h: w,
+            eob_bin,
+            skip_ctx: 0,
+            dcs_ctx: dcs,
+            txtp: Some(txtp),
+            skip_bits: self.skip_bits(cls, 0),
+        };
+        crate::rate::real_block_bits_bounded(cf, scan, &ctx, f32::INFINITY)
+    }
+
     /// Exact bits of a whole-64 TX_64X64 luma transform: the coded 32x32 at
     /// coefficient class 4, `txb_skip` ctx 0 (block == transform) and the
     /// 16-unit DC-sign span. DCT_DCT is implied (no txtp symbol).

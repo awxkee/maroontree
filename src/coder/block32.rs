@@ -3487,7 +3487,7 @@ impl<'a> LossyTile<'a> {
                     let [pred_u, pred_v] = &mut pal_pred;
                     palette_uv_pred(&mut pred_u[..], &mut pred_v[..], &up.map, &up.u, &up.v);
                     let mut bits = self.uv_mode_bits(y_mode, DC_PRED, None)
-                        + self.palette_uv_rate_bits(palette.is_some(), &up);
+                        + self.palette_uv_rate_bits(px, py, palette.is_some(), &up);
                     let mut sse = 0i64;
                     let mut pal_ccf = [self.sbuf_i1024(), self.sbuf_i1024()];
                     let mut resids = [self.sbuf_i1024(), self.sbuf_i1024()];

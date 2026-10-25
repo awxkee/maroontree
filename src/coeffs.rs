@@ -714,7 +714,6 @@ pub(crate) fn encode_tx16_coeffs_adapt(
     y_mode: usize,
     txtp: usize,
 ) -> u8 {
-    let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X16) else {
         cdfs.encode_skip(enc, 2, skip_ctx, 1); // all_zero = 1
         return 0x40;
@@ -723,6 +722,23 @@ pub(crate) fn encode_tx16_coeffs_adapt(
     if !chroma {
         enc.encode_symbol(txtp, &mut cdfs.txtp16[y_mode]); // luma TX_16X16: 1=DCT_DCT, 2=ADST_ADST
     }
+    tx16_coeffs_tail(enc, cdfs, cf, chroma, dcs_ctx, eob, cul)
+}
+
+/// Common coefficient tail of the [i32; 256] coders (everything after the
+/// `txb_skip` flag and the luma tx-type symbol); shared by the intra and the
+/// inter (IntraBC with residual) emitters.
+#[allow(clippy::too_many_arguments)]
+fn tx16_coeffs_tail(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 256],
+    chroma: bool,
+    dcs_ctx: usize,
+    eob: usize,
+    cul: u32,
+) -> u8 {
+    let pl = chroma as usize;
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -866,13 +882,30 @@ fn encode_tx32_coeffs_cls(
     dcs_ctx: usize,
     cls: usize,
 ) -> u8 {
-    let pl = chroma as usize;
     let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X32) else {
         cdfs.encode_skip(enc, cls, skip_ctx, 1); // all_zero = 1
         return 0x40;
     };
     cdfs.encode_skip(enc, cls, skip_ctx, 0); // all_zero = 0
     // NO txtp symbol for intra TX_32X32 (DCT_DCT implied).
+    tx32_coeffs_tail(enc, cdfs, cf, chroma, dcs_ctx, eob, cul, cls)
+}
+
+/// Common coefficient tail of the [i32; 1024] coders (everything after the
+/// `txb_skip` flag and the luma tx-type symbol); shared by the intra and the
+/// inter (IntraBC with residual) emitters.
+#[allow(clippy::too_many_arguments)]
+fn tx32_coeffs_tail(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 1024],
+    chroma: bool,
+    dcs_ctx: usize,
+    eob: usize,
+    cul: u32,
+    cls: usize,
+) -> u8 {
+    let pl = chroma as usize;
     let dc_sign_bits: u8 = if cf[0] == 0 {
         1 << 6
     } else if cf[0] < 0 {
@@ -969,6 +1002,47 @@ fn encode_tx32_coeffs_cls(
         }
     }
     res_ctx
+}
+
+/// Index of DCT_DCT in AV1's inter tx-type set 2 (`txtp_inter2`, TX_16X16,
+/// 12 types: IDTX, V_DCT, H_DCT, DCT_DCT, ...).
+pub(crate) const TXTP_INTER2_DCT: usize = 3;
+
+/// TX_16X16 luma of an INTER block (IntraBC with a coded residual): `txb_skip`,
+/// then the `txtp_inter2` set symbol (DCT_DCT), then the common tail. The
+/// chroma of inter blocks derives its type from the luma one (no symbol).
+pub(crate) fn encode_tx16_coeffs_inter_dct(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 256],
+    skip_ctx: usize,
+    dcs_ctx: usize,
+) -> u8 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_16X16) else {
+        cdfs.encode_skip(enc, 2, skip_ctx, 1);
+        return 0x40;
+    };
+    cdfs.encode_skip(enc, 2, skip_ctx, 0);
+    enc.encode_symbol(TXTP_INTER2_DCT, &mut cdfs.txtp_inter2);
+    tx16_coeffs_tail(enc, cdfs, cf, false, dcs_ctx, eob, cul)
+}
+
+/// TX_32X32 luma of an INTER block: `txb_skip`, the `txtp_inter3[TX_32X32]`
+/// bool (1 = DCT_DCT, 0 = IDTX), then the common class-3 tail.
+pub(crate) fn encode_tx32_coeffs_inter_dct(
+    enc: &mut OdEcEncoder,
+    cdfs: &mut Cdfs,
+    cf: &[i32; 1024],
+    skip_ctx: usize,
+    dcs_ctx: usize,
+) -> u8 {
+    let Some((eob, cul)) = eob_and_cul(cf, &SCAN_32X32) else {
+        cdfs.encode_skip(enc, 3, skip_ctx, 1);
+        return 0x40;
+    };
+    cdfs.encode_skip(enc, 3, skip_ctx, 0);
+    enc.encode_symbol(1, &mut cdfs.txtp_inter3[3]);
+    tx32_coeffs_tail(enc, cdfs, cf, false, dcs_ctx, eob, cul, 3)
 }
 
 /// DC-only tail for the eob==0 path with a raw signed level.

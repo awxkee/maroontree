@@ -50,6 +50,12 @@ pub(crate) static LOSSY_PALETTE_RESIDUAL_EMITTED: std::sync::atomic::AtomicUsize
 #[cfg(test)]
 pub(crate) static LOSSY_INTRABC_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOSSY_INTRABC_ODD_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LOSSY_INTRABC_RESID_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Partition decision for a 16x16 luma region.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Part16 {
@@ -440,6 +446,17 @@ pub(crate) fn skip_stats_cone(
     acc
 }
 
+/// dav1d default `txpart` (inter `txfm_split`) CDFs, [cat][a + l].
+const TXPART_CDF: [[u16; 3]; 7] = [
+    [28581, 23846, 20847],
+    [24315, 18196, 12133],
+    [18791, 10887, 11005],
+    [27179, 20004, 11281],
+    [26549, 19308, 14224],
+    [28015, 21546, 14400],
+    [28165, 22401, 16088],
+];
+
 #[derive(Clone)]
 pub(crate) struct Cdfs {
     /// Trellis frequency-tilt strength for this tile's format — see
@@ -454,30 +471,33 @@ pub(crate) struct Cdfs {
     pub(crate) band_tilt: f32,
     pub(crate) skip: Vec<Vec<u16>>,             // block skip [3 ctx]
     pub(crate) intrabc: Vec<u16>,               // use_intrabc
-    pub(crate) mv_joint: Vec<u16>,              // MV_JOINT
-    pub(crate) mv_sign: [Vec<u16>; 2],          // vertical, horizontal
-    pub(crate) mv_classes: [Vec<u16>; 2],       // MV class 0..10
-    pub(crate) mv_class0: [Vec<u16>; 2],        // class-zero integer bit
+    pub(crate) txpart: Vec<Vec<Vec<u16>>>,      // inter txfm_split [7 cat][3 ctx]
+    pub(crate) txtp_inter2: Vec<u16>,           // inter tx type, set 2 (TX_16X16): 12 types
+    pub(crate) txtp_inter3: Vec<Vec<u16>>, // inter tx type, set 3 (TX_32X32) [t_dim.min]: DCT vs IDTX
+    pub(crate) mv_joint: Vec<u16>,         // MV_JOINT
+    pub(crate) mv_sign: [Vec<u16>; 2],     // vertical, horizontal
+    pub(crate) mv_classes: [Vec<u16>; 2],  // MV class 0..10
+    pub(crate) mv_class0: [Vec<u16>; 2],   // class-zero integer bit
     pub(crate) mv_class_n: [[Vec<u16>; 10]; 2], // class-N integer bits
-    pub(crate) part_bl8: Vec<Vec<u16>>,         // PARTITION_NONE @ 8x8 [4 ctx]
-    pub(crate) part_split: Vec<Vec<Vec<u16>>>,  // SPLIT [bl-1=0..3][4 ctx]
-    pub(crate) kf_y: Vec<Vec<u16>>,             // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
-    pub(crate) uv_mode: Vec<Vec<u16>>,          // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
-    pub(crate) angle_delta: Vec<Vec<u16>>,      // angle_delta[8 directional modes]
-    pub(crate) filter_intra: Vec<Vec<u16>>,     // use_filter_intra [BLOCK_SIZES_ALL]
-    pub(crate) filter_intra_mode: Vec<u16>,     // five filter-intra predictors
+    pub(crate) part_bl8: Vec<Vec<u16>>,    // PARTITION_NONE @ 8x8 [4 ctx]
+    pub(crate) part_split: Vec<Vec<Vec<u16>>>, // SPLIT [bl-1=0..3][4 ctx]
+    pub(crate) kf_y: Vec<Vec<u16>>,        // kf_y_mode[5*5], index [above_ctx*5 + left_ctx]
+    pub(crate) uv_mode: Vec<Vec<u16>>,     // uv_mode[2*13], index [cfl_allowed*13 + y_mode]
+    pub(crate) angle_delta: Vec<Vec<u16>>, // angle_delta[8 directional modes]
+    pub(crate) filter_intra: Vec<Vec<u16>>, // use_filter_intra [BLOCK_SIZES_ALL]
+    pub(crate) filter_intra_mode: Vec<u16>, // five filter-intra predictors
     pub(crate) palette_y_mode: Vec<Vec<Vec<u16>>>, // [7 bsize ctx][3 neighbor ctx]
-    pub(crate) palette_y_size: Vec<Vec<u16>>,   // [7 bsize ctx], sizes 2..8
-    pub(crate) palette_uv_mode: [Vec<u16>; 2],  // luma palette absent/present
+    pub(crate) palette_y_size: Vec<Vec<u16>>, // [7 bsize ctx], sizes 2..8
+    pub(crate) palette_uv_mode: [Vec<u16>; 2], // luma palette absent/present
     pub(crate) palette_y_color: Vec<Vec<Vec<u16>>>, // [size-2][5 map ctx]
-    pub(crate) palette_uv_size: Vec<Vec<u16>>,  // [7 bsize ctx], sizes 2..8
+    pub(crate) palette_uv_size: Vec<Vec<u16>>, // [7 bsize ctx], sizes 2..8
     pub(crate) palette_uv_color: Vec<Vec<Vec<u16>>>, // [size-2][5 map ctx]
-    pub(crate) cfl_sign: Vec<u16>,              // cfl joint-sign (8 symbols)
-    pub(crate) cfl_alpha: Vec<Vec<u16>>,        // cfl alpha magnitude [6 ctx]
-    pub(crate) txsz: [Vec<Vec<u16>>; 4],        // intra tx_depth [t_dim.max-1][3 ctx]
-    pub(crate) txtp: Vec<Vec<u16>>,             // intra txtp TX_8X8 luma, per intra mode [13]
-    pub(crate) txtp4: Vec<Vec<u16>>,            // intra txtp TX_4X4 luma, per intra mode [13]
-    pub(crate) txtp16: Vec<Vec<u16>>,           // intra txtp TX_16X16 luma, per intra mode [13]
+    pub(crate) cfl_sign: Vec<u16>,         // cfl joint-sign (8 symbols)
+    pub(crate) cfl_alpha: Vec<Vec<u16>>,   // cfl alpha magnitude [6 ctx]
+    pub(crate) txsz: [Vec<Vec<u16>>; 4],   // intra tx_depth [t_dim.max-1][3 ctx]
+    pub(crate) txtp: Vec<Vec<u16>>,        // intra txtp TX_8X8 luma, per intra mode [13]
+    pub(crate) txtp4: Vec<Vec<u16>>,       // intra txtp TX_4X4 luma, per intra mode [13]
+    pub(crate) txtp16: Vec<Vec<u16>>,      // intra txtp TX_16X16 luma, per intra mode [13]
     pub(crate) txb_skip: [Vec<Vec<u16>>; 5], // [class][13 ctx] (class 3 = TX_32X32, 4 = TX_64X64)
     /// Running count of emitted `all_zero` symbols `[class][ctx][symbol]` (see
     /// `SkipStats`); the superblock drivers difference it per SB.
@@ -534,6 +554,15 @@ impl Cdfs {
             push(v);
         }
         push(&mut self.intrabc);
+        for cat in &mut self.txpart {
+            for v in cat {
+                push(v);
+            }
+        }
+        push(&mut self.txtp_inter2);
+        for v in &mut self.txtp_inter3 {
+            push(v);
+        }
         push(&mut self.mv_joint);
         for v in &mut self.mv_sign {
             push(v);
@@ -839,6 +868,17 @@ impl Cdfs {
             band_tilt: 0.0,
             skip: SKIP_CDF.iter().map(|&v| icdf(&[v])).collect(),
             intrabc: icdf(&[30531]),
+            txpart: TXPART_CDF
+                .iter()
+                .map(|cat| cat.iter().map(|&v| icdf(&[v])).collect())
+                .collect(),
+            txtp_inter2: icdf(&[
+                770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529,
+            ]),
+            txtp_inter3: [16384u16, 4167, 1998, 748]
+                .iter()
+                .map(|&v| icdf(&[v]))
+                .collect(),
             mv_joint: icdf(&[4096, 11264, 19328]),
             mv_sign: std::array::from_fn(|_| icdf(&[16384])),
             mv_classes: std::array::from_fn(|_| {
@@ -2116,11 +2156,19 @@ fn wavefront_capture(
     let pblk4hw = PlaneWriter::new(&mut pblk4h, stride4.max(1));
     let pblk4vw = PlaneWriter::new(&mut pblk4v, stride4.max(1));
     let pblk4tw = PlaneWriter::new(&mut pblk4t, stride4.max(1));
+    // Above-row reach: the classic above-right neighbour, or on IntraBC frames
+    // `ibc_wavefront_reach` so every spec-legal DV source is a finished cell
+    // (`find_intrabc` applies the same cone at every thread count).
+    let above_right = if allow_ibc {
+        (crate::tuning::get().ibc_wavefront_reach as usize).max(1)
+    } else {
+        1
+    };
     par_wavefront_pool_with(
         nthreads,
         sb_rows,
         sb_cols,
-        /* needs_above_right= */ true,
+        above_right,
         mk_tile,
         |t: &mut LossyTile, row: usize, col: usize| {
             // With above-right WPP dependencies, (row + col) >= prefix-1
@@ -3084,7 +3132,10 @@ fn screen_frame_gate(
         (few, lenient, hashes)
     });
     let total16 = (n16x * n16y).max(1) as f32;
-    let few16 = bands.iter().map(|b| b.0.iter().filter(|&&f| f).count()).sum::<usize>() as u32;
+    let few16 = bands
+        .iter()
+        .map(|b| b.0.iter().filter(|&&f| f).count())
+        .sum::<usize>() as u32;
     let lenient16: u32 = bands.iter().map(|b| b.1).sum();
     let few_share = few16 as f32 / total16;
     let few_colour = few_share >= t.screen_few_share;
@@ -3120,10 +3171,17 @@ fn screen_frame_gate(
         let mut e = 0u64;
         for j in 0..8 {
             let row = &luma[(y + j) * w8 + x..][..8];
-            e += row.windows(2).map(|p| u64::from(p[0].abs_diff(p[1])).pow(2)).sum::<u64>();
+            e += row
+                .windows(2)
+                .map(|p| u64::from(p[0].abs_diff(p[1])).pow(2))
+                .sum::<u64>();
             if j > 0 {
                 let up = &luma[(y + j - 1) * w8 + x..][..8];
-                e += row.iter().zip(up).map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2)).sum::<u64>();
+                e += row
+                    .iter()
+                    .zip(up)
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
+                    .sum::<u64>();
             }
         }
         e
@@ -3144,7 +3202,8 @@ fn screen_frame_gate(
             for &(ox, oy) in &subs {
                 let (sx, sy) = (px + ox, py + oy);
                 let exact = |ax: usize, ay: usize| {
-                    (0..8).all(|j| luma[(ay + j) * w8 + ax..][..8] == luma[(sy + j) * w8 + sx..][..8])
+                    (0..8)
+                        .all(|j| luma[(ay + j) * w8 + ax..][..8] == luma[(sy + j) * w8 + sx..][..8])
                 };
                 let earlier = |ax: usize, ay: usize| ay + 8 <= sy || (ay <= sy && ax + 8 <= sx);
                 for (ax, ay) in index
@@ -3153,10 +3212,15 @@ fn screen_frame_gate(
                     .take(3)
                 {
                     // DV of the whole 16x16 along this anchor's offset.
-                    let (Some(rx), Some(ry)) = ((px + ax).checked_sub(sx), (py + ay).checked_sub(sy)) else {
+                    let (Some(rx), Some(ry)) =
+                        ((px + ax).checked_sub(sx), (py + ay).checked_sub(sy))
+                    else {
                         continue;
                     };
-                    if rx + 16 > w8 || ry + 16 > h8 || (ry + 16 > py && rx + 16 > px && ry < py + 16 && rx < px + 16) {
+                    if rx + 16 > w8
+                        || ry + 16 > h8
+                        || (ry + 16 > py && rx + 16 > px && ry < py + 16 && rx < px + 16)
+                    {
                         continue;
                     }
                     let res: u64 = (0..16)
@@ -3192,11 +3256,15 @@ fn screen_frame_gate(
                 // >= 64: glyph + background + antialiasing). Smooth gradients
                 // (small range) stay in — that is where blocking shows.
                 for &(ox, oy) in &subs {
-                    let text = block_color_histogram(luma, w8, px + ox, py + oy, 8, 8).is_some_and(|hist| {
-                        let values = hist.as_slice().iter().map(|&(v, _)| v);
-                        let span = (values.clone().max().unwrap_or(0) - values.min().unwrap_or(0)) as u32;
-                        hist.len() <= 12 && span >= span_min
-                    });
+                    let text = block_color_histogram(luma, w8, px + ox, py + oy, 8, 8).is_some_and(
+                        |hist| {
+                            let values = hist.as_slice().iter().map(|&(v, _)| v);
+                            let span = (values.clone().max().unwrap_or(0)
+                                - values.min().unwrap_or(0))
+                                as u32;
+                            hist.len() <= 12 && span >= span_min
+                        },
+                    );
                     if !text && sad8(px + ox, py + oy) > 0 {
                         photo += 1;
                     }
@@ -6233,7 +6301,7 @@ mod aq_tests {
         let mut tile =
             LossyTile::new(160, 8, 64, 64, &src, QmLevels::FLAT).with_speed(Speed::Medium);
         let before = tile.recon[0].clone();
-        let (_, _, cost, _) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
+        let (_, _, cost, _, _) = tile.rd_pick_luma64(0, 0, true, false, 1.0);
         assert!(cost.is_finite());
         assert_eq!(tile.recon[0], before);
     }

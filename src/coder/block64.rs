@@ -85,6 +85,23 @@ struct LossyIbcIndex {
     offsets: Vec<u32>,
 }
 
+/// A residual-coded IntraBC leaf (`Tuning::ibc_residual`): an approximate copy
+/// with the prediction error coded through one luma transform of block size
+/// (DCT_DCT, inter tx-type set) and the decoder-derived chroma transform, as an
+/// AV1 INTER block with skip = 0. Predictions, levels and dequantised residuals
+/// are kept so the emitter writes exactly what the decision priced.
+struct IbcResidPlan {
+    mv: (i16, i16),
+    pred: (i16, i16),
+    cost: f32,
+    lpred: Vec<i32>,
+    lcf: Vec<i32>,
+    lrr: Vec<i32>,
+    cpred: [Vec<i32>; 2],
+    ccf: [Vec<i32>; 2],
+    crr: [Vec<i32>; 2],
+}
+
 /// Memoized IntraBC match search for one block (see `find_intrabc`).
 enum IbcMatches {
     /// The spec default DV is a legal exact copy (searched first).
@@ -103,6 +120,42 @@ fn ibc_mix(mut h: u32) -> u32 {
     h ^= h >> 15;
     h = h.wrapping_mul(0x846c_a68b);
     h ^ (h >> 16)
+}
+
+/// IntraBC chroma prediction on a subsampled plane: `(kx, ky)` is the
+/// integer reference origin (`luma_ref >> sub`), `(fx, fy)` whether the
+/// luma DV is odd along that subsampled axis, which puts the chroma position
+/// at a half sample. AV1 predicts IntraBC with the BILINEAR 8-tap filter
+/// (7.11.3.4): at the half position the taps are {64, 64} on the floor and
+/// floor+1 samples, and with InterRound0/InterRound1 = (3, 11) (12-bit:
+/// (5, 9)) the two passes reduce exactly to `(a + b + 1) >> 1` for one
+/// half-sample axis and `(a + b + c + d + 2) >> 2` for both — at every bit
+/// depth (checked against the generic convolution in the tests). Integer
+/// positions copy. `get(x, y)` reads the reference plane; `out` is `bw` x
+/// `bh`, stride `bw`.
+#[allow(clippy::too_many_arguments)]
+fn ibc_chroma_pred(
+    get: &dyn Fn(usize, usize) -> u32,
+    kx: usize,
+    ky: usize,
+    fx: bool,
+    fy: bool,
+    bw: usize,
+    bh: usize,
+    out: &mut [u16],
+) {
+    for r in 0..bh {
+        for c in 0..bw {
+            let (x, y) = (kx + c, ky + r);
+            let v = match (fx, fy) {
+                (false, false) => get(x, y),
+                (true, false) => (get(x, y) + get(x + 1, y) + 1) >> 1,
+                (false, true) => (get(x, y) + get(x, y + 1) + 1) >> 1,
+                (true, true) => (get(x, y) + get(x + 1, y) + get(x, y + 1) + get(x + 1, y + 1) + 2) >> 2,
+            };
+            out[r * bw + c] = v as u16;
+        }
+    }
 }
 
 impl LossyIbcIndex {
@@ -565,65 +618,45 @@ impl<'a> LossyTile<'a> {
             return None;
         }
         let pred = self.intrabc_predictor(px, py, size, thr);
-        let sbx = px / 64 * 64;
         let sby = py / 64 * 64;
-        // Chroma-parity restriction (see doc comment).
-        let (need_ex, need_ey) = if self.mono {
-            (false, false)
-        } else {
-            (self.ss420 || self.ss422, self.ss420)
+        // Legality (tile, odd-DV chroma taps, wavefront cone, DV range and
+        // conformance) lives in `ibc_legal`; odd DVs (`ibc_odd_dv`) predict
+        // the subsampled planes at the half sample with the BILINEAR filter
+        // (`ibc_chroma_pred`), exactly as the decoders do.
+        // Half-sample flags of a reference origin on the subsampled planes
+        // (`px`, `py` are 8-aligned, so the DV parity is the origin parity).
+        let fracs = |rx: usize, ry: usize| -> (bool, bool) {
+            (
+                (self.ss420 || self.ss422) && !self.mono && rx & 1 != 0,
+                self.ss420 && !self.mono && ry & 1 != 0,
+            )
         };
         let exact = |rx: usize, ry: usize| {
+            let (fx, fy) = fracs(rx, ry);
             (0..if self.mono { 1 } else { 3 }).all(|plane| {
                 let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
                 let sy = usize::from(plane != 0 && self.ss420);
                 let stride = if plane == 0 { self.w } else { self.cw };
                 let (x, y, ref_x, ref_y) = (px >> sx, py >> sy, rx >> sx, ry >> sy);
                 let (bw, bh) = (size >> sx, size >> sy);
+                if plane != 0 && (fx || fy) {
+                    // Exactness of the FILTERED prediction against the source.
+                    let src = &self.src[plane];
+                    let get = |xx: usize, yy: usize| u32::from(src[yy * stride + xx]);
+                    let mut pred = [0u16; 32 * 32];
+                    ibc_chroma_pred(&get, ref_x, ref_y, fx, fy, bw, bh, &mut pred[..bw * bh]);
+                    return (0..bh).all(|row| {
+                        src[(y + row) * stride + x..][..bw] == pred[row * bw..][..bw]
+                    });
+                }
                 (0..bh).all(|row| {
                     self.src[plane][(y + row) * stride + x..][..bw]
                         == self.src[plane][(ref_y + row) * stride + ref_x..][..bw]
                 })
             })
         };
-        let legal = |rx: usize, ry: usize| {
-            if rx + size > self.w
-                || ry + size > self.h
-                || ry + size > sby + 64
-                || (ry + size > sby && rx + size > sbx)
-                || (need_ex && rx & 1 != 0)
-                || (need_ey && ry & 1 != 0)
-            {
-                return false;
-            }
-            // Wavefront restriction, applied at EVERY thread count so serial
-            // and captured decisions stay byte-identical: under the capture
-            // schedule (d = 2r + c, deps left/top/top-right) the finished set
-            // when cell (r, c) starts is {r' < r: c' <= c + (r - r')} plus
-            // {r' = r: c' < c}. Every superblock the reference spans must be
-            // inside it. Costs only far above-right references (rarely the
-            // nearest match on repetitive content).
-            let (cr, cc) = (py / 64, px / 64);
-            let c1 = (rx + size - 1) / 64;
-            let (r0, r1) = (ry / 64, (ry + size - 1) / 64);
-            if !(r0..=r1).all(|r| if r < cr { c1 <= cc + (cr - r) } else { c1 < cc }) {
-                return false;
-            }
-            crate::tile::intrabc_dv_in_range(px, py, rx, ry)
-                && crate::tile::intrabc_dv_conformant(px, py, rx, ry, size, self.w)
-        };
-        let make = |rx: usize, ry: usize| {
-            let dy = (ry as isize - py as isize) * 8;
-            let dx = (rx as isize - px as isize) * 8;
-            i16::try_from(dy)
-                .ok()
-                .zip(i16::try_from(dx).ok())
-                .filter(|&(dy, dx)| {
-                    (i32::from(dy) - i32::from(pred.0)).unsigned_abs() <= 16_384
-                        && (i32::from(dx) - i32::from(pred.1)).unsigned_abs() <= 16_384
-                })
-                .map(|mv| (rx, ry, mv, pred))
-        };
+        let legal = |rx: usize, ry: usize| self.ibc_legal(px, py, size, rx, ry);
+        let make = |rx: usize, ry: usize| self.ibc_make_mv(px, py, rx, ry, pred);
         let default = if py < 64 {
             px.checked_sub(320).map(|x| (x, py))
         } else {
@@ -648,17 +681,7 @@ impl<'a> LossyTile<'a> {
                     // Hash-index lookup on the block's anchored 8x8 window
                     // (built once per tile); every hit is verified over the
                     // complete block and all planes.
-                    let idx = self.ibc_index?.get_or_init(|| {
-                        let sub = if self.mono {
-                            (0, 0)
-                        } else {
-                            (
-                                usize::from(self.ss420 || self.ss422),
-                                usize::from(self.ss420),
-                            )
-                        };
-                        LossyIbcIndex::build(self.src, self.w, self.h, sub)
-                    });
+                    let idx = self.ibc_index_ref()?;
                     let mut list = Vec::new();
                     let mut verified = 0usize;
                     // `legal` rejects every origin whose block leaves the
@@ -703,10 +726,538 @@ impl<'a> LossyTile<'a> {
         best
     }
 
+
+    /// Whether (rx, ry) is a legal IntraBC reference origin for the `size`
+    /// block at (px, py): inside the tile, chroma taps included for odd DVs,
+    /// not in the current/later superblocks of this row, inside the capture
+    /// wavefront's finished cone (`ibc_wavefront_reach`), within DV range and
+    /// `av1_is_dv_valid`-conformant. Pure function of geometry and format, so
+    /// every thread count agrees.
+    fn ibc_legal(&self, px: usize, py: usize, size: usize, rx: usize, ry: usize) -> bool {
+        let sbx = px / 64 * 64;
+        let sby = py / 64 * 64;
+        let odd_ok = self.ibc_odd_dv_allowed();
+        let (need_ex, need_ey) = if self.mono || odd_ok {
+            (false, false)
+        } else {
+            (self.ss420 || self.ss422, self.ss420)
+        };
+        let fracs = |rx: usize, ry: usize| -> (bool, bool) {
+            (
+                (self.ss420 || self.ss422) && !self.mono && rx & 1 != 0,
+                self.ss420 && !self.mono && ry & 1 != 0,
+            )
+        };
+        // A half-sample chroma position reads one more sample right/below
+        // the block's chroma footprint, i.e. the luma column/row just past
+        // the reference block: the footprint checked below grows by 2 luma
+        // samples on that axis so every tap is in-tile and finished
+        // (libaom does not extend borders for IntraBC; dav1d clamps).
+        let (fx, fy) = fracs(rx, ry);
+        let (ex, ey) = (size + 2 * usize::from(fx), size + 2 * usize::from(fy));
+        if rx + ex > self.w
+            || ry + ey > self.h
+            || ry + ey > sby + 64
+            || (ry + ey > sby && rx + ex > sbx)
+            || (need_ex && rx & 1 != 0)
+            || (need_ey && ry & 1 != 0)
+        {
+            return false;
+        }
+        // Wavefront restriction, applied at EVERY thread count so serial
+        // and captured decisions stay byte-identical: under the capture
+        // schedule (deps left/top and (r-1, c+reach)) the finished set
+        // when cell (r, c) starts is {r' < r: c' <= c + reach*(r - r')}
+        // plus {r' = r: c' < c}. Every superblock the reference spans must
+        // be inside it. `ibc_wavefront_reach` 5 would contain every
+        // `av1_is_dv_valid` source (gradient 1 + INTRABC_DELAY_SB64); the
+        // shipped 2 covers the row above completely (where the copies on
+        // repetitive content live) and nearly all of the second row. The
+        // old reach 1 admitted 1% of s_manga's exact 8x8 sources vs 56%
+        // legal; 2 recovers 98% of the resulting -10% on manga.
+        let reach = (crate::tuning::get().ibc_wavefront_reach as usize).max(1);
+        let (cr, cc) = (py / 64, px / 64);
+        let c1 = (rx + ex - 1) / 64;
+        let (r0, r1) = (ry / 64, (ry + ey - 1) / 64);
+        if !(r0..=r1).all(|r| if r < cr { c1 <= cc + reach * (cr - r) } else { c1 < cc }) {
+            return false;
+        }
+        crate::tile::intrabc_dv_in_range(px, py, rx, ry)
+            && crate::tile::intrabc_dv_conformant_rect(px, py, rx, ry, ex, ey, self.w)
+    }
+
+    /// DV (and its predictor) of the reference origin (rx, ry) for the block
+    /// at (px, py), or None when the DV residual leaves the codable range.
+    #[allow(clippy::type_complexity)]
+    fn ibc_make_mv(
+        &self,
+        px: usize,
+        py: usize,
+        rx: usize,
+        ry: usize,
+        pred: (i16, i16),
+    ) -> Option<(usize, usize, (i16, i16), (i16, i16))> {
+        let dy = (ry as isize - py as isize) * 8;
+        let dx = (rx as isize - px as isize) * 8;
+        i16::try_from(dy)
+            .ok()
+            .zip(i16::try_from(dx).ok())
+            .filter(|&(dy, dx)| {
+                (i32::from(dy) - i32::from(pred.0)).unsigned_abs() <= 16_384
+                    && (i32::from(dx) - i32::from(pred.1)).unsigned_abs() <= 16_384
+            })
+            .map(|mv| (rx, ry, mv, pred))
+    }
+
+    /// The tile's IntraBC hash index (built on first use; every position when
+    /// odd DVs are allowed, else the chroma-parity grid).
+    fn ibc_index_ref(&self) -> Option<&LossyIbcIndex> {
+        let odd_ok = self.ibc_odd_dv_allowed();
+        Some(self.ibc_index?.get_or_init(|| {
+            let sub = if self.mono || odd_ok {
+                (0, 0)
+            } else {
+                (
+                    usize::from(self.ss420 || self.ss422),
+                    usize::from(self.ss420),
+                )
+            };
+            LossyIbcIndex::build(self.src, self.w, self.h, sub)
+        }))
+    }
+
+    /// Reference block of `plane` for the copy (rx, ry) -> (px, py): integer
+    /// copy, or the bilinear half-sample chroma of an odd DV; read from the
+    /// shared finished planes under capture, the local recon otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn ibc_reference(&self, plane: usize, rx: usize, ry: usize, size: usize, out: &mut [i32]) {
+        let sx = usize::from(plane != 0 && (self.ss420 || self.ss422));
+        let sy = usize::from(plane != 0 && self.ss420);
+        let stride = if plane == 0 { self.w } else { self.cw };
+        let (ref_x, ref_y) = (rx >> sx, ry >> sy);
+        let (bw, bh) = (size >> sx, size >> sy);
+        let (fx, fy) = (sx == 1 && rx & 1 != 0, sy == 1 && ry & 1 != 0);
+        let fill = |get: &dyn Fn(usize, usize) -> u32, out: &mut [i32]| {
+            if fx || fy {
+                let mut blk = [0u16; 32 * 32];
+                ibc_chroma_pred(get, ref_x, ref_y, fx, fy, bw, bh, &mut blk[..bw * bh]);
+                for (o, &v) in out[..bw * bh].iter_mut().zip(&blk[..bw * bh]) {
+                    *o = i32::from(v);
+                }
+            } else {
+                for r in 0..bh {
+                    for c in 0..bw {
+                        out[r * bw + c] = get(ref_x + c, ref_y + r) as i32;
+                    }
+                }
+            }
+        };
+        if let Some(sh) = self.ibc_shared {
+            let (ptr, len, _) = sh.planes[plane];
+            let get = |xx: usize, yy: usize| {
+                let off = yy * stride + xx;
+                debug_assert!(off < len);
+                // SAFETY: finished-cell read (legality keeps the footprint
+                // plus taps inside finished cells).
+                u32::from(unsafe { *ptr.add(off) })
+            };
+            fill(&get, out);
+        } else {
+            let rec = &self.recon[plane];
+            let get = |xx: usize, yy: usize| u32::from(rec[yy * stride + xx]);
+            fill(&get, out);
+        }
+    }
+
+    /// Residual-coded IntraBC leaves (`Tuning::ibc_residual`): 16 / 32 on
+    /// IntraBC frames at 4:2:0 / 4:4:4 (4:2:2 chroma would need the rect
+    /// chroma transforms), Slow+.
+    fn ibc_residual_allowed(&self, size: usize) -> bool {
+        // The test build always exercises the path (knobs are const without
+        // the `tuning` feature): the dav1d oracle and the t1 == tN tests then
+        // cover the inter syntax even while the knob ships off.
+        (crate::tuning::get().ibc_residual || cfg!(test))
+            && self.allow_intrabc
+            && !self.mono
+            && !self.ss422
+            && (size == 16 || size == 32)
+            && self.speed.at_least_slow()
+    }
+
+    /// Source-domain luma SAD of the copy (rx, ry) -> (px, py).
+    fn ibc_src_sad(&self, px: usize, py: usize, rx: usize, ry: usize, size: usize) -> u64 {
+        let src = &self.src[0];
+        let mut sad = 0u64;
+        for r in 0..size {
+            let a = &src[(py + r) * self.w + px..][..size];
+            let b = &src[(ry + r) * self.w + rx..][..size];
+            for (&x, &y) in a.iter().zip(b) {
+                sad += u64::from(x.abs_diff(y));
+            }
+        }
+        sad
+    }
+
+    /// Approximate-copy candidates for a residual IntraBC leaf: the DV
+    /// predictor, the above/left neighbours' DVs and the exact 8x8 hash hits
+    /// of every textured 8x8 sub-block (translated to the block origin), all
+    /// legal; ranked by source luma SAD, the best `ibc_residual_cands` kept.
+    fn ibc_residual_candidates(&self, px: usize, py: usize, size: usize, thr: bool) -> Vec<(usize, usize)> {
+        let mut cands: Vec<(usize, usize)> = Vec::new();
+        let consider = |rx: usize, ry: usize, cands: &mut Vec<(usize, usize)>| {
+            if (rx, ry) != (px, py) && !cands.contains(&(rx, ry)) && self.ibc_legal(px, py, size, rx, ry) {
+                cands.push((rx, ry));
+            }
+        };
+        let from_mv = |mv: (i16, i16)| -> Option<(usize, usize)> {
+            let (dy, dx) = (i32::from(mv.0) / 8, i32::from(mv.1) / 8);
+            let rx = usize::try_from(px as i32 + dx).ok()?;
+            let ry = usize::try_from(py as i32 + dy).ok()?;
+            Some((rx, ry))
+        };
+        let pred = self.intrabc_predictor(px, py, size, thr);
+        if let Some((rx, ry)) = from_mv(pred) {
+            consider(rx, ry, &mut cands);
+        }
+        let (bx4, by4, stride4) = (px / 4, py / 4, self.w / 4);
+        if by4 > 0 && let Some(mv) = self.ibc_mv[(by4 - 1) * stride4 + bx4] && let Some((rx, ry)) = from_mv(mv) {
+            consider(rx, ry, &mut cands);
+        }
+        if bx4 > 0 && let Some(mv) = self.ibc_mv[by4 * stride4 + bx4 - 1] && let Some((rx, ry)) = from_mv(mv) {
+            consider(rx, ry, &mut cands);
+        }
+        if let Some(idx) = self.ibc_index_ref() {
+            let sby = py / 64 * 64;
+            let max_y = (sby + 64).saturating_sub(8);
+            let luma = &self.src[0];
+            for oy in (0..size).step_by(8) {
+                for ox in (0..size).step_by(8) {
+                    // Flat sub-blocks hash like every other flat 8x8: no
+                    // information about the copy, and a huge bucket.
+                    let (sx0, sy0) = (px + ox, py + oy);
+                    let (mut lo, mut hi) = (u16::MAX, 0u16);
+                    for r in 0..8 {
+                        for &v in &luma[(sy0 + r) * self.w + sx0..][..8] {
+                            lo = lo.min(v);
+                            hi = hi.max(v);
+                        }
+                    }
+                    if hi == lo {
+                        continue;
+                    }
+                    let (mut taken, mut scanned) = (0usize, 0usize);
+                    for (ax, ay) in idx.candidates(luma, self.w, sx0, sy0, 8, max_y) {
+                        scanned += 1;
+                        if scanned > 64 || taken >= 4 {
+                            break;
+                        }
+                        let (Some(rx), Some(ry)) = (ax.checked_sub(ox), ay.checked_sub(oy)) else {
+                            continue;
+                        };
+                        let before = cands.len();
+                        consider(rx, ry, &mut cands);
+                        taken += usize::from(cands.len() > before);
+                    }
+                }
+            }
+        }
+        let keep = crate::tuning::get().ibc_residual_cands as usize;
+        let mut scored: Vec<(u64, usize, usize)> = cands
+            .into_iter()
+            .map(|(rx, ry)| (self.ibc_src_sad(px, py, rx, ry, size), rx, ry))
+            .collect();
+        scored.sort_unstable();
+        scored.truncate(keep);
+        scored.into_iter().map(|(_, rx, ry)| (rx, ry)).collect()
+    }
+
+    /// Full R-D of one residual IntraBC candidate: luma one TX of block size
+    /// (DCT_DCT, ctx trellis, exact inter rate), chroma the derived DCT, the
+    /// DV / flag / `txfm_split` header. Reference pixels come from the
+    /// reconstruction (finished cells), so capture and serial agree.
+    #[allow(clippy::too_many_arguments)]
+    fn ibc_residual_rd(
+        &self,
+        px: usize,
+        py: usize,
+        size: usize,
+        rx: usize,
+        ry: usize,
+        thr: bool,
+        prdo: f32,
+    ) -> Option<IbcResidPlan> {
+        let pred_dv = self.intrabc_predictor(px, py, size, thr);
+        let (rx, ry, mv, pred_mv) = self.ibc_make_mv(px, py, rx, ry, pred_dv)?;
+        let n = size * size;
+        let mlam = self.mlam() * prdo;
+        let lam = trellis_lambda() * prdo;
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let (bx4, by4) = (px / 4, py / 4);
+        let mut lpred = vec![0i32; n];
+        self.ibc_reference(0, rx, ry, size, &mut lpred);
+        let mut resid = vec![0i32; n];
+        self.rd.residual_pred(&mut resid, &lpred, &self.src[0], self.w, px, py, size, size);
+        let c = self.dcdf();
+        let (lcf, lrr, lbits): (Vec<i32>, Vec<i32>, f32) = if size == 16 {
+            let r: &[i32; 256] = resid[..].try_into().unwrap();
+            let (mut cf, tf) = self.dct.dct16x16_t(r, &self.quant);
+            trellis_optimize_ctx(
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_16X16,
+                lam,
+                16,
+                16,
+                c,
+                2,
+                0,
+                &c.eob_bin_256_l,
+                self.dc_sign_ctx_16(0, bx4, by4),
+                self.quant.qm_level(),
+                self.quant.qidx() as i32,
+            );
+            let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
+            let bits = self.luma_bits_inter(&cf, &SCAN_16X16, 16, px, py);
+            (cf.to_vec(), rr.to_vec(), bits)
+        } else {
+            let r: &[i32; 1024] = resid[..].try_into().unwrap();
+            let (mut cf, tf) = self.dct.dct32x32_t(r, &self.quant);
+            trellis_optimize_ctx(
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_32X32,
+                lam,
+                32,
+                32,
+                c,
+                3,
+                0,
+                &c.eob_bin_1024_l,
+                self.dc_sign_ctx_32(0, bx4, by4),
+                self.quant.qm_level(),
+                self.quant.qidx() as i32,
+            );
+            let rr = self.idct.idct_dequant_32x32(&cf, &self.quant);
+            let bits = self.luma_bits_inter(&cf, &SCAN_32X32, 32, px, py);
+            (cf.to_vec(), rr.to_vec(), bits)
+        };
+        // The node's other candidates (NONE / SPLIT / rect proxies) carry the
+        // SATD-scaled partition distortion, not SSE — price this leaf in the
+        // same units or an approximate copy gets an ~18x distortion discount
+        // (measured: x_screen +33% bytes at SS2 -11 with SSE here).
+        let dist_l = self.luma_partition_distortion(px, py, size, size, acq, &lpred, 0, &lrr);
+        // Header: the skip variant's DV model + the `txfm_split` = 0 bool
+        // (dav1d `read_tx_tree`: cat = 2 * (TX_64X64 - max), ctx = a + l with
+        // a = above tx width < this; the initial neighbour value is TX_64X64).
+        let dv_px = ((i32::from(mv.0) - i32::from(pred_mv.0)).unsigned_abs()
+            + (i32::from(mv.1) - i32::from(pred_mv.1)).unsigned_abs()) as f32
+            / 8.0;
+        let lw = size.trailing_zeros() as usize - 2;
+        let cat = 2 * (4 - lw);
+        let a = usize::from(self.a_tx[bx4] >= 0 && (self.a_tx[bx4] as usize) < lw);
+        let l = usize::from(self.l_tx[by4] >= 0 && (self.l_tx[by4] as usize) < lw);
+        let hdr_bits = 8.0 + dirty_log2f(dv_px.max(1.0)) * 2.0 + cdf_cost(&c.txpart[cat][a + l], 0);
+        let mut cost = crate::partition_rd::rd_cost(dist_l, mlam, lbits + hdr_bits);
+        // Chroma (4:2:0 half dims, 4:4:4 full): the derived DCT transform.
+        let (sx, sy) = (usize::from(self.ss420), usize::from(self.ss420));
+        let (cw, chh) = (size >> sx, size >> sy);
+        let cn = cw * chh;
+        let (cx, cy) = (px >> sx, py >> sy);
+        let mlam_c = self.emit_mlam_c(px, py, size);
+        let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
+        let mut cpred = [vec![0i32; cn], vec![0i32; cn]];
+        let mut ccf = [Vec::new(), Vec::new()];
+        let mut crr = [Vec::new(), Vec::new()];
+        for ci in 0..2 {
+            let plane = ci + 1;
+            self.ibc_reference(plane, rx, ry, size, &mut cpred[ci]);
+            let mut cres = vec![0i32; cn];
+            self.rd.residual_pred(&mut cres, &cpred[ci], &self.src[plane], self.cw, cx, cy, cw, chh);
+            let (q, rr, bits): (Vec<i32>, Vec<i32>, f32) = match cw {
+                8 => {
+                    let r: &[i32; 64] = cres[..].try_into().unwrap();
+                    let (mut q, qt) = self.dct.dct8x8_t(r, &self.cquant);
+                    self.chroma_rect_trellis(&mut q, &qt, cdcq, cacq, &SCAN_8X8, lam, 8, 8, plane, cx, cy);
+                    self.rd.preserve_dc(&mut q[0], &cres);
+                    let rr = self.idct.idct_dequant_8x8(&q, &self.cquant);
+                    let bits = self.chroma_bits(&q, &SCAN_8X8, 8, plane, cx, cy);
+                    (q.to_vec(), rr.to_vec(), bits)
+                }
+                16 => {
+                    let r: &[i32; 256] = cres[..].try_into().unwrap();
+                    let (mut q, qt) = self.dct.dct16x16_t(r, &self.cquant);
+                    trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_16X16, lam);
+                    self.rd.preserve_dc(&mut q[0], &cres);
+                    let rr = self.idct.idct_dequant_16x16(&q, &self.cquant);
+                    let bits = self.chroma_bits(&q, &SCAN_16X16, 16, plane, cx, cy);
+                    (q.to_vec(), rr.to_vec(), bits)
+                }
+                _ => {
+                    let r: &[i32; 1024] = cres[..].try_into().unwrap();
+                    let (mut q, qt) = self.dct.dct32x32_t(r, &self.cquant);
+                    trellis_optimize(&mut q, &qt, cdcq, cacq, &SCAN_32X32, lam);
+                    self.rd.preserve_dc(&mut q[0], &cres);
+                    let rr = self.idct.idct_dequant_32x32(&q, &self.cquant);
+                    let bits = self.chroma_bits(&q, &SCAN_32X32, 32, plane, cx, cy);
+                    (q.to_vec(), rr.to_vec(), bits)
+                }
+            };
+            let d = self.rd.sse_recon(&cpred[ci], &rr, self.src_blk(plane, cx, cy, cw, chh), self.bd);
+            cost += rd_cost_i64(d, mlam_c, bits);
+            ccf[ci] = q;
+            crr[ci] = rr;
+        }
+        let _ = (rx, ry);
+        Some(IbcResidPlan {
+            mv,
+            pred: pred_mv,
+            cost,
+            lpred,
+            lcf,
+            lrr,
+            cpred,
+            ccf,
+            crr,
+        })
+    }
+
+    /// The IntraBC plan for the `size` block: the cheaper of the exact skip
+    /// copy (`rd_cost_intrabc_skip`) and the best residual-coded approximate
+    /// copy, with its cost. Decision and emitter call the same function.
+    fn ibc_plan(&self, px: usize, py: usize, size: usize, thr: bool, prdo: f32) -> Option<(f32, Option<IbcResidPlan>)> {
+        let mut best: Option<(f32, Option<IbcResidPlan>)> =
+            self.rd_cost_intrabc_skip(px, py, size, thr, prdo).map(|c| (c, None));
+        if self.ibc_residual_allowed(size) {
+            for (rx, ry) in self.ibc_residual_candidates(px, py, size, thr) {
+                if let Some(plan) = self.ibc_residual_rd(px, py, size, rx, ry, thr, prdo)
+                    && best.as_ref().is_none_or(|b| plan.cost < b.0)
+                {
+                    best = Some((plan.cost, Some(plan)));
+                }
+            }
+        }
+        best
+    }
+
+    /// R-D cost of the IntraBC leaf at (px, py): exact skip copy or
+    /// residual-coded approximate copy, whichever is cheaper.
+    fn rd_cost_intrabc(&self, px: usize, py: usize, size: usize, thr: bool, prdo: f32) -> Option<f32> {
+        self.ibc_plan(px, py, size, thr, prdo).map(|p| p.0)
+    }
+
+    /// Emit a residual-coded IntraBC block (AV1 inter syntax in an intra
+    /// frame): skip = 0, delta-q token, use_intrabc = 1, DV, `txfm_split` = 0,
+    /// luma coefficients with the inter tx-type symbol, chroma coefficients
+    /// with the derived type; reconstruction = reference + dequantised
+    /// residual.
+    fn code_intrabc_residual_block(&mut self, x8: usize, y8: usize, size: usize, plan: IbcResidPlan) {
+        #[cfg(test)]
+        LOSSY_INTRABC_RESID_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (px, py) = (x8 * 8, y8 * 8);
+        let (bx4, by4, stride4, n4) = (px / 4, py / 4, self.w / 4, size / 4);
+        let maxv = (1i32 << self.bd) - 1;
+        let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
+        self.enc.encode_symbol(0, &mut self.cdfs.skip[sctx]);
+        if !self.cdef_point_marked {
+            self.cdef_point_marked = true;
+            self.enc.trace_cdef_mark();
+        }
+        self.code_delta_q_if_armed();
+        self.enc.encode_symbol(1, &mut self.cdfs.intrabc);
+        self.encode_intrabc_mv(plan.mv, plan.pred);
+        // Var-tx tree: one TX of block size (no split).
+        let lw = size.trailing_zeros() as usize - 2;
+        let cat = 2 * (4 - lw);
+        let a = usize::from(self.a_tx[bx4] >= 0 && (self.a_tx[bx4] as usize) < lw);
+        let l = usize::from(self.l_tx[by4] >= 0 && (self.l_tx[by4] as usize) < lw);
+        self.enc.encode_symbol(0, &mut self.cdfs.txpart[cat][a + l]);
+
+        self.record_blk(x8, y8, n4 as u8);
+        self.mark_skip8_rect(x8, y8, size / 8, size / 8, false);
+        let txc = lw as i8;
+        self.a_skip[bx4..bx4 + n4].fill(0);
+        self.l_skip[by4..by4 + n4].fill(0);
+        self.a_mode[bx4..bx4 + n4].fill(DC_PRED as u8);
+        self.l_mode[by4..by4 + n4].fill(DC_PRED as u8);
+        self.a_tx[bx4..bx4 + n4].fill(txc);
+        self.l_tx[by4..by4 + n4].fill(txc);
+        self.commit_uv_mode(px, py, size, size, DC_PRED);
+        for slot in &mut self.a_palette[bx4..bx4 + n4] {
+            slot.clear();
+        }
+        for slot in &mut self.l_palette[by4..by4 + n4] {
+            slot.clear();
+        }
+        for slot in &mut self.a_palette_uv[bx4..bx4 + n4] {
+            slot.clear();
+        }
+        for slot in &mut self.l_palette_uv[by4..by4 + n4] {
+            slot.clear();
+        }
+        for y in by4..by4 + n4 {
+            self.ibc_mv[y * stride4 + bx4..y * stride4 + bx4 + n4].fill(Some(plan.mv));
+        }
+        // Luma: coefficients (txb_skip ctx 0, block-span DC-sign ctx) and recon.
+        let res_ctx = if size == 16 {
+            let cf: &[i32; 256] = plan.lcf[..].try_into().unwrap();
+            let ds = self.dc_sign_ctx_16(0, bx4, by4);
+            encode_tx16_coeffs_inter_dct(&mut self.enc, &mut self.cdfs, cf, 0, ds)
+        } else {
+            let cf: &[i32; 1024] = plan.lcf[..].try_into().unwrap();
+            let ds = self.dc_sign_ctx_32(0, bx4, by4);
+            encode_tx32_coeffs_inter_dct(&mut self.enc, &mut self.cdfs, cf, 0, ds)
+        };
+        self.a_coef[0][bx4..bx4 + n4].fill(res_ctx);
+        self.l_coef[0][by4..by4 + n4].fill(res_ctx);
+        for r in 0..size {
+            let dst = &mut self.recon[0][(py + r) * self.w + px..][..size];
+            recon_add_pred(dst, &plan.lpred[r * size..], &plan.lrr[r * size..], maxv);
+        }
+        // Chroma planes: derived DCT, recon = reference + residual.
+        let (sx, sy) = (usize::from(self.ss420), usize::from(self.ss420));
+        let (cw, chh) = (size >> sx, size >> sy);
+        let (cx, cy) = (px >> sx, py >> sy);
+        let (cbx4, cby4) = (cx / 4, cy / 4);
+        let cn4 = (cw / 4).max(1);
+        for ci in 0..2 {
+            let plane = ci + 1;
+            let cres = match cw {
+                8 => {
+                    let q: &[i32; 64] = plan.ccf[ci][..].try_into().unwrap();
+                    let sk = self.skip_ctx(plane, cbx4, cby4, true);
+                    let ds = self.dc_sign_ctx(plane, cbx4, cby4);
+                    encode_tx8_coeffs_adapt(&mut self.enc, &mut self.cdfs, q, true, sk, ds, 0, 1)
+                }
+                16 => {
+                    let q: &[i32; 256] = plan.ccf[ci][..].try_into().unwrap();
+                    let sk = self.skip_ctx_16(plane, cbx4, cby4, true);
+                    let ds = self.dc_sign_ctx_16(plane, cbx4, cby4);
+                    encode_tx16_coeffs_adapt(&mut self.enc, &mut self.cdfs, q, true, sk, ds, 0, 1)
+                }
+                _ => {
+                    let q: &[i32; 1024] = plan.ccf[ci][..].try_into().unwrap();
+                    let sk = self.skip_ctx_32(plane, cbx4, cby4, true);
+                    let ds = self.dc_sign_ctx_32(plane, cbx4, cby4);
+                    encode_tx32_coeffs_adapt(&mut self.enc, &mut self.cdfs, q, true, sk, ds)
+                }
+            };
+            self.a_coef[plane][cbx4..cbx4 + cn4].fill(cres);
+            self.l_coef[plane][cby4..cby4 + cn4].fill(cres);
+            for r in 0..chh {
+                let dst = &mut self.recon[plane][(cy + r) * self.cw + cx..][..cw];
+                recon_add_pred(dst, &plan.cpred[ci][r * cw..], &plan.crr[ci][r * cw..], maxv);
+            }
+        }
+    }
+
     /// R-D cost of coding a `size`-px square as a skip IntraBC copy: the
     /// residual is dropped (skip = 1), so distortion is the quantization
     /// drift already present in the reference reconstruction.
-    fn rd_cost_intrabc(
+    fn rd_cost_intrabc_skip(
         &self,
         px: usize,
         py: usize,
@@ -806,16 +1357,33 @@ impl<'a> LossyTile<'a> {
         self.code_intrabc_block(x8, y8, 64, thr);
     }
 
-    /// Code a `size`-px square (16/32/64) as a skip IntraBC copy: skip = 1,
+    /// Code a `size`-px square (8/16/32/64) as a skip IntraBC copy: skip = 1,
     /// use_intrabc = 1, DV residual, no coefficients. Reconstruction is an
-    /// integer copy of all coded planes (candidates are chroma-parity-even).
+    /// integer copy of every plane, except that an odd DV (`ibc_odd_dv`)
+    /// predicts the subsampled planes at the half sample with the BILINEAR
+    /// filter (`ibc_chroma_pred`).
     fn code_intrabc_block(&mut self, x8: usize, y8: usize, size: usize, thr: bool) {
         #[cfg(test)]
         LOSSY_INTRABC_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (px, py) = (x8 * 8, y8 * 8);
+        if self.ibc_residual_allowed(size) {
+            let prdo = self.perceptual_rd_scale(px, py, size);
+            if let Some((_, Some(plan))) = self.ibc_plan(px, py, size, thr, prdo) {
+                self.code_intrabc_residual_block(x8, y8, size, plan);
+                return;
+            }
+        }
         let (rx, ry, mv, pred) = self
             .find_intrabc(px, py, size, thr)
             .expect("legal IntraBC reference");
+        let (fx, fy) = (
+            (self.ss420 || self.ss422) && !self.mono && rx & 1 != 0,
+            self.ss420 && !self.mono && ry & 1 != 0,
+        );
+        #[cfg(test)]
+        if fx || fy {
+            LOSSY_INTRABC_ODD_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let (bx4, by4, stride4, n4) = (px / 4, py / 4, self.w / 4, size / 4);
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.enc.encode_symbol(1, &mut self.cdfs.skip[sctx]);
@@ -866,7 +1434,32 @@ impl<'a> LossyTile<'a> {
             let stride = if plane == 0 { self.w } else { self.cw };
             let (x, y, ref_x, ref_y) = (px >> sx, py >> sy, rx >> sx, ry >> sy);
             let (bw, bh) = (size >> sx, size >> sy);
-            if let Some(sh) = self.ibc_shared {
+            if plane != 0 && (fx || fy) {
+                // Half-sample chroma: predict from the reference (shared
+                // finished planes under capture, local recon otherwise) into
+                // a scratch block first — the +1 taps never touch this block,
+                // but the destination rows alias the recon being read.
+                let mut blk = [0u16; 32 * 32];
+                if let Some(sh) = self.ibc_shared {
+                    let (ptr, len, _) = sh.planes[plane];
+                    let get = |xx: usize, yy: usize| {
+                        let off = yy * stride + xx;
+                        debug_assert!(off < len);
+                        // SAFETY: finished-cell read (legality keeps the
+                        // footprint plus taps inside finished cells).
+                        u32::from(unsafe { *ptr.add(off) })
+                    };
+                    ibc_chroma_pred(&get, ref_x, ref_y, fx, fy, bw, bh, &mut blk[..bw * bh]);
+                } else {
+                    let rec = &self.recon[plane];
+                    let get = |xx: usize, yy: usize| u32::from(rec[yy * stride + xx]);
+                    ibc_chroma_pred(&get, ref_x, ref_y, fx, fy, bw, bh, &mut blk[..bw * bh]);
+                }
+                for row in 0..bh {
+                    self.recon[plane][(y + row) * stride + x..][..bw]
+                        .copy_from_slice(&blk[row * bw..][..bw]);
+                }
+            } else if let Some(sh) = self.ibc_shared {
                 // Capture sink emission: the reference lies outside this
                 // worker's halo, so copy it from the shared finished planes
                 // (local recon there is stale — copying it would pollute this
@@ -890,6 +1483,13 @@ impl<'a> LossyTile<'a> {
             self.a_coef[plane][cx4..cx4 + cw4].fill(0x40);
             self.l_coef[plane][cy4..cy4 + ch4].fill(0x40);
         }
+    }
+
+    /// Odd IntraBC DVs with bilinear half-sample chroma (`ibc_odd_dv`): only
+    /// meaningful on subsampled formats.
+    #[inline]
+    fn ibc_odd_dv_allowed(&self) -> bool {
+        crate::tuning::get().ibc_odd_dv && !self.mono && (self.ss420 || self.ss422)
     }
 
     /// TX_64X64 for whole-64 luma (`tx64` knob).
@@ -1171,7 +1771,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
         prdo: f32,
-    ) -> (usize, i32, f32, Luma64Tx) {
+    ) -> (usize, i32, f32, Luma64Tx, Option<LossyLumaPalette>) {
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
         let tx64 = self.tx64_allowed();
@@ -1320,12 +1920,31 @@ impl<'a> LossyTile<'a> {
                 cands.extend([-3, -2, -1, 1, 2, 3].map(|d| (best.0, d)));
             }
         }
+        // Palette leaf (`palette64`, screen frames): the block's own palette
+        // header + map, residual through the four TX_32X32 (Quad32).
+        let mut best_pal: Option<LossyLumaPalette> = None;
+        for (p, pred64) in self.big_palette_finalists(px, py, 64, 64, mlam) {
+            restore(&mut self.recon[0]);
+            let total = rate_cost(
+                mlam,
+                self.mode_bits(px, py, DC_PRED) + self.palette_rate_bits(px, py, &p),
+            ) + self.quad32_pass_pred(px, py, &pred64, lam, mlam);
+            if total < best.2 {
+                best = (DC_PRED, 0, total, Luma64Tx::Quad32);
+                best_pal = Some(p);
+            }
+        }
         // tx_depth 2 (`tx64_depth2`): sixteen TX_16X16 on the winning mode,
         // against its four-TX_32X32 (or TX_64X64) total — a 64 whose detail
         // sits in a few corners codes it in a few 16x16s instead of ringing
         // four TX_32X32. Not at Fast: its candidate loop prices the quadrants
         // with the plain trellis, so the ctx-trellis leg would not compare.
-        if crate::tuning::get().tx64_depth2 && self.speed != Speed::Fast && best.2.is_finite() {
+        // A palette winner keeps Quad32 (its prediction is not an intra mode).
+        if crate::tuning::get().tx64_depth2
+            && self.speed != Speed::Fast
+            && best.2.is_finite()
+            && best_pal.is_none()
+        {
             restore(&mut self.recon[0]);
             let (mode, delta) = (best.0, best.1);
             let mut mode_cost = rate_cost(mlam, self.mode_bits(px, py, mode));
@@ -1348,7 +1967,59 @@ impl<'a> LossyTile<'a> {
         }
         restore(&mut self.recon[0]);
         self.sc().put_u4096(saved);
-        best
+        (best.0, best.1, best.2, best.3, best_pal)
+    }
+
+    /// Price the four TX_32X32 quadrants of the 64x64 at (px, py) under a
+    /// given whole-block prediction (`pred64`, stride 64): running
+    /// reconstruction, ctx trellis, the same distortion/rate terms as the
+    /// candidate loop of [`Self::rd_pick_luma64`]. The prediction's own
+    /// header bits are the caller's. Leaves the recon modified.
+    fn quad32_pass_pred(&mut self, px: usize, py: usize, pred64: &[i32], lam: f32, mlam: f32) -> f32 {
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let maxv = (1i32 << self.bd) - 1;
+        let mut total = 0.0f32;
+        for (sx, sy) in Self::Q64 {
+            let (bx, by) = (px + sx, py + sy);
+            let (qbx4, qby4) = (bx / 4, by / 4);
+            let mut pred = self.sbuf_i1024();
+            for ry in 0..32 {
+                pred[ry * 32..ry * 32 + 32].copy_from_slice(&pred64[(sy + ry) * 64 + sx..][..32]);
+            }
+            let mut resid = self.sbuf_i1024();
+            self.rd.residual_pred(&mut resid[..], &pred[..], &self.src[0], self.w, bx, by, 32, 32);
+            let (mut cf, tf) = self.dct.dct32x32_t(&resid, &self.quant);
+            trellis_optimize_ctx(
+                &mut cf,
+                &tf,
+                dcq,
+                acq,
+                &SCAN_32X32,
+                lam,
+                32,
+                32,
+                self.dcdf(),
+                3,
+                0,
+                &self.dcdf().eob_bin_1024_l,
+                self.dc_sign_ctx_32(0, qbx4, qby4),
+                self.quant.qm_level(),
+                self.quant.qidx() as i32,
+            );
+            let rr = self.idct.idct_dequant_32x32(&cf, &self.quant);
+            let distortion =
+                self.luma_partition_distortion(bx, by, 32, 32, acq, &pred[..], 0, &rr[..]);
+            total += crate::partition_rd::rd_cost(
+                distortion,
+                mlam,
+                self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, DC_PRED, 0),
+            );
+            for row in 0..32 {
+                let dst = &mut self.recon[0][(by + row) * self.w + bx..][..32];
+                recon_add_pred(dst, &pred[row * 32..], &rr[row * 32..], maxv);
+            }
+        }
+        total
     }
 
     fn rd_cost_none64_luma(&self, px: usize, py: usize, prdo: f32) -> f32 {
@@ -1502,7 +2173,17 @@ impl<'a> LossyTile<'a> {
         // The old 4:2:2/4:4:4 handicaps attempted to predict child mode/CfL
         // headroom with fixed constants; once sample density is normalized they
         // are neutral noise and make saturated-edge decisions less portable.
-        let none_luma = self.rd_cost_none64_luma(px, py, prdo);
+        // Whole-64 palette leaf (`palette64`, screen frames): without its
+        // bound the DC-only proxy sends every palette-exact superblock to
+        // SPLIT, where the children pay four headers and four map borders.
+        // A palette-driven NONE is never accepted on the forced-NONE child
+        // bound alone (below): its bound is tiny against four child palettes,
+        // yet the refined children (IntraBC copies, free DC flats) are often
+        // cheaper still — measured +0.5..+1.2% on n_bbscreen without this.
+        let none_luma_dc = self.rd_cost_none64_luma(px, py, prdo);
+        let pal_bound = self.palette_region_bound(px, py, 64, 64, part_lam);
+        let pal_leaf = pal_bound < none_luma_dc;
+        let none_luma = none_luma_dc.min(pal_bound);
         let none_bias = if self.top_band() && self.ss420 && !self.palette_exact(px, py, 64) {
             top_none_bias_420(self.aq.base_q)
         } else {
@@ -1573,7 +2254,7 @@ impl<'a> LossyTile<'a> {
             return Part16::Split;
         }
 
-        if best_whole <= rd_split_upper * b64_refinement_window() {
+        if !pal_leaf && best_whole <= rd_split_upper * b64_refinement_window() {
             if let Some(rd_ibc) = rd_ibc
                 && rd_ibc < rd_leaf.min(rd_split_upper)
             {
@@ -1604,8 +2285,12 @@ impl<'a> LossyTile<'a> {
         // A partial-sum abort bound was built and measured here 2026-07-24 and
         // does NOT pay: `b64_split_refinement()` halves the partial sum's weight,
         // so the bound only reaches `rd_none` once the sum is nearly complete.
-        rd_split =
-            rd_split_upper + b64_split_refinement() * (rd_split.min(rd_split_upper) - rd_split_upper);
+        // A palette-driven NONE competes against the children's refined
+        // costs in full: the blend exists to temper the child estimator's
+        // optimism about deeper intra partitions, not to let a zero-residual
+        // palette bound outbid IntraBC copies and free DC flats.
+        let refinement = if pal_leaf { 1.0 } else { b64_split_refinement() };
+        rd_split = rd_split_upper + refinement * (rd_split.min(rd_split_upper) - rd_split_upper);
         if let Some(rd_ibc) = rd_ibc
             && rd_ibc < rd_leaf.min(rd_split)
         {
@@ -1647,7 +2332,7 @@ impl<'a> LossyTile<'a> {
             self.sbuf_i1024(),
             self.sbuf_i1024(),
         ];
-        let (y_mode, y_delta, ltx);
+        let (y_mode, y_delta, ltx, palette);
         if let Some(r) = rl {
             y_mode = r.mode as usize;
             y_delta = r.delta as i32;
@@ -1656,6 +2341,10 @@ impl<'a> LossyTile<'a> {
                 TxSel::Split64D2 => Luma64Tx::Grid16,
                 _ => Luma64Tx::Quad32,
             };
+            palette = (r.palette > 0).then(|| {
+                self.rederive_luma_palette(px, py, 64, 64, r.palette as usize)
+                    .expect("64x64 palette replay: candidate no longer derivable")
+            });
             if let Some(cf) = rl_cf {
                 for qi in 0..4 {
                     lcf[qi].copy_from_slice(&cf[qi * 1024..qi * 1024 + 1024]);
@@ -1663,8 +2352,14 @@ impl<'a> LossyTile<'a> {
             }
         } else {
             let pick = self.rd_pick_luma64(px, py, have_tr, have_bl, prdo);
-            (y_mode, y_delta, ltx) = (pick.0, pick.1, pick.3);
+            (y_mode, y_delta, ltx, palette) = (pick.0, pick.1, pick.3, pick.4);
         }
+        // Whole-block palette prediction (stride 64) for the quadrant pass.
+        let pal_pred = palette.as_ref().map(|p| {
+            let mut pred = vec![0i32; 4096];
+            palette_pred(&mut pred, 64, &p.colors, &p.packed_map, 64, 64);
+            pred
+        });
         let tx64 = ltx == Luma64Tx::Tx64;
         let grid16 = ltx == Luma64Tx::Grid16;
         self.record_pred_blk(x8, y8, 16);
@@ -1708,7 +2403,12 @@ impl<'a> LossyTile<'a> {
                 let (qbx4, qby4) = (bx / 4, by / 4);
                 let (tr, bl) = Self::quad_edges(sx, sy, px, py, have_tr, have_bl);
                 let mut pred = self.sbuf_i1024();
-                if y_mode == DC_PRED {
+                if let Some(region) = pal_pred.as_deref() {
+                    for ry in 0..32 {
+                        pred[ry * 32..ry * 32 + 32]
+                            .copy_from_slice(&region[(sy + ry) * 64 + sx..][..32]);
+                    }
+                } else if y_mode == DC_PRED {
                     *pred = [self.intrapred.dc_pred_32x32(&self.recon[0], self.w, bx, by, self.bd as i32); 1024];
                 } else {
                     self.intrapred.predict_nd_ad(
@@ -1820,7 +2520,7 @@ impl<'a> LossyTile<'a> {
         self.push_luma_sel(LumaSel {
             mode: y_mode as u8,
             delta: y_delta as i8,
-            palette: 0,
+            palette: palette.as_ref().map_or(0, |p| p.sel),
             filter: NO_FILTER,
             tx: if tx64 {
                 TxSel::Tx64
@@ -1866,8 +2566,11 @@ impl<'a> LossyTile<'a> {
                 .encode_symbol(3, &mut self.cdfs.angle_delta[uv_mode - V_PRED]);
         }
         self.commit_uv_mode(px, py, 64, 64, uv_mode);
-        self.emit_palette_mode_info(px, py, 64, 64, y_mode, !self.mono, None, None);
+        self.emit_palette_mode_info(px, py, 64, 64, y_mode, !self.mono, palette.as_ref(), None);
         // filter_intra is disallowed for max(w,h) > 32, so no symbol here.
+        if let Some(p) = &palette {
+            self.emit_palette_map(p);
+        }
         self.code_tx_depth(px, py, 64, 64, if tx64 { 0 } else if grid16 { 2 } else { 1 });
         let sv = block_skip as u8;
         let mv = y_mode as u8;
@@ -2021,6 +2724,70 @@ impl<'a> LossyTile<'a> {
 #[cfg(test)]
 mod ibc_index_tests {
     use super::LossyIbcIndex;
+
+    use super::ibc_chroma_pred;
+
+    /// The spec's two-pass 8-tap BILINEAR convolution (7.11.3.4) at the
+    /// positions an odd luma DV produces (0 or 8 in 1/16 chroma samples).
+    fn spec_bilinear(get: &dyn Fn(usize, usize) -> u32, kx: usize, ky: usize, fx: bool, fy: bool, bd: u32) -> u32 {
+        let (r0, r1) = if bd == 12 { (5u32, 9u32) } else { (3, 11) };
+        let taps = |p: u32| -> [i64; 8] { [0, 0, 0, 128 - 8 * p as i64, 8 * p as i64, 0, 0, 0] };
+        let (px, py) = (if fx { 8 } else { 0 }, if fy { 8 } else { 0 });
+        let round2 = |v: i64, n: u32| (v + (1i64 << (n - 1))) >> n;
+        // Horizontal pass over the 8 rows the vertical taps can touch.
+        let mut inter = [0i64; 8];
+        for (r, slot) in inter.iter_mut().enumerate() {
+            let yy = (ky + r).saturating_sub(3);
+            let mut sum = 0i64;
+            for (t, coef) in taps(px).iter().enumerate() {
+                if *coef != 0 {
+                    let xx = kx + t - 3;
+                    sum += coef * i64::from(get(xx, yy));
+                }
+            }
+            *slot = round2(sum, r0);
+        }
+        let mut sum = 0i64;
+        for (t, coef) in taps(py).iter().enumerate() {
+            if *coef != 0 {
+                sum += coef * inter[t];
+            }
+        }
+        round2(sum, r1) as u32
+    }
+
+    #[test]
+    fn ibc_chroma_pred_matches_spec_bilinear_convolution() {
+        let mut seed = 0x5eed_1234u32;
+        for bd in [8u32, 10, 12] {
+            let (w, h) = (48usize, 40usize);
+            let plane: Vec<u32> = (0..w * h)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed % (1 << bd)
+                })
+                .collect();
+            let get = |x: usize, y: usize| plane[y * w + x];
+            for fx in [false, true] {
+                for fy in [false, true] {
+                    let (kx, ky, bw, bh) = (5usize, 7usize, 16usize, 8usize);
+                    let mut out = [0u16; 16 * 8];
+                    ibc_chroma_pred(&get, kx, ky, fx, fy, bw, bh, &mut out);
+                    for r in 0..bh {
+                        for c in 0..bw {
+                            assert_eq!(
+                                u32::from(out[r * bw + c]),
+                                spec_bilinear(&get, kx + c, ky + r, fx, fy, bd),
+                                "bd {bd} fx {fx} fy {fy} at ({c},{r})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The index rolls the 8x8 window hash; queries use the direct form. They
     /// must agree at every indexed position, or no lookup can ever hit.
