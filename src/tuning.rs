@@ -356,6 +356,11 @@ pub(crate) struct Tuning {
     pub(crate) rect64: bool,
     /// R-D multiplier on the rect64 legs (1.0 = priced like whole-64 NONE).
     pub(crate) rect64_bias: f32,
+    /// Also open the rect64 legs on `screen_frame`s (Slow+), where they carry
+    /// the 64x32 / 32x64 palette leaves (`palette64`); photos unaffected.
+    /// OFF: measured BD-inert next to the 64x64 palette leaf (n_bbscreen
+    /// +-5 B) for ~8% screen-frame time.
+    pub(crate) rect64_screen: bool,
     /// TX_64X64 as a whole-64 luma alternative to four TX_32X32.
     pub(crate) tx64: bool,
     /// R-D multiplier on the TX_64X64 candidate (1.0 = priced like 4xTX_32X32).
@@ -440,6 +445,10 @@ pub(crate) struct Tuning {
     /// x_screen -9.0 (444) / -11.5 (420), n_bbscreen -4.1 / -4.9, n_scmap 420
     /// -2.4; the 48 non-screen corpus images are BD-neutral (-0.01 / +0.03).
     pub(crate) palette_dp_centers: bool,
+    /// Luma palette candidates at BLOCK_64X64 and the rect64 halves
+    /// (64x32 / 32x64), with the matching partition-proxy bound. Screen
+    /// frames only (`screen_frame`), Slow+.
+    pub(crate) palette64: bool,
     /// `screen_frame_gate`: IntraBC pays when the copied texture mass exceeds
     /// this fraction of the photo-like mass that loses the loop filters.
     pub(crate) ibc_gate_beta: f32,
@@ -449,6 +458,35 @@ pub(crate) struct Tuning {
     /// `screen_frame_gate`: build the copy index only when at least this share
     /// of 16x16 blocks has <= 16 luma values (photos never do).
     pub(crate) ibc_gate_prescreen: f32,
+    /// Above-row reach of the capture wavefront on IntraBC frames (cell (r, c)
+    /// waits for (r-1, c+reach)), and the matching DV legality in
+    /// `find_intrabc`: finished set `{r' < r: c' <= c + reach*(r-r')}`.
+    /// 1 = the classic d = 2r + c schedule, which forbade most spec-legal
+    /// copy sources (s_manga: 1% of exact 8x8 sources admitted vs 56% legal);
+    /// 5 = libaom's `av1_is_dv_valid` gradient, every spec-legal source.
+    /// 2 keeps 98% of the manga gain (39218 vs 39148 B) at 1.15x the -t8
+    /// time of reach 1 instead of 1.85x; it covers the row above completely
+    /// and two rows above to c + 4 (spec: c + 5).
+    pub(crate) ibc_wavefront_reach: u32,
+    /// Odd luma DVs for IntraBC at 4:2:0 / 4:2:2: the subsampled planes are
+    /// predicted at the half-sample position with AV1's BILINEAR filter
+    /// (`ibc_chroma_pred`), as the decoders do, instead of requiring a
+    /// chroma-parity-even DV (integer copy). Exact-copy semantics are kept:
+    /// the filtered chroma must reproduce the source. Off = the old parity
+    /// restriction (and the parity-grid hash index).
+    pub(crate) ibc_odd_dv: bool,
+    /// IntraBC with a coded residual at 16x16 / 32x32 (screen frames, 4:2:0 and
+    /// 4:4:4): an approximate copy (any legal DV from the 8x8 anchor hits, the
+    /// DV predictor and the neighbours' DVs) plus the prediction error coded as
+    /// an AV1 INTER block (skip = 0, one luma TX of block size, DCT_DCT in the
+    /// inter tx-type set, decoder-derived chroma type). OFF: measured BD
+    /// x_screen -0.2 (420) / -0.6 (444) but n_bbscreen +0.3 / +0.4, manga and
+    /// line-art ladders unchanged (the SATD proxy rightly keeps b/w flips
+    /// out), for 1.03-1.28x screen-frame time.
+    pub(crate) ibc_residual: bool,
+    /// Approximate-copy candidates that get the full residual RD (ranked by
+    /// source luma SAD).
+    pub(crate) ibc_residual_cands: u32,
     /// `screen_frame_gate`: palette-exact 16x16 share that turns the text
     /// palette tools on (libaom's screen-content test uses 10%).
     pub(crate) screen_few_share: f32,
@@ -653,6 +691,7 @@ impl Tuning {
         min_size_16_medium: true,
         rect64: false,
         rect64_bias: 1.0,
+        rect64_screen: false,
         tx64: false,
         tx64_bias: 1.0,
         tx64_none: false,
@@ -682,9 +721,14 @@ impl Tuning {
         palette_viterbi_screen_only: 1,
         palette_viterbi_uv: 0.0,
         palette_dp_centers: true,
+        palette64: true,
         ibc_gate_beta: 32.0,
         ibc_gate_dv: 1.0,
         ibc_gate_prescreen: 0.02,
+        ibc_wavefront_reach: 2,
+        ibc_odd_dv: true,
+        ibc_residual: false,
+        ibc_residual_cands: 2,
         screen_few_share: 0.10,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
@@ -911,6 +955,7 @@ mod imp {
                 "min_size_16_medium" => t.min_size_16_medium = flag(value),
                 "rect64" => t.rect64 = flag(value),
                 "rect64_bias" => t.rect64_bias = num(value),
+                "rect64_screen" => t.rect64_screen = flag(value),
                 "tx64" => t.tx64 = flag(value),
                 "tx64_bias" => t.tx64_bias = num(value),
                 "tx64_none" => t.tx64_none = flag(value),
@@ -940,9 +985,14 @@ mod imp {
                 "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
                 "palette_viterbi_uv" => t.palette_viterbi_uv = num(value),
                 "palette_dp_centers" => t.palette_dp_centers = flag(value),
+                "palette64" => t.palette64 = flag(value),
                 "ibc_gate_beta" => t.ibc_gate_beta = num(value),
                 "ibc_gate_dv" => t.ibc_gate_dv = num(value),
                 "ibc_gate_prescreen" => t.ibc_gate_prescreen = num(value),
+                "ibc_wavefront_reach" => t.ibc_wavefront_reach = num(value) as u32,
+                "ibc_odd_dv" => t.ibc_odd_dv = flag(value),
+                "ibc_residual" => t.ibc_residual = flag(value),
+                "ibc_residual_cands" => t.ibc_residual_cands = num(value) as u32,
                 "screen_few_share" => t.screen_few_share = num(value),
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),

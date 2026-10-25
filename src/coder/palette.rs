@@ -1308,6 +1308,86 @@ fn lossy_luma_palette_from_centers(
     }
 }
 
+/// Wrapped-delta plan for the V palette colors (dav1d `read_pal_uv`, delta
+/// mode): `(bits, deltas)` with `bits` in `[bd-4, bd-1]`, each signed delta
+/// satisfying `|d| < 2^bits` and `(prev + d) & max == next`. The shorter of
+/// the direct and the wrapped step is taken per color. `None` when some step
+/// needs more than `bd-1` bits (literal mode is then the only legal coding).
+fn uv_v_delta_plan(v: &[i32], bd: u32) -> Option<(u32, FixedList<i32, 8>)> {
+    let max = (1i32 << bd) - 1;
+    let mut deltas = FixedList::<i32, 8>::new(0);
+    let mut need = 0u32;
+    let mut prev = v[0];
+    for &c in &v[1..] {
+        let direct = c - prev;
+        let wrapped = if direct > 0 { direct - (max + 1) } else { direct + (max + 1) };
+        let d = if direct.abs() <= wrapped.abs() { direct } else { wrapped };
+        need = need.max(32 - d.unsigned_abs().leading_zeros());
+        deltas.push(d);
+        prev = c;
+    }
+    let bits = need.max(bd - 4);
+    (bits < bd).then_some((bits, deltas))
+}
+
+/// Cheapest legal V-plane coding: `(bits, Some(plan))` for delta mode or
+/// `(bits, None)` for literal mode (ties keep literal). Shared by the rate
+/// model and the emitter so both see the same syntax.
+fn uv_v_plane_plan(v: &[i32], bd: u32) -> (f32, Option<(u32, FixedList<i32, 8>)>) {
+    let literal = 1.0 + (v.len() as u32 * bd) as f32;
+    match uv_v_delta_plan(v, bd) {
+        Some((bits, deltas)) => {
+            let delta = 1.0
+                + 2.0
+                + bd as f32
+                + deltas
+                    .iter()
+                    .map(|&d| bits as f32 + f32::from(u8::from(d != 0)))
+                    .sum::<f32>();
+            if delta < literal {
+                (delta, Some((bits, deltas)))
+            } else {
+                (literal, None)
+            }
+        }
+        None => (literal, None),
+    }
+}
+
+/// Bits of the U-plane "new colors" transaction over the remaining multiset
+/// `out` (first color literal, then the non-decreasing delta coding with the
+/// `ulog2` range shrink), exactly as `emit_palette_mode_info` writes it.
+fn uv_u_new_colors_bits(out: &[u32], bd: u32) -> f32 {
+    let Some(&_first) = out.first() else {
+        return 0.0;
+    };
+    let mut bits = bd as f32;
+    if out.len() > 1 {
+        let max = (1u32 << bd) - 1;
+        let max_delta = out.array_windows::<2>().map(|w| w[1] - w[0]).max().unwrap();
+        let min_bits = bd - 3;
+        let mut nb = if max_delta == 0 {
+            0
+        } else {
+            32 - max_delta.leading_zeros()
+        };
+        nb = nb.max(min_bits).min(bd);
+        bits += 2.0;
+        let mut prev = out[0];
+        for w in out.array_windows::<2>() {
+            let delta = w[1] - w[0];
+            bits += nb as f32;
+            prev = (prev + delta).min(max);
+            if prev >= max {
+                break;
+            }
+            let ulog2 = 31 - (max - prev).leading_zeros();
+            nb = nb.min(1 + ulog2);
+        }
+    }
+    bits
+}
+
 impl<'a> LossyTile<'a> {
     fn palette_estimate_context(
         &self,
@@ -1573,6 +1653,151 @@ impl<'a> LossyTile<'a> {
                 (palette, pred)
             })
             .collect()
+    }
+
+    /// Whole-64 / rect64 palette leaves (`Tuning::palette64`): screen frames
+    /// at Slow+ only, so photos never pay for the extra histogram/map work.
+    fn palette_big_enabled(&self) -> bool {
+        crate::tuning::get().palette64
+            && self.screen_frame
+            && self.try_palette()
+            && self.speed.at_least_slow()
+    }
+
+    /// [`Self::rank_luma_palette_candidates`] for the large shapes (64x64,
+    /// 64x32, 32x64): the same ranked shortlist, its first `take` entries,
+    /// with the per-pixel prediction in a `Vec` (stride `w`) instead of a
+    /// const array.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_luma_palette_candidates_dyn(
+        &self,
+        hist: &[(i32, u32)],
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        mlam: f32,
+        take: usize,
+        opts: &PalMapOpts,
+    ) -> Vec<(LossyLumaPalette, Vec<i32>)> {
+        let ranked = self.rank_palette_centers(hist, mlam, (px, py, w, h));
+        ranked
+            .iter()
+            .take(take)
+            .map(|&(_, order, centers, top)| {
+                let palette = lossy_luma_palette_from_centers(
+                    &self.kmeans,
+                    &self.src[0],
+                    self.w,
+                    px,
+                    py,
+                    w,
+                    h,
+                    centers.as_slice().to_vec(),
+                    order / 2 + 2 + if top { 8 } else { 0 },
+                    opts,
+                );
+                let mut pred = vec![0i32; w * h];
+                palette_pred(&mut pred, w, &palette.colors, &palette.packed_map, w, h);
+                (palette, pred)
+            })
+            .collect()
+    }
+
+    /// Partition-proxy bound of a palette leaf over the `w`x`h` region at
+    /// (px, py): residual left uncoded (an upper bound on the emitter's cost,
+    /// like the `rd_cost_square` bracket), proxy map options, the shortlist's
+    /// first `palette_proxy_finalists()`. `INFINITY` when the leaf is not
+    /// available here.
+    fn palette_region_bound(&self, px: usize, py: usize, w: usize, h: usize, mlam: f32) -> f32 {
+        if !self.palette_big_enabled() {
+            return f32::INFINITY;
+        }
+        let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h) else {
+            return f32::INFINITY;
+        };
+        // EXACT palettes only (<= 8 values): the bound is then tight (zero
+        // residual) and the leaf is pure header/map-border consolidation.
+        // Lossy 64 palettes measured as area theft from IntraBC / DC children
+        // on n_bbscreen (+0.5..+1.2%) with a slight SS2 loss.
+        if hist.len() > 8 {
+            return f32::INFINITY;
+        }
+        // Memoized like the `rd_cost_square` bracket: (dist, bits) pairs per
+        // (position, shape), keyed with the neighbour palette/mode context
+        // and lambda (`PaletteEstimateContext`) so a stale cache or a changed
+        // mode context recomputes. `choose_64` asks several times per
+        // superblock (trial gate, decision, rect legs).
+        let key = ((px as u64) << 34) | ((py as u64) << 8) | (((w / 8) as u64) << 4) | (h / 8) as u64;
+        let context = self.palette_estimate_context(px, py, mlam);
+        let cached = if let Some(context) = context {
+            self.screen_pal_est_cache
+                .borrow()
+                .get(&key)
+                .filter(|(saved, _)| *saved == context)
+                .map(|&(_, pairs)| pairs)
+        } else {
+            self.pal_est_cache.borrow().get(&key).copied()
+        };
+        let pairs = if let Some(pairs) = cached {
+            pairs
+        } else {
+            let acq = self.quant.ac_q() as f32;
+            let mut pairs = [(f32::INFINITY, 0.0f32); 3];
+            for (i, (p, pred)) in self
+                .rank_luma_palette_candidates_dyn(
+                    &hist,
+                    px,
+                    py,
+                    w,
+                    h,
+                    mlam,
+                    palette_proxy_finalists(),
+                    &self.palette_map_opts_proxy(),
+                )
+                .into_iter()
+                .enumerate()
+            {
+                let dist = self.luma_partition_distortion(px, py, w, h, acq, &pred, 0, &[]);
+                let bits = self.mode_bits(px, py, DC_PRED) + self.palette_rate_bits(px, py, &p);
+                pairs[i] = (dist, bits);
+            }
+            if let Some(context) = context {
+                self.screen_pal_est_cache
+                    .borrow_mut()
+                    .insert(key, (context, pairs));
+            } else {
+                self.pal_est_cache.borrow_mut().insert(key, pairs);
+            }
+            pairs
+        };
+        pairs
+            .iter()
+            .filter(|(dist, _)| dist.is_finite())
+            .map(|&(dist, bits)| crate::partition_rd::rd_cost(dist, mlam, bits))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Emitter-side palette finalists (two) for the large shapes, on the
+    /// emitter's map options; empty when the leaf is not available.
+    fn big_palette_finalists(
+        &self,
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        mlam: f32,
+    ) -> Vec<(LossyLumaPalette, Vec<i32>)> {
+        if !self.palette_big_enabled() {
+            return Vec::new();
+        }
+        let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h) else {
+            return Vec::new();
+        };
+        if hist.len() > 8 {
+            return Vec::new();
+        }
+        self.rank_luma_palette_candidates_dyn(&hist, px, py, w, h, mlam, 2, &self.palette_map_opts())
     }
 
     /// UV palette candidate pre-filter (`Tuning::uv_pal_gate_k`): true = skip
@@ -1947,12 +2172,31 @@ impl<'a> LossyTile<'a> {
                         }
                     }
                 }
-                // V plane: literal mode (leading equiprobable bool = 0, then
-                // one bd-bit literal per color) — always legal; the wrapped
-                // delta mode is an optimization left for later.
-                self.enc.encode_bool(false, 16384);
-                for &v in &up.v {
-                    self.enc.encode_literal(v as u32, self.bd as u32);
+                // V plane: the cheaper of literal mode (bool 0, one bd-bit
+                // literal per color) and wrapped-delta mode (bool 1, 2-bit
+                // `bits - (bd-4)`, first color literal, then `bits`-bit
+                // magnitudes with a sign bool on nonzero steps; the decoder
+                // wraps `(prev + delta) & max`). `uv_v_plane_plan` is shared
+                // with `palette_uv_rate_bits`.
+                let bd = self.bd as u32;
+                match uv_v_plane_plan(&up.v, bd).1 {
+                    Some((bits, deltas)) => {
+                        self.enc.encode_bool(true, 16384);
+                        self.enc.encode_literal(bits - (bd - 4), 2);
+                        self.enc.encode_literal(up.v[0] as u32, bd);
+                        for &d in deltas.iter() {
+                            self.enc.encode_literal(d.unsigned_abs(), bits);
+                            if d != 0 {
+                                self.enc.encode_bool(d < 0, 16384);
+                            }
+                        }
+                    }
+                    None => {
+                        self.enc.encode_bool(false, 16384);
+                        for &v in &up.v {
+                            self.enc.encode_literal(v as u32, bd);
+                        }
+                    }
                 }
             }
         }
@@ -1974,45 +2218,47 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    /// Entropy-accurate rate of the UV palette transaction. U colors are
-    /// priced as ALL NEW (no cache credit): the U-plane neighbor cache
-    /// (a_palette_uv/l_palette_uv) is not in the wavefront ctx handoff, so a
-    /// decision model reading it would break -t1/-tN byte identity — the
-    /// EMITTER still uses the real cache, so this slightly overprices dense
-    /// regions (conservative). V is priced in literal mode, as emitted.
-    fn palette_uv_rate_bits(&self, y_pal: bool, up: &LossyUvPalette) -> f32 {
+    /// Entropy-accurate rate of the UV palette transaction, mirroring
+    /// `emit_palette_mode_info`: U colors priced against the REAL U-plane
+    /// neighbor cache (`a_palette_uv` / `l_palette_uv` cross the wavefront
+    /// handoff like the luma planes, so -t1 and -tN see the same cache), the
+    /// remaining multiset through the non-decreasing delta coding, and V by
+    /// the cheaper of literal and wrapped-delta mode (`uv_v_plane_plan`).
+    fn palette_uv_rate_bits(&self, px: usize, py: usize, y_pal: bool, up: &LossyUvPalette) -> f32 {
+        let (bx4, by4) = (px / 4, py / 4);
         let c = self.dcdf();
+        let bd = self.bd as u32;
         let bctx = palette_bsize_ctx(up.width, up.height);
         let mut bits = cdf_cost(&c.palette_uv_mode[usize::from(y_pal)], 1)
             + cdf_cost(&c.palette_uv_size[bctx], up.u.len() - 2);
-        bits += self.bd as f32; // first U color literal
-        if up.u.len() > 1 {
-            let max = (1u32 << self.bd) - 1;
-            let deltas: Vec<u32> =
-                up.u.array_windows::<2>()
-                    .map(|w| (w[1] - w[0]) as u32)
-                    .collect();
-            let max_delta = deltas.iter().copied().max().unwrap();
-            let min_bits = self.bd - 3;
-            let mut nb = if max_delta == 0 {
-                0
-            } else {
-                (32 - max_delta.leading_zeros()) as u8
-            };
-            nb = nb.max(min_bits).min(self.bd);
-            bits += 2.0;
-            let mut prev = up.u[0] as u32;
-            for &d in &deltas {
-                bits += nb as f32;
-                prev = (prev + d).min(max);
-                if prev >= max {
-                    break;
+        let cache = palette_cache(
+            &self.a_palette_uv[bx4],
+            &self.l_palette_uv[by4],
+            !py.is_multiple_of(64),
+        );
+        let mut rem = FixedList::<i32, 8>::new(0);
+        for &color in &up.u {
+            rem.push(color);
+        }
+        let mut found = 0;
+        for &cv in &cache {
+            if found == up.u.len() {
+                break;
+            }
+            bits += 1.0; // reuse flag, p = 1/2 bypass
+            if up.u.binary_search(&cv).is_ok() {
+                found += 1;
+                if let Ok(pos) = rem.binary_search(&cv) {
+                    rem.remove(pos);
                 }
-                let ulog2 = 31 - (max - prev).leading_zeros();
-                nb = nb.min(1 + ulog2 as u8);
             }
         }
-        bits += 1.0 + (up.v.len() * self.bd as usize) as f32; // V literal mode
+        let mut out = FixedList::<u32, 8>::new(0);
+        for &color in &rem {
+            out.push(color as u32);
+        }
+        bits += uv_u_new_colors_bits(&out, bd);
+        bits += uv_v_plane_plan(&up.v, bd).0;
         let ns = up.u.len();
         bits += dirty_log2f(ns as f32);
         for diagonal in 1..up.width + up.height - 1 {
@@ -2392,6 +2638,54 @@ mod ctx_tests {
     /// With lambda 0 the UV row Viterbi is the nearest-pair map (ties to the
     /// lower index); on a single row (where it is exact) a positive lambda
     /// never loses to the nearest map on SSE + lam * bits.
+    #[test]
+    fn uv_v_delta_plan_roundtrips_through_the_decoder_wrap() {
+        // Every plan must reproduce the colors under dav1d's
+        // `prev = (prev + delta) & max`, with |delta| < 2^bits and bits in
+        // [bd-4, bd-1]; the chosen mode is never costlier than literal.
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for bd in [8u32, 10, 12] {
+            let max = (1i32 << bd) - 1;
+            for n in 2..=8usize {
+                for _ in 0..200 {
+                    let spread = [2, 8, 40, 200, 1 << bd][(next() % 5) as usize];
+                    let base = (next() % (1 << bd)) as i32;
+                    let v: Vec<i32> = (0..n)
+                        .map(|_| (base + (next() % spread) as i32 - spread as i32 / 2).rem_euclid(max + 1))
+                        .collect();
+                    if let Some((bits, deltas)) = uv_v_delta_plan(&v, bd) {
+                        assert!((bd - 4..=bd - 1).contains(&bits));
+                        assert_eq!(deltas.len(), n - 1);
+                        let mut prev = v[0];
+                        for (i, &d) in deltas.iter().enumerate() {
+                            assert!(d.unsigned_abs() < (1u32 << bits));
+                            prev = (prev + d) & max;
+                            assert_eq!(prev, v[i + 1]);
+                        }
+                    }
+                    let (bits, plan) = uv_v_plane_plan(&v, bd);
+                    let literal = 1.0 + (n as u32 * bd) as f32;
+                    assert!(bits <= literal);
+                    if plan.is_some() {
+                        assert!(bits < literal);
+                    }
+                }
+            }
+        }
+        // A tight 2-color V list at 8-bit: delta mode (1+2+8+4+1 = 16) beats
+        // literal (17); a wrap-around step is the short way round.
+        let (bits, plan) = uv_v_plane_plan(&[250, 3], 8);
+        assert_eq!(plan.as_ref().unwrap().0, 4);
+        assert_eq!(plan.as_ref().unwrap().1[0], 9);
+        assert_eq!(bits, 16.0);
+    }
+
     #[test]
     fn uv_viterbi_matches_nearest_at_zero_lambda() {
         let mut seed = 0xdead_beefu32;

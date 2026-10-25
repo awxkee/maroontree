@@ -383,9 +383,23 @@ pub(crate) fn intrabc_dv_conformant(
     size: usize,
     tile_w: usize,
 ) -> bool {
+    intrabc_dv_conformant_rect(px, py, rx, ry, size, size, tile_w)
+}
+
+/// [`intrabc_dv_conformant`] for a `ew` x `eh` reference footprint (the
+/// block plus the extra half-sample chroma taps of an odd DV).
+pub(crate) fn intrabc_dv_conformant_rect(
+    px: usize,
+    py: usize,
+    rx: usize,
+    ry: usize,
+    ew: usize,
+    eh: usize,
+    tile_w: usize,
+) -> bool {
     const DELAY_SB64: usize = 4; // 256 px
     let (active_row, active_col) = (py / 64, px / 64);
-    let (src_row, src_col) = ((ry + size - 1) / 64, (rx + size - 1) / 64);
+    let (src_row, src_col) = ((ry + eh - 1) / 64, (rx + ew - 1) / 64);
     // `((mi_cols - 1) >> 4) + 1` == ceil over the 8-px-aligned width == this.
     let total_sb64_per_row = tile_w.div_ceil(64);
     if src_row * total_sb64_per_row + src_col + DELAY_SB64
@@ -4743,6 +4757,177 @@ mod tests {
         }
         assert!(
             crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed) >= 2
+        );
+    }
+
+    #[test]
+    fn lossy_intrabc_odd_dv_420_chroma_matches_dav1d_bilinear() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // One SB64 row; same-row references need a 256-px delay, so the copy
+        // of luma x in [3, 67) sits at x in [384, 448): DV = -381, ODD, so the
+        // 4:2:0 chroma is predicted at the half sample. The target chroma is
+        // BUILT as the spec's bilinear of the reference chroma, so the copy is
+        // exact and the encoder takes it; dav1d's output then has to show the
+        // same half-sample average — position and rounding checked end to end.
+        let (w, h) = (512usize, 64usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut luma = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..128 {
+                luma[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as u16;
+            }
+            luma.copy_within(y * w + 3..y * w + 67, y * w + 384);
+        }
+        let mut u = vec![128u16; cw * ch];
+        let mut v = vec![128u16; cw * ch];
+        for r in 0..ch {
+            for j in 0..64 {
+                u[r * cw + j] = ((j * 37 + r * 11) & 255) as u16;
+                v[r * cw + j] = ((j * 53 + r * 7 + 100) & 255) as u16;
+            }
+            // chroma column i of the copy maps to luma 2i - 381 = 2(i - 191) + 1:
+            // floor i - 191, half sample -> average with i - 190.
+            for i in 192..224 {
+                let k = i - 191;
+                u[r * cw + i] = (u[r * cw + k] + u[r * cw + k + 1] + 1) >> 1;
+                v[r * cw + i] = (v[r * cw + k] + v[r * cw + k + 1] + 1) >> 1;
+            }
+        }
+        crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::coder::LOSSY_INTRABC_ODD_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pool = crate::par::Pool::new(1);
+        let obu = crate::dispatch::encode_lossy_420(
+            80,
+            8,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            None,
+            &pool,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+            true,
+            true,
+            true,
+        );
+        let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-odd-dv-420");
+        assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+        let dy = &decoded[..w * h];
+        let (n_ibc, n_odd) = (
+            crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+            crate::coder::LOSSY_INTRABC_ODD_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let mut bad = Vec::new();
+        for by in (0..h).step_by(8) {
+            for bx in (384..448).step_by(8) {
+                let ok = (0..8).all(|yy| {
+                    dy[(by + yy) * w + bx - 381..(by + yy) * w + bx - 381 + 8]
+                        == dy[(by + yy) * w + bx..(by + yy) * w + bx + 8]
+                });
+                if !ok {
+                    bad.push((bx, by));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "non-copied 8x8 blocks {bad:?}; ibc {n_ibc} odd {n_odd}"
+        );
+        for (name, plane) in [
+            ("u", &decoded[w * h..w * h + cw * ch]),
+            ("v", &decoded[w * h + cw * ch..]),
+        ] {
+            for r in 0..ch {
+                for i in 192..224 {
+                    let k = i - 191;
+                    let want =
+                        (u16::from(plane[r * cw + k]) + u16::from(plane[r * cw + k + 1]) + 1) >> 1;
+                    assert_eq!(u16::from(plane[r * cw + i]), want, "{name} row {r} col {i}");
+                }
+            }
+        }
+        assert!(
+            crate::coder::LOSSY_INTRABC_ODD_EMITTED.load(std::sync::atomic::Ordering::Relaxed) > 0
+        );
+    }
+
+    #[test]
+    fn lossy_intrabc_residual_420_decodes_close_to_source() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // Luma x in [3, 67) is copied to [384, 448): rows 0..32 exactly (so
+        // the frame's IntraBC gate fires and the exact copies seed the DV
+        // predictor), rows 32..64 with a few samples perturbed, so there no
+        // exact copy exists but the approximate copy plus a coded residual
+        // is far cheaper than intra on the noise. Flat chroma. dav1d must
+        // parse the inter syntax (txfm_split, inter tx type) and reconstruct
+        // within quantiser error of the source.
+        let (w, h) = (512usize, 64usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut luma = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..128 {
+                luma[y * w + x] = ((x * 29 + y * 47 + (x ^ y) * 3) & 255) as u16;
+            }
+            luma.copy_within(y * w + 3..y * w + 67, y * w + 384);
+            if y >= 32 {
+                for x in (384 + (y % 7)..448).step_by(13) {
+                    luma[y * w + x] = (luma[y * w + x] ^ 0x18).min(255);
+                }
+            }
+        }
+        let u = vec![128u16; cw * ch];
+        let v = vec![128u16; cw * ch];
+        crate::coder::LOSSY_INTRABC_RESID_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pool = crate::par::Pool::new(1);
+        let obu = crate::dispatch::encode_lossy_420(
+            60,
+            8,
+            w,
+            h,
+            &luma,
+            &u,
+            &v,
+            None,
+            &pool,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+            true,
+            true,
+            true,
+        );
+        let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-residual-420");
+        assert_eq!(decoded.len(), w * h + 2 * cw * ch);
+        let dy = &decoded[..w * h];
+        let mut worst = 0i32;
+        let mut sse = 0i64;
+        for y in 0..h {
+            for x in 384..448 {
+                let d = i32::from(dy[y * w + x]) - i32::from(luma[y * w + x]);
+                worst = worst.max(d.abs());
+                sse += i64::from(d * d);
+            }
+        }
+        let mse = sse as f64 / (64.0 * h as f64);
+        assert!(
+            crate::coder::LOSSY_INTRABC_RESID_EMITTED.load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "no residual IntraBC block was coded"
+        );
+        assert!(
+            mse < 40.0 && worst < 64,
+            "copy region mse {mse:.1} worst {worst}"
         );
     }
 

@@ -83,7 +83,8 @@ impl<'a> LossyTile<'a> {
     /// path at all.
     #[inline]
     fn rect64_allowed(&self, vert: bool) -> bool {
-        crate::tuning::get().rect64
+        let t = crate::tuning::get();
+        (t.rect64 || (t.rect64_screen && self.palette_big_enabled()))
             && self.speed.at_least_slow()
             && !self.mono
             && !(vert && self.ss422)
@@ -541,7 +542,9 @@ impl<'a> LossyTile<'a> {
     /// Code the luma of a rect64 half in `mode`: two TX_32X32 predicted from
     /// the RUNNING reconstruction (written into `self.recon[0]`), each
     /// trellis'd with exact contexts. Returns the R-D cost under `mlam` and
-    /// leaves the levels in `cf`.
+    /// leaves the levels in `cf`. `pal_pred` (stride = the half's width)
+    /// replaces the intra prediction for a palette leaf (`mode` = DC_PRED);
+    /// its header bits are the caller's.
     #[allow(clippy::too_many_arguments)]
     fn rect64_luma_pass(
         &mut self,
@@ -555,10 +558,12 @@ impl<'a> LossyTile<'a> {
         ftype: bool,
         lam: f32,
         mlam: f32,
+        pal_pred: Option<&[i32]>,
         cf: &mut [[i32; 1024]; 2],
     ) -> f32 {
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let maxv = (1i32 << self.bd) - 1;
+        let (lw, _) = Self::rect64_dims(vert);
         let mut total = rate_cost(mlam, self.mode_bits(px, py, mode));
         if (V_PRED..=VERT_LEFT_PRED).contains(&mode) {
             total += rate_cost(
@@ -570,7 +575,15 @@ impl<'a> LossyTile<'a> {
             let (bx, by) = (px + sx, py + sy);
             let (tr, bl) = Self::rect64_sub_edges(vert, si, px, py, have_tr, have_bl);
             let mut pred = self.sbuf_i1024();
-            self.rect64_luma_pred(mode, delta, bx, by, tr, bl, ftype, &mut pred);
+            match pal_pred {
+                Some(region) => {
+                    for ry in 0..32 {
+                        pred[ry * 32..ry * 32 + 32]
+                            .copy_from_slice(&region[(sy + ry) * lw + sx..][..32]);
+                    }
+                }
+                None => self.rect64_luma_pred(mode, delta, bx, by, tr, bl, ftype, &mut pred),
+            }
             let mut resid = self.sbuf_i1024();
             self.rd
                 .residual_pred(&mut resid[..], &pred[..], &self.src[0], self.w, bx, by, 32, 32);
@@ -619,7 +632,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
         prdo: f32,
-    ) -> (usize, i32) {
+    ) -> (usize, i32, Option<LossyLumaPalette>) {
         let (lw, lh) = Self::rect64_dims(vert);
         let lam = trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
@@ -645,7 +658,7 @@ impl<'a> LossyTile<'a> {
                         .copy_from_slice(&saved[ry * lw..ry * lw + lw]);
                 }
                 let cost = self.rect64_luma_pass(
-                    px, py, vert, mode, delta, have_tr, have_bl, ftype, lam, mlam, &mut cf,
+                    px, py, vert, mode, delta, have_tr, have_bl, ftype, lam, mlam, None, &mut cf,
                 );
                 if cost < best.2 {
                     best = (mode, delta, cost);
@@ -659,12 +672,28 @@ impl<'a> LossyTile<'a> {
                 cands.extend([-3, -2, -1, 1, 2, 3].map(|d| (best.0, d)));
             }
         }
+        // Palette leaves (`palette64`, screen frames): the half's own palette
+        // header + map, residual coded through the same two TX_32X32.
+        let mut best_pal: Option<LossyLumaPalette> = None;
+        for (p, pred) in self.big_palette_finalists(px, py, lw, lh, mlam) {
+            for ry in 0..lh {
+                self.recon[0][(py + ry) * self.w + px..][..lw]
+                    .copy_from_slice(&saved[ry * lw..ry * lw + lw]);
+            }
+            let cost = self.rect64_luma_pass(
+                px, py, vert, DC_PRED, 0, have_tr, have_bl, ftype, lam, mlam, Some(&pred), &mut cf,
+            ) + rate_cost(mlam, self.palette_rate_bits(px, py, &p));
+            if cost < best.2 {
+                best = (DC_PRED, 0, cost);
+                best_pal = Some(p);
+            }
+        }
         for ry in 0..lh {
             self.recon[0][(py + ry) * self.w + px..][..lw]
                 .copy_from_slice(&saved[ry * lw..ry * lw + lw]);
         }
         self.sc().put_u4096(saved);
-        (best.0, best.1)
+        (best.0, best.1, best_pal)
     }
 
     /// Mode-aware luma estimate of one prediction region made of TX_32X32
@@ -724,7 +753,12 @@ impl<'a> LossyTile<'a> {
                 self.luma_bits(&cf, &SCAN_32X32, 32, bx, by, mode, 0),
             );
         }
-        total
+        // Palette leaf over the same region (`palette64`): the proxy must see
+        // what the emitter can pick, or a palette-exact 64x32 never beats the
+        // SPLIT it is compared against.
+        let rw = subs.iter().map(|s| s.0).max().unwrap_or(0) + 32;
+        let rh = subs.iter().map(|s| s.1).max().unwrap_or(0) + 32;
+        total.min(self.palette_region_bound(px, py, rw, rh, mlam))
     }
 
     /// Mode-aware estimate of the whole-64 leaf (luma via
@@ -838,19 +872,39 @@ impl<'a> LossyTile<'a> {
 
         // --- Luma.
         let mut lcf = [[0i32; 1024]; 2];
-        let (y_mode, y_delta) = if let Some(r) = rl {
+        let (y_mode, y_delta, palette) = if let Some(r) = rl {
             if let Some(cf) = rl_cf {
                 for (si, dst) in lcf.iter_mut().enumerate() {
                     dst.copy_from_slice(&cf[si * 1024..si * 1024 + 1024]);
                 }
             }
-            (r.mode as usize, r.delta as i32)
+            let pal = (r.palette > 0).then(|| {
+                self.rederive_luma_palette(px, py, lw, lh, r.palette as usize)
+                    .expect("rect64 palette replay: candidate no longer derivable")
+            });
+            (r.mode as usize, r.delta as i32, pal)
         } else {
-            let (mode, delta) = self.rd_pick_rect64(px, py, vert, have_tr, have_bl, prdo);
+            let (mode, delta, pal) = self.rd_pick_rect64(px, py, vert, have_tr, have_bl, prdo);
+            let pal_pred = pal.as_ref().map(|p| {
+                let mut pred = vec![0i32; lw * lh];
+                palette_pred(&mut pred, lw, &p.colors, &p.packed_map, lw, lh);
+                pred
+            });
             self.rect64_luma_pass(
-                px, py, vert, mode, delta, have_tr, have_bl, ftype, lam, mlam, &mut lcf,
+                px,
+                py,
+                vert,
+                mode,
+                delta,
+                have_tr,
+                have_bl,
+                ftype,
+                lam,
+                mlam,
+                pal_pred.as_deref(),
+                &mut lcf,
             );
-            (mode, delta)
+            (mode, delta, pal)
         };
         let luma_zero = lcf.iter().all(|q| self.rd.all_zero_i32(&q[..]));
 
@@ -887,13 +941,14 @@ impl<'a> LossyTile<'a> {
         let chroma_zero = uv.iter().all(|q| self.rd.all_zero_i32(&q[..ng * n]));
         // Not the superblock size, so a skipped half still carries delta_q
         // (5.11.6 `read_delta_qindex` only returns early for MiSize == sbSize).
-        let block_skip = luma_zero && chroma_zero;
+        // Palette leaves keep skip = 0 like every other palette shape here.
+        let block_skip = palette.is_none() && luma_zero && chroma_zero;
 
         // Record the winner for the wavefront (Capture only; no-ops otherwise).
         self.push_luma_sel(LumaSel {
             mode: y_mode as u8,
             delta: y_delta as i8,
-            palette: 0,
+            palette: palette.as_ref().map_or(0, |p| p.sel),
             filter: NO_FILTER,
             tx: TxSel::SplitDct([1; 4]),
         });
@@ -930,7 +985,10 @@ impl<'a> LossyTile<'a> {
                 .encode_symbol(3, &mut self.cdfs.angle_delta[uv_mode - V_PRED]);
         }
         self.commit_uv_mode(px, py, lw, lh, uv_mode);
-        self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, None, None);
+        self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, palette.as_ref(), None);
+        if let Some(p) = &palette {
+            self.emit_palette_map(p);
+        }
         self.code_tx_depth(px, py, lw, lh, 1);
         let (aw, ah) = (lw / 4, lh / 4);
         let sv = block_skip as u8;

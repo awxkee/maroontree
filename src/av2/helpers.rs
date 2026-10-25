@@ -1536,7 +1536,7 @@ where
         nthreads,
         rows,
         cols,
-        needs_above_right,
+        usize::from(needs_above_right),
         || (),
         |_, r, c| f(r, c),
     )
@@ -1547,11 +1547,18 @@ where
 /// (e.g. a full encoder tile with its recon planes), and `f` receives it
 /// mutably for every cell that worker executes. Scheduling, barriers and the
 /// disjoint-slot result writes are identical to [`par_wavefront_pool`].
+///
+/// `above_right` is the above-row REACH: cell (r, c) additionally depends on
+/// (r - 1, min(c + above_right, cols - 1)) when > 0, so the set guaranteed
+/// finished when (r, c) starts is `{r' < r: c' <= c + above_right * (r - r')}`
+/// plus `{r' = r: c' < c}` (1 = the classic above-right neighbour, schedule
+/// d = 2r + c; AV1's IntraBC DV validity needs reach 5 to admit every
+/// spec-legal copy source).
 pub(crate) fn par_wavefront_pool_with<S, T, M, F>(
     nthreads: usize,
     rows: usize,
     cols: usize,
-    needs_above_right: bool,
+    above_right: usize,
     mk: M,
     f: F,
 ) -> Vec<Option<T>>
@@ -1566,14 +1573,21 @@ where
         return results;
     }
     let mut diagonals: Vec<Vec<(usize, usize)>> = Vec::new();
-    if needs_above_right {
-        // d = 2r+c keeps the above-right SB on an earlier diagonal.
-        let d_max = 2 * (rows - 1) + (cols - 1);
+    if above_right > 0 {
+        // d = (g+1) r + c keeps the (r-1, c+g) dependency on an earlier
+        // diagonal (g = 1: the classic d = 2r + c).
+        let g1 = above_right + 1;
+        let d_max = g1 * (rows - 1) + (cols - 1);
         for d in 0..=d_max {
-            let r_lo = if d + 1 > cols { (d - cols + 2) / 2 } else { 0 };
-            let r_hi = (d / 2).min(rows - 1);
+            // rows r with 0 <= d - g1 r <= cols - 1
+            let r_lo = if d + 1 > cols {
+                (d + 1 - cols).div_ceil(g1)
+            } else {
+                0
+            };
+            let r_hi = (d / g1).min(rows - 1);
             if r_lo <= r_hi {
-                diagonals.push((r_lo..=r_hi).map(|r| (r, d - 2 * r)).collect());
+                diagonals.push((r_lo..=r_hi).map(|r| (r, d - g1 * r)).collect());
             }
         }
     } else {
@@ -1621,13 +1635,17 @@ where
         deps: Vec<u8>,
         remaining: usize,
     }
+    // The above-right edge of (r, c) targets (r - 1, min(c + g, cols - 1));
+    // with g > 1 several cells of row r share the row's last cell as that
+    // target, so a completion may release more than three cells.
+    let g = above_right;
+    let ar_dep = |r: usize, c: usize| -> bool { g > 0 && r > 0 && c + 1 < cols };
     let mut deps = vec![0u8; n];
     let mut queue = std::collections::VecDeque::new();
     for r in 0..rows {
         for c in 0..cols {
             let i = r * cols + c;
-            deps[i] =
-                (c > 0) as u8 + (r > 0) as u8 + (needs_above_right && r > 0 && c + 1 < cols) as u8;
+            deps[i] = (c > 0) as u8 + (r > 0) as u8 + ar_dep(r, c) as u8;
             if deps[i] == 0 {
                 queue.push_back(i);
             }
@@ -1680,12 +1698,24 @@ where
             }
             if r + 1 < rows {
                 release(i + cols); // below consumes this cell as its above edge
-                if needs_above_right && c > 0 {
-                    release(i + cols - 1); // below-left consumes above-right
+                if g > 0 {
+                    // Cells (r + 1, c') whose above-right target is this cell:
+                    // c' + g == c, or every c' with c' + g >= cols - 1 when this
+                    // is the row's last cell (all with c' + 1 < cols).
+                    if c + 1 == cols {
+                        let lo = cols.saturating_sub(1 + g);
+                        for cc in lo..cols - 1 {
+                            if ar_dep(r + 1, cc) {
+                                release((r + 1) * cols + cc);
+                            }
+                        }
+                    } else if c >= g && ar_dep(r + 1, c - g) {
+                        release((r + 1) * cols + c - g);
+                    }
                 }
             }
-            // Wake exactly as many sleepers as there is new work. At most three
-            // cells become ready per completion, so the old `notify_all` was a
+            // Wake exactly as many sleepers as there is new work. Few cells
+            // become ready per completion, so the old `notify_all` was a
             // thundering herd of up to `nthreads` wakeups per cheap cell — pure
             // contention on fast-coding content. The completing worker keeps one
             // ready cell for itself by looping, so wake `newly_ready - 1`.
