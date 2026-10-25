@@ -227,10 +227,7 @@ pub(crate) fn wiener_filter_plane_sse(
             vk,
             bd,
         );
-        for (&filtered, &original) in stripe[..w * rh].iter().zip(&reference[ytop * w..ybot * w]) {
-            let d = (filtered - original) as i64;
-            sse += d * d;
-        }
+        sse += crate::rd_sse::sse_u16_scalar(&stripe, w, 0, 0, reference, w, 0, ytop, w, rh);
         ytop = ybot;
     }
     sse
@@ -249,7 +246,7 @@ mod tests {
                 let src: Vec<u16> = (0..w * h)
                     .map(|i| (64 + ((i * 13 + i / w * 7) % 128) as u16) * scale)
                     .collect();
-                let reference: Vec<u16> = (0..w * h).map(|i| (i % 16) as u16 * scale).collect();
+                let reference: Vec<u16> = (0..w * h).map(|i| (i % 256) as u16 * scale).collect();
                 for ht in taps {
                     for vt in taps {
                         let hk = WienerKernel::from_coded(ht);
@@ -257,7 +254,7 @@ mod tests {
                         let mut filtered = vec![0; w * h];
                         wiener_filter_plane(&mut filtered, &src, w, h, &hk, &vk, bd);
                         let expected = filtered.iter().zip(&reference).fold(0i64, |s, (&a, &b)| {
-                            let d = (a - b) as i64;
+                            let d = a as i64 - b as i64;
                             s + d * d
                         });
                         assert_eq!(

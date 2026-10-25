@@ -98,7 +98,11 @@ pub(crate) fn trellis_optimize_ctx(
     // `h + 2` keeps the (y + 1, y + 2) stencil reads of the last two rows
     // inside zero padding instead of wrapping onto the next column's
     // coefficients (see `Tuning::trellis_pad_stride`).
-    let stride = if crate::tuning::get().trellis_pad_stride { h + 2 } else { h };
+    let stride = if crate::tuning::get().trellis_pad_stride {
+        h + 2
+    } else {
+        h
+    };
     let lo_off = if w < h {
         &crate::tables::LO_CTX_OFF_WLH
     } else if w > h {
@@ -472,7 +476,11 @@ pub(crate) fn trellis_optimize_ctx(
                         if tok == 3 {
                             b += hi_cost(k, bc);
                         }
-                        b + cdf_cost_with_table(&dc_sign[dcs_ctx], (cf[rc] < 0) as usize, cost_table)
+                        b + cdf_cost_with_table(
+                            &dc_sign[dcs_ctx],
+                            (cf[rc] < 0) as usize,
+                            cost_table,
+                        )
                     };
                     rate_cost(lambda, b) + dist_cur[0]
                 } else {
@@ -509,22 +517,23 @@ pub(crate) fn trellis_optimize_ctx(
             };
             // Sum of cost changes over the dependants of `rc` that lie in the
             // prefix of candidate `e` (scan index < e); `commit` stores them.
-            let reprice = |levels: &[u8], cost_i: &mut [f32], rc: usize, e: usize, commit: bool| -> f32 {
-                let (d, nd) = deps_of(rc);
-                let mut delta = 0.0f32;
-                for &q in &d[..nd] {
-                    let iq = iscan[q];
-                    if (iq as usize) < e {
-                        let iq = iq as usize;
-                        let c = price(levels, iq);
-                        delta += c - cost_i[iq];
-                        if commit {
-                            cost_i[iq] = c;
+            let reprice =
+                |levels: &[u8], cost_i: &mut [f32], rc: usize, e: usize, commit: bool| -> f32 {
+                    let (d, nd) = deps_of(rc);
+                    let mut delta = 0.0f32;
+                    for &q in &d[..nd] {
+                        let iq = iscan[q];
+                        if (iq as usize) < e {
+                            let iq = iq as usize;
+                            let c = price(levels, iq);
+                            delta += c - cost_i[iq];
+                            if commit {
+                                cost_i[iq] = c;
+                            }
                         }
                     }
-                }
-                delta
-            };
+                    delta
+                };
             let mut prefix = 0.0f32;
             for (i, ci) in cost_i[..eu].iter_mut().enumerate() {
                 let c = price(levels, i);
@@ -695,7 +704,11 @@ pub(crate) fn trellis_optimize_ctx(
             if best_m != cf[rc].unsigned_abs() {
                 // A Step-A-zeroed terminal has lost its sign; the transform
                 // target carries it.
-                let neg = if cf[rc] != 0 { cf[rc] < 0 } else { tf[rc] < 0.0 };
+                let neg = if cf[rc] != 0 {
+                    cf[rc] < 0
+                } else {
+                    tf[rc] < 0.0
+                };
                 cf[rc] = if neg { -(best_m as i32) } else { best_m as i32 };
             }
             for &rc in scan[(e + 1)..m].iter() {

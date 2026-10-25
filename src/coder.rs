@@ -3540,15 +3540,7 @@ fn frame_wiener_search(
     pool: &Pool,
 ) -> Option<crate::wiener::WienerUnit> {
     use crate::wiener::{WienerKernel, wiener_filter_plane_sse};
-    let sse = |a: &[u16]| -> i64 {
-        let mut s = 0i64;
-        for i in 0..w * h {
-            let d = (a[i] - src[i]) as i64;
-            s += d * d;
-        }
-        s
-    };
-    let base = sse(recon);
+    let base = plane_sse_vis(recon, src, w, w, h);
     // Small candidate set of separable low-pass Wiener kernels (coded taps
     // [t0,t1,t2]); the identity is implicit via `base`. These span gentle to
     // moderate smoothing within the spec tap ranges.
