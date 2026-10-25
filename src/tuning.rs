@@ -422,6 +422,21 @@ pub(crate) struct Tuning {
     /// Ungated, photos measured BD-neutral (+-0.8 per image, ~0 avg) for ~10%
     /// time and synthetic edges lose (x_fractal +1.0..1.3).
     pub(crate) palette_viterbi_screen_only: u32,
+    /// Lossy UV palette index map by the same row Viterbi (4:4:4, the only
+    /// format with UV palettes): cost = (dU^2 + dV^2) + lambda * the real
+    /// `palette_uv_color` context bits; the value multiplies
+    /// `min(mlam, mlam_c)`. Same `palette_viterbi_screen_only` gate. 0 = off
+    /// (nearest-pair map).
+    pub(crate) palette_viterbi_uv: f32,
+    /// Luma palette centers by the exact 1-D DP (globally SSE-optimal integer
+    /// centers, `dp_palette_center_sets`) instead of quantile-seeded Lloyd,
+    /// which can stop in a local minimum or reject on seed collapse. Same
+    /// selector slots, so replay and the dominant-color family are unchanged.
+    /// SHIPPED ON 2026-10-25, ungated: on text the background holds > 75% of
+    /// a block, the quantile seeds collapse onto it and Lloyd rejected, so
+    /// x_screen -9.0 (444) / -11.5 (420), n_bbscreen -4.1 / -4.9, n_scmap 420
+    /// -2.4; the 48 non-screen corpus images are BD-neutral (-0.01 / +0.03).
+    pub(crate) palette_dp_centers: bool,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -649,6 +664,8 @@ impl Tuning {
         palette_viterbi_420: 0.5,
         palette_viterbi_proxy: true,
         palette_viterbi_screen_only: 1,
+        palette_viterbi_uv: 0.0,
+        palette_dp_centers: true,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -900,6 +917,8 @@ mod imp {
                 "palette_viterbi_420" => t.palette_viterbi_420 = num(value),
                 "palette_viterbi_proxy" => t.palette_viterbi_proxy = flag(value),
                 "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
+                "palette_viterbi_uv" => t.palette_viterbi_uv = num(value),
+                "palette_dp_centers" => t.palette_dp_centers = flag(value),
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),

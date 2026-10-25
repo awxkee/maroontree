@@ -320,10 +320,17 @@ fn lossy_uv_palette(
     h: usize,
     colors: usize,
     top: bool,
+    opts: &UvMapOpts,
 ) -> Option<LossyUvPalette> {
     let hist = uv_pair_histogram(src_u, src_v, stride, cx, cy, w, h);
-    lossy_uv_palette_from_hist(kmeans, &hist, src_u, src_v, stride, cx, cy, w, h, colors, top)
+    lossy_uv_palette_from_hist(kmeans, &hist, src_u, src_v, stride, cx, cy, w, h, colors, top, opts)
 }
+
+/// UV index-map construction: `Some((palette_uv_color cost tables, lambda))`
+/// runs [`viterbi_uv_palette_map`], None keeps the nearest-pair map. Built by
+/// `uv_palette_map_opts`; quantiser-only lambda, so search and replay build
+/// the same map.
+type UvMapOpts = Option<([[[f32; 8]; 5]; 7], f32)>;
 
 /// [`lossy_uv_palette`] over a precomputed [`uv_pair_histogram`].
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +346,7 @@ fn lossy_uv_palette_from_hist(
     h: usize,
     colors: usize,
     top: bool,
+    opts: &UvMapOpts,
 ) -> Option<LossyUvPalette> {
     debug_assert!((2..=8).contains(&colors));
     let n = w * h;
@@ -419,9 +427,22 @@ fn lossy_uv_palette_from_hist(
     })?;
     centers.sort_unstable();
     let mut map = vec![0u8; n];
-    (kmeans.uv_nearest_indices)(
-        src_u, src_v, stride, cx, cy, w, h, &centers, &mut map,
-    );
+    match opts {
+        Some((tables, lam)) => viterbi_uv_palette_map(
+            &mut map,
+            src_u,
+            src_v,
+            stride,
+            cx,
+            cy,
+            w,
+            h,
+            &centers,
+            &tables[centers.len() - 2],
+            *lam,
+        ),
+        None => (kmeans.uv_nearest_indices)(src_u, src_v, stride, cx, cy, w, h, &centers, &mut map),
+    }
     Some(LossyUvPalette {
         u: centers.iter().map(|&(u, _)| u).collect(),
         v: centers.iter().map(|&(_, v)| v).collect(),
@@ -447,6 +468,7 @@ fn uv_palette_rederive(
     w: usize,
     h: usize,
     sel: usize,
+    opts: &UvMapOpts,
 ) -> LossyUvPalette {
     let top = sel > 8;
     let k = if top { sel - 8 } else { sel };
@@ -454,7 +476,7 @@ fn uv_palette_rederive(
         debug_assert_eq!(up.u.len(), k);
         return up;
     }
-    lossy_uv_palette(kmeans, src_u, src_v, stride, cx, cy, w, h, k, top)
+    lossy_uv_palette(kmeans, src_u, src_v, stride, cx, cy, w, h, k, top, opts)
         .expect("uv palette replay: lossy re-derivation failed")
 }
 
@@ -765,6 +787,9 @@ fn palette_centers(hist: &[(i32, u32)], colors: usize) -> Option<FixedList<i32, 
         }
         return Some(centers);
     }
+    if crate::tuning::get().palette_dp_centers {
+        return Some(dp_palette_center_sets(hist, colors)[colors - 2]);
+    }
     let total: u32 = hist.iter().map(|&(_, c)| c).sum();
     // Weighted-quantile init == the old sorted-with-duplicates indexing.
     let mut centers = FixedList::new(0);
@@ -815,6 +840,79 @@ fn palette_centers(hist: &[(i32, u32)], colors: usize) -> Option<FixedList<i32, 
         }
     }
     Some(centers)
+}
+
+/// Globally SSE-optimal integer centers for every palette size 2..=`kmax`
+/// (`Tuning::palette_dp_centers`, the exact replacement for the Lloyd path of
+/// [`palette_centers`]). In 1-D an optimal clustering is a split of the sorted
+/// histogram into contiguous intervals, each represented by its rounded
+/// weighted mean, so `F(k, j) = min_i F(k-1, i) + C(i, j)` over interval costs
+/// `C` from prefix sums is exact: O(kmax * H^2) with H <= 64. Index `k - 2`
+/// holds the size-`k` set (empty when `k > H`); centers come out strictly
+/// ascending (adjacent intervals of distinct integers round apart). Ties keep
+/// the shorter first interval, so the result is a pure function of the
+/// histogram, as wavefront replay requires.
+fn dp_palette_center_sets(hist: &[(i32, u32)], kmax: usize) -> [FixedList<i32, 8>; 7] {
+    debug_assert!((2..=8).contains(&kmax) && hist.len() <= 64);
+    let mut sets = [FixedList::new(0); 7];
+    let h = hist.len();
+    let mut pw = [0i64; 65];
+    let mut p1 = [0i64; 65];
+    let mut p2 = [0i64; 65];
+    for (i, &(v, c)) in hist.iter().enumerate() {
+        let (v, c) = (i64::from(v), i64::from(c));
+        pw[i + 1] = pw[i] + c;
+        p1[i + 1] = p1[i] + c * v;
+        p2[i + 1] = p2[i] + c * v * v;
+    }
+    let center = |i: usize, j: usize| {
+        let w = pw[j] - pw[i];
+        (p1[j] - p1[i] + w / 2) / w
+    };
+    // cost[i * 65 + j]: SSE of values i..j around their best integer center.
+    let mut cost = [0i64; 65 * 65];
+    for i in 0..h {
+        for j in i + 1..=h {
+            let (w, s1, s2) = (pw[j] - pw[i], p1[j] - p1[i], p2[j] - p2[i]);
+            let c = center(i, j);
+            cost[i * 65 + j] = s2 - 2 * c * s1 + c * c * w;
+        }
+    }
+    // f[k][j]: best SSE of the first j values in k + 1 intervals; arg = the
+    // start of the last interval.
+    let mut f = [[i64::MAX; 65]; 8];
+    let mut arg = [[0u8; 65]; 8];
+    for j in 1..=h {
+        f[0][j] = cost[j];
+    }
+    for k in 1..kmax.min(h) {
+        for j in k + 1..=h {
+            let mut best = i64::MAX;
+            let mut bi = k;
+            for i in k..j {
+                let c = f[k - 1][i] + cost[i * 65 + j];
+                if c < best {
+                    best = c;
+                    bi = i;
+                }
+            }
+            f[k][j] = best;
+            arg[k][j] = bi as u8;
+        }
+    }
+    for n in 2..=kmax.min(h) {
+        let mut bounds = [0usize; 9];
+        bounds[n] = h;
+        for k in (1..n).rev() {
+            bounds[k] = arg[k][bounds[k + 1]] as usize;
+        }
+        let set = &mut sets[n - 2];
+        for k in 0..n {
+            set.push(center(bounds[k], bounds[k + 1]) as i32);
+        }
+        debug_assert!(set.windows(2).all(|p| p[0] < p[1]));
+    }
+    sets
 }
 
 /// Palette candidate for a `w`x`h` luma block with `colors` entries: centers
@@ -990,7 +1088,53 @@ fn viterbi_palette_map(
     costs: &[[f32; 8]; 5],
     lam: f32,
 ) {
-    let n = centers.len();
+    viterbi_map_core(map, w, h, centers.len(), costs, lam, |x, y, dist| {
+        let v = src[(py + y) * stride + px + x] as i32;
+        for (d, &c) in dist.iter_mut().zip(centers) {
+            let e = (v - c) as f32;
+            *d = e * e;
+        }
+    });
+}
+
+/// [`viterbi_palette_map`] for the shared (U, V) index map of a UV palette
+/// (`Tuning::palette_viterbi_uv`): per-pixel cost (dU^2 + dV^2) + `lam` x the
+/// `palette_uv_color` bits, which use the same neighbour context as luma.
+#[allow(clippy::too_many_arguments)]
+fn viterbi_uv_palette_map(
+    map: &mut [u8],
+    src_u: &[u16],
+    src_v: &[u16],
+    stride: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    centers: &[(i32, i32)],
+    costs: &[[f32; 8]; 5],
+    lam: f32,
+) {
+    viterbi_map_core(map, w, h, centers.len(), costs, lam, |x, y, dist| {
+        let o = (cy + y) * stride + cx + x;
+        let (u, v) = (src_u[o] as i32, src_v[o] as i32);
+        for (d, &(cu, cv)) in dist.iter_mut().zip(centers) {
+            let (eu, ev) = ((u - cu) as f32, (v - cv) as f32);
+            *d = eu * eu + ev * ev;
+        }
+    });
+}
+
+/// The row Viterbi shared by the luma and UV maps; `dist(x, y, out)` fills
+/// the squared error of every palette entry at map position (x, y).
+fn viterbi_map_core(
+    map: &mut [u8],
+    w: usize,
+    h: usize,
+    n: usize,
+    costs: &[[f32; 8]; 5],
+    lam: f32,
+    mut dist_at: impl FnMut(usize, usize, &mut [f32; 8]),
+) {
     debug_assert!((2..=8).contains(&n));
     // Weighted transition bits, tabulated once per block: `trans[u][ul][j][i]`
     // for interior pixels (left j, above u, above-left ul), `top[j][i]` on the
@@ -1018,13 +1162,8 @@ fn viterbi_palette_map(
     let mut dist = [0f32; 8];
     let mut back = vec![0u8; w * 8];
     for y in 0..h {
-        let row = &src[(py + y) * stride + px..(py + y) * stride + px + w];
         for x in 0..w {
-            let v = row[x] as i32;
-            for (d, &c) in dist.iter_mut().zip(centers) {
-                let e = (v - c) as f32;
-                *d = e * e;
-            }
+            dist_at(x, y, &mut dist);
             if x == 0 {
                 if y > 0 {
                     let u = map[(y - 1) * w] as usize;
@@ -1317,6 +1456,10 @@ impl<'a> LossyTile<'a> {
         top_order
             .as_mut_slice()
             .sort_unstable_by_key(|&i| (core::cmp::Reverse(hist[i].1), hist[i].0));
+        // One exact DP serves all seven sizes (`palette_dp_centers`).
+        let dp_sets = crate::tuning::get()
+            .palette_dp_centers
+            .then(|| dp_palette_center_sets(hist, 8));
         for (order, (n, top)) in (2..=8).flat_map(|n| [(n, false), (n, true)]).enumerate() {
             let Some(centers) = (if top {
                 if n >= hist.len() {
@@ -1329,6 +1472,8 @@ impl<'a> LossyTile<'a> {
                     centers.as_mut_slice().sort_unstable();
                     Some(centers)
                 }
+            } else if let Some(sets) = &dp_sets {
+                (n <= hist.len()).then(|| sets[n - 2])
             } else {
                 palette_centers(hist, n)
             }) else {
@@ -1467,14 +1612,51 @@ impl<'a> LossyTile<'a> {
         } else {
             t.palette_viterbi_444
         };
-        let on = k > 0.0
-            && match t.palette_viterbi_screen_only {
-                0 => true,
-                1 => self.screen_frame,
-                _ => self.screen_content,
-            };
+        let on = k > 0.0 && self.palette_viterbi_frame();
         let viterbi = on.then(|| (**self.pal_y_cost_tables(), self.mlam() * k));
         PalMapOpts { smooth_t: self.palette_smooth_t(), viterbi }
+    }
+
+    /// `Tuning::palette_viterbi_screen_only`: whether this frame runs the
+    /// palette index-map Viterbi at all.
+    fn palette_viterbi_frame(&self) -> bool {
+        match crate::tuning::get().palette_viterbi_screen_only {
+            0 => true,
+            1 => self.screen_frame,
+            _ => self.screen_content,
+        }
+    }
+
+    /// UV index-map options (`Tuning::palette_viterbi_uv`; UV palettes are
+    /// 4:4:4-only). Lambda = the chroma decision base `min(mlam, mlam_c)`,
+    /// quantiser only, so replay re-derives the identical map.
+    fn uv_palette_map_opts(&self) -> UvMapOpts {
+        let k = crate::tuning::get().palette_viterbi_uv;
+        let on = k > 0.0 && !(self.ss420 || self.ss422 || self.mono) && self.palette_viterbi_frame();
+        on.then(|| (**self.pal_uv_cost_tables(), self.mlam().min(self.mlam_c()) * k))
+    }
+
+    /// [`Self::pal_y_cost_tables`] for `palette_uv_color`, from the same
+    /// pinned frame-initial snapshot.
+    fn pal_uv_cost_tables(&self) -> std::cell::Ref<'_, Box<[[[f32; 8]; 5]; 7]>> {
+        {
+            let mut slot = self.pal_uv_cost.borrow_mut();
+            if slot.is_none() {
+                let c = self.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
+                let mut m = Box::new([[[0f32; 8]; 5]; 7]);
+                for ns in 2..=8usize {
+                    for ctx in 0..5 {
+                        for (sym, cost) in m[ns - 2][ctx].iter_mut().enumerate().take(ns) {
+                            *cost = cdf_cost(&c.palette_uv_color[ns - 2][ctx], sym);
+                        }
+                    }
+                }
+                *slot = Some(m);
+            }
+        }
+        std::cell::Ref::map(self.pal_uv_cost.borrow(), |o| {
+            o.as_ref().expect("initialized above")
+        })
     }
 
     /// [`Self::palette_map_opts`] for the partition proxy's palette estimates
@@ -2135,6 +2317,132 @@ mod ctx_tests {
                     }
                 }
             }
+        }
+    }
+
+    fn hist_sse(hist: &[(i32, u32)], centers: &[i32]) -> i64 {
+        hist.iter()
+            .map(|&(v, c)| {
+                let d = centers.iter().map(|&k| (v - k).abs()).min().unwrap();
+                i64::from(d * d) * i64::from(c)
+            })
+            .sum()
+    }
+
+    /// The two histograms of the 2026-10-25 review: Lloyd rejects the first
+    /// (both seeds land on 0) and stops at a local minimum on the second.
+    #[test]
+    fn dp_palette_centers_review_cases() {
+        let a = [(0, 90), (80, 5), (100, 5)];
+        assert_eq!(dp_palette_center_sets(&a, 2)[0].as_slice(), &[0, 90]);
+        assert_eq!(hist_sse(&a, &[0, 90]), 1000);
+        let b = [(51, 11), (169, 7), (181, 18), (222, 16), (241, 15)];
+        assert_eq!(dp_palette_center_sets(&b, 2)[0].as_slice(), &[51, 207]);
+        assert_eq!(hist_sse(&b, &[51, 207]), 43_216);
+        assert_eq!(hist_sse(&b, &[139, 231]), 126_032);
+    }
+
+    /// Against brute force over every contiguous split (all optimal 1-D
+    /// clusterings are contiguous) with rounded-mean centers, every size.
+    #[test]
+    fn dp_palette_centers_are_optimal() {
+        let mut seed = 0x1234_5677u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        fn best(hist: &[(i32, u32)], k: usize) -> i64 {
+            if k == 1 {
+                let w: i64 = hist.iter().map(|&(_, c)| i64::from(c)).sum();
+                let s: i64 = hist.iter().map(|&(v, c)| i64::from(v) * i64::from(c)).sum();
+                let m = ((s + w / 2) / w) as i32;
+                return hist_sse(hist, &[m]);
+            }
+            (k - 1..hist.len()).map(|i| best(&hist[..i], k - 1) + best(&hist[i..], 1)).min().unwrap()
+        }
+        for _ in 0..200 {
+            let h = 2 + (rnd() % 11) as usize;
+            let mut vals: Vec<i32> = Vec::new();
+            while vals.len() < h {
+                let v = (rnd() % 256) as i32;
+                if !vals.contains(&v) {
+                    vals.push(v);
+                }
+            }
+            vals.sort_unstable();
+            let hist: Vec<(i32, u32)> = vals.iter().map(|&v| (v, 1 + rnd() % 40)).collect();
+            let sets = dp_palette_center_sets(&hist, 8);
+            for n in 2..=8usize {
+                let set = sets[n - 2];
+                if n > h {
+                    assert!(set.is_empty());
+                    continue;
+                }
+                assert_eq!(set.len(), n);
+                assert!(set.windows(2).all(|p| p[0] < p[1]));
+                assert_eq!(hist_sse(&hist, &set), best(&hist, n), "{hist:?} n={n}");
+                // Lloyd (when it does not reject) can never beat the DP.
+                if let Some(l) = palette_centers(&hist, n) {
+                    assert!(hist_sse(&hist, &set) <= hist_sse(&hist, &l));
+                }
+            }
+        }
+    }
+
+    /// With lambda 0 the UV row Viterbi is the nearest-pair map (ties to the
+    /// lower index); on a single row (where it is exact) a positive lambda
+    /// never loses to the nearest map on SSE + lam * bits.
+    #[test]
+    fn uv_viterbi_matches_nearest_at_zero_lambda() {
+        let mut seed = 0xdead_beefu32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let (w, h) = (16usize, 16usize);
+        let mut costs = [[0f32; 8]; 5];
+        for row in costs.iter_mut() {
+            for c in row.iter_mut() {
+                *c = 0.5 + (rnd() % 64) as f32 / 8.0;
+            }
+        }
+        for n in 2..=8usize {
+            let src_u: Vec<u16> = (0..w * h).map(|_| (rnd() % 32) as u16).collect();
+            let src_v: Vec<u16> = (0..w * h).map(|_| (rnd() % 32) as u16).collect();
+            let mut centers: Vec<(i32, i32)> = Vec::new();
+            while centers.len() < n {
+                let c = ((rnd() % 32) as i32, (rnd() % 32) as i32);
+                if !centers.contains(&c) {
+                    centers.push(c);
+                }
+            }
+            centers.sort_unstable();
+            let mut near = vec![0u8; w * h];
+            crate::kmeans::uv_nearest_indices_scalar(&src_u, &src_v, w, 0, 0, w, h, &centers, &mut near);
+            let mut vit = vec![0u8; w * h];
+            viterbi_uv_palette_map(&mut vit, &src_u, &src_v, w, 0, 0, w, h, &centers, &costs, 0.0);
+            assert_eq!(vit, near, "n={n}");
+            let total = |map: &[u8], lam: f32| {
+                let mut t = 0f32;
+                for y in 0..1 {
+                    for x in 0..w {
+                        let (cu, cv) = centers[map[y * w + x] as usize];
+                        let (eu, ev) = ((src_u[y * w + x] as i32 - cu) as f32, (src_v[y * w + x] as i32 - cv) as f32);
+                        t += eu * eu + ev * ev;
+                        if x > 0 || y > 0 {
+                            let (ctx, sym) = palette_color_ctx(map, w, y, x, n);
+                            t += lam * costs[ctx][sym];
+                        }
+                    }
+                }
+                t
+            };
+            viterbi_uv_palette_map(&mut vit[..w], &src_u, &src_v, w, 0, 0, w, 1, &centers, &costs, 40.0);
+            assert!(total(&vit, 40.0) <= total(&near, 40.0) + 1e-2, "n={n}");
         }
     }
 }

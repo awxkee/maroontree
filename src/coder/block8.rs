@@ -1837,6 +1837,7 @@ impl<'a> LossyTile<'a> {
                         vec![u]
                     } else {
                         let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 8, 8);
+                        let uv_map_opts = self.uv_palette_map_opts();
                         [(8usize, false), (4, false), (8, true), (4, true)]
                             .iter()
                             .filter_map(|&(k, top)| {
@@ -1852,6 +1853,7 @@ impl<'a> LossyTile<'a> {
                                     8,
                                     k,
                                     top,
+                                    &uv_map_opts,
                                 )
                             })
                             .collect()
@@ -1937,6 +1939,7 @@ impl<'a> LossyTile<'a> {
                 8,
                 8,
                 r.palette as usize,
+                &self.uv_palette_map_opts(),
             ));
         }
 

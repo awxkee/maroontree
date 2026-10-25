@@ -3233,6 +3233,7 @@ impl<'a> LossyTile<'a> {
                             32,
                             32,
                             r.palette as usize,
+                            &self.uv_palette_map_opts(),
                         ));
                     }
                     break 'sv (cf_use, DC_PRED);
@@ -3447,6 +3448,7 @@ impl<'a> LossyTile<'a> {
                     // attempts. This is aom's mechanism (490 UV palettes on
                     // kodak20 q93, all carrying coefficients).
                     let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 32, 32);
+                    let uv_map_opts = self.uv_palette_map_opts();
                     [(8usize, false), (4, false), (8, true), (4, true)]
                         .iter()
                         .filter_map(|&(k, top)| {
@@ -3462,6 +3464,7 @@ impl<'a> LossyTile<'a> {
                                 32,
                                 k,
                                 top,
+                                &uv_map_opts,
                             )
                         })
                         .collect()

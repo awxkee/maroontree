@@ -1348,6 +1348,9 @@ struct LossyTile<'a> {
     /// assumption `pal_est_cache` already relies on).
     #[allow(clippy::type_complexity)]
     pal_y_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
+    /// `palette_uv_color` counterpart of `pal_y_cost` (UV map Viterbi).
+    #[allow(clippy::type_complexity)]
+    pal_uv_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
     /// Snapshot `pal_y_cost` is built from: the FRAME-INITIAL decision CDFs,
     /// captured on the first `switch_decision_cdfs` (None until then, when
     /// `dec_cdfs` still is that snapshot). Pinned so that every worker and the
