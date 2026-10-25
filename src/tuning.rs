@@ -149,6 +149,9 @@ pub(crate) struct Tuning {
     /// synth -0.56, holdout -0.08; ~+10-15% Slow time.
     pub(crate) ad8_full: bool,
     pub(crate) ad8_runner: bool,
+    /// Add two globally ranked (mode, nonzero angle) luma finalists at 8/16/32.
+    /// ExtraSlow always enables this; other presets keep their current budget.
+    pub(crate) joint_angle_search: bool,
     /// 8x8-vs-split4 decision prices the 8x8 side with angle deltas + real
     /// tr/bl. Without it edge 8x8s went to four 4x4s, which cannot signal
     /// angle_delta (spec: bsize >= 8x8) and predict outlines 3-9x worse.
@@ -552,6 +555,7 @@ impl Tuning {
         recon_fill_dim: 4,
         ad8_full: true,
         ad8_runner: true,
+        joint_angle_search: false,
         split4_ad: true,
         trial_part: 0,
         trial_part_xslow: 6,
@@ -805,6 +809,7 @@ mod imp {
                 "recon_fill_dim" => t.recon_fill_dim = num(value) as u32,
                 "ad8_full" => t.ad8_full = flag(value),
                 "ad8_runner" => t.ad8_runner = flag(value),
+                "joint_angle_search" => t.joint_angle_search = flag(value),
                 "split4_ad" => t.split4_ad = flag(value),
                 "trial_part" => t.trial_part = num(value) as u32,
                 "trial_part_xslow" => t.trial_part_xslow = num(value) as u32,

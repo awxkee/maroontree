@@ -5643,6 +5643,161 @@ mod aq_tests {
     }
 
     #[test]
+    fn angle_shortlist_keeps_predictions_paired_with_deltas() {
+        fn check<const N: usize>(dim: usize) {
+            let w = 64;
+            let src = std::array::from_fn(|p| {
+                (0..w * w)
+                    .map(|i| ((i * 37 + i / w * 53 + p * 17) & 1023) as u16)
+                    .collect()
+            });
+            let mut tile = LossyTile::new(140, 10, w, w, &src, QmLevels::FLAT);
+            tile.recon.clone_from(&src);
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for budget in 0..=2 {
+                    let (mut a, mut b, mut scratch) = ([0; N], [0; N], [0; N]);
+                    let mut preds = [&mut a, &mut b, &mut scratch];
+                    let deltas = tile.rank_angle_deltas::<N>(
+                        mode, 8, 8, dim, dim, true, true, budget, &mut preds,
+                    );
+                    assert_eq!(deltas.len(), budget);
+                    let mut previous = 0;
+                    for (i, &delta) in deltas.iter().enumerate() {
+                        let mut expected = [0; N];
+                        tile.intrapred.predict_nd_ad(
+                            mode,
+                            delta,
+                            &tile.recon[0],
+                            w,
+                            8,
+                            8,
+                            dim,
+                            dim,
+                            true,
+                            true,
+                            w,
+                            w,
+                            tile.luma_filter_type(8, 8),
+                            &mut expected,
+                            10,
+                        );
+                        assert_eq!(
+                            *preds[i], expected,
+                            "{dim} mode={mode} budget={budget} delta={delta}"
+                        );
+                        let score =
+                            tile.rd
+                                .satd_sad_proxy(tile.src_blk(0, 8, 8, dim, dim), &expected, dim);
+                        assert!(score >= previous);
+                        previous = score;
+                    }
+                }
+            }
+        }
+        check::<64>(8);
+        check::<256>(16);
+        check::<1024>(32);
+    }
+
+    #[test]
+    fn ordinary_luma_syntax_includes_directional_zero_delta() {
+        let src = std::array::from_fn(|_| vec![128; 64 * 64]);
+        let tile = LossyTile::new(140, 8, 64, 64, &src, QmLevels::FLAT);
+        for dim in [8, 16, 32] {
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for delta in -3..=3 {
+                    let expected = tile.mode_bits(8, 8, mode)
+                        + cdf_cost(
+                            &tile.dcdf().angle_delta[mode - V_PRED],
+                            (delta + 3) as usize,
+                        );
+                    assert_eq!(
+                        tile.luma_intra_syntax_bits(8, 8, dim, dim, mode, delta),
+                        expected
+                    );
+                }
+            }
+            let dc = tile.mode_bits(8, 8, DC_PRED)
+                + cdf_cost(&tile.dcdf().filter_intra[av1_block_size_index(dim, dim)], 0);
+            assert_eq!(tile.luma_intra_syntax_bits(8, 8, dim, dim, DC_PRED, 0), dc);
+            assert_eq!(
+                tile.luma_intra_syntax_bits(8, 8, dim, dim, PAETH_PRED, 0),
+                tile.mode_bits(8, 8, PAETH_PRED)
+            );
+        }
+        assert_eq!(
+            tile.luma_intra_syntax_bits(8, 8, 4, 4, V_PRED, 0),
+            tile.mode_bits(8, 8, V_PRED)
+        );
+    }
+
+    #[test]
+    fn global_angles_recover_a_family_pruned_at_delta_zero() {
+        fn check<const N: usize>(dim: usize) {
+            let w = 64;
+            let recon: Vec<u16> = (0..w * w)
+                .map(|i| ((i * 37 + i / w * 53 + (i ^ (i / w)) * 11) & 255) as u16)
+                .collect();
+            let dispatch = IntraPredDispatch::selected();
+            let mut recovered = false;
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for delta in [-3, -2, -1, 1, 2, 3] {
+                    let mut target = [0; N];
+                    dispatch.predict_nd_ad(
+                        mode,
+                        delta,
+                        &recon,
+                        w,
+                        8,
+                        8,
+                        dim,
+                        dim,
+                        true,
+                        true,
+                        w,
+                        w,
+                        false,
+                        &mut target,
+                        8,
+                    );
+                    let mut src = std::array::from_fn(|_| recon.clone());
+                    for y in 0..dim {
+                        for x in 0..dim {
+                            src[0][(8 + y) * w + 8 + x] = target[y * dim + x] as u16;
+                        }
+                    }
+                    let mut tile = LossyTile::new(140, 8, w, w, &src, QmLevels::FLAT)
+                        .with_speed(Speed::ExtraSlow);
+                    tile.recon[0].clone_from(&recon);
+                    let nominal =
+                        tile.rank_luma_modes::<N>(nd_modes(), 8, 8, dim, dim, true, true, 1);
+                    if nominal.contains(&mode) {
+                        continue;
+                    }
+                    let candidates =
+                        tile.rank_luma_candidates::<N>(nd_modes(), 8, 8, dim, dim, true, true, 1);
+                    assert_eq!(candidates.len(), 3);
+                    assert_eq!(candidates[0], (nominal[0], 0));
+                    if candidates.contains(&(mode, delta)) {
+                        recovered = true;
+                        break;
+                    }
+                }
+                if recovered {
+                    break;
+                }
+            }
+            assert!(
+                recovered,
+                "no pruned angular family recovered for {dim}x{dim}"
+            );
+        }
+        check::<64>(8);
+        check::<256>(16);
+        check::<1024>(32);
+    }
+
+    #[test]
     fn directional_top_k_keeps_three_lowest_costs() {
         let mut top = DirectionalTopK::new();
         for (mode, cost) in [(1, 50), (2, 10), (3, 30), (4, 20), (5, 40)] {

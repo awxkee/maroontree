@@ -42,6 +42,7 @@ const JOINT_LARGE_BEAM: usize = 2;
 struct Luma8BeamCandidate {
     luma_cost: f32,
     mode: usize,
+    delta: i32,
     pred: [i32; 64],
     cf: [i32; 64],
     tf: [f32; 64],
@@ -701,6 +702,7 @@ impl<'a> LossyTile<'a> {
         // emit_prdo/emit_mlam already carry the perceptual scale
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let mut best_mode = DC_PRED;
+        let mut best_delta: i32 = 0;
         let mut best_is_adst = false;
         let mut best_is_idtx = false;
         let mut best_is_vdct = false;
@@ -731,7 +733,7 @@ impl<'a> LossyTile<'a> {
         let rl = self.luma_sel_replay();
         let rl_cf = self.luma_cf_replay();
         let mode_shortlist = if rl.is_none() {
-            self.rank_luma_modes::<64>(
+            self.rank_luma_candidates::<64>(
                 modes,
                 px,
                 py,
@@ -742,15 +744,12 @@ impl<'a> LossyTile<'a> {
                 self.luma_mode_budget_eff(),
             )
         } else {
-            FixedList::new(DC_PRED)
+            FixedList::new((DC_PRED, 0))
         };
         outline_block8(|| {
-            for &m in modes {
+            for &(m, delta) in &mode_shortlist {
                 if rl.is_some() {
                     break;
-                }
-                if !mode_shortlist.contains(&m) {
-                    continue;
                 }
                 let mut pred = [0i32; 64];
                 if m == DC_PRED {
@@ -759,8 +758,9 @@ impl<'a> LossyTile<'a> {
                             .dc_pred_8x8(&self.recon[0], self.w, px, py, self.bd as i32);
                     pred = [d; 64];
                 } else {
-                    self.intrapred.predict_nd(
+                    self.intrapred.predict_nd_ad(
                         m,
+                        delta,
                         &self.recon[0],
                         self.w,
                         px,
@@ -811,13 +811,9 @@ impl<'a> LossyTile<'a> {
                 }
                 let sse = blk_sse(&self.idct.idct_dequant_8x8(&cf, &self.quant));
                 let bits = self.luma_bits(&cf, &SCAN_8X8, 8, px, py, m, 1);
-                let filter_bits = if m == DC_PRED {
-                    cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(8, 8)], 0)
-                } else {
-                    0.0
-                };
-                let cost = rd_cost_i64(sse, mlam, bits + self.mode_bits(px, py, m) + filter_bits);
-                if (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                let syntax_bits = self.luma_intra_syntax_bits(px, py, 8, 8, m, delta);
+                let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
+                if delta == 0 && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
                     if cost < dir_top[0].0 {
                         dir_top[1] = dir_top[0];
                         dir_top[0] = (cost, m);
@@ -828,6 +824,7 @@ impl<'a> LossyTile<'a> {
                 let candidate = Luma8BeamCandidate {
                     luma_cost: cost,
                     mode: m,
+                    delta,
                     pred,
                     cf,
                     tf,
@@ -851,6 +848,7 @@ impl<'a> LossyTile<'a> {
                 if cost < best_eff {
                     best_eff = cost;
                     best_mode = m;
+                    best_delta = delta;
                     lpred_arr = pred;
                     lcf = cf;
                     ltf = tf;
@@ -901,6 +899,7 @@ impl<'a> LossyTile<'a> {
                     let candidate = Luma8BeamCandidate {
                         luma_cost: cost,
                         mode: DC_PRED,
+                        delta: 0,
                         pred,
                         cf,
                         tf,
@@ -924,6 +923,7 @@ impl<'a> LossyTile<'a> {
                     if cost < best_eff {
                         best_eff = cost;
                         best_mode = DC_PRED;
+                        best_delta = 0;
                         best_filter_intra = None;
                         best_palette = Some(palette);
                         lpred_arr = pred;
@@ -960,6 +960,7 @@ impl<'a> LossyTile<'a> {
             if let Some(candidate) = selected {
                 best_eff = candidate.luma_cost;
                 best_mode = candidate.mode;
+                best_delta = candidate.delta;
                 lpred_arr = candidate.pred;
                 lcf = candidate.cf;
                 ltf = candidate.tf;
@@ -1029,6 +1030,7 @@ impl<'a> LossyTile<'a> {
                     {
                         best_eff = cost;
                         best_mode = DC_PRED;
+                        best_delta = 0;
                         lpred_arr = pred;
                         lcf = cf;
                         ltf = tf;
@@ -1040,16 +1042,11 @@ impl<'a> LossyTile<'a> {
                 }
             }
         });
-        // Angle-delta winner refinement: if the winning luma mode is one of the
-        // six pure diagonals, try angle_delta in -3..=3 (3 deg steps) and keep the
-        // best by SSE + lambda*(coeff bits + angle_delta symbol bits). V/H and the
-        // non-directional modes stay at delta 0. ~6 extra predictions per block.
-        let mut best_delta: i32 = 0;
         // Angle-delta winner refinement: if the winning luma mode is directional
         // (the six diagonals, plus V/H under `ad_vh`), try angle_delta in
         // -3..=3 (3 deg steps) and keep the best by SSE + lambda*(coeff bits +
-        // angle_delta symbol bits). Shipped: the two SATD-ranked deltas;
-        // `ad8_full` prices all six. `ad8_runner` then gives the best
+        // angle_delta symbol bits). `ad8_full` prices all six (otherwise the
+        // two SATD-ranked deltas). `ad8_runner` then gives the best
         // directional that did NOT win the same refinement against the
         // winner's full cost (the 16x16 `ad_runner` analog): on hard outline
         // edges the right (mode, delta) pair loses at delta 0 and was never

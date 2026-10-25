@@ -882,9 +882,7 @@ fn dp_palette_center_sets(hist: &[(i32, u32)], kmax: usize) -> [FixedList<i32, 8
     // start of the last interval.
     let mut f = [[i64::MAX; 65]; 8];
     let mut arg = [[0u8; 65]; 8];
-    for j in 1..=h {
-        f[0][j] = cost[j];
-    }
+    f[0][1..=h].copy_from_slice(&cost[1..=h]);
     for k in 1..kmax.min(h) {
         for j in k + 1..=h {
             let mut best = i64::MAX;
