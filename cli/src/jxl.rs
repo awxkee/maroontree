@@ -28,8 +28,7 @@
  */
 use crate::{Args, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use image::DynamicImage;
-use jxl::api::{JxlColorProfile, JxlColorType, JxlDataFormat};
-use jxl::headers::extra_channels::ExtraChannel;
+use jxl::api::{ExtraChannel, JxlColorProfile, JxlColorType, JxlDataFormat};
 use std::fs;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
@@ -200,25 +199,63 @@ pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>
     decode_jxl_bytes(input_src)
 }
 
+/// Drive the jxl 0.8 event decoder until `want` fires. `Complete` or a request
+/// for more input before that means the codestream ended early.
+fn jxl_advance_to(
+    decoder: &mut jxl::api::JxlDecoder,
+    reader: &mut BufReader<Cursor<Vec<u8>>>,
+    want: jxl::api::Event,
+    stage: &str,
+) -> Result<(), JxlError> {
+    use jxl::api::Event;
+    loop {
+        match decoder
+            .process(reader, None, None)
+            .map_err(|x| JxlError::Format(format!("jxl {x}")))?
+        {
+            ev if ev == want => return Ok(()),
+            Event::NeedMoreInput { .. } | Event::Complete => {
+                return Err(JxlError::Format(format!("jxl: truncated before {stage}")));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Decode the current frame into `out`, returning once it is complete.
+fn jxl_decode_frame(
+    decoder: &mut jxl::api::JxlDecoder,
+    reader: &mut BufReader<Cursor<Vec<u8>>>,
+    out: &mut [jxl::api::JxlOutputBuffer<'_>],
+) -> Result<(), JxlError> {
+    use jxl::api::Event;
+    loop {
+        match decoder
+            .process(reader, Some(out), None)
+            .map_err(|x| JxlError::Format(format!("jxl {x}")))?
+        {
+            Event::FrameComplete { .. } | Event::Complete => return Ok(()),
+            Event::NeedMoreInput { .. } => {
+                return Err(JxlError::Format("jxl: truncated inside frame".into()));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>), JxlError> {
     use jxl::api::{
-        Endianness, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
-        ProcessingResult,
+        Endianness, Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
     };
 
     let mut reader = BufReader::new(Cursor::new(input_src));
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info")?;
 
-    let mut decoder_with_image_info = match JxlDecoder::new(JxlDecoderOptions::default())
-        .process(&mut reader, None)
-        .map_err(|x| JxlError::Format(format!("jxl {x}")))?
-    {
-        ProcessingResult::Complete { result: d } => d,
-        ProcessingResult::NeedsMoreInput { .. } => {
-            return Err(JxlError::Format("jxl: truncated before basic_info".into()));
-        }
-    };
-
-    let info = decoder_with_image_info.basic_info();
+    let info = decoder
+        .basic_info()
+        .ok_or_else(|| JxlError::Format("jxl: no basic_info after BasicInfo event".into()))?
+        .clone();
     let (w, h) = info.size;
     let bits = info.bit_depth.bits_per_sample();
     let has_alpha = info
@@ -226,8 +263,8 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
         .iter()
         .any(|ec| ec.ec_type == ExtraChannel::Alpha);
     let is_gray = matches!(
-        decoder_with_image_info.current_pixel_format().color_type,
-        JxlColorType::Grayscale | JxlColorType::GrayscaleAlpha
+        decoder.current_pixel_format().map(|f| f.color_type),
+        Some(JxlColorType::Grayscale | JxlColorType::GrayscaleAlpha)
     );
 
     let color_type = match (is_gray, has_alpha) {
@@ -250,36 +287,26 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
         },
     });
 
-    decoder_with_image_info
+    decoder
         .set_pixel_format(JxlPixelFormat {
             color_type,
             color_data_format,
             extra_channel_format: vec![None; info.extra_channels.len()],
         })
         .map_err(|x| JxlError::Format(format!("jxl pixel format: {x}")))?;
-    let output_profile = match decoder_with_image_info.output_color_profile() {
-        JxlColorProfile::Icc(v) => Some(v.to_vec()),
-        JxlColorProfile::Simple(_) => None,
+    let output_profile = match decoder.output_color_profile() {
+        Some(JxlColorProfile::Icc(v)) => Some(v.to_vec()),
+        _ => None,
     };
 
-    let decoder_with_frame_info = match decoder_with_image_info
-        .process(&mut reader, None)
-        .map_err(|x| JxlError::Format(format!("jxl {x}")))?
-    {
-        ProcessingResult::Complete { result: d } => d,
-        ProcessingResult::NeedsMoreInput { .. } => {
-            return Err(JxlError::Format("jxl: truncated before frame info".into()));
-        }
-    };
+    jxl_advance_to(&mut decoder, &mut reader, Event::FrameHeader, "frame info")?;
 
     macro_rules! decode_pixels {
         (u8, $channels:expr, $label:expr, $img:ident) => {{
             let stride = w * $channels;
             let mut buf = vec![0u8; h * stride];
             let mut out = [JxlOutputBuffer::new(buf.as_mut_slice(), h, stride)];
-            decoder_with_frame_info
-                .process(&mut reader, &mut out, None)
-                .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
+            jxl_decode_frame(&mut decoder, &mut reader, &mut out)?;
             DynamicImage::$img(
                 image::ImageBuffer::from_raw(w as u32, h as u32, buf)
                     .ok_or_else(|| JxlError::Format(format!("jxl {} buffer mismatch", $label)))?,
@@ -293,9 +320,7 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
                 h,
                 stride_bytes,
             )];
-            decoder_with_frame_info
-                .process(&mut reader, &mut out, None)
-                .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
+            jxl_decode_frame(&mut decoder, &mut reader, &mut out)?;
             DynamicImage::$img(
                 image::ImageBuffer::from_raw(w as u32, h as u32, buf)
                     .ok_or_else(|| JxlError::Format(format!("jxl {} buffer mismatch", $label)))?,
@@ -323,9 +348,7 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
                 h,
                 stride_bytes,
             )];
-            decoder_with_frame_info
-                .process(&mut reader, &mut out, None)
-                .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
+            jxl_decode_frame(&mut decoder, &mut reader, &mut out)?;
             let rgb: Vec<f32> = buf.iter().flat_map(|&v| [v, v, v]).collect();
             DynamicImage::ImageRgb32F(
                 image::ImageBuffer::from_raw(w as u32, h as u32, rgb).ok_or_else(|| {
@@ -341,9 +364,7 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
                 h,
                 stride_bytes,
             )];
-            decoder_with_frame_info
-                .process(&mut reader, &mut out, None)
-                .map_err(|x| JxlError::Format(format!("jxl {x}")))?;
+            jxl_decode_frame(&mut decoder, &mut reader, &mut out)?;
             let rgba: Vec<f32> = buf
                 .as_chunks::<2>()
                 .0
@@ -899,29 +920,25 @@ mod tests {
             // Checking the original ICC alone missed ImageIO's sRGB fallback.
             // A separate decoder must also select P3 for its default pixels.
             use jxl::api::{
-                JxlColorEncoding, JxlDecoder, JxlDecoderOptions, JxlPrimaries, JxlTransferFunction,
-                JxlWhitePoint, ProcessingResult,
+                Event, JxlColorEncoding, JxlDecoder, JxlDecoderOptions, JxlPrimaries,
+                JxlTransferFunction, JxlWhitePoint,
             };
-            let mut reader = BufReader::new(Cursor::new(cli_output.as_slice()));
-            let ProcessingResult::Complete { result: decoder } =
-                JxlDecoder::new(JxlDecoderOptions::default())
-                    .process(&mut reader, None)
-                    .unwrap()
-            else {
-                panic!("complete codestream must include color information");
-            };
+            let mut reader = BufReader::new(Cursor::new(cli_output.clone()));
+            let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+            jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info")
+                .expect("complete codestream must include color information");
             for profile in [
                 decoder.embedded_color_profile(),
                 decoder.output_color_profile(),
             ] {
                 assert!(matches!(
                     profile,
-                    JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
+                    Some(JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
                         white_point: JxlWhitePoint::D65,
                         primaries: JxlPrimaries::P3,
                         transfer_function: JxlTransferFunction::SRGB,
                         ..
-                    })
+                    }))
                 ));
             }
             for cicp in [

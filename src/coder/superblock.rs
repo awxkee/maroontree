@@ -182,6 +182,104 @@ impl<'a> LossyTile<'a> {
         shortlist
     }
 
+    /// Syntax emitted for an ordinary luma predictor (excluding coefficients).
+    /// Directional delta zero still carries an angle-delta symbol at >=8x8.
+    #[allow(clippy::too_many_arguments)]
+    fn luma_intra_syntax_bits(
+        &self,
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        mode: usize,
+        delta: i32,
+    ) -> f32 {
+        let mut bits = self.mode_bits(px, py, mode);
+        if is_directional_mode(mode) && w >= 8 && h >= 8 {
+            bits += cdf_cost(
+                &self.dcdf().angle_delta[mode - V_PRED],
+                (delta + 3) as usize,
+            );
+        } else if filter_intra_allowed(mode, w, h) {
+            bits += cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(w, h)], 0);
+        }
+        bits
+    }
+
+    /// Preserve the nominal shortlist and add two globally ranked nonzero
+    /// angles. A family that loses at delta zero can now reach full RD and the
+    /// luma/UV beam. ExtraSlow enables this search; other tiers can probe it
+    /// with `joint_angle_search` before changing their measured speed budgets.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_luma_candidates<const N: usize>(
+        &self,
+        modes: &[usize],
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        have_tr: bool,
+        have_bl: bool,
+        budget: usize,
+    ) -> FixedList<(usize, i32), 15> {
+        let mut out = FixedList::new((DC_PRED, 0));
+        let nominal = self.rank_luma_modes::<N>(modes, px, py, w, h, have_tr, have_bl, budget);
+        for &mode in modes {
+            if nominal.contains(&mode) {
+                out.push((mode, 0));
+            }
+        }
+        if w < 8
+            || h < 8
+            || !self.speed.try_angle_deltas_av1(w.max(h), self.base_q_idx)
+            || !(self.speed == Speed::ExtraSlow || crate::tuning::get().joint_angle_search)
+        {
+            return out;
+        }
+        let mut ranked = FixedList::<(u64, f32, usize, i32), 48>::new((0, 0.0, DC_PRED, 0));
+        let mut pred = [0i32; N];
+        for &mode in modes {
+            if !self.angle_delta_refines(mode) {
+                continue;
+            }
+            for delta in [-3, -2, -1, 1, 2, 3] {
+                self.intrapred.predict_nd_ad(
+                    mode,
+                    delta,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    w,
+                    h,
+                    have_tr,
+                    have_bl,
+                    self.w,
+                    self.h,
+                    self.luma_filter_type(px, py),
+                    &mut pred,
+                    self.bd,
+                );
+                let score = self
+                    .rd
+                    .satd_sad_proxy(self.src_blk(0, px, py, w, h), &pred, w);
+                let bits = self.luma_intra_syntax_bits(px, py, w, h, mode, delta);
+                ranked.push((score, bits, mode, delta));
+            }
+        }
+        // SATD is a screening proxy; exact syntax breaks equal-distortion ties.
+        // Full reconstruction RD decides between these and the nominal modes.
+        ranked.as_mut_slice().sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.total_cmp(&b.1))
+                .then((a.2, a.3).cmp(&(b.2, b.3)))
+        });
+        for &(_, _, mode, delta) in ranked.iter().take(2) {
+            out.push((mode, delta));
+        }
+        out
+    }
+
     /// Prediction-only shortlist for the expensive Slow filter-intra trials.
     fn rank_filter_intra_modes<const N: usize>(
         &self,
@@ -239,8 +337,11 @@ impl<'a> LossyTile<'a> {
         pred_bufs: &mut [&mut [i32; N]; 3],
     ) -> FixedList<i32, 6> {
         debug_assert_eq!(N, w * h);
-        debug_assert!(budget <= 2);
-        let keep = budget.max(1);
+        assert!(budget <= 2);
+        let keep = budget;
+        if keep == 0 {
+            return FixedList::new(0);
+        }
         let mut selected = [(u64::MAX, usize::MAX, 0i32); 2];
         for (order, delta) in [-3i32, -2, -1, 1, 2, 3].into_iter().enumerate() {
             self.intrapred.predict_nd_ad(
@@ -270,6 +371,8 @@ impl<'a> LossyTile<'a> {
                     selected[i] = selected[i - 1];
                 }
                 selected[pos] = candidate;
+                // Prediction scratch is always slot 2, including for top-1.
+                pred_bufs.swap(keep, 2);
                 for i in (pos + 1..=keep).rev() {
                     pred_bufs.swap(i - 1, i);
                 }

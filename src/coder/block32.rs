@@ -38,6 +38,7 @@ const fn full_partition_proxy32() -> bool {
 struct Luma32BeamCandidate {
     luma_cost: f32,
     mode: usize,
+    delta: i32,
     pred: SBuf<[i32; 1024]>,
     cf: SBuf<[i32; 1024]>,
     tf: SBuf<[f32; 1024]>,
@@ -701,6 +702,7 @@ impl<'a> LossyTile<'a> {
         // residual transform is always DCT_DCT, so the mode affects prediction
         // only). Mirrors the 16x16 search.
         let mut best_mode = DC_PRED;
+        let mut best_delta: i32 = 0;
         let mut lpred = self.sbuf_i1024();
         let mut lcf = self.sbuf_i1024();
         let mut best_eff = f32::INFINITY;
@@ -722,7 +724,7 @@ impl<'a> LossyTile<'a> {
         let joint_large =
             rl.is_none() && !self.mono && self.speed.at_least_slow() && joint_luma_uv_large_enabled();
         let mode_shortlist = if rl.is_none() {
-            self.rank_luma_modes::<1024>(
+            self.rank_luma_candidates::<1024>(
                 modes,
                 px,
                 py,
@@ -739,22 +741,20 @@ impl<'a> LossyTile<'a> {
                 },
             )
         } else {
-            FixedList::new(DC_PRED)
+            FixedList::new((DC_PRED, 0))
         };
-        for &m in modes {
+        for &(m, delta) in &mode_shortlist {
             if rl.is_some() {
                 break;
-            }
-            if !mode_shortlist.contains(&m) {
-                continue;
             }
             let mut pred = self.sbuf_i1024();
             if m == DC_PRED {
                 let d = self.intrapred.dc_pred_32x32(&self.recon[0], self.w, px, py, self.bd as i32);
                 *pred = [d; 1024];
             } else {
-                self.intrapred.predict_nd(
+                self.intrapred.predict_nd_ad(
                     m,
+                    delta,
                     &self.recon[0],
                     self.w,
                     px,
@@ -803,18 +803,13 @@ impl<'a> LossyTile<'a> {
             }
             let rr = self.idct.idct_dequant_32x32(&cf, &self.quant);
             let sse = sse_recon::<1024, 32>(&self.rd, &pred, &rr, self.src_blk(0, px, py, 32, 32), self.bd);
-            let filter_bits = if m == DC_PRED {
-                cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(32, 32)], 0)
-            } else {
-                0.0
-            };
-            let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, m, 0)
-                + self.mode_bits(px, py, m)
-                + filter_bits;
+            let syntax_bits = self.luma_intra_syntax_bits(px, py, 32, 32, m, delta);
+            let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, m, 0) + syntax_bits;
             let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
+                best_delta = delta;
                 *lpred = *pred;
                 *lcf = cf;
                 *ltf = tf;
@@ -840,6 +835,7 @@ impl<'a> LossyTile<'a> {
                     luma_beam[pos] = Some(Luma32BeamCandidate {
                         luma_cost: cost,
                         mode: m,
+                        delta,
                         pred,
                         cf: beam_cf,
                         tf: beam_tf,
@@ -900,6 +896,7 @@ impl<'a> LossyTile<'a> {
                 if cost < best_eff {
                     best_eff = cost;
                     best_mode = DC_PRED;
+                    best_delta = 0;
                     best_filter_intra = None;
                     best_palette32 = Some(palette.clone());
                     *lpred = pred;
@@ -928,6 +925,7 @@ impl<'a> LossyTile<'a> {
                         luma_beam[pos] = Some(Luma32BeamCandidate {
                             luma_cost: cost,
                             mode: DC_PRED,
+                            delta: 0,
                             pred: beam_pred,
                             cf: beam_cf,
                             tf: beam_tf,
@@ -959,6 +957,7 @@ impl<'a> LossyTile<'a> {
             if let Some(candidate) = selected {
                 best_eff = candidate.luma_cost;
                 best_mode = candidate.mode;
+                best_delta = candidate.delta;
                 *lpred = *candidate.pred;
                 *lcf = *candidate.cf;
                 *ltf = *candidate.tf;
@@ -1032,6 +1031,7 @@ impl<'a> LossyTile<'a> {
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;
+                    best_delta = 0;
                     *lpred = *pred;
                     *lcf = cf;
                     *ltf = tf;
@@ -1041,8 +1041,8 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
-        let mut best_delta: i32 = 0;
+        // Refine the directional winner, retaining its current angle cost if
+        // it came from the global angular shortlist.
         if rl.is_none()
             && self.speed.try_angle_deltas_av1(32, self.base_q_idx)
             && self.angle_delta_refines(best_mode)
@@ -1053,7 +1053,11 @@ impl<'a> LossyTile<'a> {
             let wrr = self.idct.idct_dequant_32x32(&lcf, &self.quant);
             let wsse = sse_recon::<1024, 32>(&self.rd, &lpred, &wrr, self.src_blk(0, px, py, 32, 32), self.bd);
             let wbits = self.luma_bits(&lcf[..], &SCAN_32X32, 32, px, py, best_mode, 0);
-            let mut best_ad_cost = rd_cost_i64(wsse, mlam, wbits + cdf_cost(&ad_cdf, 3));
+            let mut best_ad_cost = rd_cost_i64(
+                wsse,
+                mlam,
+                wbits + cdf_cost(&ad_cdf, (best_delta + 3) as usize),
+            );
             let mut ad_pred0 = self.sbuf_i1024();
             let mut ad_pred1 = self.sbuf_i1024();
             let mut ad_scratch = self.sbuf_i1024();
@@ -3233,6 +3237,7 @@ impl<'a> LossyTile<'a> {
                             32,
                             32,
                             r.palette as usize,
+                            &self.uv_palette_map_opts(),
                         ));
                     }
                     break 'sv (cf_use, DC_PRED);
@@ -3447,6 +3452,7 @@ impl<'a> LossyTile<'a> {
                     // attempts. This is aom's mechanism (490 UV palettes on
                     // kodak20 q93, all carrying coefficients).
                     let uv_hist = uv_pair_histogram(&self.src[1], &self.src[2], self.w, px, py, 32, 32);
+                    let uv_map_opts = self.uv_palette_map_opts();
                     [(8usize, false), (4, false), (8, true), (4, true)]
                         .iter()
                         .filter_map(|&(k, top)| {
@@ -3462,6 +3468,7 @@ impl<'a> LossyTile<'a> {
                                 32,
                                 k,
                                 top,
+                                &uv_map_opts,
                             )
                         })
                         .collect()

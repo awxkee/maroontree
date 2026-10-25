@@ -89,10 +89,8 @@ pub enum ChromaFormat {
 /// Rate-distortion effort for the encoder's mode search
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Speed {
-    /// [`Speed::Slow`]'s exact search plus per-unit RD CDEF and the real-R-D
-    /// trial-encode partition decision (`coder/trial.rs`). Wider searches
-    /// (more mode/palette/partition finalists, looser breakouts) all measured
-    /// worse than Slow: they exploit decision-cost errors rather than fix them.
+    /// [`Speed::Slow`]'s search plus global angular finalists, per-unit RD
+    /// CDEF, and the trial-encode partition decision (`coder/trial.rs`).
     ExtraSlow,
     /// Highest-effort rate-distortion search among the tuned tiers.
     #[default]

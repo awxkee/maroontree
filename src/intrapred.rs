@@ -2341,10 +2341,7 @@ mod intra_edge_tests {
                 (32, 64),
                 (64, 64),
             ] {
-                for mode in D45_PRED..=VERT_LEFT_PRED {
-                    if mode == H_PRED {
-                        continue;
-                    }
+                for mode in V_PRED..=VERT_LEFT_PRED {
                     for delta in -3..=3 {
                         for &(ox, oy, have_tr, have_bl) in &[
                             (0usize, 0usize, false, false),

@@ -162,6 +162,7 @@ fn proxy_mode_beam_len(speed: Speed, _dim: usize) -> usize {
 struct Luma16BeamCandidate {
     luma_cost: f32,
     mode: usize,
+    delta: i32,
     pred: SBuf<[i32; 256]>,
     cf: SBuf<[i32; 256]>,
     tf: SBuf<[f32; 256]>,
@@ -3651,6 +3652,7 @@ impl<'a> LossyTile<'a> {
         // 2026-07-27, finding 3). `prdo` stays for the coupled chroma path.
         let prdo = self.perceptual_rd_scale(px, py, 16);
         let mut best_mode = DC_PRED;
+        let mut best_delta: i32 = 0;
         let mut txtp16: u8 = 0; // 0=DCT_DCT 1=ADST_ADST 2=ADST_DCT 3=DCT_ADST
         let mut s8_txtps = [1u8; 4];
         let mut s16_txtps = [1u8; 16];
@@ -3677,7 +3679,7 @@ impl<'a> LossyTile<'a> {
             rl.is_none() && !self.mono && self.speed.at_least_slow() && joint_luma_uv_large_enabled();
         let mut dir_top = [(f32::INFINITY, DC_PRED); 2];
         let mode_shortlist = if rl.is_none() {
-            self.rank_luma_modes::<256>(
+            self.rank_luma_candidates::<256>(
                 modes,
                 px,
                 py,
@@ -3688,22 +3690,20 @@ impl<'a> LossyTile<'a> {
                 self.luma_mode_budget_eff(),
             )
         } else {
-            FixedList::new(DC_PRED)
+            FixedList::new((DC_PRED, 0))
         };
-        for &m in modes {
+        for &(m, delta) in &mode_shortlist {
             if rl.is_some() {
                 break;
-            }
-            if !mode_shortlist.contains(&m) {
-                continue;
             }
             let mut pred = self.sbuf_i256();
             if m == DC_PRED {
                 let d = self.intrapred.dc_pred_16x16(&self.recon[0], self.w, px, py, self.bd as i32);
                 *pred = [d; 256];
             } else {
-                self.intrapred.predict_nd(
+                self.intrapred.predict_nd_ad(
                     m,
+                    delta,
                     &self.recon[0],
                     self.w,
                     px,
@@ -3755,13 +3755,9 @@ impl<'a> LossyTile<'a> {
             }
             let sse = blk_sse16(&self.idct.idct_dequant_16x16(&cf, &self.quant));
             let bits = self.luma_bits(&cf, &SCAN_16X16, 16, px, py, m, 1);
-            let filter_bits = if m == DC_PRED {
-                cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(16, 16)], 0)
-            } else {
-                0.0
-            };
-            let cost = rd_cost_i64(sse, mlam, bits + self.mode_bits(px, py, m) + filter_bits);
-            if (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+            let syntax_bits = self.luma_intra_syntax_bits(px, py, 16, 16, m, delta);
+            let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
+            if delta == 0 && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
                 if cost < dir_top[0].0 {
                     dir_top[1] = dir_top[0];
                     dir_top[0] = (cost, m);
@@ -3772,6 +3768,7 @@ impl<'a> LossyTile<'a> {
             if cost < best_eff {
                 best_eff = cost;
                 best_mode = m;
+                best_delta = delta;
                 *lpred_arr = *pred;
                 *lcf = cf;
                 *ltf = tf;
@@ -3798,6 +3795,7 @@ impl<'a> LossyTile<'a> {
                     luma_beam[pos] = Some(Luma16BeamCandidate {
                         luma_cost: cost,
                         mode: m,
+                        delta,
                         pred,
                         cf: beam_cf,
                         tf: beam_tf,
@@ -3861,6 +3859,7 @@ impl<'a> LossyTile<'a> {
                 if cost < best_eff {
                     best_eff = cost;
                     best_mode = DC_PRED;
+                    best_delta = 0;
                     best_filter_intra = None;
                     best_palette16 = Some(palette.clone());
                     *lpred_arr = pred;
@@ -3890,6 +3889,7 @@ impl<'a> LossyTile<'a> {
                         luma_beam[pos] = Some(Luma16BeamCandidate {
                             luma_cost: cost,
                             mode: DC_PRED,
+                            delta: 0,
                             pred: beam_pred,
                             cf: beam_cf,
                             tf: beam_tf,
@@ -3922,6 +3922,7 @@ impl<'a> LossyTile<'a> {
             if let Some(candidate) = selected {
                 best_eff = candidate.luma_cost;
                 best_mode = candidate.mode;
+                best_delta = candidate.delta;
                 *lpred_arr = *candidate.pred;
                 *lcf = *candidate.cf;
                 *ltf = *candidate.tf;
@@ -3996,6 +3997,7 @@ impl<'a> LossyTile<'a> {
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;
+                    best_delta = 0;
                     *lpred_arr = *pred;
                     *lcf = cf;
                     *ltf = tf;
@@ -4006,16 +4008,19 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        // Angle-delta winner refinement (see code_block: diagonals only, -3..=3).
-        let mut best_delta: i32 = 0;
+        // Refine the directional winner, retaining its current angle cost if
+        // it came from the global angular shortlist.
         if rl.is_none()
             && self.speed.try_angle_deltas_av1(16, self.base_q_idx)
             && self.angle_delta_refines(best_mode)
         {
             let mut ad_cdf = [0u16; 7];
             ad_cdf.copy_from_slice(&self.dcdf().angle_delta[best_mode - V_PRED]);
-            let mut best_ad_cost =
-                rd_cost_i64(best_dct_sse, mlam, best_dct_bits + cdf_cost(&ad_cdf, 3));
+            let mut best_ad_cost = rd_cost_i64(
+                best_dct_sse,
+                mlam,
+                best_dct_bits + cdf_cost(&ad_cdf, (best_delta + 3) as usize),
+            );
             let mut ad_pred0 = self.sbuf_i256();
             let mut ad_pred1 = self.sbuf_i256();
             let mut ad_scratch = self.sbuf_i256();

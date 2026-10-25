@@ -149,6 +149,9 @@ pub(crate) struct Tuning {
     /// synth -0.56, holdout -0.08; ~+10-15% Slow time.
     pub(crate) ad8_full: bool,
     pub(crate) ad8_runner: bool,
+    /// Add two globally ranked (mode, nonzero angle) luma finalists at 8/16/32.
+    /// ExtraSlow always enables this; other presets keep their current budget.
+    pub(crate) joint_angle_search: bool,
     /// 8x8-vs-split4 decision prices the 8x8 side with angle deltas + real
     /// tr/bl. Without it edge 8x8s went to four 4x4s, which cannot signal
     /// angle_delta (spec: bsize >= 8x8) and predict outlines 3-9x worse.
@@ -422,6 +425,33 @@ pub(crate) struct Tuning {
     /// Ungated, photos measured BD-neutral (+-0.8 per image, ~0 avg) for ~10%
     /// time and synthetic edges lose (x_fractal +1.0..1.3).
     pub(crate) palette_viterbi_screen_only: u32,
+    /// Lossy UV palette index map by the same row Viterbi (4:4:4, the only
+    /// format with UV palettes): cost = (dU^2 + dV^2) + lambda * the real
+    /// `palette_uv_color` context bits; the value multiplies
+    /// `min(mlam, mlam_c)`. Same `palette_viterbi_screen_only` gate. 0 = off
+    /// (nearest-pair map).
+    pub(crate) palette_viterbi_uv: f32,
+    /// Luma palette centers by the exact 1-D DP (globally SSE-optimal integer
+    /// centers, `dp_palette_center_sets`) instead of quantile-seeded Lloyd,
+    /// which can stop in a local minimum or reject on seed collapse. Same
+    /// selector slots, so replay and the dominant-color family are unchanged.
+    /// SHIPPED ON 2026-10-25, ungated: on text the background holds > 75% of
+    /// a block, the quantile seeds collapse onto it and Lloyd rejected, so
+    /// x_screen -9.0 (444) / -11.5 (420), n_bbscreen -4.1 / -4.9, n_scmap 420
+    /// -2.4; the 48 non-screen corpus images are BD-neutral (-0.01 / +0.03).
+    pub(crate) palette_dp_centers: bool,
+    /// `screen_frame_gate`: IntraBC pays when the copied texture mass exceeds
+    /// this fraction of the photo-like mass that loses the loop filters.
+    pub(crate) ibc_gate_beta: f32,
+    /// `screen_frame_gate`: per-copy DV overhead in SAD units, as a multiple of
+    /// the frame's AC dequant step.
+    pub(crate) ibc_gate_dv: f32,
+    /// `screen_frame_gate`: build the copy index only when at least this share
+    /// of 16x16 blocks has <= 16 luma values (photos never do).
+    pub(crate) ibc_gate_prescreen: f32,
+    /// `screen_frame_gate`: palette-exact 16x16 share that turns the text
+    /// palette tools on (libaom's screen-content test uses 10%).
+    pub(crate) screen_few_share: f32,
     /// 4:4:4-only top-band NONE-vs-SPLIT bias at the 32/64 levels: the bias
     /// ramps from `none32/64_split_bias` at qindex >= knee to these values at
     /// qindex <= knee - width.
@@ -537,6 +567,7 @@ impl Tuning {
         recon_fill_dim: 4,
         ad8_full: true,
         ad8_runner: true,
+        joint_angle_search: false,
         split4_ad: true,
         trial_part: 0,
         trial_part_xslow: 6,
@@ -649,6 +680,12 @@ impl Tuning {
         palette_viterbi_420: 0.5,
         palette_viterbi_proxy: true,
         palette_viterbi_screen_only: 1,
+        palette_viterbi_uv: 0.0,
+        palette_dp_centers: true,
+        ibc_gate_beta: 32.0,
+        ibc_gate_dv: 1.0,
+        ibc_gate_prescreen: 0.02,
+        screen_few_share: 0.10,
         none32_split_bias_444_top: 1.03,
         none64_split_bias_444_top: 1.03,
         top_bias_knee_444: 40.0,
@@ -788,6 +825,7 @@ mod imp {
                 "recon_fill_dim" => t.recon_fill_dim = num(value) as u32,
                 "ad8_full" => t.ad8_full = flag(value),
                 "ad8_runner" => t.ad8_runner = flag(value),
+                "joint_angle_search" => t.joint_angle_search = flag(value),
                 "split4_ad" => t.split4_ad = flag(value),
                 "trial_part" => t.trial_part = num(value) as u32,
                 "trial_part_xslow" => t.trial_part_xslow = num(value) as u32,
@@ -900,6 +938,12 @@ mod imp {
                 "palette_viterbi_420" => t.palette_viterbi_420 = num(value),
                 "palette_viterbi_proxy" => t.palette_viterbi_proxy = flag(value),
                 "palette_viterbi_screen_only" => t.palette_viterbi_screen_only = num(value) as u32,
+                "palette_viterbi_uv" => t.palette_viterbi_uv = num(value),
+                "palette_dp_centers" => t.palette_dp_centers = flag(value),
+                "ibc_gate_beta" => t.ibc_gate_beta = num(value),
+                "ibc_gate_dv" => t.ibc_gate_dv = num(value),
+                "ibc_gate_prescreen" => t.ibc_gate_prescreen = num(value),
+                "screen_few_share" => t.screen_few_share = num(value),
                 "none32_split_bias_444_top" => t.none32_split_bias_444_top = num(value),
                 "none64_split_bias_444_top" => t.none64_split_bias_444_top = num(value),
                 "top_bias_knee_444" => t.top_bias_knee_444 = num(value),

@@ -40,7 +40,7 @@ use crate::obu::{
 use crate::odec::OdEcEncoder;
 use crate::par::Pool;
 use crate::quant::QmLevels;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 #[cfg(test)]
 pub(crate) static LOSSY_PALETTE_EMITTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1348,6 +1348,9 @@ struct LossyTile<'a> {
     /// assumption `pal_est_cache` already relies on).
     #[allow(clippy::type_complexity)]
     pal_y_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
+    /// `palette_uv_color` counterpart of `pal_y_cost` (UV map Viterbi).
+    #[allow(clippy::type_complexity)]
+    pal_uv_cost: std::cell::RefCell<Option<Box<[[[f32; 8]; 5]; 7]>>>,
     /// Snapshot `pal_y_cost` is built from: the FRAME-INITIAL decision CDFs,
     /// captured on the first `switch_decision_cdfs` (None until then, when
     /// `dec_cdfs` still is that snapshot). Pinned so that every worker and the
@@ -2999,6 +3002,230 @@ pub(crate) fn resolve_threads(threads: usize) -> usize {
     }
 }
 
+/// Frame-level screen-content verdicts from `screen_frame_gate`.
+#[derive(Default, Clone, Copy, Debug)]
+struct ScreenGate {
+    /// IntraBC is expected to save more than the loop filters it costs.
+    ibc_pays: bool,
+    /// Enough few-colour (palette-exact) 16x16 blocks for the text palette
+    /// tools (map Viterbi, colour-cache pricing) to be worth their time.
+    few_colour: bool,
+}
+
+/// Decide the two frame-level screen-content bits with a rate model instead
+/// of a duplicate count.
+///
+/// IntraBC costs the whole frame its loop filters, so it has to pay for
+/// itself: the saving is the texture mass of every aligned 8x8 luma block that
+/// has an EXACT earlier copy anywhere in the frame (unaligned — periodic
+/// screentones / UI patterns rarely sit on a 16-grid, which is why the old
+/// aligned-16x16 duplicate count never fired on line art and left s_manga 40%
+/// behind libaom), less a per-copy DV overhead; the loss is a fraction of the
+/// texture mass of the photo-like area (neither few-colour nor copied) that
+/// the deblocking filter would have cleaned. Texture mass = SAD to the block
+/// mean, the same quantity on both sides, so the quantiser cancels except in
+/// the DV overhead term. Exact copies come from the IntraBC hash index
+/// (`LossyIbcIndex`, every 8x8 window), built only when the cheap few-colour
+/// pre-screen says the frame could be screen content at all, so photos pay
+/// one histogram pass and nothing else.
+///
+/// `few_colour` is libaom's screen-content test in our palette's terms: the
+/// share of 16x16 blocks that are palette-exact (2..=8 luma values with a
+/// span of at least 64): the text palette tools are priced for that content
+/// and measured as noise on photos.
+#[allow(clippy::too_many_arguments)]
+fn screen_frame_gate(
+    src: &[Vec<u16>; 3],
+    w8: usize,
+    h8: usize,
+    sub_x: usize,
+    sub_y: usize,
+    bd: u8,
+    base_q_idx: u8,
+    pool: &crate::par::Pool,
+) -> ScreenGate {
+    let t = crate::tuning::get();
+    let luma = &src[0];
+    let (n8x, n8y) = (w8 / 8, h8 / 8);
+    if n8x < 2 || n8y < 2 {
+        return ScreenGate::default();
+    }
+    // Stage 1: per 16x16 block, is it palette-exact (few colours), and how
+    // many colours does it hold at all (lenient pre-screen for stage 2).
+    let (n16x, n16y) = (w8 / 16, h8 / 16);
+    let span_min = 64u32 << (bd - 8);
+    // Per 16-row band: palette-exact / lenient 16x16 flags plus the window
+    // hash of every non-flat aligned 8x8 (a cheap aligned-duplicate count
+    // completes the pre-screen for UI/text frames whose antialiased 16x16
+    // blocks hold more than 16 colours).
+    let bands = pool.map_indexed(pool.width(), n16y, |row| -> (Vec<bool>, u32, Vec<u32>) {
+        let mut few = Vec::with_capacity(n16x);
+        let mut lenient = 0u32;
+        let mut hashes = Vec::with_capacity(n16x * 4);
+        for col in 0..n16x {
+            let mut is_few = false;
+            if let Some(hist) = block_color_histogram(luma, w8, col * 16, row * 16, 16, 16) {
+                let values = hist.as_slice().iter().map(|&(v, _)| v);
+                let span = (values.clone().max().unwrap_or(0) - values.min().unwrap_or(0)) as u32;
+                if span >= span_min {
+                    lenient += u32::from(hist.len() <= 16);
+                    is_few = hist.len() <= 8;
+                }
+            }
+            few.push(is_few);
+            for (ox, oy) in [(0, 0), (8, 0), (0, 8), (8, 8)] {
+                let (x, y) = (col * 16 + ox, row * 16 + oy);
+                let first = luma[y * w8 + x];
+                if (0..8).any(|j| luma[(y + j) * w8 + x..][..8].iter().any(|&v| v != first)) {
+                    hashes.push(LossyIbcIndex::hash8(luma, w8, x, y));
+                }
+            }
+        }
+        (few, lenient, hashes)
+    });
+    let total16 = (n16x * n16y).max(1) as f32;
+    let few16 = bands.iter().map(|b| b.0.iter().filter(|&&f| f).count()).sum::<usize>() as u32;
+    let lenient16: u32 = bands.iter().map(|b| b.1).sum();
+    let few_share = few16 as f32 / total16;
+    let few_colour = few_share >= t.screen_few_share;
+    let mut seen: HashSet<u32> = HashSet::with_capacity(n16x * n16y * 4);
+    let dup8 = bands
+        .iter()
+        .flat_map(|b| b.2.iter())
+        .filter(|&&h| !seen.insert(h))
+        .count() as f32
+        / (4.0 * total16);
+    drop(seen);
+    let lenient_share = lenient16 as f32 / total16;
+    if lenient_share < t.ibc_gate_prescreen && dup8 < t.ibc_gate_prescreen {
+        return ScreenGate {
+            ibc_pays: false,
+            few_colour,
+        };
+    }
+    // Stage 2: copy gain per 16x16 block. An exact earlier 8x8 window (the
+    // IntraBC search's own anchor) proposes a DV; the block's gain is its
+    // texture mass minus what copying the whole 16x16 along that DV leaves
+    // as residual (text repeats exactly at the glyph and nearly around it),
+    // minus the DV overhead. Blocks that gain nothing and are not palette
+    // territory are the photo-like mass that pays for the lost loop filters;
+    // that loss scales with the deblocking level the q-law would apply.
+    let index = LossyIbcIndex::build(src, w8, h8, (sub_x, sub_y));
+    let dv_cost = (t.ibc_gate_dv * f32::from(crate::quant::ac_q(base_q_idx, bd)).powi(2)) as u64;
+    // Texture mass = gradient energy (squared neighbour differences): the
+    // bit-cost proxy that prices a sharp edge above a smooth ramp of the same
+    // swing, as the transform coder does, and is commensurate with the SSE
+    // a copy leaves behind.
+    let sad8 = |x: usize, y: usize| -> u64 {
+        let mut e = 0u64;
+        for j in 0..8 {
+            let row = &luma[(y + j) * w8 + x..][..8];
+            e += row.windows(2).map(|p| u64::from(p[0].abs_diff(p[1])).pow(2)).sum::<u64>();
+            if j > 0 {
+                let up = &luma[(y + j - 1) * w8 + x..][..8];
+                e += row.iter().zip(up).map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2)).sum::<u64>();
+            }
+        }
+        e
+    };
+    let rows = pool.map_indexed(pool.width(), n16y, |row| -> (u64, u64, u32) {
+        let py = row * 16;
+        let (mut gain, mut photo, mut copied) = (0u64, 0u64, 0u32);
+        for (col, &parent_few) in bands[row].0.iter().enumerate() {
+            let px = col * 16;
+            let subs = [(0usize, 0usize), (8, 0), (0, 8), (8, 8)];
+            let mass: u64 = subs.iter().map(|&(ox, oy)| sad8(px + ox, py + oy)).sum();
+            if mass == 0 {
+                continue;
+            }
+            // Best copy residual over the anchors' DVs (first few exact,
+            // earlier hits per sub-block; the search itself ranks further).
+            let mut best_res = u64::MAX;
+            for &(ox, oy) in &subs {
+                let (sx, sy) = (px + ox, py + oy);
+                let exact = |ax: usize, ay: usize| {
+                    (0..8).all(|j| luma[(ay + j) * w8 + ax..][..8] == luma[(sy + j) * w8 + sx..][..8])
+                };
+                let earlier = |ax: usize, ay: usize| ay + 8 <= sy || (ay <= sy && ax + 8 <= sx);
+                for (ax, ay) in index
+                    .candidates(luma, w8, sx, sy, 8, sy)
+                    .filter(|&(ax, ay)| earlier(ax, ay) && exact(ax, ay))
+                    .take(3)
+                {
+                    // DV of the whole 16x16 along this anchor's offset.
+                    let (Some(rx), Some(ry)) = ((px + ax).checked_sub(sx), (py + ay).checked_sub(sy)) else {
+                        continue;
+                    };
+                    if rx + 16 > w8 || ry + 16 > h8 || (ry + 16 > py && rx + 16 > px && ry < py + 16 && rx < px + 16) {
+                        continue;
+                    }
+                    let res: u64 = (0..16)
+                        .map(|j| {
+                            luma[(py + j) * w8 + px..][..16]
+                                .iter()
+                                .zip(&luma[(ry + j) * w8 + rx..][..16])
+                                .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
+                                .sum::<u64>()
+                        })
+                        .sum();
+                    best_res = best_res.min(res);
+                    if best_res == 0 {
+                        break;
+                    }
+                }
+                if best_res == 0 {
+                    break;
+                }
+            }
+            let g = if best_res == u64::MAX {
+                0
+            } else {
+                mass.saturating_sub(best_res).saturating_sub(dv_cost)
+            };
+            if g > 0 {
+                gain += g;
+                copied += 1;
+            } else if !parent_few {
+                // Photo-like = what the intra coder transform-codes and the
+                // deblocker then cleans: not palette territory at 16x16, and
+                // per 8x8 not a text fragment either (<= 12 values spanning
+                // >= 64: glyph + background + antialiasing). Smooth gradients
+                // (small range) stay in — that is where blocking shows.
+                for &(ox, oy) in &subs {
+                    let text = block_color_histogram(luma, w8, px + ox, py + oy, 8, 8).is_some_and(|hist| {
+                        let values = hist.as_slice().iter().map(|&(v, _)| v);
+                        let span = (values.clone().max().unwrap_or(0) - values.min().unwrap_or(0)) as u32;
+                        hist.len() <= 12 && span >= span_min
+                    });
+                    if !text && sad8(px + ox, py + oy) > 0 {
+                        photo += 1;
+                    }
+                }
+            }
+        }
+        (gain, photo, copied)
+    });
+    let gain: u64 = rows.iter().map(|r| r.0).sum();
+    let photo: u64 = rows.iter().map(|r| r.1).sum();
+    let copied: u32 = rows.iter().map(|r| r.2).sum();
+    // Deblocking is worth roughly a fixed SSE per filtered block boundary
+    // step, i.e. per photo-like block it scales with the quantiser step (not
+    // its square: at coarse q the filter also costs detail), and nothing at
+    // all once the q-law switches the filter off.
+    let ac_q = f64::from(crate::quant::ac_q(base_q_idx, bd));
+    let lvl_y = crate::obu::loop_filter_levels(base_q_idx, sub_x + sub_y).0;
+    let loss = if lvl_y > 0 {
+        f64::from(t.ibc_gate_beta) * photo as f64 * ac_q
+    } else {
+        0.0
+    };
+    let ibc_pays = copied >= 4 && gain as f64 > loss;
+    ScreenGate {
+        ibc_pays,
+        few_colour,
+    }
+}
+
 /// `encode_lossy_tilegroup` output: tile-group bytes, tiling plan, CDEF and
 /// loop-restoration header params, `allow_intrabc`, and the searched deblock
 /// levels (`None` = the q-law).
@@ -3079,105 +3306,17 @@ pub(crate) fn encode_lossy_tilegroup(
         }
     }
 
-    // Repeated non-flat 16x16 content = screen content (text, UI). Measured
-    // whenever the screen tools are on — it also gates the text palette tools
-    // (`LossyTile::screen_frame`), so it must not depend on `--no-intrabc`.
-    let repeats = (screen_content || intrabc_allowed)
-        && !mono
-        && rects.iter().any(|r| {
-            // Coverage threshold: IntraBC costs the whole frame its loop
-            // filters, so one duplicate pair is NOT enough (h_vvc's letterbox
-            // bars measured +3.3% BD from lost deblock). Count NON-FLAT
-            // aligned 16x16 blocks with an exact earlier duplicate; require
-            // a meaningful fraction of the tile before paying the trade.
-            let exact16 = |ax: usize, ay: usize, bx: usize, by: usize| {
-                (0..3).all(|plane| {
-                    let sx = usize::from(plane != 0 && sub_x != 0);
-                    let sy = usize::from(plane != 0 && sub_y != 0);
-                    let stride = if plane == 0 { w8 } else { cw8 };
-                    let (bw, bh) = (16 >> sx, 16 >> sy);
-                    let (ax, ay) = ((r.x0 + ax) >> sx, (r.y0 + ay) >> sy);
-                    let (bx, by) = ((r.x0 + bx) >> sx, (r.y0 + by) >> sy);
-                    (0..bh).all(|row| {
-                        src[plane][(ay + row) * stride + ax..][..bw]
-                            == src[plane][(by + row) * stride + bx..][..bw]
-                    })
-                })
-            };
-            let nly = r.th.saturating_sub(15).div_ceil(16);
-            let nlx = r.tw.saturating_sub(15).div_ceil(16);
-            let total = nly * nlx;
-            if total == 0 {
-                return false;
-            }
-            // dup * 20 >= total  <=>  dup >= ceil(total / 20); with the >= 8
-            // floor this is the exact pass threshold, so the raster walk below
-            // can stop the moment it is reached (positive early-out).
-            let need = 8usize.max(total.div_ceil(20));
-            // The content hash per block is ~99% of the gate's work and each
-            // block is independent, so hash rows in parallel; the duplicate
-            // count needs raster ("earlier block") semantics and stays serial.
-            let hash_row = |row: usize| -> Vec<(bool, u64)> {
-                let ly = row * 16;
-                (0..nlx)
-                    .map(|col| {
-                        let lx = col * 16;
-                        let (x0, y0) = (r.x0 + lx, r.y0 + ly);
-                        // Flat blocks (single luma value) duplicate trivially —
-                        // black bars, blank sky — and gain nothing from a copy
-                        // that DC prediction doesn't already provide.
-                        let first = src[0][y0 * w8 + x0];
-                        let flat = (0..16).all(|row| {
-                            src[0][(y0 + row) * w8 + x0..][..16]
-                                .iter()
-                                .all(|&v| v == first)
-                        });
-                        if flat {
-                            return (true, 0);
-                        }
-                        let mut h = 0xcbf2_9ce4_8422_2325u64;
-                        for (plane, sp) in src.iter().enumerate() {
-                            let sx = usize::from(plane != 0 && sub_x != 0);
-                            let sy = usize::from(plane != 0 && sub_y != 0);
-                            let stride = if plane == 0 { w8 } else { cw8 };
-                            let (x, y) = ((r.x0 + lx) >> sx, (r.y0 + ly) >> sy);
-                            let (bw, bh) = (16 >> sx, 16 >> sy);
-                            for row in 0..bh {
-                                for &v in &sp[(y + row) * stride + x..][..bw] {
-                                    h ^= v as u64;
-                                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                                }
-                            }
-                        }
-                        (false, h)
-                    })
-                    .collect()
-            };
-            let rows = pool.map_indexed(pool.width(), nly, hash_row);
-            let mut seen: HashMap<u64, (usize, usize)> = HashMap::new();
-            let mut dup = 0usize;
-            for (row, cells) in rows.iter().enumerate() {
-                for (col, &(flat, h)) in cells.iter().enumerate() {
-                    if flat {
-                        continue;
-                    }
-                    let (lx, ly) = (col * 16, row * 16);
-                    if let Some(&(ox, oy)) = seen.get(&h) {
-                        if exact16(ox, oy, lx, ly) {
-                            dup += 1;
-                            if dup >= need {
-                                return true;
-                            }
-                        }
-                    } else {
-                        seen.insert(h, (lx, ly));
-                    }
-                }
-            }
-            false
-        });
-    let allow_intrabc = intrabc_allowed && repeats;
-    let screen_frame = screen_content && repeats;
+    // Screen-content / IntraBC frame decision: a rate model over the frame's
+    // texture mass, see `screen_frame_gate`. Measured whenever either consumer
+    // is on: it also gates the text palette tools (`LossyTile::screen_frame`),
+    // so that half must not depend on `--no-intrabc`.
+    let gate = if !mono && (screen_content || intrabc_allowed) {
+        screen_frame_gate(src, w8, h8, sub_x, sub_y, bd, base_q_idx, pool)
+    } else {
+        ScreenGate::default()
+    };
+    let allow_intrabc = intrabc_allowed && gate.ibc_pays;
+    let screen_frame = screen_content && (gate.ibc_pays || gate.few_colour);
 
     let n = rects.len();
     let nthreads = want.clamp(1, n.max(1));
@@ -5637,6 +5776,161 @@ mod aq_tests {
             assert_eq!(packed_cdfs.skip, reference_cdfs.skip);
             assert_eq!(packed_cdfs.part_split, reference_cdfs.part_split);
         }
+    }
+
+    #[test]
+    fn angle_shortlist_keeps_predictions_paired_with_deltas() {
+        fn check<const N: usize>(dim: usize) {
+            let w = 64;
+            let src = std::array::from_fn(|p| {
+                (0..w * w)
+                    .map(|i| ((i * 37 + i / w * 53 + p * 17) & 1023) as u16)
+                    .collect()
+            });
+            let mut tile = LossyTile::new(140, 10, w, w, &src, QmLevels::FLAT);
+            tile.recon.clone_from(&src);
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for budget in 0..=2 {
+                    let (mut a, mut b, mut scratch) = ([0; N], [0; N], [0; N]);
+                    let mut preds = [&mut a, &mut b, &mut scratch];
+                    let deltas = tile.rank_angle_deltas::<N>(
+                        mode, 8, 8, dim, dim, true, true, budget, &mut preds,
+                    );
+                    assert_eq!(deltas.len(), budget);
+                    let mut previous = 0;
+                    for (i, &delta) in deltas.iter().enumerate() {
+                        let mut expected = [0; N];
+                        tile.intrapred.predict_nd_ad(
+                            mode,
+                            delta,
+                            &tile.recon[0],
+                            w,
+                            8,
+                            8,
+                            dim,
+                            dim,
+                            true,
+                            true,
+                            w,
+                            w,
+                            tile.luma_filter_type(8, 8),
+                            &mut expected,
+                            10,
+                        );
+                        assert_eq!(
+                            *preds[i], expected,
+                            "{dim} mode={mode} budget={budget} delta={delta}"
+                        );
+                        let score =
+                            tile.rd
+                                .satd_sad_proxy(tile.src_blk(0, 8, 8, dim, dim), &expected, dim);
+                        assert!(score >= previous);
+                        previous = score;
+                    }
+                }
+            }
+        }
+        check::<64>(8);
+        check::<256>(16);
+        check::<1024>(32);
+    }
+
+    #[test]
+    fn ordinary_luma_syntax_includes_directional_zero_delta() {
+        let src = std::array::from_fn(|_| vec![128; 64 * 64]);
+        let tile = LossyTile::new(140, 8, 64, 64, &src, QmLevels::FLAT);
+        for dim in [8, 16, 32] {
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for delta in -3..=3 {
+                    let expected = tile.mode_bits(8, 8, mode)
+                        + cdf_cost(
+                            &tile.dcdf().angle_delta[mode - V_PRED],
+                            (delta + 3) as usize,
+                        );
+                    assert_eq!(
+                        tile.luma_intra_syntax_bits(8, 8, dim, dim, mode, delta),
+                        expected
+                    );
+                }
+            }
+            let dc = tile.mode_bits(8, 8, DC_PRED)
+                + cdf_cost(&tile.dcdf().filter_intra[av1_block_size_index(dim, dim)], 0);
+            assert_eq!(tile.luma_intra_syntax_bits(8, 8, dim, dim, DC_PRED, 0), dc);
+            assert_eq!(
+                tile.luma_intra_syntax_bits(8, 8, dim, dim, PAETH_PRED, 0),
+                tile.mode_bits(8, 8, PAETH_PRED)
+            );
+        }
+        assert_eq!(
+            tile.luma_intra_syntax_bits(8, 8, 4, 4, V_PRED, 0),
+            tile.mode_bits(8, 8, V_PRED)
+        );
+    }
+
+    #[test]
+    fn global_angles_recover_a_family_pruned_at_delta_zero() {
+        fn check<const N: usize>(dim: usize) {
+            let w = 64;
+            let recon: Vec<u16> = (0..w * w)
+                .map(|i| ((i * 37 + i / w * 53 + (i ^ (i / w)) * 11) & 255) as u16)
+                .collect();
+            let dispatch = IntraPredDispatch::selected();
+            let mut recovered = false;
+            for mode in V_PRED..=VERT_LEFT_PRED {
+                for delta in [-3, -2, -1, 1, 2, 3] {
+                    let mut target = [0; N];
+                    dispatch.predict_nd_ad(
+                        mode,
+                        delta,
+                        &recon,
+                        w,
+                        8,
+                        8,
+                        dim,
+                        dim,
+                        true,
+                        true,
+                        w,
+                        w,
+                        false,
+                        &mut target,
+                        8,
+                    );
+                    let mut src = std::array::from_fn(|_| recon.clone());
+                    for y in 0..dim {
+                        for x in 0..dim {
+                            src[0][(8 + y) * w + 8 + x] = target[y * dim + x] as u16;
+                        }
+                    }
+                    let mut tile = LossyTile::new(140, 8, w, w, &src, QmLevels::FLAT)
+                        .with_speed(Speed::ExtraSlow);
+                    tile.recon[0].clone_from(&recon);
+                    let nominal =
+                        tile.rank_luma_modes::<N>(nd_modes(), 8, 8, dim, dim, true, true, 1);
+                    if nominal.contains(&mode) {
+                        continue;
+                    }
+                    let candidates =
+                        tile.rank_luma_candidates::<N>(nd_modes(), 8, 8, dim, dim, true, true, 1);
+                    assert_eq!(candidates.len(), 3);
+                    assert_eq!(candidates[0], (nominal[0], 0));
+                    if candidates.contains(&(mode, delta)) {
+                        recovered = true;
+                        break;
+                    }
+                }
+                if recovered {
+                    break;
+                }
+            }
+            assert!(
+                recovered,
+                "no pruned angular family recovered for {dim}x{dim}"
+            );
+        }
+        check::<64>(8);
+        check::<256>(16);
+        check::<1024>(32);
     }
 
     #[test]
