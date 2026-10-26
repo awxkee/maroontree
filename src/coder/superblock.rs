@@ -206,10 +206,58 @@ impl<'a> LossyTile<'a> {
         bits
     }
 
+    /// Dominant edge direction of the source block as an AV1 prediction angle
+    /// (degrees in [0, 180)) and that direction's share of the gradient
+    /// energy: a 3-degree orientation histogram of squared central-difference
+    /// gradients over the block interior; the peak is the [1 2 1]-smoothed
+    /// maximum and the share is its three bins over the total.
+    fn luma_gradient_peak(&self, px: usize, py: usize, w: usize, h: usize) -> (f32, f32) {
+        const BINS: usize = 60;
+        let src = &self.src[0];
+        let stride = self.w;
+        let mut hist = [0f32; BINS];
+        let mut total = 0f32;
+        for y in py + 1..py + h - 1 {
+            for x in px + 1..px + w - 1 {
+                let i = y * stride + x;
+                let dx = src[i + 1] as f32 - src[i - 1] as f32;
+                let dy = src[i + stride] as f32 - src[i - stride] as f32;
+                let mag = dx * dx + dy * dy;
+                if mag == 0.0 {
+                    continue;
+                }
+                // The edge line is perpendicular to the gradient; image y points
+                // down while AV1 angles use y up, so line angle = atan2(-dy, dx) + 90.
+                let a = ((-dy).atan2(dx).to_degrees() + 90.0).rem_euclid(180.0);
+                let b = ((a / 3.0).round() as usize) % BINS;
+                hist[b] += mag;
+                total += mag;
+            }
+        }
+        if total <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let mut best = (0usize, -1.0f32);
+        for b in 0..BINS {
+            let m = hist[(b + BINS - 1) % BINS] + 2.0 * hist[b] + hist[(b + 1) % BINS];
+            if m > best.1 {
+                best = (b, m);
+            }
+        }
+        let share =
+            (hist[(best.0 + BINS - 1) % BINS] + hist[best.0] + hist[(best.0 + 1) % BINS]) / total;
+        (best.0 as f32 * 3.0, share)
+    }
+
     /// Preserve the nominal shortlist and add two globally ranked nonzero
     /// angles. A family that loses at delta zero can now reach full RD and the
-    /// luma/UV beam. ExtraSlow enables this search; other tiers can probe it
-    /// with `joint_angle_search` before changing their measured speed budgets.
+    /// luma/UV beam. Slow and ExtraSlow run this search (SHIPPED 2026-10-26 with
+    /// the gradient gate: 4 photos/synth -1.05 (420) / -1.07 (444), illustrations
+    /// -2.70 / -1.59, +4-6% instructions); Medium can probe it with
+    /// `joint_angle_search`. The gradient-orientation gate (`angle_hog_gate`,
+    /// `angle_hog_win`) keeps the same BD at a third of the ungated cost: an
+    /// exhaustive all-pairs oracle measured WORSE than two finalists, so the
+    /// gate only drops candidates that never paid.
     #[allow(clippy::too_many_arguments)]
     fn rank_luma_candidates<const N: usize>(
         &self,
@@ -221,7 +269,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
         budget: usize,
-    ) -> FixedList<(usize, i32), 15> {
+    ) -> FixedList<(usize, i32), 64> {
         let mut out = FixedList::new((DC_PRED, 0));
         let nominal = self.rank_luma_modes::<N>(modes, px, py, w, h, have_tr, have_bl, budget);
         for &mode in modes {
@@ -232,10 +280,20 @@ impl<'a> LossyTile<'a> {
         if w < 8
             || h < 8
             || !self.speed.try_angle_deltas_av1(w.max(h), self.base_q_idx)
-            || !(self.speed == Speed::ExtraSlow || crate::tuning::get().joint_angle_search)
+            || !(self.speed.at_least_slow() || crate::tuning::get().joint_angle_search)
         {
             return out;
         }
+        let tune = crate::tuning::get();
+        let hog_peak = if tune.angle_hog_gate > 0.0 && !tune.joint_angle_all {
+            let (angle, share) = self.luma_gradient_peak(px, py, w, h);
+            if share < tune.angle_hog_gate {
+                return out;
+            }
+            Some(angle)
+        } else {
+            None
+        };
         let mut ranked = FixedList::<(u64, f32, usize, i32), 48>::new((0, 0.0, DC_PRED, 0));
         let mut pred = [0i32; N];
         for &mode in modes {
@@ -243,6 +301,13 @@ impl<'a> LossyTile<'a> {
                 continue;
             }
             for delta in [-3, -2, -1, 1, 2, 3] {
+                if let Some(peak) = hog_peak {
+                    let a = (mode_base_angle(mode) + 3 * delta) as f32;
+                    let d = (a - peak).rem_euclid(180.0);
+                    if d.min(180.0 - d) > tune.angle_hog_win {
+                        continue;
+                    }
+                }
                 self.intrapred.predict_nd_ad(
                     mode,
                     delta,
@@ -274,7 +339,12 @@ impl<'a> LossyTile<'a> {
                 .then(a.1.total_cmp(&b.1))
                 .then((a.2, a.3).cmp(&(b.2, b.3)))
         });
-        for &(_, _, mode, delta) in ranked.iter().take(2) {
+        let take = if tune.joint_angle_all {
+            ranked.len()
+        } else {
+            tune.joint_angle_count as usize
+        };
+        for &(_, _, mode, delta) in ranked.iter().take(take) {
             out.push((mode, delta));
         }
         out
@@ -985,5 +1055,20 @@ impl<'a> LossyTile<'a> {
                 self.decode_sb(bl + 1, cx, cy, hh, cthr, clhb);
             }
         }
+    }
+}
+
+/// Spec `Mode_To_Angle`: the nominal prediction angle of a directional mode.
+fn mode_base_angle(mode: usize) -> i32 {
+    match mode {
+        V_PRED => 90,
+        H_PRED => 180,
+        D45_PRED => 45,
+        D135_PRED => 135,
+        D113_PRED => 113,
+        D157_PRED => 157,
+        D203_PRED => 203,
+        VERT_LEFT_PRED => 67,
+        _ => unreachable!("not a directional mode"),
     }
 }
