@@ -349,6 +349,18 @@ pub(crate) struct Tuning {
     pub(crate) palette_medium: bool,
     pub(crate) palette_budget_medium: u32,
     pub(crate) angle_deltas_medium: bool,
+    /// Gradient-orientation gate on the global angular finalists: the block's
+    /// dominant source edge direction must carry at least this share of the
+    /// gradient energy (0 = no gate), and finalists must lie within
+    /// `angle_hog_win` degrees of it. SHIPPED 0.3 / 15: same BD as ungated
+    /// (gate 0.3 / 9 deg lost a third of the gain) at +4-6% instructions
+    /// instead of +17-19%.
+    pub(crate) angle_hog_gate: f32,
+    pub(crate) angle_hog_win: f32,
+    /// Number of global (mode, nonzero delta) finalists (study; shipped 2).
+    pub(crate) joint_angle_count: u32,
+    /// Oracle: admit every nonzero (mode, delta) pair to full RD.
+    pub(crate) joint_angle_all: bool,
     pub(crate) full_chroma_rdo_medium: bool,
     pub(crate) min_size_16_fast: bool,
     pub(crate) min_size_16_medium: bool,
@@ -686,6 +698,10 @@ impl Tuning {
         palette_medium: true,
         palette_budget_medium: 1,
         angle_deltas_medium: true,
+        angle_hog_gate: 0.3,
+        angle_hog_win: 15.0,
+        joint_angle_count: 2,
+        joint_angle_all: false,
         full_chroma_rdo_medium: true,
         min_size_16_fast: false,
         min_size_16_medium: true,
@@ -950,6 +966,10 @@ mod imp {
                 "palette_medium" => t.palette_medium = flag(value),
                 "palette_budget_medium" => t.palette_budget_medium = num(value) as u32,
                 "angle_deltas_medium" => t.angle_deltas_medium = flag(value),
+                "angle_hog_gate" => t.angle_hog_gate = num(value),
+                "angle_hog_win" => t.angle_hog_win = num(value),
+                "joint_angle_count" => t.joint_angle_count = num(value) as u32,
+                "joint_angle_all" => t.joint_angle_all = flag(value),
                 "full_chroma_rdo_medium" => t.full_chroma_rdo_medium = flag(value),
                 "min_size_16_fast" => t.min_size_16_fast = flag(value),
                 "min_size_16_medium" => t.min_size_16_medium = flag(value),

@@ -28,7 +28,9 @@
  */
 use crate::gainmap::{ParsedGainMap, parse_apple_gain_map};
 use crate::orientation::apply_orientation;
-use crate::{Args, Chroma, Depth, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
+use crate::{
+    Args, Chroma, Depth, EncodingEffort, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
+};
 use hpvca::ChromaFormat;
 use image::{DynamicImage, Luma};
 use std::fs;
@@ -546,6 +548,16 @@ fn hpvca_cicp(cicp: crate::PngCicp) -> hpvca::Cicp {
     }
 }
 
+impl EncodingEffort {
+    /// hpvca has two tiers: Slow (ExtraSlow/Slow) and Fast (Medium/Fast).
+    fn to_hpvca(self) -> hpvca::Speed {
+        match self {
+            EncodingEffort::ExtraSlow | EncodingEffort::Slow => hpvca::Speed::Slow,
+            EncodingEffort::Medium | EncodingEffort::Fast => hpvca::Speed::Fast,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_hevc(
     img: &DynamicImage,
@@ -570,7 +582,11 @@ pub(crate) fn encode_hevc(
     let mut cfg = hpvca::EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
-        .with_threads(args.threads);
+        .with_threads(args.threads)
+        .with_speed(args.speed.to_hpvca())
+        .with_sao(true)
+        .with_persistent_rice(true)
+        .with_implicit_rdpcm(args.lossless);
 
     if let Some(cicp) = png_cicp {
         cfg = cfg.with_cicp(hpvca_cicp(cicp));
