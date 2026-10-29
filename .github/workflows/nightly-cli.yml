@@ -1,0 +1,82 @@
+name: CLI builds
+run-name: CLI ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }} (${{ inputs.encoder_source == 'released' && 'released' || 'git' }} encoders) - ${{ github.ref_name }}
+
+on:
+  schedule:
+    - cron: '23 19 * * *'
+  workflow_dispatch:
+    inputs:
+      encoder_source:
+        description: 'Encoder dependencies: latest Git heads or released crates'
+        type: choice
+        required: true
+        default: git
+        options:
+          - git
+          - released
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-build-${{ github.ref }}-${{ github.event_name }}-${{ inputs.encoder_source == 'released' && 'released' || 'git' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CLI (${{ matrix.platform }}, ${{ inputs.encoder_source == 'released' && 'released' || 'git' }} encoders)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            executable: maroontree-cli
+          - os: macos-latest
+            platform: macos-arm64
+            executable: maroontree-cli
+          - os: windows-latest
+            platform: windows-x86_64
+            executable: maroontree-cli.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      BUILD_KIND: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      ENCODER_SOURCE: ${{ inputs.encoder_source == 'released' && 'released' || 'git' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Use latest encoder Git sources
+        if: env.ENCODER_SOURCE == 'git'
+        run: python .github/scripts/prepare-nightly.py
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: Test CLI
+        run: cargo test -p maroontree-cli --all-features --locked
+      - name: Build release CLI
+        run: cargo build -p maroontree-cli --release --all-features --locked
+      - name: Smoke test every encoder
+        run: python .github/scripts/smoke-cli.py target/release/${{ matrix.executable }}
+      - name: Package binary and resolved versions
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.executable }} dist/
+          cp Cargo.lock dist/
+          cp LICENSE.md LICENSE-APACHE.md dist/
+          target/release/${{ matrix.executable }} --version | tee dist/versions.txt
+          target/release/${{ matrix.executable }} -e jxl --list-overrides
+          target/release/${{ matrix.executable }} -e av1 --encoder-version
+          tar -czf "maroontree-cli-${BUILD_KIND}-${ENCODER_SOURCE}-${{ matrix.platform }}.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: maroontree-cli-${{ env.BUILD_KIND }}-${{ env.ENCODER_SOURCE }}-${{ matrix.platform }}
+          path: maroontree-cli-${{ env.BUILD_KIND }}-${{ env.ENCODER_SOURCE }}-${{ matrix.platform }}.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
