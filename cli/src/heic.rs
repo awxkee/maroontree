@@ -503,7 +503,7 @@ fn finish_monochrome(
     Ok(apply_orientation(img, dec.orientation))
 }
 
-fn hpvca_cicp(cicp: crate::PngCicp) -> hpvca::Cicp {
+pub(crate) fn hpvca_cicp(cicp: crate::PngCicp) -> hpvca::Cicp {
     use hpvca::{MatrixCoefficients, Primaries, TransferFunction};
 
     let primaries = match cicp.color_primaries {
@@ -575,10 +575,6 @@ pub(crate) fn encode_hevc(
         Chroma::C420 => ChromaFormat::Yuv420,
     };
 
-    if args.lossless && chroma_fmt != ChromaFormat::Yuv444 {
-        return Err(anyhow::anyhow!(HeicError::Lossless444(chroma_fmt)));
-    }
-
     let mut cfg = hpvca::EncodeConfig::new()
         .with_quality(args.quality)
         .with_chroma(chroma_fmt)
@@ -603,7 +599,7 @@ pub(crate) fn encode_hevc(
         cfg = cfg.with_lossless(true);
     }
 
-    if let Some(gain_map) = gain_map {
+    if let Some(gain_map) = gain_map.filter(|_| !args.no_gain_map) {
         match crate::gainmap::hevc_gain_map(gain_map) {
             Ok(heic) => {
                 if args.verbose {
@@ -620,9 +616,17 @@ pub(crate) fn encode_hevc(
         }
     }
 
+    for option in &args.overrides {
+        option.apply_heic(&mut cfg).map_err(anyhow::Error::msg)?;
+    }
+    if cfg.lossless && cfg.chroma != ChromaFormat::Yuv444 && !cfg.lossless_ycbcr {
+        return Err(anyhow::anyhow!(HeicError::Lossless444(cfg.chroma)));
+    }
+
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D16, _, _) => anyhow::bail!("16-bit output is supported only by JXL"),
         (Depth::D8, true, _) => {
             hpvca::encode_gray(img.to_luma8().as_raw(), img.width(), img.height(), &cfg)?
         }
@@ -669,4 +673,55 @@ pub(crate) fn encode_hevc(
             &cfg,
         )?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_heic_settings_reach_lossy_and_lossless_output() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 31) as u8, 128])
+        }));
+        for lossless in [false, true] {
+            let group = format!(
+                "heic:lossless={lossless},quality=60,speed=fast,threads=1,parallelism=single,sao=false,persistent-rice=false,implicit-rdpcm=false,orientation=6,max-cll=1000,max-fall=400"
+            );
+            let args = crate::args::try_parse(&[
+                "cli", "-e", "heic", "-q", "99", "-s", "slow", "-O", &group, "in.png",
+            ])
+            .unwrap();
+            let actual = encode_hevc(
+                &image,
+                &args,
+                image.color(),
+                Depth::D8,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let reference = hpvca::EncodeConfig::new()
+                .with_lossless(lossless)
+                .with_quality(60)
+                .with_chroma(if lossless {
+                    ChromaFormat::Yuv444
+                } else {
+                    ChromaFormat::Yuv422
+                })
+                .with_speed(hpvca::Speed::Fast)
+                .with_threads(1)
+                .with_parallelism(hpvca::ParallelismStrategy::Single)
+                .with_sao(false)
+                .with_persistent_rice(false)
+                .with_implicit_rdpcm(false)
+                .with_orientation(hpvca::Orientation::Rotate90)
+                .with_content_light_level(hpvca::ContentLightLevel::new(1000, 400));
+            let expected = hpvca::encode_rgb(image.to_rgb8().as_raw(), 8, 8, &reference).unwrap();
+            assert_eq!(actual, expected);
+            hpvcd::decode_heic_yuv_with_settings(&actual, &hpvcd::HeicSettings::new()).unwrap();
+        }
+    }
 }

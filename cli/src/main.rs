@@ -27,34 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! # avif — CLI encoder
-//!
-//! ```text
-//! Usage: avif [OPTIONS] <INPUT> [OUTPUT]
-//!
-//! Arguments:
-//!   <INPUT>   Source image (PNG, JPEG, WebP, TIFF, GIF, BMP, …)
-//!   [OUTPUT]  Destination .avif  [default: INPUT stem + ".avif"]
-//!
-//! Options:
-//!   -e, --encoder <av1|av2|hevc|jxl,vvc>     Encoder backend                 [default: av1]
-//!   -q, --quality <1-100>                    Encode quality (higher = better) [default: 80(AV1)/60(AV2)]
-//!       --lossless                           Pixel-perfect lossless
-//!   -c, --chroma <444|422|420>               Chroma subsampling              [default: 420]
-//!   -d, --depth <8|10|12>                    Output bit depth (auto-detect from source)
-//!   -t, --threads <N>                        Worker threads; 0 = all cores   [default: all]
-//!       --no-alpha                           Discard alpha channel
-//!       --no-screen-content                  Skip palette (screen-content) search
-//!       --no-intrabc                         Veto lossy IntraBC (keeps loop filters)
-//!       --cdef                               Enable AV1 CDEF (per-unit RD strength search)
-//!       --wiener                             Enable luma Wiener loop restoration
-//!       --no-exif                            Strip EXIF from output
-//!       --no-icc                             Strip ICC profile from output
-//!   -s, --speed                              Encoding effort: extraslow|slow|medium|fast (default = slow)
-//!   -v, --verbose                            Print dimensions, timing, file size
-//!   -h, --help                               Print this help
-//! ```
+//! Image encoder CLI. Run `maroontree-cli --help` for options and examples.
 
+mod args;
 mod av1_lossless;
 mod av1_lossy;
 mod av2_decode;
@@ -66,9 +41,10 @@ mod gainmap;
 #[cfg(feature = "heic")]
 mod heic;
 mod jxl;
-#[cfg(feature = "heic")]
 mod orientation;
+mod overrides;
 mod raster;
+mod version;
 #[cfg(feature = "vvc")]
 mod vvc;
 
@@ -102,6 +78,7 @@ enum Depth {
     D8,
     D10,
     D12,
+    D16,
 }
 
 #[derive(Debug)]
@@ -117,6 +94,7 @@ struct Args {
     no_alpha: bool,
     no_exif: bool,
     no_icc: bool,
+    no_gain_map: bool,
     apply_icc: bool,
     verbose: bool,
     speed: EncodingEffort,
@@ -126,6 +104,7 @@ struct Args {
     intrabc: bool,
     cdef: bool,
     wiener: bool,
+    overrides: Vec<overrides::EncoderOverride>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,74 +169,6 @@ impl PngCicp {
     }
 }
 
-#[cfg(test)]
-mod cicp_tests {
-    use super::*;
-
-    #[test]
-    fn maps_png_rec2100_pq_to_avif_cicp() {
-        let cicp = PngCicp {
-            color_primaries: 9,
-            transfer_function: 16,
-            matrix_coefficients: 0,
-            full_range: true,
-        }
-        .to_maroontree(maroontree::MatrixCoefficients::Smpte170m, true);
-
-        assert_eq!(cicp.primaries, maroontree::Primaries::Bt2020);
-        assert_eq!(cicp.transfer, maroontree::TransferFunction::Smpte2084);
-        assert_eq!(cicp.matrix, maroontree::MatrixCoefficients::Smpte170m);
-        assert!(cicp.full_range);
-    }
-
-    #[test]
-    fn unknown_png_cicp_codes_become_unspecified() {
-        let cicp = PngCicp {
-            color_primaries: u8::MAX,
-            transfer_function: u8::MAX,
-            matrix_coefficients: 0,
-            full_range: true,
-        }
-        .to_maroontree(maroontree::MatrixCoefficients::Identity, true);
-
-        assert_eq!(cicp.primaries, maroontree::Primaries::Unspecified);
-        assert_eq!(cicp.transfer, maroontree::TransferFunction::Unspecified);
-    }
-}
-
-fn usage() -> ! {
-    eprintln!(
-        "\
-Usage: avif [OPTIONS] <INPUT> [OUTPUT]
-
-Arguments:
-  <INPUT>   Source image (PNG, JPEG, WebP, TIFF, …)
-  [OUTPUT]  Output .avif  [default: input stem + \".avif\"]
-
-Options:
-  -e, --encoder <av1|av2|hevc|jxl,vvc>  Encoder backend                 [default: av1]
-  -q, --quality <1-100>                 Quality (higher = better)       [default: 80(AV1)/60(AV2)]
-      --lossless                        Pixel-perfect lossless (AV2 only)
-  -c, --chroma <444|422|420>            Chroma subsampling              [default: 420]
-  -d, --depth <8|10|12>                 Output bit depth (auto from source)
-  -t, --threads <N>                     Worker threads; 0 = all cores   [default: all]
-      --no-alpha                        Discard alpha channel
-      --no-screen-content               Skip palette (screen-content) search
-      --no-intrabc                      Veto lossy IntraBC (keeps loop filters)
-      --cdef                            Enable AV1 CDEF (per-unit RD strength search)
-      --wiener                          Enable luma Wiener loop restoration
-      --no-exif                         Strip EXIF metadata from output
-      --no-icc                          Strip ICC color profile from output
-      --apply-icc                       Apply ICC profile to pixels (convert to sRGB), then strip it
-      --qm <auto|0-15>                  Enable AV1 quantization matrices
-      --no-cdf-update                   Freeze AV1 entropy CDFs
-  -s, --speed                           Encoding effort: extraslow|slow|medium|fast (default = slow)
-  -v, --verbose                         Print timing and file stats
-  -h, --help                            Print this help"
-    );
-    std::process::exit(0);
-}
-
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
@@ -294,170 +205,6 @@ impl EncodingEffort {
     }
 }
 
-fn parse_args() -> Args {
-    let mut args = std::env::args().skip(1).peekable();
-    let mut input: Option<PathBuf> = None;
-    let mut output: Option<PathBuf> = None;
-    let mut encoder = Encoder::Av1;
-    let mut quality: Option<u8> = None;
-    let mut lossless = false;
-    let mut chroma: Option<Chroma> = None;
-    let mut depth: Option<Depth> = None;
-    let mut threads: usize = basic_concurrency();
-    let mut no_alpha = false;
-    let mut screen_content = true;
-    let mut intrabc = true;
-    let mut cdef = false;
-    let mut wiener = false;
-    let mut no_exif = false;
-    let mut no_icc = false;
-    let mut apply_icc = false;
-    let mut verbose = false;
-    let mut speed = EncodingEffort::Slow;
-    let mut qmatrix = None;
-    let mut updating_cdf = true;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => usage(),
-            "-v" | "--verbose" => verbose = true,
-            "--lossless" => lossless = true,
-            "--no-alpha" => no_alpha = true,
-            "--no-screen-content" => screen_content = false,
-            "--no-intrabc" => intrabc = false,
-            "--cdef" => cdef = true,
-            "--wiener" => wiener = true,
-            "--no-exif" => no_exif = true,
-            "--no-icc" => no_icc = true,
-            "--apply-icc" => apply_icc = true,
-            "--no-cdf-update" => updating_cdf = false,
-            "--qm" => {
-                let value = args.next().unwrap_or_default();
-                qmatrix = Some(if value == "auto" {
-                    Qmatrix::Auto
-                } else {
-                    let level = value.parse::<u8>().unwrap_or_else(|_| {
-                        die(format!(
-                            "invalid qmatrix level '{value}'; expected auto or 0-15"
-                        ))
-                    });
-                    if level > 15 {
-                        die("qmatrix level must be 0-15");
-                    }
-                    Qmatrix::Level(level)
-                });
-            }
-            "-e" | "--encoder" => match args.next().unwrap_or_default().as_str() {
-                "av1" => encoder = Encoder::Av1,
-                "av2" => encoder = Encoder::Av2,
-                "hevc" | "heic" | "heif" => encoder = Encoder::Hevc,
-                "jxl" | "jpegxl" | "jpeg-xl" => encoder = Encoder::JpegXl,
-                "vvc" => encoder = Encoder::Vvc,
-                other => die(format!("unknown encoder '{other}'; use av1 or av2")),
-            },
-            "-q" | "--quality" => {
-                let v = args.next().unwrap_or_default();
-                let new_quality = v
-                    .parse::<u8>()
-                    .unwrap_or_else(|_| die(format!("invalid quality '{v}'; expected 1-100")));
-                if new_quality > 100 {
-                    die("quality must be 1-100");
-                }
-                quality = Some(new_quality);
-            }
-            "-c" | "--chroma" => {
-                chroma = Some(match args.next().unwrap_or_default().as_str() {
-                    "444" => Chroma::C444,
-                    "422" => Chroma::C422,
-                    "420" => Chroma::C420,
-                    other => die(format!("unknown chroma '{other}'; use 444, 422, or 420")),
-                })
-            }
-            "-d" | "--depth" => {
-                depth = Some(match args.next().unwrap_or_default().as_str() {
-                    "8" => Depth::D8,
-                    "10" => Depth::D10,
-                    "12" => Depth::D12,
-                    other => die(format!("unsupported depth '{other}'; use 8, 10, or 12")),
-                })
-            }
-            "-s" | "--speed" => {
-                speed = match args.next().unwrap_or_default().as_str() {
-                    "extraslow" => EncodingEffort::ExtraSlow,
-                    "slow" => EncodingEffort::Slow,
-                    "medium" => EncodingEffort::Medium,
-                    "fast" => EncodingEffort::Fast,
-                    other => die(format!(
-                        "unsupported speed '{other}'; use extraslow, slow, medium, or fast"
-                    )),
-                }
-            }
-            "-t" | "--threads" => {
-                let v = args
-                    .next()
-                    .unwrap_or_else(|| format!("{}", basic_concurrency()));
-                threads = v
-                    .parse()
-                    .unwrap_or_else(|_| die(format!("invalid thread count '{v}'")));
-                if threads == 0 {
-                    threads = basic_concurrency();
-                }
-            }
-            path => {
-                if input.is_none() {
-                    input = Some(PathBuf::from(path));
-                } else if output.is_none() {
-                    output = Some(PathBuf::from(path));
-                } else {
-                    die(format!("unexpected argument '{path}'"));
-                }
-            }
-        }
-    }
-
-    let input = input.unwrap_or_else(|| die("no input file specified; use --help"));
-    let output = output.unwrap_or_else(|| {
-        let stem = input.file_stem().unwrap_or_default();
-        let parent = input.parent().unwrap_or(Path::new("."));
-        parent.join(stem).with_extension("avif")
-    });
-
-    Args {
-        input,
-        output,
-        encoder,
-        quality: match quality {
-            None => match encoder {
-                Encoder::Av1 => 80,
-                Encoder::Av2 => 60,
-                Encoder::Hevc => 80,
-                Encoder::JpegXl => 70,
-                Encoder::Vvc => 60,
-            },
-            Some(v) => v,
-        },
-        lossless,
-        chroma: match chroma {
-            None => Some(if lossless { Chroma::C444 } else { Chroma::C422 }),
-            Some(v) => Some(v),
-        },
-        depth,
-        threads,
-        no_alpha,
-        screen_content,
-        intrabc,
-        cdef,
-        wiener,
-        no_exif,
-        no_icc,
-        apply_icc,
-        verbose,
-        speed,
-        qmatrix,
-        updating_cdf,
-    }
-}
-
 fn is_16bit(ct: image::ColorType) -> bool {
     use image::ColorType::*;
     matches!(ct, L16 | La16 | Rgb16 | Rgba16)
@@ -479,6 +226,18 @@ fn scale16_to_10(src: &[u16]) -> Vec<u16> {
 
 fn scale16_to_12(src: &[u16]) -> Vec<u16> {
     src.iter().map(|&v| v >> 4).collect()
+}
+
+fn expand_to_16bit(buffer: &mut [u16], is12_bit: bool) {
+    if is12_bit {
+        for px in buffer.iter_mut() {
+            *px = (*px << 4) | (*px >> 8);
+        }
+    } else {
+        for px in buffer.iter_mut() {
+            *px = (*px << 6) | (*px >> 4);
+        }
+    }
 }
 
 fn read_exif(path: &Path) -> Option<Vec<u8>> {
@@ -780,14 +539,7 @@ fn avif_gain_map(
 }
 
 fn main() {
-    let args = parse_args();
-
-    if args.lossless
-        && let Some(c) = args.chroma
-        && c != Chroma::C444
-    {
-        die("--lossless requires --chroma 444");
-    }
+    let args = args::parse_args();
 
     // Raster output extensions take precedence over the selected encoder.
     let raster_format = raster::raster_output_format(&args.output);
@@ -801,11 +553,16 @@ fn main() {
     } = load_image(
         &args.input,
         matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
+            && !args.no_gain_map
             && raster_format.is_none(),
     );
     let color_type = img.color();
     let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
-        Depth::D10
+        if args.encoder == Encoder::JpegXl {
+            Depth::D16
+        } else {
+            Depth::D10
+        }
     } else {
         Depth::D8
     });
@@ -848,6 +605,10 @@ fn main() {
     };
 
     if args.verbose {
+        eprintln!("encoder: {}", version::encoder(args.encoder));
+        for option in &args.overrides {
+            eprintln!("override: {option}");
+        }
         match &exif_bytes {
             Some(b) => eprintln!("exif   : {} bytes", b.len()),
             None => eprintln!("exif   : none"),
@@ -999,5 +760,40 @@ fn main() {
         );
     } else {
         println!("{}", args.output.display());
+    }
+}
+
+#[cfg(test)]
+mod cicp_tests {
+    use super::*;
+
+    #[test]
+    fn maps_png_rec2100_pq_to_avif_cicp() {
+        let cicp = PngCicp {
+            color_primaries: 9,
+            transfer_function: 16,
+            matrix_coefficients: 0,
+            full_range: true,
+        }
+        .to_maroontree(maroontree::MatrixCoefficients::Smpte170m, true);
+
+        assert_eq!(cicp.primaries, maroontree::Primaries::Bt2020);
+        assert_eq!(cicp.transfer, maroontree::TransferFunction::Smpte2084);
+        assert_eq!(cicp.matrix, maroontree::MatrixCoefficients::Smpte170m);
+        assert!(cicp.full_range);
+    }
+
+    #[test]
+    fn unknown_png_cicp_codes_become_unspecified() {
+        let cicp = PngCicp {
+            color_primaries: u8::MAX,
+            transfer_function: u8::MAX,
+            matrix_coefficients: 0,
+            full_range: true,
+        }
+        .to_maroontree(maroontree::MatrixCoefficients::Identity, true);
+
+        assert_eq!(cicp.primaries, maroontree::Primaries::Unspecified);
+        assert_eq!(cicp.transfer, maroontree::TransferFunction::Unspecified);
     }
 }

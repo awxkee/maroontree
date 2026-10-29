@@ -37,6 +37,7 @@ use fast_transpose::{
     transpose_plane_with_alpha, transpose_plane16, transpose_plane16_with_alpha, transpose_rgb,
     transpose_rgb_f32, transpose_rgb16, transpose_rgba, transpose_rgba_f32, transpose_rgba16,
 };
+#[cfg(feature = "heic")]
 use hpvcd::Orientation;
 use image::GenericImageView;
 
@@ -274,6 +275,7 @@ macro_rules! apply_op {
 /// Apply EXIF orientation to a `DynamicImage`, consuming it and returning
 /// the corrected image.  After this the orientation is baked into pixels,
 /// so the EXIF tag should be reset to 1 on output.
+#[cfg(feature = "heic")]
 pub(crate) fn apply_orientation(
     img: image::DynamicImage,
     orientation: Orientation,

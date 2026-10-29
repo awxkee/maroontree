@@ -35,17 +35,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub(crate) fn expand_to_16bit(buffer: &mut [u16], is12_bit: bool) {
-    if is12_bit {
-        for px in buffer.iter_mut() {
-            *px = (*px << 4) | (*px >> 8);
-        }
-    } else {
-        for px in buffer.iter_mut() {
-            *px = (*px << 6) | (*px >> 4);
-        }
-    }
-}
+use crate::expand_to_16bit;
 
 #[derive(Error, Debug)]
 pub enum VvcError {
@@ -484,6 +474,7 @@ pub(crate) fn encode_vvc(
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D16, _, _) => anyhow::bail!("16-bit output is supported only by JXL"),
         (Depth::D8, true, _) => {
             garnetash::encode_gray(img.to_luma8().as_raw(), img.width(), img.height(), &cfg)?
         }

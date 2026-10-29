@@ -79,13 +79,17 @@ pub(crate) fn encode_av1_lossless(
         .with_speed(args.speed.to_maroontreee())
         .with_updating_cdf(args.updating_cdf);
 
+    for option in &args.overrides {
+        option.apply_av1(&mut cfg).map_err(anyhow::Error::msg)?;
+    }
+
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());
     }
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
-    cfg.gain_map = gain_map;
+    cfg.gain_map = gain_map.filter(|_| !args.no_gain_map);
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
@@ -96,6 +100,7 @@ pub(crate) fn encode_av1_lossless(
     }
 
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D16, _, _) => anyhow::bail!("16-bit output is supported only by JXL"),
         (Depth::D8, true, alpha) => {
             if alpha {
                 encode_lossless_gray_alpha(
