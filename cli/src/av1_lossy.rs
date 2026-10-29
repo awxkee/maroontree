@@ -86,18 +86,23 @@ pub(crate) fn encode_av1(
         None => cfg,
     };
 
+    for option in &args.overrides {
+        option.apply_av1(&mut cfg).map_err(anyhow::Error::msg)?;
+    }
+
     if let Some(icc) = icc {
         cfg = cfg.with_icc_profile(icc.to_vec());
     }
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
-    cfg.gain_map = gain_map;
+    cfg.gain_map = gain_map.filter(|_| !args.no_gain_map);
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D16, _, _) => anyhow::bail!("16-bit output is supported only by JXL"),
         (Depth::D8, true, _) => encode_gray8(
             &PlanarImage::from_luma(
                 img.width() as usize,
@@ -180,4 +185,61 @@ pub(crate) fn encode_av1(
             &cfg,
         )?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overrides_reach_lossy_and_lossless_av1_after_common_flags() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 31) as u8, 128])
+        }));
+        for lossless in [false, true] {
+            let mut options = vec![
+                "cli",
+                "-s",
+                "slow",
+                "-t",
+                "2",
+                "-q",
+                "99",
+                "in.png",
+                "-O",
+                "av1:speed=fast,threads=1,quality=60,updating-cdf=false",
+            ];
+            let mut reference = vec![
+                "cli",
+                "-s",
+                "fast",
+                "-t",
+                "1",
+                "-q",
+                "60",
+                "--no-cdf-update",
+                "in.png",
+            ];
+            if lossless {
+                options.push("--lossless");
+                reference.push("--lossless");
+            }
+            let actual = crate::args::try_parse(&options).unwrap();
+            let expected = crate::args::try_parse(&reference).unwrap();
+            let encode = |args: &Args| {
+                encode_av1(
+                    &image,
+                    args,
+                    image.color(),
+                    Depth::D8,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            assert_eq!(encode(&actual), encode(&expected));
+        }
+    }
 }

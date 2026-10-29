@@ -42,7 +42,9 @@ pub enum JxlError {
     Io(String),
 }
 
-fn color_encoding_from_cicp(cicp: PngCicp) -> Option<(jixel::ColorEncoding, Option<f32>)> {
+pub(crate) fn color_encoding_from_cicp(
+    cicp: PngCicp,
+) -> Option<(jixel::ColorEncoding, Option<f32>)> {
     use jixel::{Primaries, RenderingIntent, TransferFunction, WhitePoint};
 
     // CICP must describe the RGB pixels supplied to this encoder. HEIF decode
@@ -174,24 +176,6 @@ fn color_encoding_from_icc(icc: &[u8]) -> Option<(jixel::ColorEncoding, Option<f
         moxcms::RenderingIntent::AbsoluteColorimetric => jixel::RenderingIntent::Absolute,
     };
     Some((encoding, intensity_target))
-}
-
-fn can_signal_structured_color(encoding: jixel::ColorEncoding) -> bool {
-    // JXL's built-in enum values are a subset of CICP. Other transfer
-    // functions may be usable for jixel's input transform while still needing
-    // an ICC (or custom gamma) to describe them in a conforming codestream.
-    matches!(
-        encoding.primaries,
-        jixel::Primaries::Bt709 | jixel::Primaries::Bt2020 | jixel::Primaries::Smpte431
-    ) && matches!(
-        encoding.transfer,
-        jixel::TransferFunction::Bt709
-            | jixel::TransferFunction::Linear
-            | jixel::TransferFunction::Srgb
-            | jixel::TransferFunction::Smpte2084
-            | jixel::TransferFunction::Smpte428
-            | jixel::TransferFunction::Hlg
-    )
 }
 
 pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>>), JxlError> {
@@ -432,9 +416,18 @@ pub(crate) fn encode_jxl(
     effective_depth: Depth,
     metadata: JxlMetadata<'_>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let mut cfg = jixel::EncodeConfig::default().with_quality(args.quality as f32);
+    let mut cfg = jixel::EncodeConfig::default()
+        .with_quality(args.quality as f32)
+        .with_num_threads(args.threads)
+        .with_lossless(args.lossless)
+        .with_speed(match args.speed {
+            crate::EncodingEffort::ExtraSlow => jixel::Speed::ExtraSlow,
+            crate::EncodingEffort::Slow => jixel::Speed::Slow,
+            crate::EncodingEffort::Medium => jixel::Speed::Medium,
+            crate::EncodingEffort::Fast => jixel::Speed::Fast,
+        });
     #[cfg(feature = "heic")]
-    if let Some(gain_map) = metadata.gain_map {
+    if let Some(gain_map) = metadata.gain_map.filter(|_| !args.no_gain_map) {
         cfg = cfg.with_gain_map(jxl_gain_map(gain_map, args.lossless));
         if args.verbose {
             eprintln!(
@@ -449,48 +442,56 @@ pub(crate) fn encode_jxl(
 
     let cicp_encoding = metadata.cicp.and_then(color_encoding_from_cicp);
     let input_encoding = cicp_encoding.or_else(|| metadata.icc.and_then(color_encoding_from_icc));
-    if let Some((encoding, intensity_target)) = input_encoding {
+    if let Some((encoding, _)) = input_encoding {
         cfg = cfg.with_color_encoding(encoding);
-        if let Some(intensity_target) = intensity_target {
-            cfg = cfg.with_intensity_target(intensity_target);
-        }
-        if args.verbose {
-            eprintln!(
-                "jxl    : input {:?} / {:?} (from {})",
-                encoding.primaries,
-                encoding.transfer,
-                if cicp_encoding.is_some() {
-                    "CICP"
-                } else {
-                    "ICC"
-                },
-            );
-        }
-    } else if metadata.icc.is_some() && !args.lossless {
+    }
+    for option in &args.overrides {
+        option.apply_jxl(&mut cfg).map_err(anyhow::Error::msg)?;
+    }
+    if cfg.intensity_target.is_none() {
+        cfg.intensity_target = match cfg.color_encoding.transfer {
+            jixel::TransferFunction::Smpte2084 => Some(10_000.0),
+            jixel::TransferFunction::Hlg => Some(1_000.0),
+            _ => None,
+        };
+    }
+    if input_encoding.is_none()
+        && metadata.icc.is_some()
+        && !args.lossless
+        && cfg.coding_transform == jixel::CodingTransform::Xyb
+        && !args
+            .overrides
+            .iter()
+            .any(|option| option.overrides_input_color())
+    {
         anyhow::bail!(
             "JXL: ICC profile cannot be matched to a supported input color space; \
              use --apply-icc to convert to sRGB, or --lossless to preserve the original pixels"
         );
     }
-    // With XYB + ICC, ImageIO and decoders without a CMS can choose sRGB as
-    // their output space. Signal recognized colors with JXL's built-in fields
-    // so they can reconstruct P3/BT.2020 directly. Lossless keeps the exact ICC.
-    let structured_color = !args.lossless
-        && input_encoding.is_some_and(|(encoding, _)| can_signal_structured_color(encoding));
-    if let Some(icc) = metadata.icc.filter(|_| !structured_color) {
+    if args.verbose {
+        eprintln!(
+            "jxl    : input {:?} / {:?}",
+            cfg.color_encoding.primaries, cfg.color_encoding.transfer
+        );
+    }
+    // Keep the original profile even when its colors can be described structurally.
+    if let Some(icc) = metadata.icc {
         cfg = cfg.with_icc_profile(icc.to_vec());
     }
     if let Some(exif) = metadata.exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
 
-    if args.lossless {
-        cfg = cfg.with_lossless(true);
-    }
-
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D8, true, true) => jixel::encode_image_gray_alpha(
+            img.to_luma_alpha8().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
         (Depth::D8, true, _) => jixel::encode_image_gray(
             img.to_luma8().as_raw(),
             img.width() as usize,
@@ -505,6 +506,12 @@ pub(crate) fn encode_jxl(
         )?,
         (Depth::D8, false, true) => jixel::encode_image_with_alpha(
             img.to_rgba8().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
+        (Depth::D10, true, true) => jixel::encode_image_gray_alpha_10bit(
+            &scale16_to_10(img.to_luma_alpha16().as_raw()),
             img.width() as usize,
             img.height() as usize,
             &cfg,
@@ -527,6 +534,12 @@ pub(crate) fn encode_jxl(
             img.height() as usize,
             &cfg,
         )?,
+        (Depth::D12, true, true) => jixel::encode_image_gray_alpha_12bit(
+            &scale16_to_12(img.to_luma_alpha16().as_raw()),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
         (Depth::D12, true, _) => jixel::encode_image_gray_12bit(
             &scale16_to_12(img.to_luma16().as_raw()),
             img.width() as usize,
@@ -545,12 +558,180 @@ pub(crate) fn encode_jxl(
             img.height() as usize,
             &cfg,
         )?,
+        (Depth::D16, true, true) => jixel::encode_image_gray_alpha_16bit(
+            img.to_luma_alpha16().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
+        (Depth::D16, true, false) => jixel::encode_image_gray_16bit(
+            img.to_luma16().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
+        (Depth::D16, false, false) => jixel::encode_image_16bit(
+            img.to_rgb16().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
+        (Depth::D16, false, true) => jixel::encode_image_with_alpha_16bit(
+            img.to_rgba16().as_raw(),
+            img.width() as usize,
+            img.height() as usize,
+            &cfg,
+        )?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossless_sixteen_bit_color_and_gray_alpha_preserve_source_samples() {
+        for image in [
+            DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(5, 3, |x, y| {
+                image::Rgb([
+                    (x * 9173 + y * 1193) as u16,
+                    (x * 3451 + y * 4597) as u16,
+                    (65535 - x * 9371 - y * 4177) as u16,
+                ])
+            })),
+            DynamicImage::ImageLumaA16(image::ImageBuffer::from_fn(5, 3, |x, y| {
+                image::LumaA([
+                    (x * 9173 + y * 1193) as u16,
+                    (65535 - x * 9371 - y * 4177) as u16,
+                ])
+            })),
+        ] {
+            let args = crate::args::try_parse(&[
+                "cli",
+                "-e",
+                "jxl",
+                "-s",
+                "fast",
+                "-t",
+                "1",
+                "-O",
+                "jxl:lossless=true,depth=16",
+                "in.png",
+            ])
+            .unwrap();
+            let encoded = encode_jxl(
+                &image,
+                &args,
+                image.color(),
+                Depth::D16,
+                JxlMetadata {
+                    icc: None,
+                    exif: None,
+                    cicp: None,
+                    #[cfg(feature = "heic")]
+                    gain_map: None,
+                },
+            )
+            .unwrap();
+            let decoded = decode_jxl_bytes(encoded).unwrap().0;
+            assert_eq!(decoded, image);
+        }
+    }
+
+    #[test]
+    fn preserves_icc_bytes_in_lossy_and_lossless_output() {
+        use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
+
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([90, 130, 180]),
+        ));
+        let icc = moxcms::ColorProfile::new_srgb().encode().unwrap();
+        for lossless in [false, true] {
+            let mut options = vec!["cli", "-e", "jxl", "-s", "fast", "-t", "1", "in.png"];
+            if lossless {
+                options.extend(["-O", "jxl:lossless=true"]);
+            }
+            let args = crate::args::try_parse(&options).unwrap();
+            let output = encode_jxl(
+                &image,
+                &args,
+                image.color(),
+                Depth::D8,
+                JxlMetadata {
+                    icc: Some(&icc),
+                    exif: None,
+                    cicp: None,
+                    #[cfg(feature = "heic")]
+                    gain_map: None,
+                },
+            )
+            .unwrap();
+            let mut reader = BufReader::new(Cursor::new(output));
+            let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+            jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info").unwrap();
+            assert!(matches!(decoder.embedded_color_profile(),
+                Some(JxlColorProfile::Icc(bytes)) if bytes == &icc));
+        }
+    }
+
+    #[test]
+    fn overrides_reach_jxl_after_common_flags() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 31) as u8, 128])
+        }));
+        let args = crate::args::try_parse(&[
+            "cli",
+            "-e",
+            "jxl",
+            "-q",
+            "99",
+            "-s",
+            "slow",
+            "-t",
+            "2",
+            "-O",
+            "jxl:distance=31,speed=fast,threads=1,progressive-shifts=[2,1,0],grain=photon:3200,orientation=6,color-encoding=srgb",
+            "in.png",
+        ])
+        .unwrap();
+        let actual = encode_jxl(
+            &image,
+            &args,
+            image.color(),
+            Depth::D8,
+            JxlMetadata {
+                icc: None,
+                exif: None,
+                cicp: Some(PngCicp {
+                    color_primaries: 12,
+                    transfer_function: 13,
+                    matrix_coefficients: 0,
+                    full_range: true,
+                }),
+                #[cfg(feature = "heic")]
+                gain_map: None,
+            },
+        )
+        .unwrap();
+        let mut expected_config = jixel::EncodeConfig::default()
+            .with_distance(31.0)
+            .with_speed(jixel::Speed::Fast)
+            .with_num_threads(1)
+            .with_orientation(jixel::Orientation::Rotate90)
+            .with_grain(jixel::Grain::PhotonIso(3200.0))
+            .with_color_encoding(jixel::ColorEncoding {
+                white_point: jixel::WhitePoint::D65,
+                primaries: jixel::Primaries::Bt709,
+                transfer: jixel::TransferFunction::Srgb,
+                rendering_intent: jixel::RenderingIntent::Perceptual,
+            });
+        expected_config.progressive_shifts = Some(vec![2, 1, 0]);
+        let expected =
+            jixel::encode_image(image.to_rgb8().as_raw(), 8, 8, &expected_config).unwrap();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn maps_png_rec2100_pq_cicp() {
@@ -695,6 +876,7 @@ mod tests {
                 no_alpha: false,
                 no_exif: false,
                 no_icc: false,
+                no_gain_map: false,
                 apply_icc: false,
                 verbose: false,
                 speed: crate::EncodingEffort::Fast,
@@ -704,6 +886,7 @@ mod tests {
                 intrabc: false,
                 cdef: false,
                 wiener: false,
+                overrides: Vec::new(),
             }
         }
 
@@ -883,7 +1066,7 @@ mod tests {
         }
 
         #[test]
-        fn lossy_p3_uses_p3_for_input_and_default_decoder_output() {
+        fn lossy_p3_preserves_icc_and_uses_p3_for_input() {
             let primary = image::RgbImage::from_fn(8, 8, |x, y| {
                 image::Rgb([(x * 31) as u8, (y * 31) as u8, 128])
             });
@@ -909,6 +1092,8 @@ mod tests {
             .unwrap();
             let expected_config = jixel::EncodeConfig::default()
                 .with_quality(90.0)
+                .with_num_threads(1)
+                .with_icc_profile(profile.clone())
                 .with_color_encoding(jixel::ColorEncoding {
                     white_point: jixel::WhitePoint::D65,
                     primaries: jixel::Primaries::Smpte431,
@@ -917,30 +1102,14 @@ mod tests {
                 });
             let reference = jixel::encode_image(primary.as_raw(), 8, 8, &expected_config).unwrap();
             assert_eq!(cli_output, reference);
-            // Checking the original ICC alone missed ImageIO's sRGB fallback.
-            // A separate decoder must also select P3 for its default pixels.
-            use jxl::api::{
-                Event, JxlColorEncoding, JxlDecoder, JxlDecoderOptions, JxlPrimaries,
-                JxlTransferFunction, JxlWhitePoint,
-            };
+            // Check the encoded profile through an independent decoder.
+            use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
             let mut reader = BufReader::new(Cursor::new(cli_output.clone()));
             let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
             jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info")
                 .expect("complete codestream must include color information");
-            for profile in [
-                decoder.embedded_color_profile(),
-                decoder.output_color_profile(),
-            ] {
-                assert!(matches!(
-                    profile,
-                    Some(JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
-                        white_point: JxlWhitePoint::D65,
-                        primaries: JxlPrimaries::P3,
-                        transfer_function: JxlTransferFunction::SRGB,
-                        ..
-                    }))
-                ));
-            }
+            assert!(matches!(decoder.embedded_color_profile(),
+                Some(JxlColorProfile::Icc(bytes)) if bytes == &profile));
             for cicp in [
                 None,
                 Some(PngCicp {

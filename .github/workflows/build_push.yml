@@ -5,6 +5,7 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'master'
@@ -16,6 +17,18 @@ on:
       - 'master'
 
 jobs:
+  cli:
+    name: CLI (${{ matrix.features || 'AV1, AV2, JXL' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [ "", "heic,vvc" ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p maroontree-cli --no-default-features --features "${{ matrix.features }}"
+
   build:
     name: Build
     runs-on: ubuntu-latest

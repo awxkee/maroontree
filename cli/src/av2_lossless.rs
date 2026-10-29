@@ -82,6 +82,7 @@ pub(crate) fn encode_av2_lossless_image(
     let enc = Av2Encoder::with_bit_depth(
         0,
         match effective_depth {
+            Depth::D16 => return Err("16-bit output is supported only by JXL".into()),
             Depth::D8 => 8,
             Depth::D10 => 10,
             Depth::D12 => 12,
@@ -94,6 +95,7 @@ pub(crate) fn encode_av2_lossless_image(
     let alpha_enc = Av2Encoder::with_bit_depth(
         0,
         match effective_depth {
+            Depth::D16 => return Err("16-bit output is supported only by JXL".into()),
             Depth::D8 => 8,
             Depth::D10 => 10,
             Depth::D12 => 12,
@@ -106,6 +108,7 @@ pub(crate) fn encode_av2_lossless_image(
 
     if gray {
         let frame = match effective_depth {
+            Depth::D16 => return Err("16-bit output is supported only by JXL".into()),
             Depth::D8 => {
                 let l = img.to_luma8().into_raw();
                 enc.encode_image_400(&PlanarImage::from_luma(w, h, BitDepth::Eight, &l)?, &color)?

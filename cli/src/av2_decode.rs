@@ -227,7 +227,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
                     out.extend_from_slice(&[r, g, b, alpha]);
                 }
                 let mut final_view = finalize::<u16, 4>(out, &image)?;
-                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                crate::expand_to_16bit(&mut final_view.data, is_12);
                 rgba16_image(
                     final_view.width as u32,
                     final_view.height as u32,
@@ -239,7 +239,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
                     out.extend_from_slice(&[r, g, b]);
                 }
                 let mut final_view = finalize::<u16, 3>(out, &image)?;
-                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                crate::expand_to_16bit(&mut final_view.data, is_12);
                 rgb16_image(
                     final_view.width as u32,
                     final_view.height as u32,
@@ -271,7 +271,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
                 }
                 .map_err(|e| AvifError::Format(format!("icgc→rgba16: {e}")))?;
                 let mut final_view = finalize::<u16, 4>(out, &image)?;
-                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                crate::expand_to_16bit(&mut final_view.data, is_12);
                 rgba16_image(
                     final_view.width as u32,
                     final_view.height as u32,
@@ -299,7 +299,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
                 }
                 .map_err(|e| AvifError::Format(format!("icgc→rgb16: {e}")))?;
                 let mut final_view = finalize::<u16, 3>(out, &image)?;
-                crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+                crate::expand_to_16bit(&mut final_view.data, is_12);
                 rgb16_image(
                     final_view.width as u32,
                     final_view.height as u32,
@@ -330,7 +330,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
             }
             .map_err(|e| AvifError::Format(format!("yuv→rgba16: {e}")))?;
             let mut final_view = finalize::<u16, 4>(out, &image)?;
-            crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+            crate::expand_to_16bit(&mut final_view.data, is_12);
             rgba16_image(
                 final_view.width as u32,
                 final_view.height as u32,
@@ -358,7 +358,7 @@ pub(crate) fn decode_av2_file_url(file: &PathBuf) -> Result<DynamicImage, AvifEr
             }
             .map_err(|e| AvifError::Format(format!("yuv→rgb16: {e}")))?;
             let mut final_view = finalize::<u16, 3>(out, &image)?;
-            crate::vvc::expand_to_16bit(&mut final_view.data, is_12);
+            crate::expand_to_16bit(&mut final_view.data, is_12);
             rgb16_image(
                 final_view.width as u32,
                 final_view.height as u32,
@@ -565,7 +565,7 @@ fn finish_monochrome(
             dec.strides[0] as u32,
             Subsampling::Full,
         );
-        crate::vvc::expand_to_16bit(&mut y, is_12);
+        crate::expand_to_16bit(&mut y, is_12);
         DynamicImage::ImageLuma16(
             image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(w, h, y)
                 .ok_or_else(|| AvifError::Format("HEIC Luma16 mismatch".into()))?,

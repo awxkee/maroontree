@@ -80,6 +80,7 @@ pub(crate) fn encode_av2(
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;
 
     Ok(match (effective_depth, gray, alpha) {
+        (Depth::D16, _, _) => return Err("16-bit output is supported only by JXL".into()),
         (Depth::D8, true, _) => maroontree::av2_image::encode_gray8(
             &PlanarImage::from_luma(
                 img.width() as usize,
