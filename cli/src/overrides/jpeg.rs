@@ -6,15 +6,14 @@ use jhm17::{
 };
 
 pub const OPTIONS: &str = "\
-jpeg/jpg/jhm17 overrides (jhm17; polishing compiled in and enabled by default):
+jpeg/jpg/jhm17 overrides (jhm17; polishing is opt-in through overrides):
   Syntax: -O 'jpeg:KEY=VALUE,KEY=VALUE,...' (repeatable)
 
-  quality (q)            1..100 [default: 80]
-  chroma (c)             420|444|422 [default: 420; 422 requires polish=off]
+  quality (q)            1..100 [default: 92]
+  chroma (c)             420|444|422 [default: 444]
   sampling-factor        444|440|441|422|420|421|411|410
   subsampling-method     average|nearest
   sample-precision       all|luma|integer
-  speed (s)              fast|medium|slow|extraslow; selects greedy|trellis|trellis-greedy polishing
   progressive            false|true|off|optimized|standard
   progressive-scans      2..64; selects spectral progressive encoding
   restart-interval       0..65535 MCUs; 0 disables restart markers
@@ -45,7 +44,8 @@ RDO (enabled by default; setting an rdo-* parameter enables RDO):
   rdo-clip-iterations    0..255; 0 disables white-pixel clip continuation
 
 Polishing (RGB 420/444; grayscale uses the configured quantizer):
-  polish                 off|greedy|trellis|trellis-greedy [default: trellis-greedy]
+  polish                 off|greedy|trellis|trellis-greedy [default: off]
+  speed (s)              fast|medium|slow|extraslow; override shortcut enabling greedy|trellis|trellis-greedy polishing
   polish-judge           both|ssimulacra2|cvvdp
   polish-proposals/polish-rounds nonnegative integer
   polish-max-bits        signed i32 candidate bit-cost limit
@@ -55,6 +55,7 @@ Polishing (RGB 420/444; grayscale uses the configured quantizer):
   polish-quality-step   1..99 (exchange-rate quality distance)
   polish-trellis-k/polish-trellis-proposals nonnegative integer
   Explicit polish-* settings select custom polishing and enable it.
+  The common --speed flag does not enable polishing.
 
 Metadata and format:
   density                [X,Y], positive u16 density values

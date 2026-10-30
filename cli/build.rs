@@ -90,7 +90,7 @@ fn main() {
         ("JXL", format!("jxl: {}", dependency("jixel"))),
         (
             "JPEG",
-            format!("jpeg: {} (polish enabled)", dependency("jhm17")),
+            format!("jpeg: {} (polish available)", dependency("jhm17")),
         ),
         (
             "HEVC",
