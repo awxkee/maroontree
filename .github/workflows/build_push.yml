@@ -18,7 +18,7 @@ on:
 
 jobs:
   cli:
-    name: CLI (${{ matrix.features || 'AV1, AV2, JXL' }})
+    name: CLI (${{ matrix.features || 'AV1, AV2, JXL, JPEG' }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -23,11 +23,11 @@ with tempfile.TemporaryDirectory(prefix="maroontree-smoke-") as directory:
     source.write_bytes(b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
-    for encoder, extension in [("av1", "avif"), ("av2", "avif"), ("jxl", "jxl"), ("hevc", "heic"), ("vvc", "heif")]:
+    for encoder, extension in [("av1", "avif"), ("av2", "avif"), ("jxl", "jxl"), ("jpeg", "jpg"), ("hevc", "heic"), ("vvc", "heif")]:
         version = subprocess.check_output([binary, "-e", encoder, "--encoder-version"], text=True)
         if "disabled at build time" in version:
             continue
-        for lossless in [False, True]:
+        for lossless in ([False] if encoder == "jpeg" else [False, True]):
             output = root / f"{encoder}-{'lossless' if lossless else 'lossy'}.{extension}"
             options = [binary, "-e", encoder, "-s", "fast", "-t", "1"]
             if lossless:
@@ -42,6 +42,12 @@ with tempfile.TemporaryDirectory(prefix="maroontree-smoke-") as directory:
                 options += ["-O", "heic:parallelism=single,sao=false,persistent-rice=false,implicit-rdpcm=false,orientation=6,max-cll=1000,max-fall=400"]
                 if lossless:
                     options += ["-O", "hevc:lossless-ycbcr=true,chroma=420"]
+            elif encoder == "jpeg":
+                options += ["-O", "jpeg:progressive=standard,polish=trellis-greedy,polish-judge=both,rdo=true"]
             subprocess.run(options + [str(source), str(output)], check=True)
             if not output.is_file() or output.stat().st_size == 0:
                 raise RuntimeError(f"empty output for {encoder}, lossless={lossless}")
+            if encoder == "jpeg":
+                data = output.read_bytes()
+                if not (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")):
+                    raise RuntimeError("jhm17 output is not a complete JPEG stream")

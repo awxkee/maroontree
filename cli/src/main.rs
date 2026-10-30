@@ -40,6 +40,7 @@ mod box_walker;
 mod gainmap;
 #[cfg(feature = "heic")]
 mod heic;
+mod jpeg;
 mod jxl;
 mod orientation;
 mod overrides;
@@ -63,6 +64,7 @@ enum Encoder {
     Av2,
     Hevc,
     JpegXl,
+    Jpeg,
     Vvc,
 }
 
@@ -557,7 +559,9 @@ fn main() {
             && raster_format.is_none(),
     );
     let color_type = img.color();
-    let effective_depth = args.depth.unwrap_or(if is_16bit(color_type) {
+    let effective_depth = args.depth.unwrap_or(if args.encoder == Encoder::Jpeg {
+        Depth::D8
+    } else if is_16bit(color_type) {
         if args.encoder == Encoder::JpegXl {
             Depth::D16
         } else {
@@ -660,6 +664,10 @@ fn main() {
         .unwrap_or_else(|e| die(format!("encode failed: {e}")))
     } else {
         match args.encoder {
+            Encoder::Jpeg => {
+                jpeg::encode_jpeg(&img, &args, icc_bytes.as_deref(), exif_bytes.as_deref())
+                    .unwrap_or_else(|e| die(format!("encode failed: {e}")))
+            }
             Encoder::Av1 => encode_av1(
                 &img,
                 &args,

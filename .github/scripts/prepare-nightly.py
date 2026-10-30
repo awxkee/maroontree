@@ -7,7 +7,7 @@ import sys
 
 def prepare(manifest: Path) -> None:
     source = manifest.read_text()
-    for name in ("jixel", "hpvca", "garnetash"):
+    for name in ("jixel", "hpvca", "garnetash", "jhm17"):
         # Preserve optional/features attributes, but remove the release version
         # constraint so a new upstream minor/major cannot fall back to crates.io.
         pattern = rf"(?m)^{name}\s*=\s*(.+)$"
@@ -17,9 +17,9 @@ def prepare(manifest: Path) -> None:
         value = matches[0].group(1).strip()
         git = f'git = "https://github.com/awxkee/{name}"'
         if value.startswith("{"):
-            value, count = re.subn(r'version\s*=\s*"[^"]+"', git, value, count=1)
+            value, count = re.subn(r'(?:version|git)\s*=\s*"[^"]+"', git, value, count=1)
             if count != 1:
-                raise ValueError(f"missing release version for {name}")
+                raise ValueError(f"missing release version or Git source for {name}")
         elif re.fullmatch(r'"[^"]+"', value):
             value = "{ " + git + " }"
         else:

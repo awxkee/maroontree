@@ -72,6 +72,8 @@ jobs:
           target/release/${{ matrix.executable }} --version | tee dist/versions.txt
           target/release/${{ matrix.executable }} -e jxl --list-overrides
           target/release/${{ matrix.executable }} -e av1 --encoder-version
+          target/release/${{ matrix.executable }} -e jpeg --encoder-version
+          cp -R cli/licenses dist/licenses
           tar -czf "maroontree-cli-${BUILD_KIND}-${ENCODER_SOURCE}-${{ matrix.platform }}.tar.gz" -C dist .
       - uses: actions/upload-artifact@v7
         with:
