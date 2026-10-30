@@ -7,24 +7,24 @@ use std::{ffi::OsString, path::PathBuf};
 
 fn command() -> Command {
     let mut cmd = Command::new("maroontree-cli")
-        .about("Encode images as AVIF (AV1/AV2), JPEG XL, HEIC, or VVC HEIF")
+        .about("Encode images as AVIF (AV1/AV2), JPEG XL, jhm17 JPEG, HEIC, or VVC HEIF")
         .version(env!("CARGO_PKG_VERSION"))
         .long_version(version::all().trim_start_matches("maroontree-cli ").to_owned())
         .arg_required_else_help(true)
-        .after_help("Examples:\n  maroontree-cli input.png\n  maroontree-cli -e jxl -O 'jxl:distance=3.1,speed=medium,progressive=true' input.png\n  maroontree-cli -O 'av1:adaptive-quant=false,cdef=true,qm=7' input.png output.avif\n\nGroup settings with commas and one encoder prefix per -O; repeated -O flags also work.\nOverrides are applied after common options, in order; the last value wins.\nUse -e av1|jxl|heic --list-overrides for supported settings.\nICC profiles and EXIF are preserved by default. Use --no-icc/--no-exif to strip them.")
+        .after_help("Examples:\n  maroontree-cli input.png\n  maroontree-cli -e jxl -O 'jxl:distance=3.1,speed=medium,progressive=true' input.png\n  maroontree-cli -O 'av1:adaptive-quant=false,cdef=true,qm=7' input.png output.avif\n\nGroup settings with commas and one encoder prefix per -O; repeated -O flags also work.\nOverrides are applied after common options, in order; the last value wins.\nUse -e av1|jxl|heic|jpeg --list-overrides for supported settings.\nICC profiles and EXIF are preserved by default. Use --no-icc/--no-exif to strip them.")
         .arg(Arg::new("input").value_name("INPUT").value_parser(value_parser!(PathBuf))
             .required_unless_present_any(["encoder-version", "list-overrides"])
             .help("Source image (PNG, JPEG, WebP, TIFF, AVIF, JXL, HEIC, ...)"))
         .arg(Arg::new("output").value_name("OUTPUT").value_parser(value_parser!(PathBuf))
             .help("Destination; defaults to the input path with the encoder's extension"))
         .arg(Arg::new("encoder").short('e').long("encoder").value_name("ENCODER")
-            .value_parser(["av1", "av2", "hevc", "heic", "heif", "jxl", "jpegxl", "jpeg-xl", "vvc"])
+            .value_parser(["av1", "av2", "hevc", "heic", "heif", "jxl", "jpegxl", "jpeg-xl", "jpeg", "jpg", "jhm17", "vvc"])
             .default_value("av1").help("Encoder backend"))
         .arg(Arg::new("quality").short('q').long("quality").value_name("1-100")
             .value_parser(value_parser!(u8).range(1..=100))
-            .help("Quality; defaults: AV1/HEVC 80, AV2/VVC 60, JXL 70"))
+            .help("Quality; defaults: AV1/HEVC/JPEG 80, AV2/VVC 60, JXL 70"))
         .arg(Arg::new("chroma").short('c').long("chroma").value_name("CHROMA")
-            .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: 422; lossless: 444]"))
+            .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: JPEG 420, others 422; lossless 444]"))
         .arg(Arg::new("depth").short('d').long("depth").value_name("DEPTH")
             .value_parser(["8", "10", "12", "16"]).help("Output bit depth; 16 is JXL-only [default: auto from source]"))
         .arg(Arg::new("threads").short('t').long("threads").value_name("N")
@@ -35,7 +35,7 @@ fn command() -> Command {
             .value_parser(parse_qmatrix).help("Enable AV1 quantization matrices"))
         .arg(Arg::new("override").short('O').long("override").value_name("ENCODER:KEY=VALUE[,KEY=VALUE...]")
             .action(ArgAction::Append).value_parser(value_parser!(OverrideGroup))
-            .help("Override AV1, JXL, or HEIC settings; comma-separated groups and repeated flags are supported"));
+            .help("Override AV1, JXL, HEIC, or JPEG settings; comma-separated groups and repeated flags are supported"));
     for (name, short, help) in [
         (
             "lossless",
@@ -103,6 +103,7 @@ fn encoder(matches: &ArgMatches) -> Encoder {
         "av2" => Encoder::Av2,
         "hevc" | "heic" | "heif" => Encoder::Hevc,
         "jxl" | "jpegxl" | "jpeg-xl" => Encoder::JpegXl,
+        "jpeg" | "jpg" | "jhm17" => Encoder::Jpeg,
         "vvc" => Encoder::Vvc,
         _ => unreachable!(),
     }
@@ -146,14 +147,19 @@ pub fn parse_args() -> Args {
                 Encoder::Av1 => crate::overrides::AV1_OPTIONS,
                 Encoder::JpegXl => crate::overrides::JXL_OPTIONS,
                 Encoder::Hevc => crate::overrides::HEIC_OPTIONS,
+                Encoder::Jpeg => crate::overrides::JPEG_OPTIONS,
                 _ => command()
                     .error(
                         ErrorKind::InvalidValue,
-                        "overrides are supported for av1, jxl, and heic"
+                        "overrides are supported for av1, jxl, heic, and jpeg"
                     )
                     .exit(),
             },
-            crate::overrides::COMMON_OPTIONS,
+            if selected == Encoder::Jpeg {
+                ""
+            } else {
+                crate::overrides::COMMON_OPTIONS
+            },
         );
         std::process::exit(0);
     }
@@ -161,7 +167,24 @@ pub fn parse_args() -> Args {
 }
 
 fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
-    let encoder = encoder(matches);
+    let mut encoder = encoder(matches);
+    let input = matches.get_one::<PathBuf>("input").unwrap().clone();
+    let output = matches
+        .get_one::<PathBuf>("output")
+        .cloned()
+        .unwrap_or_else(|| {
+            input.with_extension(match encoder {
+                Encoder::Av1 | Encoder::Av2 => "avif",
+                Encoder::JpegXl => "jxl",
+                Encoder::Jpeg => "jpg",
+                Encoder::Hevc => "heic",
+                Encoder::Vvc => "heif",
+            })
+        });
+    // All JPEG output, including an explicit .jpg path, uses jhm17.
+    if crate::raster::raster_output_format(&output) == Some(crate::raster::RasterFormat::Jpeg) {
+        encoder = Encoder::Jpeg;
+    }
     if encoder == Encoder::Hevc && !cfg!(feature = "heic") {
         return Err(command().error(
             ErrorKind::InvalidValue,
@@ -174,18 +197,6 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             "VVC support is disabled; rebuild with --features vvc",
         ));
     }
-    let input = matches.get_one::<PathBuf>("input").unwrap().clone();
-    let output = matches
-        .get_one::<PathBuf>("output")
-        .cloned()
-        .unwrap_or_else(|| {
-            input.with_extension(match encoder {
-                Encoder::Av1 | Encoder::Av2 => "avif",
-                Encoder::JpegXl => "jxl",
-                Encoder::Hevc => "heic",
-                Encoder::Vvc => "heif",
-            })
-        });
     if input == output {
         return Err(command().error(
             ErrorKind::InvalidValue,
@@ -214,7 +225,9 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             return Err(command().error(ErrorKind::ArgumentConflict, format!("override '{option}' does not match the selected encoder; select it with --encoder")));
         }
     }
-    if !overrides.is_empty() && crate::raster::raster_output_format(&output).is_some() {
+    if !overrides.is_empty()
+        && crate::raster::raster_output_format(&output) == Some(crate::raster::RasterFormat::Png)
+    {
         return Err(command().error(
             ErrorKind::ArgumentConflict,
             "encoder overrides cannot be applied to raster output; use an AVIF, JXL, or HEIC output path",
@@ -229,7 +242,7 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             .get_one::<u8>("quality")
             .copied()
             .unwrap_or(match encoder {
-                Encoder::Av1 | Encoder::Hevc => 80,
+                Encoder::Av1 | Encoder::Hevc | Encoder::Jpeg => 80,
                 Encoder::Av2 | Encoder::Vvc => 60,
                 Encoder::JpegXl => 70,
             }),
@@ -278,6 +291,8 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
     if !matches.contains_id("chroma") && !overrides.iter().any(|option| option.key() == "chroma") {
         parsed.chroma = Some(if parsed.lossless {
             Chroma::C444
+        } else if encoder == Encoder::Jpeg {
+            Chroma::C420
         } else {
             Chroma::C422
         });
@@ -290,6 +305,7 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
     if parsed.lossless
         && parsed.chroma != Some(Chroma::C444)
         && encoder != Encoder::JpegXl
+        && encoder != Encoder::Jpeg
         && !lossless_ycbcr
     {
         return Err(command().error(
@@ -298,6 +314,22 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
         ));
     }
     parsed.overrides = overrides;
+    if encoder == Encoder::Jpeg {
+        if parsed.lossless {
+            return Err(command().error(
+                ErrorKind::ArgumentConflict,
+                "JPEG does not support pixel-perfect lossless encoding; use AV1, JXL, or HEIC",
+            ));
+        }
+        if parsed.depth.is_some_and(|depth| depth != Depth::D8) {
+            return Err(command().error(
+                ErrorKind::InvalidValue,
+                "jhm17 JPEG output supports only depth 8 or auto",
+            ));
+        }
+        crate::jpeg::JpegOptions::from_args(&parsed)
+            .map_err(|e| command().error(ErrorKind::InvalidValue, e))?;
+    }
     if parsed.depth == Some(Depth::D16) && encoder != Encoder::JpegXl {
         return Err(command().error(
             ErrorKind::InvalidValue,
@@ -317,6 +349,97 @@ pub(crate) fn try_parse(args: &[&str]) -> Result<Args, clap::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_aliases_and_extensions_select_jhm17_with_polishing() {
+        for alias in ["jpeg", "jpg", "jhm17"] {
+            let args = try_parse(&["cli", "-e", alias, "image.png"]).unwrap();
+            assert_eq!(args.encoder, Encoder::Jpeg);
+            assert_eq!(args.output, PathBuf::from("image.jpg"));
+            assert_eq!(args.chroma, Some(Chroma::C420));
+            assert_eq!(
+                crate::jpeg::JpegOptions::from_args(&args).unwrap().polish,
+                jhm17::Polish::TrellisGreedy
+            );
+        }
+        let args = try_parse(&[
+            "cli",
+            "image.png",
+            "out.JPEG",
+            "-O",
+            "jpeg:quality=91,progressive=standard,polish=greedy",
+        ])
+        .unwrap();
+        assert_eq!(args.encoder, Encoder::Jpeg);
+        let options = crate::jpeg::JpegOptions::from_args(&args).unwrap();
+        assert_eq!(options.quality, 91);
+        assert_eq!(options.progressive, Some(jhm17::ProgressiveMode::Standard));
+        assert_eq!(options.polish, jhm17::Polish::Greedy);
+    }
+
+    #[test]
+    fn jpeg_rejects_unsupported_formats_and_invalid_final_settings() {
+        for options in [
+            vec!["--lossless"],
+            vec!["--lossless", "-c", "420"],
+            vec!["--depth", "10"],
+            vec!["-c", "422"],
+            vec!["-O", "jpeg:polish=unknown"],
+            vec!["-O", "jpeg:polish-quality-step=0"],
+            vec!["-O", "jpeg:polish-scan-limit=64"],
+            vec!["-O", "jpeg:rdo-aq-min=3,rdo-aq-max=2"],
+            vec!["-O", "jpeg:rdo-lambda=NaN"],
+            vec!["-O", "jpeg:progressive-scans=1"],
+            vec!["-O", "jpeg:alpha=true"],
+            vec!["-O", "jpeg:luma-table=[1,2]"],
+            vec!["-O", "jpeg:luma-bands=[1,1,1,-1,1]"],
+        ] {
+            let mut args = vec!["cli", "-e", "jpeg", "image.png"];
+            args.extend(options);
+            assert!(try_parse(&args).is_err(), "accepted {args:?}");
+        }
+        assert!(
+            try_parse(&[
+                "cli",
+                "-e",
+                "jpeg",
+                "-c",
+                "422",
+                "-O",
+                "jpeg:polish=off",
+                "image.png"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn jpeg_sampling_aliases_obey_last_value_wins() {
+        for (group, expected) in [
+            (
+                "jpeg:sampling-factor=444,chroma=420",
+                jhm17::SamplingFactor::R_4_2_0,
+            ),
+            (
+                "jpeg:chroma=420,sampling-factor=444",
+                jhm17::SamplingFactor::R_4_4_4,
+            ),
+        ] {
+            let args = try_parse(&["cli", "-e", "jpeg", "-O", group, "in.png"]).unwrap();
+            assert_eq!(
+                crate::jpeg::JpegOptions::from_args(&args).unwrap().sampling,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn jpeg_extension_does_not_require_an_unused_optional_codec() {
+        for codec in ["heic", "vvc"] {
+            let args = try_parse(&["cli", "-e", codec, "in.png", "out.jpg"]).unwrap();
+            assert_eq!(args.encoder, Encoder::Jpeg);
+        }
+    }
 
     #[test]
     fn defaults_preserve_profiles_and_choose_encoder_extension() {

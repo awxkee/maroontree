@@ -89,6 +89,10 @@ fn main() {
         ("AV2", format!("av2: {own}")),
         ("JXL", format!("jxl: {}", dependency("jixel"))),
         (
+            "JPEG",
+            format!("jpeg: {} (polish enabled)", dependency("jhm17")),
+        ),
+        (
             "HEVC",
             if env::var_os("CARGO_FEATURE_HEIC").is_some() {
                 format!("hevc: {}", dependency("hpvca"))

@@ -4,7 +4,10 @@ use std::str::FromStr;
 mod av1;
 #[cfg(feature = "heic")]
 mod heic;
+mod jpeg;
 mod jxl;
+
+pub use jpeg::OPTIONS as JPEG_OPTIONS;
 
 pub const COMMON_OPTIONS: &str = "\
 Shared settings:
@@ -167,6 +170,7 @@ impl std::fmt::Display for EncoderOverride {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let backend = match self.encoder {
             Encoder::JpegXl => "jxl",
+            Encoder::Jpeg => "jpeg",
             Encoder::Hevc => "heic",
             _ => "av1",
         };
@@ -184,10 +188,11 @@ impl FromStr for EncoderOverride {
         let encoder = match backend.trim() {
             "jxl" | "jpegxl" | "jpeg-xl" => Encoder::JpegXl,
             "av1" => Encoder::Av1,
+            "jpeg" | "jpg" | "jhm17" => Encoder::Jpeg,
             "heic" | "hevc" | "heif" => Encoder::Hevc,
             _ => {
                 return Err(format!(
-                    "unknown override encoder '{backend}'; use av1, jxl, or heic"
+                    "unknown override encoder '{backend}'; use av1, jxl, heic, or jpeg"
                 ));
             }
         };
@@ -218,6 +223,7 @@ impl FromStr for EncoderOverride {
         match encoder {
             Encoder::JpegXl => option.apply_jxl(&mut jixel::EncodeConfig::default())?,
             Encoder::Av1 => option.apply_av1(&mut maroontree::EncodeConfig::new())?,
+            Encoder::Jpeg => option.apply_jpeg(&mut crate::jpeg::JpegOptions::default())?,
             Encoder::Hevc => {
                 #[cfg(feature = "heic")]
                 option.apply_heic(&mut hpvca::EncodeConfig::new())?;

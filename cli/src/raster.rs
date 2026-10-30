@@ -27,9 +27,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{Args, PngCicp, is_gray};
+use crate::{Args, PngCicp};
 use image::DynamicImage;
-use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, png::PngChunk};
+use img_parts::{ImageEXIF, ImageICC, png::Png, png::PngChunk};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -40,7 +40,7 @@ pub(crate) enum RasterFormat {
 }
 
 /// If `path`'s extension names a plain raster format we can write directly,
-/// return it. These outputs skip the codec backends entirely.
+/// return it. JPEG output is encoded through jhm17; PNG is written directly.
 pub(crate) fn raster_output_format(path: &Path) -> Option<RasterFormat> {
     match path
         .extension()
@@ -49,7 +49,7 @@ pub(crate) fn raster_output_format(path: &Path) -> Option<RasterFormat> {
         .as_deref()
     {
         Some("png") => Some(RasterFormat::Png),
-        Some("jpg") | Some("jpeg") => Some(RasterFormat::Jpeg),
+        Some("jpg") | Some("jpeg") | Some("jpe") | Some("jfif") => Some(RasterFormat::Jpeg),
         _ => None,
     }
 }
@@ -104,33 +104,6 @@ pub(crate) fn encode_raster(
                 .map_err(|e| anyhow::anyhow!("write PNG: {e}"))?;
             Ok(out)
         }
-        RasterFormat::Jpeg => {
-            let mut pixels = Vec::new();
-            {
-                let q = args.quality.clamp(1, 100);
-                let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut pixels, q);
-                if is_gray(img.color()) {
-                    enc.encode_image(&img.to_luma8())?;
-                } else {
-                    enc.encode_image(&img.to_rgb8())?;
-                }
-            }
-            if icc.is_none() && exif.is_none() {
-                return Ok(pixels);
-            }
-            let mut jpeg = Jpeg::from_bytes(pixels.into())
-                .map_err(|e| anyhow::anyhow!("re-parse JPEG for metadata: {e}"))?;
-            if let Some(icc) = icc {
-                jpeg.set_icc_profile(Some(icc.to_vec().into()));
-            }
-            if let Some(exif) = exif {
-                jpeg.set_exif(Some(exif.to_vec().into()));
-            }
-            let mut out = Vec::new();
-            jpeg.encoder()
-                .write_to(&mut out)
-                .map_err(|e| anyhow::anyhow!("write JPEG: {e}"))?;
-            Ok(out)
-        }
+        RasterFormat::Jpeg => crate::jpeg::encode_jpeg(img, args, icc, exif),
     }
 }
