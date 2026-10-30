@@ -22,9 +22,9 @@ fn command() -> Command {
             .default_value("av1").help("Encoder backend"))
         .arg(Arg::new("quality").short('q').long("quality").value_name("1-100")
             .value_parser(value_parser!(u8).range(1..=100))
-            .help("Quality; defaults: AV1/HEVC/JPEG 80, AV2/VVC 60, JXL 70"))
+            .help("Quality; defaults: JPEG 92, AV1/HEVC 80, AV2/VVC 60, JXL 70"))
         .arg(Arg::new("chroma").short('c').long("chroma").value_name("CHROMA")
-            .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: JPEG 420, others 422; lossless 444]"))
+            .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: JPEG 444, others 422; lossless 444]"))
         .arg(Arg::new("depth").short('d').long("depth").value_name("DEPTH")
             .value_parser(["8", "10", "12", "16"]).help("Output bit depth; 16 is JXL-only [default: auto from source]"))
         .arg(Arg::new("threads").short('t').long("threads").value_name("N")
@@ -242,7 +242,8 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             .get_one::<u8>("quality")
             .copied()
             .unwrap_or(match encoder {
-                Encoder::Av1 | Encoder::Hevc | Encoder::Jpeg => 80,
+                Encoder::Jpeg => 92,
+                Encoder::Av1 | Encoder::Hevc => 80,
                 Encoder::Av2 | Encoder::Vvc => 60,
                 Encoder::JpegXl => 70,
             }),
@@ -289,10 +290,8 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             .map_err(|e| command().error(ErrorKind::InvalidValue, e))?;
     }
     if !matches.contains_id("chroma") && !overrides.iter().any(|option| option.key() == "chroma") {
-        parsed.chroma = Some(if parsed.lossless {
+        parsed.chroma = Some(if parsed.lossless || encoder == Encoder::Jpeg {
             Chroma::C444
-        } else if encoder == Encoder::Jpeg {
-            Chroma::C420
         } else {
             Chroma::C422
         });
@@ -351,16 +350,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jpeg_aliases_and_extensions_select_jhm17_with_polishing() {
+    fn jpeg_aliases_and_extensions_select_jhm17_with_opt_in_polishing() {
         for alias in ["jpeg", "jpg", "jhm17"] {
             let args = try_parse(&["cli", "-e", alias, "image.png"]).unwrap();
             assert_eq!(args.encoder, Encoder::Jpeg);
             assert_eq!(args.output, PathBuf::from("image.jpg"));
-            assert_eq!(args.chroma, Some(Chroma::C420));
-            assert_eq!(
-                crate::jpeg::JpegOptions::from_args(&args).unwrap().polish,
-                jhm17::Polish::TrellisGreedy
-            );
+            assert_eq!(args.quality, 92);
+            assert_eq!(args.chroma, Some(Chroma::C444));
+            let options = crate::jpeg::JpegOptions::from_args(&args).unwrap();
+            assert_eq!(options.quality, 92);
+            assert_eq!(options.sampling, jhm17::SamplingFactor::R_4_4_4);
+            assert_eq!(options.polish, jhm17::Polish::Off);
+        }
+        for settings in [
+            vec!["-q", "80", "-c", "420"],
+            vec!["-O", "jpeg:quality=80,chroma=420"],
+        ] {
+            let mut args = vec!["cli", "image.png", "out.jpg"];
+            args.extend(settings);
+            let args = try_parse(&args).unwrap();
+            let options = crate::jpeg::JpegOptions::from_args(&args).unwrap();
+            assert_eq!(options.quality, 80);
+            assert_eq!(options.sampling, jhm17::SamplingFactor::R_4_2_0);
         }
         let args = try_parse(&[
             "cli",
@@ -378,12 +389,29 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_common_speed_never_enables_polishing() {
+        for speed in ["fast", "medium", "slow", "extraslow"] {
+            let args = try_parse(&["cli", "-s", speed, "image.png", "out.jpg"]).unwrap();
+            assert_eq!(
+                crate::jpeg::JpegOptions::from_args(&args).unwrap().polish,
+                jhm17::Polish::Off,
+                "common speed {speed} must not enable polishing"
+            );
+        }
+        let args = try_parse(&["cli", "image.png", "out.jpg", "-O", "jpeg:speed=fast"]).unwrap();
+        assert_eq!(
+            crate::jpeg::JpegOptions::from_args(&args).unwrap().polish,
+            jhm17::Polish::Greedy
+        );
+    }
+
+    #[test]
     fn jpeg_rejects_unsupported_formats_and_invalid_final_settings() {
         for options in [
             vec!["--lossless"],
             vec!["--lossless", "-c", "420"],
             vec!["--depth", "10"],
-            vec!["-c", "422"],
+            vec!["-c", "422", "-O", "jpeg:polish=greedy"],
             vec!["-O", "jpeg:polish=unknown"],
             vec!["-O", "jpeg:polish-quality-step=0"],
             vec!["-O", "jpeg:polish-scan-limit=64"],
@@ -398,6 +426,7 @@ mod tests {
             args.extend(options);
             assert!(try_parse(&args).is_err(), "accepted {args:?}");
         }
+        assert!(try_parse(&["cli", "-e", "jpeg", "-c", "422", "image.png"]).is_ok());
         assert!(
             try_parse(&[
                 "cli",

@@ -31,8 +31,8 @@ pub(crate) struct JpegOptions {
 impl Default for JpegOptions {
     fn default() -> Self {
         Self {
-            quality: 80,
-            sampling: SamplingFactor::R_4_2_0,
+            quality: 92,
+            sampling: SamplingFactor::R_4_4_4,
             subsampling: ChromaSubsamplingMethod::Average,
             precision: SamplePrecision::All,
             progressive: None,
@@ -51,7 +51,7 @@ impl Default for JpegOptions {
             cr_steps: StepTuning::default(),
             deadzone: Deadzone::default(),
             auto_chroma_scale: true,
-            polish: Polish::TrellisGreedy,
+            polish: Polish::Off,
             density: PixelDensity::default(),
         }
     }
@@ -61,12 +61,11 @@ impl JpegOptions {
     pub fn from_args(args: &Args) -> Result<Self, String> {
         let mut options = Self {
             quality: args.quality,
-            sampling: match args.chroma.unwrap_or(Chroma::C420) {
+            sampling: match args.chroma.unwrap_or(Chroma::C444) {
                 Chroma::C444 => SamplingFactor::R_4_4_4,
                 Chroma::C422 => SamplingFactor::R_4_2_2,
                 Chroma::C420 => SamplingFactor::R_4_2_0,
             },
-            polish: Self::polish_for_speed(args.speed),
             ..Self::default()
         };
         for option in &args.overrides {
@@ -169,7 +168,7 @@ pub(crate) fn encode_jpeg(
             jhm17::ColorType::Luma,
         )?;
     } else {
-        // JPEG has no alpha; RGB also enables jhm17's decoder-feedback polish.
+        // JPEG has no alpha; RGB supports decoder-feedback polish when requested.
         encoder.encode(img.to_rgb8().as_raw(), width, height, jhm17::ColorType::Rgb)?;
     }
     if args.verbose
@@ -199,24 +198,37 @@ mod tests {
     }
 
     #[test]
-    fn default_polishing_really_executes_on_rgb_pixels() {
+    fn polishing_only_executes_when_requested_by_override() {
         let image = image();
-        let args = crate::args::try_parse(&["cli", "-e", "jpeg", "-q", "60", "in.png"]).unwrap();
-        let options = JpegOptions::from_args(&args).unwrap();
-        let stats = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let mut bytes = Vec::new();
-        let mut encoder = options.encoder(&mut bytes);
-        encoder.set_polish_stats_sink(stats.clone());
-        encoder
-            .encode(image.to_rgb8().as_raw(), 64, 48, jhm17::ColorType::Rgb)
-            .unwrap();
-        let stats = stats
-            .lock()
-            .unwrap()
-            .expect("default JPEG mode must run the polishing pass");
-        assert!(stats.evaluated > 0);
-        let decoded = image::load_from_memory(&bytes).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (64, 48));
+        for polish in [false, true] {
+            let mut args = vec!["cli", "-e", "jpeg", "-q", "60", "in.png"];
+            if polish {
+                args.extend(["-O", "jpeg:polish=trellis-greedy"]);
+            }
+            let args = crate::args::try_parse(&args).unwrap();
+            let options = JpegOptions::from_args(&args).unwrap();
+            let stats = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let mut bytes = Vec::new();
+            let mut encoder = options.encoder(&mut bytes);
+            encoder.set_polish_stats_sink(stats.clone());
+            encoder
+                .encode(image.to_rgb8().as_raw(), 64, 48, jhm17::ColorType::Rgb)
+                .unwrap();
+            let stats = stats.lock().unwrap();
+            if polish {
+                assert!(
+                    stats
+                        .as_ref()
+                        .expect("explicit polishing must run the polishing pass")
+                        .evaluated
+                        > 0
+                );
+            } else {
+                assert!(stats.is_none(), "default JPEG mode must skip polishing");
+            }
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (64, 48));
+        }
     }
 
     #[test]
