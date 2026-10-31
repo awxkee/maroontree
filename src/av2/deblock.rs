@@ -562,7 +562,13 @@ fn build_tx_grid(
     for &(lmr, lmc, bw, bh) in leaves {
         let (blr, blc) = (lmr >> ssy, lmc >> ssx);
         let (bbw, bbh) = ((bw >> ssx).max(1), (bh >> ssy).max(1));
-        let (txw, txh) = (bbw.min(cap_w), bbh.min(cap_h));
+        // The cap models the 32-px TX tiling of 32/64-px leaves; 16x64 / 64x16 leaves
+        // are a single TX_16X64 / TX_64X16 and must not get an inner TU edge.
+        let (txw, txh) = if matches!((bbw, bbh), (4, 16) | (16, 4)) {
+            (bbw, bbh)
+        } else {
+            (bbw.min(cap_w), bbh.min(cap_h))
+        };
         let (sw, sh) = (txw.trailing_zeros() as u8, txh.trailing_zeros() as u8);
         let mut ty = 0;
         while ty < bbh {
@@ -693,8 +699,10 @@ pub(crate) fn deblock_frame(f: FrameDeblock<'_>) {
     let mut lcfg = PlaneCfg {
         buf: f.recy,
         stride: f.luma_stride,
-        width: f.width,
-        height: f.height,
+        // AVM's frame-end filter cap reads `dst.width/height`, the 8-aligned
+        // buffer extent (yv12config.c `aligned_width`), not the visible size.
+        width: (f.width + 7) & !7,
+        height: (f.height + 7) & !7,
         is_chroma: false,
         bit_depth: f.bit_depth,
         delta_q: f.delta_y,
@@ -736,8 +744,9 @@ pub(crate) fn deblock_frame(f: FrameDeblock<'_>) {
             let mut ccfg = PlaneCfg {
                 buf: cbuf,
                 stride: f.chroma_stride,
-                width: cw,
-                height: ch,
+                // Chroma buffer extent = aligned luma extent >> subsampling.
+                width: ((f.width + 7) & !7) >> f.ssx,
+                height: ((f.height + 7) & !7) >> f.ssy,
                 is_chroma: true,
                 bit_depth: f.bit_depth,
                 delta_q: f.delta_uv,

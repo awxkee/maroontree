@@ -106,12 +106,12 @@ use crate::av2::headers::{Config, frame_header, obu, sequence_header};
 use crate::av2::helpers::{
     BoundedIntraRect, PlaneRect, TX16_TYPE_RATE_DELTA, TxbContextSpec, choose_tx16_type,
     coeff_abs_rate_f32, coeff_rate_f32, coeff_tu_rate_proxy_f32, coeff_tus_rate_proxy_f32, dc_pred,
-    dc_pred_rect, dc_pred_rect_bounded, dc_pred_rect_subsampled, get_residual, get_residual_rect,
-    levels_to_coeffs, lossless_sb_tus, pad_plane, par_map_indexed, pixel_sse_f32_u16_block,
-    pixel_sse_rounded_block, pixel_sse_rounded_block_const, put_block, put_block_rect, rect_rows,
-    rect_rows_mut, rect_sse_f32, sb_align, sb_tu_contexts, sb_tu_contexts_64x32,
-    sb_tu_contexts_pos, sb_tu_contexts_rect, sb_tu4_chroma_skip, sb_tu4_contexts, tx16_dc_only,
-    tx16_distortion,
+    dc_pred_bounded, dc_pred_rect, dc_pred_rect_bounded, dc_pred_rect_subsampled_bounded,
+    get_residual, get_residual_rect, levels_to_coeffs, lossless_sb_tus, pad_plane, par_map_indexed,
+    pixel_sse_f32_u16_block, pixel_sse_rounded_block, pixel_sse_rounded_block_const, put_block,
+    put_block_rect, rect_rows, rect_rows_mut, rect_sse_f32, sb_align, sb_tu_contexts,
+    sb_tu_contexts_64x32, sb_tu_contexts_pos, sb_tu_contexts_rect, sb_tu4_chroma_skip,
+    sb_tu4_contexts, tx16_dc_only, tx16_distortion,
 };
 use crate::av2::itx422::reconstruct_luma;
 use crate::av2::layout::Layout;

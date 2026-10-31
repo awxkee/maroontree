@@ -28,7 +28,8 @@
  */
 
 use crate::av2::helpers::{
-    cfl_sse_i32, coeff_rate_f32, dc_pred, dc_pred_cfl_subsampled, pixel_sse_rounded,
+    BoundedIntraRect, cfl_sse_i32, coeff_rate_f32, dc_pred_bounded,
+    dc_pred_rect_subsampled_bounded, pixel_sse_rounded,
 };
 use crate::av2::mhccp;
 use crate::av2::proj::Basis;
@@ -373,6 +374,20 @@ pub(crate) fn cfl_candidate(
     })
 }
 
+/// AVM `cfl_implicit_fetch_neighbor_luma` edge rule: neighbour entries whose luma
+/// position lies past the 8-aligned frame extent repeat the last in-frame entry;
+/// when the whole run starts outside, every entry is the bare `(1 << bd) >> 1`
+/// (AVM writes it unscaled). `start`/`len` are luma px, `ss` the subsampling.
+fn cfl_clamp_neighbors(v: &mut [i32], start: usize, len: usize, extent: usize, ss: usize, bd: i32) {
+    if start >= extent {
+        v.iter_mut().for_each(|e| *e = (1 << bd) >> 1);
+    } else if start + len > extent {
+        for j in ((extent - start) >> ss).max(1)..v.len() {
+            v[j] = v[j - 1];
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cfl_avg_l(
     recy: &[f32],
@@ -384,18 +399,25 @@ pub(crate) fn cfl_avg_l(
     ssx: bool,
     ssy: bool,
     bd: i32,
+    (frame_w, frame_h): (usize, usize),
 ) -> i32 {
     let have_top = sb_y > 0;
     let have_left = sb_x > 0;
     let ss_h = if cw > 32 { 2 } else { 1 };
     let ss_v = if ch > 32 { 2 } else { 1 };
-    let l = |y: usize, x: usize| -> i32 { recy[y * pw + x].fast_round() as i32 };
+    let (fw, fh) = ((frame_w + 7) & !7, (frame_h + 7) & !7);
+    // Neighbour reads stay inside the plane; entries past the frame extent are
+    // replaced below exactly as AVM does.
+    let rows = recy.len() / pw;
+    let l = |y: usize, x: usize| -> i32 {
+        recy[y.min(rows - 1) * pw + x.min(pw - 1)].fast_round() as i32
+    };
     let mut sum: i32 = 0;
     let mut count: i32 = 0;
     if have_top {
-        let mut kk = 0;
-        while kk < cw {
-            let s = match (ssx, ssy) {
+        let mut top = vec![0i32; cw];
+        for (kk, t) in top.iter_mut().enumerate() {
+            *t = match (ssx, ssy) {
                 (false, false) => l(sb_y - 1, sb_x + kk) << 3,
                 // 4:2:0, is_top_sb_boundary=1: single row sb_y-1 counted twice, <<1.
                 (true, true) => {
@@ -407,15 +429,17 @@ pub(crate) fn cfl_avg_l(
                 (true, false) => (l(sb_y - 1, sb_x + 2 * kk) + l(sb_y - 1, sb_x + 2 * kk + 1)) << 2,
                 _ => unreachable!(),
             };
-            sum += s;
+        }
+        cfl_clamp_neighbors(&mut top, sb_x, cw << ssx as usize, fw, ssx as usize, bd);
+        for t in top.iter().step_by(ss_h) {
+            sum += t;
             count += 1;
-            kk += ss_h;
         }
     }
     if have_left {
-        let mut jj = 0;
-        while jj < ch {
-            let s = match (ssx, ssy) {
+        let mut lft = vec![0i32; ch];
+        for (jj, e) in lft.iter_mut().enumerate() {
+            *e = match (ssx, ssy) {
                 (false, false) => l(sb_y + jj, sb_x - 1) << 3,
                 // 4:2:0: 2x2 luma box at cols sb_x-2,sb_x-1 over rows 2jj,2jj+1, <<1.
                 (true, true) => {
@@ -429,13 +453,18 @@ pub(crate) fn cfl_avg_l(
                 (true, false) => (l(sb_y + jj, sb_x - 2) + l(sb_y + jj, sb_x - 1)) << 2,
                 _ => unreachable!(),
             };
-            sum += s;
+        }
+        cfl_clamp_neighbors(&mut lft, sb_y, ch << ssy as usize, fh, ssy as usize, bd);
+        for e in lft.iter().step_by(ss_v) {
+            sum += e;
             count += 1;
-            jj += ss_v;
         }
     }
     if count > 0 {
-        let val = (sum + count / 2) / count;
+        // AVM divides with the 9-bit `div_lut` reciprocal, not exactly; the two
+        // differ once the Q3 sums get large (12-bit content).
+        let (scale, shift) = crate::av2::helpers::resolve_divisor_32(count as u32);
+        let val = ((sum as i64 * scale + ((1i64 << shift) >> 1)) >> shift) as i32;
         let max_v = (1 << (bd + 3)) - 1;
         val.min(max_v)
     } else {
@@ -1013,8 +1042,8 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
     } else {
         0
     };
-    let luma_ref = build_luma_ref(ctx, cw, ch, above, left, tr_ext, bl_ext);
-    let cref_u = build_chroma_ref(
+    let mut luma_ref = build_luma_ref(ctx, cw, ch, above, left, tr_ext, bl_ext);
+    let mut cref_u = build_chroma_ref(
         ctx.recu,
         &ChromaRefSpec {
             stride: ctx.pcw,
@@ -1031,7 +1060,7 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
             is_top_sb: ctx.is_top_sb_boundary,
         },
     );
-    let cref_v = build_chroma_ref(
+    let mut cref_v = build_chroma_ref(
         ctx.recv,
         &ChromaRefSpec {
             stride: ctx.pcw,
@@ -1048,6 +1077,19 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
             is_top_sb: ctx.is_top_sb_boundary,
         },
     );
+    // AVM `mhccp_implicit_fetch_neighbor_luma`: a block reaching the tile's coded
+    // extent clips the reference window there (`ref_width = mi_col_end - tx_col +
+    // left_lines`), so the parameter fit only sees in-tile above/left samples. The
+    // buffers keep the block's own luma for prediction. AVM measures this in luma
+    // px, which equals chroma px only at 4:4:4 (the subsampled sweeps are exact).
+    if !ctx.ssx && !ctx.ssy {
+        let lim_w = left + ctx.bounds.chroma_width.saturating_sub(ctx.cx);
+        let lim_h = above + ctx.bounds.chroma_height.saturating_sub(ctx.cy);
+        for buf in [&mut luma_ref, &mut cref_u, &mut cref_v] {
+            buf.ref_width = buf.ref_width.min(lim_w);
+            buf.ref_height = buf.ref_height.min(lim_h);
+        }
+    }
 
     // filter_dir signaling cost (3-ary) + mhccp switch (1 bit), approximated in
     // bits from the default CDFs; the classic alpha/index bits saved are folded
@@ -1357,6 +1399,7 @@ pub(crate) fn cfl_partition_prediction<const N: usize>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cfl_avg_l_444(
     recy: &[f32],
     pw: usize,
@@ -1365,32 +1408,42 @@ fn cfl_avg_l_444(
     w: usize,
     h: usize,
     bd: i32,
+    (frame_w, frame_h): (usize, usize),
 ) -> i32 {
     let have_top = sb_y > 0;
     let have_left = sb_x > 0;
     let ss_hor = if w > 32 { 2 } else { 1 };
     let ss_ver = if h > 32 { 2 } else { 1 };
+    let (fw, fh) = ((frame_w + 7) & !7, (frame_h + 7) & !7);
+    let rows = recy.len() / pw;
     let mut sum: i32 = 0;
     let mut count: i32 = 0;
     if have_top {
-        let base = (sb_y - 1) * pw + sb_x;
-        let mut i = 0;
-        while i < w {
-            sum += (recy[base + i].fast_round() as i32) << 3;
+        let base = (sb_y - 1) * pw;
+        let mut top: Vec<i32> = (0..w)
+            .map(|i| (recy[base + (sb_x + i).min(pw - 1)].fast_round() as i32) << 3)
+            .collect();
+        cfl_clamp_neighbors(&mut top, sb_x, w, fw, 0, bd);
+        for t in top.iter().step_by(ss_hor) {
+            sum += t;
             count += 1;
-            i += ss_hor;
         }
     }
     if have_left {
-        let mut i = 0;
-        while i < h {
-            sum += (recy[(sb_y + i) * pw + sb_x - 1].fast_round() as i32) << 3;
+        let mut lft: Vec<i32> = (0..h)
+            .map(|i| (recy[(sb_y + i).min(rows - 1) * pw + sb_x - 1].fast_round() as i32) << 3)
+            .collect();
+        cfl_clamp_neighbors(&mut lft, sb_y, h, fh, 0, bd);
+        for e in lft.iter().step_by(ss_ver) {
+            sum += e;
             count += 1;
-            i += ss_ver;
         }
     }
     if count > 0 {
-        let val = (sum + count / 2) / count;
+        // AVM divides with the 9-bit `div_lut` reciprocal, not exactly; the two
+        // differ once the Q3 sums get large (12-bit content).
+        let (scale, shift) = crate::av2::helpers::resolve_divisor_32(count as u32);
+        let val = ((sum as i64 * scale + ((1i64 << shift) >> 1)) >> shift) as i32;
         let max_v = (1 << (bd + 3)) - 1;
         val.min(max_v)
     } else {
@@ -1410,6 +1463,9 @@ pub(crate) struct Cfl64Input<'a> {
     pub(crate) y: usize,
     pub(crate) x: usize,
     pub(crate) neutral: f32,
+    /// Visible luma frame (tile) size; CfL neighbours past its 8-aligned extent
+    /// are replicated like AVM.
+    pub(crate) frame: (usize, usize),
 }
 
 pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Option<CflChoice> {
@@ -1423,6 +1479,7 @@ pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Op
         y: sb_y,
         x: sb_x,
         neutral,
+        frame,
     } = *input;
     let ChromaRdSpec {
         basis: chroma,
@@ -1468,7 +1525,7 @@ pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Op
         }
     }
     let luma_q3 = subsample_luma_q3(&luma, 64, 64, 64, false, false);
-    let avg_l = cfl_avg_l_444(recy, pw, sb_y, sb_x, 64, 64, bd);
+    let avg_l = cfl_avg_l_444(recy, pw, sb_y, sb_x, 64, 64, bd, frame);
     let ac: Vec<i32> = luma_q3.iter().map(|&v| v - avg_l).collect();
     // TX_64X64 is one CfL prediction block. AVM limits the transform's coded
     // coefficient support to 32x32, but it does not split the intra predictor into
@@ -1476,12 +1533,28 @@ pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Op
     // 64x64 DC predictor and then adds the whole-block CfL AC signal to it.
     // Flat-DC alternative (the non-CfL DC intra mode) uses the standard
     // full-reference DC predictor, matching the caller's DC reconstruction path.
-    let predu_f = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
-    let predv_f = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
+    let (fw, fh) = frame;
+    let predu_f = dc_pred_bounded(recu, pw, sb_y, sb_x, 64, neutral, fw, fh);
+    let predv_f = dc_pred_bounded(recv, pw, sb_y, sb_x, 64, neutral, fw, fh);
     // The CfL prediction base, however, must use AVM's subsampled-reference DC
     // (`highbd_dc_predictor_subsampled`), applied for `uv_mode == CFL && tx > 32`.
-    let predu_cfl = dc_pred_cfl_subsampled(recu, pw, sb_y, sb_x, 64, neutral, bd);
-    let predv_cfl = dc_pred_cfl_subsampled(recv, pw, sb_y, sb_x, 64, neutral, bd);
+    let rect = |plane: &[f32]| {
+        dc_pred_rect_subsampled_bounded(
+            plane,
+            &BoundedIntraRect {
+                stride: pw,
+                y: sb_y,
+                x: sb_x,
+                width: 64,
+                height: 64,
+                frame_width: (fw + 7) & !7,
+                frame_height: (fh + 7) & !7,
+            },
+            neutral,
+            bd,
+        )
+    };
+    let (predu_cfl, predv_cfl) = (rect(recu), rect(recv));
     let cand = cfl_candidate(
         &su,
         &sv,

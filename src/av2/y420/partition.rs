@@ -1570,7 +1570,7 @@ impl Av2Encoder {
         }
     }
     /// Decide + emit one 4:2:0 superblock (the extracted body of the `for col`
-    /// walk loop). Behaviour-preserving; byte-identical. Split out so the
+    /// walk loop). Behavior-preserving; byte-identical. Split out so the
     /// SB-wavefront can drive it per cell with private recon + fresh contexts.
     /// The per-row left-neighbor scalars are threaded in by value and returned.
     fn decide_sb_420(&self, decision: Sb420Decision<'_, '_>) -> (u8, u8, u8, Option<Mv>, u8) {
@@ -3585,12 +3585,34 @@ impl Av2Encoder {
                     let cfl_choice = if let Some(d) = leaf_replay {
                         d.chroma.clone()
                     } else if enc.cfl && PARTITION_CFL {
-                        let avg_l = cfl::cfl_avg_l(recy, pw, sb_y, sb_x, 32, 32, true, true, bd);
+                        let avg_l = cfl::cfl_avg_l(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            32,
+                            32,
+                            true,
+                            true,
+                            bd,
+                            (width, height),
+                        );
                         let mut suf = [0f32; 32 * 32];
                         let mut svf = [0f32; 32 * 32];
                         cfl_partition_prediction::<32>(pcw, up, vp, cy, cx, &mut suf, &mut svf);
-                        let dc_u_f = dc_pred_rect(recu, pcw, cy, cx, 32, 32, neutral, bd);
-                        let dc_v_f = dc_pred_rect(recv, pcw, cy, cx, 32, 32, neutral, bd);
+                        // Chroma DC neighbours stop at the 8-aligned luma extent (AVM
+                        // replicates past it), not at the SB-padded plane.
+                        let crect = BoundedIntraRect {
+                            stride: pcw,
+                            y: cy,
+                            x: cx,
+                            width: 32,
+                            height: 32,
+                            frame_width: ((width + 7) & !7) >> 1,
+                            frame_height: ((height + 7) & !7) >> 1,
+                        };
+                        let dc_u_f = dc_pred_rect_subsampled_bounded(recu, &crect, neutral, bd);
+                        let dc_v_f = dc_pred_rect_subsampled_bounded(recv, &crect, neutral, bd);
                         cfl::cfl_decide(
                             &cfl::CflDecisionInput {
                                 reconstructed_luma: recy,
@@ -3642,6 +3664,9 @@ impl Av2Encoder {
                     // per-block flag is clear so no switch symbol is emitted.
                     enc.mhccp_allowed = false;
                     enc.mhccp_use = false;
+                    // Partition leaves predict chroma with DC/CfL only; never emit a
+                    // uv mode left over from an earlier whole-SB mode search.
+                    enc.uv_mode = 0;
                     encode_luma_block_split(
                         enc,
                         &tus,

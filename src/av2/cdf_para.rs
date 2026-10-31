@@ -887,6 +887,13 @@ pub(crate) static PARA_DELTA_Q: (u8, u8, u8) = (1, 3, 4);
 pub(crate) static PARA_TX_SHORT_SIDE: (u8, u8, u8) = (3, 3, 4);
 
 // ===== EOB-multi CDF PARA =====
+/// avm `av2_default_eob_multi16_cdfs` PARA (AVM_PARA5 = a+3, b+4, c+5).
+pub(crate) static PARA_EOB16: [[(u8, u8, u8); 3]; 4] = [
+    [(3, 3, 4), (2, 4, 5), (2, 3, 4)],
+    [(2, 3, 5), (2, 3, 5), (2, 3, 5)],
+    [(2, 3, 5), (2, 3, 5), (2, 3, 5)],
+    [(2, 3, 4), (2, 3, 4), (2, 4, 3)],
+];
 pub(crate) static PARA_EOB_BIN_INTER: [(u8, u8, u8); 4] =
     [(1, 3, 3), (1, 3, 3), (1, 3, 3), (2, 3, 3)];
 pub(crate) static PARA_EOB_BIN: [(u8, u8, u8); 4] = [(1, 2, 3), (1, 3, 3), (2, 3, 3), (2, 3, 4)];

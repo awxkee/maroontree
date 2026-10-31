@@ -156,7 +156,7 @@ fn luma_sse_per_sb(
                     // AVM passes dir 0 when the signaled pri strength is 0
                     // (`pri_strength ? dir[by][bx] : 0`).
                     if pri == 0 { 0 } else { dirs[bi] },
-                    damping,
+                    damping + (bd as i32 - 8),
                     bd,
                 );
                 cdef_dist_8x8(src, &tmp, w, h, x, y, coeff_shift)
@@ -226,7 +226,7 @@ fn chroma_sse_per_sb(
                     pri << (bd - 8),
                     sec << (bd - 8),
                     dir,
-                    damping,
+                    damping + (bd as i32 - 8),
                     bd,
                 );
                 let mut s = 0i64;
@@ -285,8 +285,49 @@ fn apply_grid(off: &[i64], filt: &[i64], sb_dir_var: &[i64]) -> (i64, Vec<u8>, u
     (total, grid, n_on)
 }
 
+/// Luma-pixel rectangles `(x0, y0, x1, y1)` (end-exclusive) inside which CDEF may
+/// read samples, one per tile `(x0, y0, w, h)`, clipped to the 8-aligned frame
+/// extent. AVM bounds CDEF at the 8-aligned mi extent and, with
+/// `disable_loopfilters_across_tiles = 1`, treats every tile edge as a frame edge
+/// (cdef.c `cdef_prepare_fb`): samples outside read as `CDEF_VERY_LARGE`.
+pub(crate) fn cdef_regions(
+    tiles: &[(usize, usize, usize, usize)],
+    width: usize,
+    height: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let (fw, fh) = ((width + 7) & !7, (height + 7) & !7);
+    tiles
+        .iter()
+        .filter(|&&(x0, y0, _, _)| x0 < fw && y0 < fh)
+        // A tile reaching the visible edge extends to the 8-aligned frame edge.
+        .map(|&(x0, y0, w, h)| {
+            let x1 = if x0 + w >= width { fw } else { x0 + w };
+            let y1 = if y0 + h >= height { fh } else { y0 + h };
+            (x0, y0, x1, y1)
+        })
+        .collect()
+}
+
+/// Copy of `src` with every sample outside `[x0, x1) × [y0, y1)` set to
+/// `CDEF_VERY_LARGE`, so the filter treats the region edge as a frame edge.
+fn mask_region(
+    src: &[i32],
+    stride: usize,
+    (x0, y0, x1, y1): (usize, usize, usize, usize),
+) -> Vec<i32> {
+    let mut out = vec![cdef::CDEF_VERY_LARGE; src.len()];
+    let rows = src.len() / stride.max(1);
+    let x1 = x1.min(stride);
+    for y in y0..y1.min(rows) {
+        let row = y * stride;
+        out[row + x0..row + x1].copy_from_slice(&src[row + x0..row + x1]);
+    }
+    out
+}
+
 /// Apply a signaled per-block CDEF decision to the deblocked reconstruction.
-/// Every output sample reads from an immutable pre-CDEF snapshot.
+/// Every output sample reads from an immutable pre-CDEF snapshot, limited to the
+/// `regions` (see [`cdef_regions`]) the block lies in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_per_block(
     rec: &mut [Vec<f32>],
@@ -299,6 +340,7 @@ pub(crate) fn apply_per_block(
     has_chroma: bool,
     decision: &CdefDecision,
     bd: u8,
+    regions: &[(usize, usize, usize, usize)],
 ) {
     if rec.is_empty() || rec[0].len() < pw.saturating_mul(ph) {
         return;
@@ -326,26 +368,31 @@ pub(crate) fn apply_per_block(
     };
 
     let (y_pri, y_sec) = decode_strength(decision.y_str);
-    for by in 0..nby {
-        for bx in 0..nbx {
-            let sb = sb_of(bx, by, decision.sb_cols);
-            if decision.grid.get(sb).copied().unwrap_or(0) == 0 {
-                continue;
+    for &region in regions {
+        let (x0, y0, x1, y1) = region;
+        let masked = mask_region(&src_y, pw, region);
+        for by in y0 / 8..y1.div_ceil(8).min(nby) {
+            for bx in x0 / 8..x1.div_ceil(8).min(nbx) {
+                let sb = sb_of(bx, by, decision.sb_cols);
+                if decision.grid.get(sb).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                let bi = by * nbx + bx;
+                cdef::cdef_filter_8x8(
+                    &mut dst_y,
+                    &masked,
+                    pw,
+                    bx * 8,
+                    by * 8,
+                    cdef::adjust_pri(y_pri << coeff_shift, vars[bi]),
+                    y_sec << coeff_shift,
+                    // AVM passes dir 0 when the signaled pri strength is 0.
+                    if y_pri == 0 { 0 } else { dirs[bi] },
+                    // AVM cdef_block.c: `damping += coeff_shift - (pli != Y)`.
+                    decision.damping as i32 + (bd as i32 - 8),
+                    bd,
+                );
             }
-            let bi = by * nbx + bx;
-            cdef::cdef_filter_8x8(
-                &mut dst_y,
-                &src_y,
-                pw,
-                bx * 8,
-                by * 8,
-                cdef::adjust_pri(y_pri << coeff_shift, vars[bi]),
-                y_sec << coeff_shift,
-                // AVM passes dir 0 when the signaled pri strength is 0.
-                if y_pri == 0 { 0 } else { dirs[bi] },
-                decision.damping as i32,
-                bd,
-            );
         }
     }
     rec[0] = dst_y.into_iter().map(|value| value as f32).collect();
@@ -366,36 +413,43 @@ pub(crate) fn apply_per_block(
     for plane in &mut rec[1..=2] {
         let src = to_i32(plane);
         let mut dst = src.clone();
-        for by in 0..nby {
-            for bx in 0..nbx {
-                let sb = sb_of(bx, by, decision.sb_cols);
-                if decision.grid.get(sb).copied().unwrap_or(0) == 0 {
-                    continue;
+        for &(x0, y0, x1, y1) in regions {
+            let masked = mask_region(
+                &src,
+                cw,
+                (x0 >> sub_x, y0 >> sub_y, x1 >> sub_x, y1 >> sub_y),
+            );
+            for by in y0 / 8..y1.div_ceil(8).min(nby) {
+                for bx in x0 / 8..x1.div_ceil(8).min(nbx) {
+                    let sb = sb_of(bx, by, decision.sb_cols);
+                    if decision.grid.get(sb).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let (cx, cy) = ((bx * 8) >> sub_x, (by * 8) >> sub_y);
+                    if cx >= cw || cy >= ch {
+                        continue;
+                    }
+                    cdef::cdef_filter_block(
+                        &mut dst,
+                        0,
+                        &masked,
+                        cw,
+                        cx,
+                        cy,
+                        cbw,
+                        cbh,
+                        uv_pri << coeff_shift,
+                        uv_sec << coeff_shift,
+                        // AVM passes dir 0 when the signaled pri strength is 0.
+                        if uv_pri == 0 {
+                            0
+                        } else {
+                            uv_dir[dirs[by * nbx + bx]]
+                        },
+                        (decision.damping as i32 - 1).max(1) + (bd as i32 - 8),
+                        bd,
+                    );
                 }
-                let (cx, cy) = ((bx * 8) >> sub_x, (by * 8) >> sub_y);
-                if cx >= cw || cy >= ch {
-                    continue;
-                }
-                cdef::cdef_filter_block(
-                    &mut dst,
-                    0,
-                    &src,
-                    cw,
-                    cx,
-                    cy,
-                    cbw,
-                    cbh,
-                    uv_pri << coeff_shift,
-                    uv_sec << coeff_shift,
-                    // AVM passes dir 0 when the signaled pri strength is 0.
-                    if uv_pri == 0 {
-                        0
-                    } else {
-                        uv_dir[dirs[by * nbx + bx]]
-                    },
-                    (decision.damping as i32 - 1).max(1),
-                    bd,
-                );
             }
         }
         *plane = dst.into_iter().map(|value| value as f32).collect();
@@ -617,6 +671,7 @@ mod tests {
                 sb_cols: 2,
             },
             8,
+            &cdef_regions(&[(0, 0, w, h)], w, h),
         );
         assert!((0..h).any(|row| rec[0][row * w..row * w + 64] != y[row * w..row * w + 64]));
         for row in 0..h {
@@ -624,6 +679,51 @@ mod tests {
                 &rec[0][row * w + 64..(row + 1) * w],
                 &y[row * w + 64..(row + 1) * w]
             );
+        }
+    }
+
+    #[test]
+    fn regions_extend_edge_tiles_to_the_aligned_frame() {
+        // 250x170 frame: the 8-aligned extent is 256x176. Two tile columns.
+        let r = cdef_regions(&[(0, 0, 128, 170), (128, 0, 122, 170)], 250, 170);
+        assert_eq!(r, vec![(0, 0, 128, 176), (128, 0, 256, 176)]);
+        // A single tile covering the visible frame.
+        assert_eq!(
+            cdef_regions(&[(0, 0, 250, 170)], 250, 170),
+            vec![(0, 0, 256, 176)]
+        );
+    }
+
+    #[test]
+    fn tile_edges_bound_cdef_like_frame_edges() {
+        // Filtering the left SB with a tile seam at x=64 must not read the right
+        // SB's samples, so it differs from the seamless whole-frame result.
+        let (w, h) = (128usize, 64usize);
+        let y: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, row) = (i % w, i / w);
+                ((x * 37 + row * 11 + ((x ^ row) % 5) * 23) & 255) as f32
+            })
+            .collect();
+        let decision = CdefDecision {
+            damping: 4,
+            y_str: (7 << 2) | 2,
+            uv_str: 0,
+            grid: vec![1, 0],
+            sb_cols: 2,
+        };
+        let run = |regions: &[(usize, usize, usize, usize)]| {
+            let mut rec = vec![y.clone()];
+            apply_per_block(&mut rec, w, h, 0, 0, 0, 0, false, &decision, 8, regions);
+            rec.remove(0)
+        };
+        let whole = run(&cdef_regions(&[(0, 0, w, h)], w, h));
+        let tiled = run(&cdef_regions(&[(0, 0, 64, h), (64, 0, 64, h)], w, h));
+        let seam = |p: &[f32]| (0..h).map(|r| p[r * w + 63]).collect::<Vec<_>>();
+        assert_ne!(seam(&whole), seam(&tiled));
+        // Away from the seam both agree.
+        for r in 0..h {
+            assert_eq!(&whole[r * w..r * w + 56], &tiled[r * w..r * w + 56]);
         }
     }
 }

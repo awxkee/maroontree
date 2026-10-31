@@ -46,8 +46,8 @@ static F4: [[i32;4];32] = [
 ];
 
 #[inline]
-fn clip8(v: i32) -> i32 {
-    v.clamp(0, 255)
+fn clip_px(v: i32, max_pixel: i32) -> i32 {
+    v.clamp(0, max_pixel)
 }
 #[inline]
 fn iclip(v: i32, lo: i32, hi: i32) -> i32 {
@@ -148,6 +148,7 @@ fn z1(
     is_luma: bool,
     edge: bool,
     max_width: i32,
+    max_pixel: i32,
 ) {
     let (w, h) = (bs, bs);
     let dx = DR[angle as usize];
@@ -205,10 +206,10 @@ fn z1(
                     + f[1] * filt[bi]
                     + f[2] * filt[bi + 1]
                     + f[3] * filt[bi + 2];
-                clip8((v + 64) >> 7)
+                clip_px((v + 64) >> 7, max_pixel)
             } else {
                 let v = (32 - shift as i32) * filt[bi] + shift as i32 * filt[bi + 1];
-                clip8((v + 16) >> 5)
+                clip_px((v + 16) >> 5, max_pixel)
             };
             base += 1;
         }
@@ -227,6 +228,7 @@ fn z3(
     is_luma: bool,
     edge: bool,
     max_height: i32,
+    max_pixel: i32,
 ) {
     let (w, h) = (bs, bs);
     let dy = DR[(270 - angle) as usize];
@@ -280,10 +282,10 @@ fn z3(
                         + f[1] * filt[bi]
                         + f[2] * filt[bi - 1]
                         + f[3] * filt[bi - 2];
-                    clip8((v + 64) >> 7)
+                    clip_px((v + 64) >> 7, max_pixel)
                 } else {
                     let v = (32 - shift as i32) * filt[bi] + shift as i32 * filt[bi - 1];
-                    clip8((v + 16) >> 5)
+                    clip_px((v + 16) >> 5, max_pixel)
                 };
                 base += 1;
             } else {
@@ -307,6 +309,7 @@ struct Z2Spec {
     filter_left: bool,
     max_width: i32,
     max_height: i32,
+    max_pixel: i32,
 }
 
 /// z2: both-edge directional prediction (angles 90..180), port of `ipred_z2`.
@@ -319,6 +322,7 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
         filter_left,
         max_width,
         max_height,
+        max_pixel,
     } = *spec;
     let (w, h) = (bs, bs);
     let dy = DR[(angle - 90) as usize];
@@ -405,10 +409,10 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
             dst[y * w + x] = if is_luma {
                 let f = &F4[shift];
                 let v = f[0] * g(-1) + f[1] * g(-2) + f[2] * g(-3) + f[3] * g(-4);
-                clip8((v + 64) >> 7)
+                clip_px((v + 64) >> 7, max_pixel)
             } else {
                 let v = (32 - shift as i32) * g(-2) + shift as i32 * g(-3);
-                clip8((v + 16) >> 5)
+                clip_px((v + 16) >> 5, max_pixel)
             };
             x += 1;
             xpos += 64;
@@ -422,10 +426,10 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
             dst[y * w + x] = if is_luma {
                 let f = &F4[shift];
                 let v = f[0] * g(1) + f[1] * g(2) + f[2] * g(3) + f[3] * g(4);
-                clip8((v + 64) >> 7)
+                clip_px((v + 64) >> 7, max_pixel)
             } else {
                 let v = (32 - shift as i32) * g(2) + shift as i32 * g(3);
-                clip8((v + 16) >> 5)
+                clip_px((v + 16) >> 5, max_pixel)
             };
             x += 1;
             xpos += 64;
@@ -472,6 +476,9 @@ pub(crate) struct DirectionalSpec {
     pub(crate) edge_filter: bool,
     pub(crate) max_width: i32,
     pub(crate) max_height: i32,
+    /// Largest sample value, `(1 << bit_depth) - 1`; AVM clips every directional
+    /// output to it (an 8-bit clip mispredicts every 10/12-bit block).
+    pub(crate) max_pixel: i32,
 }
 
 /// Directional predictor for a square block, conformant to the decoder.
@@ -491,6 +498,7 @@ pub(crate) fn directional(
         edge_filter,
         max_width,
         max_height,
+        max_pixel,
     } = *spec;
     let mut out = vec![0i32; bs * bs];
     // AVM filters the above edge when have_top and the left edge when have_left,
@@ -511,7 +519,9 @@ pub(crate) fn directional(
     } else {
         let (tl, o) = edge_buffer(bs, above, left, corner);
         if ang < 90 {
-            z1(&mut out, bs, &tl, o, ang, is_luma, edge_top, max_width);
+            z1(
+                &mut out, bs, &tl, o, ang, is_luma, edge_top, max_width, max_pixel,
+            );
         } else if ang < 180 {
             // z2 filters each edge independently when its neighbor exists; the corner
             // is prepared whenever the edge filter is enabled (missing physical samples
@@ -529,10 +539,13 @@ pub(crate) fn directional(
                     filter_left: edge_left,
                     max_width,
                     max_height,
+                    max_pixel,
                 },
             );
         } else {
-            z3(&mut out, bs, &tl, o, ang, is_luma, edge_left, max_height);
+            z3(
+                &mut out, bs, &tl, o, ang, is_luma, edge_left, max_height, max_pixel,
+            );
         }
     }
     out.iter().map(|&v| v as f32).collect()
@@ -572,6 +585,7 @@ mod tests {
                 edge_filter: true,
                 max_width: 8,
                 max_height: 8,
+                max_pixel: 255,
             },
         );
         let h = directional(
@@ -588,6 +602,7 @@ mod tests {
                 edge_filter: true,
                 max_width: 8,
                 max_height: 8,
+                max_pixel: 255,
             },
         );
         for r in 0..8 {
@@ -615,12 +630,43 @@ mod tests {
                 edge_filter: false,
                 max_width: 8,
                 max_height: 8,
+                max_pixel: 255,
             },
         );
         for r in 0..8 {
             for x in 0..8 {
                 assert_eq!(p[r * 8 + x], a[x + r + 1] as f32);
             }
+        }
+    }
+
+    #[test]
+    fn high_bit_depth_prediction_is_not_clipped_to_8_bit() {
+        // 10-bit neighbours far above 255: every directional mode must keep them.
+        let a = vec![900i32; 16];
+        let l = vec![700i32; 16];
+        for dir in [Dir::D45, Dir::D135, Dir::D203, Dir::D67] {
+            let p = directional(
+                dir,
+                &a,
+                &l,
+                800,
+                &DirectionalSpec {
+                    angle_delta: 0,
+                    block_size: 8,
+                    is_luma: false,
+                    have_top: true,
+                    have_left: true,
+                    edge_filter: true,
+                    max_width: 16,
+                    max_height: 16,
+                    max_pixel: 1023,
+                },
+            );
+            assert!(
+                p.iter().all(|&v| (700.0..=900.0).contains(&v)),
+                "{dir:?}: {p:?}"
+            );
         }
     }
 }

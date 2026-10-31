@@ -1314,7 +1314,7 @@ struct LossyTile<'a> {
     /// Frame passed the repeated-content (IntraBC coverage) test: enables the
     /// text palette tools — palette-aware 8x8-vs-split4, 16x8/8x16 palette
     /// leaves, a wider palette refine budget. Photos never pass it, so they
-    /// keep the photo-tuned palette behaviour bit-for-bit.
+    /// keep the photo-tuned palette Behavior bit-for-bit.
     screen_frame: bool,
     /// Chroma angle delta the next `emit_uv_mode` codes for a directional
     /// uv mode (set by the searching site, reset by the emit).

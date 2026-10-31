@@ -314,6 +314,7 @@ impl Av2Encoder {
                     true,
                     pre,
                     self.bit_depth,
+                    &crate::av2::cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
                 );
             } else if self.tune.cdef && !replay::in_tile_subencode() {
                 enc.cdef_decided = crate::av2::cdef_est::search_per_block(
@@ -1397,6 +1398,24 @@ impl Av2Encoder {
                         (ph / 4) as i64,
                     );
                     let (cy, cx) = (sb_y / 2, sb_x / 2);
+                    // Chroma DC neighbours stop at the 8-aligned luma extent (AVM replicates
+                    // past it), not at the SB-padded plane.
+                    let chroma_dc = |rec: &[f32]| {
+                        dc_pred_rect_subsampled_bounded(
+                            rec,
+                            &BoundedIntraRect {
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                                width: 32,
+                                height: 32,
+                                frame_width: ((width + 7) & !7) >> 1,
+                                frame_height: ((height + 7) & !7) >> 1,
+                            },
+                            neutral,
+                            self.bit_depth as i32,
+                        )
+                    };
                     // CfL decision (4:2:0 whole-64 fast path). recy is final after
                     // encode_luma_sb; sets the per-block CfL state read by encode_intra_modes
                     // during the luma encode below. Context from the per-SB CfL-usage grid.
@@ -1413,12 +1432,23 @@ impl Av2Encoder {
                     enc.cfl_ctx = (cfl_a + cfl_l) as usize;
                     let cfl_choice = if enc.cfl {
                         let bd = self.bit_depth as i32;
-                        let avg_l = cfl::cfl_avg_l(&recy, pw, sb_y, sb_x, 32, 32, true, true, bd);
+                        let avg_l = cfl::cfl_avg_l(
+                            &recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            32,
+                            32,
+                            true,
+                            true,
+                            bd,
+                            (width, height),
+                        );
                         let mut suf = [0f32; 32 * 32];
                         let mut svf = [0f32; 32 * 32];
                         cfl_partition_prediction::<32>(pcw, &up, &vp, cy, cx, &mut suf, &mut svf);
-                        let dc_u_f = dc_pred(&recu, pcw, cy, cx, 32, neutral);
-                        let dc_v_f = dc_pred(&recv, pcw, cy, cx, 32, neutral);
+                        let dc_u_f = chroma_dc(&recu);
+                        let dc_v_f = chroma_dc(&recv);
                         cfl::cfl_decide(
                             &cfl::CflDecisionInput {
                                 reconstructed_luma: &recy,
@@ -1463,8 +1493,8 @@ impl Av2Encoder {
                     let mhccp_choice = if enc.mhccp {
                         let bd = self.bit_depth as i32;
                         let lam = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
-                        let dc_u_f = dc_pred(&recu, pcw, cy, cx, 32, neutral);
-                        let dc_v_f = dc_pred(&recv, pcw, cy, cx, 32, neutral);
+                        let dc_u_f = chroma_dc(&recu);
+                        let dc_v_f = chroma_dc(&recv);
                         // Chroma source blocks (same extraction cfl_decide uses).
                         let mut suf_m = [0f32; 32 * 32];
                         let mut svf_m = [0f32; 32 * 32];
@@ -1592,8 +1622,8 @@ impl Av2Encoder {
                         Vec<f32>,
                         Vec<f32>,
                     )> = if cfl_choice.is_none() {
-                        let dcu = dc_pred(&recu, pcw, cy, cx, 32, neutral);
-                        let dcv = dc_pred(&recv, pcw, cy, cx, 32, neutral);
+                        let dcu = chroma_dc(&recu);
+                        let dcv = chroma_dc(&recv);
                         let cand_modes: &[usize] = if !self.tune.chroma_mode_search {
                             &[0] // search disabled: DC only (byte-identical to baseline)
                         } else if self.speed.reduced_modes() {
@@ -1948,6 +1978,7 @@ impl Av2Encoder {
                 true,
                 pre,
                 self.bit_depth,
+                &crate::av2::cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
             );
             let mut planes = filtered_recon.into_iter();
             recy = planes.next().unwrap();

@@ -1263,3 +1263,99 @@ mod tests {
         };
     }
 }
+
+/// Replays AVM `inv_txfm_c` oracle output through the encoder's inverse transform.
+/// Local debugging aid, ignored by default: build `tests/data/itx_oracle.c` against
+/// `avm-main/build_dbg/libavm.a`, run it to a file and pass `MT_ITX_ORACLE=<file>`.
+#[cfg(test)]
+mod avm_oracle {
+    use super::*;
+
+    fn tx_index(w: usize, h: usize) -> Option<usize> {
+        use tx_size::*;
+        Some(match (w, h) {
+            (4, 4) => TX_4X4,
+            (8, 8) => TX_8X8,
+            (16, 16) => TX_16X16,
+            (32, 32) => TX_32X32,
+            (64, 64) => TX_64X64,
+            (4, 8) => RTX_4X8,
+            (8, 4) => RTX_8X4,
+            (8, 16) => RTX_8X16,
+            (16, 8) => RTX_16X8,
+            (16, 32) => RTX_16X32,
+            (32, 16) => RTX_32X16,
+            (32, 64) => RTX_32X64,
+            (64, 32) => RTX_64X32,
+            (4, 16) => RTX_4X16,
+            (16, 4) => RTX_16X4,
+            (8, 32) => RTX_8X32,
+            (32, 8) => RTX_32X8,
+            (16, 64) => RTX_16X64,
+            (64, 16) => RTX_64X16,
+            (4, 32) => RTX_4X32,
+            (32, 4) => RTX_32X4,
+            (8, 64) => RTX_8X64,
+            (64, 8) => RTX_64X8,
+            (4, 64) => RTX_4X64,
+            (64, 4) => RTX_64X4,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn inverse_dct_matches_avm_oracle() {
+        let Ok(path) = std::env::var("MT_ITX_ORACLE") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.lines();
+        let (mut total, mut bad) = (0, 0);
+        let mut bad_sizes = std::collections::BTreeMap::new();
+        while let Some(hdr) = lines.next() {
+            let f: Vec<usize> = hdr[5..].split(' ').map(|v| v.parse().unwrap()).collect();
+            let (w, h, bd) = (f[1], f[2], f[3] as i32);
+            let input: Vec<i32> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            let want: Vec<i32> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            let Some(tx) = tx_index(w, h) else { continue };
+            let (cw, ch) = (w.min(32), h.min(32));
+            // AVM: input[row*cw + col]; encoder: coeff[col*ch + row].
+            let mut coeff = vec![0i32; cw * ch];
+            for r in 0..ch {
+                for c in 0..cw {
+                    coeff[c * ch + r] = input[r * cw + c];
+                }
+            }
+            let mid = 1 << (bd - 1);
+            let mut out = vec![0f32; w * h];
+            inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| mid);
+            total += 1;
+            let diff = out
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| **a as i32 != **b)
+                .count();
+            if diff > 0 {
+                bad += 1;
+                let e = bad_sizes.entry((w, h, bd)).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(diff);
+            }
+        }
+        eprintln!(
+            "ITX ORACLE: {bad}/{total} cases differ; by (w,h,bd) -> (cases, max px): {bad_sizes:?}"
+        );
+        assert_eq!(bad, 0);
+    }
+}

@@ -343,7 +343,13 @@ impl CdfState {
             chr_eob128: expand_para(&CHROMA_EOB128_QC[qc], 7, cdf_para::PARA_CHROMA_EOB128[qc]),
             chr_eob256: expand_para(&CHROMA_EOB256_QC[qc], 7, cdf_para::PARA_CHROMA_EOB256[qc]),
             chr_eob512: expand_para(&CHROMA_EOB512_QC[qc], 7, cdf_para::PARA_CHROMA_EOB512[qc]),
-            eob16_q0: e1d(&EOB16_Q0),
+            // Lossy 4x4 TUs adapt these, so they need AVM's per-q-context table and
+            // PARA (the q0-only lossless table drifted from the decoder after one use).
+            eob16_q0: crate::av2::cdfx_4tx::EOB16_QC[qc]
+                .iter()
+                .zip(cdf_para::PARA_EOB16[qc])
+                .map(|(r, p)| expand_para(r, 4, p))
+                .collect(),
             base_lf_tx4: BASE_LF_TX4_Q0
                 .iter()
                 .map(|outer| outer.iter().map(|r| expand(r, 5)).collect())
