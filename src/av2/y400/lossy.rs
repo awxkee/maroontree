@@ -169,6 +169,7 @@ impl Av2Encoder {
                     chroma_tx_cap: (8, 8),
                 });
             }
+            self.cdef_400(&mut enc, &mut recy, frame, cdef_pre);
             if self
                 .capture_recon
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -282,16 +283,51 @@ impl Av2Encoder {
                 );
             }
         }
-        // Pass 1: derive the per-block CDEF decision from this reconstruction (400
-        // lossy is always whole-frame — no tiling — so no capture_recon guard).
-        if self.tune.cdef
-            && cdef_pre.is_none()
-            && !self
-                .capture_recon
-                .load(std::sync::atomic::Ordering::Relaxed)
+        self.cdef_400(&mut enc, &mut recy, frame, cdef_pre);
+        if self
+            .capture_recon
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
+            enc.recon = vec![recy];
+        }
+        enc
+    }
+
+    /// Per-block CDEF on a finished (post-deblock) monochrome reconstruction. Pass 2
+    /// applies the signaled grid so the encoder recon matches the decoder; pass 1
+    /// searches the grid. Tile sub-encodes skip the search — the tiled path searches
+    /// the stitched frame instead.
+    fn cdef_400(
+        &self,
+        enc: &mut RangeEncoder,
+        recy: &mut Vec<f32>,
+        frame: Core400Frame<'_>,
+        cdef_pre: Option<&cdef_est::CdefDecision>,
+    ) {
+        let Core400Frame {
+            yp,
+            pw,
+            ph,
+            width,
+            height,
+        } = frame;
+        if let Some(pre) = cdef_pre {
+            cdef_est::apply_per_block(
+                std::slice::from_mut(recy),
+                pw,
+                ph,
+                pw,
+                ph,
+                0,
+                0,
+                false,
+                pre,
+                self.bit_depth,
+                &cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
+            );
+        } else if self.tune.cdef && !replay::in_tile_subencode() {
             enc.cdef_decided = cdef_est::search_per_block(
-                std::slice::from_ref(&recy),
+                std::slice::from_ref(recy),
                 &[yp.to_vec()],
                 pw,
                 ph,
@@ -304,12 +340,5 @@ impl Av2Encoder {
                 self.bit_depth,
             );
         }
-        if self
-            .capture_recon
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            enc.recon = vec![recy];
-        }
-        enc
     }
 }

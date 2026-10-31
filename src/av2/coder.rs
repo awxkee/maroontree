@@ -3731,15 +3731,15 @@ pub(crate) fn encode_chroma_tu4(
         .min(63)
 }
 
-/// Lossy DCT_DCT 4×4 scan (decoder `SCANS[TX_4X4]`, up-right diagonal). The lossless
-/// path uses the transposed scan; lossy DCT needs this one.
-pub(crate) static SCAN4X4_LOSSY: [u16; 16] = [0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 11, 14, 15];
+/// Lossy DCT_DCT 4×4 scan: avm `default_scan_4x4` (raster rc = row*4 + col), the
+/// same order as the lossless `SCAN_4X4`.
+pub(crate) static SCAN4X4_LOSSY: [u16; 16] = [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15];
 
 /// Same scan order as `SCAN4X4_LOSSY`, but in the encoder's packed rc = (col<<5)|row
 /// convention used by `project_scan` / `reconstruct_chroma` (which index `coeff[row*n+col]`
 /// via `(rc&31)*n + (rc>>5)`). The token coder uses the plain-raster `SCAN4X4_LOSSY`.
 pub(crate) static SCAN4X4_LOSSY_PACKED: [u16; 16] =
-    [0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 97, 66, 35, 98, 67, 99];
+    [0, 1, 32, 2, 33, 64, 3, 34, 65, 96, 35, 66, 97, 67, 98, 99];
 
 /// Scan-parameterized 4×4 chroma TU coder (clone of `encode_chroma_tu4` taking the scan
 /// explicitly, for the lossy DCT corner chroma).
@@ -4028,6 +4028,9 @@ fn palette_color_ctx(
 fn encode_luma_palette_map(enc: &mut RangeEncoder, palette: &crate::av2::lossless::LumaPalette) {
     let (w, h) = (palette.width, palette.height);
     let size = palette.colors.len();
+    if w < 64 && h < 64 {
+        enc.encode_bypass(0, 1); // map direction (transverse_allowed): row-major
+    }
     for y in 0..h {
         // A zero line-copy symbol means every color index in this row is coded.
         enc.sym_palette_identity_row_off(y == 0);

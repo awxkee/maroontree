@@ -618,23 +618,53 @@ impl Av2Encoder {
             }
         }
         // Real deblocking (4:2:2). At deblock-active quality the RD split is off
-        // (base_q>38 gate), so every full-interior SB is whole-64 -> one 64x64 luma
-        // leaf per SB. Chroma is half-width/full-height (ssx=1, ssy=0) with 32x64 TX
-        // (cap (8,16) chroma MI). Skips the edge-residue partition path for now.
+        // (base_q>38 gate), so a full-interior SB is whole-64 (4x TX_32X32 luma, one
+        // 32x64 chroma TX). Edge-residue frames run every SB through the partition
+        // walk, whose leaf shapes depend only on geometry: rebuild them here. Chroma is
+        // half-width/full-height (ssx=1, ssy=0) with cap (8,16) chroma MI.
         let df_quant = {
             let qs = crate::av2::quant::qstep(self.base_q_idx as u32) as i32;
             ((qs + 4) >> 3) >> 6
         };
-        if self.tune.deblock && df_quant >= 1 && !needs_partition {
+        if self.tune.deblock && df_quant >= 1 {
             let eff_dy = if self.tune.db_delta_y == i32::MIN {
                 if df_quant >= 5 { 0 } else { 1 }
             } else {
                 self.tune.db_delta_y
             };
             let mut leaves = Vec::with_capacity(sb_rows * sb_cols);
-            for r in 0..sb_rows {
-                for c in 0..sb_cols {
-                    leaves.push((r * 16, c * 16, 16usize, 16usize));
+            if needs_partition {
+                let mut apctx = vec![0u8; tmc as usize + 16];
+                for r in 0..sb_rows {
+                    let mut lpctx = [0u8; 16];
+                    for c in 0..sb_cols {
+                        let ops = partition::sb_partition_ops(
+                            r,
+                            c,
+                            tmr as usize,
+                            tmc as usize,
+                            &mut apctx,
+                            &mut lpctx,
+                        );
+                        for op in &ops {
+                            if let partition::Op::Leaf {
+                                bw_mi,
+                                bh_mi,
+                                mi_row,
+                                mi_col,
+                                ..
+                            } = *op
+                            {
+                                leaves.push((mi_row, mi_col, bw_mi, bh_mi));
+                            }
+                        }
+                    }
+                }
+            } else {
+                for r in 0..sb_rows {
+                    for c in 0..sb_cols {
+                        leaves.push((r * 16, c * 16, 16usize, 16usize));
+                    }
                 }
             }
             deblock::deblock_frame(deblock::FrameDeblock {
@@ -663,24 +693,28 @@ impl Av2Encoder {
                 chroma_tx_cap: (8, 16),
             });
         }
-        // Multi-tile CDEF stitches per-tile recon; capture it when asked.
-        if self
-            .capture_recon
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            enc.recon = vec![recy.clone(), recu.clone(), recv.clone()];
-        }
-        // Pass 1 (single-tile whole-frame): derive the per-block CDEF decision. The
-        // multi-tile path forces `capture_recon` and searches the stitched recon, so
-        // skip here when recon is captured (avoids a redundant per-tile search).
-        if self.tune.cdef
-            && cdef_pre.is_none()
-            && !self
-                .capture_recon
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // Per-block CDEF: pass 2 applies the signaled grid so the recon matches the
+        // decoder; pass 1 (single tile) searches it. Tile sub-encodes skip the search —
+        // the multi-tile path searches the stitched recon instead.
+        let mut rec = vec![recy, recu, recv];
+        if let Some(pre) = cdef_pre {
+            let regions = cdef_est::cdef_regions(&[(0, 0, width, height)], width, height);
+            cdef_est::apply_per_block(
+                &mut rec,
+                pw,
+                ph,
+                pcw,
+                pch,
+                1,
+                0,
+                true,
+                pre,
+                self.bit_depth,
+                &regions,
+            );
+        } else if self.tune.cdef && !replay::in_tile_subencode() {
             enc.cdef_decided = cdef_est::search_per_block(
-                &[recy, recu, recv],
+                &rec,
                 &[yp, up, vp],
                 pw,
                 ph,
@@ -693,11 +727,18 @@ impl Av2Encoder {
                 self.bit_depth,
             );
         }
+        // Multi-tile CDEF stitches per-tile recon; capture it when asked.
+        if self
+            .capture_recon
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            enc.recon = rec;
+        }
         enc
     }
 
     /// Decide + emit one 4:2:2 superblock (the extracted body of the `for col`
-    /// loop). Behaviour-preserving; byte-identical. Split out so the SB-wavefront
+    /// loop). Behavior-preserving; byte-identical. Split out so the SB-wavefront
     /// can drive it per cell with private scratch buffers.
     fn decide_sb_422(&self, decision: Sb422Decision<'_, '_>) {
         let Sb422Decision {
@@ -906,8 +947,18 @@ impl Av2Encoder {
                     Some(c) => c,
                     None => {
                         let c = if enc.cfl {
-                            let avg_l =
-                                cfl::cfl_avg_l(recy, pw, sb_y, sb_x, 32, 64, true, false, bd);
+                            let avg_l = cfl::cfl_avg_l(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                32,
+                                64,
+                                true,
+                                false,
+                                bd,
+                                (width, height),
+                            );
                             let mut suf = [0f32; 32 * 64];
                             let mut svf = [0f32; 32 * 64];
                             for (((suf_row, svf_row), up_row), vp_row) in suf
@@ -921,10 +972,34 @@ impl Av2Encoder {
                                 suf_row.copy_from_slice(up_row);
                                 svf_row.copy_from_slice(vp_row);
                             }
-                            let dc_u_f =
-                                dc_pred_rect_subsampled(recu, pcw, cy, cx, 32, 64, neutral, bd);
-                            let dc_v_f =
-                                dc_pred_rect_subsampled(recv, pcw, cy, cx, 32, 64, neutral, bd);
+                            let dc_u_f = dc_pred_rect_subsampled_bounded(
+                                recu,
+                                &BoundedIntraRect {
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                    width: 32,
+                                    height: 64,
+                                    frame_width: ((width + 7) & !7) >> 1,
+                                    frame_height: (height + 7) & !7,
+                                },
+                                neutral,
+                                bd,
+                            );
+                            let dc_v_f = dc_pred_rect_subsampled_bounded(
+                                recv,
+                                &BoundedIntraRect {
+                                    stride: pcw,
+                                    y: cy,
+                                    x: cx,
+                                    width: 32,
+                                    height: 64,
+                                    frame_width: ((width + 7) & !7) >> 1,
+                                    frame_height: (height + 7) & !7,
+                                },
+                                neutral,
+                                bd,
+                            );
                             cfl::cfl_decide(
                                 &cfl::CflDecisionInput {
                                     reconstructed_luma: recy,
@@ -967,6 +1042,9 @@ impl Av2Encoder {
                 } else {
                     enc.cfl_use = false;
                     enc.cfl_signaled = false;
+                    // This path predicts chroma with DC; never emit a uv mode left
+                    // over from an earlier block's mode search.
+                    enc.uv_mode = 0;
                 }
                 enc.delta_q_pending = enc.delta_q_present;
                 let lmidx = if col > 0 {
@@ -1033,7 +1111,20 @@ impl Av2Encoder {
                     );
                     (levu, levv)
                 } else {
-                    let predu = dc_pred_rect(recu, pcw, cy, cx, 32, 64, neutral, bd);
+                    let predu = dc_pred_rect_bounded(
+                        recu,
+                        &BoundedIntraRect {
+                            stride: pcw,
+                            y: cy,
+                            x: cx,
+                            width: 32,
+                            height: 64,
+                            frame_width: ((width + 7) & !7) >> 1,
+                            frame_height: (height + 7) & !7,
+                        },
+                        neutral,
+                        bd,
+                    );
                     let levu = bases.chroma422.project_scan(
                         &aq::scale_resid(
                             &get_residual_rect(up, pcw, cy, cx, 32, 64, predu),
@@ -1060,7 +1151,20 @@ impl Av2Encoder {
                             bd,
                         ),
                     );
-                    let predv = dc_pred_rect(recv, pcw, cy, cx, 32, 64, neutral, bd);
+                    let predv = dc_pred_rect_bounded(
+                        recv,
+                        &BoundedIntraRect {
+                            stride: pcw,
+                            y: cy,
+                            x: cx,
+                            width: 32,
+                            height: 64,
+                            frame_width: ((width + 7) & !7) >> 1,
+                            frame_height: (height + 7) & !7,
+                        },
+                        neutral,
+                        bd,
+                    );
                     let levv = bases.chroma422.project_scan(
                         &aq::scale_resid(
                             &get_residual_rect(vp, pcw, cy, cx, 32, 64, predv),
@@ -1215,6 +1319,9 @@ impl Av2Encoder {
             enc.cfl_use = false;
             enc.cfl_signaled = false;
             enc.mhccp_use = false;
+            // Per-leaf uv mode: DC unless this leaf's own search sets one (a stale
+            // mode from the previous block would be emitted for DC-only arms).
+            enc.uv_mode = 0;
             let (u_present, v_present) = match (bw_mi, bh_mi) {
                 (16, 16) => outline_leaf_422(|| {
                     let (tus, mode_idx, _, _) = encode_luma_sb(
@@ -1249,14 +1356,49 @@ impl Av2Encoder {
                     const PARTITION_CFL: bool = true;
                     let bd = self.bit_depth as i32;
                     let cfl_choice = if enc.cfl && PARTITION_CFL {
-                        let avg_l = cfl::cfl_avg_l(recy, pw, sb_y, sb_x, 32, 64, true, false, bd);
+                        let avg_l = cfl::cfl_avg_l(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            32,
+                            64,
+                            true,
+                            false,
+                            bd,
+                            (width, height),
+                        );
                         let mut suf = [0f32; 32 * 64];
                         let mut svf = [0f32; 32 * 64];
                         cfl_partition_prediction::<32>(pcw, up, vp, cy, cx, &mut suf, &mut svf);
-                        let dc_u_f =
-                            dc_pred_rect_subsampled(recu, pcw, cy, cx, 32, 64, neutral, bd);
-                        let dc_v_f =
-                            dc_pred_rect_subsampled(recv, pcw, cy, cx, 32, 64, neutral, bd);
+                        let dc_u_f = dc_pred_rect_subsampled_bounded(
+                            recu,
+                            &BoundedIntraRect {
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                                width: 32,
+                                height: 64,
+                                frame_width: ((width + 7) & !7) >> 1,
+                                frame_height: (height + 7) & !7,
+                            },
+                            neutral,
+                            bd,
+                        );
+                        let dc_v_f = dc_pred_rect_subsampled_bounded(
+                            recv,
+                            &BoundedIntraRect {
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                                width: 32,
+                                height: 64,
+                                frame_width: ((width + 7) & !7) >> 1,
+                                frame_height: (height + 7) & !7,
+                            },
+                            neutral,
+                            bd,
+                        );
                         cfl::cfl_decide(
                             &cfl::CflDecisionInput {
                                 reconstructed_luma: recy,
@@ -1410,8 +1552,8 @@ impl Av2Encoder {
                                 y: cy,
                                 x: cx,
                                 size: 32,
-                                coded_width: width / 2,
-                                coded_height: height,
+                                coded_width: ((width + 7) & !7) >> 1,
+                                coded_height: (height + 7) & !7,
                             },
                             &chroma422::ChromaModeSearch {
                                 neutral,

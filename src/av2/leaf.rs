@@ -54,6 +54,7 @@ fn fill_scaled_residual(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_intra_pred(
+    max_pixel: i32,
     m: usize,
     adelta: i32,
     ab: &[i32],
@@ -93,6 +94,7 @@ fn dispatch_intra_pred(
             edge_filter: true,
             max_width: max_w,
             max_height: max_h,
+            max_pixel,
         },
     )
 }
@@ -244,6 +246,7 @@ pub(super) fn predict_luma(recy: &[f32], spec: &LumaPredictSpec) -> Vec<f32> {
         },
     );
     dispatch_intra_pred(
+        2 * neutral as i32 - 1,
         m,
         adelta,
         &ab,
@@ -556,6 +559,7 @@ pub(super) fn predict_luma_leaf32(
         },
     );
     dispatch_intra_pred(
+        2 * neutral as i32 - 1,
         m,
         0,
         &ab,
@@ -751,6 +755,7 @@ pub(crate) fn predict_luma_leaf_tu(recy: &[f32], spec: &LumaLeafPredictSpec) -> 
         },
     );
     dispatch_intra_pred(
+        2 * neutral as i32 - 1,
         m,
         0,
         &ab,

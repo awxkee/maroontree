@@ -173,7 +173,7 @@ impl Av2Encoder {
     /// sub-frame). Returns the finished entropy coder; assembly (frame header/OBU,
     /// or multi-tile concatenation) happens in the caller.
     /// Encode one full-64 (16×16-mi) leaf on the partition-walk path — the
-    /// extracted body of the walk's `(16, 16)` match arm. Behaviour-preserving
+    /// extracted body of the walk's `(16, 16)` match arm. Behavior-preserving
     /// (byte-identical); this is the first step of decoupling the `ops` walk into
     /// a per-leaf function so its search can later be recorded/replayed. Returns
     /// whether the U / V planes coded any coefficients.
@@ -251,6 +251,7 @@ impl Av2Encoder {
                     y: sb_y,
                     x: sb_x,
                     neutral,
+                    frame: (width, height),
                 },
                 &ChromaRdSpec {
                     basis: &bases.chroma444,
@@ -328,7 +329,7 @@ impl Av2Encoder {
             );
             (levu, levv)
         } else {
-            let predu = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
+            let predu = dc_pred_bounded(recu, pw, sb_y, sb_x, 64, neutral, width, height);
             let levu = chroma422::project_chroma_rdoq(
                 &bases.chroma444,
                 &aq::scale_resid(
@@ -349,7 +350,7 @@ impl Av2Encoder {
                 64,
                 &itx422::reconstruct_chroma(predu, &levu, split_qstep_c, &tables::SCAN, 64, 64, bd),
             );
-            let predv = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
+            let predv = dc_pred_bounded(recv, pw, sb_y, sb_x, 64, neutral, width, height);
             let levv = chroma422::project_chroma_rdoq(
                 &bases.chroma444,
                 &aq::scale_resid(
@@ -382,7 +383,7 @@ impl Av2Encoder {
     }
 
     /// Extracted body of the walk's `(16, 8)` arm — a 64×32 luma leaf with DC
-    /// chroma. Behaviour-preserving; byte-identical.
+    /// chroma. Behavior-preserving; byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn encode_walk_leaf16x8(
         &self,
@@ -493,7 +494,7 @@ impl Av2Encoder {
     }
 
     /// Extracted body of the walk's `(8, 16)` arm — a 32×64 vertical luma leaf
-    /// with DC chroma (chroma422 basis). Behaviour-preserving; byte-identical.
+    /// with DC chroma (chroma422 basis). Behavior-preserving; byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn encode_walk_leaf8x16(
         &self,
@@ -619,7 +620,7 @@ impl Av2Encoder {
     }
 
     /// Extracted body of the walk's `(8, 8)` arm — a 32×32 luma leaf whose chroma
-    /// competes MHCCP against the DC incumbent (chroma420 basis). Behaviour-
+    /// competes MHCCP against the DC incumbent (chroma420 basis). Behavior-
     /// preserving; byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn encode_walk_leaf8x8(
@@ -935,7 +936,7 @@ impl Av2Encoder {
 
     /// Extracted body of the walk's `(16, 4)` arm — a bottom-edge 64×16 luma leaf
     /// that RD-picks single TX_64X16 vs a 2×TX_32X16 vertical tx-partition, with DC
-    /// chroma. Behaviour-preserving; byte-identical.
+    /// chroma. Behavior-preserving; byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn encode_walk_leaf16x4(
         &self,
@@ -961,6 +962,7 @@ impl Av2Encoder {
         ul: i32,
         va: i32,
         vl: i32,
+        luma_split: &mut bool,
     ) -> (bool, bool) {
         let bases = &self.bases;
         let neutral = self.dc_neutral();
@@ -999,6 +1001,7 @@ impl Av2Encoder {
                 recs_b[half] = rec;
             }
         }
+        *luma_split = j_b < j_a;
         if j_b < j_a {
             for (half, src) in recs_b.iter().enumerate() {
                 put_block_rect(recy, pw, sb_y, sb_x + half * 32, 32, 16, src);
@@ -1452,7 +1455,7 @@ impl Av2Encoder {
 
     /// Extracted body of the walk's `(4, 16)` arm — a right-edge 16×64 luma leaf
     /// that RD-picks single TX_16X64 vs a 2×TX_16X32 horizontal tx-partition, with
-    /// DC chroma. Behaviour-preserving; byte-identical.
+    /// DC chroma. Behavior-preserving; byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn encode_walk_leaf4x16(
         &self,
@@ -1478,6 +1481,7 @@ impl Av2Encoder {
         ul: i32,
         va: i32,
         vl: i32,
+        luma_split: &mut bool,
     ) -> (bool, bool) {
         let bases = &self.bases;
         let neutral = self.dc_neutral();
@@ -1516,6 +1520,7 @@ impl Av2Encoder {
                 recs_b[half] = rec;
             }
         }
+        *luma_split = j_b < j_a;
         if j_b < j_a {
             for (half, src) in recs_b.iter().enumerate() {
                 put_block_rect(recy, pw, sb_y + half * 32, sb_x, 16, 32, src);
@@ -1871,6 +1876,42 @@ impl Av2Encoder {
             4,
             2,
         );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 16,
+                height: 8,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.c16x8,
+                scan: &tables::SCAN16X8,
+                eob_cdf: EobCdf::ChrEob128,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 128,
+                u_skip_row: &SKIP_TX16_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
+        );
         coder::encode_luma_leaf_rect128(
             enc,
             &tu,
@@ -1990,6 +2031,42 @@ impl Av2Encoder {
             },
             2,
             4,
+        );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 8,
+                height: 16,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.c8x16,
+                scan: &tables::SCAN8X16,
+                eob_cdf: EobCdf::ChrEob128,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 128,
+                u_skip_row: &SKIP_TX16_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
         );
         coder::encode_luma_leaf_rect128(
             enc,
@@ -2111,6 +2188,42 @@ impl Av2Encoder {
             8,
             4,
         );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 32,
+                height: 16,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.luma32x16,
+                scan: &SCAN32X16,
+                eob_cdf: EobCdf::ChrEob512,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 512,
+                u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
+        );
         encode_luma_leaf_32x16(enc, &tu, skip, dcs, 0, true, pc);
         let mh_on = enc.mhccp;
         code_444_chroma_leaf(
@@ -2215,6 +2328,42 @@ impl Av2Encoder {
             },
             4,
             8,
+        );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 16,
+                height: 32,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.luma16x32,
+                scan: &SCAN16X32,
+                eob_cdf: EobCdf::ChrEob512,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 512,
+                u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
         );
         encode_luma_leaf_16x32(enc, &tu, skip, dcs, 0, true, pc);
         let mh_on = enc.mhccp;
@@ -2328,6 +2477,42 @@ impl Av2Encoder {
             8,
             2,
         );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 32,
+                height: 8,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.luma32x8,
+                scan: &SCAN32X8,
+                eob_cdf: EobCdf::ChrEob256,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 256,
+                u_skip_row: &SKIP_TX16_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
+        );
         encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, true, pc);
         let mh_on = enc.mhccp;
         code_444_chroma_leaf(
@@ -2439,6 +2624,42 @@ impl Av2Encoder {
             },
             2,
             8,
+        );
+        // Decide MHCCP before the luma emit: the uv mode / MHCCP flags are part of
+        // the block's mode info, which `encode_luma_leaf_*` writes.
+        crate::av2::y444::chroma::preset_444_mhccp(
+            enc,
+            &*recy,
+            &*recu,
+            &*recv,
+            up,
+            vp,
+            pw,
+            &Chroma444Block {
+                bounds: mhccp_bounds,
+                y: sb_y,
+                x: sb_x,
+                width: 8,
+                height: 32,
+                have_top: lmr > 0,
+                have_left: lmc > 0,
+            },
+            &Chroma444Tx {
+                basis: &bases.luma8x32,
+                scan: &SCAN8X32,
+                eob_cdf: EobCdf::ChrEob256,
+                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                area: 256,
+                u_skip_row: &SKIP_TX16_QC[qc],
+            },
+            &Chroma444Quant {
+                neutral,
+                qstep: split_qstep_c,
+                lambda: leaf::part_lambda(split_qstep, self.tune.part_lambda_c),
+                bit_depth: self.bit_depth as i32,
+            },
+            enc.mhccp,
+            None,
         );
         encode_luma_leaf_8x32(enc, &tu, skip, dcs, 0, true, pc);
         let mh_on = enc.mhccp;
@@ -2836,6 +3057,7 @@ impl Av2Encoder {
                         y: sb_y,
                         x: sb_x,
                         neutral,
+                        frame: (width, height),
                     },
                     &ChromaRdSpec {
                         basis: &bases.chroma444,
@@ -2873,8 +3095,8 @@ impl Av2Encoder {
                     &[0, 1, 2, 3, 4, 5, 6]
                 };
                 let mode_lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
-                let dcu = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
-                let dcv = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
+                let dcu = dc_pred_bounded(recu, pw, sb_y, sb_x, 64, neutral, width, height);
+                let dcv = dc_pred_bounded(recv, pw, sb_y, sb_x, 64, neutral, width, height);
                 let mut best_mode = 0usize;
                 let mut best_cost = f32::INFINITY;
                 let mut best_pred: Option<(Vec<f32>, Vec<f32>)> = None;
@@ -3335,7 +3557,7 @@ impl Av2Encoder {
                 (levu, levv)
             } else {
                 // DC (either search disabled, or DC won the search above).
-                let predu = dc_pred(recu, pw, sb_y, sb_x, 64, neutral);
+                let predu = dc_pred_bounded(recu, pw, sb_y, sb_x, 64, neutral, width, height);
                 let levu = chroma422::project_chroma_rdoq(
                     &bases.chroma444,
                     &aq::scale_resid(
@@ -3364,7 +3586,7 @@ impl Av2Encoder {
                         bd,
                     ),
                 );
-                let predv = dc_pred(recv, pw, sb_y, sb_x, 64, neutral);
+                let predv = dc_pred_bounded(recv, pw, sb_y, sb_x, 64, neutral, width, height);
                 let levv = chroma422::project_chroma_rdoq(
                     &bases.chroma444,
                     &aq::scale_resid(
@@ -4321,6 +4543,12 @@ impl Av2Encoder {
                 push_whole64(db_tx, lmr, lmc, 0);
                 // Chroma of a full-64 walk leaf is a single TX_64X64.
                 db_tx_c.push((lmr, lmc, 16, 16));
+            } else if matches!((bw_mi, bh_mi), (16, 8) | (8, 16)) {
+                // 64x32 / 32x64 leaves code luma as two TX_32X32 (the second TU at
+                // +32 px along the long side); chroma is one TX_64X32 / TX_32X64.
+                db_tx.push((lmr, lmc, 8, 8));
+                db_tx.push((lmr + (bh_mi - 8), lmc + (bw_mi - 8), 8, 8));
+                db_tx_c.push((lmr, lmc, bw_mi, bh_mi));
             } else {
                 db_tx.push((lmr, lmc, bw_mi, bh_mi));
                 db_tx_c.push((lmr, lmc, bw_mi, bh_mi));
@@ -4388,6 +4616,9 @@ impl Av2Encoder {
                 enc.cfl_use = false;
                 enc.cfl_signaled = false;
                 enc.mhccp_use = false;
+                // Walk leaves code chroma as DC or MHCCP; never emit a uv mode left
+                // over from an earlier whole-64 SB's mode search.
+                enc.uv_mode = 0;
             }
             let (u_present, v_present) = match (bw_mi, bh_mi) {
                 (16, 16) => self.encode_walk_leaf16(
@@ -4505,54 +4736,74 @@ impl Av2Encoder {
                         walk,
                     )
                 }
-                (4, 16) => self.encode_walk_leaf4x16(
-                    enc,
-                    recy,
-                    recu,
-                    recv,
-                    yp,
-                    up,
-                    vp,
-                    pw,
-                    sb_y,
-                    sb_x,
-                    split_qstep,
-                    split_resid_scale,
-                    split_qstep_c,
-                    above,
-                    left,
-                    tmc,
-                    tmr,
-                    pc,
-                    ua,
-                    ul,
-                    va,
-                    vl,
-                ),
-                (16, 4) => self.encode_walk_leaf16x4(
-                    enc,
-                    recy,
-                    recu,
-                    recv,
-                    yp,
-                    up,
-                    vp,
-                    pw,
-                    sb_y,
-                    sb_x,
-                    split_qstep,
-                    split_resid_scale,
-                    split_qstep_c,
-                    above,
-                    left,
-                    tmc,
-                    tmr,
-                    pc,
-                    ua,
-                    ul,
-                    va,
-                    vl,
-                ),
+                (4, 16) => {
+                    let mut luma_split = false;
+                    let r = self.encode_walk_leaf4x16(
+                        enc,
+                        recy,
+                        recu,
+                        recv,
+                        yp,
+                        up,
+                        vp,
+                        pw,
+                        sb_y,
+                        sb_x,
+                        split_qstep,
+                        split_resid_scale,
+                        split_qstep_c,
+                        above,
+                        left,
+                        tmc,
+                        tmr,
+                        pc,
+                        ua,
+                        ul,
+                        va,
+                        vl,
+                        &mut luma_split,
+                    );
+                    // The leaf may code luma as two TUs (RD); re-record them.
+                    if luma_split {
+                        db_tx.pop();
+                        db_tx.extend([(lmr, lmc, 4, 8), (lmr + 8, lmc, 4, 8)]);
+                    }
+                    r
+                }
+                (16, 4) => {
+                    let mut luma_split = false;
+                    let r = self.encode_walk_leaf16x4(
+                        enc,
+                        recy,
+                        recu,
+                        recv,
+                        yp,
+                        up,
+                        vp,
+                        pw,
+                        sb_y,
+                        sb_x,
+                        split_qstep,
+                        split_resid_scale,
+                        split_qstep_c,
+                        above,
+                        left,
+                        tmc,
+                        tmr,
+                        pc,
+                        ua,
+                        ul,
+                        va,
+                        vl,
+                        &mut luma_split,
+                    );
+                    // The leaf may code luma as two TUs (RD); re-record them.
+                    if luma_split {
+                        db_tx.pop();
+                        db_tx.extend([(lmr, lmc, 8, 4), (lmr, lmc + 8, 8, 4)]);
+                    }
+                    r
+                }
                 (2, 8) => self.encode_walk_leaf2x8(
                     enc,
                     recy,
@@ -5391,14 +5642,11 @@ impl Av2Encoder {
             let qs = quant::qstep(self.base_q_idx as u32) as i32;
             ((qs + 4) >> 3) >> 6
         };
-        // Byte-exact for the split path (base_q<=140 = `preserve_fullres_chroma`, where
-        // every full-interior SB is coded via the split ops → Op::Leaf recording). The
-        // whole-64 fast path (base_q>140) RD-picks SPLIT/VERT4/HORZ4 whose TX tilings the
-        // recorder doesn't yet reproduce exactly (VERT4/HORZ4), so it's gated out for now.
-        // SB-aligned only for now: partial edge SBs take the whole-64 path but the
-        // synthesized full-64 leaf produces spurious TU edges (and out-of-range reads).
-        let sb_aligned_444 = width.is_multiple_of(64) && height.is_multiple_of(64);
-        if self.tune.deblock && df_quant >= 1 && !needs_partition && sb_aligned_444 {
+        // The header signals deblock whenever `filter_active` (mod.rs), so the recon
+        // must always be filtered to match the decoder. Leaves are recorded at TX
+        // granularity on every path: whole-64 SPLIT/VERT4/HORZ4, walk leaves (64x32 /
+        // 32x64 as two TX_32X32), and edge SBs.
+        if self.tune.deblock && df_quant >= 1 {
             let eff_dy = if self.tune.db_delta_y == i32::MIN {
                 if df_quant >= 5 { 0 } else { 1 }
             } else {
@@ -5429,25 +5677,29 @@ impl Av2Encoder {
                 chroma_tx_cap: (16, 16),
             });
         }
-        // Video: stash final recon (Y,U,V) for the DPB; skipped for still tiles.
-        if self
-            .capture_recon
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            enc.recon = vec![recy.clone(), recu.clone(), recv.clone()];
-        }
         // Pass 1 (single-tile whole-frame): derive the per-block CDEF decision from
         // this reconstruction for a pass-2 re-emit. Skipped when a grid is already
-        // installed (pass 2), or when recon is captured for the tiled path.
-        if self.tune.cdef
-            && tile_ref.is_none()
-            && cdef_pre.is_none()
-            && !self
-                .capture_recon
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // installed (pass 2) and inside tile sub-encodes (the tiled path searches
+        // the stitched recon).
+        // Pass 2 applies the signaled grid so the recon matches the decoder.
+        let mut rec = vec![recy, recu, recv];
+        if let Some(pre) = cdef_pre {
+            crate::av2::cdef_est::apply_per_block(
+                &mut rec,
+                pw,
+                ph,
+                pw,
+                ph,
+                0,
+                0,
+                true,
+                pre,
+                self.bit_depth,
+                &crate::av2::cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
+            );
+        } else if self.tune.cdef && tile_ref.is_none() && !replay::in_tile_subencode() {
             enc.cdef_decided = crate::av2::cdef_est::search_per_block(
-                &[recy, recu, recv],
+                &rec,
                 &[yp, up, vp],
                 pw,
                 ph,
@@ -5459,6 +5711,13 @@ impl Av2Encoder {
                 self.base_q_idx,
                 self.bit_depth,
             );
+        }
+        // Video: stash final recon (Y,U,V) for the DPB; skipped for still tiles.
+        if self
+            .capture_recon
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            enc.recon = rec;
         }
         enc
     }

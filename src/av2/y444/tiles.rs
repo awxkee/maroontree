@@ -214,7 +214,7 @@ impl Av2Encoder {
             records.push(rec);
             tiles.push((b, r));
         }
-        let recon = stitch_tile_recon_444(&tiles, &specs, sig_w, sig_h);
+        let mut recon = stitch_tile_recon_444(&tiles, &specs, sig_w, sig_h);
         // Per-block CDEF two-pass. Pass 1 (above) captured each tile's recon; stitch
         // it and decide the frame-level per-SB grid. When any SB benefits, pass 2
         // re-encodes every tile with its slice of the grid (each tile independent,
@@ -312,6 +312,35 @@ impl Av2Encoder {
             },
             &tiles_bytes,
         );
+        // The decoder applies CDEF frame-wide after all tiles; mirror it on the
+        // stitched recon so the retained reconstruction matches.
+        if let Some(dec) = &frame_dec
+            && recon.len() >= 3
+            && !recon[0].is_empty()
+        {
+            // Filter an 8-aligned stitched frame (the decoder's CDEF extent), then
+            // crop back to the `sig_w × sig_h` recon.
+            let (aw, ah) = ((sig_w + 7) & !7, (sig_h + 7) & !7);
+            let mut ext = stitch_tile_recon_444_ext(&tiles, &specs, sig_w, sig_h, aw, ah);
+            cdef_est::apply_per_block(
+                &mut ext,
+                aw,
+                ah,
+                aw,
+                ah,
+                0,
+                0,
+                true,
+                dec,
+                self.bit_depth,
+                &cdef_est::cdef_regions(&specs, sig_w, sig_h),
+            );
+            for (dst, src) in recon.iter_mut().zip(&ext) {
+                for r in 0..sig_h {
+                    dst[r * sig_w..(r + 1) * sig_w].copy_from_slice(&src[r * aw..r * aw + sig_w]);
+                }
+            }
+        }
         frame.recon = recon;
         frame
     }
@@ -326,19 +355,45 @@ fn stitch_tile_recon_444(
     sig_w: usize,
     sig_h: usize,
 ) -> Vec<Vec<f32>> {
+    stitch_tile_recon_444_ext(tiles, specs, sig_w, sig_h, sig_w, sig_h)
+}
+
+/// Like [`stitch_tile_recon_444`], but into an `out_w × out_h` frame: tiles touching
+/// the right/bottom edge contribute their padded recon out to `out_w`/`out_h`. The
+/// decoder keeps reconstructed pixels out to the 8-aligned frame edge and CDEF reads
+/// them, so the CDEF pass needs this extended frame.
+fn stitch_tile_recon_444_ext(
+    tiles: &[(Vec<u8>, Vec<Vec<f32>>)],
+    specs: &[(usize, usize, usize, usize)],
+    sig_w: usize,
+    sig_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<Vec<f32>> {
     if tiles.iter().all(|(_, r)| r.len() < 3) {
         return Vec::new();
     }
-    let mut planes = vec![vec![0f32; sig_w * sig_h]; 3];
+    let mut planes = vec![vec![0f32; out_w * out_h]; 3];
     for ((_, recon), &(x0, y0, tw, th)) in tiles.iter().zip(specs.iter()) {
         if recon.len() < 3 {
             continue;
         }
         let tpw = sb_align(tw);
+        let tph = recon[0].len() / tpw;
+        let tw = if x0 + tw >= sig_w {
+            (out_w - x0).min(tpw)
+        } else {
+            tw
+        };
+        let th = if y0 + th >= sig_h {
+            (out_h - y0).min(tph)
+        } else {
+            th
+        };
         for (pi, out) in planes.iter_mut().enumerate() {
             for r in 0..th {
                 let src = &recon[pi][r * tpw..r * tpw + tw];
-                out[(y0 + r) * sig_w + x0..(y0 + r) * sig_w + x0 + tw].copy_from_slice(src);
+                out[(y0 + r) * out_w + x0..(y0 + r) * out_w + x0 + tw].copy_from_slice(src);
             }
         }
     }

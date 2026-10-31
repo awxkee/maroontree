@@ -289,19 +289,41 @@ impl Av2Encoder {
             },
             &tiles_bytes,
         );
-        if let Some(decision) = &frame_dec {
+        if let Some(decision) = &frame_dec
+            && !recon.is_empty()
+        {
+            // Filter an 8-aligned stitched frame (the decoder's CDEF extent), then
+            // crop back to the `sig_w × sig_h` recon.
+            let (aw, ah) = ((sig_w + 7) & !7, (sig_h + 7) & !7);
+            let mut ext = stitch_tile_recon_420_ext(&tiles, &specs, sig_w, sig_h, aw, ah);
+            let (acw, ach) = (aw / 2, ah / 2);
             cdef_est::apply_per_block(
-                &mut recon,
-                sig_w,
-                sig_h,
-                cw,
-                sig_h.div_ceil(2),
+                &mut ext,
+                aw,
+                ah,
+                acw,
+                ach,
                 1,
                 1,
                 true,
                 decision,
                 self.bit_depth,
+                &cdef_est::cdef_regions(&specs, sig_w, sig_h),
             );
+            let (lw, cwf, chf) = (
+                recon[0].len() / sig_h,
+                recon[1].len() / sig_h.div_ceil(2),
+                sig_h.div_ceil(2),
+            );
+            for r in 0..sig_h {
+                recon[0][r * lw..r * lw + sig_w].copy_from_slice(&ext[0][r * aw..r * aw + sig_w]);
+            }
+            for p in 1..3 {
+                for r in 0..chf {
+                    recon[p][r * cwf..r * cwf + cwf]
+                        .copy_from_slice(&ext[p][r * acw..r * acw + cwf]);
+                }
+            }
         }
         frame.recon = recon;
         frame
@@ -319,12 +341,27 @@ fn stitch_tile_recon_420(
     sig_w: usize,
     sig_h: usize,
 ) -> Vec<Vec<f32>> {
+    stitch_tile_recon_420_ext(tiles, specs, sig_w, sig_h, sig_w, sig_h)
+}
+
+/// Like [`stitch_tile_recon_420`], but into an `out_w × out_h` frame (≥ `sig_w ×
+/// sig_h`): tiles touching the right/bottom edge contribute their padded recon out
+/// to `out_w`/`out_h`. The decoder keeps reconstructed pixels out to the 8-aligned
+/// frame edge and CDEF reads them, so the CDEF pass needs this extended frame.
+fn stitch_tile_recon_420_ext(
+    tiles: &[(Vec<u8>, Vec<Vec<f32>>)],
+    specs: &[(usize, usize, usize, usize)],
+    sig_w: usize,
+    sig_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<Vec<f32>> {
     if tiles.iter().all(|(_, r)| r.len() < 3) {
         return Vec::new();
     }
-    let cwf = sig_w.div_ceil(2);
-    let chf = sig_h.div_ceil(2);
-    let mut y = vec![0f32; sig_w * sig_h];
+    let cwf = out_w.div_ceil(2);
+    let chf = out_h.div_ceil(2);
+    let mut y = vec![0f32; out_w * out_h];
     let mut u = vec![0f32; cwf * chf];
     let mut v = vec![0f32; cwf * chf];
     for ((_, recon), &(x0, y0, tw, th)) in tiles.iter().zip(specs.iter()) {
@@ -333,11 +370,22 @@ fn stitch_tile_recon_420(
         }
         let tpw = sb_align(tw);
         let tcw = tpw / 2;
+        let tph = recon[0].len() / tpw;
+        let tw = if x0 + tw >= sig_w {
+            (out_w - x0).min(tpw)
+        } else {
+            tw
+        };
+        let th = if y0 + th >= sig_h {
+            (out_h - y0).min(tph)
+        } else {
+            th
+        };
         let (cx, cy) = (x0 / 2, y0 / 2);
         let (ctw, cth) = (tw.div_ceil(2), th.div_ceil(2));
         for r in 0..th {
             let src = &recon[0][r * tpw..r * tpw + tw];
-            y[(y0 + r) * sig_w + x0..(y0 + r) * sig_w + x0 + tw].copy_from_slice(src);
+            y[(y0 + r) * out_w + x0..(y0 + r) * out_w + x0 + tw].copy_from_slice(src);
         }
         for r in 0..cth {
             let su = &recon[1][r * tcw..r * tcw + ctw];

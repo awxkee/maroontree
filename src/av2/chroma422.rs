@@ -444,9 +444,10 @@ fn predict_chroma_sq(
 ) -> Vec<f32> {
     let have_above = cy > 0;
     let have_left = cx > 0;
-    // Chroma mi grid (4 chroma px per mi). SB-aligned plane bounds.
-    let mi_col_end = (((cw_px + 31) & !31) >> 2) as i64;
-    let mi_row_end = (((ch_px + 31) & !31) >> 2) as i64;
+    // Chroma mi grid (4 chroma px per mi). `cw_px`/`ch_px` are the coded chroma
+    // extents (8-aligned luma >> subsampling), AVM's `tile.mi_col_end` in chroma px.
+    let mi_col_end = (cw_px.div_ceil(4)) as i64;
+    let mi_row_end = (ch_px.div_ceil(4)) as i64;
     let mi_col = (cx >> 2) as i64;
     let mi_row = (cy >> 2) as i64;
     let bs_mi = (bs >> 2) as i64;
@@ -473,8 +474,9 @@ fn predict_chroma_sq(
             top_right: tr_px,
             bottom_left: bl_px,
             neutral,
-            available_above: bs,
-            available_left: bs,
+            // AVM n_top_px / n_left_px: samples past the coded extent repeat.
+            available_above: cw_px.saturating_sub(cx).clamp(1, bs),
+            available_left: ch_px.saturating_sub(cy).clamp(1, bs),
         },
     );
     match m {
@@ -509,9 +511,13 @@ fn predict_chroma_sq(
                     is_luma: false,
                     have_top: have_above,
                     have_left,
-                    edge_filter: false,
+                    // enable_intra_edge_filter = 1 filters chroma DR edges too
+                    // (reconintra.c). Strength uses type 0; AVM picks type 1 when a
+                    // chroma neighbour is UV_SMOOTH*, which only differs for w+h <= 32.
+                    edge_filter: true,
                     max_width: bs as i32 + tr_px as i32,
                     max_height: bs as i32 + bl_px as i32,
+                    max_pixel: 2 * neutral as i32 - 1,
                 },
             )
         }
@@ -908,8 +914,10 @@ pub(crate) fn predict_chroma444_whole64(
             top_right: tr_px,
             bottom_left: bl_px,
             neutral,
-            available_above: 64,
-            available_left: 64,
+            // AVM n_top_px / n_left_px: samples past the coded (8-aligned) extent
+            // repeat the last available one (the luma predictor bounds the same way).
+            available_above: (((mi_col_end - mi_col) << 2) as usize).clamp(1, 64),
+            available_left: (((mi_row_end - mi_row) << 2) as usize).clamp(1, 64),
         },
     );
     match m {
@@ -940,9 +948,13 @@ pub(crate) fn predict_chroma444_whole64(
                     is_luma: false,
                     have_top: have_above,
                     have_left,
-                    edge_filter: false,
+                    // enable_intra_edge_filter = 1 filters chroma DR edges too
+                    // (reconintra.c). Strength uses type 0; AVM picks type 1 when a
+                    // chroma neighbour is UV_SMOOTH*, which only differs for w+h <= 32.
+                    edge_filter: true,
                     max_width: 64 + tr_px as i32,
                     max_height: 64 + bl_px as i32,
+                    max_pixel: 2 * neutral as i32 - 1,
                 },
             )
         }

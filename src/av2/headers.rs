@@ -113,7 +113,16 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     let has_chroma = config.layout.has_chroma();
     let mut b = ByteWriter::new();
     b.write_uvlc(0);
-    b.write_bits(config.layout.profile(), 5); // seq_profile_idc (0=420/mono, 3=422, 4=444)
+    // seq_profile_idc (0=420/mono, 3=422, 4=444). AV2 v1.0 profiles are 8/10-bit
+    // only; 12-bit streams use AVM's TEST_ONLY_12BIT_PROFILE (5), which decoders
+    // built with CONFIG_TESTONLY_12BIT_SUPPORT accept (chroma format is coded
+    // separately below).
+    let profile = if config.bit_depth == 12 {
+        5
+    } else {
+        config.layout.profile()
+    };
+    b.write_bits(profile, 5);
     b.write_bit(1); // single_picture_header_flag
     b.write_bits(31, 5); // seq_max_level_idx = SEQ_LEVEL_MAX (unconstrained; skips DPB/ref-frame conformance)
     b.write_uvlc(config.layout.header_uvlc());

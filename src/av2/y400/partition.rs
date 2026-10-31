@@ -416,7 +416,7 @@ impl Av2Encoder {
     }
 
     /// Decide + emit one 4:0:0 superblock (the extracted body of the `for col`
-    /// loop). Behaviour-preserving; byte-identical. Split out so the SB-wavefront
+    /// loop). Behavior-preserving; byte-identical. Split out so the SB-wavefront
     /// can drive it per cell with a private luma recon + fresh contexts.
     fn decide_sb_400(&self, decision: Sb400Decision<'_, '_>) {
         let Sb400Decision {
@@ -540,6 +540,12 @@ impl Av2Encoder {
         } else {
             partition::sb_partition_ops(row, col, tmr as usize, tmc as usize, above_pctx, left_pctx)
         };
+        // Per-block CDEF: AVM reads the SB's strength index at its first coded block
+        // (`read_cdef`, cdef_on_skip_txfm = 1), same as the whole-SB path above.
+        if enc.cdef_nb >= 2 {
+            enc.cdef_pending = true;
+            enc.cdef_sb_rc = (row, col);
+        }
         enc.delta_q_pending = enc.delta_q_present;
         // Staged decouple — the walk pushes exactly one `luma400` entry per SB:
         // `Walk(leaves)` when every leaf shape is replayable ({(16,16),(8,8),(4,4),

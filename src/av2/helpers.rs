@@ -361,44 +361,6 @@ pub(crate) fn dc_pred(rec: &[f32], w: usize, y0: usize, x0: usize, bs: usize, ne
     dc_pred_bounded(rec, w, y0, x0, bs, neutral, usize::MAX, usize::MAX)
 }
 
-pub(crate) fn dc_pred_cfl_subsampled(
-    rec: &[f32],
-    w: usize,
-    y0: usize,
-    x0: usize,
-    bs: usize,
-    neutral: f32,
-    bd: i32,
-) -> f32 {
-    let (ha, hl) = (y0 > 0, x0 > 0);
-    let ss = if bs > 32 { 2 } else { 1 };
-    let mut sum: i64 = 0;
-    let mut count: i64 = 0;
-    if ha {
-        let base = (y0 - 1) * w + x0;
-        let mut i = 0;
-        while i < bs {
-            sum += rec[base + i] as i64;
-            count += 1;
-            i += ss;
-        }
-    }
-    if hl {
-        let mut i = 0;
-        while i < bs {
-            sum += rec[(y0 + i) * w + x0 - 1] as i64;
-            count += 1;
-            i += ss;
-        }
-    }
-    if count == 0 {
-        return neutral;
-    }
-    let dc = (sum + count / 2) / count;
-    let maxv = (1i64 << bd) - 1;
-    dc.clamp(0, maxv) as f32
-}
-
 /// DC predictor that limits neighbor samples to the in-frame region and replicates the
 /// last available sample beyond it, matching AVM (`build_intra_predictors` uses
 /// `n_left_px = min(txh, yd+txh)` / `n_top_px = min(txw, xr+txw)` then extends). `fw`/`fh`
@@ -576,26 +538,35 @@ pub(crate) fn put_block(plane: &mut [f32], w: usize, y0: usize, x0: usize, bs: u
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dc_pred_rect_subsampled(
+/// Subsampled-reference DC predictor (AVM `highbd_dc_predictor_subsampled`, every
+/// other sample for sides > 32) with decoder-style edge replication: neighbours past
+/// the coded plane bounds repeat the last in-frame sample before subsampling.
+pub(crate) fn dc_pred_rect_subsampled_bounded(
     rec: &[f32],
-    w: usize,
-    y0: usize,
-    x0: usize,
-    bw: usize,
-    bh: usize,
+    rect: &BoundedIntraRect,
     neutral: f32,
     bd: i32,
 ) -> f32 {
+    let BoundedIntraRect {
+        stride: w,
+        y: y0,
+        x: x0,
+        width: bw,
+        height: bh,
+        frame_width: fw,
+        frame_height: fh,
+    } = *rect;
     let (ha, hl) = (y0 > 0, x0 > 0);
     let ss_hor = if bw > 32 { 2 } else { 1 };
     let ss_ver = if bh > 32 { 2 } else { 1 };
+    let avail_above = fw.saturating_sub(x0).min(bw).max(1);
+    let avail_left = fh.saturating_sub(y0).min(bh).max(1);
     let mut sum: i64 = 0;
     let mut count: i64 = 0;
     if ha {
         let mut i = 0;
         while i < bw {
-            sum += rec[(y0 - 1) * w + x0 + i] as i64;
+            sum += rec[(y0 - 1) * w + x0 + i.min(avail_above - 1)] as i64;
             count += 1;
             i += ss_hor;
         }
@@ -603,7 +574,7 @@ pub(crate) fn dc_pred_rect_subsampled(
     if hl {
         let mut i = 0;
         while i < bh {
-            sum += rec[(y0 + i) * w + x0 - 1] as i64;
+            sum += rec[(y0 + i.min(avail_left - 1)) * w + x0 - 1] as i64;
             count += 1;
             i += ss_ver;
         }
