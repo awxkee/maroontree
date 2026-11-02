@@ -3579,10 +3579,13 @@ mod tests {
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    type Avx2DctFn<const N: usize> = unsafe fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]);
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     fn assert_forward_avx2_matches_scalar<const N: usize>(
         name: &str,
         scalar_fn: DctFn<N>,
-        avx2_fn: unsafe fn(&[i32; N], i32, i32) -> ([i32; N], [f32; N]),
+        avx2_fn: Avx2DctFn<N>,
     ) {
         if !std::is_x86_feature_detected!("avx2") {
             return;
@@ -4005,7 +4008,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_8_f64(&mut ref_buf);
 
-        let mut got: [i32; 8] = *fixed.as_slice().first_chunk().unwrap();
+        let mut got: [i32; 8] = *fixed.first_chunk().unwrap();
         dct1d_8_i32(&mut got);
 
         for k in 0..8 {
@@ -4070,7 +4073,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_16_f64(&mut ref_buf);
 
-        let mut got: [i32; 16] = *fixed.as_slice().first_chunk().unwrap();
+        let mut got: [i32; 16] = *fixed.first_chunk().unwrap();
         dct1d_16_i32(&mut got);
 
         for k in 0..16 {
@@ -4109,7 +4112,7 @@ mod tests {
         let mut ref_buf: Vec<f64> = fixed.iter().map(|&v| v as f64).collect();
         dct1d_32_f64(&mut ref_buf);
 
-        let mut got: [i32; 32] = *fixed.as_slice().first_chunk().unwrap();
+        let mut got: [i32; 32] = *fixed.first_chunk().unwrap();
         dct1d_32_i32(&mut got);
 
         for k in 0..32 {

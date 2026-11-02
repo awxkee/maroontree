@@ -123,6 +123,7 @@ impl ByteWriter {
 }
 
 /// AV2 multi-symbol arithmetic coder (encoder side).
+#[derive(Clone)]
 pub(crate) struct RangeEncoder {
     low: u64,
     /// Current range; exposed for encoder/decoder trace alignment during testing.
@@ -217,6 +218,9 @@ pub(crate) struct RangeEncoder {
     /// get_y_mode_idx_ctx = count of directional above-right/bottom-left
     /// neighbor modes (0..=2). Set per block by the encoders.
     pub(crate) y_ctx: usize,
+    /// Luma mode class of the last block whose intra modes were emitted:
+    /// directional midx (>= 0), `leaf::MIDX_SMOOTH`, or -1 (`leaf::midx_class`).
+    pub(crate) luma_class: i32,
     pub(crate) cfl_signaled: bool,
     pub(crate) cfl_js: u8,
     pub(crate) cfl_mag_u: u8,
@@ -263,9 +267,109 @@ pub(crate) struct RangeEncoder {
     /// SB-wavefront decide (Capture) pass, whose bytes are thrown away — only the
     /// serial Replay emits the real bitstream. Skips range coding + `output` growth.
     pub(crate) sink: bool,
+    /// SDP luma-tree pass: leaves carry no chroma syntax and the chroma TU coders
+    /// code nothing (the chroma tree codes chroma after the SB's luma).
+    pub(crate) sdp_luma: bool,
+    /// SDP chroma-tree partition contexts (plane 1): above per luma mi column
+    /// (grown on demand), left per mi row of the current SB row.
+    pub(crate) sdp_above_c: Vec<u8>,
+    pub(crate) sdp_left_c: [u8; 16],
+    /// SDP chroma-tree leaves of the frame so far (luma-mi rects), for the chroma
+    /// deblock (4:2:2 collects them here; 4:2:0 threads its own list).
+    pub(crate) sdp_chroma_leaves: Vec<(usize, usize, usize, usize)>,
+    /// Lossy screen-content frame: every DC luma block >= 8x8 carries palette
+    /// syntax (emitted with its mode info).
+    pub(crate) sct: bool,
+    /// Coding a luma TX_64X64: the 32x32 token symbols use the txs_ctx 4 CDFs.
+    pub(crate) tx64: bool,
+    /// The palette of the next luma block to be emitted (set by the leaf).
+    pub(crate) palette_next: Option<Box<crate::av2::palette::Palette>>,
+    /// Luma mi (row, col) of the block being emitted, tile-relative.
+    pub(crate) pal_pos: (usize, usize),
+    /// Palette id per mi column / row of the latest coded block (0 = none), for
+    /// the neighbour color cache; ids index `pal_store` (id - 1).
+    pub(crate) pal_above: Vec<u32>,
+    pub(crate) pal_left: Vec<u32>,
+    pub(crate) pal_store: Vec<Vec<u16>>,
 }
 
 impl RangeEncoder {
+    /// A copy for a trial encode: all coder and context state, but an empty output
+    /// (the bytes already written are not needed to measure what follows).
+    pub(crate) fn trial_clone(&mut self) -> RangeEncoder {
+        let out = std::mem::take(&mut self.output);
+        let leaves = std::mem::take(&mut self.sdp_chroma_leaves);
+        let t = self.clone();
+        self.output = out;
+        self.sdp_chroma_leaves = leaves;
+        t
+    }
+
+    /// [`trial_clone`](Self::trial_clone) into an existing trial encoder, reusing its
+    /// CDF-state and buffer allocations.
+    pub(crate) fn trial_clone_into(&mut self, dst: &mut RangeEncoder) {
+        // Heap fields: copied into dst's own buffers (`clone_from` keeps their
+        // capacity); `output` / `sdp_chroma_leaves` start empty as in `trial_clone`.
+        macro_rules! with_bufs_taken {
+            ($($f:ident),*) => {{
+                $(let $f = (std::mem::take(&mut dst.$f), std::mem::take(&mut self.$f));)*
+                let keep = dst.cdf_state.take();
+                let cs = self.cdf_state.take();
+                *dst = self.clone();
+                self.cdf_state = cs;
+                $(self.$f = $f.1; dst.$f = $f.0;)*
+                keep
+            }};
+        }
+        let mut keep = with_bufs_taken!(
+            output,
+            sdp_chroma_leaves,
+            ccso_grid,
+            ccso_grid_v,
+            recon,
+            cdef_grid,
+            sdp_above_c,
+            pal_above,
+            pal_left,
+            pal_store
+        );
+        dst.output.clear();
+        dst.sdp_chroma_leaves.clear();
+        dst.ccso_grid.clone_from(&self.ccso_grid);
+        dst.ccso_grid_v.clone_from(&self.ccso_grid_v);
+        dst.recon.clone_from(&self.recon);
+        dst.cdef_grid.clone_from(&self.cdef_grid);
+        dst.sdp_above_c.clone_from(&self.sdp_above_c);
+        dst.pal_above.clone_from(&self.pal_above);
+        dst.pal_left.clone_from(&self.pal_left);
+        dst.pal_store.clone_from(&self.pal_store);
+        dst.cdf_state = match (keep.take(), &self.cdf_state) {
+            (Some(mut b), Some(src)) => {
+                b.assign_from(src);
+                Some(b)
+            }
+            (_, src) => src.clone(),
+        };
+    }
+
+    /// Continue as `trial`, a [`trial_clone`](Self::trial_clone) of this encoder
+    /// that has coded more: its output (precarry words, so appending is exact) and
+    /// SDP chroma leaves follow this encoder's.
+    pub(crate) fn adopt_trial(&mut self, trial: RangeEncoder) {
+        let mut out = std::mem::take(&mut self.output);
+        let mut leaves = std::mem::take(&mut self.sdp_chroma_leaves);
+        *self = trial;
+        out.append(&mut self.output);
+        leaves.append(&mut self.sdp_chroma_leaves);
+        self.output = out;
+        self.sdp_chroma_leaves = leaves;
+    }
+
+    /// Bits written so far, for differences between two points of one encoder.
+    pub(crate) fn tell_bits(&self) -> f32 {
+        (8 * self.output.len()) as f32 + self.count as f32 + 16.0 - (self.range as f32).log2()
+    }
+
     pub(crate) fn new() -> Self {
         RangeEncoder {
             low: 0,
@@ -302,6 +406,7 @@ impl RangeEncoder {
             cfl_ctx: 0,
             cfl_use: false,
             y_ctx: 0,
+            luma_class: -1,
             cfl_signaled: false,
             cfl_js: 0,
             cfl_mag_u: 0,
@@ -327,6 +432,17 @@ impl RangeEncoder {
             ref_bit_ctx: 0,
             ref_rank: 0,
             sink: false,
+            sdp_luma: false,
+            sdp_above_c: Vec::new(),
+            sdp_left_c: [0; 16],
+            sdp_chroma_leaves: Vec::new(),
+            sct: false,
+            tx64: false,
+            palette_next: None,
+            pal_pos: (0, 0),
+            pal_above: Vec::new(),
+            pal_left: Vec::new(),
+            pal_store: Vec::new(),
         }
     }
 
@@ -340,7 +456,7 @@ impl RangeEncoder {
     /// CDF. `nsyms` excludes the adaptation metadata stored after the CDF
     /// boundaries.
     #[inline]
-    fn symbol_bits(cdf: &[u16], symbol: usize, nsyms: usize) -> f32 {
+    pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize, nsyms: usize) -> f32 {
         debug_assert!(symbol < nsyms);
         let hi = if symbol == 0 {
             32768i32
@@ -854,80 +970,60 @@ impl RangeEncoder {
         }
     }
 
-    /// Static palette syntax is used only by coded-lossless frames, for which
-    /// AVM forces `disable_cdf_update=1`.
+    /// Palette syntax: adaptive with a CDF state (lossy screen-content frames),
+    /// else static (coded-lossless frames, where AVM forces disable_cdf_update=1).
+    fn sym_cdf(
+        &mut self,
+        pick: impl FnOnce(&mut CdfState) -> &mut Vec<u16>,
+        fallback: &[u16],
+        s: usize,
+        nsyms: usize,
+    ) {
+        if let Some(cs) = self.cdf_state.as_deref_mut() {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                pick(cs),
+                s,
+                nsyms,
+            );
+        } else {
+            self.sym_static(fallback, s, nsyms);
+        }
+    }
+
     pub(crate) fn sym_palette_y_mode(&mut self, val: usize) {
-        self.sym_static(&[2723], val, 1);
+        use crate::av2::palette::Y_MODE_ICDF;
+        self.sym_cdf(|cs| &mut cs.pal_y_mode, &[Y_MODE_ICDF], val, 1);
     }
 
     pub(crate) fn sym_palette_y_size(&mut self, size: usize) {
-        const CDF: [u16; 6] = [23989, 17673, 11991, 7865, 4845, 2365];
-        self.sym_static(&CDF, size - 2, 6);
+        use crate::av2::palette::Y_SIZE_ICDF;
+        self.sym_cdf(|cs| &mut cs.pal_y_size, &Y_SIZE_ICDF, size - 2, 6);
+    }
+
+    /// Line flag (0 = coded, 1 = repeated index, 2 = copy previous line); ctx 3 is
+    /// the first line, else the previous line's flag.
+    pub(crate) fn sym_palette_row(&mut self, ctx: usize, flag: usize) {
+        use crate::av2::palette::ROW_ICDF;
+        self.sym_cdf(|cs| &mut cs.pal_row[ctx], &ROW_ICDF[ctx], flag, 2);
     }
 
     pub(crate) fn sym_palette_identity_row_off(&mut self, first_row: bool) {
         // The first row uses context 3; subsequent non-copy rows use context 0.
-        let cdf = if first_row {
-            [19769, 12]
-        } else {
-            [10253, 7017]
-        };
-        self.sym_static(&cdf, 0, 2);
+        self.sym_palette_row(if first_row { 3 } else { 0 }, 0);
     }
 
     pub(crate) fn sym_palette_y_color(&mut self, size: usize, ctx: usize, val: usize) {
-        const CDF: [[[u16; 7]; 5]; 7] = [
-            [
-                [4628, 0, 0, 0, 0, 0, 0],
-                [16384, 0, 0, 0, 0, 0, 0],
-                [24186, 0, 0, 0, 0, 0, 0],
-                [5355, 0, 0, 0, 0, 0, 0],
-                [2339, 0, 0, 0, 0, 0, 0],
-            ],
-            [
-                [7418, 3742, 0, 0, 0, 0, 0],
-                [21405, 7495, 0, 0, 0, 0, 0],
-                [25927, 4189, 0, 0, 0, 0, 0],
-                [11418, 6756, 0, 0, 0, 0, 0],
-                [2195, 1122, 0, 0, 0, 0, 0],
-            ],
-            [
-                [9062, 5806, 3708, 0, 0, 0, 0],
-                [22792, 10252, 5386, 0, 0, 0, 0],
-                [26077, 7308, 3534, 0, 0, 0, 0],
-                [13859, 8843, 4365, 0, 0, 0, 0],
-                [2460, 1692, 950, 0, 0, 0, 0],
-            ],
-            [
-                [8652, 5811, 4282, 2827, 0, 0, 0],
-                [23200, 12296, 8474, 3826, 0, 0, 0],
-                [27062, 7525, 4728, 2362, 0, 0, 0],
-                [12663, 9786, 5744, 3857, 0, 0, 0],
-                [1871, 1426, 1002, 569, 0, 0, 0],
-            ],
-            [
-                [11944, 8541, 6842, 5309, 3502, 0, 0],
-                [24627, 13779, 11169, 6586, 4192, 0, 0],
-                [27516, 8428, 6318, 4330, 2143, 0, 0],
-                [13249, 10073, 7181, 5796, 4345, 0, 0],
-                [2385, 1878, 1521, 1115, 618, 0, 0],
-            ],
-            [
-                [11140, 8256, 6895, 5714, 4637, 3229, 0],
-                [24740, 14504, 12155, 7344, 5656, 3862, 0],
-                [26279, 10526, 8307, 6374, 4418, 2258, 0],
-                [10720, 8339, 5778, 4824, 4351, 3194, 0],
-                [1967, 1563, 1296, 1040, 763, 463, 0],
-            ],
-            [
-                [10297, 7685, 6784, 5875, 5114, 4018, 2865],
-                [25226, 15711, 13617, 9218, 7309, 5702, 3964],
-                [25186, 12331, 10040, 8146, 6253, 4189, 2136],
-                [10666, 8624, 5852, 4617, 3922, 3556, 2615],
-                [2244, 1881, 1612, 1375, 1142, 857, 487],
-            ],
-        ];
-        self.sym_static(&CDF[size - 2][ctx], val, size - 1);
+        use crate::av2::palette::COLOR_ICDF;
+        self.sym_cdf(
+            |cs| &mut cs.pal_color[size - 2][ctx],
+            &COLOR_ICDF[size - 2][ctx],
+            val,
+            size - 1,
+        );
     }
 
     /// Flush the coder and return the packed tile bytes.
@@ -1176,7 +1272,11 @@ impl RangeEncoder {
     // ---- luma 32x32 -------------------------------------------------------
     pub(crate) fn sym_luma32_hf(&mut self, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.luma32_hf[ctx];
+            let cdf = if self.tx64 {
+                &mut cs.luma64_hf[ctx]
+            } else {
+                &mut cs.luma32_hf[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1187,13 +1287,21 @@ impl RangeEncoder {
                 3,
             );
         } else {
-            use crate::av2::cdfs_qctx::LUMA32_BASE_TOK_HF_QC;
-            self.sym_static(&LUMA32_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+            use crate::av2::cdfs_qctx::{LUMA32_BASE_TOK_HF_QC, LUMA64_BASE_TOK_HF_QC};
+            if self.tx64 {
+                self.sym_static(&LUMA64_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+            } else {
+                self.sym_static(&LUMA32_BASE_TOK_HF_QC[self.qc][ctx], s, 3);
+            }
         }
     }
     pub(crate) fn sym_luma32_lf(&mut self, ctx: usize, s: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.luma32_lf[ctx];
+            let cdf = if self.tx64 {
+                &mut cs.luma64_lf[ctx]
+            } else {
+                &mut cs.luma32_lf[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1204,13 +1312,21 @@ impl RangeEncoder {
                 5,
             );
         } else {
-            use crate::av2::cdfs_qctx::LUMA32_BASE_TOK_LF_QC;
-            self.sym_static(&LUMA32_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+            use crate::av2::cdfs_qctx::{LUMA32_BASE_TOK_LF_QC, LUMA64_BASE_TOK_LF_QC};
+            if self.tx64 {
+                self.sym_static(&LUMA64_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+            } else {
+                self.sym_static(&LUMA32_BASE_TOK_LF_QC[self.qc][ctx], s, 5);
+            }
         }
     }
     pub(crate) fn sym_luma32_eob_hf(&mut self, ctx: usize, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.luma32_eob_hf[ctx];
+            let cdf = if self.tx64 {
+                &mut cs.luma64_eob_hf[ctx]
+            } else {
+                &mut cs.luma32_eob_hf[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1221,13 +1337,21 @@ impl RangeEncoder {
                 nsyms,
             );
         } else {
-            use crate::av2::cdfs_qctx::LUMA32_EOB_TOK_HF_QC;
-            self.sym_static(&LUMA32_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+            use crate::av2::cdfs_qctx::{LUMA32_EOB_TOK_HF_QC, LUMA64_EOB_TOK_HF_QC};
+            if self.tx64 {
+                self.sym_static(&LUMA64_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+            } else {
+                self.sym_static(&LUMA32_EOB_TOK_HF_QC[self.qc][ctx], s, nsyms);
+            }
         }
     }
     pub(crate) fn sym_luma32_eob_lf(&mut self, ctx: usize, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
-            let cdf = &mut cs.luma32_eob_lf[ctx];
+            let cdf = if self.tx64 {
+                &mut cs.luma64_eob_lf[ctx]
+            } else {
+                &mut cs.luma32_eob_lf[ctx]
+            };
             Self::sym_mut_inner(
                 &mut self.low,
                 &mut self.range,
@@ -1238,8 +1362,12 @@ impl RangeEncoder {
                 nsyms,
             );
         } else {
-            use crate::av2::cdfs_qctx::LUMA32_EOB_TOK_LF_QC;
-            self.sym_static(&LUMA32_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+            use crate::av2::cdfs_qctx::{LUMA32_EOB_TOK_LF_QC, LUMA64_EOB_TOK_LF_QC};
+            if self.tx64 {
+                self.sym_static(&LUMA64_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+            } else {
+                self.sym_static(&LUMA32_EOB_TOK_LF_QC[self.qc][ctx], s, nsyms);
+            }
         }
     }
 
@@ -1850,6 +1978,33 @@ impl RangeEncoder {
             self.sym_static(&TX_PART_64X32_INIT, s, nsyms);
         }
     }
+    pub(crate) fn sym_tx_part_32x16(&mut self, s: usize, nsyms: usize) {
+        use crate::av2::cdf_state::TX_PART_32X16_INIT;
+        self.sym_cdf(|cs| &mut cs.tx_part_32x16, &TX_PART_32X16_INIT, s, nsyms);
+    }
+    pub(crate) fn sym_tx_part_16x32(&mut self, s: usize, nsyms: usize) {
+        use crate::av2::cdf_state::TX_PART_16X32_INIT;
+        self.sym_cdf(|cs| &mut cs.tx_part_16x32, &TX_PART_16X32_INIT, s, nsyms);
+    }
+    /// 4-way tx partition type of the newer rect shapes (`bw4` x `bh4`):
+    /// AVM txfm_4way_partition_type_cdf[0][0][group].
+    pub(crate) fn sym_tx_part_4way(&mut self, bw4: usize, bh4: usize, s: usize) {
+        let slot = match (bw4, bh4) {
+            (2, 4) => 0,  // 8X16, group 1
+            (4, 2) => 1,  // 16X8, group 2
+            (2, 8) => 2,  // 8X32, group 10
+            (8, 2) => 3,  // 32X8, group 11
+            (4, 16) => 4, // 16X64, group 12
+            _ => 5,       // 64X16, group 13
+        };
+        use crate::av2::cdf_state::TX_PART_4WAY_INIT;
+        self.sym_cdf(
+            |cs| &mut cs.tx_part_4way[slot],
+            &TX_PART_4WAY_INIT[slot],
+            s,
+            6,
+        );
+    }
     pub(crate) fn sym_tx_part_32x64(&mut self, s: usize, nsyms: usize) {
         if let Some(ref mut cs) = self.cdf_state {
             let cdf = &mut cs.tx_part_32x64;
@@ -2277,6 +2432,40 @@ impl RangeEncoder {
             );
         } else {
             self.encode_bool(static_cdf, bit);
+        }
+    }
+
+    /// SDP chroma-tree (plane 1) do_split bool at partition context `ctx`.
+    pub(crate) fn bool_do_split_c(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.do_split_c[ctx],
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(crate::av2::partition::DO_SPLIT_CDF1[ctx], bit);
+        }
+    }
+
+    /// SDP chroma-tree (plane 1) rect_type bool at partition context `ctx`.
+    pub(crate) fn bool_rect_type_c(&mut self, ctx: usize, bit: u32) {
+        if let Some(ref mut cs) = self.cdf_state {
+            Self::sym_mut_inner(
+                &mut self.low,
+                &mut self.range,
+                &mut self.count,
+                &mut self.output,
+                &mut cs.rect_type_c[ctx],
+                bit as usize,
+                1,
+            );
+        } else {
+            self.encode_bool(crate::av2::partition::RECT_TYPE_CDF1[ctx], bit);
         }
     }
 

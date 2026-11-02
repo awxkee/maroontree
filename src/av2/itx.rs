@@ -653,9 +653,18 @@ pub(crate) fn inv_txfm_recon_f32<F: Fn(usize) -> i32>(
     bd: i32,
     pred_fn: F,
 ) {
+    let pmax = (1 << bd) - 1;
+    // All-zero coefficients: every pass rounds 0 to 0, so the reconstruction is
+    // the (clamped) prediction.
+    if coeff.iter().all(|&c| c == 0) {
+        let (tw, th, _, _) = DIM[tx];
+        for (i, o) in out[..16 * tw * th].iter_mut().enumerate() {
+            *o = pred_fn(i).clamp(0, pmax) as f32;
+        }
+        return;
+    }
     let mut tmp = [0i32; 32 * 32];
     let (sw, sh, w, h, s1) = txfm_passes(&mut tmp, coeff, txtp, tx, bd);
-    let pmax = (1 << bd) - 1;
     let rnd1 = (1 << s1) >> 1;
     // AVM clamps each column-pass output (the residual) to [-2^bd, 2^bd-1]
     // (idct.c col_rng_min/max); required for enc/dec recon match at large qstep.
@@ -1162,8 +1171,16 @@ mod neon_lane {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     use super::*;
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn valid_1d_types(sz: usize) -> &'static [usize] {
         match sz {
             0 => &[0, 1, 2, 3],
@@ -1174,6 +1191,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn coeff_case(sw: usize, sh: usize, tx: usize, hor: usize, ver: usize, seed: u32) -> Vec<i32> {
         let mut state = seed
             .wrapping_mul(747_796_405)
@@ -1192,6 +1213,10 @@ mod tests {
         coeff
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn coeff_clip_case(sw: usize, sh: usize, bd: i32) -> Vec<i32> {
         let mut coeff = vec![0i32; sw * sh];
         let lim = 1 << (bd + 7);
@@ -1207,6 +1232,10 @@ mod tests {
         coeff
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     unsafe fn assert_itx_impl_matches_scalar(name: &str, simd: ItxPassesFn) {
         for (tx, &(tw, th, lw, lh)) in DIM.iter().enumerate() {
             let sw = (4 * tw).min(32);

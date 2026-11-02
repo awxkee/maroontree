@@ -121,6 +121,9 @@ pub(super) fn preset_444_mhccp(
     }
     let choice = if let Some(cached) = replay_choice {
         cached
+    } else if enc.sdp_luma {
+        // SDP luma pass: the chroma tree decides chroma.
+        None
     } else {
         let dcu = dc_pred_rect(recu, pw, sb_y, sb_x, cw, ch, neutral, bd);
         let dcv = dc_pred_rect(recv, pw, sb_y, sb_x, cw, ch, neutral, bd);
@@ -188,6 +191,9 @@ pub(super) fn code_444_chroma_leaf(
     neighbors: ChromaNeighbors,
     mhccp_on: bool,
 ) -> (bool, bool) {
+    if enc.sdp_luma {
+        return (false, false);
+    }
     let coded_mask = enc.sb_coded;
     let Chroma444Planes {
         reconstructed_luma,

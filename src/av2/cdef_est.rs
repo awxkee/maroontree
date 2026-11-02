@@ -145,7 +145,7 @@ fn luma_sse_per_sb(
             let dist = if pri != 0 || sec != 0 {
                 let bi = by * nbx + bx;
                 let apri = cdef::adjust_pri(pri << (bd - 8), vars[bi]);
-                cdef::cdef_filter_8x8(
+                cdef::cdef_filter_8x8_i32(
                     &mut tmp,
                     rec,
                     w,
@@ -214,7 +214,7 @@ fn chroma_sse_per_sb(
                 } else {
                     uv_dir[ldirs.get(lby * nbx + lbx).copied().unwrap_or(0)]
                 };
-                cdef::cdef_filter_block(
+                cdef::cdef_filter_block_i32(
                     &mut tmp,
                     0,
                     rec,
@@ -378,7 +378,7 @@ pub(crate) fn apply_per_block(
                     continue;
                 }
                 let bi = by * nbx + bx;
-                cdef::cdef_filter_8x8(
+                cdef::cdef_filter_8x8_i32(
                     &mut dst_y,
                     &masked,
                     pw,
@@ -429,7 +429,7 @@ pub(crate) fn apply_per_block(
                     if cx >= cw || cy >= ch {
                         continue;
                     }
-                    cdef::cdef_filter_block(
+                    cdef::cdef_filter_block_i32(
                         &mut dst,
                         0,
                         &masked,

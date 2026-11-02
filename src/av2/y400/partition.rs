@@ -28,6 +28,7 @@
  */
 
 use super::super::*;
+use crate::av2::leaf::MIDX_SMOOTH;
 
 /// Copy an `w × h` reconstruction rectangle at `(y, x)` out of a plane (row-major).
 /// Used to snapshot a walk leaf's luma reconstruction for the decouple record.
@@ -58,6 +59,8 @@ struct WfScratch400 {
     above: Vec<u8>,
     left: Vec<u8>,
     apctx: Vec<u8>,
+    mia: Vec<i32>,
+    mil: Vec<i32>,
     dbq: Vec<u16>,
 }
 
@@ -70,6 +73,8 @@ impl WfScratch400 {
         self.above.resize(pw / 4 + 16, 0x40);
         self.left.resize(ph / 4 + 16, 0x40);
         self.apctx.resize(tmc as usize + 16, 0);
+        self.mia.resize(tmc as usize + 16, -1);
+        self.mil.resize(ph / 4 + 16, -1);
         self.dbq.resize(sb_cols * sb_rows, 0);
     }
 
@@ -79,6 +84,8 @@ impl WfScratch400 {
         self.above.fill(0x40);
         self.left.fill(0x40);
         self.apctx.fill(0);
+        self.mia.fill(-1);
+        self.mil.fill(-1);
         self.dbq.fill(0);
     }
 }
@@ -98,6 +105,9 @@ struct Sb400Decision<'a, 'record> {
     left: &'a mut [u8],
     above_pctx: &'a mut [u8],
     left_pctx: &'a mut [u8],
+    /// Per-mi luma mode class of the last block above / left (`leaf::midx_class`).
+    midx_above: &'a mut [i32],
+    midx_left: &'a mut [i32],
     tx_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
     sb_qidx: &'a mut [u16],
     pw: usize,
@@ -131,6 +141,8 @@ impl Av2Encoder {
         // it (skips the leaf mode/tx searches). `Off` = today's inline behavior.
         mut decide_mode: crate::av2::replay::DecideMode<'_>,
     ) {
+        // Perceptual (4x4 DCT-weighted) decision distortion for stills.
+        crate::av2::helpers::set_wsse(self.still_rd());
         let LumaPlanes { rec: recy, src: yp } = luma;
         let &PartitionPass {
             luma_stride: pw,
@@ -241,6 +253,12 @@ impl Av2Encoder {
             let base_q = self.base_q_idx as i32;
             let nthreads = Self::resolve_threads(self.threads);
             let wy = crate::av2::helpers::PlaneWriter::new(recy, pw);
+            // Per-mi luma mode class of every SB's bottom row and right column, so a
+            // cell sees its neighbours' directional / SMOOTH state as the serial pass
+            // does (mode set and directional edge filter of border leaves).
+            let map_stride = sb_cols * 16;
+            let mut mode_map = vec![-1i32; sb_rows * 16 * map_stride];
+            let wm = crate::av2::helpers::PlaneWriter::new(&mut mode_map, map_stride);
             // Persistent-pool wavefront: fast/DC-only mode uses the wider top/left
             // schedule; directional search retains the above-right-safe WPP schedule.
             // Worker scratch is allocated once, not once per diagonal.
@@ -257,6 +275,22 @@ impl Av2Encoder {
                         let s = &mut *sc.borrow_mut();
                         s.ensure(pw, ph_full, tmc, sb_cols, sb_rows);
                         s.reset_contexts();
+                        let (mr0, mc0) = (r * 16, c * 16);
+                        {
+                            // SAFETY: row mr0-1 / column mc0-1 were written by the
+                            // above / left cells, which finished on earlier diagonals.
+                            let (mp, _, ms) = wm.read_view();
+                            if r > 0 {
+                                for col in mc0..(mc0 + 16).min(s.mia.len()) {
+                                    s.mia[col] = unsafe { *mp.add((mr0 - 1) * ms + col) };
+                                }
+                            }
+                            if c > 0 {
+                                for row in mr0..(mr0 + 16).min(s.mil.len()) {
+                                    s.mil[row] = unsafe { *mp.add(row * ms + mc0 - 1) };
+                                }
+                            }
+                        }
                         let ly_end = (sb_y + 64).min(ph_full);
                         let bx = sb_x.saturating_sub(HALO_BAND);
                         let tx_end = (sb_x + 64 + HALO_AR).min(pw);
@@ -301,6 +335,8 @@ impl Av2Encoder {
                             left: &mut s.left,
                             above_pctx: &mut s.apctx,
                             left_pctx: &mut lpctx,
+                            midx_above: &mut s.mia,
+                            midx_left: &mut s.mil,
                             tx_leaves: &mut cell_tx,
                             sb_qidx: &mut s.dbq,
                             pw,
@@ -328,6 +364,14 @@ impl Av2Encoder {
                             );
                         }
                         unsafe { wy.write_block(sb_y, sb_x, hl, 64, &blk[..hl * 64]) };
+                        let edge = |v: &[i32], i: usize| v.get(i).copied().unwrap_or(-1);
+                        let bottom: [i32; 16] = std::array::from_fn(|i| edge(&s.mia, mc0 + i));
+                        let right: [i32; 16] = std::array::from_fn(|i| edge(&s.mil, mr0 + i));
+                        // SAFETY: this SB's own mi rows/columns; no other cell writes them.
+                        unsafe {
+                            wm.write_block(mr0 + 15, mc0, 1, 16, &bottom);
+                            wm.write_block(mr0, mc0 + 15, 16, 1, &right);
+                        }
                         // Restore the buffer to all-zero: re-zero exactly what was dirtied
                         // (halo bands + own block) so the next cell sees all-zero-except-halo.
                         for rr in by..ly_end {
@@ -361,6 +405,8 @@ impl Av2Encoder {
             return;
         }
 
+        let mut midx_above = vec![-1i32; tmc as usize + 16];
+        let mut midx_left = vec![-1i32; tmr as usize + 16];
         for row in 0..sb_rows {
             left_pctx.iter_mut().for_each(|p| *p = 0);
             for col in 0..sb_cols {
@@ -391,6 +437,8 @@ impl Av2Encoder {
                     left,
                     above_pctx,
                     left_pctx,
+                    midx_above: &mut midx_above,
+                    midx_left: &mut midx_left,
                     tx_leaves,
                     sb_qidx,
                     pw,
@@ -419,6 +467,7 @@ impl Av2Encoder {
     /// loop). Behavior-preserving; byte-identical. Split out so the SB-wavefront
     /// can drive it per cell with a private luma recon + fresh contexts.
     fn decide_sb_400(&self, decision: Sb400Decision<'_, '_>) {
+        let _qm = self.qm_scope(Layout::Monochrome);
         let Sb400Decision {
             enc,
             aqs,
@@ -429,6 +478,8 @@ impl Av2Encoder {
             left,
             above_pctx,
             left_pctx,
+            midx_above,
+            midx_left,
             tx_leaves,
             sb_qidx,
             pw,
@@ -501,12 +552,14 @@ impl Av2Encoder {
                     },
                     &LumaPartitionSearch {
                         quant: LumaQuantSpec {
+                            prune: leaf::PRUNE_PROBE,
                             basis: &bases.luma,
                             qstep: sb_qstep,
                             scan: &tables::SCAN,
                             neutral,
                             quant_context: qc,
                             rdoq_lambda,
+                            pixel_lambda: self.still_rd(),
                             speed: self.speed,
                             bit_depth: self.bit_depth as i32,
                         },
@@ -518,7 +571,11 @@ impl Av2Encoder {
                         basis8: &bases.c8x8,
                         allow_16x16: true,
                         allow_8x8: true,
+                        leaf_modes: self.still_rd(),
+                        leaf_modes8: self.still_rd(),
+                        split8_chroma_weight: 1.0,
                     },
+                    None,
                 );
                 if let DecideMode::Capture(rec) = &mut *decide_mode {
                     rec.push_part(p);
@@ -561,6 +618,7 @@ impl Av2Encoder {
             None
         };
         let capturing = matches!(*decide_mode, DecideMode::Capture(_));
+        enc.sb_coded = [0u8; 256];
         let mut leaf_recs: Vec<Leaf400> = Vec::new();
         let mut walk_capturable = true;
         let mut cap_idx = 0usize;
@@ -592,14 +650,31 @@ impl Av2Encoder {
             let sb_y = lmr * 4;
             let sb_x = lmc * 4;
             let leaf_replay: Option<&Leaf400> = replay_walk.as_ref().and_then(|v| v.get(cap_idx));
+            // Luma mode-set neighbours (avm above_right / bottom_left mi), the y_idx
+            // context, and the SMOOTH edge-filter flag of this leaf.
+            let nb_midx = |v: i32| if v >= 0 { v as u8 } else { 0xff };
+            let amidx = nb_midx(if lmr > 0 {
+                midx_above[lmc + bw_mi - 1]
+            } else {
+                -1
+            });
+            let lmidx = nb_midx(if lmc > 0 {
+                midx_left[lmr + bh_mi - 1]
+            } else {
+                -1
+            });
+            enc.y_ctx = (amidx != 0xff) as usize + (lmidx != 0xff) as usize;
+            let smooth_nb = (lmr > 0 && midx_above[lmc] == MIDX_SMOOTH)
+                || (lmc > 0 && midx_left[lmr] == MIDX_SMOOTH);
+            enc.luma_class = -1;
             match (bw_mi, bh_mi) {
                 (16, 16) => {
-                    let (tus, mode_idx) = if let Some(d) = leaf_replay {
+                    let (tus, mode_idx, adelta) = if let Some(d) = leaf_replay {
                         put_block_rect(recy, pw, sb_y, sb_x, 64, 64, &d.recon_y);
                         let t: [Vec<Coeff>; 4] = std::array::from_fn(|k| d.tus[k].clone());
-                        (t, d.mode_idx)
+                        (t, d.mode_idx, d.angle_delta)
                     } else {
-                        let (tus, mode_idx, _, _) = encode_luma_sb(
+                        let (tus, mode_idx, adelta, _) = encode_luma_sb(
                             recy,
                             &LumaSource {
                                 plane: yp,
@@ -612,21 +687,27 @@ impl Av2Encoder {
                                 x: sb_x,
                             },
                             &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE,
                                 basis: &bases.luma,
                                 qstep: sb_qstep,
                                 scan: &tables::SCAN,
                                 neutral,
                                 quant_context: qc,
                                 rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
                                 speed: self.speed,
                                 bit_depth: self.bit_depth as i32,
                             },
                             &LumaSbSearch {
                                 residual_scale: sb_resid_scale,
-                                allow_directional: false,
+                                // Stills, whole SBs only (a directional 64 leaf in a
+                                // partial edge SB desyncs, as on the 4:2:0 path).
+                                allow_directional: self.still_rd()
+                                    && self.speed.try_directional()
+                                    && whole_sb,
                             },
                         );
-                        (tus, mode_idx)
+                        (tus, mode_idx, adelta)
                     };
                     if capturing {
                         leaf_recs.push(Leaf400 {
@@ -634,6 +715,7 @@ impl Av2Encoder {
                             bh_mi: 16,
                             tus: tus.to_vec(),
                             mode_idx,
+                            angle_delta: adelta,
                             tx_idx: 0,
                             recon_y: gather_rect(recy, pw, sb_y, sb_x, 64, 64),
                         });
@@ -641,44 +723,72 @@ impl Av2Encoder {
                     cap_idx += 1;
                     let (skip_cdfs, dc_sign_ctxs) =
                         sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
-                    encode_luma_block_split(
-                        enc,
-                        &tus,
-                        &skip_cdfs,
-                        &dc_sign_ctxs,
-                        mode_idx,
-                        false,
-                        pc,
-                    );
+                    if mode_idx >= 5 {
+                        encode_luma_block_split_dir(
+                            enc,
+                            &LumaSplitDirSpec {
+                                tus: &tus,
+                                skip_cdfs: &skip_cdfs,
+                                dc_sign_ctxs: &dc_sign_ctxs,
+                                mode_idx,
+                                angle_delta: adelta,
+                                has_chroma: false,
+                                part_cdf: pc,
+                                left_midx: lmidx,
+                                above_midx: amidx,
+                            },
+                        );
+                    } else {
+                        encode_luma_block_split(
+                            enc,
+                            &tus,
+                            &skip_cdfs,
+                            &dc_sign_ctxs,
+                            mode_idx,
+                            false,
+                            pc,
+                        );
+                    }
                 }
                 (8, 8) => {
-                    let (tu, mode_idx) = if let Some(d) = leaf_replay {
+                    let (tu, mode_idx, adelta) = if let Some(d) = leaf_replay {
                         put_block(recy, pw, sb_y, sb_x, 32, &d.recon_y);
-                        (d.tus[0].clone(), d.mode_idx)
+                        (d.tus[0].clone(), d.mode_idx, d.angle_delta)
                     } else {
-                        encode_luma_leaf_s32x32(
-                            recy,
-                            &LumaSource {
-                                plane: yp,
-                                stride: pw,
-                            },
-                            &LumaGridBlock {
-                                mi_cols: tmc,
-                                mi_rows: tmr,
-                                y: sb_y,
-                                x: sb_x,
-                            },
-                            &LumaQuantSpec {
-                                basis: &bases.luma,
-                                qstep: sb_qstep,
-                                scan: &tables::SCAN,
-                                neutral,
-                                quant_context: qc,
-                                rdoq_lambda: self.tune.rdoq_lambda,
-                                speed: self.speed,
-                                bit_depth: self.bit_depth as i32,
-                            },
-                        )
+                        {
+                            encode_luma_leaf_s32x32(
+                                recy,
+                                &LumaSource {
+                                    plane: yp,
+                                    stride: pw,
+                                },
+                                &LumaGridBlock {
+                                    mi_cols: tmc,
+                                    mi_rows: tmr,
+                                    y: sb_y,
+                                    x: sb_x,
+                                },
+                                &LumaQuantSpec {
+                                    prune: leaf::PRUNE_PROBE,
+                                    basis: &bases.luma,
+                                    qstep: sb_qstep,
+                                    scan: &tables::SCAN,
+                                    neutral,
+                                    quant_context: qc,
+                                    rdoq_lambda: self.tune.rdoq_lambda,
+                                    pixel_lambda: self.still_rd(),
+                                    speed: self.speed,
+                                    bit_depth: self.bit_depth as i32,
+                                },
+                                self.still_rd().then_some(leaf::LeafDirSearch {
+                                    coded: &enc.sb_coded,
+                                    frame_width: width,
+                                    frame_height: height,
+                                    refine: 8,
+                                }),
+                                None,
+                            )
+                        }
                     };
                     if capturing {
                         leaf_recs.push(Leaf400 {
@@ -686,6 +796,7 @@ impl Av2Encoder {
                             bh_mi: 8,
                             tus: vec![tu.clone()],
                             mode_idx,
+                            angle_delta: adelta,
                             tx_idx: 0,
                             recon_y: gather_rect(recy, pw, sb_y, sb_x, 32, 32),
                         });
@@ -705,14 +816,28 @@ impl Av2Encoder {
                             block_eq_tx: true,
                         },
                     );
-                    encode_luma_leaf_32x32(enc, &tu, skip2[0], dcs2[0], mode_idx, false, pc);
+                    if mode_idx >= 5 {
+                        coder::encode_luma_leaf_32x32_dir(
+                            enc, &tu, skip2[0], dcs2[0], mode_idx, adelta, false, pc, lmidx, amidx,
+                        );
+                    } else {
+                        encode_luma_leaf_32x32(enc, &tu, skip2[0], dcs2[0], mode_idx, false, pc);
+                    }
                 }
                 (4, 4) => {
                     // 16x16 corner leaf: tx_type RD over DCT/ADST mixes (ported from 4:4:4).
                     let bd = self.bit_depth as i32;
-                    let (tu, tx_idx) = if let Some(d) = leaf_replay {
+                    let (tu, tx_idx, mode16) = if let Some(d) = leaf_replay {
                         put_block_rect(recy, pw, sb_y, sb_x, 16, 16, &d.recon_y);
-                        (d.tus[0].clone(), d.tx_idx)
+                        (
+                            d.tus[0].clone(),
+                            d.tx_idx,
+                            leaf::SquareLumaMode {
+                                mode: d.mode_idx,
+                                angle_delta: d.angle_delta as i32,
+                                smooth_neighbour: smooth_nb,
+                            },
+                        )
                     } else {
                         let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 16, neutral, bd);
                         let resid = aq::scale_resid(
@@ -731,7 +856,7 @@ impl Av2Encoder {
                         }
                         let rate = coeff_rate_f32;
                         let sse = |rec: &[f32]| -> f32 { tx16_distortion(&src16, rec) };
-                        let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                        let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
                         let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
                         let rec_dct =
                             itx422::reconstruct_luma16(&pred_flat, &lev_dct, sb_qstep, &SCAN16, bd);
@@ -772,15 +897,132 @@ impl Av2Encoder {
                             3 => (&lev_da, &rec_da, 3),
                             _ => (&lev_dct, &rec_dct, 0),
                         };
+                        // Every other luma mode: SMOOTH, SMOOTH_V, SMOOTH_H, PAETH and (Slow /
+                        // Medium) the directional modes, each with the four TX_16X16 types —
+                        // at size class 2 av2_md_idx2type maps idx 0..=3 to the same types
+                        // for every intra mode class. Directional (mode, delta) pairs are
+                        // SATD-ranked and only the best few get the full RD.
+                        // Mode bits: flat.
+                        let mb16 = |m: usize| -> f32 {
+                            if m >= 5 {
+                                9.0
+                            } else if m == 0 {
+                                0.0
+                            } else {
+                                6.0
+                            }
+                        };
+                        let mut best_cost =
+                            [cost_dct, cost_adst, cost_ad, cost_da][tx_idx] + lambda * mb16(0);
+                        let mut best: Option<(Vec<f32>, [f32; 256], usize, leaf::SquareLumaMode)> =
+                            None;
+                        if self.still_rd() {
+                            let scale = sb_resid_scale;
+                            let block = leaf::SquareLumaBlock {
+                                stride: pw,
+                                frame_width: width,
+                                frame_height: height,
+                                y: sb_y,
+                                x: sb_x,
+                                size: 16,
+                            };
+                            // Edge-filter type 1 when the above or left block is SMOOTH*.
+                            let smooth_neighbour = smooth_nb;
+                            let refs = std::cell::RefCell::new(leaf::SquareRefCache::default());
+                            let predict = |lm: leaf::SquareLumaMode| -> [f32; 256] {
+                                let mut out = [0f32; 256];
+                                leaf::predict_luma_square_cached(
+                                    &*recy,
+                                    &block,
+                                    &enc.sb_coded,
+                                    lm,
+                                    neutral,
+                                    bd,
+                                    &mut refs.borrow_mut(),
+                                    &mut out,
+                                );
+                                out
+                            };
+                            let mut cands: Vec<leaf::SquareLumaMode> =
+                                (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
+                            let dir_keep = 3;
+                            if dir_keep > 0 && self.speed.try_directional() {
+                                let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
+                                    mode,
+                                    angle_delta,
+                                    smooth_neighbour,
+                                };
+                                let picked = leaf::screen_directional(
+                                    dir_keep,
+                                    self.speed.try_angle_deltas(),
+                                    8,
+                                    |m, d| {
+                                        crate::av2::metrics::satd_f32(
+                                            &src16,
+                                            16,
+                                            &predict(dir_lm(m, d)),
+                                            16,
+                                            16,
+                                            16,
+                                        )
+                                    },
+                                );
+                                cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
+                            }
+                            for lm in cands {
+                                let pred_m = predict(lm);
+                                let resid_m: Vec<f32> = src16
+                                    .iter()
+                                    .zip(&pred_m)
+                                    .map(|(&s, &q)| (s - q) * scale)
+                                    .collect();
+                                for (tx, &tx_delta) in TX16_TYPE_RATE_DELTA.iter().enumerate() {
+                                    let (basis, flips) = match tx {
+                                        0 => (&bases.luma16x16, (false, false)),
+                                        1 => (&bases.luma16x16_adst, (true, true)),
+                                        2 => (&bases.luma16x16_adst_dct, (false, true)),
+                                        _ => (&bases.luma16x16_dct_adst, (true, false)),
+                                    };
+                                    let lev_m = basis.project_scan(&resid_m, 0.0, &SCAN16);
+                                    if tx > 0 && tx16_dc_only(&lev_m) {
+                                        continue;
+                                    }
+                                    let rec_m = if tx == 0 {
+                                        itx422::reconstruct_luma16(
+                                            &pred_m, &lev_m, sb_qstep, &SCAN16, bd,
+                                        )
+                                    } else {
+                                        itx422::reconstruct_luma16_adst(
+                                            &pred_m, &lev_m, sb_qstep, &SCAN16, flips.0, flips.1,
+                                            bd,
+                                        )
+                                    };
+                                    let cost = crate::av2::rd::rd_cost(
+                                        sse(&rec_m),
+                                        rate(&lev_m) + tx_delta + mb16(lm.mode),
+                                        lambda,
+                                    );
+                                    if cost < best_cost {
+                                        best_cost = cost;
+                                        best = Some((lev_m, rec_m, tx, lm));
+                                    }
+                                }
+                            }
+                        }
+                        let (lev, rec, tx_idx, mode16) = match &best {
+                            Some((l, r, t, lm)) => (&l[..], r, *t, *lm),
+                            None => (lev, rec, tx_idx, leaf::SquareLumaMode::nondir(0)),
+                        };
                         put_block_rect(recy, pw, sb_y, sb_x, 16, 16, rec);
-                        (levels_to_coeffs(lev), tx_idx)
+                        (levels_to_coeffs(lev), tx_idx, mode16)
                     };
                     if capturing {
                         leaf_recs.push(Leaf400 {
                             bw_mi: 4,
                             bh_mi: 4,
                             tus: vec![tu.clone()],
-                            mode_idx: 0,
+                            mode_idx: mode16.mode,
+                            angle_delta: mode16.angle_delta as i8,
                             tx_idx,
                             recon_y: gather_rect(recy, pw, sb_y, sb_x, 16, 16),
                         });
@@ -802,19 +1044,48 @@ impl Av2Encoder {
                         4,
                     );
                     let skip = SKIP_TX16_QC[qc][0] as u32;
-                    coder::encode_luma_leaf_16x16_full(
-                        enc, &tu, skip, dcs, 0, false, pc, 11074, tx_idx,
-                    );
+                    if mode16.mode >= 5 {
+                        coder::encode_luma_leaf_16x16_dir(
+                            enc,
+                            &tu,
+                            skip,
+                            dcs,
+                            mode16.mode,
+                            mode16.angle_delta as i8,
+                            false,
+                            pc,
+                            11074,
+                            tx_idx,
+                            lmidx,
+                            amidx,
+                        );
+                    } else {
+                        coder::encode_luma_leaf_16x16_full(
+                            enc,
+                            &tu,
+                            skip,
+                            dcs,
+                            mode16.mode,
+                            false,
+                            pc,
+                            11074,
+                            tx_idx,
+                        );
+                    }
                 }
                 (2, 2) => {
                     // 8x8 luma leaf (TX_8X8), search-free single DCT.
                     let bd = self.bit_depth as i32;
+                    let mut mode8 = 0usize;
+                    let mut adelta8 = 0i32;
                     let tu: Vec<Coeff> = if let Some(d) = leaf_replay {
                         put_block_rect(recy, pw, sb_y, sb_x, 8, 8, &d.recon_y);
+                        mode8 = d.mode_idx;
+                        adelta8 = d.angle_delta as i32;
                         d.tus[0].clone()
                     } else {
                         let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 8, neutral, bd);
-                        let lev = bases.c8x8.project_scan(
+                        let mut lev = bases.c8x8.project_scan(
                             &aq::scale_resid(
                                 &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
                                 sb_resid_scale,
@@ -822,15 +1093,127 @@ impl Av2Encoder {
                             0.0,
                             &tables::SCAN8X8,
                         );
-                        put_block_rect(
-                            recy,
-                            pw,
-                            sb_y,
-                            sb_x,
-                            8,
-                            8,
-                            &itx422::reconstruct_chroma(pred, &lev, sb_qstep, &SCAN8X8, 8, 8, bd),
-                        );
+                        let mut rec8 =
+                            itx422::reconstruct_chroma(pred, &lev, sb_qstep, &SCAN8X8, 8, 8, bd);
+                        // Non-directional luma modes against DC (DCT only: tx index 0).
+                        if self.still_rd() {
+                            let lambda =
+                                leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                            let mb8 = |m: usize| -> f32 { if m == 0 { 0.0 } else { 6.0 } };
+                            let src8: Vec<f32> = rect_rows(yp, pw, sb_y, sb_x, 8, 8)
+                                .flatten()
+                                .copied()
+                                .collect();
+                            let sse8 = |rec: &[f32]| -> f32 {
+                                crate::av2::helpers::dist_rounded(&src8, 8, rec, 8, 8, 8)
+                            };
+                            let mut best_cost = crate::av2::rd::rd_cost(
+                                sse8(&rec8),
+                                coeff_rate_f32(&lev) + mb8(0),
+                                lambda,
+                            );
+                            let block = leaf::SquareLumaBlock {
+                                stride: pw,
+                                frame_width: width,
+                                frame_height: height,
+                                y: sb_y,
+                                x: sb_x,
+                                size: 8,
+                            };
+                            let refs = std::cell::RefCell::new(leaf::SquareRefCache::default());
+                            let predict = |lm: leaf::SquareLumaMode| -> [f32; 64] {
+                                let mut out = [0f32; 64];
+                                leaf::predict_luma_square_cached(
+                                    &*recy,
+                                    &block,
+                                    &enc.sb_coded,
+                                    lm,
+                                    neutral,
+                                    bd,
+                                    &mut refs.borrow_mut(),
+                                    &mut out,
+                                );
+                                out
+                            };
+                            let mut cands: Vec<leaf::SquareLumaMode> =
+                                (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
+                            // Directional modes: SATD-ranked, the best few get the RD.
+                            let dir_keep = 3;
+                            if dir_keep > 0 && self.speed.try_directional() {
+                                let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
+                                    mode,
+                                    angle_delta,
+                                    smooth_neighbour: smooth_nb,
+                                };
+                                let picked = leaf::screen_directional(
+                                    dir_keep,
+                                    self.speed.try_angle_deltas(),
+                                    2,
+                                    |m, d| {
+                                        crate::av2::metrics::satd_f32(
+                                            &src8,
+                                            8,
+                                            &predict(dir_lm(m, d)),
+                                            8,
+                                            8,
+                                            8,
+                                        )
+                                    },
+                                );
+                                cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
+                            }
+                            // Only the `prk8` SATD-best candidates get the full RD.
+                            let prk8 = 2;
+                            if cands.len() > prk8 {
+                                let mut ranked: Vec<(u64, leaf::SquareLumaMode)> = cands
+                                    .iter()
+                                    .map(|&lm| {
+                                        (
+                                            crate::av2::metrics::satd_f32(
+                                                &src8,
+                                                8,
+                                                &predict(lm),
+                                                8,
+                                                8,
+                                                8,
+                                            ),
+                                            lm,
+                                        )
+                                    })
+                                    .collect();
+                                ranked.sort_by_key(|&(sc, _)| sc);
+                                cands = ranked.into_iter().take(prk8).map(|(_, lm)| lm).collect();
+                            }
+                            let mb_dir = 9.0;
+                            for lm in cands {
+                                let m = lm.mode;
+                                let p = predict(lm);
+                                let resid: Vec<f32> = src8
+                                    .iter()
+                                    .zip(&p)
+                                    .map(|(&s, &q)| (s - q) * sb_resid_scale)
+                                    .collect();
+                                let lev_m = bases.c8x8.project_scan(&resid, 0.0, &tables::SCAN8X8);
+                                let p_i: Vec<i32> = p.iter().map(|&v| v as i32).collect();
+                                let rec_m = itx422::reconstruct_chroma_pred(
+                                    &p_i, &lev_m, sb_qstep, &SCAN8X8, 8, 8, bd,
+                                );
+                                let bits = if m >= 5 { mb_dir } else { mb8(m) };
+                                let cost = crate::av2::rd::rd_cost(
+                                    sse8(&rec_m),
+                                    coeff_rate_f32(&lev_m) + bits,
+                                    lambda,
+                                );
+                                if cost < best_cost {
+                                    best_cost = cost;
+                                    lev = lev_m;
+                                    rec8 = rec_m;
+                                    mode8 = m;
+                                    adelta8 = lm.angle_delta;
+                                }
+                            }
+                        }
+                        put_block_rect(recy, pw, sb_y, sb_x, 8, 8, &rec8);
                         levels_to_coeffs(&lev)
                     };
                     if capturing {
@@ -838,7 +1221,8 @@ impl Av2Encoder {
                             bw_mi: 2,
                             bh_mi: 2,
                             tus: vec![tu.clone()],
-                            mode_idx: 0,
+                            mode_idx: mode8,
+                            angle_delta: adelta8 as _,
                             tx_idx: 0,
                             recon_y: gather_rect(recy, pw, sb_y, sb_x, 8, 8),
                         });
@@ -859,23 +1243,38 @@ impl Av2Encoder {
                         2,
                         2,
                     );
-                    encode_luma_leaf_8x8(
-                        enc,
-                        &tu,
-                        skip,
-                        dcs,
-                        0,
-                        false,
-                        pc,
-                        3148,
-                        Some((&coder::TXTP_EXT8, 0, 6)),
-                    );
+                    if mode8 >= 5 {
+                        coder::encode_luma_leaf_8x8_dir(
+                            enc,
+                            &tu,
+                            skip,
+                            dcs,
+                            (mode8, adelta8 as i8),
+                            false,
+                            pc,
+                            3148,
+                            Some((&coder::TXTP_EXT8, 0, 6)),
+                            (lmidx, amidx),
+                        );
+                    } else {
+                        encode_luma_leaf_8x8(
+                            enc,
+                            &tu,
+                            skip,
+                            dcs,
+                            mode8,
+                            false,
+                            pc,
+                            3148,
+                            Some((&coder::TXTP_EXT8, 0, 6)),
+                        );
+                    }
                 }
                 (16, 8) => {
                     // Native edge shape — not yet captured; whole SB falls back to a
                     // serial re-search in replay (byte-safe).
                     walk_capturable = false;
-                    let (tus2, mode_idx) = encode_luma_leaf32(
+                    let (tus2, mode_idx, _) = encode_luma_leaf32(
                         recy,
                         &LumaSource {
                             plane: yp,
@@ -888,15 +1287,18 @@ impl Av2Encoder {
                             x: sb_x,
                         },
                         &LumaQuantSpec {
+                            prune: leaf::PRUNE_PROBE,
                             basis: &bases.luma,
                             qstep: sb_qstep,
                             scan: &tables::SCAN,
                             neutral,
                             quant_context: qc,
                             rdoq_lambda: self.tune.rdoq_lambda,
+                            pixel_lambda: self.still_rd(),
                             speed: self.speed,
                             bit_depth: self.bit_depth as i32,
                         },
+                        None,
                     );
                     let (skip2, dcs2) =
                         sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
@@ -904,7 +1306,7 @@ impl Av2Encoder {
                 }
                 (8, 16) => {
                     walk_capturable = false;
-                    let (tus2, mode_idx) = encode_luma_leaf_v32x64(
+                    let (tus2, mode_idx, _) = encode_luma_leaf_v32x64(
                         recy,
                         &LumaSource {
                             plane: yp,
@@ -917,15 +1319,18 @@ impl Av2Encoder {
                             x: sb_x,
                         },
                         &LumaQuantSpec {
+                            prune: leaf::PRUNE_PROBE,
                             basis: &bases.luma,
                             qstep: sb_qstep,
                             scan: &tables::SCAN,
                             neutral,
                             quant_context: qc,
                             rdoq_lambda: self.tune.rdoq_lambda,
+                            pixel_lambda: self.still_rd(),
                             speed: self.speed,
                             bit_depth: self.bit_depth as i32,
                         },
+                        None,
                     );
                     let (skip2, dcs2) = sb_tu_contexts_pos(
                         &[(0, 0), (32, 0)],
@@ -1320,6 +1725,14 @@ impl Av2Encoder {
                     );
                 }
                 other => unreachable!("unsupported native 4:0:0 leaf {:?}", other),
+            }
+            midx_above[lmc..lmc + bw_mi].fill(enc.luma_class);
+            midx_left[lmr..lmr + bh_mi].fill(enc.luma_class);
+            // Coded-mi mask for the next leaf's top-right / bottom-left availability.
+            for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
+                for c in (lmc & 15)..((lmc & 15) + bw_mi).min(16) {
+                    enc.sb_coded[r * 16 + c] = 1;
+                }
             }
         }
         if let DecideMode::Capture(rec) = &mut *decide_mode {

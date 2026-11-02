@@ -31,6 +31,7 @@ use crate::av2::quant::{BASE_Q, qstep};
 use crate::util::FastRound;
 use std::cell::RefCell;
 
+#[derive(Clone)]
 pub(crate) struct Basis {
     /// quantizer rescale factor (qstep_target / qstep_measured), applied at run time.
     pub(crate) scale: f32,
@@ -40,6 +41,11 @@ pub(crate) struct Basis {
     pub(crate) qstep: i32,
     /// Which avm forward transform this basis uses (DCT size, or 16×16 ADST mix).
     pub(crate) fwd: crate::av2::fdct::FwdKind,
+    /// Dead-zone rounding offset of the forward quantizer (0.5 = round-to-nearest).
+    pub(crate) dz: f32,
+    /// Trellis RDOQ for a square 16x16 / 8x8 luma basis: (quantizer context,
+    /// lambda in level^2 per bit). `None` = dead-zone rounding + EOB truncation.
+    pub(crate) rdoq: Option<(usize, f32)>,
 }
 
 /// RD end-of-block (EOB) truncation threshold, in unrounded-coefficient-magnitude units.
@@ -156,6 +162,19 @@ thread_local! {
         RefCell::new(FwdScratch { resid: Box::new([0; 4096]), out: Box::new([0; 1024])});
 }
 
+thread_local! {
+    /// Unquantised-magnitude scratch for the projections that only consume it.
+    static PRM_SCRATCH: std::cell::Cell<Vec<f32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Run `f` with the thread's `|pr|` scratch (taken out, so re-entry just allocates).
+fn with_prm_scratch<R>(f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
+    let mut prm = PRM_SCRATCH.take();
+    let r = f(&mut prm);
+    PRM_SCRATCH.set(prm);
+    r
+}
+
 impl Basis {
     /// Rescale to a different quantizer. The bases are the decoder's level-1
     /// reconstruction `qstep · T(k)` with a q-independent transform `T`, so the target
@@ -193,6 +212,46 @@ impl Bases {
         self.c4x16.max_val = mv;
         self.c16x4.max_val = mv;
         self.c16x8.max_val = mv;
+    }
+    /// Dead-zone rounding for every basis' forward quantizer (see [`Basis::dz`]).
+    pub(crate) fn set_dead_zone(&mut self, dz: f32) {
+        self.luma.dz = dz;
+        self.chroma420.dz = dz;
+        self.chroma422.dz = dz;
+        self.chroma444.dz = dz;
+        self.chroma444_64x32.dz = dz;
+        self.luma16x64.dz = dz;
+        self.luma64x16.dz = dz;
+        self.luma16x16.dz = dz;
+        self.luma16x16_adst.dz = dz;
+        self.luma16x16_adst_dct.dz = dz;
+        self.luma16x16_dct_adst.dz = dz;
+        self.luma8x32.dz = dz;
+        self.luma32x8.dz = dz;
+        self.luma16x32.dz = dz;
+        self.luma32x16.dz = dz;
+        self.c16x32.dz = dz;
+        self.c8x64.dz = dz;
+        self.c32x16.dz = dz;
+        self.c8x16.dz = dz;
+        self.c8x8.dz = dz;
+        self.c4x32.dz = dz;
+        self.c4x16.dz = dz;
+        self.c4x8.dz = dz;
+        self.c8x4.dz = dz;
+        self.c16x4.dz = dz;
+        self.c4x4.dz = dz;
+        self.c16x8.dz = dz;
+    }
+    /// Trellis RDOQ on the square TX_16X16 (all four tx types) and TX_8X8 bases
+    /// (`lambda` 0 = off for that size).
+    pub(crate) fn set_square_rdoq(&mut self, qc: usize, lambda16: f32, lambda8: f32) {
+        let r16 = (lambda16 > 0.0).then_some((qc, lambda16));
+        self.luma16x16.rdoq = r16;
+        self.luma16x16_adst.rdoq = r16;
+        self.luma16x16_adst_dct.rdoq = r16;
+        self.luma16x16_dct_adst.rdoq = r16;
+        self.c8x8.rdoq = (lambda8 > 0.0).then_some((qc, lambda8));
     }
     pub(crate) fn rescaled_to_q(mut self, base_q_idx: u32) -> Bases {
         let f = qstep(base_q_idx) as f32 / qstep(BASE_Q) as f32;
@@ -263,15 +322,24 @@ impl Basis {
             max_val: 255.0,
             qstep: qstep(BASE_Q) as i32,
             fwd: crate::av2::fdct::FwdKind::Proj,
+            dz: 0.5,
+            rdoq: None,
         }
     }
 
     /// avm forward transform for this basis; returns scan-order `(levels, |unquantised|)`.
     /// Only the unset `Proj` sentinel returns `None` (no basis is left in that state).
-    fn fwd_fast(&self, resid: &[f32], scan: &[u16], thresh: f32) -> Option<(Vec<f32>, Vec<f32>)> {
+    fn fwd_fast(
+        &self,
+        resid: &[f32],
+        scan: &[u16],
+        thresh: f32,
+        lev: &mut Vec<f32>,
+        prm: &mut Vec<f32>,
+    ) -> Option<()> {
         use crate::av2::fdct::{FwdKind, dc_tx_scale, fdct_rect, fwd16x16, quantize_to_levels};
         let q = self.qstep;
-        Some(match self.fwd {
+        match self.fwd {
             FwdKind::Proj => return None,
             // Every DCT_DCT size routes through the one general avm butterfly driver.
             FwdKind::Dct(w, h) => {
@@ -285,8 +353,44 @@ impl Basis {
                         *d = v.fast_round() as i32;
                     }
                     let nc = fdct_rect(&s.resid[..n], w, h, s.out.as_mut_slice());
-                    quantize_to_levels(&s.out[..nc], cw, q, factor, thresh, scan)
+                    quantize_to_levels(&s.out[..nc], cw, q, factor, thresh, scan, self.dz, lev, prm)
                 })
+            }
+            // 4×4 ADST/DCT mixes (chroma tx types derived from the uv mode), factor 8.
+            FwdKind::Tx4 { col_adst, row_adst } => {
+                let mut r = [0i32; 16];
+                for (d, &s) in r.iter_mut().zip(resid) {
+                    *d = s.fast_round() as i32;
+                }
+                quantize_to_levels(
+                    &crate::av2::fdct::fwd4x4(&r, col_adst, row_adst),
+                    4,
+                    q,
+                    8.0,
+                    thresh,
+                    scan,
+                    self.dz,
+                    lev,
+                    prm,
+                )
+            }
+            // 8×8 ADST/DCT mixes, factor 8 (as the 8×8 DCT).
+            FwdKind::Tx8 { col_adst, row_adst } => {
+                let mut r = [0i32; 64];
+                for (d, &s) in r.iter_mut().zip(resid) {
+                    *d = s.fast_round() as i32;
+                }
+                quantize_to_levels(
+                    &crate::av2::fdct::fwd8x8(&r, col_adst, row_adst),
+                    8,
+                    q,
+                    8.0,
+                    thresh,
+                    scan,
+                    self.dz,
+                    lev,
+                    prm,
+                )
             }
             // 16×16 ADST/DCT mixes: fwd16x16(col_adst, row_adst), factor 8.
             FwdKind::AdstAdst16 | FwdKind::AdstDct16 | FwdKind::DctAdst16 => {
@@ -299,9 +403,20 @@ impl Basis {
                 for (d, &s) in r.iter_mut().zip(resid) {
                     *d = s.fast_round() as i32;
                 }
-                quantize_to_levels(&fwd16x16(&r, col_adst, row_adst), 16, q, 8.0, thresh, scan)
+                quantize_to_levels(
+                    &fwd16x16(&r, col_adst, row_adst),
+                    16,
+                    q,
+                    8.0,
+                    thresh,
+                    scan,
+                    self.dz,
+                    lev,
+                    prm,
+                )
             }
-        })
+        }
+        Some(())
     }
 
     /// Forward-transform a residual block (row-major) → integer coefficient levels;
@@ -310,40 +425,71 @@ impl Basis {
     /// After quantization an RD end-of-block (EOB) truncation is applied: see
     /// [`rdoq_truncate_eob`].
     pub(crate) fn project(&self, resid: &[f32], thresh: f32) -> Vec<f32> {
-        let (mut lev, prm) = self
-            .fwd_fast(resid, &crate::av2::tables::SCAN, thresh)
-            .expect("every basis carries a forward DCT");
-        rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
+        let mut lev = Vec::new();
+        with_prm_scratch(|prm| {
+            self.fwd_fast(resid, &crate::av2::tables::SCAN, thresh, &mut lev, prm)
+                .expect("every basis carries a forward DCT");
+            rdoq_truncate_eob(&mut lev, prm, RDOQ_EOB_T);
+        });
         lev
-    }
-
-    /// Like [`project`] but returns the round-to-nearest levels together with the
-    /// per-coefficient unquantised magnitudes `|pr|` (scan order), and applies no
-    /// EOB truncation — trellis RDOQ ([`crate::av2::coder::rdoq_luma`]) consumes
-    /// these and does its own level + EOB optimisation.
-    pub(crate) fn project_with_prm(&self, resid: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        self.fwd_fast(resid, &crate::av2::tables::SCAN, 0.0)
-            .expect("every basis carries a forward DCT")
     }
 
     /// Scan-parameterised forward transform (see `project`).
     pub(crate) fn project_scan(&self, resid: &[f32], thresh: f32, scan: &[u16]) -> Vec<f32> {
-        let (mut lev, prm) = self
-            .fwd_fast(resid, scan, thresh)
-            .expect("every basis carries a forward DCT");
-        rdoq_truncate_eob(&mut lev, &prm, RDOQ_EOB_T);
+        let mut lev = Vec::new();
+        self.project_scan_into(resid, thresh, scan, &mut lev);
         lev
     }
 
-    /// Scan-parameterized [`project_with_prm`]: round levels + `|pr|`, no EOB
-    /// truncation, for the partition leaf paths (all TX_32X32-class).
-    pub(crate) fn project_scan_with_prm(
+    /// [`project_scan`] into a reused level buffer.
+    pub(crate) fn project_scan_into(
+        &self,
+        resid: &[f32],
+        thresh: f32,
+        scan: &[u16],
+        lev: &mut Vec<f32>,
+    ) {
+        with_prm_scratch(|prm| {
+            self.fwd_fast(resid, scan, thresh, lev, prm)
+                .expect("every basis carries a forward DCT");
+            match self.rdoq {
+                Some((qc, lambda)) => {
+                    let bwl = if resid.len() == 64 { 3 } else { 4 };
+                    crate::av2::coder::rdoq_luma_sq(prm, lev, qc, scan, bwl, lambda);
+                }
+                None => rdoq_truncate_eob(lev, prm, RDOQ_EOB_T),
+            }
+        })
+    }
+
+    /// Round-to-nearest levels with no EOB truncation, handed with the
+    /// per-coefficient unquantised magnitudes `|pr|` (scan order, lent from the
+    /// thread scratch) to `rdoq` — trellis RDOQ ([`crate::av2::coder::rdoq_luma`])
+    /// does its own level + EOB optimisation.
+    pub(crate) fn project_scan_rdoq<R>(
         &self,
         resid: &[f32],
         scan: &[u16],
-    ) -> (Vec<f32>, Vec<f32>) {
-        self.fwd_fast(resid, scan, 0.0)
-            .expect("every basis carries a forward DCT")
+        rdoq: impl FnOnce(&[f32], &mut [f32]) -> R,
+    ) -> (Vec<f32>, R) {
+        let mut lev = Vec::new();
+        let r = self.project_scan_rdoq_into(resid, scan, &mut lev, rdoq);
+        (lev, r)
+    }
+
+    /// [`project_scan_rdoq`](Self::project_scan_rdoq) into a reused level buffer.
+    pub(crate) fn project_scan_rdoq_into<R>(
+        &self,
+        resid: &[f32],
+        scan: &[u16],
+        lev: &mut Vec<f32>,
+        rdoq: impl FnOnce(&[f32], &mut [f32]) -> R,
+    ) -> R {
+        with_prm_scratch(|prm| {
+            self.fwd_fast(resid, scan, 0.0, lev, prm)
+                .expect("every basis carries a forward DCT");
+            rdoq(prm, lev)
+        })
     }
 }
 

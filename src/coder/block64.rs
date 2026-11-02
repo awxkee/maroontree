@@ -43,9 +43,11 @@ enum Luma64Tx {
     Grid16,
 }
 
-/// SSE against the wavefront's raw shared reconstruction
+/// [`crate::rd_sse::RdDispatch::sse_u16`] (plain or weighted, as `rd`
+/// measures) against the wavefront's raw shared reconstruction.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sse_u16_raw_reference(
+    rd: &crate::rd_sse::RdDispatch,
     src: crate::rd_sse::SrcBlock<'_>,
     reference: *const u16,
     reference_len: usize,
@@ -56,6 +58,13 @@ unsafe fn sse_u16_raw_reference(
     // Visible part only, like every other distortion (see `SrcBlock`).
     let (w, h) = src.vis();
     debug_assert!(h == 0 || (ref_y + h - 1) * ref_stride + ref_x + w <= reference_len);
+    // SAFETY: the caller guarantees that this finished reference rectangle
+    // is initialized and inside the shared plane.
+    if let Some(d) = rd.weighted_sse_with(src, |x, y| unsafe {
+        *reference.add((ref_y + y) * ref_stride + ref_x + x)
+    }) {
+        return d;
+    }
     let mut sse = 0i64;
     for row in 0..h {
         let src_row = &src.row(row)[..w];
@@ -121,6 +130,11 @@ fn ibc_mix(mut h: u32) -> u32 {
     h = h.wrapping_mul(0x846c_a68b);
     h ^ (h >> 16)
 }
+
+/// Samples in the largest subsampled IntraBC chroma block: a 64x64 block at
+/// 4:2:2 has 32x64 chroma (4:2:0 is 32x32), the bound for the scratch
+/// buffers of `ibc_chroma_pred`.
+const IBC_CHROMA_MAX: usize = 32 * 64;
 
 /// IntraBC chroma prediction on a subsampled plane: `(kx, ky)` is the
 /// integer reference origin (`luma_ref >> sub`), `(fx, fy)` whether the
@@ -643,7 +657,7 @@ impl<'a> LossyTile<'a> {
                     // Exactness of the FILTERED prediction against the source.
                     let src = &self.src[plane];
                     let get = |xx: usize, yy: usize| u32::from(src[yy * stride + xx]);
-                    let mut pred = [0u16; 32 * 32];
+                    let mut pred = [0u16; IBC_CHROMA_MAX];
                     ibc_chroma_pred(&get, ref_x, ref_y, fx, fy, bw, bh, &mut pred[..bw * bh]);
                     return (0..bh).all(|row| {
                         src[(y + row) * stride + x..][..bw] == pred[row * bw..][..bw]
@@ -839,7 +853,7 @@ impl<'a> LossyTile<'a> {
         let (fx, fy) = (sx == 1 && rx & 1 != 0, sy == 1 && ry & 1 != 0);
         let fill = |get: &dyn Fn(usize, usize) -> u32, out: &mut [i32]| {
             if fx || fy {
-                let mut blk = [0u16; 32 * 32];
+                let mut blk = [0u16; IBC_CHROMA_MAX];
                 ibc_chroma_pred(get, ref_x, ref_y, fx, fy, bw, bh, &mut blk[..bw * bh]);
                 for (o, &v) in out[..bw * bh].iter_mut().zip(&blk[..bw * bh]) {
                     *o = i32::from(v);
@@ -1286,6 +1300,7 @@ impl<'a> LossyTile<'a> {
                 // the IntraBC legality rule admits only finished cells.
                 distortion += unsafe {
                     sse_u16_raw_reference(
+                        &self.rd,
                         self.src_blk(plane, x, y, bw, bh),
                         ptr,
                         len,
@@ -1439,7 +1454,7 @@ impl<'a> LossyTile<'a> {
                 // finished planes under capture, local recon otherwise) into
                 // a scratch block first — the +1 taps never touch this block,
                 // but the destination rows alias the recon being read.
-                let mut blk = [0u16; 32 * 32];
+                let mut blk = [0u16; IBC_CHROMA_MAX];
                 if let Some(sh) = self.ibc_shared {
                     let (ptr, len, _) = sh.planes[plane];
                     let get = |xx: usize, yy: usize| {

@@ -41,12 +41,29 @@ pub(super) fn project_chroma_rdoq(
     plane_offset: usize,
     lambda: f32,
 ) -> Vec<f32> {
+    let mut lev = Vec::new();
+    project_chroma_rdoq_into(basis, resid, scan, qc, area, plane_offset, lambda, &mut lev);
+    lev
+}
+
+/// [`project_chroma_rdoq`] into a reused level buffer.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_chroma_rdoq_into(
+    basis: &Basis,
+    resid: &[f32],
+    scan: &[u16],
+    qc: usize,
+    area: usize,
+    plane_offset: usize,
+    lambda: f32,
+    lev: &mut Vec<f32>,
+) {
     if lambda > 0.0 {
-        let (mut l, prm) = basis.project_scan_with_prm(resid, scan);
-        coder::rdoq_chroma(&prm, &mut l, qc, scan, area, plane_offset, lambda);
-        l
+        basis.project_scan_rdoq_into(resid, scan, lev, |prm, l| {
+            coder::rdoq_chroma(prm, l, qc, scan, area, plane_offset, lambda)
+        });
     } else {
-        basis.project_scan(resid, 0.0, scan)
+        basis.project_scan_into(resid, 0.0, scan, lev);
     }
 }
 
@@ -154,8 +171,11 @@ pub(super) struct ChromaModeSearch<'a> {
     pub(super) bit_depth: i32,
 }
 
+/// MHCCP decision for one chroma leaf. The fit is logged in `decide_mode`'s
+/// capture pass and reused in its replay pass.
 pub(super) fn mhccp_decide_leaf(
     enc: &mut RangeEncoder,
+    decide_mode: &mut crate::av2::replay::DecideMode<'_>,
     planes: &ChromaLeafPlanes,
     block: &ChromaLeafGeometry,
     rd: &ChromaLeafRd,
@@ -194,7 +214,8 @@ pub(super) fn mhccp_decide_leaf(
         lambda,
         bit_depth: bd,
     } = rd;
-    if !enc.mhccp
+    if enc.sdp_luma
+        || !enc.mhccp
         || !cfl::is_mhccp_allowed(
             (cw << (ssx as usize)) / 4,
             (ch << (ssy as usize)) / 4,
@@ -204,80 +225,88 @@ pub(super) fn mhccp_decide_leaf(
     {
         return None;
     }
-    let mut suf = vec![0f32; cw * ch];
-    let mut svf = vec![0f32; cw * ch];
+    let choice = if let Some(c) = decide_mode.replay_mhccp() {
+        c
+    } else {
+        let c = {
+            let mut suf = vec![0f32; cw * ch];
+            let mut svf = vec![0f32; cw * ch];
 
-    let up_rows = up[cy * pcw + cx..].chunks(pcw);
-    let vp_rows = vp[cy * pcw + cx..].chunks(pcw);
+            let up_rows = up[cy * pcw + cx..].chunks(pcw);
+            let vp_rows = vp[cy * pcw + cx..].chunks(pcw);
 
-    for ((suf_row, svf_row), (up_row, vp_row)) in suf
-        .chunks_exact_mut(cw)
-        .zip(svf.chunks_exact_mut(cw))
-        .zip(up_rows.zip(vp_rows))
-        .take(ch)
-    {
-        suf_row.copy_from_slice(&up_row[..cw]);
-        svf_row.copy_from_slice(&vp_row[..cw]);
-    }
+            for ((suf_row, svf_row), (up_row, vp_row)) in suf
+                .chunks_exact_mut(cw)
+                .zip(svf.chunks_exact_mut(cw))
+                .zip(up_rows.zip(vp_rows))
+                .take(ch)
+            {
+                suf_row.copy_from_slice(&up_row[..cw]);
+                svf_row.copy_from_slice(&vp_row[..cw]);
+            }
 
-    let dc_u = dc_pred_rect_bounded(
-        recu,
-        &BoundedIntraRect {
-            stride: pcw,
-            y: cy,
-            x: cx,
-            width: cw,
-            height: ch,
-            frame_width: bounds.chroma_width,
-            frame_height: bounds.chroma_height,
-        },
-        neutral,
-        bd,
-    );
-    let dc_v = dc_pred_rect_bounded(
-        recv,
-        &BoundedIntraRect {
-            stride: pcw,
-            y: cy,
-            x: cx,
-            width: cw,
-            height: ch,
-            frame_width: bounds.chroma_width,
-            frame_height: bounds.chroma_height,
-        },
-        neutral,
-        bd,
-    );
-    let choice = cfl::mhccp_eval_leaf(&cfl::MhccpLeafInput {
-        reconstructed_luma: recy,
-        luma_stride: pw,
-        reconstructed_u: recu,
-        reconstructed_v: recv,
-        chroma_stride: pcw,
-        bounds,
-        luma_y: ly,
-        luma_x: lx,
-        chroma_y: cy,
-        chroma_x: cx,
-        width: cw,
-        height: ch,
-        subsample_x: ssx,
-        subsample_y: ssy,
-        have_top,
-        have_left,
-        source_u: &suf,
-        source_v: &svf,
-        dc_u,
-        dc_v,
-        rd: cfl::ChromaRdSpec {
-            basis,
-            qstep,
-            lambda,
-            bit_depth: bd,
-        },
-        scan,
-        coded_mask: &coded_mask,
-    });
+            let dc_u = dc_pred_rect_bounded(
+                recu,
+                &BoundedIntraRect {
+                    stride: pcw,
+                    y: cy,
+                    x: cx,
+                    width: cw,
+                    height: ch,
+                    frame_width: bounds.chroma_width,
+                    frame_height: bounds.chroma_height,
+                },
+                neutral,
+                bd,
+            );
+            let dc_v = dc_pred_rect_bounded(
+                recv,
+                &BoundedIntraRect {
+                    stride: pcw,
+                    y: cy,
+                    x: cx,
+                    width: cw,
+                    height: ch,
+                    frame_width: bounds.chroma_width,
+                    frame_height: bounds.chroma_height,
+                },
+                neutral,
+                bd,
+            );
+            cfl::mhccp_eval_leaf(&cfl::MhccpLeafInput {
+                reconstructed_luma: recy,
+                luma_stride: pw,
+                reconstructed_u: recu,
+                reconstructed_v: recv,
+                chroma_stride: pcw,
+                bounds,
+                luma_y: ly,
+                luma_x: lx,
+                chroma_y: cy,
+                chroma_x: cx,
+                width: cw,
+                height: ch,
+                subsample_x: ssx,
+                subsample_y: ssy,
+                have_top,
+                have_left,
+                source_u: &suf,
+                source_v: &svf,
+                dc_u,
+                dc_v,
+                rd: cfl::ChromaRdSpec {
+                    basis,
+                    qstep,
+                    lambda,
+                    bit_depth: bd,
+                },
+                scan,
+                coded_mask: &coded_mask,
+            })
+        };
+        decide_mode.capture_mhccp(&c);
+        c
+    };
     if let Some(ref ch_choice) = choice
         && let Some(ref mh) = ch_choice.mhccp
     {
@@ -310,6 +339,13 @@ pub(super) fn chroma_mode_decide_leaf(
         coded_width: cw_px,
         coded_height: ch_px,
     } = block;
+    // Below 32x32 the decoder derives an ADST tx type from a non-DC uv mode (avm
+    // intra_mode_to_tx_type), but `code_422_chroma_tu` reconstructs these predictors
+    // with DCT: keep DC there (4:2:0 4x4 chroma codes the derived type itself).
+    if bs < 32 {
+        enc.uv_mode = 0;
+        return None;
+    }
     let &ChromaModeSearch {
         neutral,
         basis,
@@ -324,6 +360,10 @@ pub(super) fn chroma_mode_decide_leaf(
         angle_directional: angle_dir,
         bit_depth: bd,
     } = search;
+    if enc.sdp_luma {
+        enc.uv_mode = 0;
+        return None;
+    }
     // Candidate set. DC + SMOOTH family + PAETH is the base. V/H (nominal
     // directional) are searched in every speed tier. The diagonal directionals
     // (D45..D203) are searched only when `angle_dir` (Medium speed and above).
@@ -344,8 +384,8 @@ pub(super) fn chroma_mode_decide_leaf(
             (vec![dcu; bs * bs], vec![dcv; bs * bs])
         } else {
             (
-                predict_chroma_sq(recu, pcw, cy, cx, bs, m, neutral, cw_px, ch_px),
-                predict_chroma_sq(recv, pcw, cy, cx, bs, m, neutral, cw_px, ch_px),
+                predict_chroma_sq(recu, pcw, cy, cx, bs, m, neutral, cw_px, ch_px, None),
+                predict_chroma_sq(recv, pcw, cy, cx, bs, m, neutral, cw_px, ch_px, None),
             )
         }
     };
@@ -431,7 +471,7 @@ pub(super) fn chroma_mode_decide_leaf(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predict_chroma_sq(
+pub(super) fn predict_chroma_sq(
     rec: &[f32],
     pcw: usize,
     cy: usize,
@@ -441,7 +481,32 @@ fn predict_chroma_sq(
     neutral: f32,
     cw_px: usize,
     ch_px: usize,
+    // (top-right, bottom-left) pixels from the coding order; None: top-right from the
+    // tile extent only and no bottom-left (blocks whose neighbours there are not coded).
+    edges: Option<(usize, usize)>,
 ) -> Vec<f32> {
+    let mut out = vec![0f32; bs * bs];
+    predict_chroma_sq_into(
+        rec, pcw, cy, cx, bs, m, neutral, cw_px, ch_px, edges, &mut out,
+    );
+    out
+}
+
+/// [`predict_chroma_sq`] into `out[..bs*bs]`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_chroma_sq_into(
+    rec: &[f32],
+    pcw: usize,
+    cy: usize,
+    cx: usize,
+    bs: usize,
+    m: usize,
+    neutral: f32,
+    cw_px: usize,
+    ch_px: usize,
+    edges: Option<(usize, usize)>,
+    out: &mut [f32],
+) {
     let have_above = cy > 0;
     let have_left = cx > 0;
     // Chroma mi grid (4 chroma px per mi). `cw_px`/`ch_px` are the coded chroma
@@ -461,7 +526,7 @@ fn predict_chroma_sq(
     } else {
         0
     };
-    let bl_px = 0usize;
+    let (tr_px, bl_px) = edges.unwrap_or((tr_px, 0));
     let (ab, lf, corner) = intrapred::build_refs(
         rec,
         &intrapred::IntraRefSpec {
@@ -480,10 +545,10 @@ fn predict_chroma_sq(
         },
     );
     match m {
-        1 => intrapred::smooth(bs, &ab, &lf),
-        2 => intrapred::smooth_v(bs, &ab, &lf),
-        3 => intrapred::smooth_h(bs, &ab, &lf),
-        4 => intrapred::paeth(bs, &ab, &lf, corner),
+        1 => intrapred::smooth_into(bs, &ab, &lf, out),
+        2 => intrapred::smooth_v_into(bs, &ab, &lf, out),
+        3 => intrapred::smooth_h_into(bs, &ab, &lf, out),
+        4 => intrapred::paeth_into(bs, &ab, &lf, corner, out),
         // Directional (nominal angle; UV angle_delta is 0 when the co-located luma
         // mode is non-directional, which is the case for these leaves). The mode
         // order after PAETH follows AVM's `default_mode_list_uv`:
@@ -500,7 +565,7 @@ fn predict_chroma_sq(
                 11 => Dir::D157,
                 _ => Dir::D203,
             };
-            directional::directional(
+            directional::directional_into(
                 dir,
                 &ab,
                 &lf,
@@ -518,7 +583,9 @@ fn predict_chroma_sq(
                     max_width: bs as i32 + tr_px as i32,
                     max_height: bs as i32 + bl_px as i32,
                     max_pixel: 2 * neutral as i32 - 1,
+                    smooth_neighbour: false,
                 },
+                out,
             )
         }
     }
@@ -563,6 +630,9 @@ pub(super) fn code_422_chroma_tu(
     nb: ChromaNeighbors,
     input: &ChromaTuInput,
 ) -> (bool, bool) {
+    if enc.sdp_luma {
+        return (false, false);
+    }
     let &ChromaTuInput {
         y: cy,
         x: cx,
@@ -584,10 +654,7 @@ pub(super) fn code_422_chroma_tu(
         ch,
         basis,
         scan,
-        eob_cdf,
-        eob_hi,
-        area,
-        u_skip_row,
+        ..
     } = spec;
     let QuantCtx {
         qc,
@@ -601,7 +668,6 @@ pub(super) fn code_422_chroma_tu(
     // residual so the projection (which quantizes at `basis.qstep`) effectively quantizes at
     // `qstep`, matching the reconstruction that dequantizes at `qstep`. Identity when equal.
     let cscale = basis.qstep as f32 / qstep as f32;
-    let ChromaNeighbors { ua, ul, va, vl } = nb;
     let (levu, levv) = if let Some(cflc) = cfl {
         // CfL: residual against the per-pixel prediction; reconstruct with that base.
         let n = cw * ch;
@@ -788,9 +854,23 @@ pub(super) fn code_422_chroma_tu(
         );
         (levu, levv)
     };
-    let (uc, vc) = (levels_to_coeffs(&levu), levels_to_coeffs(&levv));
-    let cbwl = dirty_log2f(cw.min(32) as f32) as i32;
-    let u_skip = u_skip_row[(6 + ua + ul) as usize] as u32;
+    emit_chroma_tu_pair(enc, &levu, &levv, spec, nb)
+}
+
+/// Emit one chroma TU per plane (U then V) from already-quantised levels; returns
+/// which planes have coefficients.
+pub(super) fn emit_chroma_tu_pair(
+    enc: &mut RangeEncoder,
+    levu: &[f32],
+    levv: &[f32],
+    spec: &ChromaTxSpec,
+    nb: ChromaNeighbors,
+) -> (bool, bool) {
+    let ChromaNeighbors { ua, ul, va, vl } = nb;
+    let (uc, vc) = (levels_to_coeffs(levu), levels_to_coeffs(levv));
+    let cbwl = dirty_log2f(spec.cw.min(32) as f32) as i32;
+    let u_skip = spec.u_skip_row[(6 + ua + ul) as usize] as u32;
+    let (scan, eob_cdf, eob_hi, area) = (spec.scan, spec.eob_cdf, spec.eob_hi, spec.area);
     encode_chroma_block_rect_w(enc, &uc, u_skip, true, scan, eob_cdf, eob_hi, area, cbwl);
     let up_ = uc.iter().any(|&(_, l)| l != 0);
     let v_skip = (6 * (up_ as i32) + va + vl) as u32;
@@ -955,6 +1035,7 @@ pub(crate) fn predict_chroma444_whole64(
                     max_width: 64 + tr_px as i32,
                     max_height: 64 + bl_px as i32,
                     max_pixel: 2 * neutral as i32 - 1,
+                    smooth_neighbour: false,
                 },
             )
         }

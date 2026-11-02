@@ -134,10 +134,12 @@ fn prepare(
     .with_speed(cfg.speed)
     .with_threads(cfg.threads)
     .with_cfl(true)
-    // CDEF is chosen by a self-gating post-reconstruction search (picks a strength
-    // only when it reduces distortion, else stays off), so enabling it cannot
-    // regress content the filter would hurt.
-    .with_cdef(cfg.cdef)
+    // CDEF is always searched for AV2 stills: the per-SB search self-gates (a
+    // strength is kept only where it lowers distortion, and the frame keeps CDEF
+    // off unless it gains >= 0.5%). Measured -2.4..-5.7% SS2 BD on every chroma
+    // format at every speed, for ~+25% time once pass 2 replays the partition
+    // decisions — more than any speed tier buys.
+    .with_cdef(true)
     .with_aq(cfg.adaptive_quant))
 }
 
@@ -158,11 +160,22 @@ fn prepare_lossless_capable(
     } else {
         av2_map_quality(cfg.quality)
     };
+    // Lossless keeps its 8x8 tile request (clamped by the lossless coder for
+    // parallelism); lossy uses the same thread-driven grid as the colour paths:
+    // a fixed 8x8 grid reset the entropy contexts and cut prediction at every
+    // tile edge (4:0:0 spent +31% bits at q30 vs the same luma coded as 4:2:0).
+    let (tc, tr) = if q == 0 {
+        (8, 8)
+    } else {
+        auto_tiles(width, height, cfg.threads)
+    };
     Ok(Av2Encoder::with_bit_depth(q, bit_depth.bits())
-        .with_tiles(8, 8)
+        .with_tiles(tc, tr)
         .with_txpart(TxPart::ThreeWay)
         .with_speed(cfg.speed)
         .with_threads(cfg.threads)
+        // Lossy only (see `prepare`); lossless frames carry no loop filters.
+        .with_cdef(q != 0)
         .with_aq(cfg.adaptive_quant))
 }
 

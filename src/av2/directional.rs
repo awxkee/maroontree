@@ -54,10 +54,24 @@ fn iclip(v: i32, lo: i32, hi: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
-/// Intra-edge reference filter strength (non-smooth branch; is_sm = false).
-fn filter_strength(wh: i32, angle: i32) -> i32 {
-    // AVM intra_edge_filter_strength type 0 (reconintra.c:958).
+/// Intra-edge reference filter strength (AVM `intra_edge_filter_strength`,
+/// reconintra.c:958). `smooth` = filter type 1: the above or left block uses a
+/// SMOOTH / SMOOTH_V / SMOOTH_H mode (`get_filt_type`).
+fn filter_strength(wh: i32, angle: i32, smooth: bool) -> i32 {
     let d = angle.abs();
+    if smooth {
+        return if wh <= 8 {
+            if d >= 64 { 2 } else { (d >= 40) as i32 }
+        } else if wh <= 16 {
+            if d >= 48 { 2 } else { (d >= 20) as i32 }
+        } else if wh <= 24 {
+            if d >= 4 { 3 } else { 0 }
+        } else if d >= 1 {
+            3
+        } else {
+            0
+        };
+    }
     if wh <= 8 {
         if d >= 56 {
             return 1;
@@ -105,30 +119,35 @@ fn filter_edge(
     strength: usize,
 ) {
     static K: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
-    let mut i = 0i32;
-    while i < (sz as i32).min(lim_from) {
-        out[i as usize] = inp[iclip(i, from, to - 1) as usize];
-        i += 1;
+    // pad[k] = inp[clip(k - 2)]: the clipped reads become a plain 5-tap window.
+    let mut pad = [0i32; 129 + 4];
+    let pad = &mut pad[..sz + 4];
+    for (k, p) in pad.iter_mut().enumerate() {
+        *p = inp[iclip(k as i32 - 2, from, to - 1) as usize];
     }
-    while i < lim_to.min(sz as i32) {
-        let mut s = 0;
-        for j in 0..5 {
-            s += inp[iclip(i - 2 + j, from, to - 1) as usize] * K[strength - 1][j as usize];
-        }
-        out[i as usize] = (s + 8) >> 4;
-        i += 1;
+    let k = &K[strength - 1];
+    let lo = (lim_from.max(0) as usize).min(sz);
+    let hi = (lim_to.max(0) as usize).min(sz).max(lo);
+    out[..lo].copy_from_slice(&pad[2..lo + 2]);
+    let (p0, p1, p2, p3, p4) = (
+        &pad[lo..hi],
+        &pad[lo + 1..hi + 1],
+        &pad[lo + 2..hi + 2],
+        &pad[lo + 3..hi + 3],
+        &pad[lo + 4..hi + 4],
+    );
+    for (i, o) in out[lo..hi].iter_mut().enumerate() {
+        *o = (k[0] * p0[i] + k[1] * p1[i] + k[2] * p2[i] + k[3] * p3[i] + k[4] * p4[i] + 8) >> 4;
     }
-    while i < sz as i32 {
-        out[i as usize] = inp[iclip(i, from, to - 1) as usize];
-        i += 1;
-    }
+    out[hi..sz].copy_from_slice(&pad[hi + 2..sz + 2]);
 }
 
 /// Build the decoder-style edge buffer (`tl`,`o`) from encoder refs.
 /// `tl[o] = corner`, `tl[o+1+i] = above[i]`, `tl[o-1-i] = left[i]`.
-fn edge_buffer(bs: usize, above: &[i32], left: &[i32], corner: i32) -> (Vec<i32>, usize) {
+fn edge_buffer(bs: usize, above: &[i32], left: &[i32], corner: i32) -> ([i32; 260], usize) {
     let o = 2 * bs;
-    let mut tl = vec![0i32; 4 * bs + 4];
+    assert!(bs <= 64);
+    let mut tl = [0i32; 4 * 64 + 4];
     tl[o] = corner;
     for i in 0..2 * bs {
         tl[o + 1 + i] = above[i];
@@ -147,6 +166,7 @@ fn z1(
     angle: i32,
     is_luma: bool,
     edge: bool,
+    smooth: bool,
     max_width: i32,
     max_pixel: i32,
 ) {
@@ -157,7 +177,7 @@ fn z1(
     let top_off = 2usize;
     let sz = 1 + w + h;
     let str = if edge {
-        filter_strength((w + h) as i32, 90 - angle)
+        filter_strength((w + h) as i32, 90 - angle, smooth)
     } else {
         0
     };
@@ -179,41 +199,51 @@ fn z1(
     filt[sz + 1] = filt[sz];
     filt[sz + 2] = filt[sz + 1];
 
+    let fill = filt[top_off + max_base_x as usize];
     let mut ypos = dx;
-    for y in 0..h {
-        let mut base = ypos >> 6;
-        let fill = filt[top_off + max_base_x as usize];
-        if base > max_base_x {
-            for yy in y..h {
-                for x in 0..w {
-                    dst[yy * w + x] = fill;
-                }
-            }
-            break;
-        }
+    for row in dst[..w * h].chunks_exact_mut(w) {
+        let base = ypos >> 6;
+        // Samples whose base passes max_base_x repeat the last edge sample.
+        let n = (max_base_x - base + 1).clamp(0, w as i32) as usize;
         let shift = ((ypos & 0x3F) >> 1) as usize;
-        let f = &F4[shift];
-        for x in 0..w {
-            if base > max_base_x {
-                for xx in x..w {
-                    dst[y * w + xx] = fill;
-                }
-                break;
-            }
-            let bi = (top_off as i32 + base) as usize;
-            dst[y * w + x] = if is_luma {
-                let v = f[0] * filt[bi - 1]
-                    + f[1] * filt[bi]
-                    + f[2] * filt[bi + 1]
-                    + f[3] * filt[bi + 2];
-                clip_px((v + 64) >> 7, max_pixel)
+        let (head, tail) = row.split_at_mut(n);
+        if n > 0 {
+            let s = (top_off as i32 + base) as usize;
+            if is_luma {
+                interp4(head, &filt[s - 1..s + n + 2], &F4[shift], max_pixel);
             } else {
-                let v = (32 - shift as i32) * filt[bi] + shift as i32 * filt[bi + 1];
-                clip_px((v + 16) >> 5, max_pixel)
-            };
-            base += 1;
+                interp2(head, &filt[s..s + n + 1], shift as i32, max_pixel);
+            }
         }
+        tail.fill(fill);
         ypos += dx;
+    }
+}
+
+/// `out[i]` = the 4-tap luma filter over `edge[i..i + 4]`.
+#[inline(always)]
+fn interp4(out: &mut [i32], edge: &[i32], f: &[i32; 4], max_pixel: i32) {
+    let n = out.len();
+    let (e0, e1, e2, e3) = (
+        &edge[..n],
+        &edge[1..n + 1],
+        &edge[2..n + 2],
+        &edge[3..n + 3],
+    );
+    for i in 0..n {
+        let v = f[0] * e0[i] + f[1] * e1[i] + f[2] * e2[i] + f[3] * e3[i];
+        out[i] = clip_px((v + 64) >> 7, max_pixel);
+    }
+}
+
+/// `out[i]` = the 2-tap chroma filter over `edge[i..i + 2]`.
+#[inline(always)]
+fn interp2(out: &mut [i32], edge: &[i32], shift: i32, max_pixel: i32) {
+    let n = out.len();
+    let (e0, e1) = (&edge[..n], &edge[1..n + 1]);
+    for i in 0..n {
+        let v = (32 - shift) * e0[i] + shift * e1[i];
+        out[i] = clip_px((v + 16) >> 5, max_pixel);
     }
 }
 
@@ -227,6 +257,7 @@ fn z3(
     angle: i32,
     is_luma: bool,
     edge: bool,
+    smooth: bool,
     max_height: i32,
     max_pixel: i32,
 ) {
@@ -237,7 +268,7 @@ fn z3(
     let left_off = 1 + w + h;
     let sz = 1 + w + h;
     let str = if edge {
-        filter_strength((w + h) as i32, angle - 180)
+        filter_strength((w + h) as i32, angle - 180, smooth)
     } else {
         0
     };
@@ -268,32 +299,39 @@ fn z3(
     filt[1] = filt[2];
     filt[sz + 2] = filt[sz + 1];
 
+    // Each column walks the left edge downwards (decreasing `filt` index), so it is
+    // filtered in increasing index order with mirrored taps into `col`, reversed.
+    let fill = filt[left_off - max_base_y as usize];
+    let mut col = [0i32; 64];
     let mut ypos = dy;
     for x in 0..w {
+        let base = ypos >> 6;
+        let n = (max_base_y - base + 1).clamp(0, h as i32) as usize;
         let shift = ((ypos & 0x3F) >> 1) as usize;
-        let f = &F4[shift];
-        let mut base = ypos >> 6;
-        let fill = filt[left_off - max_base_y as usize];
-        for y in 0..h {
-            if base <= max_base_y {
-                let bi = (left_off as i32 - base) as usize;
-                dst[y * w + x] = if is_luma {
-                    let v = f[0] * filt[bi + 1]
-                        + f[1] * filt[bi]
-                        + f[2] * filt[bi - 1]
-                        + f[3] * filt[bi - 2];
-                    clip_px((v + 64) >> 7, max_pixel)
-                } else {
-                    let v = (32 - shift as i32) * filt[bi] + shift as i32 * filt[bi - 1];
-                    clip_px((v + 16) >> 5, max_pixel)
-                };
-                base += 1;
+        if n > 0 {
+            let e = left_off - base as usize;
+            if is_luma {
+                let f = &F4[shift];
+                interp4(
+                    &mut col[..n],
+                    &filt[e - n - 1..e + 2],
+                    &[f[3], f[2], f[1], f[0]],
+                    max_pixel,
+                );
             } else {
-                for yy in y..h {
-                    dst[yy * w + x] = fill;
-                }
-                break;
+                interp2(
+                    &mut col[..n],
+                    &filt[e - n..e + 1],
+                    32 - shift as i32,
+                    max_pixel,
+                );
             }
+        }
+        for (y, &v) in col[..n].iter().rev().enumerate() {
+            dst[y * w + x] = v;
+        }
+        for y in n..h {
+            dst[y * w + x] = fill;
         }
         ypos += dy;
     }
@@ -307,6 +345,7 @@ struct Z2Spec {
     filter_corner: bool,
     filter_top: bool,
     filter_left: bool,
+    smooth: bool,
     max_width: i32,
     max_height: i32,
     max_pixel: i32,
@@ -320,6 +359,7 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
         filter_corner,
         filter_top,
         filter_left,
+        smooth,
         max_width,
         max_height,
         max_pixel,
@@ -350,7 +390,7 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
     let mut filt = [0i32; 72];
     let top_off = 0usize;
     let str_t = if filter_top {
-        filter_strength((w + h) as i32, angle - 90)
+        filter_strength((w + h) as i32, angle - 90, smooth)
     } else {
         0
     };
@@ -375,7 +415,7 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
     let mut filt2 = [0i32; 72];
     let left_off = h + 2;
     let str_l = if filter_left {
-        filter_strength((w + h) as i32, 180 - angle)
+        filter_strength((w + h) as i32, 180 - angle, smooth)
     } else {
         0
     };
@@ -396,43 +436,73 @@ fn z2(dst: &mut [i32], tl: &[i32], o: usize, angle: i32, spec: &Z2Spec) {
     filt2[1 + sz_l] = filt2[sz_l];
     filt2[0] = filt2[1];
 
-    for y in 0..h {
-        let mut xpos = -((y as i32 + 1) * dx);
-        let mut x = 0usize;
-        // left-reference run
-        while x < w && xpos < -64 {
-            let ypos_l = ((y as i32) << 6) - ((x as i32 + 1) * dy);
-            let base_y = ypos_l >> 6;
-            let shift = ((ypos_l & 0x3F) >> 1) as usize;
-            let bi = left_off as i32 - base_y; // keep signed
-            let g = |k: i32| filt2[(bi + k) as usize];
-            dst[y * w + x] = if is_luma {
-                let f = &F4[shift];
-                let v = f[0] * g(-1) + f[1] * g(-2) + f[2] * g(-3) + f[3] * g(-4);
-                clip_px((v + 64) >> 7, max_pixel)
-            } else {
-                let v = (32 - shift as i32) * g(-2) + shift as i32 * g(-3);
-                clip_px((v + 16) >> 5, max_pixel)
-            };
-            x += 1;
-            xpos += 64;
+    // Row y takes its first `split[y]` samples from the left edge (xpos < -64)
+    // and the rest from the top edge; `split` is non-decreasing in y.
+    let mut split = [0usize; 64];
+    for (y, sp) in split[..h].iter_mut().enumerate() {
+        let t = (y as i32 + 1) * dx - 64;
+        *sp = if t <= 0 {
+            0
+        } else {
+            (((t + 63) >> 6) as usize).min(w)
+        };
+    }
+    // left-reference part, by column: the phase is fixed down a column and the
+    // base advances by one per row (decreasing `filt2` index), as in z3.
+    let mut col = [0i32; 64];
+    let mut y0 = 0usize;
+    for x in 0..w {
+        while y0 < h && split[y0] <= x {
+            y0 += 1;
         }
-        // top-reference run
-        while x < w {
-            let base_x = xpos >> 6;
+        if y0 == h {
+            break;
+        }
+        let n = h - y0;
+        let c = -((x as i32 + 1) * dy);
+        let shift = ((c & 0x3F) >> 1) as usize;
+        // filt2 index of the last row's base sample.
+        let last = left_off as i32 - (h as i32 - 1) - (c >> 6);
+        if is_luma {
+            let f = &F4[shift];
+            let s = (last - 4) as usize;
+            interp4(
+                &mut col[..n],
+                &filt2[s..s + n + 3],
+                &[f[3], f[2], f[1], f[0]],
+                max_pixel,
+            );
+        } else {
+            let s = (last - 3) as usize;
+            interp2(
+                &mut col[..n],
+                &filt2[s..s + n + 1],
+                32 - shift as i32,
+                max_pixel,
+            );
+        }
+        for (k, &v) in col[..n].iter().enumerate() {
+            dst[(h - 1 - k) * w + x] = v;
+        }
+    }
+    // top-reference part: xpos steps by whole samples, so the phase is fixed
+    // and the base advances by one per pixel.
+    for y in 0..h {
+        let x = split[y];
+        if x < w {
+            let xpos = -((y as i32 + 1) * dx) + 64 * x as i32;
+            let m = w - x;
             let shift = ((xpos & 0x3F) >> 1) as usize;
-            let ti = top_off as i32 + base_x; // keep signed: base_x may be -1
-            let g = |k: i32| filt[(ti + k) as usize];
-            dst[y * w + x] = if is_luma {
-                let f = &F4[shift];
-                let v = f[0] * g(1) + f[1] * g(2) + f[2] * g(3) + f[3] * g(4);
-                clip_px((v + 64) >> 7, max_pixel)
+            // base_x may be -1; the +1 / +2 tap offsets keep the index >= 0.
+            let ti = top_off as i32 + (xpos >> 6);
+            let row = &mut dst[y * w + x..(y + 1) * w];
+            if is_luma {
+                let s = (ti + 1) as usize;
+                interp4(row, &filt[s..s + m + 3], &F4[shift], max_pixel);
             } else {
-                let v = (32 - shift as i32) * g(2) + shift as i32 * g(3);
-                clip_px((v + 16) >> 5, max_pixel)
-            };
-            x += 1;
-            xpos += 64;
+                let s = (ti + 2) as usize;
+                interp2(row, &filt[s..s + m + 1], shift as i32, max_pixel);
+            }
         }
     }
 }
@@ -479,6 +549,9 @@ pub(crate) struct DirectionalSpec {
     /// Largest sample value, `(1 << bit_depth) - 1`; AVM clips every directional
     /// output to it (an 8-bit clip mispredicts every 10/12-bit block).
     pub(crate) max_pixel: i32,
+    /// Edge-filter type 1: the above or left block is SMOOTH/SMOOTH_V/SMOOTH_H.
+    /// Only changes the strength when the TX width + height is <= 32.
+    pub(crate) smooth_neighbour: bool,
 }
 
 /// Directional predictor for a square block, conformant to the decoder.
@@ -489,6 +562,27 @@ pub(crate) fn directional(
     corner: i32,
     spec: &DirectionalSpec,
 ) -> Vec<f32> {
+    let bs = spec.block_size;
+    let mut out = vec![0f32; bs * bs];
+    directional_into(dir, above, left, corner, spec, &mut out);
+    out
+}
+
+thread_local! {
+    /// Integer prediction scratch of [`directional_into`] (up to 64x64).
+    static DIR_SCRATCH: std::cell::RefCell<Box<[i32; 4096]>> =
+        std::cell::RefCell::new(Box::new([0; 4096]));
+}
+
+/// [`directional`] into `dst[..bs*bs]`.
+pub(crate) fn directional_into(
+    dir: Dir,
+    above: &[i32],
+    left: &[i32],
+    corner: i32,
+    spec: &DirectionalSpec,
+    dst: &mut [f32],
+) {
     let DirectionalSpec {
         angle_delta,
         block_size: bs,
@@ -499,56 +593,81 @@ pub(crate) fn directional(
         max_width,
         max_height,
         max_pixel,
+        smooth_neighbour,
     } = *spec;
-    let mut out = vec![0i32; bs * bs];
-    // AVM filters the above edge when have_top and the left edge when have_left,
-    // independently (reconintra.c:1301-1311). z1 uses above, z3 uses left, z2 both.
-    let ang = dir.angle() + angle_delta * 3;
-    let edge_top = edge_filter && have_top;
-    let edge_left = edge_filter && have_left;
-    let vert_copy = ang == 90 || (ang < 90 && !have_top);
-    let hor_copy = ang == 180 || (ang > 180 && !have_left);
-    if vert_copy {
-        for row in out.chunks_mut(bs) {
-            row.copy_from_slice(&above[..bs]);
-        }
-    } else if hor_copy {
-        for (r, row) in out.chunks_mut(bs).enumerate() {
-            row.fill(left[r]);
-        }
-    } else {
-        let (tl, o) = edge_buffer(bs, above, left, corner);
-        if ang < 90 {
-            z1(
-                &mut out, bs, &tl, o, ang, is_luma, edge_top, max_width, max_pixel,
-            );
-        } else if ang < 180 {
-            // z2 filters each edge independently when its neighbor exists; the corner
-            // is prepared whenever the edge filter is enabled (missing physical samples
-            // were already synthesized by build_refs), matching AVM.
-            z2(
-                &mut out,
-                &tl,
-                o,
-                ang,
-                &Z2Spec {
-                    block_size: bs,
+    DIR_SCRATCH.with(|cell| {
+        let out = &mut cell.borrow_mut()[..bs * bs];
+        out.fill(0);
+        // AVM filters the above edge when have_top and the left edge when have_left,
+        // independently (reconintra.c:1301-1311). z1 uses above, z3 uses left, z2 both.
+        let ang = dir.angle() + angle_delta * 3;
+        let edge_top = edge_filter && have_top;
+        let edge_left = edge_filter && have_left;
+        let vert_copy = ang == 90 || (ang < 90 && !have_top);
+        let hor_copy = ang == 180 || (ang > 180 && !have_left);
+        if vert_copy {
+            for row in out.chunks_mut(bs) {
+                row.copy_from_slice(&above[..bs]);
+            }
+        } else if hor_copy {
+            for (r, row) in out.chunks_mut(bs).enumerate() {
+                row.fill(left[r]);
+            }
+        } else {
+            let (tl, o) = edge_buffer(bs, above, left, corner);
+            if ang < 90 {
+                z1(
+                    out,
+                    bs,
+                    &tl,
+                    o,
+                    ang,
                     is_luma,
-                    filter_corner: edge_filter,
-                    filter_top: edge_top,
-                    filter_left: edge_left,
+                    edge_top,
+                    smooth_neighbour,
                     max_width,
+                    max_pixel,
+                );
+            } else if ang < 180 {
+                // z2 filters each edge independently when its neighbor exists; the corner
+                // is prepared whenever the edge filter is enabled (missing physical samples
+                // were already synthesized by build_refs), matching AVM.
+                z2(
+                    out,
+                    &tl,
+                    o,
+                    ang,
+                    &Z2Spec {
+                        block_size: bs,
+                        is_luma,
+                        filter_corner: edge_filter,
+                        filter_top: edge_top,
+                        filter_left: edge_left,
+                        smooth: smooth_neighbour,
+                        max_width,
+                        max_height,
+                        max_pixel,
+                    },
+                );
+            } else {
+                z3(
+                    out,
+                    bs,
+                    &tl,
+                    o,
+                    ang,
+                    is_luma,
+                    edge_left,
+                    smooth_neighbour,
                     max_height,
                     max_pixel,
-                },
-            );
-        } else {
-            z3(
-                &mut out, bs, &tl, o, ang, is_luma, edge_left, max_height, max_pixel,
-            );
+                );
+            }
         }
-    }
-    out.iter().map(|&v| v as f32).collect()
+        for (d, &v) in dst[..bs * bs].iter_mut().zip(out.iter()) {
+            *d = v as f32;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -586,6 +705,7 @@ mod tests {
                 max_width: 8,
                 max_height: 8,
                 max_pixel: 255,
+                smooth_neighbour: false,
             },
         );
         let h = directional(
@@ -603,6 +723,7 @@ mod tests {
                 max_width: 8,
                 max_height: 8,
                 max_pixel: 255,
+                smooth_neighbour: false,
             },
         );
         for r in 0..8 {
@@ -631,6 +752,7 @@ mod tests {
                 max_width: 8,
                 max_height: 8,
                 max_pixel: 255,
+                smooth_neighbour: false,
             },
         );
         for r in 0..8 {
@@ -661,6 +783,7 @@ mod tests {
                     max_width: 16,
                     max_height: 16,
                     max_pixel: 1023,
+                    smooth_neighbour: false,
                 },
             );
             assert!(

@@ -48,6 +48,8 @@ impl Av2Encoder {
         // Staged replay: `Capture` logs the whole-64 luma winner; `Replay` reuses it.
         mut decide_mode: replay::DecideMode<'_>,
     ) -> RangeEncoder {
+        // Perceptual (4x4 DCT-weighted) decision distortion for stills.
+        crate::av2::helpers::set_wsse(self.still_rd());
         let Core400Frame {
             yp,
             pw,
@@ -232,12 +234,14 @@ impl Av2Encoder {
                             x: sb_x,
                         },
                         &LumaQuantSpec {
+                            prune: leaf::PRUNE_PROBE,
                             basis: &bases.luma,
                             qstep: sb_qstep,
                             scan: &tables::SCAN,
                             neutral,
                             quant_context: qc,
                             rdoq_lambda: self.tune.rdoq_lambda,
+                            pixel_lambda: self.still_rd(),
                             speed: self.speed,
                             bit_depth: self.bit_depth as i32,
                         },

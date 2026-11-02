@@ -32,6 +32,7 @@ use crate::av2::cfl::cfl_partition_prediction;
 use crate::av2::video::{mc, me, mv::Mv};
 
 const INTER_BORDER_420: usize = 72;
+use crate::av2::leaf::{MIDX_SMOOTH, midx_class};
 const ENABLE_DENSE_INTER_32: bool = true;
 const ENABLE_DENSE_INTER_16: bool = true;
 
@@ -151,6 +152,7 @@ fn refill_coeffs(dst: &mut Vec<Coeff>, levels: &[f32]) {
 struct WfSlot420 {
     record: replay::DecisionRecord,
     tx: Vec<(usize, usize, usize, usize)>,
+    ch: Vec<(usize, usize, usize, usize)>,
 }
 
 /// Per-worker reusable scratch for the 4:2:0 wavefront decide: a private full-res
@@ -173,6 +175,8 @@ struct WfScratch420 {
     vl: Vec<i32>,
     cfa: Vec<i32>,
     cfl: Vec<i32>,
+    mia: Vec<i32>,
+    mil: Vec<i32>,
     imia: Vec<u8>,
     imil: Vec<u8>,
     skmia: Vec<u8>,
@@ -365,6 +369,10 @@ struct Sb420Decision<'a, 'record> {
     v_left: &'a mut [i32],
     cfl_above: &'a mut [i32],
     cfl_left: &'a mut [i32],
+    /// Luma directional `midx` of the coded neighbours per mi (-1 = none):
+    /// avm's above_right / bottom_left mode-set neighbours.
+    midx_above: &'a mut [i32],
+    midx_left: &'a mut [i32],
     inter_mi_above: &'a mut [u8],
     inter_mi_left: &'a mut [u8],
     skip_mi_above: &'a mut [u8],
@@ -385,6 +393,8 @@ struct Sb420Decision<'a, 'record> {
     ref_mi_left: &'a mut [u8],
     tx_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
     skip_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
+    /// SDP chroma-tree leaves (luma-mi rects) for the chroma deblock grid.
+    chroma_leaves: &'a mut Vec<(usize, usize, usize, usize)>,
     sb_qidx: &'a mut [u16],
     last_ref: &'a [Vec<f32>],
     ref_x0: usize,
@@ -421,6 +431,8 @@ struct Sb420Decision<'a, 'record> {
     ref_left: u8,
     row: usize,
     col: usize,
+    /// Encode with this partition instead of probing (an SB partition trial).
+    forced_part: Option<LumaPartitionDecision>,
 }
 
 impl WfScratch420 {
@@ -454,6 +466,8 @@ impl WfScratch420 {
         self.vl.resize(mr, 0);
         self.cfa.resize(mc, 0);
         self.cfl.resize(mr, 0);
+        self.mia.resize(mc, -1);
+        self.mil.resize(mr, -1);
         self.imia.resize(mc, 0);
         self.imil.resize(mr, 0);
         self.skmia.resize(mc, 0);
@@ -484,6 +498,8 @@ impl WfScratch420 {
         self.vl.fill(0);
         self.cfa.fill(0);
         self.cfl.fill(0);
+        self.mia.fill(-1);
+        self.mil.fill(-1);
         self.imia.fill(0);
         self.imil.fill(0);
         self.skmia.fill(0);
@@ -507,6 +523,641 @@ thread_local! {
     static WF_SCRATCH_420: std::cell::RefCell<WfScratch420> =
         std::cell::RefCell::new(WfScratch420::default());
 }
+
+/// A rect luma leaf coded as square TUs along its long side (see
+/// [`Av2Encoder::multi_tu_search`]).
+struct RectSplit {
+    tus: Vec<Vec<Coeff>>,
+    tx: Vec<usize>,
+    mode: (usize, i8),
+    /// Pixel SSE + lambda * (coefficient + mode + tx-type bits).
+    cost: f32,
+    recon: Vec<Vec<f32>>,
+}
+
+/// Geometry of a [`Av2Encoder::multi_tu_search`] leaf.
+struct RectSplitBlock<'a> {
+    yp: &'a [f32],
+    pw: usize,
+    y: usize,
+    x: usize,
+    w: usize,
+    h: usize,
+    frame: (usize, usize),
+    coded: &'a [u8; 256],
+    smooth_neighbour: bool,
+}
+
+impl RectSplitBlock<'_> {
+    /// TU side (the block's short side, at most 32) and the TU origins in coding
+    /// (raster) order.
+    fn tus(&self) -> (usize, Vec<(usize, usize)>) {
+        let s = self.w.min(self.h).min(32);
+        let mut pos = Vec::new();
+        for ty in (0..self.h).step_by(s) {
+            for tx in (0..self.w).step_by(s) {
+                pos.push((self.y + ty, self.x + tx));
+            }
+        }
+        (s, pos)
+    }
+}
+
+impl Av2Encoder {
+    /// RD search of a 2:1 / 4:1 rect leaf as square TUs along its long side (TX
+    /// partition VERT / HORZ / VERT4 / HORZ4): one luma mode for the block, each TU
+    /// predicted as a square from the coded-mi mask. 16x16 TUs search every mode
+    /// (DC, SMOOTH*, PAETH, SATD-best directional pairs) and their four TX_16X16
+    /// types; 8x8 TUs the non-directional modes with DCT. Leaves `recy` as found.
+    fn multi_tu_search(
+        &self,
+        recy: &mut [f32],
+        b: &RectSplitBlock<'_>,
+        qstep: i32,
+        lambda: f32,
+    ) -> Option<RectSplit> {
+        self.leaf_eval(recy, b, qstep, lambda, false)
+    }
+
+    /// [`Self::multi_tu_search`] over any leaf shape (squares too: one TU, or four
+    /// TX_32X32 for 64x64; TX_32X32 TUs DCT only), optionally with the zero-residual
+    /// palette candidate. The partition tree search prices every shape with it.
+    fn leaf_eval(
+        &self,
+        recy: &mut [f32],
+        b: &RectSplitBlock<'_>,
+        qstep: i32,
+        lambda: f32,
+        with_palette: bool,
+    ) -> Option<RectSplit> {
+        let bases = &self.bases;
+        let bd = self.bit_depth as i32;
+        let neutral = self.dc_neutral();
+        let pw = b.pw;
+        let (sz, pos) = b.tus();
+        let n = pos.len();
+        let area = sz * sz;
+        let src: Vec<Vec<f32>> = pos
+            .iter()
+            .map(|&(y, x)| {
+                rect_rows(b.yp, pw, y, x, sz, sz)
+                    .flatten()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let saved: Vec<Vec<f32>> = pos
+            .iter()
+            .map(|&(y, x)| {
+                rect_rows(recy, pw, y, x, sz, sz)
+                    .flatten()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let predict = |recy: &[f32], k: usize, (m, d): (usize, i32)| -> Vec<f32> {
+            let (y, x) = pos[k];
+            if m == 0 {
+                vec![dc_pred_rect(recy, pw, y, x, sz, sz, neutral, bd); area]
+            } else {
+                leaf::predict_luma_square(
+                    recy,
+                    &leaf::SquareLumaBlock {
+                        stride: pw,
+                        frame_width: b.frame.0,
+                        frame_height: b.frame.1,
+                        y,
+                        x,
+                        size: sz,
+                    },
+                    b.coded,
+                    leaf::SquareLumaMode {
+                        mode: m,
+                        angle_delta: d,
+                        smooth_neighbour: b.smooth_neighbour,
+                    },
+                    neutral,
+                    bd,
+                )
+            }
+        };
+        let mode_bits = |m: usize| -> f32 {
+            if m >= 5 {
+                9.0
+            } else if m == 0 {
+                0.0
+            } else {
+                6.0
+            }
+        };
+        let mut cands: Vec<(usize, i32)> = (0..=4usize).map(|m| (m, 0)).collect();
+        if self.speed.try_directional() {
+            cands.extend(leaf::screen_directional(
+                3,
+                self.speed.try_angle_deltas(),
+                8,
+                |m, d| {
+                    (0..n)
+                        .map(|k| {
+                            crate::av2::metrics::satd_f32(
+                                &src[k],
+                                sz,
+                                &predict(recy, k, (m, d)),
+                                sz,
+                                sz,
+                                sz,
+                            )
+                        })
+                        .sum()
+                },
+            ));
+        }
+        let sse = |s: &[f32], r: &[f32]| -> f32 {
+            s.iter()
+                .zip(r)
+                .map(|(&a, &r)| (a - r.round()).powi(2))
+                .sum()
+        };
+        let mut best: Option<RectSplit> = None;
+        for md in cands {
+            let mut cost = lambda * mode_bits(md.0);
+            let mut tus = Vec::with_capacity(n);
+            let mut tx = Vec::with_capacity(n);
+            let mut recon = Vec::with_capacity(n);
+            for k in 0..n {
+                let pred = predict(recy, k, md);
+                let (j, lev, rec, t) = if sz == 32 {
+                    let scale = bases.luma.qstep as f32 / qstep as f32;
+                    let resid: Vec<f32> = src[k]
+                        .iter()
+                        .zip(&pred)
+                        .map(|(&s, &p)| (s - p) * scale)
+                        .collect();
+                    let lev = bases.luma.project_scan(&resid, 0.0, &tables::SCAN);
+                    let rec = itx422::reconstruct_luma(&pred, &lev, qstep, &tables::SCAN, bd);
+                    (
+                        sse(&src[k], &rec) + lambda * coeff_rate_f32(&lev),
+                        lev,
+                        rec.to_vec(),
+                        0,
+                    )
+                } else if sz == 16 {
+                    let scale = bases.luma16x16.qstep as f32 / qstep as f32;
+                    let resid: Vec<f32> = src[k]
+                        .iter()
+                        .zip(&pred)
+                        .map(|(&s, &p)| (s - p) * scale)
+                        .collect();
+                    let mut src16 = [0f32; 256];
+                    src16.copy_from_slice(&src[k]);
+                    // (type-selection cost, SSE-based cost, levels, recon, tx type)
+                    type Tx16Pick = (f32, f32, Vec<f32>, Vec<f32>, usize);
+                    let mut tb: Option<Tx16Pick> = None;
+                    for (t, &delta) in TX16_TYPE_RATE_DELTA.iter().enumerate() {
+                        let (basis, flips) = match t {
+                            0 => (&bases.luma16x16, (false, false)),
+                            1 => (&bases.luma16x16_adst, (true, true)),
+                            2 => (&bases.luma16x16_adst_dct, (false, true)),
+                            _ => (&bases.luma16x16_dct_adst, (true, false)),
+                        };
+                        let lev = basis.project_scan(&resid, 0.0, &SCAN16);
+                        if t > 0 && tx16_dc_only(&lev) {
+                            continue;
+                        }
+                        let rec = if t == 0 {
+                            itx422::reconstruct_luma16(&pred, &lev, qstep, &SCAN16, bd)
+                        } else {
+                            itx422::reconstruct_luma16_adst(
+                                &pred, &lev, qstep, &SCAN16, flips.0, flips.1, bd,
+                            )
+                        };
+                        let rate = coeff_rate_f32(&lev) + delta;
+                        let jt = tx16_distortion(&src16, &rec) + lambda * rate;
+                        if tb.as_ref().is_none_or(|t0| jt < t0.0) {
+                            tb = Some((
+                                jt,
+                                sse(&src[k], &rec) + lambda * rate,
+                                lev,
+                                rec.to_vec(),
+                                t,
+                            ));
+                        }
+                    }
+                    let (_, j, lev, rec, t) = tb.expect("DCT_DCT is always a candidate");
+                    (j, lev, rec, t)
+                } else {
+                    let scale = bases.c8x8.qstep as f32 / qstep as f32;
+                    let resid: Vec<f32> = src[k]
+                        .iter()
+                        .zip(&pred)
+                        .map(|(&s, &p)| (s - p) * scale)
+                        .collect();
+                    let lev = bases.c8x8.project_scan(&resid, 0.0, &SCAN8X8);
+                    let p_i: Vec<i32> = pred.iter().map(|&v| v as i32).collect();
+                    let rec =
+                        itx422::reconstruct_chroma_pred(&p_i, &lev, qstep, &SCAN8X8, 8, 8, bd);
+                    (
+                        sse(&src[k], &rec) + lambda * coeff_rate_f32(&lev),
+                        lev,
+                        rec,
+                        0,
+                    )
+                };
+                cost += j;
+                let (y, x) = pos[k];
+                put_block_rect(recy, pw, y, x, sz, sz, &rec);
+                tus.push(levels_to_coeffs(&lev));
+                tx.push(t);
+                recon.push(rec);
+            }
+            for (k, &(y, x)) in pos.iter().enumerate() {
+                put_block_rect(recy, pw, y, x, sz, sz, &saved[k]);
+            }
+            if best.as_ref().is_none_or(|bst| cost < bst.cost) {
+                best = Some(RectSplit {
+                    tus,
+                    tx,
+                    mode: (md.0, md.1 as i8),
+                    cost,
+                    recon,
+                });
+            }
+        }
+        // Screen content: the zero-residual palette of a square >= 16x16.
+        if with_palette && b.w == b.h && b.w >= 16 && crate::av2::palette::enabled() {
+            let blk: Vec<f32> = rect_rows(b.yp, pw, b.y, b.x, b.w, b.h)
+                .flatten()
+                .copied()
+                .collect();
+            if let Some(pal) = crate::av2::palette::search(&blk, b.w, b.h, bd as u32, lambda) {
+                let pred = pal.pred();
+                let cost = sse(&blk, &pred) + lambda * pal.bits;
+                if best.as_ref().is_none_or(|bst| cost < bst.cost) {
+                    let recon = pos
+                        .iter()
+                        .map(|&(y, x)| {
+                            rect_rows(&pred, b.w, y - b.y, x - b.x, sz, sz)
+                                .flatten()
+                                .copied()
+                                .collect()
+                        })
+                        .collect();
+                    best = Some(RectSplit {
+                        tus: Vec::new(),
+                        tx: Vec::new(),
+                        mode: (crate::av2::palette::PAL_MODE, 0),
+                        cost,
+                        recon,
+                    });
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Inputs of [`Av2Encoder::gtree_search`].
+struct GSearch<'a> {
+    yp: &'a [f32],
+    pw: usize,
+    frame: (usize, usize),
+    qstep: i32,
+    lambda: f32,
+    /// SB origin (px).
+    sb: (usize, usize),
+    /// Probe decision to refine: its split nodes stay quad splits, its leaves may
+    /// become VERT/HORZ pairs (None = free search).
+    guide: Option<LumaPartitionDecision>,
+}
+
+/// A searched subtree: RD cost, pre-order codes, reconstruction (row-major w x h).
+struct GNode {
+    cost: f32,
+    codes: Vec<u8>,
+    recon: Vec<f32>,
+}
+
+impl Av2Encoder {
+    fn g_save(recy: &[f32], pw: usize, y: usize, x: usize, w: usize, h: usize) -> Vec<f32> {
+        rect_rows(recy, pw, y, x, w, h).flatten().copied().collect()
+    }
+
+    fn g_mark(coded: &mut [u8; 256], sb: (usize, usize), y: usize, x: usize, w: usize, h: usize) {
+        let (r0, c0) = ((y - sb.0) / 4, (x - sb.1) / 4);
+        for r in r0..r0 + h / 4 {
+            coded[r * 16 + c0..r * 16 + c0 + w / 4].fill(1);
+        }
+    }
+
+    /// RD of one leaf (best mode over its square TUs) in the current context;
+    /// returns (cost incl. the leaf's partition bit, w x h recon).
+    #[allow(clippy::too_many_arguments)]
+    fn g_leaf(
+        &self,
+        recy: &mut [f32],
+        g: &GSearch<'_>,
+        coded: &[u8; 256],
+        y: usize,
+        x: usize,
+        w: usize,
+        h: usize,
+    ) -> (f32, Vec<f32>) {
+        let b = RectSplitBlock {
+            yp: g.yp,
+            pw: g.pw,
+            y,
+            x,
+            w,
+            h,
+            frame: g.frame,
+            coded,
+            smooth_neighbour: false,
+        };
+        let r = self
+            .leaf_eval(recy, &b, g.qstep, g.lambda, w == h)
+            .expect("DC is always a candidate");
+        let (sz, pos) = b.tus();
+        let mut out = vec![0f32; w * h];
+        for (k, &(ty, tx)) in pos.iter().enumerate() {
+            for rr in 0..sz {
+                let o = (ty - y + rr) * w + (tx - x);
+                out[o..o + sz].copy_from_slice(&r.recon[k][rr * sz..rr * sz + sz]);
+            }
+        }
+        let mut cost = r.cost;
+        // A 64x64 leaf may also code one TX_64X64 (the leaf coder picks it by RD).
+        if w == 64 && h == 64 {
+            let (c64, _, _, rec64) =
+                self.tx64_eval(recy, g.yp, g.pw, y, x, g.frame, coded, g.qstep, g.lambda);
+            if c64 < cost {
+                cost = c64;
+                out = rec64;
+            }
+        }
+        (cost + g.lambda * G_LEAF_BITS, out)
+    }
+
+    /// Best subtree of the `s` x `s` square at (y, x). On return the region holds
+    /// its reconstruction and `coded` marks it. The quad (VERT, then HORZ halves) is
+    /// searched first in coding order; its squares are reused by the rect options.
+    fn g_square(
+        &self,
+        recy: &mut [f32],
+        g: &GSearch<'_>,
+        coded: &mut [u8; 256],
+        y: usize,
+        x: usize,
+        s: usize,
+    ) -> GNode {
+        let pw = g.pw;
+        let saved = Self::g_save(recy, pw, y, x, s, s);
+        let coded0 = *coded;
+        if s == 8 {
+            let (cost, recon) = self.g_leaf(recy, g, coded, y, x, 8, 8);
+            put_block_rect(recy, pw, y, x, 8, 8, &recon);
+            Self::g_mark(coded, g.sb, y, x, 8, 8);
+            return GNode {
+                cost,
+                codes: vec![0],
+                recon,
+            };
+        }
+        let h = s / 2;
+        let split = g.lambda * G_SPLIT_BITS;
+        // Guided: is this square split in the probe's quad tree?
+        let probe_split = g.guide.as_ref().map(|p| {
+            let (dy, dx) = (y - g.sb.0, x - g.sb.1);
+            let s32 = |dy: usize, dx: usize| p.split32[(dy / 32) * 2 + dx / 32];
+            match s {
+                64 => p.split64,
+                32 => p.split64 && s32(dy, dx),
+                _ => p.split64 && s32(dy, dx) && p.split16[(dy / 16) * 4 + dx / 16],
+            }
+        });
+        // Quad, VERT-first coding order: TL, BL, TR, BR.
+        let quad = (probe_split != Some(false)).then(|| {
+            let tl = self.g_square(recy, g, coded, y, x, h);
+            let bl = self.g_square(recy, g, coded, y + h, x, h);
+            let tr = self.g_square(recy, g, coded, y, x + h, h);
+            let br = self.g_square(recy, g, coded, y + h, x + h, h);
+            let mut codes = vec![2, 1];
+            codes.extend(&tl.codes);
+            codes.extend(&bl.codes);
+            codes.push(1);
+            codes.extend(&tr.codes);
+            codes.extend(&br.codes);
+            let node = GNode {
+                cost: tl.cost + bl.cost + tr.cost + br.cost + 3.0 * split,
+                codes,
+                recon: Self::g_save(recy, pw, y, x, s, s),
+            };
+            (node, [tl, bl, tr, br])
+        });
+        // A guided split whose four children are all split again: rect pairs would
+        // span that detail, so keep the quad.
+        let deep = probe_split == Some(true)
+            && s >= 32
+            && g.guide.as_ref().is_some_and(|p| {
+                let (dy, dx) = (y - g.sb.0, x - g.sb.1);
+                let (h2, cs) = (s / 2, s / 2);
+                [(0, 0), (0, h2), (h2, 0), (h2, h2)]
+                    .iter()
+                    .all(|&(oy, ox)| {
+                        let (cy, cx) = (dy + oy, dx + ox);
+                        if cs == 32 {
+                            p.split32[(cy / 32) * 2 + cx / 32]
+                        } else {
+                            p.split32[(cy / 32) * 2 + cx / 32] && p.split16[(cy / 16) * 4 + cx / 16]
+                        }
+                    })
+            });
+        let pair_at_split = !deep;
+        if probe_split == Some(true) && !pair_at_split {
+            return quad.expect("guided split computes the quad").0;
+        }
+        let quad_recon = quad.as_ref().map(|q| q.0.recon.clone());
+        let mut best = match &quad {
+            Some(q) => GNode {
+                cost: q.0.cost,
+                codes: q.0.codes.clone(),
+                recon: q.0.recon.clone(),
+            },
+            None => GNode {
+                cost: f32::INFINITY,
+                codes: Vec::new(),
+                recon: Vec::new(),
+            },
+        };
+        let mut best_coded = *coded;
+        let restore = |recy: &mut [f32], coded: &mut [u8; 256]| {
+            put_block_rect(recy, pw, y, x, s, s, &saved);
+            *coded = coded0;
+        };
+        // Whole leaf (not where the guiding probe split).
+        restore(recy, coded);
+        let (lc, lrec) = if probe_split == Some(true) {
+            (f32::INFINITY, Vec::new())
+        } else {
+            self.g_leaf(recy, g, coded, y, x, s, s)
+        };
+        if lc < best.cost {
+            let mut c = coded0;
+            Self::g_mark(&mut c, g.sb, y, x, s, s);
+            best = GNode {
+                cost: lc,
+                codes: vec![0],
+                recon: lrec,
+            };
+            best_coded = c;
+        }
+        // VERT / HORZ pairs; each half: leaf, its 4:1 pair, or the quad's squares.
+        for dir in [2u8, 1] {
+            restore(recy, coded);
+            let mut cost = split;
+            let mut codes = vec![dir];
+            let mut longs = 0;
+            for half in 0..2 {
+                let (ry, rx, rw, rh) = if dir == 2 {
+                    (y, x + half * h, h, s)
+                } else {
+                    (y + half * h, x, s, h)
+                };
+                let rcoded = *coded;
+                // Leaf.
+                let (lc, lrec) = self.g_leaf(recy, g, coded, ry, rx, rw, rh);
+                let mut lcoded = rcoded;
+                Self::g_mark(&mut lcoded, g.sb, ry, rx, rw, rh);
+                let mut opt: (f32, Vec<u8>, Vec<f32>, [u8; 256]) = (lc, vec![0], lrec, lcoded);
+                let mut is_long = false;
+                // The quad's two squares (split across the long side).
+                if let (Some((_, [tl, bl, tr, br])), Some(quad_recon)) = (&quad, &quad_recon) {
+                    let (a, b2, ldir) = match (dir, half) {
+                        (2, 0) => (tl, bl, 1u8),
+                        (2, _) => (tr, br, 1u8),
+                        (_, 0) => (tl, tr, 2u8),
+                        _ => (bl, br, 2u8),
+                    };
+                    let c = a.cost + b2.cost + split;
+                    if c < opt.0 {
+                        let mut lc2 = rcoded;
+                        Self::g_mark(&mut lc2, g.sb, ry, rx, rw, rh);
+                        let mut codes2 = vec![ldir];
+                        codes2.extend(&a.codes);
+                        codes2.extend(&b2.codes);
+                        let rec: Vec<f32> = rect_rows(quad_recon, s, ry - y, rx - x, rw, rh)
+                            .flatten()
+                            .copied()
+                            .collect();
+                        opt = (c, codes2, rec, lc2);
+                        is_long = true;
+                    }
+                }
+                put_block_rect(recy, pw, ry, rx, rw, rh, &opt.2);
+                *coded = opt.3;
+                cost += opt.0;
+                codes.extend(&opt.1);
+                longs += is_long as usize;
+            }
+            // HORZ with both halves split across is the quad again.
+            if dir == 1 && longs == 2 {
+                continue;
+            }
+            if cost < best.cost {
+                best = GNode {
+                    cost,
+                    codes,
+                    recon: Self::g_save(recy, pw, y, x, s, s),
+                };
+                best_coded = *coded;
+            }
+        }
+        put_block_rect(recy, pw, y, x, s, s, &best.recon);
+        *coded = best_coded;
+        best
+    }
+
+    /// The 64x64 luma leaf at (y, x) as one TX_64X64 (DCT; only its 32x32 low
+    /// frequencies are coded) with each non-directional mode predicted as one 64x64
+    /// block. Returns the RD-best (cost, levels, mode, recon) — cost = pixel SSE +
+    /// lambda * (coefficient proxy + mode bits). Leaves `recy` as found.
+    #[allow(clippy::too_many_arguments)]
+    fn tx64_eval(
+        &self,
+        recy: &[f32],
+        yp: &[f32],
+        pw: usize,
+        y: usize,
+        x: usize,
+        frame: (usize, usize),
+        coded: &[u8; 256],
+        qstep: i32,
+        lambda: f32,
+    ) -> (f32, Vec<f32>, usize, Vec<f32>) {
+        let bases = &self.bases;
+        let bd = self.bit_depth as i32;
+        let neutral = self.dc_neutral();
+        let src: Vec<f32> = rect_rows(yp, pw, y, x, 64, 64).flatten().copied().collect();
+        let scale = bases.chroma444.qstep as f32 / qstep as f32;
+        let mut best: Option<(f32, Vec<f32>, usize, Vec<f32>)> = None;
+        for m in 0..=4usize {
+            let pred: Vec<f32> = if m == 0 {
+                vec![dc_pred_rect(recy, pw, y, x, 64, 64, neutral, bd); 4096]
+            } else {
+                leaf::predict_luma_square(
+                    recy,
+                    &leaf::SquareLumaBlock {
+                        stride: pw,
+                        frame_width: frame.0,
+                        frame_height: frame.1,
+                        y,
+                        x,
+                        size: 64,
+                    },
+                    coded,
+                    leaf::SquareLumaMode::nondir(m),
+                    neutral,
+                    bd,
+                )
+            };
+            let resid: Vec<f32> = src
+                .iter()
+                .zip(&pred)
+                .map(|(&s, &p)| (s - p) * scale)
+                .collect();
+            let lev = bases.chroma444.project_scan(&resid, 0.0, &tables::SCAN);
+            let p_i: Vec<i32> = pred.iter().map(|&v| v as i32).collect();
+            let rec =
+                itx422::reconstruct_chroma_pred_tx(&p_i, &lev, qstep, &tables::SCAN, 64, 64, bd, 0);
+            let sse: f32 = src
+                .iter()
+                .zip(&rec)
+                .map(|(&a, &r)| (a - r.round()).powi(2))
+                .sum();
+            let mb = if m == 0 { 0.0 } else { 6.0 };
+            let cost = sse + lambda * (coeff_rate_f32(&lev) + mb);
+            if best.as_ref().is_none_or(|b| cost < b.0) {
+                best = Some((cost, lev, m, rec));
+            }
+        }
+        best.expect("DC is always a candidate")
+    }
+
+    /// Free binary-tree luma partition search of a full interior SB (squares, 2:1
+    /// and 4:1 leaves from 64 down to 8), every leaf priced by [`Self::leaf_eval`].
+    /// Leaves `recy` as found.
+    fn gtree_search(&self, recy: &mut [f32], g: &GSearch<'_>) -> crate::av2::leaf::GTree {
+        let saved = Self::g_save(recy, g.pw, g.sb.0, g.sb.1, 64, 64);
+        let mut coded = [0u8; 256];
+        let n = self.g_square(recy, g, &mut coded, g.sb.0, g.sb.1, 64);
+        put_block_rect(recy, g.pw, g.sb.0, g.sb.1, 64, 64, &saved);
+        crate::av2::leaf::GTree::from_codes(&n.codes)
+    }
+}
+
+/// Partition signalling in the tree search: a leaf's do_split = 0, a split's
+/// do_split + rect_type.
+const G_LEAF_BITS: f32 = 1.0;
+const G_SPLIT_BITS: f32 = 2.0;
 
 impl Av2Encoder {
     /// Search the live DRL/NEWMV candidates and materialize the selected luma
@@ -962,6 +1613,8 @@ impl Av2Encoder {
         // Prediction blocks that signal skip_txfm. AVM derives their deblock
         // geometry from the prediction block rather than residual TX tiling.
         skip_leaves: &mut Vec<(usize, usize, usize, usize)>,
+        // SDP chroma-tree leaves (empty without SDP: chroma follows `tx_leaves`).
+        chroma_leaves: &mut Vec<(usize, usize, usize, usize)>,
         // Per-SB settled AC qindex (`final_qindex_ac`, decoder `ts.last_qidx`),
         // indexed `row * sb_cols + col`. The DF thresholds are per-qindex, so with
         // AQ on this varies per SB. Pre-sized `sb_rows * sb_cols` by the caller.
@@ -1012,6 +1665,8 @@ impl Av2Encoder {
         // Per-mi CfL-usage neighbors for get_cfl_ctx (one bit per chroma block).
         let mut cfl_above = vec![0i32; tmc as usize + 16];
         let mut cfl_left = vec![0i32; tmr as usize + 16];
+        let mut midx_above = vec![-1i32; tmc as usize + 16];
+        let mut midx_left = vec![-1i32; tmr as usize + 16];
         // Per-mi interstate grids (1 = neighbor is an inter block). Needed so intra
         // edge leaves on an inter frame derive the correct intra_inter context (AVM
         // av2_get_intra_inter_context) from actual neighbor state, not all-intra.
@@ -1226,6 +1881,7 @@ impl Av2Encoder {
         if wavefront {
             let enc_qc = enc.qc;
             let enc_cfl = enc.cfl;
+            let enc_sct = enc.sct;
             let enc_mhccp = enc.mhccp;
             let enc_dqp = enc.delta_q_present;
             let adaptive = self.tune.updating_cdf && self.base_q_idx != 0;
@@ -1234,6 +1890,13 @@ impl Av2Encoder {
             let wy = helpers::PlaneWriter::new(recy, pw);
             let wu = helpers::PlaneWriter::new(recu, pcw);
             let wv = helpers::PlaneWriter::new(recv, pcw);
+            // Per-mi luma mode class (`midx_above` / `midx_left` values) of every
+            // SB's bottom row and right column, so a cell sees its neighbours'
+            // directional / SMOOTH state exactly as the serial pass does: the
+            // directional edge filter of a border leaf depends on it.
+            let map_stride = sb_cols * 16;
+            let mut mode_map = vec![-1i32; sb_rows * 16 * map_stride];
+            let wm = helpers::PlaneWriter::new(&mut mode_map, map_stride);
             // Persistent-pool WPP wavefront: workers spawn once and loop over the
             // diagonals with a barrier between each, so each worker's thread_local
             // recon scratch is allocated once (not re-allocated per diagonal).
@@ -1261,6 +1924,22 @@ impl Av2Encoder {
                             sb_rows,
                         });
                         s.reset_contexts();
+                        let (mr0, mc0) = (r * 16, c * 16);
+                        {
+                            // SAFETY: row mr0-1 / column mc0-1 were written by the
+                            // above / left cells, which finished on earlier diagonals.
+                            let (mp, _, ms) = wm.read_view();
+                            if r > 0 {
+                                for col in mc0..(mc0 + 16).min(s.mia.len()) {
+                                    s.mia[col] = unsafe { *mp.add((mr0 - 1) * ms + col) };
+                                }
+                            }
+                            if c > 0 {
+                                for row in mr0..(mr0 + 16).min(s.mil.len()) {
+                                    s.mil[row] = unsafe { *mp.add(row * ms + mc0 - 1) };
+                                }
+                            }
+                        }
                         let ly_end = (sb_y + 64).min(ph);
                         let cyc_end = (cy + 32).min(pch);
                         // Luma halo geometry.
@@ -1299,6 +1978,7 @@ impl Av2Encoder {
                             e.enable_adaptive_cdf(enc_qc);
                         }
                         e.cfl = enc_cfl;
+                        e.sct = enc_sct;
                         e.mhccp = enc_mhccp;
                         e.mhccp_ssx = true;
                         e.mhccp_ssy = true;
@@ -1309,6 +1989,7 @@ impl Av2Encoder {
                         let mut lpctx = [0u8; 16];
                         let mut cell_tx: Vec<(usize, usize, usize, usize)> = Vec::new();
                         let mut cell_skips: Vec<(usize, usize, usize, usize)> = Vec::new();
+                        let mut cell_ch: Vec<(usize, usize, usize, usize)> = Vec::new();
                         self.decide_sb_420(Sb420Decision {
                             enc: &mut e,
                             aqs: &mut a,
@@ -1329,6 +2010,8 @@ impl Av2Encoder {
                             v_left: &mut s.vl,
                             cfl_above: &mut s.cfa,
                             cfl_left: &mut s.cfl,
+                            midx_above: &mut s.mia,
+                            midx_left: &mut s.mil,
                             inter_mi_above: &mut s.imia,
                             inter_mi_left: &mut s.imil,
                             skip_mi_above: &mut s.skmia,
@@ -1346,6 +2029,7 @@ impl Av2Encoder {
                             ref_mi_left: &mut s.rfmil,
                             tx_leaves: &mut cell_tx,
                             skip_leaves: &mut cell_skips,
+                            chroma_leaves: &mut cell_ch,
                             sb_qidx: &mut s.dbq,
                             last_ref: last_ref.as_slice(),
                             ref_x0,
@@ -1380,6 +2064,7 @@ impl Av2Encoder {
                             ref_left: 0,
                             row: r,
                             col: c,
+                            forced_part: None,
                         });
                         // Write own blocks back: luma 64×64 at (sb_y,sb_x); chroma 32×32
                         // at (cy,cx). SAFETY: disjoint from every other worker's own block.
@@ -1406,6 +2091,14 @@ impl Av2Encoder {
                         unsafe { wu.write_block(cy, cx, hc, 32, &blk[..hc * 32]) };
                         gather(&s.rv, pcw, cy, cx, 32, hc, &mut blk);
                         unsafe { wv.write_block(cy, cx, hc, 32, &blk[..hc * 32]) };
+                        let edge = |v: &[i32], i: usize| v.get(i).copied().unwrap_or(-1);
+                        let bottom: [i32; 16] = std::array::from_fn(|i| edge(&s.mia, mc0 + i));
+                        let right: [i32; 16] = std::array::from_fn(|i| edge(&s.mil, mr0 + i));
+                        // SAFETY: this SB's own mi rows/columns; no other cell writes them.
+                        unsafe {
+                            wm.write_block(mr0 + 15, mc0, 1, 16, &bottom);
+                            wm.write_block(mr0, mc0 + 15, 16, 1, &right);
+                        }
                         // Restore the buffer to all-zero: re-zero exactly what was dirtied
                         // (halo bands + own block) so the next cell sees all-zero-except-halo.
                         for rr in by..ly_end {
@@ -1423,6 +2116,7 @@ impl Av2Encoder {
                         WfSlot420 {
                             record: rec,
                             tx: cell_tx,
+                            ch: cell_ch,
                         }
                     })
                 },
@@ -1435,6 +2129,7 @@ impl Av2Encoder {
                     let mut slot = slot.expect("every SB decided");
                     rec.append(slot.record);
                     tx_leaves.append(&mut slot.tx);
+                    chroma_leaves.append(&mut slot.ch);
                 }
             }
             for (i, cell) in aq_grid.iter().enumerate() {
@@ -1449,6 +2144,7 @@ impl Av2Encoder {
             let mut mv_left: Option<Mv> = None;
             let mut ref_left = 0u8;
             left_pctx.iter_mut().for_each(|p| *p = 0);
+            enc.sdp_left_c = [0; 16];
             for col in 0..sb_cols {
                 if fresh_ctx {
                     // Reproduce the frame-initial (context-free) state a wavefront worker
@@ -1459,12 +2155,16 @@ impl Av2Encoder {
                     left.iter_mut().for_each(|v| *v = 0x40);
                     above_pctx.iter_mut().for_each(|v| *v = 0);
                     left_pctx.iter_mut().for_each(|v| *v = 0);
+                    enc.sdp_above_c.iter_mut().for_each(|v| *v = 0);
+                    enc.sdp_left_c = [0; 16];
                     u_above.iter_mut().for_each(|v| *v = 0);
                     v_above.iter_mut().for_each(|v| *v = 0);
                     u_left.iter_mut().for_each(|v| *v = 0);
                     v_left.iter_mut().for_each(|v| *v = 0);
                     cfl_above.iter_mut().for_each(|v| *v = 0);
                     cfl_left.iter_mut().for_each(|v| *v = 0);
+                    // midx_above / midx_left are NOT reset: wavefront cells are seeded
+                    // with the neighbour SBs' mode classes (see `mode_map`).
                 }
                 let (sb_y, sb_x) = (row * 64, col * 64);
                 if halo_mode {
@@ -1504,6 +2204,8 @@ impl Av2Encoder {
                     v_left,
                     cfl_above: &mut cfl_above,
                     cfl_left: &mut cfl_left,
+                    midx_above: &mut midx_above,
+                    midx_left: &mut midx_left,
                     inter_mi_above: &mut inter_mi_above,
                     inter_mi_left: &mut inter_mi_left,
                     skip_mi_above: &mut skip_mi_above,
@@ -1521,6 +2223,7 @@ impl Av2Encoder {
                     ref_mi_left: &mut ref_mi_left,
                     tx_leaves,
                     skip_leaves,
+                    chroma_leaves,
                     sb_qidx,
                     last_ref: last_ref.as_slice(),
                     ref_x0,
@@ -1555,6 +2258,7 @@ impl Av2Encoder {
                     ref_left,
                     row,
                     col,
+                    forced_part: None,
                 });
                 skip_left = n_sl;
                 inter_left = n_il;
@@ -1574,6 +2278,7 @@ impl Av2Encoder {
     /// SB-wavefront can drive it per cell with private recon + fresh contexts.
     /// The per-row left-neighbor scalars are threaded in by value and returned.
     fn decide_sb_420(&self, decision: Sb420Decision<'_, '_>) -> (u8, u8, u8, Option<Mv>, u8) {
+        let _qm = self.qm_scope(Layout::I420);
         let Sb420Decision {
             enc,
             aqs,
@@ -1594,6 +2299,8 @@ impl Av2Encoder {
             v_left,
             cfl_above,
             cfl_left,
+            midx_above,
+            midx_left,
             inter_mi_above,
             inter_mi_left,
             skip_mi_above,
@@ -1611,6 +2318,7 @@ impl Av2Encoder {
             ref_mi_left,
             tx_leaves,
             skip_leaves,
+            chroma_leaves,
             sb_qidx,
             last_ref,
             ref_x0,
@@ -1645,7 +2353,9 @@ impl Av2Encoder {
             mut ref_left,
             row,
             col,
+            forced_part,
         } = decision;
+        let _pal = crate::av2::palette::Scope::new(enc.sct);
         let bases = &self.bases;
         let cell = aq_grid[row * sb_cols + col];
         if enc.cdef_nb >= 2 {
@@ -1664,61 +2374,399 @@ impl Av2Encoder {
         };
         let (sb_y, sb_x) = (row * 64, col * 64);
         let full_interior = sb_x + 64 <= width && sb_y + 64 <= height;
-        // The general subsampled 32x32 leaf coefficient path is currently
-        // AVM-safe only through qidx 38. Lower qualities retain the proven
-        // geometry partition walker until its entropy contexts are completed.
-        let luma_partition = if full_interior && self.tune.chroma_split && self.base_q_idx <= 38 {
-            choose_luma_64x64_partition(
-                recy,
-                &LumaSource {
-                    plane: yp,
-                    stride: pw,
-                },
-                &LumaFrameBlock {
-                    frame_width: width,
-                    frame_height: height,
-                    y: sb_y,
-                    x: sb_x,
-                },
-                &LumaGridBlock {
-                    mi_cols: tmc,
-                    mi_rows: tmr,
-                    y: sb_y,
-                    x: sb_x,
-                },
-                &LumaPartitionSearch {
-                    quant: LumaQuantSpec {
-                        basis: &bases.luma,
-                        qstep: sb_qstep,
-                        scan: &tables::SCAN,
-                        neutral,
-                        quant_context: qc,
-                        rdoq_lambda,
-                        speed: self.speed,
-                        bit_depth: self.bit_depth as i32,
+        // Stills run the RD partition probe at every q (avmdec-conformant at all
+        // qidx, 2026-10-31). Video keeps the old qidx <= 38 limit: above it the
+        // probe would replace the geometry walker that carries the inter-skip paths.
+        let luma_partition = if full_interior
+            && self.tune.chroma_split
+            && (self.base_q_idx <= 38 || self.still_rd())
+        {
+            // Replay: reuse the captured partition decision instead of re-running
+            // the probe (the bulk of the decide cost). The probe restores the recon
+            // it touches, and any split tree is a valid choice for the emitter.
+            let replayed = if let crate::av2::replay::DecideMode::Replay(cur) = &mut decide_mode {
+                cur.next_part()
+            } else {
+                None
+            };
+            if let Some(p) = replayed.or(forced_part) {
+                p
+            } else {
+                let p = choose_luma_64x64_partition(
+                    recy,
+                    &LumaSource {
+                        plane: yp,
+                        stride: pw,
                     },
-                    sb: LumaSbSearch {
-                        residual_scale: sb_scale,
-                        allow_directional: self.speed.try_directional(),
+                    &LumaFrameBlock {
+                        frame_width: width,
+                        frame_height: height,
+                        y: sb_y,
+                        x: sb_x,
                     },
-                    basis16: &bases.luma16x16,
-                    basis8: &bases.c8x8,
-                    allow_16x16: self.video_allows_16x16_partitions(),
-                    allow_8x8: false,
-                },
-            )
+                    &LumaGridBlock {
+                        mi_cols: tmc,
+                        mi_rows: tmr,
+                        y: sb_y,
+                        x: sb_x,
+                    },
+                    &LumaPartitionSearch {
+                        quant: LumaQuantSpec {
+                            prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                            basis: &bases.luma,
+                            qstep: sb_qstep,
+                            scan: &tables::SCAN,
+                            neutral,
+                            quant_context: qc,
+                            rdoq_lambda,
+                            pixel_lambda: self.still_rd(),
+                            speed: self.speed,
+                            bit_depth: self.bit_depth as i32,
+                        },
+                        sb: LumaSbSearch {
+                            residual_scale: sb_scale,
+                            allow_directional: self.speed.try_directional(),
+                        },
+                        basis16: &bases.luma16x16,
+                        basis8: &bases.c8x8,
+                        allow_16x16: self.video_allows_16x16_partitions(),
+                        // With SDP chroma has its own tree, so 8x8 luma leaves are free at
+                        // every q. On the shared tree they pay off at qindex <= 128 only:
+                        // below that their 4x4 chroma loses to the 16x16 leaf's MHCCP.
+                        allow_8x8: self.still_rd() && (self.sdp_still() || self.base_q_idx <= 128),
+                        // Shared tree: the probe prices both chroma candidates with DC, so it
+                        // cannot see the 16x16 leaf's MHCCP; weighting the 4x4 chroma SSE
+                        // stands in.
+                        split8_chroma_weight: 1.5,
+                        leaf_modes: self.still_rd(),
+                        leaf_modes8: self.still_rd(),
+                    },
+                    // Shared-tree stills price chroma in the partition probe; with SDP the
+                    // chroma tree decides chroma, and video keeps luma-only.
+                    (self.still_rd() && !self.sdp_still()).then_some(
+                        &mut crate::av2::leaf::ChromaProbe {
+                            src_u: up,
+                            src_v: vp,
+                            rec_u: &mut *recu,
+                            rec_v: &mut *recv,
+                            stride: pcw,
+                            bases: [&bases.chroma420, &bases.luma16x16, &bases.c8x8, &bases.c4x4],
+                            full: false,
+                        },
+                    ),
+                );
+                // ExtraSlow SB partition trial: encode the SB for real under partitions
+                // around the probe's pick (the probe's own pick survives ~half the
+                // time) and keep the cheapest D + lambda * bits. -1.35 SS2 tuning /
+                // -1.43 holdout at 4:2:0 for ~3.9x Slow instructions.
+                let p = if self.still_rd() && matches!(self.speed, Speed::ExtraSlow) {
+                    let mut cands = vec![p];
+                    let mut push = |c: LumaPartitionDecision| {
+                        let same = |a: &LumaPartitionDecision| {
+                            a.split64 == c.split64
+                                && a.rect64 == c.rect64
+                                && (!c.split64
+                                    || (a.split32 == c.split32
+                                        && a.split16 == c.split16
+                                        && a.rect32 == c.rect32
+                                        && a.rect16 == c.rect16))
+                        };
+                        if !cands.iter().any(same) {
+                            cands.push(c);
+                        }
+                    };
+                    push(LumaPartitionDecision::default());
+                    push(LumaPartitionDecision {
+                        split16: [false; 16],
+                        ..p
+                    });
+                    push(LumaPartitionDecision {
+                        split64: true,
+                        ..Default::default()
+                    });
+                    push(LumaPartitionDecision {
+                        split64: true,
+                        split32: [true; 4],
+                        ..p
+                    });
+                    // Half the leaf lambda: measured -1.35 SS2 vs -0.84 at 1x (2 imgs).
+                    let lambda = 0.5 * leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                    let sse_plane = |rec: &[f32],
+                                     src: &[f32],
+                                     stride: usize,
+                                     y: usize,
+                                     x: usize,
+                                     n: usize|
+                     -> f32 {
+                        rect_rows(rec, stride, y, x, n, n)
+                            .zip(rect_rows(src, stride, y, x, n, n))
+                            .map(|(r, s)| {
+                                r.iter()
+                                    .zip(s)
+                                    .map(|(&a, &b)| (a.round() - b).powi(2))
+                                    .sum::<f32>()
+                            })
+                            .sum()
+                    };
+                    let save =
+                        |pl: &[f32], stride: usize, y: usize, x: usize, n: usize| -> Vec<f32> {
+                            rect_rows(pl, stride, y, x, n, n)
+                                .flatten()
+                                .copied()
+                                .collect()
+                        };
+                    let put =
+                        |pl: &mut [f32], stride: usize, y: usize, x: usize, n: usize, v: &[f32]| {
+                            for (dst, src) in
+                                rect_rows_mut(pl, stride, y, x, n, n).zip(v.chunks_exact(n))
+                            {
+                                dst.copy_from_slice(src);
+                            }
+                        };
+                    let (ccy, ccx) = (sb_y / 2, sb_x / 2);
+                    let ry0 = save(recy, pw, sb_y, sb_x, 64);
+                    let ru0 = save(recu, pcw, ccy, ccx, 32);
+                    let rv0 = save(recv, pcw, ccy, ccx, 32);
+                    let s_above = above.to_vec();
+                    let s_left = left.to_vec();
+                    let s_above_pctx = above_pctx.to_vec();
+                    let s_left_pctx = left_pctx.to_vec();
+                    let s_u_above = u_above.to_vec();
+                    let s_v_above = v_above.to_vec();
+                    let s_u_left = u_left.to_vec();
+                    let s_v_left = v_left.to_vec();
+                    let s_cfl_above = cfl_above.to_vec();
+                    let s_cfl_left = cfl_left.to_vec();
+                    let s_midx_above = midx_above.to_vec();
+                    let s_midx_left = midx_left.to_vec();
+                    let s_inter_mi_above = inter_mi_above.to_vec();
+                    let s_inter_mi_left = inter_mi_left.to_vec();
+                    let s_skip_mi_above = skip_mi_above.to_vec();
+                    let s_skip_mi_left = skip_mi_left.to_vec();
+                    let s_newmv_mi_above = newmv_mi_above.to_vec();
+                    let s_newmv_mi_left = newmv_mi_left.to_vec();
+                    let s_mv_mi_above = mv_mi_above.to_vec();
+                    let s_mv_mi_left = mv_mi_left.to_vec();
+                    let s_newmv_above = newmv_above.to_vec();
+                    let s_mv_above = mv_above.to_vec();
+                    let s_skip_above = skip_above.to_vec();
+                    let s_inter_above = inter_above.to_vec();
+                    let s_ref_above = ref_above.to_vec();
+                    let s_ref_mi_above = ref_mi_above.to_vec();
+                    let s_ref_mi_left = ref_mi_left.to_vec();
+                    let s_sb_qidx = sb_qidx.to_vec();
+                    let (n_tx, n_skip, n_ch) =
+                        (tx_leaves.len(), skip_leaves.len(), chroma_leaves.len());
+                    let bits0 = enc.tell_bits();
+                    let mut eval = |c: LumaPartitionDecision| -> f32 {
+                        let mut te = enc.trial_clone();
+                        let mut ta = aqs.clone();
+                        let mut off = crate::av2::replay::DecideMode::Off;
+                        self.decide_sb_420(Sb420Decision {
+                            enc: &mut te,
+                            aqs: &mut ta,
+                            decide_mode: &mut off,
+                            recy: &mut *recy,
+                            recu: &mut *recu,
+                            recv: &mut *recv,
+                            yp,
+                            up,
+                            vp,
+                            above: &mut *above,
+                            left: &mut *left,
+                            above_pctx: &mut *above_pctx,
+                            left_pctx: &mut *left_pctx,
+                            u_above: &mut *u_above,
+                            v_above: &mut *v_above,
+                            u_left: &mut *u_left,
+                            v_left: &mut *v_left,
+                            cfl_above: &mut *cfl_above,
+                            cfl_left: &mut *cfl_left,
+                            midx_above: &mut *midx_above,
+                            midx_left: &mut *midx_left,
+                            inter_mi_above: &mut *inter_mi_above,
+                            inter_mi_left: &mut *inter_mi_left,
+                            skip_mi_above: &mut *skip_mi_above,
+                            skip_mi_left: &mut *skip_mi_left,
+                            newmv_mi_above: &mut *newmv_mi_above,
+                            newmv_mi_left: &mut *newmv_mi_left,
+                            mv_mi_above: &mut *mv_mi_above,
+                            mv_mi_left: &mut *mv_mi_left,
+                            newmv_above: &mut *newmv_above,
+                            mv_above: &mut *mv_above,
+                            skip_above: &mut *skip_above,
+                            inter_above: &mut *inter_above,
+                            ref_above: &mut *ref_above,
+                            ref_mi_above: &mut *ref_mi_above,
+                            ref_mi_left: &mut *ref_mi_left,
+                            tx_leaves: &mut *tx_leaves,
+                            skip_leaves: &mut *skip_leaves,
+                            chroma_leaves: &mut *chroma_leaves,
+                            sb_qidx: &mut *sb_qidx,
+                            last_ref,
+                            ref_x0,
+                            ref_y0,
+                            ref_ls,
+                            ref_cs,
+                            has_last,
+                            second_ref,
+                            has_second,
+                            inter_luma,
+                            inter_chroma,
+                            me_scratch: &mut *me_scratch,
+                            inter_pred_scratch: &mut *inter_pred_scratch,
+                            frame_mv_seed,
+                            mhccp_bounds,
+                            pw,
+                            pcw,
+                            width,
+                            height,
+                            sb_cols,
+                            tmc,
+                            tmr,
+                            qc,
+                            neutral,
+                            rdoq_lambda,
+                            aq_grid,
+                            use_grid,
+                            skip_left,
+                            inter_left,
+                            newmv_left,
+                            mv_left,
+                            ref_left,
+                            row,
+                            col,
+                            forced_part: Some(c),
+                        });
+                        let d = sse_plane(recy, yp, pw, sb_y, sb_x, 64)
+                            + sse_plane(recu, up, pcw, ccy, ccx, 32)
+                            + sse_plane(recv, vp, pcw, ccy, ccx, 32);
+                        let j = d + lambda * (te.tell_bits() - bits0);
+                        put(recy, pw, sb_y, sb_x, 64, &ry0);
+                        put(recu, pcw, ccy, ccx, 32, &ru0);
+                        put(recv, pcw, ccy, ccx, 32, &rv0);
+                        above.copy_from_slice(&s_above);
+                        left.copy_from_slice(&s_left);
+                        above_pctx.copy_from_slice(&s_above_pctx);
+                        left_pctx.copy_from_slice(&s_left_pctx);
+                        u_above.copy_from_slice(&s_u_above);
+                        v_above.copy_from_slice(&s_v_above);
+                        u_left.copy_from_slice(&s_u_left);
+                        v_left.copy_from_slice(&s_v_left);
+                        cfl_above.copy_from_slice(&s_cfl_above);
+                        cfl_left.copy_from_slice(&s_cfl_left);
+                        midx_above.copy_from_slice(&s_midx_above);
+                        midx_left.copy_from_slice(&s_midx_left);
+                        inter_mi_above.copy_from_slice(&s_inter_mi_above);
+                        inter_mi_left.copy_from_slice(&s_inter_mi_left);
+                        skip_mi_above.copy_from_slice(&s_skip_mi_above);
+                        skip_mi_left.copy_from_slice(&s_skip_mi_left);
+                        newmv_mi_above.copy_from_slice(&s_newmv_mi_above);
+                        newmv_mi_left.copy_from_slice(&s_newmv_mi_left);
+                        mv_mi_above.copy_from_slice(&s_mv_mi_above);
+                        mv_mi_left.copy_from_slice(&s_mv_mi_left);
+                        newmv_above.copy_from_slice(&s_newmv_above);
+                        mv_above.copy_from_slice(&s_mv_above);
+                        skip_above.copy_from_slice(&s_skip_above);
+                        inter_above.copy_from_slice(&s_inter_above);
+                        ref_above.copy_from_slice(&s_ref_above);
+                        ref_mi_above.copy_from_slice(&s_ref_mi_above);
+                        ref_mi_left.copy_from_slice(&s_ref_mi_left);
+                        sb_qidx.copy_from_slice(&s_sb_qidx);
+                        tx_leaves.truncate(n_tx);
+                        skip_leaves.truncate(n_skip);
+                        chroma_leaves.truncate(n_ch);
+                        j
+                    };
+                    let mut best = (f32::INFINITY, p);
+                    for c in cands {
+                        let j = eval(c);
+                        if j < best.0 {
+                            best = (j, c);
+                        }
+                    }
+                    // Greedy refinement: flip each 32x32 quadrant's split, then each
+                    // split quadrant's 8x8 splits, keeping every flip that lowers J.
+                    if best.1.split64 {
+                        let q16 = |k: usize| {
+                            let (qy, qx) = (k / 2, k % 2);
+                            [0usize, 1, 4, 5].map(|o| qy * 8 + qx * 2 + o)
+                        };
+                        for k in 0..4 {
+                            let mut c = best.1;
+                            c.split32[k] = !c.split32[k];
+                            for i in q16(k) {
+                                c.split16[i] = false;
+                            }
+                            let j = eval(c);
+                            if j < best.0 {
+                                best = (j, c);
+                            }
+                        }
+                        if self.base_q_idx <= 128 {
+                            for k in 0..4 {
+                                if !best.1.split32[k] {
+                                    continue;
+                                }
+                                let mut c = best.1;
+                                let any = q16(k).iter().any(|&i| c.split16[i]);
+                                for i in q16(k) {
+                                    c.split16[i] = !any;
+                                }
+                                let j = eval(c);
+                                if j < best.0 {
+                                    best = (j, c);
+                                }
+                            }
+                        }
+                    }
+                    best.1
+                } else {
+                    p
+                };
+                // Rect refinement of the probe's (or trial's) leaves by the binary-tree search.
+                let p = if self.still_rd()
+                    && self.sdp_still()
+                    && (if matches!(self.speed, Speed::ExtraSlow) {
+                        1.0
+                    } else {
+                        0.0
+                    }) > 0.0
+                {
+                    let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                    let g = self.gtree_search(
+                        recy,
+                        &GSearch {
+                            yp,
+                            pw,
+                            frame: (width, height),
+                            qstep: sb_qstep,
+                            lambda,
+                            sb: (sb_y, sb_x),
+                            guide: Some(p),
+                        },
+                    );
+                    LumaPartitionDecision {
+                        gtree: Some(g),
+                        dir8: p.dir8,
+                        ..Default::default()
+                    }
+                } else {
+                    p
+                };
+                if let crate::av2::replay::DecideMode::Capture(rec) = &mut decide_mode {
+                    rec.push_part(p);
+                }
+                p
+            }
         } else {
             LumaPartitionDecision::default()
         };
-        let ops = if full_interior && luma_partition.split64 {
-            partition::sb_rd_split_ops(
-                row,
-                col,
-                luma_partition.split32,
-                luma_partition.split16,
-                above_pctx,
-                left_pctx,
-            )
+        let ops = if full_interior && luma_partition.is_tree() {
+            match &luma_partition.gtree {
+                Some(g) => partition::sb_gtree_ops(row, col, g.codes(), above_pctx, left_pctx),
+                None => partition::sb_tree_ops(row, col, &luma_partition, above_pctx, left_pctx),
+            }
         } else {
             partition::sb_partition_ops(row, col, tmr as usize, tmc as usize, above_pctx, left_pctx)
         };
@@ -1745,6 +2793,15 @@ impl Av2Encoder {
         let mut leaf_recs: Vec<Leaf420> = Vec::new();
         let mut sb_walk_ok = false;
         let mut cap_idx = 0usize;
+        // SDP: this walk is the luma tree (no chroma syntax, chroma contexts left
+        // to the chroma tree, which runs after it).
+        let sdp = self.sdp_still();
+        enc.sdp_luma = sdp;
+        let mut sdp_midx = [0xffu8; 256];
+        let leaf_start = tx_leaves.len();
+        // TU geometry of split rect leaves, appended to `tx_leaves` (the deblock
+        // grid) after the SB: the chroma tree reads this SB's prediction blocks.
+        let mut tu_splits: Vec<(usize, usize, usize, usize)> = Vec::new();
         for op in &ops {
             let (bw_mi, bh_mi, pc, lmr, lmc) = match op {
                 partition::Op::RectType { cdf, val, ctx } => {
@@ -1770,6 +2827,7 @@ impl Av2Encoder {
                 } => (*bw_mi, *bh_mi, part_cdf.unwrap_or(12276), *mi_row, *mi_col),
             };
             tx_leaves.push((lmr, lmc, bw_mi, bh_mi));
+            enc.pal_pos = (lmr, lmc);
             #[cfg(test)]
             TOTAL_LEAF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let sb_y = lmr * 4;
@@ -1893,6 +2951,21 @@ impl Av2Encoder {
             enc.cfl_ctx = (cfl_a + cfl_l) as usize;
             enc.cfl_use = false;
             enc.cfl_signaled = false;
+            // Luma mode-set neighbours (avm above_right / bottom_left mi) and the
+            // y_idx context = how many of them are directional.
+            let nb_midx = |v: i32| if v >= 0 { v as u8 } else { 0xff };
+            let amidx = nb_midx(if lmr > 0 {
+                midx_above[lmc + bw_mi - 1]
+            } else {
+                -1
+            });
+            let lmidx = nb_midx(if lmc > 0 {
+                midx_left[lmr + bh_mi - 1]
+            } else {
+                -1
+            });
+            enc.y_ctx = (amidx != 0xff) as usize + (lmidx != 0xff) as usize;
+            let mut leaf_midx: i32 = -1;
             // Sub-superblock GLOBALMV skip, including native rectangular edge
             // leaves. Chroma uses the same zero motion at half resolution.
             let block_w = bw_mi * 4;
@@ -3536,1409 +4609,2162 @@ impl Av2Encoder {
                 }
                 aq_committed = true;
             }
-            let (u_present, v_present) = match (bw_mi, bh_mi) {
-                (16, 16) => outline_leaf_420(|| {
-                    // 64x64 luma → 32x32 chroma (TX_32X32, eob 1024, skip TX32).
-                    // Staged decouple: Replay restores the captured luma recon +
-                    // reuses the luma winner and CfL choice (skipping the mode
-                    // search + CfL RD); Capture logs them; Off searches inline.
-                    // Order preserved exactly: luma → tu-contexts → CfL → emit.
-                    let leaf_replay: Option<&Leaf420> =
-                        replay_walk.as_ref().and_then(|v| v.get(cap_idx));
-                    const PARTITION_CFL: bool = true;
-                    let bd = self.bit_depth as i32;
-                    let (tus, mode_idx): ([Vec<Coeff>; 4], usize) = if let Some(d) = leaf_replay {
-                        put_block_rect(recy, pw, sb_y, sb_x, 64, 64, &d.recon_y);
-                        (std::array::from_fn(|k| d.tus[k].clone()), d.mode_idx)
+            // Stills: the rect shapes code as square TUs along their long side with the
+            // full luma mode set (the legacy rect arms are DC-only frame-edge coders).
+            let generic = sdp
+                && self.still_rd()
+                && matches!(
+                    (bw_mi, bh_mi),
+                    (8, 4) | (4, 8) | (4, 2) | (2, 4) | (8, 2) | (2, 8) | (16, 4) | (4, 16)
+                )
+                && sb_y + bh_mi * 4 <= height
+                && sb_x + bw_mi * 4 <= width;
+            let (u_present, v_present) = if generic {
+                outline_leaf_420(|| {
+                    let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                    let smooth_neighbour = (lmr > 0 && midx_above[lmc] == MIDX_SMOOTH)
+                        || (lmc > 0 && midx_left[lmr] == MIDX_SMOOTH);
+                    let coded = enc.sb_coded;
+                    let blk = RectSplitBlock {
+                        yp,
+                        pw,
+                        y: sb_y,
+                        x: sb_x,
+                        w: bw_mi * 4,
+                        h: bh_mi * 4,
+                        frame: (width, height),
+                        coded: &coded,
+                        smooth_neighbour,
+                    };
+                    let sp = self
+                        .multi_tu_search(recy, &blk, sb_qstep, lambda)
+                        .expect("DC is always a candidate");
+                    let (sz, pos) = blk.tus();
+                    let mut skips = Vec::with_capacity(pos.len());
+                    let mut dcss = Vec::with_capacity(pos.len());
+                    for (k, &(ty, tx)) in pos.iter().enumerate() {
+                        put_block_rect(recy, pw, ty, tx, sz, sz, &sp.recon[k]);
+                        let (sk, dc) = sb_tu_contexts_rect(
+                            &sp.tus[k],
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y: ty,
+                                sb_x: tx,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: false,
+                            },
+                            sz / 4,
+                            sz / 4,
+                        );
+                        skips.push(sk);
+                        dcss.push(dc);
+                        tu_splits.push((ty / 4, tx / 4, sz / 4, sz / 4));
+                    }
+                    let midx = coder::encode_luma_leaf_multi_tu(
+                        enc,
+                        &sp.tus,
+                        &skips,
+                        &dcss,
+                        &sp.tx,
+                        sp.mode,
+                        pc,
+                        (bw_mi, bh_mi),
+                        (lmidx, amidx),
+                    );
+                    leaf_midx = if midx != 0xff {
+                        midx as i32
                     } else {
-                        let (tus, mode_idx, _, _) = encode_luma_sb(
+                        midx_class(sp.mode.0)
+                    };
+                    (false, false)
+                })
+            } else {
+                match (bw_mi, bh_mi) {
+                    (16, 16) => outline_leaf_420(|| {
+                        // 64x64 luma → 32x32 chroma (TX_32X32, eob 1024, skip TX32).
+                        // Staged decouple: Replay restores the captured luma recon +
+                        // reuses the luma winner and CfL choice (skipping the mode
+                        // search + CfL RD); Capture logs them; Off searches inline.
+                        // Order preserved exactly: luma → tu-contexts → CfL → emit.
+                        let leaf_replay: Option<&Leaf420> =
+                            replay_walk.as_ref().and_then(|v| v.get(cap_idx));
+                        const PARTITION_CFL: bool = true;
+                        let bd = self.bit_depth as i32;
+                        let (tus, mode_idx, adelta): ([Vec<Coeff>; 4], usize, i8) =
+                            if let Some(d) = leaf_replay {
+                                put_block_rect(recy, pw, sb_y, sb_x, 64, 64, &d.recon_y);
+                                (
+                                    std::array::from_fn(|k| d.tus[k].clone()),
+                                    d.mode_idx,
+                                    d.angle_delta,
+                                )
+                            } else {
+                                let (tus, mode_idx, adelta, _) = encode_luma_sb(
+                                    recy,
+                                    &LumaSource {
+                                        plane: yp,
+                                        stride: pw,
+                                    },
+                                    &LumaFrameBlock {
+                                        frame_width: width,
+                                        frame_height: height,
+                                        y: sb_y,
+                                        x: sb_x,
+                                    },
+                                    &LumaQuantSpec {
+                                        prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                                        basis: &bases.luma,
+                                        qstep: sb_qstep,
+                                        scan: &tables::SCAN,
+                                        neutral,
+                                        quant_context: qc,
+                                        rdoq_lambda: self.tune.rdoq_lambda,
+                                        pixel_lambda: self.still_rd(),
+                                        speed: self.speed,
+                                        bit_depth: self.bit_depth as i32,
+                                    },
+                                    &LumaSbSearch {
+                                        residual_scale: sb_scale,
+                                        // Stills: directional modes + angle deltas (the
+                                        // neighbours' midx are tracked per mi for the mode
+                                        // list / y_idx context). Video keeps the old set.
+                                        // Whole superblocks only: a 64x64 leaf in a partial
+                                        // edge SB stays non-directional (as on the legacy
+                                        // path; directional there desyncs avmdec).
+                                        allow_directional: self.still_rd()
+                                            && self.speed.try_directional()
+                                            && sb_x + 64 <= width
+                                            && sb_y + 64 <= height,
+                                    },
+                                );
+                                (tus, mode_idx, adelta)
+                            };
+                        // Stills: one TX_64X64 instead of the four TX_32X32, by RD.
+                        let tx64: Option<(Vec<Coeff>, usize)> = if let Some(d) = leaf_replay {
+                            (d.tx_idx == 64).then(|| (d.tus[0].clone(), d.mode_idx))
+                        } else if sdp
+                            && self.still_rd()
+                            && mode_idx != crate::av2::palette::PAL_MODE
+                            && sb_y + 64 <= height
+                            && sb_x + 64 <= width
+                        {
+                            let lambda =
+                                leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                            let cur: Vec<f32> = rect_rows(recy, pw, sb_y, sb_x, 64, 64)
+                                .flatten()
+                                .copied()
+                                .collect();
+                            let sse32: f32 = rect_rows(yp, pw, sb_y, sb_x, 64, 64)
+                                .flatten()
+                                .zip(&cur)
+                                .map(|(&a, &r)| (a - r.round()).powi(2))
+                                .sum();
+                            let mb = if mode_idx >= 5 {
+                                9.0
+                            } else if mode_idx != 0 {
+                                6.0
+                            } else {
+                                0.0
+                            };
+                            let j32 = sse32
+                                + lambda
+                                    * (tus.iter().map(|t| coeff_tu_rate_proxy_f32(t)).sum::<f32>()
+                                        + mb);
+                            let coded = enc.sb_coded;
+                            let (j64, lev, m, rec) = self.tx64_eval(
+                                &*recy,
+                                yp,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                (width, height),
+                                &coded,
+                                sb_qstep,
+                                lambda,
+                            );
+                            if j64 < j32 {
+                                put_block_rect(recy, pw, sb_y, sb_x, 64, 64, &rec);
+                                Some((levels_to_coeffs(&lev), m))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let (skip_cdfs, dc_sign_ctxs, dcs64) = if let Some((tu64, _)) = &tx64 {
+                            let (_, d) = sb_tu_contexts_rect(
+                                tu64,
+                                above,
+                                left,
+                                &TxbContextSpec {
+                                    sb_y,
+                                    sb_x,
+                                    qc,
+                                    mi_cols: tmc,
+                                    mi_rows: tmr,
+                                    block_eq_tx: true,
+                                },
+                                16,
+                                16,
+                            );
+                            tu_splits.push((
+                                lmr,
+                                lmc,
+                                16 | crate::av2::deblock::TU_WHOLE,
+                                16 | crate::av2::deblock::TU_WHOLE,
+                            ));
+                            ([0u32; 4], [0usize; 4], d)
+                        } else {
+                            let (a, b) =
+                                sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
+                            (a, b, 0)
+                        };
+                        let cfl_choice = if let Some(d) = leaf_replay {
+                            d.chroma.clone()
+                        } else if enc.cfl && PARTITION_CFL && !enc.sdp_luma {
+                            let avg_l = cfl::cfl_avg_l(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                32,
+                                32,
+                                true,
+                                true,
+                                bd,
+                                (width, height),
+                            );
+                            let mut suf = [0f32; 32 * 32];
+                            let mut svf = [0f32; 32 * 32];
+                            cfl_partition_prediction::<32>(pcw, up, vp, cy, cx, &mut suf, &mut svf);
+                            // Chroma DC neighbours stop at the 8-aligned luma extent (AVM
+                            // replicates past it), not at the SB-padded plane.
+                            let crect = BoundedIntraRect {
+                                stride: pcw,
+                                y: cy,
+                                x: cx,
+                                width: 32,
+                                height: 32,
+                                frame_width: ((width + 7) & !7) >> 1,
+                                frame_height: ((height + 7) & !7) >> 1,
+                            };
+                            let dc_u_f = dc_pred_rect_subsampled_bounded(recu, &crect, neutral, bd);
+                            let dc_v_f = dc_pred_rect_subsampled_bounded(recv, &crect, neutral, bd);
+                            cfl::cfl_decide(
+                                &cfl::CflDecisionInput {
+                                    reconstructed_luma: recy,
+                                    luma_stride: pw,
+                                    luma_y: sb_y,
+                                    luma_x: sb_x,
+                                    source_u: &suf,
+                                    source_v: &svf,
+                                    dc_u: dc_u_f,
+                                    dc_v: dc_v_f,
+                                    width: 32,
+                                    height: 32,
+                                    subsample_x: true,
+                                    subsample_y: true,
+                                    luma_average_q3: avg_l,
+                                },
+                                &cfl::ChromaRdSpec {
+                                    basis: &bases.chroma420,
+                                    qstep: sb_qstep,
+                                    lambda: leaf::part_lambda(
+                                        sb_qstep,
+                                        self.subsampled_part_lambda_c(),
+                                    ),
+                                    bit_depth: bd,
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        if capturing {
+                            leaf_recs.push(Leaf420 {
+                                bw_mi: 16,
+                                bh_mi: 16,
+                                tus: match &tx64 {
+                                    Some((t, _)) => {
+                                        vec![t.clone(), Vec::new(), Vec::new(), Vec::new()]
+                                    }
+                                    None => tus.to_vec(),
+                                },
+                                mode_idx: tx64.as_ref().map_or(mode_idx, |t| t.1),
+                                angle_delta: adelta,
+                                tx_idx: if tx64.is_some() { 64 } else { 0 },
+                                recon_y: gather_rect(recy, pw, sb_y, sb_x, 64, 64),
+                                chroma: cfl_choice.clone(),
+                            });
+                            sb_walk_ok = true;
+                        }
+                        cap_idx += 1;
+                        if let Some(ref ch) = cfl_choice {
+                            enc.cfl_use = true;
+                            enc.cfl_js = ch.js;
+                            enc.cfl_mag_u = ch.mag_u;
+                            enc.cfl_mag_v = ch.mag_v;
+                            enc.cfl_ctx_u = ch.ctx_u;
+                            enc.cfl_ctx_v = ch.ctx_v;
+                        }
+                        // Partition path does not evaluate MHCCP; ensure the
+                        // per-block flag is clear so no switch symbol is emitted.
+                        enc.mhccp_allowed = false;
+                        enc.mhccp_use = false;
+                        // Partition leaves predict chroma with DC/CfL only; never emit a
+                        // uv mode left over from an earlier whole-SB mode search.
+                        enc.uv_mode = 0;
+                        // A palette winner codes as DC_PRED plus the re-derived palette.
+                        let mode_idx = if mode_idx == crate::av2::palette::PAL_MODE {
+                            enc.palette_next = leaf::luma_palette(
+                                &LumaSource {
+                                    plane: yp,
+                                    stride: pw,
+                                },
+                                (width, height),
+                                sb_y,
+                                sb_x,
+                                64,
+                                64,
+                                &LumaQuantSpec {
+                                    prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                                    basis: &bases.luma,
+                                    qstep: sb_qstep,
+                                    scan: &tables::SCAN,
+                                    neutral,
+                                    quant_context: qc,
+                                    rdoq_lambda: self.tune.rdoq_lambda,
+                                    pixel_lambda: self.still_rd(),
+                                    speed: self.speed,
+                                    bit_depth: self.bit_depth as i32,
+                                },
+                            )
+                            .map(Box::new);
+                            debug_assert!(enc.palette_next.is_some());
+                            0
+                        } else {
+                            mode_idx
+                        };
+                        if let Some((tu64, m64)) = &tx64 {
+                            enc.palette_next = None;
+                            coder::encode_luma_block_tx64(
+                                enc,
+                                tu64,
+                                dcs64,
+                                (*m64, 0),
+                                pc,
+                                (lmidx, amidx),
+                            );
+                            leaf_midx = midx_class(*m64);
+                        } else if mode_idx >= 5 {
+                            let (_, midx) = encode_luma_block_split_dir(
+                                enc,
+                                &LumaSplitDirSpec {
+                                    tus: &tus,
+                                    skip_cdfs: &skip_cdfs,
+                                    dc_sign_ctxs: &dc_sign_ctxs,
+                                    mode_idx,
+                                    angle_delta: adelta,
+                                    has_chroma: true,
+                                    part_cdf: pc,
+                                    left_midx: lmidx,
+                                    above_midx: amidx,
+                                },
+                            );
+                            leaf_midx = midx as i32;
+                        } else {
+                            encode_luma_block_split(
+                                enc,
+                                &tus,
+                                &skip_cdfs,
+                                &dc_sign_ctxs,
+                                mode_idx,
+                                true,
+                                pc,
+                            );
+                            leaf_midx = midx_class(mode_idx);
+                        }
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 32,
+                                ch: 32,
+                                basis: &bases.chroma420,
+                                scan: &tables::SCAN,
+                                eob_cdf: EobCdf::ChrEobBin,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 1024,
+                                u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: cfl_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (16, 8) => outline_leaf_420(|| {
+                        // 64x32 luma → 32x16 chroma (TX_32X16, eob 512, skip TX32).
+                        let (tus2, mode_idx, adelta2) = encode_luma_leaf32(
                             recy,
                             &LumaSource {
                                 plane: yp,
                                 stride: pw,
                             },
-                            &LumaFrameBlock {
-                                frame_width: width,
-                                frame_height: height,
+                            &LumaGridBlock {
+                                mi_cols: tmc,
+                                mi_rows: tmr,
                                 y: sb_y,
                                 x: sb_x,
                             },
                             &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
                                 basis: &bases.luma,
                                 qstep: sb_qstep,
                                 scan: &tables::SCAN,
                                 neutral,
                                 quant_context: qc,
                                 rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
                                 speed: self.speed,
                                 bit_depth: self.bit_depth as i32,
                             },
-                            &LumaSbSearch {
-                                residual_scale: sb_scale,
-                                allow_directional: false,
+                            self.still_rd().then_some(leaf::LeafDirSearch {
+                                coded: &enc.sb_coded,
+                                frame_width: width,
+                                frame_height: height,
+                                refine: 2,
+                            }),
+                        );
+                        let (skip2, dcs2) =
+                            sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 32,
+                                height: 16,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c32x16,
+                                scan: &SCAN32X16,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
                             },
                         );
-                        (tus, mode_idx)
-                    };
-                    let (skip_cdfs, dc_sign_ctxs) =
-                        sb_tu_contexts(&tus, sb_y, sb_x, above, left, qc, tmc, tmr);
-                    let cfl_choice = if let Some(d) = leaf_replay {
-                        d.chroma.clone()
-                    } else if enc.cfl && PARTITION_CFL {
-                        let avg_l = cfl::cfl_avg_l(
+                        if mode_idx >= 5 {
+                            let midx = coder::encode_luma_leaf_rect64_dir(
+                                enc,
+                                &tus2,
+                                &skip2,
+                                &dcs2,
+                                (mode_idx, adelta2),
+                                pc,
+                                true,
+                                (lmidx, amidx),
+                            );
+                            leaf_midx = midx as i32;
+                        } else {
+                            encode_luma_leaf_64x32(enc, &tus2, &skip2, &dcs2, mode_idx, true, pc);
+                            leaf_midx = midx_class(mode_idx);
+                        }
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 32,
+                                ch: 16,
+                                basis: &bases.c32x16,
+                                scan: &SCAN32X16,
+                                eob_cdf: EobCdf::ChrEob512,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 512,
+                                u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (8, 16) => outline_leaf_420(|| {
+                        // 32x64 luma → 16x32 chroma (TX_16X32, eob 512, skip TX32).
+                        let (tus2, mode_idx, adelta2) = encode_luma_leaf_v32x64(
+                            recy,
+                            &LumaSource {
+                                plane: yp,
+                                stride: pw,
+                            },
+                            &LumaGridBlock {
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                y: sb_y,
+                                x: sb_x,
+                            },
+                            &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                                basis: &bases.luma,
+                                qstep: sb_qstep,
+                                scan: &tables::SCAN,
+                                neutral,
+                                quant_context: qc,
+                                rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
+                                speed: self.speed,
+                                bit_depth: self.bit_depth as i32,
+                            },
+                            self.still_rd().then_some(leaf::LeafDirSearch {
+                                coded: &enc.sb_coded,
+                                frame_width: width,
+                                frame_height: height,
+                                refine: 2,
+                            }),
+                        );
+                        let (skip2, dcs2) = sb_tu_contexts_pos(
+                            &[(0, 0), (32, 0)],
+                            &tus2,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: false,
+                            },
+                        );
+                        let s2 = [skip2[0], skip2[1]];
+                        let d2 = [dcs2[0], dcs2[1]];
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 16,
+                                height: 32,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c16x32,
+                                scan: &SCAN16X32,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        if mode_idx >= 5 {
+                            let midx = coder::encode_luma_leaf_rect64_dir(
+                                enc,
+                                &tus2,
+                                &s2,
+                                &d2,
+                                (mode_idx, adelta2),
+                                pc,
+                                false,
+                                (lmidx, amidx),
+                            );
+                            leaf_midx = midx as i32;
+                        } else {
+                            encode_luma_leaf_32x64(enc, &tus2, &s2, &d2, mode_idx, true, pc);
+                            leaf_midx = midx_class(mode_idx);
+                        }
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 16,
+                                ch: 32,
+                                basis: &bases.c16x32,
+                                scan: &SCAN16X32,
+                                eob_cdf: EobCdf::ChrEob512,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 512,
+                                u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (8, 8) => outline_leaf_420(|| {
+                        // 32x32 luma → 16x16 chroma (TX_16X16, eob 256, skip TX16).
+                        // Replay pass: code the captured winner, skipping the search.
+                        let forced32 = decide_mode.replay_leaf().map(|c| {
+                            let (m, d, _) = crate::av2::replay::unpack_leaf_choice(c);
+                            (m, d)
+                        });
+                        let (tu, mode_idx, adelta32) = encode_luma_leaf_s32x32(
+                            recy,
+                            &LumaSource {
+                                plane: yp,
+                                stride: pw,
+                            },
+                            &LumaGridBlock {
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                y: sb_y,
+                                x: sb_x,
+                            },
+                            &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                                basis: &bases.luma,
+                                qstep: sb_qstep,
+                                scan: &tables::SCAN,
+                                neutral,
+                                quant_context: qc,
+                                rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
+                                speed: self.speed,
+                                bit_depth: self.bit_depth as i32,
+                            },
+                            self.still_rd().then_some(leaf::LeafDirSearch {
+                                coded: &enc.sb_coded,
+                                frame_width: width,
+                                frame_height: height,
+                                refine: 2,
+                            }),
+                            forced32,
+                        );
+                        decide_mode.capture_leaf(crate::av2::replay::leaf_choice(
+                            mode_idx,
+                            adelta32 as i32,
+                            0,
+                        ));
+                        let (skip2, dcs2) = sb_tu_contexts_pos(
+                            &[(0, 0)],
+                            std::slice::from_ref(&tu),
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 16,
+                                height: 16,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.luma16x16,
+                                scan: &SCAN16,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        // A palette winner codes as DC_PRED plus the re-derived palette.
+                        let mode_idx = if mode_idx == crate::av2::palette::PAL_MODE {
+                            enc.palette_next = leaf::luma_palette(
+                                &LumaSource {
+                                    plane: yp,
+                                    stride: pw,
+                                },
+                                (tmc as usize * 4, tmr as usize * 4),
+                                sb_y,
+                                sb_x,
+                                32,
+                                32,
+                                &LumaQuantSpec {
+                                    prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
+                                    basis: &bases.luma,
+                                    qstep: sb_qstep,
+                                    scan: &tables::SCAN,
+                                    neutral,
+                                    quant_context: qc,
+                                    rdoq_lambda: self.tune.rdoq_lambda,
+                                    pixel_lambda: self.still_rd(),
+                                    speed: self.speed,
+                                    bit_depth: self.bit_depth as i32,
+                                },
+                            )
+                            .map(Box::new);
+                            debug_assert!(enc.palette_next.is_some());
+                            0
+                        } else {
+                            mode_idx
+                        };
+                        if mode_idx >= 5 {
+                            // Partition leaves predict chroma with DC/CfL only.
+                            enc.uv_mode = 0;
+                            let midx = coder::encode_luma_leaf_32x32_dir(
+                                enc, &tu, skip2[0], dcs2[0], mode_idx, adelta32, true, pc, lmidx,
+                                amidx,
+                            );
+                            leaf_midx = midx as i32;
+                        } else {
+                            encode_luma_leaf_32x32(enc, &tu, skip2[0], dcs2[0], mode_idx, true, pc);
+                            leaf_midx = midx_class(mode_idx);
+                        }
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 16,
+                                ch: 16,
+                                basis: &bases.luma16x16,
+                                scan: &SCAN16,
+                                eob_cdf: EobCdf::ChrEob256,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 256,
+                                u_skip_row: &SKIP_TX16_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (4, 16) => outline_leaf_420(|| {
+                        // Right-edge 16x64 luma leaf → 4:2:0 chroma 8x32 (TX_8X32,
+                        // coeff 8x32, SCAN8X32, eob 256, ctx-2 SKIP_TX16). Reuses the
+                        // luma8x32 basis (identical 8x32 geometry).
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            16,
+                            64,
+                            neutral,
+                            self.bit_depth as i32,
+                        );
+                        let lev = bases.luma16x64.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
+                                bases.luma16x64.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
+                            &SCAN16X32,
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            16,
+                            64,
+                            &crate::av2::itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN16X32,
+                                16,
+                                64,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            4,
+                            16,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 8,
+                                height: 32,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.luma8x32,
+                                scan: &SCAN8X32,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_16x64(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 8,
+                                ch: 32,
+                                basis: &bases.luma8x32,
+                                scan: &SCAN8X32,
+                                eob_cdf: EobCdf::ChrEob256,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 256,
+                                u_skip_row: &SKIP_TX16_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (16, 4) => outline_leaf_420(|| {
+                        // Bottom-edge 64x16 luma leaf → 4:2:0 chroma 32x8 (TX_32X8,
+                        // coeff 32x8, SCAN32X8, eob 256, ctx-2 SKIP_TX16). Reuses the
+                        // luma32x8 basis.
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            64,
+                            16,
+                            neutral,
+                            self.bit_depth as i32,
+                        );
+                        let lev = bases.luma64x16.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
+                                bases.luma64x16.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
+                            &SCAN32X16,
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            64,
+                            16,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN32X16,
+                                64,
+                                16,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            16,
+                            4,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 32,
+                                height: 8,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.luma32x8,
+                                scan: &SCAN32X8,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_64x16(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 32,
+                                ch: 8,
+                                basis: &bases.luma32x8,
+                                scan: &SCAN32X8,
+                                eob_cdf: EobCdf::ChrEob256,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 256,
+                                u_skip_row: &SKIP_TX16_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (2, 8) => outline_leaf_420(|| {
+                        // Right-edge 8×32 luma leaf (residue-2 width) → 4:2:0 chroma
+                        // 4×16 (TX_4X16, SCAN4X16, eob 64, ctx-1 SKIP_TX8). Luma
+                        // TX_8X32 long-side-32 (min=1 short cdf).
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            8,
+                            32,
+                            neutral,
+                            self.bit_depth as i32,
+                        );
+                        let lev = bases.luma8x32.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
+                                bases.luma8x32.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
+                            &SCAN8X32,
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            8,
+                            32,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN8X32,
+                                8,
+                                32,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            2,
+                            8,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 4,
+                                height: 16,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c4x16,
+                                scan: &tables::SCAN4X16,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_8x32(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 4,
+                                ch: 16,
+                                basis: &bases.c4x16,
+                                scan: &tables::SCAN4X16,
+                                eob_cdf: EobCdf::ChrEob64,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 64,
+                                u_skip_row: &SKIP_TX8_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (8, 2) => outline_leaf_420(|| {
+                        // Bottom-edge 32×8 luma leaf (residue-2 height) → 4:2:0 chroma
+                        // 16×4 (TX_16X4, SCAN16X4, eob 64, ctx-1 SKIP_TX8).
+                        let pred = dc_pred_rect(
                             recy,
                             pw,
                             sb_y,
                             sb_x,
                             32,
-                            32,
-                            true,
-                            true,
-                            bd,
-                            (width, height),
+                            8,
+                            neutral,
+                            self.bit_depth as i32,
                         );
-                        let mut suf = [0f32; 32 * 32];
-                        let mut svf = [0f32; 32 * 32];
-                        cfl_partition_prediction::<32>(pcw, up, vp, cy, cx, &mut suf, &mut svf);
-                        // Chroma DC neighbours stop at the 8-aligned luma extent (AVM
-                        // replicates past it), not at the SB-padded plane.
-                        let crect = BoundedIntraRect {
-                            stride: pcw,
-                            y: cy,
-                            x: cx,
-                            width: 32,
-                            height: 32,
-                            frame_width: ((width + 7) & !7) >> 1,
-                            frame_height: ((height + 7) & !7) >> 1,
-                        };
-                        let dc_u_f = dc_pred_rect_subsampled_bounded(recu, &crect, neutral, bd);
-                        let dc_v_f = dc_pred_rect_subsampled_bounded(recv, &crect, neutral, bd);
-                        cfl::cfl_decide(
-                            &cfl::CflDecisionInput {
-                                reconstructed_luma: recy,
+                        let lev = bases.luma32x8.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
+                                bases.luma32x8.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
+                            &SCAN32X8,
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            32,
+                            8,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN32X8,
+                                32,
+                                8,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            8,
+                            2,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
                                 luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
                                 luma_y: sb_y,
                                 luma_x: sb_x,
-                                source_u: &suf,
-                                source_v: &svf,
-                                dc_u: dc_u_f,
-                                dc_v: dc_v_f,
-                                width: 32,
-                                height: 32,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 16,
+                                height: 4,
                                 subsample_x: true,
                                 subsample_y: true,
-                                luma_average_q3: avg_l,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
                             },
-                            &cfl::ChromaRdSpec {
-                                basis: &bases.chroma420,
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c16x4,
+                                scan: &tables::SCAN16X4,
                                 qstep: sb_qstep,
-                                lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                                bit_depth: bd,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 16,
+                                ch: 4,
+                                basis: &bases.c16x4,
+                                scan: &tables::SCAN16X4,
+                                eob_cdf: EobCdf::ChrEob64,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 64,
+                                u_skip_row: &SKIP_TX8_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
                             },
                         )
-                    } else {
-                        None
-                    };
-                    if capturing {
-                        leaf_recs.push(Leaf420 {
-                            bw_mi: 16,
-                            bh_mi: 16,
-                            tus: tus.to_vec(),
-                            mode_idx,
-                            tx_idx: 0,
-                            recon_y: gather_rect(recy, pw, sb_y, sb_x, 64, 64),
-                            chroma: cfl_choice.clone(),
-                        });
-                        sb_walk_ok = true;
-                    }
-                    cap_idx += 1;
-                    if let Some(ref ch) = cfl_choice {
-                        enc.cfl_use = true;
-                        enc.cfl_js = ch.js;
-                        enc.cfl_mag_u = ch.mag_u;
-                        enc.cfl_mag_v = ch.mag_v;
-                        enc.cfl_ctx_u = ch.ctx_u;
-                        enc.cfl_ctx_v = ch.ctx_v;
-                    }
-                    // Partition path does not evaluate MHCCP; ensure the
-                    // per-block flag is clear so no switch symbol is emitted.
-                    enc.mhccp_allowed = false;
-                    enc.mhccp_use = false;
-                    // Partition leaves predict chroma with DC/CfL only; never emit a
-                    // uv mode left over from an earlier whole-SB mode search.
-                    enc.uv_mode = 0;
-                    encode_luma_block_split(
-                        enc,
-                        &tus,
-                        &skip_cdfs,
-                        &dc_sign_ctxs,
-                        mode_idx,
-                        true,
-                        pc,
-                    );
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 32,
-                            ch: 32,
-                            basis: &bases.chroma420,
-                            scan: &tables::SCAN,
-                            eob_cdf: EobCdf::ChrEobBin,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 1024,
-                            u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: cfl_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (16, 8) => outline_leaf_420(|| {
-                    // 64x32 luma → 32x16 chroma (TX_32X16, eob 512, skip TX32).
-                    let (tus2, mode_idx) = encode_luma_leaf32(
-                        recy,
-                        &LumaSource {
-                            plane: yp,
-                            stride: pw,
-                        },
-                        &LumaGridBlock {
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            y: sb_y,
-                            x: sb_x,
-                        },
-                        &LumaQuantSpec {
-                            basis: &bases.luma,
-                            qstep: sb_qstep,
-                            scan: &tables::SCAN,
-                            neutral,
-                            quant_context: qc,
-                            rdoq_lambda: self.tune.rdoq_lambda,
-                            speed: self.speed,
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    let (skip2, dcs2) =
-                        sb_tu_contexts_64x32(&tus2, sb_y, sb_x, above, left, qc, tmc, tmr);
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 32,
-                            height: 16,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c32x16,
-                            scan: &SCAN32X16,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_64x32(enc, &tus2, &skip2, &dcs2, mode_idx, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 32,
-                            ch: 16,
-                            basis: &bases.c32x16,
-                            scan: &SCAN32X16,
-                            eob_cdf: EobCdf::ChrEob512,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 512,
-                            u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (8, 16) => outline_leaf_420(|| {
-                    // 32x64 luma → 16x32 chroma (TX_16X32, eob 512, skip TX32).
-                    let (tus2, mode_idx) = encode_luma_leaf_v32x64(
-                        recy,
-                        &LumaSource {
-                            plane: yp,
-                            stride: pw,
-                        },
-                        &LumaGridBlock {
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            y: sb_y,
-                            x: sb_x,
-                        },
-                        &LumaQuantSpec {
-                            basis: &bases.luma,
-                            qstep: sb_qstep,
-                            scan: &tables::SCAN,
-                            neutral,
-                            quant_context: qc,
-                            rdoq_lambda: self.tune.rdoq_lambda,
-                            speed: self.speed,
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    let (skip2, dcs2) = sb_tu_contexts_pos(
-                        &[(0, 0), (32, 0)],
-                        &tus2,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                    }),
+                    (4, 8) => outline_leaf_420(|| {
+                        // Bottom-right 16×32 corner leaf (residue-4 width ×
+                        // residue-{6,8} height) → 4:2:0 chroma 8×16 (TX_8X16,
+                        // SCAN8X16, eob class 128, ctx-2 SKIP_TX16). Luma TX_16X32
+                        // is EXT_TX long-side-32 (DCT_DCT via the long32 coder).
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: false,
-                        },
-                    );
-                    let s2 = [skip2[0], skip2[1]];
-                    let d2 = [dcs2[0], dcs2[1]];
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 16,
-                            height: 32,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
+                            16,
+                            32,
                             neutral,
-                            basis: &bases.c16x32,
-                            scan: &SCAN16X32,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_32x64(enc, &tus2, &s2, &d2, mode_idx, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 16,
-                            ch: 32,
-                            basis: &bases.c16x32,
-                            scan: &SCAN16X32,
-                            eob_cdf: EobCdf::ChrEob512,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 512,
-                            u_skip_row: &CHROMA_SKIP_TX32_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (8, 8) => outline_leaf_420(|| {
-                    // 32x32 luma → 16x16 chroma (TX_16X16, eob 256, skip TX16).
-                    let (tu, mode_idx) = encode_luma_leaf_s32x32(
-                        recy,
-                        &LumaSource {
-                            plane: yp,
-                            stride: pw,
-                        },
-                        &LumaGridBlock {
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            y: sb_y,
-                            x: sb_x,
-                        },
-                        &LumaQuantSpec {
-                            basis: &bases.luma,
-                            qstep: sb_qstep,
-                            scan: &tables::SCAN,
-                            neutral,
-                            quant_context: qc,
-                            rdoq_lambda: self.tune.rdoq_lambda,
-                            speed: self.speed,
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    let (skip2, dcs2) = sb_tu_contexts_pos(
-                        &[(0, 0)],
-                        std::slice::from_ref(&tu),
-                        above,
-                        left,
-                        &TxbContextSpec {
-                            sb_y,
-                            sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 16,
-                            height: 16,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.luma16x16,
-                            scan: &SCAN16,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_32x32(enc, &tu, skip2[0], dcs2[0], mode_idx, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 16,
-                            ch: 16,
-                            basis: &bases.luma16x16,
-                            scan: &SCAN16,
-                            eob_cdf: EobCdf::ChrEob256,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 256,
-                            u_skip_row: &SKIP_TX16_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (4, 16) => outline_leaf_420(|| {
-                    // Right-edge 16x64 luma leaf → 4:2:0 chroma 8x32 (TX_8X32,
-                    // coeff 8x32, SCAN8X32, eob 256, ctx-2 SKIP_TX16). Reuses the
-                    // luma8x32 basis (identical 8x32 geometry).
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 16, 64, neutral, self.bit_depth as i32);
-                    let lev = bases.luma16x64.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 16, 64, pred),
-                            bases.luma16x64.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN16X32,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        16,
-                        64,
-                        &crate::av2::itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
+                            self.bit_depth as i32,
+                        );
+                        let lev = bases.luma16x32.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
+                                bases.luma16x32.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
                             &SCAN16X32,
-                            16,
-                            64,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        4,
-                        16,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 8,
-                            height: 32,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.luma8x32,
-                            scan: &SCAN8X32,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_16x64(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 8,
-                            ch: 32,
-                            basis: &bases.luma8x32,
-                            scan: &SCAN8X32,
-                            eob_cdf: EobCdf::ChrEob256,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 256,
-                            u_skip_row: &SKIP_TX16_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (16, 4) => outline_leaf_420(|| {
-                    // Bottom-edge 64x16 luma leaf → 4:2:0 chroma 32x8 (TX_32X8,
-                    // coeff 32x8, SCAN32X8, eob 256, ctx-2 SKIP_TX16). Reuses the
-                    // luma32x8 basis.
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 64, 16, neutral, self.bit_depth as i32);
-                    let lev = bases.luma64x16.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 64, 16, pred),
-                            bases.luma64x16.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN32X16,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        64,
-                        16,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
-                            &SCAN32X16,
-                            64,
                             16,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
-                            sb_y,
-                            sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        16,
-                        4,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 32,
-                            height: 8,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.luma32x8,
-                            scan: &SCAN32X8,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_64x16(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 32,
-                            ch: 8,
-                            basis: &bases.luma32x8,
-                            scan: &SCAN32X8,
-                            eob_cdf: EobCdf::ChrEob256,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 256,
-                            u_skip_row: &SKIP_TX16_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (2, 8) => outline_leaf_420(|| {
-                    // Right-edge 8×32 luma leaf (residue-2 width) → 4:2:0 chroma
-                    // 4×16 (TX_4X16, SCAN4X16, eob 64, ctx-1 SKIP_TX8). Luma
-                    // TX_8X32 long-side-32 (min=1 short cdf).
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 8, 32, neutral, self.bit_depth as i32);
-                    let lev = bases.luma8x32.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 8, 32, pred),
-                            bases.luma8x32.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN8X32,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        8,
-                        32,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
-                            &SCAN8X32,
+                            32,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN16X32,
+                                16,
+                                32,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            4,
                             8,
-                            32,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 8,
+                                height: 16,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c8x16,
+                                scan: &tables::SCAN8X16,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_16x32(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 8,
+                                ch: 16,
+                                basis: &bases.c8x16,
+                                scan: &tables::SCAN8X16,
+                                eob_cdf: EobCdf::ChrEob128,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 128,
+                                u_skip_row: &SKIP_TX16_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (8, 4) => outline_leaf_420(|| {
+                        // Bottom-right 32×16 corner leaf (residue-{6,8} width ×
+                        // residue-4 height) → 4:2:0 chroma 16×8 (TX_16X8, SCAN16X8,
+                        // eob class 128, ctx-2 SKIP_TX16). Luma TX_32X16 long-side-32.
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        2,
-                        8,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 4,
-                            height: 16,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c4x16,
-                            scan: &tables::SCAN4X16,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_8x32(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 4,
-                            ch: 16,
-                            basis: &bases.c4x16,
-                            scan: &tables::SCAN4X16,
-                            eob_cdf: EobCdf::ChrEob64,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 64,
-                            u_skip_row: &SKIP_TX8_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (8, 2) => outline_leaf_420(|| {
-                    // Bottom-edge 32×8 luma leaf (residue-2 height) → 4:2:0 chroma
-                    // 16×4 (TX_16X4, SCAN16X4, eob 64, ctx-1 SKIP_TX8).
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 32, 8, neutral, self.bit_depth as i32);
-                    let lev = bases.luma32x8.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 32, 8, pred),
-                            bases.luma32x8.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN32X8,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        32,
-                        8,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
-                            &SCAN32X8,
                             32,
-                            8,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
-                            sb_y,
-                            sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        8,
-                        2,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 16,
-                            height: 4,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c16x4,
-                            scan: &tables::SCAN16X4,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_32x8(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 16,
-                            ch: 4,
-                            basis: &bases.c16x4,
-                            scan: &tables::SCAN16X4,
-                            eob_cdf: EobCdf::ChrEob64,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 64,
-                            u_skip_row: &SKIP_TX8_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (4, 8) => outline_leaf_420(|| {
-                    // Bottom-right 16×32 corner leaf (residue-4 width ×
-                    // residue-{6,8} height) → 4:2:0 chroma 8×16 (TX_8X16,
-                    // SCAN8X16, eob class 128, ctx-2 SKIP_TX16). Luma TX_16X32
-                    // is EXT_TX long-side-32 (DCT_DCT via the long32 coder).
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 16, 32, neutral, self.bit_depth as i32);
-                    let lev = bases.luma16x32.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 16, 32, pred),
-                            bases.luma16x32.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN16X32,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        16,
-                        32,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
-                            &SCAN16X32,
                             16,
-                            32,
+                            neutral,
                             self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
-                            sb_y,
-                            sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        4,
-                        8,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 8,
-                            height: 16,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c8x16,
-                            scan: &tables::SCAN8X16,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_16x32(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 8,
-                            ch: 16,
-                            basis: &bases.c8x16,
-                            scan: &tables::SCAN8X16,
-                            eob_cdf: EobCdf::ChrEob128,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 128,
-                            u_skip_row: &SKIP_TX16_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (8, 4) => outline_leaf_420(|| {
-                    // Bottom-right 32×16 corner leaf (residue-{6,8} width ×
-                    // residue-4 height) → 4:2:0 chroma 16×8 (TX_16X8, SCAN16X8,
-                    // eob class 128, ctx-2 SKIP_TX16). Luma TX_32X16 long-side-32.
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 32, 16, neutral, self.bit_depth as i32);
-                    let lev = bases.luma32x16.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
-                            bases.luma32x16.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN32X16,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        32,
-                        16,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
+                        );
+                        let lev = bases.luma32x16.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 32, 16, pred),
+                                bases.luma32x16.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
                             &SCAN32X16,
-                            32,
-                            16,
-                            self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        8,
-                        4,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 16,
-                            height: 8,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
+                            32,
+                            16,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &SCAN32X16,
+                                32,
+                                16,
+                                self.bit_depth as i32,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            8,
+                            4,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 16,
+                                height: 8,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c16x8,
+                                scan: &tables::SCAN16X8,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        encode_luma_leaf_32x16(enc, &tu, skip, dcs, 0, true, pc);
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 16,
+                                ch: 8,
+                                basis: &bases.c16x8,
+                                scan: &tables::SCAN16X8,
+                                eob_cdf: EobCdf::ChrEob128,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 128,
+                                u_skip_row: &SKIP_TX16_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (4, 4) => outline_leaf_420(|| {
+                        // Replay pass: code the captured winner, skipping the search.
+                        let forced16 = decide_mode
+                            .replay_leaf()
+                            .map(crate::av2::replay::unpack_leaf_choice);
+                        // Bottom-right 16×16 corner leaf (residue 4 in both dims):
+                        // full-AC TX_16X16 luma with 4-way ADST RD (DCT_DCT /
+                        // ADST_ADST / ADST_DCT / DCT_ADST, DC mode) → 4:2:0 chroma
+                        // 8×8 (TX_8X8, SCAN8X8, eob class 64, skip txs_ctx 1).
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
+                            sb_y,
+                            sb_x,
+                            16,
+                            16,
                             neutral,
-                            basis: &bases.c16x8,
-                            scan: &tables::SCAN16X8,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_32x16(enc, &tu, skip, dcs, 0, true, pc);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 16,
-                            ch: 8,
-                            basis: &bases.c16x8,
-                            scan: &tables::SCAN16X8,
-                            eob_cdf: EobCdf::ChrEob128,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 128,
-                            u_skip_row: &SKIP_TX16_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (4, 4) => outline_leaf_420(|| {
-                    // Bottom-right 16×16 corner leaf (residue 4 in both dims):
-                    // full-AC TX_16X16 luma with 4-way ADST RD (DCT_DCT /
-                    // ADST_ADST / ADST_DCT / DCT_ADST, DC mode) → 4:2:0 chroma
-                    // 8×8 (TX_8X8, SCAN8X8, eob class 64, skip txs_ctx 1).
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 16, 16, neutral, self.bit_depth as i32);
-                    let resid = aq::scale_resid(
-                        &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
-                        bases.luma16x16.qstep as f32 / sb_qstep as f32,
-                    );
-                    let pred_flat = [pred; 256];
-                    let mut src16 = [0f32; 256];
-                    for (dst_row, src_row) in src16
-                        .as_chunks_mut::<16>()
-                        .0
-                        .iter_mut()
-                        .zip(rect_rows(yp, pw, sb_y, sb_x, 16, 16))
-                    {
-                        dst_row.copy_from_slice(src_row);
-                    }
-                    let rate = coeff_rate_f32;
-                    let sse = |rec: &[f32]| -> f32 { tx16_distortion(&src16, rec) };
-                    let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
-                    let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
-                    let rec_dct = itx422::reconstruct_luma16(
-                        &pred_flat,
-                        &lev_dct,
-                        sb_qstep,
-                        &SCAN16,
-                        self.bit_depth as i32,
-                    );
-                    let dist_dct = sse(&rec_dct);
-                    let cost_dct = dist_dct + lambda * rate(&lev_dct);
-                    let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
-                    let rec_adst = itx422::reconstruct_luma16_adst(
-                        &pred_flat,
-                        &lev_adst,
-                        sb_qstep,
-                        &SCAN16,
-                        true,
-                        true,
-                        self.bit_depth as i32,
-                    );
-                    let dist_adst = sse(&rec_adst);
-                    let cost_adst =
-                        dist_adst + lambda * (rate(&lev_adst) + TX16_TYPE_RATE_DELTA[1]);
-                    let lev_ad = bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
-                    let rec_ad = itx422::reconstruct_luma16_adst(
-                        &pred_flat,
-                        &lev_ad,
-                        sb_qstep,
-                        &SCAN16,
-                        false,
-                        true,
-                        self.bit_depth as i32,
-                    );
-                    let dist_ad = sse(&rec_ad);
-                    let cost_ad = dist_ad + lambda * (rate(&lev_ad) + TX16_TYPE_RATE_DELTA[2]);
-                    let lev_da = bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
-                    let rec_da = itx422::reconstruct_luma16_adst(
-                        &pred_flat,
-                        &lev_da,
-                        sb_qstep,
-                        &SCAN16,
-                        true,
-                        false,
-                        self.bit_depth as i32,
-                    );
-                    let dist_da = sse(&rec_da);
-                    let cost_da = dist_da + lambda * (rate(&lev_da) + TX16_TYPE_RATE_DELTA[3]);
-                    let choice = choose_tx16_type(
-                        [cost_dct, cost_adst, cost_ad, cost_da],
-                        [dist_dct, dist_adst, dist_ad, dist_da],
-                        [
+                            self.bit_depth as i32,
+                        );
+                        let resid = aq::scale_resid(
+                            &get_residual_rect(yp, pw, sb_y, sb_x, 16, 16, pred),
+                            bases.luma16x16.qstep as f32 / sb_qstep as f32,
+                        );
+                        let pred_flat = [pred; 256];
+                        let mut src16 = [0f32; 256];
+                        for (dst_row, src_row) in src16
+                            .as_chunks_mut::<16>()
+                            .0
+                            .iter_mut()
+                            .zip(rect_rows(yp, pw, sb_y, sb_x, 16, 16))
+                        {
+                            dst_row.copy_from_slice(src_row);
+                        }
+                        let rate = coeff_rate_f32;
+                        let sse = |rec: &[f32]| -> f32 { tx16_distortion(&src16, rec) };
+                        let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                        let lev_dct = bases.luma16x16.project_scan(&resid, 0.0, &SCAN16);
+                        let rec_dct = itx422::reconstruct_luma16(
+                            &pred_flat,
+                            &lev_dct,
+                            sb_qstep,
+                            &SCAN16,
+                            self.bit_depth as i32,
+                        );
+                        let dist_dct = sse(&rec_dct);
+                        let cost_dct = dist_dct + lambda * rate(&lev_dct);
+                        let lev_adst = bases.luma16x16_adst.project_scan(&resid, 0.0, &SCAN16);
+                        let rec_adst = itx422::reconstruct_luma16_adst(
+                            &pred_flat,
+                            &lev_adst,
+                            sb_qstep,
+                            &SCAN16,
+                            true,
+                            true,
+                            self.bit_depth as i32,
+                        );
+                        let dist_adst = sse(&rec_adst);
+                        let cost_adst =
+                            dist_adst + lambda * (rate(&lev_adst) + TX16_TYPE_RATE_DELTA[1]);
+                        let lev_ad = bases.luma16x16_adst_dct.project_scan(&resid, 0.0, &SCAN16);
+                        let rec_ad = itx422::reconstruct_luma16_adst(
+                            &pred_flat,
+                            &lev_ad,
+                            sb_qstep,
+                            &SCAN16,
                             false,
-                            tx16_dc_only(&lev_adst),
-                            tx16_dc_only(&lev_ad),
-                            tx16_dc_only(&lev_da),
-                        ],
-                    );
-                    let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice {
-                        1 => (&lev_adst, &rec_adst, 1),
-                        2 => (&lev_ad, &rec_ad, 2),
-                        3 => (&lev_da, &rec_da, 3),
-                        _ => (&lev_dct, &rec_dct, 0),
-                    };
-                    put_block_rect(recy, pw, sb_y, sb_x, 16, 16, rec);
-                    let tu: Vec<Coeff> = levels_to_coeffs(lev);
-                    let (_s, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                            true,
+                            self.bit_depth as i32,
+                        );
+                        let dist_ad = sse(&rec_ad);
+                        let cost_ad = dist_ad + lambda * (rate(&lev_ad) + TX16_TYPE_RATE_DELTA[2]);
+                        let lev_da = bases.luma16x16_dct_adst.project_scan(&resid, 0.0, &SCAN16);
+                        let rec_da = itx422::reconstruct_luma16_adst(
+                            &pred_flat,
+                            &lev_da,
+                            sb_qstep,
+                            &SCAN16,
+                            true,
+                            false,
+                            self.bit_depth as i32,
+                        );
+                        let dist_da = sse(&rec_da);
+                        let cost_da = dist_da + lambda * (rate(&lev_da) + TX16_TYPE_RATE_DELTA[3]);
+                        let choice = choose_tx16_type(
+                            [cost_dct, cost_adst, cost_ad, cost_da],
+                            [dist_dct, dist_adst, dist_ad, dist_da],
+                            [
+                                false,
+                                tx16_dc_only(&lev_adst),
+                                tx16_dc_only(&lev_ad),
+                                tx16_dc_only(&lev_da),
+                            ],
+                        );
+                        let (lev, rec, tx_idx): (&[f32], &[f32; 256], usize) = match choice {
+                            1 => (&lev_adst, &rec_adst, 1),
+                            2 => (&lev_ad, &rec_ad, 2),
+                            3 => (&lev_da, &rec_da, 3),
+                            _ => (&lev_dct, &rec_dct, 0),
+                        };
+                        // Every other luma mode: SMOOTH, SMOOTH_V, SMOOTH_H, PAETH and (Slow /
+                        // Medium) the directional modes, each with the four TX_16X16 types —
+                        // at size class 2 av2_md_idx2type maps idx 0..=3 to the same types
+                        // for every intra mode class. Directional (mode, delta) pairs are
+                        // SATD-ranked and only the best few get the full RD.
+                        // Mode bits: flat.
+                        let mb16 = |m: usize| -> f32 {
+                            if m >= 5 {
+                                9.0
+                            } else if m == 0 {
+                                0.0
+                            } else {
+                                6.0
+                            }
+                        };
+                        let mut best_cost =
+                            [cost_dct, cost_adst, cost_ad, cost_da][tx_idx] + lambda * mb16(0);
+                        let mut best: Option<(Vec<f32>, [f32; 256], usize, leaf::SquareLumaMode)> =
+                            None;
+                        if self.still_rd() {
+                            let scale = bases.luma16x16.qstep as f32 / sb_qstep as f32;
+                            let block = leaf::SquareLumaBlock {
+                                stride: pw,
+                                frame_width: width,
+                                frame_height: height,
+                                y: sb_y,
+                                x: sb_x,
+                                size: 16,
+                            };
+                            // Edge-filter type 1 when the above or left block is SMOOTH*.
+                            let smooth_neighbour = (lmr > 0 && midx_above[lmc] == MIDX_SMOOTH)
+                                || (lmc > 0 && midx_left[lmr] == MIDX_SMOOTH);
+                            let refs = std::cell::RefCell::new(leaf::SquareRefCache::default());
+                            let predict = |lm: leaf::SquareLumaMode| -> [f32; 256] {
+                                let mut out = [0f32; 256];
+                                leaf::predict_luma_square_cached(
+                                    &*recy,
+                                    &block,
+                                    &enc.sb_coded,
+                                    lm,
+                                    neutral,
+                                    self.bit_depth as i32,
+                                    &mut refs.borrow_mut(),
+                                    &mut out,
+                                );
+                                out
+                            };
+                            let mut cands: Vec<leaf::SquareLumaMode> =
+                                (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
+                            let dir_keep = 3;
+                            if let Some((m, d, _)) = forced16 {
+                                cands = match m {
+                                    0 | crate::av2::palette::PAL_MODE => Vec::new(),
+                                    1..=4 => vec![leaf::SquareLumaMode::nondir(m)],
+                                    _ => vec![leaf::SquareLumaMode {
+                                        mode: m,
+                                        angle_delta: d,
+                                        smooth_neighbour,
+                                    }],
+                                };
+                            } else if dir_keep > 0 && self.speed.try_directional() {
+                                let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
+                                    mode,
+                                    angle_delta,
+                                    smooth_neighbour,
+                                };
+                                let picked = leaf::screen_directional(
+                                    dir_keep,
+                                    self.speed.try_angle_deltas(),
+                                    2,
+                                    |m, d| {
+                                        crate::av2::metrics::satd_f32(
+                                            &src16,
+                                            16,
+                                            &predict(dir_lm(m, d)),
+                                            16,
+                                            16,
+                                            16,
+                                        )
+                                    },
+                                );
+                                cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
+                            }
+                            // Unified SATD prune (`prk16` SATD-best candidates), as the 8x8 leaf.
+                            let prk16 = 2;
+                            if forced16.is_none() && cands.len() > prk16 {
+                                let mut ranked: Vec<(u64, leaf::SquareLumaMode)> = cands
+                                    .iter()
+                                    .map(|&lm| {
+                                        (
+                                            crate::av2::metrics::satd_f32(
+                                                &src16,
+                                                16,
+                                                &predict(lm),
+                                                16,
+                                                16,
+                                                16,
+                                            ),
+                                            lm,
+                                        )
+                                    })
+                                    .collect();
+                                ranked.sort_by_key(|&(sc, _)| sc);
+                                cands = ranked.into_iter().take(prk16).map(|(_, lm)| lm).collect();
+                            }
+                            // DCT only for every candidate, then the ADST types for
+                            // the DCT-best candidate alone.
+                            let tx16w = forced16.is_none();
+                            let n_first = cands.len();
+                            let mut order: Vec<(leaf::SquareLumaMode, bool)> =
+                                cands.into_iter().map(|lm| (lm, !tx16w)).collect();
+                            let mut dct_best: Option<(f32, leaf::SquareLumaMode)> = None;
+                            let mut k = 0;
+                            while k < order.len() {
+                                let (lm, all_tx) = order[k];
+                                let second = k >= n_first;
+                                k += 1;
+                                let pred_m = predict(lm);
+                                let resid_m: Vec<f32> = src16
+                                    .iter()
+                                    .zip(&pred_m)
+                                    .map(|(&s, &q)| (s - q) * scale)
+                                    .collect();
+                                for (tx, &tx_delta) in TX16_TYPE_RATE_DELTA.iter().enumerate() {
+                                    if forced16.is_some_and(|(_, _, ft)| ft != tx) {
+                                        continue;
+                                    }
+                                    if (!all_tx && tx > 0) || (second && tx == 0) {
+                                        continue;
+                                    }
+                                    let (basis, flips) = match tx {
+                                        0 => (&bases.luma16x16, (false, false)),
+                                        1 => (&bases.luma16x16_adst, (true, true)),
+                                        2 => (&bases.luma16x16_adst_dct, (false, true)),
+                                        _ => (&bases.luma16x16_dct_adst, (true, false)),
+                                    };
+                                    let lev_m = basis.project_scan(&resid_m, 0.0, &SCAN16);
+                                    if tx > 0 && tx16_dc_only(&lev_m) {
+                                        continue;
+                                    }
+                                    let rec_m = if tx == 0 {
+                                        itx422::reconstruct_luma16(
+                                            &pred_m,
+                                            &lev_m,
+                                            sb_qstep,
+                                            &SCAN16,
+                                            self.bit_depth as i32,
+                                        )
+                                    } else {
+                                        itx422::reconstruct_luma16_adst(
+                                            &pred_m,
+                                            &lev_m,
+                                            sb_qstep,
+                                            &SCAN16,
+                                            flips.0,
+                                            flips.1,
+                                            self.bit_depth as i32,
+                                        )
+                                    };
+                                    let cost = crate::av2::rd::rd_cost(
+                                        sse(&rec_m),
+                                        rate(&lev_m) + tx_delta + mb16(lm.mode),
+                                        lambda,
+                                    );
+                                    if tx == 0 && dct_best.is_none_or(|(c, _)| cost < c) {
+                                        dct_best = Some((cost, lm));
+                                    }
+                                    if cost < best_cost {
+                                        best_cost = cost;
+                                        best = Some((lev_m, rec_m, tx, lm));
+                                    }
+                                }
+                                if tx16w
+                                    && k == n_first
+                                    && let Some((_, blm)) = dct_best
+                                {
+                                    order.push((blm, true));
+                                }
+                            }
+                        }
+                        // Screen content: the DC-predicted palette joins the RD (its
+                        // syntax bits replace the mode bits). A replayed palette leaf
+                        // re-derives the same palette from the source.
+                        let mut best_pal: Option<crate::av2::palette::Palette> = None;
+                        let pal_forced =
+                            forced16.is_some_and(|(m, _, _)| m == crate::av2::palette::PAL_MODE);
+                        if enc.sct
+                            && sb_y + 16 <= height
+                            && sb_x + 16 <= width
+                            && forced16.is_none_or(|(m, _, _)| m == crate::av2::palette::PAL_MODE)
+                        {
+                            let lambda_p =
+                                leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                            if let Some(pal) = crate::av2::palette::search(
+                                &src16,
+                                16,
+                                16,
+                                self.bit_depth as u32,
+                                lambda_p,
+                            ) {
+                                let mut pred_m = [0f32; 256];
+                                pred_m.copy_from_slice(&pal.pred());
+                                let scale = bases.luma16x16.qstep as f32 / sb_qstep as f32;
+                                let resid_m: Vec<f32> = src16
+                                    .iter()
+                                    .zip(&pred_m)
+                                    .map(|(&s, &q)| (s - q) * scale)
+                                    .collect();
+                                if pal_forced {
+                                    best_cost = f32::INFINITY;
+                                }
+                                for (tx, &tx_delta) in TX16_TYPE_RATE_DELTA.iter().enumerate() {
+                                    if forced16.is_some_and(|(_, _, ft)| ft != tx) {
+                                        continue;
+                                    }
+                                    let (basis, flips) = match tx {
+                                        0 => (&bases.luma16x16, (false, false)),
+                                        1 => (&bases.luma16x16_adst, (true, true)),
+                                        2 => (&bases.luma16x16_adst_dct, (false, true)),
+                                        _ => (&bases.luma16x16_dct_adst, (true, false)),
+                                    };
+                                    let lev_m = basis.project_scan(&resid_m, 0.0, &SCAN16);
+                                    if tx > 0 && tx16_dc_only(&lev_m) {
+                                        continue;
+                                    }
+                                    let rec_m = if tx == 0 {
+                                        itx422::reconstruct_luma16(
+                                            &pred_m,
+                                            &lev_m,
+                                            sb_qstep,
+                                            &SCAN16,
+                                            self.bit_depth as i32,
+                                        )
+                                    } else {
+                                        itx422::reconstruct_luma16_adst(
+                                            &pred_m,
+                                            &lev_m,
+                                            sb_qstep,
+                                            &SCAN16,
+                                            flips.0,
+                                            flips.1,
+                                            self.bit_depth as i32,
+                                        )
+                                    };
+                                    let cost = crate::av2::rd::rd_cost(
+                                        sse(&rec_m),
+                                        rate(&lev_m) + tx_delta + pal.bits,
+                                        lambda_p,
+                                    );
+                                    if cost < best_cost {
+                                        best_cost = cost;
+                                        best = Some((
+                                            lev_m,
+                                            rec_m,
+                                            tx,
+                                            leaf::SquareLumaMode::nondir(0),
+                                        ));
+                                        best_pal = Some(pal.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let (lev, rec, tx_idx, mode16) = match &best {
+                            Some((l, r, t, lm)) => (&l[..], r, *t, *lm),
+                            None => (lev, rec, tx_idx, leaf::SquareLumaMode::nondir(0)),
+                        };
+                        decide_mode.capture_leaf(crate::av2::replay::leaf_choice(
+                            if best_pal.is_some() {
+                                crate::av2::palette::PAL_MODE
+                            } else {
+                                mode16.mode
+                            },
+                            mode16.angle_delta,
+                            tx_idx,
+                        ));
+                        enc.palette_next = best_pal.map(Box::new);
+                        put_block_rect(recy, pw, sb_y, sb_x, 16, 16, rec);
+                        let tu: Vec<Coeff> = levels_to_coeffs(lev);
+                        let (_s, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            4,
+                            4,
+                        );
+                        let skip = SKIP_TX16_QC[qc][0] as u32;
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 8,
+                                height: 8,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c8x8,
+                                scan: &SCAN8X8,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        if mode16.mode >= 5 {
+                            // Partition leaves predict chroma with DC/CfL only.
+                            enc.uv_mode = 0;
+                            let midx = coder::encode_luma_leaf_16x16_dir(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                mode16.mode,
+                                mode16.angle_delta as i8,
+                                true,
+                                pc,
+                                11074,
+                                tx_idx,
+                                lmidx,
+                                amidx,
+                            );
+                            leaf_midx = midx as i32;
+                        } else {
+                            encode_luma_leaf_16x16_full(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                mode16.mode,
+                                true,
+                                pc,
+                                11074,
+                                tx_idx,
+                            );
+                            leaf_midx = midx_class(mode16.mode);
+                        }
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 8,
+                                ch: 8,
+                                basis: &bases.c8x8,
+                                scan: &SCAN8X8,
+                                eob_cdf: EobCdf::ChrEob64,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 64,
+                                u_skip_row: &SKIP_TX8_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (2, 2) => outline_leaf_420(|| {
+                        // Bottom-right 8×8 corner leaf (residue-2 both axes), TX_8X8 ctx-1.
+                        // Luma TX_8X8 (szctx=1, do_part_cdf=3148, ext-tx txtp_ext(min=1)
+                        // DCT_DCT idx 0); 4:2:0 chroma is one 4×4 (TX_4X4) TU per plane.
+                        let pred = dc_pred_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        4,
-                        4,
-                    );
-                    let skip = SKIP_TX16_QC[qc][0] as u32;
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 8,
-                            height: 8,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
+                            8,
+                            8,
                             neutral,
-                            basis: &bases.c8x8,
-                            scan: &SCAN8X8,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    encode_luma_leaf_16x16_full(enc, &tu, skip, dcs, 0, true, pc, 11074, tx_idx);
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 8,
-                            ch: 8,
-                            basis: &bases.c8x8,
-                            scan: &SCAN8X8,
-                            eob_cdf: EobCdf::ChrEob64,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 64,
-                            u_skip_row: &SKIP_TX8_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (2, 2) => outline_leaf_420(|| {
-                    // Bottom-right 8×8 corner leaf (residue-2 both axes), TX_8X8 ctx-1.
-                    // Luma TX_8X8 (szctx=1, do_part_cdf=3148, ext-tx txtp_ext(min=1)
-                    // DCT_DCT idx 0); 4:2:0 chroma is one 4×4 (TX_4X4) TU per plane.
-                    let pred =
-                        dc_pred_rect(recy, pw, sb_y, sb_x, 8, 8, neutral, self.bit_depth as i32);
-                    let lev = bases.c8x8.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
-                            bases.c8x8.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN8X8,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        8,
-                        8,
-                        &itx422::reconstruct_chroma(
+                            self.bit_depth as i32,
+                        );
+                        let scale8 = bases.c8x8.qstep as f32 / sb_qstep as f32;
+                        let mut lev = bases.c8x8.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 8, pred),
+                                scale8,
+                            ),
+                            0.0,
+                            &SCAN8X8,
+                        );
+                        let mut rec8 = itx422::reconstruct_chroma(
                             pred,
                             &lev,
                             sb_qstep,
@@ -4946,378 +6772,785 @@ impl Av2Encoder {
                             8,
                             8,
                             self.bit_depth as i32,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
-                            sb_y,
-                            sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        2,
-                        2,
-                    );
-                    encode_luma_leaf_8x8(
-                        enc,
-                        &tu,
-                        skip,
-                        dcs,
-                        0,
-                        true,
-                        pc,
-                        3148,
-                        Some((&coder::TXTP_EXT8, 0, 6)),
-                    );
-                    use crate::av2::coder::{
-                        SCAN4X4_LOSSY, SCAN4X4_LOSSY_PACKED, encode_chroma_tu4_scan,
-                    };
-                    let bd = self.bit_depth as i32;
-                    let predu = dc_pred_rect(recu, pcw, cy, cx, 4, 4, neutral, bd);
-                    let levu = bases.c4x4.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(up, pcw, cy, cx, 4, 4, predu),
-                            bases.c4x4.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN4X4_LOSSY_PACKED,
-                    );
-                    put_block_rect(
-                        recu,
-                        pcw,
-                        cy,
-                        cx,
-                        4,
-                        4,
-                        &itx422::reconstruct_chroma(
-                            predu,
-                            &levu,
-                            sb_qstep,
-                            &SCAN4X4_LOSSY_PACKED,
-                            4,
-                            4,
-                            bd,
-                        ),
-                    );
-                    let uc = levels_to_coeffs(&levu);
-                    let u_ctx = (6 + ua + ul) as usize;
-                    let u_skip = cdfs_qctx::SKIP_TX4_QC[enc.qc][u_ctx] as u32;
-                    encode_chroma_tu4_scan(enc, &uc, u_skip, false, &SCAN4X4_LOSSY, u_ctx);
-                    let u_nz = uc.iter().any(|&(_, l)| l != 0);
-                    let predv = dc_pred_rect(recv, pcw, cy, cx, 4, 4, neutral, bd);
-                    let levv = bases.c4x4.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(vp, pcw, cy, cx, 4, 4, predv),
-                            bases.c4x4.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &SCAN4X4_LOSSY_PACKED,
-                    );
-                    put_block_rect(
-                        recv,
-                        pcw,
-                        cy,
-                        cx,
-                        4,
-                        4,
-                        &itx422::reconstruct_chroma(
-                            predv,
-                            &levv,
-                            sb_qstep,
-                            &SCAN4X4_LOSSY_PACKED,
-                            4,
-                            4,
-                            bd,
-                        ),
-                    );
-                    let vc = levels_to_coeffs(&levv);
-                    let v_ctx = (6 * (u_nz as i32) + va + vl) as usize;
-                    let v_skip = v_ctx as u32;
-                    encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
-                    (u_nz, vc.iter().any(|&(_, l)| l != 0))
-                }),
-                (2, 4) => outline_leaf_420(|| {
-                    // residue-2 width × residue-4 height corner: 8×16 luma
-                    // (TX_8X16) + 4×8 chroma per plane (4:2:0).
-                    let bd = self.bit_depth as i32;
-                    let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
-                    let lev = bases.c8x16.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
-                            bases.c8x16.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &tables::SCAN8X16,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        8,
-                        16,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
+                        );
+                        // Non-directional luma modes (DCT only: the 8x8 leaf codes tx index 0).
+                        let mut mode8 = 0usize;
+                        let mut adelta8 = 0i32;
+                        let mut tx8 = 0usize;
+                        if self.still_rd() {
+                            let lambda =
+                                leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+
+                            let mb8 = |m: usize| -> f32 { if m == 0 { 0.0 } else { 6.0 } };
+                            let mut src8 = [0f32; 64];
+                            for (d, &v) in src8
+                                .iter_mut()
+                                .zip(rect_rows(yp, pw, sb_y, sb_x, 8, 8).flatten())
+                            {
+                                *d = v;
+                            }
+                            let sse8 = |rec: &[f32]| -> f32 {
+                                crate::av2::helpers::dist_rounded(&src8, 8, rec, 8, 8, 8)
+                            };
+                            let mut best_cost = crate::av2::rd::rd_cost(
+                                sse8(&rec8),
+                                coeff_rate_f32(&lev) + mb8(0),
+                                lambda,
+                            );
+                            let block = leaf::SquareLumaBlock {
+                                stride: pw,
+                                frame_width: width,
+                                frame_height: height,
+                                y: sb_y,
+                                x: sb_x,
+                                size: 8,
+                            };
+                            let smooth_neighbour = (lmr > 0 && midx_above[lmc] == MIDX_SMOOTH)
+                                || (lmc > 0 && midx_left[lmr] == MIDX_SMOOTH);
+                            let refs = std::cell::RefCell::new(leaf::SquareRefCache::default());
+                            let predict = |lm: leaf::SquareLumaMode| -> [f32; 64] {
+                                let mut out = [0f32; 64];
+                                leaf::predict_luma_square_cached(
+                                    &*recy,
+                                    &block,
+                                    &enc.sb_coded,
+                                    lm,
+                                    neutral,
+                                    self.bit_depth as i32,
+                                    &mut refs.borrow_mut(),
+                                    &mut out,
+                                );
+                                out
+                            };
+                            let mut cands: Vec<leaf::SquareLumaMode> =
+                                (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
+                            // Directional modes: SATD-ranked (mode, delta) pairs, best few
+                            // get the full RD (as the 16x16 leaf).
+                            let dir_keep = 3;
+                            if dir_keep > 0 && self.speed.try_directional() {
+                                let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
+                                    mode,
+                                    angle_delta,
+                                    smooth_neighbour,
+                                };
+                                let satd = |m: usize, d: i32| {
+                                    crate::av2::metrics::satd_f32(
+                                        &src8,
+                                        8,
+                                        &predict(dir_lm(m, d)),
+                                        8,
+                                        8,
+                                        8,
+                                    )
+                                };
+                                // Reuse: the probe's picks for this block (screened against
+                                // the probe's recon) join a light re-screen of the 8 base
+                                // angles, ranked on the real recon (mode 2), or replace
+                                // the screen outright (mode 1).
+                                let reuse = 1;
+                                let probe = luma_partition
+                                    .dir8_at(sb_y - row * 64, sb_x - col * 64)
+                                    .filter(|_| reuse > 0);
+                                let picked = match probe {
+                                    Some(p) if reuse == 1 => p,
+                                    Some(p) => {
+                                        let mut ranked: Vec<(u64, (usize, i32))> =
+                                            (5..=12usize).map(|m| (satd(m, 0), (m, 0))).collect();
+                                        for md in p {
+                                            if md.1 != 0 {
+                                                ranked.push((satd(md.0, md.1), md));
+                                            }
+                                        }
+                                        ranked.sort_by_key(|&(c, _)| c);
+                                        ranked
+                                            .into_iter()
+                                            .take(dir_keep)
+                                            .map(|(_, md)| md)
+                                            .collect()
+                                    }
+                                    None => leaf::screen_directional(
+                                        dir_keep,
+                                        self.speed.try_angle_deltas(),
+                                        2,
+                                        satd,
+                                    ),
+                                };
+                                cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
+                            }
+                            // Unified SATD prune: only the `prk8` SATD-best non-DC
+                            // candidates get the full RD.
+                            let prk8 = 2;
+                            if cands.len() > prk8 {
+                                let mut ranked: Vec<(u64, leaf::SquareLumaMode)> = cands
+                                    .iter()
+                                    .map(|&lm| {
+                                        (
+                                            crate::av2::metrics::satd_f32(
+                                                &src8,
+                                                8,
+                                                &predict(lm),
+                                                8,
+                                                8,
+                                                8,
+                                            ),
+                                            lm,
+                                        )
+                                    })
+                                    .collect();
+                                ranked.sort_by_key(|&(sc, _)| sc);
+                                cands = ranked.into_iter().take(prk8).map(|(_, lm)| lm).collect();
+                            }
+                            // TX_8X8 types idx 0..=3 (DCT, ADST_ADST, ADST_DCT, DCT_ADST: the
+                            // same for every intra mode class at this size).
+                            use crate::av2::itx::{Tx1d, TxClass, txtp};
+                            let n_tx = 1;
+                            let tx8_basis = |col_adst: bool, row_adst: bool| {
+                                let mut b = bases.c8x8.clone();
+                                b.fwd = crate::av2::fdct::FwdKind::Tx8 { col_adst, row_adst };
+                                b
+                            };
+                            let bases8 = [
+                                bases.c8x8.clone(),
+                                tx8_basis(true, true),
+                                tx8_basis(true, false),
+                                tx8_basis(false, true),
+                            ];
+                            let txtp8 = [
+                                0,
+                                txtp(Tx1d::Adst, Tx1d::Adst, TxClass::TwoD),
+                                txtp(Tx1d::Dct, Tx1d::Adst, TxClass::TwoD),
+                                txtp(Tx1d::Adst, Tx1d::Dct, TxClass::TwoD),
+                            ];
+                            let mb_dir = 9.0;
+                            let dc_lm = leaf::SquareLumaMode::nondir(0);
+                            let (mut lev_m, mut rec_m) = (Vec::new(), Vec::new());
+                            for lm in std::iter::once(dc_lm).chain(cands) {
+                                let p = if lm.mode == 0 {
+                                    [pred; 64]
+                                } else {
+                                    predict(lm)
+                                };
+                                let mut resid = [0f32; 64];
+                                let mut p_i = [0i32; 64];
+                                for (((r, pi), &s), &q) in
+                                    resid.iter_mut().zip(&mut p_i).zip(&src8).zip(&p)
+                                {
+                                    *r = (s - q) * scale8;
+                                    *pi = q as i32;
+                                }
+                                let mbits = if lm.mode >= 5 { mb_dir } else { mb8(lm.mode) };
+                                for tx in 0..n_tx {
+                                    // DC + DCT_DCT is the starting point above.
+                                    if lm.mode == 0 && tx == 0 {
+                                        continue;
+                                    }
+                                    bases8[tx].project_scan_into(&resid, 0.0, &SCAN8X8, &mut lev_m);
+                                    if tx > 0 && tx16_dc_only(&lev_m) {
+                                        continue;
+                                    }
+                                    rec_m.resize(64, 0.0);
+                                    itx422::reconstruct_chroma_pred_tx_into(
+                                        &p_i,
+                                        &lev_m,
+                                        sb_qstep,
+                                        &SCAN8X8,
+                                        8,
+                                        8,
+                                        self.bit_depth as i32,
+                                        txtp8[tx],
+                                        &mut rec_m,
+                                    );
+                                    let cost = crate::av2::rd::rd_cost(
+                                        sse8(&rec_m),
+                                        coeff_rate_f32(&lev_m) + mbits + TX16_TYPE_RATE_DELTA[tx],
+                                        lambda,
+                                    );
+                                    if cost < best_cost {
+                                        best_cost = cost;
+                                        std::mem::swap(&mut lev, &mut lev_m);
+                                        std::mem::swap(&mut rec8, &mut rec_m);
+                                        mode8 = lm.mode;
+                                        adelta8 = lm.angle_delta;
+                                        tx8 = tx;
+                                    }
+                                }
+                            }
+                        }
+                        put_block_rect(recy, pw, sb_y, sb_x, 8, 8, &rec8);
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            2,
+                            2,
+                        );
+                        use crate::av2::coder::{
+                            SCAN4X4_LOSSY, SCAN4X4_LOSSY_PACKED, encode_chroma_tu4_scan,
+                        };
+                        // 4x4 chroma: DC or classic CfL (MHCCP is not allowed for 4x4 chroma),
+                        // scored on the real 4x4 coding. Decided before the luma emit because
+                        // is_cfl / the alphas are written with the mode info.
+                        let bd = self.bit_depth as i32;
+                        let scale4 = bases.c4x4.qstep as f32 / sb_qstep as f32;
+                        let dc_u = dc_pred_rect(recu, pcw, cy, cx, 4, 4, neutral, bd);
+                        let dc_v = dc_pred_rect(recv, pcw, cy, cx, 4, 4, neutral, bd);
+                        let src4 = |plane: &[f32]| -> [f32; 16] {
+                            let mut out = [0f32; 16];
+                            for (d, &v) in out
+                                .iter_mut()
+                                .zip(rect_rows(plane, pcw, cy, cx, 4, 4).flatten())
+                            {
+                                *d = v;
+                            }
+                            out
+                        };
+                        let (su4, sv4) = (src4(up), src4(vp));
+                        let rq4 = if self.still_rd() {
+                            self.tune.chroma_rdoq_lambda
+                        } else {
+                            0.0
+                        };
+                        // The decoder derives the 4x4 chroma tx type from the uv mode (avm
+                        // intra_mode_to_tx_type): 0 DCT_DCT, 1 ADST_ADST, 2 ADST_DCT (vertical
+                        // ADST), 3 DCT_ADST (horizontal ADST).
+                        use crate::av2::itx::{Tx1d, TxClass, txtp};
+                        let uv_tx = |m: usize| -> usize {
+                            match m {
+                                1 | 4 => 1,
+                                2 | 5 => 2,
+                                3 | 6 => 3,
+                                _ => 0,
+                            }
+                        };
+                        let tx4_basis = |col_adst: bool, row_adst: bool| {
+                            let mut b = bases.c4x4.clone();
+                            b.fwd = crate::av2::fdct::FwdKind::Tx4 { col_adst, row_adst };
+                            b
+                        };
+                        let bases4 = [
+                            bases.c4x4.clone(),
+                            tx4_basis(true, true),
+                            tx4_basis(true, false),
+                            tx4_basis(false, true),
+                        ];
+                        let txtp4 = [
+                            0,
+                            txtp(Tx1d::Adst, Tx1d::Adst, TxClass::TwoD),
+                            txtp(Tx1d::Dct, Tx1d::Adst, TxClass::TwoD),
+                            txtp(Tx1d::Adst, Tx1d::Dct, TxClass::TwoD),
+                        ];
+                        // (levels, recon) of one 4x4 chroma TU against a per-pixel predictor.
+                        let code4 = |src: &[f32],
+                                     pred: &[i32],
+                                     voff: usize,
+                                     ti: usize,
+                                     lev: &mut Vec<f32>| {
+                            let mut resid = [0f32; 16];
+                            for ((r, &s), &q) in resid.iter_mut().zip(src).zip(pred) {
+                                *r = (s - q as f32) * scale4;
+                            }
+                            chroma422::project_chroma_rdoq_into(
+                                &bases4[ti],
+                                &resid,
+                                &SCAN4X4_LOSSY_PACKED,
+                                qc,
+                                16,
+                                voff,
+                                rq4,
+                                lev,
+                            );
+                            let mut rec = [0f32; 16];
+                            itx422::reconstruct_chroma_pred_tx_into(
+                                pred,
+                                lev,
+                                sb_qstep,
+                                &SCAN4X4_LOSSY_PACKED,
+                                4,
+                                4,
+                                bd,
+                                txtp4[ti],
+                                &mut rec,
+                            );
+                            rec
+                        };
+                        let lambda4 = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
+                        // RD cost of coding both 4x4 planes against (U, V) predictors.
+                        let lev_scratch = std::cell::RefCell::new(Vec::new());
+                        let j = |preds: [&[i32]; 2], extra_bits: f32, ti: usize| -> f32 {
+                            let mut j = lambda4 * extra_bits;
+                            for (src, pred, voff) in [(&su4, preds[0], 0), (&sv4, preds[1], 4)] {
+                                let lev = &mut *lev_scratch.borrow_mut();
+                                let rec = code4(src, pred, voff, ti, lev);
+                                let d =
+                                    crate::av2::helpers::dist_rounded(&src[..], 4, &rec, 4, 4, 4);
+                                j += crate::av2::rd::rd_cost(d, coeff_rate_f32(lev), lambda4);
+                            }
+                            j
+                        };
+                        let (dcu, dcv) = (dc_u.round() as i32, dc_v.round() as i32);
+                        // UV intra mode (SMOOTH*, PAETH, V/H) against DC. The 4x4 block's
+                        // top-right / bottom-left follow the co-located 8x8 luma block's
+                        // availability, halved. Diagonal modes are left out: their edge filter
+                        // depends on the neighbours' uv_mode, which is not tracked.
+                        enc.uv_mode = 0;
+                        let mut pred_uv: ([i32; 16], [i32; 16]) = ([dcu; 16], [dcv; 16]);
+                        let mut tx_i = 0usize;
+                        let mut best_j = f32::INFINITY;
+                        if self.still_rd() && self.tune.chroma_mode_search && !enc.sdp_luma {
+                            let edges4 = {
+                                let (tr, bl) = leaf::square_edge_px(
+                                    &leaf::SquareLumaBlock {
+                                        stride: pw,
+                                        frame_width: width,
+                                        frame_height: height,
+                                        y: sb_y,
+                                        x: sb_x,
+                                        size: 8,
+                                    },
+                                    &enc.sb_coded,
+                                    true,
+                                    true,
+                                );
+                                (tr / 2, bl / 2)
+                            };
+                            best_j = j([&pred_uv.0, &pred_uv.1], 0.0, 0);
+                            let modes: &[usize] = if self.speed.reduced_modes() {
+                                &[1, 4, 5, 6]
+                            } else {
+                                &[1, 2, 3, 4, 5, 6]
+                            };
+                            let pred4 = |m: usize, rec: &[f32]| -> [i32; 16] {
+                                let mut pf = [0f32; 16];
+                                chroma422::predict_chroma_sq_into(
+                                    rec,
+                                    pcw,
+                                    cy,
+                                    cx,
+                                    4,
+                                    m,
+                                    neutral,
+                                    mhccp_bounds.chroma_width,
+                                    mhccp_bounds.chroma_height,
+                                    Some(edges4),
+                                    &mut pf,
+                                );
+                                pf.map(|p| (p + 0.5) as i32)
+                            };
+                            for &m in modes {
+                                let pred = |rec: &[f32]| pred4(m, rec);
+                                let (pu, pv) = (pred(&*recu), pred(&*recv));
+                                let c = j([&pu, &pv], 2.0, uv_tx(m));
+                                if c < best_j {
+                                    best_j = c;
+                                    enc.uv_mode = m;
+                                    tx_i = uv_tx(m);
+                                    pred_uv = (pu, pv);
+                                }
+                            }
+                        }
+                        if enc.cfl && self.still_rd() && !enc.sdp_luma {
+                            let luma: Vec<i32> = rect_rows(recy, pw, sb_y, sb_x, 8, 8)
+                                .flatten()
+                                .map(|&v| v.round() as i32)
+                                .collect();
+                            let luma_q3 = cfl::subsample_luma_q3(&luma, 8, 4, 4, true, true);
+                            let avg_l = cfl::cfl_avg_l(
+                                recy,
+                                pw,
+                                sb_y,
+                                sb_x,
+                                4,
+                                4,
+                                true,
+                                true,
+                                bd,
+                                (width, height),
+                            );
+                            let ac: Vec<i32> = luma_q3.iter().map(|&q| q - avg_l).collect();
+                            let to_i = |v: &[f32]| -> Vec<i32> {
+                                v.iter().map(|&x| x.round() as i32).collect()
+                            };
+                            if let Some(c) =
+                                cfl::cfl_candidate(&to_i(&su4), &to_i(&sv4), &ac, dcu, dcv, bd)
+                            {
+                                let alpha_bits = 2.0
+                                    + 3.0
+                                    + if c.sign_u != 0 { 3.0 } else { 0.0 }
+                                    + if c.sign_v != 0 { 3.0 } else { 0.0 };
+                                if !best_j.is_finite() {
+                                    best_j = j([&pred_uv.0, &pred_uv.1], 0.0, 0);
+                                }
+                                // CfL is uv_mode UV_CFL: DC_PRED's tx type (DCT_DCT).
+                                if j([&c.pred_u, &c.pred_v], alpha_bits, 0) < best_j {
+                                    enc.cfl_use = true;
+                                    enc.cfl_js = c.js;
+                                    enc.cfl_mag_u = c.mag_u;
+                                    enc.cfl_mag_v = c.mag_v;
+                                    enc.cfl_ctx_u = c.ctx_u;
+                                    enc.cfl_ctx_v = c.ctx_v;
+                                    enc.uv_mode = 0;
+                                    tx_i = 0;
+                                    pred_uv.0.copy_from_slice(&c.pred_u);
+                                    pred_uv.1.copy_from_slice(&c.pred_v);
+                                }
+                            }
+                        }
+                        if mode8 >= 5 {
+                            leaf_midx = coder::encode_luma_leaf_8x8_dir(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                (mode8, adelta8 as i8),
+                                true,
+                                pc,
+                                3148,
+                                Some((&coder::TXTP_EXT8, tx8, 6)),
+                                (lmidx, amidx),
+                            ) as i32;
+                        } else {
+                            encode_luma_leaf_8x8(
+                                enc,
+                                &tu,
+                                skip,
+                                dcs,
+                                mode8,
+                                true,
+                                pc,
+                                3148,
+                                Some((&coder::TXTP_EXT8, tx8, 6)),
+                            );
+                            leaf_midx = midx_class(mode8);
+                        }
+                        // Other 4:2:0 leaves emit `enc.uv_mode` as is and expect DC.
+                        enc.uv_mode = 0;
+                        let mut levu = Vec::new();
+                        let recu4 = code4(&su4, &pred_uv.0, 0, tx_i, &mut levu);
+                        put_block_rect(recu, pcw, cy, cx, 4, 4, &recu4);
+                        let uc = levels_to_coeffs(&levu);
+                        let u_ctx = (6 + ua + ul) as usize;
+                        let u_skip = cdfs_qctx::SKIP_TX4_QC[enc.qc][u_ctx] as u32;
+                        encode_chroma_tu4_scan(enc, &uc, u_skip, false, &SCAN4X4_LOSSY, u_ctx);
+                        let u_nz = uc.iter().any(|&(_, l)| l != 0);
+                        let mut levv = Vec::new();
+                        let recv4 = code4(&sv4, &pred_uv.1, 4, tx_i, &mut levv);
+                        put_block_rect(recv, pcw, cy, cx, 4, 4, &recv4);
+                        let vc = levels_to_coeffs(&levv);
+                        let v_ctx = (6 * (u_nz as i32) + va + vl) as usize;
+                        let v_skip = v_ctx as u32;
+                        encode_chroma_tu4_scan(enc, &vc, v_skip, true, &SCAN4X4_LOSSY, v_ctx);
+                        (u_nz, vc.iter().any(|&(_, l)| l != 0))
+                    }),
+                    (2, 4) => outline_leaf_420(|| {
+                        // residue-2 width × residue-4 height corner: 8×16 luma
+                        // (TX_8X16) + 4×8 chroma per plane (4:2:0).
+                        let bd = self.bit_depth as i32;
+                        let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 8, 16, neutral, bd);
+                        let lev = bases.c8x16.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 8, 16, pred),
+                                bases.c8x16.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
                             &tables::SCAN8X16,
-                            8,
-                            16,
-                            bd,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        2,
-                        4,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 4,
-                            height: 8,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c4x8,
-                            scan: &tables::SCAN4X8,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    coder::encode_luma_leaf_rect128(
-                        enc,
-                        &tu,
-                        &LumaLeafRect128Spec {
-                            skip_cdf: skip,
-                            dc_sign_ctx: dcs,
-                            mode_idx: 0,
-                            has_chroma: true,
-                            width_mi: 2,
-                            height_mi: 4,
-                            part_cdf: pc,
-                            tx_part_cdf: 12348,
-                            scan: &tables::SCAN8X16,
-                            tx_type_cdf: Some((&coder::TXTP_EXT8, 0, 6)),
-                        },
-                    );
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 4,
-                            ch: 8,
-                            basis: &bases.c4x8,
-                            scan: &tables::SCAN4X8,
-                            eob_cdf: EobCdf::ChrEob32,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 32,
-                            u_skip_row: &SKIP_TX8_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                (4, 2) => outline_leaf_420(|| {
-                    // residue-4 width × residue-2 height corner: 16×8 luma
-                    // (TX_16X8) + 8×4 chroma per plane (4:2:0).
-                    let bd = self.bit_depth as i32;
-                    let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
-                    let lev = bases.c16x8.project_scan(
-                        &aq::scale_resid(
-                            &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
-                            bases.c16x8.qstep as f32 / sb_qstep as f32,
-                        ),
-                        0.0,
-                        &tables::SCAN16X8,
-                    );
-                    put_block_rect(
-                        recy,
-                        pw,
-                        sb_y,
-                        sb_x,
-                        16,
-                        8,
-                        &itx422::reconstruct_chroma(
-                            pred,
-                            &lev,
-                            sb_qstep,
+                            8,
+                            16,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &tables::SCAN8X16,
+                                8,
+                                16,
+                                bd,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            2,
+                            4,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 4,
+                                height: 8,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c4x8,
+                                scan: &tables::SCAN4X8,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        coder::encode_luma_leaf_rect128(
+                            enc,
+                            &tu,
+                            &LumaLeafRect128Spec {
+                                skip_cdf: skip,
+                                dc_sign_ctx: dcs,
+                                mode_idx: 0,
+                                has_chroma: true,
+                                width_mi: 2,
+                                height_mi: 4,
+                                part_cdf: pc,
+                                tx_part_cdf: 12348,
+                                scan: &tables::SCAN8X16,
+                                tx_type_cdf: Some((&coder::TXTP_EXT8, 0, 6)),
+                            },
+                        );
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 4,
+                                ch: 8,
+                                basis: &bases.c4x8,
+                                scan: &tables::SCAN4X8,
+                                eob_cdf: EobCdf::ChrEob32,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 32,
+                                u_skip_row: &SKIP_TX8_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    (4, 2) => outline_leaf_420(|| {
+                        // residue-4 width × residue-2 height corner: 16×8 luma
+                        // (TX_16X8) + 8×4 chroma per plane (4:2:0).
+                        let bd = self.bit_depth as i32;
+                        let pred = dc_pred_rect(recy, pw, sb_y, sb_x, 16, 8, neutral, bd);
+                        let lev = bases.c16x8.project_scan(
+                            &aq::scale_resid(
+                                &get_residual_rect(yp, pw, sb_y, sb_x, 16, 8, pred),
+                                bases.c16x8.qstep as f32 / sb_qstep as f32,
+                            ),
+                            0.0,
                             &tables::SCAN16X8,
-                            16,
-                            8,
-                            bd,
-                        ),
-                    );
-                    let tu = levels_to_coeffs(&lev);
-                    let (skip, dcs) = sb_tu_contexts_rect(
-                        &tu,
-                        above,
-                        left,
-                        &TxbContextSpec {
+                        );
+                        put_block_rect(
+                            recy,
+                            pw,
                             sb_y,
                             sb_x,
-                            qc,
-                            mi_cols: tmc,
-                            mi_rows: tmr,
-                            block_eq_tx: true,
-                        },
-                        4,
-                        2,
-                    );
-                    let mh_choice = chroma422::mhccp_decide_leaf(
-                        enc,
-                        &chroma422::ChromaLeafPlanes {
-                            reconstructed_luma: &*recy,
-                            reconstructed_u: &*recu,
-                            reconstructed_v: &*recv,
-                            source_u: up,
-                            source_v: vp,
-                            luma_stride: pw,
-                            chroma_stride: pcw,
-                        },
-                        &chroma422::ChromaLeafGeometry {
-                            bounds: mhccp_bounds,
-                            luma_y: sb_y,
-                            luma_x: sb_x,
-                            chroma_y: cy,
-                            chroma_x: cx,
-                            width: 8,
-                            height: 4,
-                            subsample_x: true,
-                            subsample_y: true,
-                            have_top: lmr > 0,
-                            have_left: lmc > 0,
-                        },
-                        &chroma422::ChromaLeafRd {
-                            neutral,
-                            basis: &bases.c8x4,
-                            scan: &tables::SCAN8X4,
-                            qstep: sb_qstep,
-                            lambda: leaf::part_lambda(sb_qstep, self.tune.part_lambda_c),
-                            bit_depth: self.bit_depth as i32,
-                        },
-                    );
-                    coder::encode_luma_leaf_rect128(
-                        enc,
-                        &tu,
-                        &LumaLeafRect128Spec {
-                            skip_cdf: skip,
-                            dc_sign_ctx: dcs,
-                            mode_idx: 0,
-                            has_chroma: true,
-                            width_mi: 4,
-                            height_mi: 2,
-                            part_cdf: pc,
-                            tx_part_cdf: 12348,
-                            scan: &tables::SCAN16X8,
-                            tx_type_cdf: Some((&coder::TXTP_EXT8, 0, 6)),
-                        },
-                    );
-                    code_422_chroma_tu(
-                        enc,
-                        ChromaPlanes {
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            src_u: up,
-                            src_v: vp,
-                            stride: pcw,
-                            coded_width: mhccp_bounds.chroma_width,
-                            coded_height: mhccp_bounds.chroma_height,
-                        },
-                        &ChromaTxSpec {
-                            cw: 8,
-                            ch: 4,
-                            basis: &bases.c8x4,
-                            scan: &tables::SCAN8X4,
-                            eob_cdf: EobCdf::ChrEob32,
-                            eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
-                            area: 32,
-                            u_skip_row: &SKIP_TX8_QC[qc],
-                        },
-                        QuantCtx {
-                            qc,
-                            neutral,
-                            qstep: sb_qstep,
-                            rdoq_lambda: self.tune.chroma_rdoq_lambda,
-                        },
-                        ChromaNeighbors { ua, ul, va, vl },
-                        &ChromaTuInput {
-                            y: cy,
-                            x: cx,
-                            bit_depth: self.bit_depth as i32,
-                            cfl: mh_choice.as_ref(),
-                            mode_predictors: None,
-                        },
-                    )
-                }),
-                other => unreachable!("unsupported native 4:2:0 leaf {:?}", other),
+                            16,
+                            8,
+                            &itx422::reconstruct_chroma(
+                                pred,
+                                &lev,
+                                sb_qstep,
+                                &tables::SCAN16X8,
+                                16,
+                                8,
+                                bd,
+                            ),
+                        );
+                        let tu = levels_to_coeffs(&lev);
+                        let (skip, dcs) = sb_tu_contexts_rect(
+                            &tu,
+                            above,
+                            left,
+                            &TxbContextSpec {
+                                sb_y,
+                                sb_x,
+                                qc,
+                                mi_cols: tmc,
+                                mi_rows: tmr,
+                                block_eq_tx: true,
+                            },
+                            4,
+                            2,
+                        );
+                        let mh_choice = chroma422::mhccp_decide_leaf(
+                            enc,
+                            decide_mode,
+                            &chroma422::ChromaLeafPlanes {
+                                reconstructed_luma: &*recy,
+                                reconstructed_u: &*recu,
+                                reconstructed_v: &*recv,
+                                source_u: up,
+                                source_v: vp,
+                                luma_stride: pw,
+                                chroma_stride: pcw,
+                            },
+                            &chroma422::ChromaLeafGeometry {
+                                bounds: mhccp_bounds,
+                                luma_y: sb_y,
+                                luma_x: sb_x,
+                                chroma_y: cy,
+                                chroma_x: cx,
+                                width: 8,
+                                height: 4,
+                                subsample_x: true,
+                                subsample_y: true,
+                                have_top: lmr > 0,
+                                have_left: lmc > 0,
+                            },
+                            &chroma422::ChromaLeafRd {
+                                neutral,
+                                basis: &bases.c8x4,
+                                scan: &tables::SCAN8X4,
+                                qstep: sb_qstep,
+                                lambda: leaf::part_lambda(
+                                    sb_qstep,
+                                    self.subsampled_part_lambda_c(),
+                                ),
+                                bit_depth: self.bit_depth as i32,
+                            },
+                        );
+                        coder::encode_luma_leaf_rect128(
+                            enc,
+                            &tu,
+                            &LumaLeafRect128Spec {
+                                skip_cdf: skip,
+                                dc_sign_ctx: dcs,
+                                mode_idx: 0,
+                                has_chroma: true,
+                                width_mi: 4,
+                                height_mi: 2,
+                                part_cdf: pc,
+                                tx_part_cdf: 12348,
+                                scan: &tables::SCAN16X8,
+                                tx_type_cdf: Some((&coder::TXTP_EXT8, 0, 6)),
+                            },
+                        );
+                        code_422_chroma_tu(
+                            enc,
+                            ChromaPlanes {
+                                rec_u: &mut *recu,
+                                rec_v: &mut *recv,
+                                src_u: up,
+                                src_v: vp,
+                                stride: pcw,
+                                coded_width: mhccp_bounds.chroma_width,
+                                coded_height: mhccp_bounds.chroma_height,
+                            },
+                            &ChromaTxSpec {
+                                cw: 8,
+                                ch: 4,
+                                basis: &bases.c8x4,
+                                scan: &tables::SCAN8X4,
+                                eob_cdf: EobCdf::ChrEob32,
+                                eob_hi: CHROMA_EOB_HI_BIT_QC[qc],
+                                area: 32,
+                                u_skip_row: &SKIP_TX8_QC[qc],
+                            },
+                            QuantCtx {
+                                qc,
+                                neutral,
+                                qstep: sb_qstep,
+                                rdoq_lambda: self.tune.chroma_rdoq_lambda,
+                            },
+                            ChromaNeighbors { ua, ul, va, vl },
+                            &ChromaTuInput {
+                                y: cy,
+                                x: cx,
+                                bit_depth: self.bit_depth as i32,
+                                cfl: mh_choice.as_ref(),
+                                mode_predictors: None,
+                            },
+                        )
+                    }),
+                    other => unreachable!("unsupported native 4:2:0 leaf {:?}", other),
+                }
             };
             let cfl_used = enc.cfl_signaled as i32;
             for c in lmc..lmc + bw_mi {
-                u_above[c] = u_present as i32;
-                v_above[c] = v_present as i32;
-                cfl_above[c] = cfl_used;
+                if !sdp {
+                    u_above[c] = u_present as i32;
+                    v_above[c] = v_present as i32;
+                    cfl_above[c] = cfl_used;
+                }
+                midx_above[c] = leaf_midx;
             }
             for r in lmr..lmr + bh_mi {
-                u_left[r] = u_present as i32;
-                v_left[r] = v_present as i32;
-                cfl_left[r] = cfl_used;
+                if !sdp {
+                    u_left[r] = u_present as i32;
+                    v_left[r] = v_present as i32;
+                    cfl_left[r] = cfl_used;
+                }
+                midx_left[r] = leaf_midx;
+            }
+            if sdp {
+                let m = if leaf_midx >= 0 {
+                    leaf_midx as u8
+                } else {
+                    0xff
+                };
+                for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
+                    sdp_midx[r * 16 + (lmc & 15)..r * 16 + ((lmc & 15) + bw_mi).min(16)].fill(m);
+                }
             }
             // Mark this leaf's luma mi as coded for the next leaf's MHCCP.
             for r in (lmr & 15)..((lmr & 15) + bh_mi).min(16) {
@@ -5326,6 +7559,42 @@ impl Av2Encoder {
                 }
             }
         }
+        enc.sdp_luma = false;
+        if sdp {
+            let luma_leaves = tx_leaves[leaf_start..].to_vec();
+            self.code_chroma_tree_420(&mut super::sdp::ChromaTree420 {
+                enc: &mut *enc,
+                decide_mode: &mut *decide_mode,
+                recy: &*recy,
+                recu: &mut *recu,
+                recv: &mut *recv,
+                up,
+                vp,
+                pw,
+                pcw,
+                width,
+                height,
+                u_above: &mut *u_above,
+                v_above: &mut *v_above,
+                u_left: &mut *u_left,
+                v_left: &mut *v_left,
+                cfl_above: &mut *cfl_above,
+                cfl_left: &mut *cfl_left,
+                luma_leaves: &luma_leaves,
+                chroma_leaves: &mut *chroma_leaves,
+                luma_midx: &sdp_midx,
+                row,
+                col,
+                tmr,
+                tmc,
+                qc,
+                neutral,
+                sb_qstep,
+                mhccp_bounds,
+                ss: (1, 1),
+            });
+        }
+        tx_leaves.extend(tu_splits);
         // Staged decouple: log this SB's captured walk in raster order so the
         // serial Replay consumes the exact sequence a serial Capture produced.
         if let DecideMode::Capture(rec) = &mut decide_mode {

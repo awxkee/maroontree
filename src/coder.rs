@@ -5682,12 +5682,15 @@ mod aq_tests {
                                 continue;
                             }
                             if pri != 0 || sec != 0 {
-                                cdef::cdef_filter_8x8(
+                                cdef::cdef_filter_block(
                                     &mut full,
+                                    0,
                                     &recon,
                                     w,
                                     x,
                                     y,
+                                    8,
+                                    8,
                                     cdef::adjust_pri(pri << (bd - 8), vars[bi]),
                                     sec << (bd - 8),
                                     if pri == 0 { 0 } else { dirs[bi] },

@@ -179,6 +179,7 @@ pub(crate) struct AqCell {
 pub use crate::aq_common::DarkAq;
 use crate::aq_common::dirty_log1pf;
 
+#[derive(Clone)]
 pub(crate) struct AqState {
     present: bool,
     base_q: i32,

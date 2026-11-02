@@ -667,3 +667,95 @@ pub(crate) fn satd_sad_proxy_avx2(
     let satd = reduce_i64x4(satd_acc);
     (sad as u64) + ((satd as u64) >> 2)
 }
+
+/// AVX2 `rd_sse::weighted_sse_scalar`: each 128-bit half carries one 4x4 tile
+/// (two tiles side by side), its four lanes four columns through the column
+/// DCT; an in-half lane broadcast then runs the row DCT, leaving coefficient
+/// (k, l) in lane l of row accumulator k. A lone 4-wide tile column uses the
+/// same steps on 128-bit vectors. Fused multiply-adds, so the sum differs from
+/// the scalar kernel in the last bits.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn weighted_sse_avx2(err: &[i32], w: usize, h: usize) -> f32 {
+    use crate::rd_sse::{WSSE_DCT4 as D, WSSE_WEIGHTS};
+    debug_assert!(w.is_multiple_of(4) && h.is_multiple_of(4));
+    debug_assert!(err.len() >= w * h);
+    unsafe {
+        let column = |j: usize| -> [f32; 4] { std::array::from_fn(|l| D[l][j]) };
+        let basis: [__m256; 4] = std::array::from_fn(|j| {
+            let c = _mm_loadu_ps(column(j).as_ptr());
+            _mm256_set_m128(c, c)
+        });
+        let weights: [__m256; 4] = std::array::from_fn(|k| {
+            let c = _mm_loadu_ps(WSSE_WEIGHTS[k].as_ptr());
+            _mm256_set_m128(c, c)
+        });
+        let mut total = [_mm256_setzero_ps(); 4];
+        let pairs = w / 8 * 8;
+        for r0 in (0..h).step_by(4) {
+            for c0 in (0..pairs).step_by(8) {
+                let rows: [__m256; 4] = std::array::from_fn(|i| {
+                    let p = err[(r0 + i) * w + c0..][..8].as_ptr();
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256(p.cast()))
+                });
+                for (k, acc) in total.iter_mut().enumerate() {
+                    let mut t = _mm256_mul_ps(rows[0], _mm256_set1_ps(D[k][0]));
+                    t = _mm256_fmadd_ps(rows[1], _mm256_set1_ps(D[k][1]), t);
+                    t = _mm256_fmadd_ps(rows[2], _mm256_set1_ps(D[k][2]), t);
+                    t = _mm256_fmadd_ps(rows[3], _mm256_set1_ps(D[k][3]), t);
+                    let mut c = _mm256_mul_ps(basis[0], _mm256_permute_ps::<0x00>(t));
+                    c = _mm256_fmadd_ps(basis[1], _mm256_permute_ps::<0x55>(t), c);
+                    c = _mm256_fmadd_ps(basis[2], _mm256_permute_ps::<0xAA>(t), c);
+                    c = _mm256_fmadd_ps(basis[3], _mm256_permute_ps::<0xFF>(t), c);
+                    *acc = _mm256_fmadd_ps(_mm256_mul_ps(weights[k], c), c, *acc);
+                }
+            }
+        }
+        let mut sum = _mm_add_ps(
+            _mm_add_ps(
+                _mm256_castps256_ps128(total[0]),
+                _mm256_extractf128_ps::<1>(total[0]),
+            ),
+            _mm_add_ps(
+                _mm256_castps256_ps128(total[1]),
+                _mm256_extractf128_ps::<1>(total[1]),
+            ),
+        );
+        sum = _mm_add_ps(
+            sum,
+            _mm_add_ps(
+                _mm_add_ps(
+                    _mm256_castps256_ps128(total[2]),
+                    _mm256_extractf128_ps::<1>(total[2]),
+                ),
+                _mm_add_ps(
+                    _mm256_castps256_ps128(total[3]),
+                    _mm256_extractf128_ps::<1>(total[3]),
+                ),
+            ),
+        );
+        if pairs < w {
+            let c0 = pairs;
+            for r0 in (0..h).step_by(4) {
+                let rows: [__m128; 4] = std::array::from_fn(|i| {
+                    let p = err[(r0 + i) * w + c0..][..4].as_ptr();
+                    _mm_cvtepi32_ps(_mm_loadu_si128(p.cast()))
+                });
+                for k in 0..4 {
+                    let mut t = _mm_mul_ps(rows[0], _mm_set1_ps(D[k][0]));
+                    t = _mm_fmadd_ps(rows[1], _mm_set1_ps(D[k][1]), t);
+                    t = _mm_fmadd_ps(rows[2], _mm_set1_ps(D[k][2]), t);
+                    t = _mm_fmadd_ps(rows[3], _mm_set1_ps(D[k][3]), t);
+                    let b = |j: usize| _mm256_castps256_ps128(basis[j]);
+                    let mut c = _mm_mul_ps(b(0), _mm_permute_ps::<0x00>(t));
+                    c = _mm_fmadd_ps(b(1), _mm_permute_ps::<0x55>(t), c);
+                    c = _mm_fmadd_ps(b(2), _mm_permute_ps::<0xAA>(t), c);
+                    c = _mm_fmadd_ps(b(3), _mm_permute_ps::<0xFF>(t), c);
+                    let wk = _mm256_castps256_ps128(weights[k]);
+                    sum = _mm_fmadd_ps(_mm_mul_ps(wk, c), c, sum);
+                }
+            }
+        }
+        let pair = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+        _mm_cvtss_f32(_mm_add_ss(pair, _mm_shuffle_ps::<0x55>(pair, pair)))
+    }
+}

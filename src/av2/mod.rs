@@ -62,9 +62,12 @@ mod metrics;
 mod mhccp;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
+mod palette;
 mod partition;
 mod proj;
+mod qm;
 mod quant;
+mod rd;
 #[allow(dead_code)]
 mod replay;
 pub mod simple;
@@ -295,6 +298,13 @@ pub struct Tuning {
     pub dark_aq: aq::DarkAq,
     /// Enable the non-CfL chroma intra-mode search
     pub chroma_mode_search: bool,
+    /// SDP: 4:2:0 still key frames code each SB's chroma with its own partition
+    /// tree after the luma tree.
+    pub sdp: bool,
+    /// Luma palette on screen-content stills (frame-level detector).
+    pub palette: bool,
+    /// Quantization matrices on SDP still frames (levels by the qindex laws).
+    pub qm: bool,
     /// Enable RD-driven 64x64->4x32x32 chroma-motivated square split (4:4:4/4:2:2).
     /// A 64x64 chroma transform zeros the high-frequency 3/4 of coefficients; splitting
     /// into 32x32 transforms codes all frequencies, a large win on detailed chroma.
@@ -337,6 +347,9 @@ impl Default for Tuning {
                 ..aq::DarkAq::default()
             },
             chroma_mode_search: true,
+            sdp: true,
+            palette: true,
+            qm: true,
             chroma_split: true,
             uv_ac_delta_q: 0,
             updating_cdf: true,
@@ -376,6 +389,8 @@ pub struct Av2Encoder {
     /// default (multi-threaded → single-tile SB-wavefront) is suppressed when this
     /// is set, so a video cfg's `with_tiles`/`with_threads` behaves exactly as before.
     pub(crate) video_mode: std::sync::atomic::AtomicBool,
+    /// The current still frame enables screen-content tools (luma palette).
+    pub(crate) sct_frame: std::sync::atomic::AtomicBool,
     pub(crate) capture_recon: std::sync::atomic::AtomicBool,
     /// LAST reference recon planes (Y,U,V f32) for inter prediction; empty for intra.
     pub(crate) last_ref: std::sync::Mutex<std::sync::Arc<Vec<Vec<f32>>>>,
@@ -524,6 +539,10 @@ impl Av2Encoder {
         );
         let mut bases = proj::default_bases().rescaled_to_q(base_q_idx as u32);
         bases.set_bit_depth(bit_depth);
+        bases.set_dead_zone(STILL_DEAD_ZONE);
+        if base_q_idx != 0 {
+            bases.set_square_rdoq(get_q_ctx(base_q_idx), 0.11, 0.16);
+        }
         let mut enc = Av2Encoder {
             bases,
             base_q_idx,
@@ -539,6 +558,7 @@ impl Av2Encoder {
             threads: 1,
             inter_tile: std::sync::atomic::AtomicBool::new(false),
             video_mode: std::sync::atomic::AtomicBool::new(false),
+            sct_frame: std::sync::atomic::AtomicBool::new(false),
             capture_recon: std::sync::atomic::AtomicBool::new(false),
             last_ref: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
             second_ref: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
@@ -576,6 +596,92 @@ impl Av2Encoder {
     }
 
     #[inline]
+    /// `part_lambda` coefficient for the 4:2:0 / 4:2:2 / 4:0:0 leaf decisions. Stills
+    /// use the encoder's operational slope (2.5e-5·qstep², 4:2:0 -0.60% / 4:2:2 -0.23% /
+    /// 4:0:0 -2.4% SS2 vs 1e-4); 4:4:4 measured +0.18% and keeps `tune.part_lambda_c`,
+    /// as does video.
+    pub(crate) fn subsampled_part_lambda_c(&self) -> f32 {
+        if self.still_rd() {
+            self.tune.part_lambda_c * 0.25
+        } else {
+            self.tune.part_lambda_c
+        }
+    }
+
+    /// Still-image RD pricing (pixel-domain luma lambda, partition RD at every q).
+    /// Video frames keep their historical decisions.
+    /// 4:2:0 lossy still frames use SDP (see [`Tuning::sdp`]); lossless and video
+    /// keep the shared tree.
+    /// Screen-content tools for this frame: lossy stills whose source the
+    /// detector flagged (`detect_screen_content`), 4:2:0 only so far.
+    pub(crate) fn sct(&self, layout: Layout) -> bool {
+        layout == Layout::I420
+            && self.sdp_still()
+            && self.sct_frame.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flag palette-friendly content: the share of 16x16 luma blocks holding 2..=8
+    /// distinct values. Natural images almost never do; line art, text, UI and
+    /// flat-colour illustrations do in bulk.
+    pub(crate) fn detect_screen_content(&self, y: &[f32], width: usize, height: usize) {
+        let mut blocks = 0usize;
+        let mut pal = 0usize;
+        let mut vals = [0u16; 256];
+        for by in (0..height.saturating_sub(15)).step_by(16) {
+            for bx in (0..width.saturating_sub(15)).step_by(16) {
+                for r in 0..16 {
+                    for c in 0..16 {
+                        vals[r * 16 + c] = y[(by + r) * width + bx + c] as u16;
+                    }
+                }
+                vals.sort_unstable();
+                let distinct = 1 + vals.windows(2).filter(|v| v[0] != v[1]).count();
+                blocks += 1;
+                pal += (2..=8).contains(&distinct) as usize;
+            }
+        }
+        let share = if blocks == 0 {
+            0.0
+        } else {
+            pal as f32 / blocks as f32
+        };
+        self.sct_frame.store(
+            self.tune.palette && share >= 0.05,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn sdp_still(&self) -> bool {
+        self.tune.sdp && self.still_rd() && self.base_q_idx != 0
+    }
+
+    /// QM levels `(luma, chroma)` for a frame of `layout`, `None` when off. QM rides
+    /// on SDP: the chroma coders switch the QM plane, so chroma is never coded in
+    /// the luma pass. Levels follow the AV1 encoder's qindex laws.
+    pub(crate) fn qm_levels(&self, layout: Layout) -> Option<(u8, u8)> {
+        if !(self.tune.qm && self.sdp_still()) {
+            return None;
+        }
+        // The AV1 laws: +-2 level offsets on either plane measured neutral to
+        // +0.8 SS2 at 4:2:0. QM on vs off: SS2 -11..-14 (all formats), -19 holdout.
+        let sub = matches!(layout, Layout::I420 | Layout::I422) as usize;
+        let q = self.base_q_idx;
+        let y = crate::quant::qm_level_law(q, sub);
+        let uv = crate::quant::qm_chroma_level_law(q, sub);
+        (y < qm::QM_FLAT || uv < qm::QM_FLAT).then_some((y, uv))
+    }
+
+    /// Set this thread's QM levels for an SB decision of `layout` (luma plane);
+    /// the returned guard restores the previous state.
+    pub(crate) fn qm_scope(&self, layout: Layout) -> qm::QmScope {
+        let (y, uv) = self.qm_levels(layout).unwrap_or((qm::QM_FLAT, qm::QM_FLAT));
+        qm::QmScope::new(y, uv)
+    }
+
+    pub(crate) fn still_rd(&self) -> bool {
+        !self.video_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn video_allows_16x16_partitions(&self) -> bool {
         self.video_min_block_size <= 16 && self.video_max_partition_depth >= 2
     }
@@ -699,6 +805,7 @@ impl Av2Encoder {
         self.base_q_idx = base_q_idx;
         self.bases = proj::default_bases().rescaled_to_q(base_q_idx as u32);
         self.bases.set_bit_depth(self.bit_depth);
+        self.bases.set_dead_zone(0.5);
     }
 
     fn config(&self, layout: Layout) -> Config {
@@ -732,6 +839,9 @@ impl Av2Encoder {
         Config {
             layout,
             base_q: self.base_q_idx as u32,
+            sdp: matches!(layout, Layout::I420 | Layout::I422 | Layout::I444) && self.sdp_still(),
+            qm: self.qm_levels(layout),
+            sct: self.sct(layout),
             // Chroma delta-q is wired through the 4:4:4 coding paths only so far; other
             // layouts must keep the header at delta 0 or the coding would desync.
             uv_ac_delta_q: if layout == Layout::I444 {
@@ -990,6 +1100,12 @@ impl Av2Encoder {
         ))
     }
 }
+
+/// Forward-quantizer dead zone for stills (0.5 = round-to-nearest). Measured
+/// 2026-11-01: 0.45 is negative on every format (SS2 4:2:0 -1.67%, 4:4:4 -0.31%,
+/// 4:2:2 -1.40%, 4:0:0 -1.25%); 0.4 helps 4:2:0/4:2:2 more but costs 4:4:4 +0.89%.
+/// Video keeps 0.5.
+pub(crate) const STILL_DEAD_ZONE: f32 = 0.45;
 
 /// Maps CLI quality 1–100 to AV2 `base_q_idx` 1–254.
 /// quality 100 → q≈3 (near-lossless), quality 60 → q≈100, quality 1 → q=254.

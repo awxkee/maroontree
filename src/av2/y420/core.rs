@@ -96,6 +96,8 @@ impl Av2Encoder {
         // luma mode-search winner; `Replay` reuses it (skips `encode_luma_sb`).
         mut decide_mode: replay::DecideMode<'_>,
     ) -> RangeEncoder {
+        // Perceptual (4x4 DCT-weighted) decision distortion for stills.
+        crate::av2::helpers::set_wsse(self.still_rd());
         let bases = &self.bases;
         let (pw, ph) = (sb_align(width), sb_align(height));
         let (pcw, pch) = (pw / 2, ph / 2);
@@ -120,6 +122,7 @@ impl Av2Encoder {
             enc.enable_adaptive_cdf(enc.qc);
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.sct = self.sct(crate::av2::layout::Layout::I420);
         enc.mhccp = self.tune.mhccp && self.base_q_idx != 0;
         enc.mhccp_ssx = true;
         enc.mhccp_ssy = true;
@@ -217,6 +220,7 @@ impl Av2Encoder {
         if needs_partition {
             let mut tx_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
             let mut skip_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
+            let mut chroma_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
             let mut sb_qidx = vec![self.base_q_idx as u16; sb_rows * sb_cols];
             self.encode_yuv420_partition(
                 &mut enc,
@@ -261,6 +265,7 @@ impl Av2Encoder {
                 tile_ref,
                 &mut tx_leaves,
                 &mut skip_leaves,
+                &mut chroma_leaves,
                 &mut sb_qidx,
                 decide_mode,
             );
@@ -294,7 +299,11 @@ impl Av2Encoder {
                     sb_cols,
                     sb_qidx: &sb_qidx,
                     leaves: &tx_leaves,
-                    chroma_leaves: &tx_leaves,
+                    chroma_leaves: if chroma_leaves.is_empty() {
+                        &tx_leaves
+                    } else {
+                        &chroma_leaves
+                    },
                     skip_leaves: &skip_leaves,
                     luma_tx_cap: (8, 8),
 
@@ -1351,12 +1360,14 @@ impl Av2Encoder {
                                 x: sb_x,
                             },
                             &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
                                 basis: &bases.luma,
                                 qstep: sb_qstep,
                                 scan: &tables::SCAN,
                                 neutral,
                                 quant_context: qc,
                                 rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
                                 speed: self.speed,
                                 bit_depth: self.bit_depth as i32,
                             },
@@ -1468,7 +1479,7 @@ impl Av2Encoder {
                             &cfl::ChromaRdSpec {
                                 basis: &bases.chroma420,
                                 qstep: qstep_i,
-                                lambda: leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                lambda: leaf::part_lambda(qstep_i, self.subsampled_part_lambda_c()),
                                 bit_depth: bd,
                             },
                         )
@@ -1492,7 +1503,7 @@ impl Av2Encoder {
                     // the incumbent (DC or classic CfL) on J = SSE + lambda*bits.
                     let mhccp_choice = if enc.mhccp {
                         let bd = self.bit_depth as i32;
-                        let lam = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                        let lam = leaf::part_lambda(qstep_i, self.subsampled_part_lambda_c());
                         let dc_u_f = chroma_dc(&recu);
                         let dc_v_f = chroma_dc(&recv);
                         // Chroma source blocks (same extraction cfl_decide uses).
@@ -1631,7 +1642,7 @@ impl Av2Encoder {
                         } else {
                             &[0, 1, 2, 3, 4]
                         };
-                        let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                        let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
                         let mut best_mode = 0usize;
                         let mut best_cost = f32::INFINITY;
                         let mut best = None;

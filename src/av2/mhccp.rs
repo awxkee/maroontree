@@ -226,6 +226,7 @@ pub(crate) fn gauss_elimination(
 /// avm `convolve`: `sum_i mul_fixed32_adapt(params[i], vector[i], DECIM)`,
 /// clamped to i16. `vector` holds the three Q0 predictor terms.
 #[inline]
+#[cfg(test)]
 pub(crate) fn convolve(params: &[i32; MHCCP_NUM_PARAMS], vector: &[i32; MHCCP_NUM_PARAMS]) -> i32 {
     let mut sum = 0i32;
     for i in 0..MHCCP_NUM_PARAMS {
@@ -303,8 +304,10 @@ pub(crate) fn derive_params(
     let ref_height = l.ref_height as i32;
     let ref_stride = MHCCP_REF_STRIDE as i32;
 
-    let mut a = vec![[0i32; 3]; l.ref_width * l.ref_height];
-    let mut ycb = vec![0i32; l.ref_width * l.ref_height];
+    // Normal equations (A^T A, A^T y) accumulated row by row over the reference
+    // samples, in the reference order.
+    let mut ata = [[0i32; MHCCP_NUM_PARAMS]; MHCCP_NUM_PARAMS];
+    let mut ty = [0i32; MHCCP_NUM_PARAMS];
     let mut count = 0usize;
 
     if above_lines != 0 || left_lines != 0 {
@@ -326,12 +329,18 @@ pub(crate) fn derive_params(
                     2 => ld[idx(i - 1, j + ref_h_offset)] >> 3, // L
                     _ => center,                                // C
                 };
-                a[count] = [
+                let a = [
                     (a0 as i16) as i32,
                     (non_linear(center, mid, bd) as i16) as i32,
                     (mid as i16) as i32,
                 ];
-                ycb[count] = cd[idx(i, j + ref_h_offset)];
+                let ycb = cd[idx(i, j + ref_h_offset)];
+                for c0 in 0..MHCCP_NUM_PARAMS {
+                    for c1 in c0..MHCCP_NUM_PARAMS {
+                        ata[c0][c1] += a[c0] * a[c1];
+                    }
+                    ty[c0] += a[c0] * ycb;
+                }
                 count += 1;
             }
         }
@@ -341,27 +350,6 @@ pub(crate) fn derive_params(
         let mut out = [0i32; MHCCP_NUM_PARAMS];
         out[MHCCP_NUM_PARAMS - 1] = 1 << MHCCP_DECIM_BITS;
         return out;
-    }
-
-    let mut ata = [[0i32; MHCCP_NUM_PARAMS]; MHCCP_NUM_PARAMS];
-    let mut ty = [0i32; MHCCP_NUM_PARAMS];
-    #[allow(clippy::needless_range_loop)]
-    for c0 in 0..MHCCP_NUM_PARAMS {
-        #[allow(clippy::needless_range_loop)]
-        for c1 in c0..MHCCP_NUM_PARAMS {
-            let mut acc = 0i32;
-            for r in 0..count {
-                acc += a[r][c0] * a[r][c1];
-            }
-            ata[c0][c1] = acc;
-        }
-    }
-    for (c, tyc) in ty.iter_mut().enumerate() {
-        let mut acc = 0i32;
-        for r in 0..count {
-            acc += a[r][c] * ycb[r];
-        }
-        *tyc = acc;
     }
 
     let matrix_shift = (MHCCP_DECIM_BITS + 6) - 2 * bd - ceil_log2(count as i32);
@@ -415,6 +403,20 @@ pub(crate) fn predict_block(
     // Base offset of the block top-left inside the reference buffer.
     let base = l.left_lines as i32 + l.above_lines as i32 * stride;
     let get = |off: i32| -> i32 { l.data[off as usize] };
+    // `convolve` term by term: the third term (the `mid` bias) is per block; the
+    // first two use the shift-free form of `mul_fixed32_adapt` whenever the
+    // operands fit 29 bits together (same result, see `mul_fixed32_fits`).
+    let bias = mul_fixed32_adapt(params[2], mid, MHCCP_DECIM_BITS);
+    let (lim0, lim1) = (mul_fixed32_fits(params[0]), mul_fixed32_fits(params[1]));
+    let term = |a: i32, b: i32, lim: u32| -> i32 {
+        if b >= 0 && (b as u32) < lim {
+            let r =
+                (a.unsigned_abs() * b as u32 + (1 << (MHCCP_DECIM_BITS - 1))) >> MHCCP_DECIM_BITS;
+            if a < 0 { -(r as i32) } else { r as i32 }
+        } else {
+            mul_fixed32_adapt(a, b, MHCCP_DECIM_BITS)
+        }
+    };
     for j in 0..height as i32 {
         for i in 0..width as i32 {
             let p = base + i + j * stride;
@@ -434,15 +436,59 @@ pub(crate) fn predict_block(
                 2 => c,
                 _ => center,
             };
-            let vector = [v0, non_linear(center, mid, bd), mid];
+            let sum = term(params[0], v0, lim0)
+                + term(params[1], non_linear(center, mid, bd), lim1)
+                + bias;
             out[(j as usize) * width + i as usize] =
-                clip_pixel_highbd(convolve(params, &vector), bd);
+                clip_pixel_highbd(sum.clamp(i16::MIN as i32, i16::MAX as i32), bd);
         }
+    }
+}
+
+/// The bound `b < lim` (for `b >= 0`) under which `mul_fixed32_adapt(a, b, 16)`
+/// needs no operand pre-shift (`bits(a) + bits(b) <= 29`) and so reduces to the
+/// sign-magnitude rounded `(|a| * b + 2^15) >> 16`; 0 when `a` alone is too wide.
+fn mul_fixed32_fits(a: i32) -> u32 {
+    let bits_a = ilog2_32(a.unsigned_abs()) + 1;
+    if bits_a <= 28 {
+        1u32 << (29 - bits_a)
+    } else {
+        0
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The shift-free product used by `predict_block` matches `mul_fixed32_adapt`
+    /// everywhere below its bound.
+    #[test]
+    fn mul_fixed32_fits_matches_adapt() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for _ in 0..200_000 {
+            let bits = 1 + next(30) as u32;
+            let a = (next(1 << bits) as i64 - (1i64 << (bits - 1))) as i32;
+            let lim = mul_fixed32_fits(a);
+            if lim == 0 {
+                continue;
+            }
+            let b = next(lim as u64) as i32;
+            let r =
+                (a.unsigned_abs() * b as u32 + (1 << (MHCCP_DECIM_BITS - 1))) >> MHCCP_DECIM_BITS;
+            let fast = if a < 0 { -(r as i32) } else { r as i32 };
+            assert_eq!(
+                fast,
+                mul_fixed32_adapt(a, b, MHCCP_DECIM_BITS),
+                "a {a} b {b}"
+            );
+        }
+    }
+
     use super::*;
 
     // Reproduce the standalone golden-vector driver deterministically so the

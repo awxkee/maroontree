@@ -99,6 +99,22 @@ pub(crate) static RECT_TYPE_CDF0: [u32; 64] = [
     16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384,
 ];
 
+// do_split / rect_type cdf0 for plane 1 (the SDP chroma tree), 64 contexts.
+pub(crate) static DO_SPLIT_CDF1: [u32; 64] = [
+    16384, 16384, 16384, 16384, 7214, 13876, 14238, 21962, 10264, 20628, 20802, 27784, 8308, 24070,
+    23113, 30205, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384,
+    16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384,
+    16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 6541, 16384, 15099, 16384, 6589, 14879,
+    16384, 16384, 9268, 19653, 17515, 26310, 10202, 21271, 22723, 29018,
+];
+pub(crate) static RECT_TYPE_CDF1: [u32; 64] = [
+    17114, 19268, 13591, 18029, 13999, 19268, 9185, 11841, 17723, 22240, 10294, 18518, 16207,
+    21341, 10894, 16424, 11202, 19411, 5413, 8651, 21867, 26988, 13712, 23627, 12332, 17075, 6232,
+    9101, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384,
+    16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 13527,
+    19730, 3865, 7966, 23671, 30019, 17567, 28319, 16384, 16384, 16384, 16384,
+];
+
 const HORZ: u8 = 0; // RECT_PART_TYPE / PARTITION ordering: HORZ first
 const VERT: u8 = 1;
 
@@ -650,6 +666,181 @@ pub(crate) fn sb_rd_split_ops(
     out
 }
 
+/// Ops for a full interior SB coded as `d`: the probe's square tree
+/// (`split64` / `split32` / `split16`, each square step a VERT + HORZ rect pair)
+/// with rect leaf pairs where a node stays unsplit (`rect64` / `rect32` /
+/// `rect16`: 64x32|32x64, 32x16|16x32, 16x8|8x16).
+pub(crate) fn sb_tree_ops(
+    sb_row: usize,
+    sb_col: usize,
+    d: &crate::av2::leaf::LumaPartitionDecision,
+    above_pctx: &mut [u8],
+    left_pctx: &mut [u8],
+) -> Vec<Op> {
+    const B64: usize = 12;
+    const B32X64: usize = 10;
+    const B32: usize = 9;
+    const B16X32: usize = 7;
+    const B16: usize = 6;
+    const B8X16: usize = 4;
+    const B8: usize = 3;
+    let mut out = Vec::new();
+    let (mi_row, mi_col) = (sb_row * 16, sb_col * 16);
+    let leaf = |out: &mut Vec<Op>, ap: &mut [u8], lp: &mut [u8], r: usize, c: usize, b: usize| {
+        let ctx = raw_ctx(ap, lp, r, c, b) + BSIZE_MAP[b] * 4;
+        out.push(Op::Leaf {
+            mi_row: r,
+            mi_col: c,
+            bw_mi: MI_W[b],
+            bh_mi: MI_H[b],
+            part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+        });
+        update_pctx(ap, lp, r, c, b);
+    };
+    // An unsplit node of size `b`: one leaf, or a HORZ / VERT pair of rect leaves.
+    let node = |out: &mut Vec<Op>,
+                ap: &mut [u8],
+                lp: &mut [u8],
+                r: usize,
+                c: usize,
+                b: usize,
+                rect: u8| {
+        match rect {
+            1 => {
+                push_rect_split(out, ap, lp, r, c, b, HORZ);
+                let sub = SUBSIZE_HORZ[b] as usize;
+                leaf(out, ap, lp, r, c, sub);
+                leaf(out, ap, lp, r + MI_H[b] / 2, c, sub);
+            }
+            2 => {
+                push_rect_split(out, ap, lp, r, c, b, VERT);
+                let sub = SUBSIZE_VERT[b] as usize;
+                leaf(out, ap, lp, r, c, sub);
+                leaf(out, ap, lp, r, c + MI_W[b] / 2, sub);
+            }
+            _ => leaf(out, ap, lp, r, c, b),
+        }
+    };
+    if !d.split64 {
+        node(
+            &mut out, above_pctx, left_pctx, mi_row, mi_col, B64, d.rect64,
+        );
+        return out;
+    }
+    push_rect_split(&mut out, above_pctx, left_pctx, mi_row, mi_col, B64, VERT);
+    for dc in [0usize, 8usize] {
+        push_rect_split(
+            &mut out,
+            above_pctx,
+            left_pctx,
+            mi_row,
+            mi_col + dc,
+            B32X64,
+            HORZ,
+        );
+        for dr in [0usize, 8usize] {
+            let (r, c) = (mi_row + dr, mi_col + dc);
+            let child = (dr / 8) * 2 + dc / 8;
+            if !d.split32[child] {
+                node(&mut out, above_pctx, left_pctx, r, c, B32, d.rect32[child]);
+                continue;
+            }
+            push_rect_split(&mut out, above_pctx, left_pctx, r, c, B32, VERT);
+            for dc16 in [0usize, 4usize] {
+                push_rect_split(&mut out, above_pctx, left_pctx, r, c + dc16, B16X32, HORZ);
+                for dr16 in [0usize, 4usize] {
+                    let (lr, lc) = (r + dr16, c + dc16);
+                    let child16 = ((lr - mi_row) / 4) * 4 + (lc - mi_col) / 4;
+                    if !d.split16[child16] {
+                        node(
+                            &mut out,
+                            above_pctx,
+                            left_pctx,
+                            lr,
+                            lc,
+                            B16,
+                            d.rect16[child16],
+                        );
+                        continue;
+                    }
+                    push_rect_split(&mut out, above_pctx, left_pctx, lr, lc, B16, VERT);
+                    for dc8 in [0usize, 2usize] {
+                        push_rect_split(&mut out, above_pctx, left_pctx, lr, lc + dc8, B8X16, HORZ);
+                        for dr8 in [0usize, 2usize] {
+                            leaf(&mut out, above_pctx, left_pctx, lr + dr8, lc + dc8, B8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ops for a full interior SB coded as the free binary tree `codes` (see
+/// [`crate::av2::leaf::GTree`]).
+pub(crate) fn sb_gtree_ops(
+    sb_row: usize,
+    sb_col: usize,
+    codes: &[u8],
+    above_pctx: &mut [u8],
+    left_pctx: &mut [u8],
+) -> Vec<Op> {
+    #[allow(clippy::too_many_arguments)]
+    fn rec(
+        codes: &[u8],
+        at: &mut usize,
+        r: usize,
+        c: usize,
+        b: usize,
+        ap: &mut [u8],
+        lp: &mut [u8],
+        out: &mut Vec<Op>,
+    ) {
+        let code = codes[*at];
+        *at += 1;
+        match code {
+            0 => {
+                let ctx = raw_ctx(ap, lp, r, c, b) + BSIZE_MAP[b] * 4;
+                out.push(Op::Leaf {
+                    mi_row: r,
+                    mi_col: c,
+                    bw_mi: MI_W[b],
+                    bh_mi: MI_H[b],
+                    part_cdf: Some(DO_SPLIT_CDF0[ctx]),
+                });
+                update_pctx(ap, lp, r, c, b);
+            }
+            1 => {
+                push_rect_split(out, ap, lp, r, c, b, HORZ);
+                let sub = SUBSIZE_HORZ[b] as usize;
+                rec(codes, at, r, c, sub, ap, lp, out);
+                rec(codes, at, r + MI_H[b] / 2, c, sub, ap, lp, out);
+            }
+            _ => {
+                push_rect_split(out, ap, lp, r, c, b, VERT);
+                let sub = SUBSIZE_VERT[b] as usize;
+                rec(codes, at, r, c, sub, ap, lp, out);
+                rec(codes, at, r, c + MI_W[b] / 2, sub, ap, lp, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    rec(
+        codes,
+        &mut at,
+        sb_row * 16,
+        sb_col * 16,
+        12,
+        above_pctx,
+        left_pctx,
+        &mut out,
+    );
+    debug_assert_eq!(at, codes.len());
+    out
+}
+
 fn push_rect_split(
     out: &mut Vec<Op>,
     above_pctx: &[u8],
@@ -670,4 +861,283 @@ fn push_rect_split(
         val: rect_type as u32,
         ctx,
     });
+}
+
+/// A chroma-tree (SDP, plane 1) partition op: the split / direction bools carry
+/// their context into the plane-1 CDF halves.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChromaOp {
+    Split {
+        ctx: usize,
+        bit: u32,
+    },
+    Dir {
+        ctx: usize,
+        bit: u32,
+    },
+    Leaf {
+        mi_row: usize,
+        mi_col: usize,
+        bw_mi: usize,
+        bh_mi: usize,
+    },
+}
+
+/// Partition of a node, 255 = NONE, else HORZ / VERT.
+pub(crate) const PART_NONE: u8 = 255;
+
+/// The luma tree's partition at a node, recovered from its leaf rectangles
+/// `(mi_row, mi_col, bw_mi, bh_mi)` and the luma op generators' conventions:
+/// boundary-implied direction first, NONE when a leaf covers the node exactly,
+/// else square and wide nodes split VERT and tall ones HORZ.
+pub(crate) fn luma_part_from_leaves(
+    leaves: &[(usize, usize, usize, usize)],
+    mi_row: usize,
+    mi_col: usize,
+    b: usize,
+    mi_rows: usize,
+    mi_cols: usize,
+) -> u8 {
+    let (w, h) = (MI_W[b], MI_H[b]);
+    if leaves.contains(&(mi_row, mi_col, w, h)) {
+        return PART_NONE;
+    }
+    if let Some(p) = implied_boundary(mi_row, mi_col, b, mi_rows, mi_cols) {
+        return p;
+    }
+    let has_rows = mi_row + h / 2 < mi_rows;
+    let has_cols = mi_col + w / 2 < mi_cols;
+    if !(has_rows && has_cols) {
+        // `decide_signaled` with NONE disallowed.
+        let rimp = rect_type_implied(b);
+        if let Some(r) = rimp {
+            return r;
+        }
+        let horz_valid = SUBSIZE_HORZ[b] != INV;
+        let vert_valid = SUBSIZE_VERT[b] != INV;
+        return match (horz_valid, vert_valid) {
+            (true, false) => HORZ,
+            (false, true) => VERT,
+            _ if !has_rows => HORZ,
+            _ => VERT,
+        };
+    }
+    // Rect leaf pairs: a node whose leaves never cross its horizontal midline
+    // (but do cross the vertical one) was split HORZ, and vice versa. With
+    // neither crossed (square quadrants) the tree builders' convention applies:
+    // squares split VERT first, tall blocks HORZ.
+    let (mr, mc) = (mi_row + h / 2, mi_col + w / 2);
+    let inside = |&&(r, c, lw, lh): &&(usize, usize, usize, usize)| {
+        r >= mi_row && r < mi_row + h && c >= mi_col && c < mi_col + w && (lw, lh) != (0, 0)
+    };
+    let crosses_h = leaves
+        .iter()
+        .filter(inside)
+        .any(|&(r, _, _, lh)| r < mr && r + lh > mr);
+    let crosses_v = leaves
+        .iter()
+        .filter(inside)
+        .any(|&(_, c, lw, _)| c < mc && c + lw > mc);
+    match (crosses_h, crosses_v) {
+        (false, true) => HORZ,
+        (true, false) => VERT,
+        _ if h > w => HORZ,
+        _ => VERT,
+    }
+}
+
+/// Some luma leaf in `leaves` is rectangular.
+pub(crate) fn luma_has_rects(leaves: &[(usize, usize, usize, usize)]) -> bool {
+    leaves
+        .iter()
+        .any(|&(_, _, w, h)| w != h && (w, h) != (0, 0))
+}
+
+/// The `b`-sized luma node at (`mi_row`, `mi_col`) lies inside one luma leaf.
+pub(crate) fn luma_node_covered(
+    leaves: &[(usize, usize, usize, usize)],
+    mi_row: usize,
+    mi_col: usize,
+    b: usize,
+) -> bool {
+    let (w, h) = (MI_W[b], MI_H[b]);
+    leaves.iter().any(|&(r, c, lw, lh)| {
+        r <= mi_row && c <= mi_col && r + lh >= mi_row + h && c + lw >= mi_col + w
+    })
+}
+
+/// Luma-space `w`x`h` (mi) sub-block has a valid chroma block size under the
+/// `(ssx, ssy)` subsampling.
+fn chroma_valid(w: usize, h: usize, ss: (usize, usize)) -> bool {
+    let (cw, ch) = ((4 * w) >> ss.0, (4 * h) >> ss.1);
+    cw >= 4 && ch >= 4 && cw.max(ch) <= 8 * cw.min(ch)
+}
+
+/// Pre-order chroma-tree ops for one 64x64 SB (4:2:0, ext partitions off), a port
+/// of the decoder's plane-1 `decode_partition`: forced NONE at luma-coord 8x8,
+/// boundary-implied splits, the root inferred from the luma root, else a split
+/// bool and (unless the size implies it) a direction bool from the plane-1 CDFs.
+/// `want` gives the encoder's choice at signalled nodes (PART_NONE / HORZ / VERT).
+/// Returns the ops and `sdp_cfl_disallowed` (chroma root direction family differs
+/// from the luma root's, which turns CfL / MHCCP off for the whole SB).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdp_chroma_ops(
+    sb_row: usize,
+    sb_col: usize,
+    mi_rows: usize,
+    mi_cols: usize,
+    ss: (usize, usize),
+    above_c: &mut [u8],
+    left_c: &mut [u8],
+    luma_part: &dyn Fn(usize, usize, usize) -> u8,
+    want: &dyn Fn(usize, usize, usize) -> u8,
+) -> (Vec<ChromaOp>, bool) {
+    let (r0, c0) = (sb_row * 16, sb_col * 16);
+    // Luma root and whether every on-frame root child split the other way.
+    let lroot = luma_part(r0, c0, 12);
+    let children_other = lroot != PART_NONE && {
+        let sub = if lroot == HORZ {
+            SUBSIZE_HORZ[12]
+        } else {
+            SUBSIZE_VERT[12]
+        } as usize;
+        let other = if lroot == HORZ { VERT } else { HORZ };
+        let kids: [(usize, usize); 2] = if lroot == HORZ {
+            [(r0, c0), (r0 + 8, c0)]
+        } else {
+            [(r0, c0), (r0, c0 + 8)]
+        };
+        kids.iter()
+            .filter(|&&(r, c)| r < mi_rows && c < mi_cols)
+            .all(|&(r, c)| luma_part(r, c, sub) == other)
+    };
+    let mut out = Vec::new();
+    let mut root_dir: Option<u8> = None;
+    struct Walk<'a> {
+        mi_rows: usize,
+        mi_cols: usize,
+        above_c: &'a mut [u8],
+        left_c: &'a mut [u8],
+        want: &'a dyn Fn(usize, usize, usize) -> u8,
+        out: &'a mut Vec<ChromaOp>,
+        root_inferred: Option<u8>,
+        ss: (usize, usize),
+    }
+    fn walk_c(
+        st: &mut Walk<'_>,
+        r: usize,
+        c: usize,
+        b: usize,
+        root_dir: &mut Option<u8>,
+        is_root: bool,
+    ) {
+        if r >= st.mi_rows || c >= st.mi_cols {
+            return;
+        }
+        let (w, h) = (MI_W[b], MI_H[b]);
+        let (cw4, ch4) = ((w >> st.ss.0).max(1), (h >> st.ss.1).max(1));
+        let has_rows = r + h / 2 < st.mi_rows;
+        let has_cols = c + w / 2 < st.mi_cols;
+        let mut part: Option<u8> = None;
+        if cw4.max(ch4) == 1 || b == 3 || (SUBSIZE_HORZ[b] == INV && SUBSIZE_VERT[b] == INV) {
+            part = Some(PART_NONE);
+        } else if !has_rows || !has_cols {
+            if w == h {
+                part = Some(if !has_rows { HORZ } else { VERT });
+            } else if w > h {
+                if !has_cols || st.mi_rows <= r + h / 4 {
+                    part = Some(VERT);
+                }
+            } else if !has_rows || st.mi_cols <= c + w / 4 {
+                part = Some(HORZ);
+            }
+        }
+        if part.is_none() && is_root && st.root_inferred.is_some() {
+            part = st.root_inferred;
+        }
+        let part = match part {
+            Some(p) => p,
+            None => {
+                let ctx1 = raw_ctx(st.above_c, st.left_c, r, c, b);
+                let want = (st.want)(r, c, b);
+                let split = if !has_rows || !has_cols {
+                    true
+                } else {
+                    let s = want != PART_NONE;
+                    st.out.push(ChromaOp::Split {
+                        ctx: ctx1 + BSIZE_MAP[b] * 4,
+                        bit: s as u32,
+                    });
+                    s
+                };
+                if !split {
+                    PART_NONE
+                } else if cw4.min(ch4) == 1 {
+                    if cw4 > ch4 { VERT } else { HORZ }
+                } else if b == 4 || b == 21 {
+                    HORZ
+                } else if b == 5 || b == 22 {
+                    VERT
+                } else {
+                    let v_ok = SUBSIZE_VERT[b] != INV && chroma_valid(w / 2, h, st.ss);
+                    let h_ok = SUBSIZE_HORZ[b] != INV && chroma_valid(w, h / 2, st.ss);
+                    if v_ok && h_ok {
+                        let d = if want == HORZ { HORZ } else { VERT };
+                        st.out.push(ChromaOp::Dir {
+                            ctx: ctx1 + BSIZE_RECT_MAP[b] * 4,
+                            bit: d as u32,
+                        });
+                        d
+                    } else if v_ok {
+                        VERT
+                    } else {
+                        HORZ
+                    }
+                }
+            }
+        };
+        if is_root {
+            *root_dir = Some(part);
+        }
+        if part == PART_NONE {
+            st.out.push(ChromaOp::Leaf {
+                mi_row: r,
+                mi_col: c,
+                bw_mi: w,
+                bh_mi: h,
+            });
+            update_pctx(st.above_c, st.left_c, r, c, b);
+        } else if part == HORZ {
+            let sub = SUBSIZE_HORZ[b] as usize;
+            walk_c(st, r, c, sub, root_dir, false);
+            walk_c(st, r + h / 2, c, sub, root_dir, false);
+        } else {
+            let sub = SUBSIZE_VERT[b] as usize;
+            walk_c(st, r, c, sub, root_dir, false);
+            walk_c(st, r, c + w / 2, sub, root_dir, false);
+        }
+    }
+    let root_inferred = if lroot == PART_NONE {
+        Some(PART_NONE)
+    } else if children_other {
+        Some(lroot)
+    } else {
+        None
+    };
+    let mut st = Walk {
+        mi_rows,
+        mi_cols,
+        above_c,
+        left_c,
+        want,
+        out: &mut out,
+        root_inferred,
+        ss,
+    };
+    walk_c(&mut st, r0, c0, 12, &mut root_dir, true);
+    let cfl_disallowed = match root_dir {
+        Some(d) if d != PART_NONE => lroot == PART_NONE || d != lroot,
+        _ => false,
+    };
+    (out, cfl_disallowed)
 }

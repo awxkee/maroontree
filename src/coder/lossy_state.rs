@@ -3737,7 +3737,17 @@ impl<'a> LossyTile<'a> {
         self.idct = idct;
         self.intrapred = intrapred;
         self.kmeans = kmeans;
-        self.rd = rd;
+        let t = crate::tuning::get();
+        let wsse = if self.mono {
+            t.wsse_400
+        } else if self.ss420 {
+            t.wsse_420
+        } else if self.ss422 {
+            t.wsse_422
+        } else {
+            t.wsse_444
+        };
+        self.rd = rd.with_weighted_sse(wsse.then_some(t.wsse_scale));
         self
     }
 

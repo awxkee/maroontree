@@ -49,6 +49,12 @@ pub(crate) struct CcsoConfig {
 pub(crate) struct Config {
     pub(crate) layout: Layout,
     pub(crate) base_q: u32,
+    /// Semi-decoupled partitioning (separate key-frame chroma tree).
+    pub(crate) sdp: bool,
+    /// Quantization-matrix levels `(luma, chroma)`; `None` = QM off.
+    pub(crate) qm: Option<(u8, u8)>,
+    /// Lossy screen-content tools (palette) for the frame.
+    pub(crate) sct: bool,
     pub(crate) uv_ac_delta_q: i32,
     pub(crate) deblock: bool,
     pub(crate) db_apply: (bool, bool, bool, bool),
@@ -148,7 +154,7 @@ pub(crate) fn sequence_header(config: &Config, width: u32, height: u32) -> Vec<u
     b.write_bit(0);
     b.write_bit(0); // superblock size
     if has_chroma {
-        b.write_bit(0); // semi-decoupled partition
+        b.write_bit(config.sdp as u32); // semi-decoupled partition
     }
     b.write_bit(0);
     b.write_bit(0); // partition
@@ -230,8 +236,9 @@ pub(crate) fn frame_header(
     b.write_uvlc(0);
     // Reduced/single-picture sequence headers infer SELECT_SCREEN_CONTENT_TOOLS.
     // Lossless frames enable SCC for palettes and optionally intra block copy.
-    b.write_bit(config.lossless as u32); // allow_screen_content_tools
-    if config.lossless {
+    let sct = config.lossless || config.sct;
+    b.write_bit(sct as u32); // allow_screen_content_tools
+    if sct {
         b.write_bit(0); // cur_frame_force_integer_mv
     }
     b.write_bit(config.allow_intrabc as u32);
@@ -308,8 +315,21 @@ pub(crate) fn frame_header_body(
     // high-bit-depth streams. The decoder reads 8 + (seqhdr.hbd != 0) bits.
     let q_bits = 8 + u32::from(config.bit_depth > 8);
     b.write_bits(if config.lossless { 0 } else { config.base_q }, q_bits);
-    b.write_bit(0);
-    b.write_bit(0); // segmentation.enabled = 0, qm.enabled = 0
+    b.write_bit(0); // segmentation.enabled = 0
+    match config.qm {
+        Some((qy, quv)) if !config.lossless => {
+            b.write_bit(1); // qm.enabled
+            b.write_bits(qy as u32, 4);
+            if config.layout.has_chroma() {
+                // uv levels equal to y, else u (v = u: no separate uv delta-q).
+                b.write_bit((qy == quv) as u32);
+                if qy != quv {
+                    b.write_bits(quv as u32, 4);
+                }
+            }
+        }
+        _ => b.write_bit(0), // qm.enabled = 0
+    }
     // delta_q_params: present flag (gated on quant.yac != 0, true for lossy),
     // then 2-bit res_log2. The decoder reads no delta_lf here (AVM continues with
     // TCQ/parity), so this inserts exactly present(+res) with no further change.

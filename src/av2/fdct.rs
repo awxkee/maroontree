@@ -268,6 +268,7 @@ fn fdct64_1d(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_to_levels(
     coeff: &[i32],
     n: usize,
@@ -275,29 +276,48 @@ pub(crate) fn quantize_to_levels(
     factor: f32,
     thresh: f32,
     scan: &[u16],
-) -> (Vec<f32>, Vec<f32>) {
+    dz: f32,
+    lev: &mut Vec<f32>,
+    prm: &mut Vec<f32>,
+) {
     let inv_q = factor / qstep as f32;
     let th = thresh;
     // Dead-zone quantizer: round with a bias < 0.5 toward zero (AV1/AV2 use ~0.36 for AC),
     // instead of round-to-nearest. Zeros more small coefficients, cutting rate at matched
-    // distortion. Overridable for calibration; 0.5 == plain round-to-nearest.
-    let dz: f32 = 0.5;
-    let mut lev = vec![0f32; scan.len()];
-    let mut prm = vec![0f32; scan.len()];
+    // distortion. `dz` = 0.5 is plain round-to-nearest (see `Basis::dz`).
+    lev.clear();
+    lev.resize(scan.len(), 0.0);
+    prm.clear();
+    prm.resize(scan.len(), 0.0);
     // Width-w AVM scans (rc=row*cw+col) index the row-major fdct out directly;
     // legacy stride-32 scans (rc=col*32+row) use the old decode.
     let wscan = !scan.is_empty() && scan.get(1).is_some_and(|&v| v as usize == n);
+    // Quantization matrix: coefficient (row, col) quantizes at qstep * w / 32.
+    let ch = scan.len() / n.max(1);
+    let qm = crate::av2::qm::weights(n, ch);
+    // The TU widths are powers of two: (idx % n, idx / n) as mask and shift.
+    let pow2 = n.is_power_of_two();
+    let (mask, sh) = (n.wrapping_sub(1), n.trailing_zeros());
     for ((&rc, prm), lev) in scan.iter().zip(prm.iter_mut()).zip(lev.iter_mut()) {
         let rc = rc as usize;
         let idx = if wscan { rc } else { (rc & 31) * n + (rc >> 5) };
-        let pr = coeff[idx] as f32 * inv_q;
+        let pr = match qm {
+            Some(t) => {
+                let (col, row) = if pow2 {
+                    (idx & mask, idx >> sh)
+                } else {
+                    (idx % n, idx / n)
+                };
+                coeff[idx] as f32 * inv_q * 32.0 / t[col * ch + row] as f32
+            }
+            None => coeff[idx] as f32 * inv_q,
+        };
         let a = pr.abs();
         *prm = a;
         if a >= th {
             *lev = pr.signum() * (a + (dz - 0.5)).max(0.0).round();
         }
     }
-    (lev, prm)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -309,6 +329,16 @@ pub(crate) enum FwdKind {
     AdstAdst16, // 16×16 ADST_ADST (luma16x16_adst)
     AdstDct16,  // 16×16 ADST_DCT  (luma16x16_adst_dct: col ADST, row DCT)
     DctAdst16,  // 16×16 DCT_ADST  (luma16x16_dct_adst: col DCT, row ADST)
+    /// 4×4 with per-axis ADST/DCT (`col_adst` = vertical pass).
+    Tx4 {
+        col_adst: bool,
+        row_adst: bool,
+    },
+    /// 8×8 with per-axis ADST/DCT (`col_adst` = vertical pass).
+    Tx8 {
+        col_adst: bool,
+        row_adst: bool,
+    },
 }
 pub(crate) static DCT16_FWD_KERNEL: [i8; 256] = [
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 90, 87, 80, 70, 57, 43, 26, 9,
@@ -458,6 +488,40 @@ fn fdct8_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     }
 }
 
+/// 1-D forward ADST, 8 point: the transpose of the decoder's (orthonormal) inverse
+/// kernel [`crate::av2::itx::ADST8_KERNEL`]. Column-strided I/O like [`fdct8_1d`].
+fn fadst8_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
+    let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
+    let km = &crate::av2::itx::ADST8_KERNEL;
+    for i in 0..line {
+        let o = &mut dst[i * 8..i * 8 + 8];
+        for (j, oj) in o.iter_mut().enumerate() {
+            let sum: i32 = (0..8)
+                .map(|k| src[k * line + i] * km[k * 8 + j] as i32)
+                .sum();
+            *oj = (sum + add) >> shift;
+        }
+    }
+}
+
+/// 2-D 8×8 forward transform with per-axis ADST/DCT (avm `fwd_txfm_c`, shifts {2, 10}).
+/// `col_adst` = vertical pass, `row_adst` = horizontal pass. `[vfreq*8+hfreq]`.
+pub(crate) fn fwd8x8(resid: &[i32; 64], col_adst: bool, row_adst: bool) -> [i32; 64] {
+    let mut buf = [0i32; 64];
+    let mut coeff = [0i32; 64];
+    if col_adst {
+        fadst8_1d(resid, &mut buf, 2, 8);
+    } else {
+        fdct8_1d(resid, &mut buf, 2, 8);
+    }
+    if row_adst {
+        fadst8_1d(&buf, &mut coeff, 10, 8);
+    } else {
+        fdct8_1d(&buf, &mut coeff, 10, 8);
+    }
+    coeff
+}
+
 /// 1-D forward DCT-II, 4 point (avm `fwd_txfm_dct2_size4_c`). Column-strided I/O.
 fn fdct4_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
@@ -474,6 +538,46 @@ fn fdct4_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
         o[3] = (m(3, 0) * b[0] + m(3, 1) * b[1] + add) >> shift;
     }
 }
+/// avm 4-point ADST kernel (symmetric, so the forward and inverse matrices agree).
+#[rustfmt::skip]
+static ADST4_FWD_KERNEL: [i8; 16] = [
+    18, 50, 75, 89,
+    50, 89, 18, -75,
+    75, 18, -89, 50,
+    89, -75, 50, -18,
+];
+/// 1-D forward ADST, 4 point. Column-strided I/O like [`fdct4_1d`].
+fn fadst4_1d(src: &[i32], dst: &mut [i32], shift: i32, line: usize) {
+    let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
+    for i in 0..line {
+        let o = &mut dst[i * 4..i * 4 + 4];
+        for (j, oj) in o.iter_mut().enumerate() {
+            let sum: i32 = (0..4)
+                .map(|k| src[k * line + i] * ADST4_FWD_KERNEL[j * 4 + k] as i32)
+                .sum();
+            *oj = (sum + add) >> shift;
+        }
+    }
+}
+
+/// 2-D 4×4 forward transform with per-axis ADST/DCT (avm `fwd_txfm_c`, shifts {1, 10}).
+/// `col_adst` = vertical pass, `row_adst` = horizontal pass. `[vfreq*4+hfreq]`.
+pub(crate) fn fwd4x4(resid: &[i32; 16], col_adst: bool, row_adst: bool) -> [i32; 16] {
+    let mut buf = [0i32; 16];
+    let mut coeff = [0i32; 16];
+    if col_adst {
+        fadst4_1d(resid, &mut buf, 1, 4);
+    } else {
+        fdct4_1d(resid, &mut buf, 1, 4);
+    }
+    if row_adst {
+        fadst4_1d(&buf, &mut coeff, 10, 4);
+    } else {
+        fdct4_1d(&buf, &mut coeff, 10, 4);
+    }
+    coeff
+}
+
 /// avm `fwd_tx_shift[TX_SIZE]` — (shift_1st for col/height pass, shift_2nd for row/width pass).
 pub(crate) fn fwd_shifts(w: usize, h: usize) -> (i32, i32) {
     match (w, h) {
@@ -588,6 +692,10 @@ pub(crate) fn fdct_rect(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> u
 mod tests {
     use super::*;
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     const TX_SIZES: &[(usize, usize)] = &[
         (4, 4),
         (8, 8),
@@ -633,6 +741,20 @@ mod tests {
         out
     }
 
+    #[test]
+    fn fwd8x8_dct_matches_fdct_rect() {
+        let resid = residual_case(8, 8, 3);
+        let mut r = [0i32; 64];
+        r.copy_from_slice(&resid);
+        let mut out = [0i32; 1024];
+        let n = fdct_rect(&resid, 8, 8, &mut out);
+        assert_eq!(&fwd8x8(&r, false, false)[..], &out[..n]);
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     unsafe fn assert_fdct_impl_matches_scalar(name: &str, simd: FdctRectFn) {
         // Run a few sequences in intentionally mixed order so TLS scratch reuse is exercised.
         for seed in 0..8u32 {

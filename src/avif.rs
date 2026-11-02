@@ -276,7 +276,8 @@ pub struct EncodeConfig {
     pub adaptive_quant: bool,
     pub variance_boost: bool,
     pub dark_aq: bool,
-    /// Enable CDEF
+    /// Enable AV1 CDEF (ExtraSlow always enables it). AV2 stills always search
+    /// CDEF per superblock and ignore this flag.
     pub cdef: bool,
     /// Enable luma Wiener loop restoration (off by default)
     pub wiener: bool,
