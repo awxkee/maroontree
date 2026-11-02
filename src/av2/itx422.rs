@@ -79,9 +79,11 @@ pub(crate) fn reconstruct_chroma(
     let (cw, ch) = (w.min(32), h.min(32));
     let txs = dc_tx_scale(w, h);
     let tx = dc_tx_index(w, h);
+    let qm = crate::av2::qm::weights(cw, ch);
     // Dequantize scan-ordered levels directly into dav2d's transposed coeff
     // layout (`coeff[col*ch + row]`), skipping the intermediate grid + transpose.
-    let mut coeff = vec![0i32; cw * ch];
+    let mut coeff_buf = [0i32; 1024];
+    let coeff = &mut coeff_buf[..cw * ch];
     // Width-w scans: rc=row*cw+col; legacy stride-32: rc=col*32+row.
     let wscan = scan.get(1).is_some_and(|&v| v as usize == cw);
     let sh = (cw as u32).trailing_zeros();
@@ -95,7 +97,7 @@ pub(crate) fn reconstruct_chroma(
                 (rc & 31, rc >> 5)
             };
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, col * ch + row)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
             let dqmag = (rounded >> txs) as i32;
             coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
@@ -103,7 +105,7 @@ pub(crate) fn reconstruct_chroma(
     }
     let p = pred.fast_round() as i32;
     let mut out = vec![0f32; w * h];
-    crate::av2::itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |_| p);
+    crate::av2::itx::inv_txfm_recon_f32(&mut out, coeff, 0, tx, bd, |_| p);
     out
 }
 
@@ -116,12 +118,47 @@ pub(crate) fn reconstruct_chroma_pred(
     h: usize,
     bd: i32,
 ) -> Vec<f32> {
+    reconstruct_chroma_pred_tx(pred, lev, qstep, scan, w, h, bd, 0)
+}
+
+/// [`reconstruct_chroma_pred`] with an explicit transform type (`itx::txtp`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_chroma_pred_tx(
+    pred: &[i32],
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    bd: i32,
+    txtp: usize,
+) -> Vec<f32> {
+    let mut out = vec![0f32; w * h];
+    reconstruct_chroma_pred_tx_into(pred, lev, qstep, scan, w, h, bd, txtp, &mut out);
+    out
+}
+
+/// [`reconstruct_chroma_pred_tx`] into `out[..w*h]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_chroma_pred_tx_into(
+    pred: &[i32],
+    lev: &[f32],
+    qstep: i32,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    bd: i32,
+    txtp: usize,
+    out: &mut [f32],
+) {
     // Per-pixel (motion-compensated) predictor variant of reconstruct_chroma.
     // Handles w/h up to 64 (TX64 keeps only the top-left 32x32 coeffs).
     let (cw, ch) = (w.min(32), h.min(32));
     let txs = dc_tx_scale(w, h);
     let tx = dc_tx_index(w, h);
-    let mut coeff = vec![0i32; cw * ch];
+    let qm = crate::av2::qm::weights(cw, ch);
+    let mut coeff_buf = [0i32; 1024];
+    let coeff = &mut coeff_buf[..cw * ch];
     let wscan = scan.get(1).is_some_and(|&v| v as usize == cw);
     let sh = (cw as u32).trailing_zeros();
     let smask = cw - 1;
@@ -134,15 +171,13 @@ pub(crate) fn reconstruct_chroma_pred(
                 (rc & 31, rc >> 5)
             };
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, col * ch + row)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> txs) as i32;
             coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
         }
     }
-    let mut out = vec![0f32; w * h];
-    crate::av2::itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |i| pred[i]);
-    out
+    crate::av2::itx::inv_txfm_recon_f32(&mut out[..w * h], coeff, txtp, tx, bd, |i| pred[i]);
 }
 
 pub(crate) fn reconstruct_chroma_cfl(
@@ -154,33 +189,7 @@ pub(crate) fn reconstruct_chroma_cfl(
     h: usize,
     bd: i32,
 ) -> Vec<f32> {
-    let (cw, ch) = (w.min(32), h.min(32));
-    let txs = dc_tx_scale(w, h);
-    let tx = dc_tx_index(w, h);
-    let mut coeff = vec![0i32; cw * ch];
-    // Width-sensitive scan mapping, matching reconstruct_chroma: width-w scans use
-    // rc = row*cw + col; the legacy stride-32 packed scan uses rc = col*32 + row.
-    let wscan = scan.get(1).is_some_and(|&v| v as usize == cw);
-    let sh = (cw as u32).trailing_zeros();
-    let smask = cw - 1;
-    for (&l, &rc) in lev.iter().zip(scan.iter()) {
-        if l != 0.0 {
-            let rc = rc as usize;
-            let (row, col) = if wscan {
-                (rc >> sh, rc & smask)
-            } else {
-                (rc & 31, rc >> 5)
-            };
-            let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
-            let rounded = (mag + (1 << 2)) >> 3;
-            let dqmag = (rounded >> txs) as i32;
-            coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
-        }
-    }
-    let mut out = vec![0f32; w * h];
-    crate::av2::itx::inv_txfm_recon_f32(&mut out, &coeff, 0, tx, bd, |i| pred[i]);
-    out
+    reconstruct_chroma_pred_tx(pred, lev, qstep, scan, w, h, bd, 0)
 }
 
 #[rustfmt::skip]
@@ -273,6 +282,7 @@ pub(crate) fn reconstruct_luma16_adst(
     let dq_min = -(1i32 << (7 + bd));
     let dq_max = (1i32 << (7 + bd)) - 1;
     let mut block = [0i32; 256];
+    let qm = crate::av2::qm::weights(16, 16);
     for (&l, &rc) in lev[..256].iter().zip(scan[..256].iter()) {
         if l != 0.0 {
             let rc = rc as usize;
@@ -282,7 +292,8 @@ pub(crate) fn reconstruct_luma16_adst(
                 (rc >> 5) + (rc & 31) * 16
             };
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let q = crate::av2::qm::step(qm, qstep, (pos & 15) * 16 + (pos >> 4));
+            let mag = (li.abs() * q) & 0xffffff;
             let dqmag = ((mag + (1 << 2)) >> 3) as i32;
             block[pos] = (if li < 0 { -dqmag } else { dqmag }).clamp(dq_min, dq_max);
         }
@@ -329,6 +340,7 @@ pub(crate) fn reconstruct_luma16(
     // mismatch. Detect the convention exactly as `reconstruct_chroma` does.
     let wscan = scan.get(1).is_some_and(|&v| v as usize == 16);
     let mut coeff = [0i32; 256];
+    let qm = crate::av2::qm::weights(16, 16);
     for (&l, &rc) in lev[..256].iter().zip(scan[..256].iter()) {
         if l != 0.0 {
             let rc = rc as usize;
@@ -338,7 +350,7 @@ pub(crate) fn reconstruct_luma16(
                 (rc & 31, rc >> 5)
             };
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, col * 16 + row)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
             let dqmag = rounded as i32; // tx_scale(TX_16X16)=0
             coeff[col * 16 + row] = if li < 0 { -dqmag } else { dqmag };
@@ -374,6 +386,7 @@ pub(crate) fn reconstruct_luma_64x16(
 ) -> [f32; 1024] {
     let h = 16usize;
     let mut coeff = [0i32; 512];
+    let qm = crate::av2::qm::weights(32, 16);
     for (&l, &rc) in lev[..512].iter().zip(scan[..512].iter()) {
         if l != 0.0 {
             // SCAN32X16 rc = height_freq*32 + width_freq (avm width-32 scan row-major);
@@ -381,7 +394,7 @@ pub(crate) fn reconstruct_luma_64x16(
             let hf = rc as usize >> 5; // height freq 0..15
             let wf = rc as usize & 31; // width freq 0..31
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, wf * h + hf)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> 1) as i32; // tx_scale(TX_64X16)=1
             coeff[wf * h + hf] = if li < 0 { -dqmag } else { dqmag };
@@ -410,12 +423,13 @@ pub(crate) fn reconstruct_luma_16x64(
     // Zero-initialize: the inverse transform reads the full coefficient block,
     // so every uncoded (zero) coefficient position must be 0, not stack garbage.
     let mut coeff = [0i32; 512];
+    let qm = crate::av2::qm::weights(16, 32);
     for (&l, &rc) in lev[..512].iter().zip(scan[..512].iter()) {
         if l != 0.0 {
             // SCAN16X32 is the AVM width-16 scan: rc = row*16 + col.
             let (row, col) = (rc as usize >> 4, rc as usize & 15);
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, col * ch + row)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3;
             let dqmag = (rounded >> 1) as i32; // tx_scale(TX_16X64)=1
             coeff[col * ch + row] = if li < 0 { -dqmag } else { dqmag };
@@ -443,11 +457,12 @@ pub(crate) fn reconstruct_luma(
     // Zero-initialize: the inverse transform reads the full coefficient block,
     // so every uncoded (zero) coefficient position must be 0, not stack garbage.
     let mut coeff = [0i32; 1024];
+    let qm = crate::av2::qm::weights(32, 32);
     for (&l, &rc) in lev[..1024].iter().zip(scan[..1024].iter()) {
         if l != 0.0 {
             let (col, row) = (rc as usize >> 5, rc as usize & 31);
             let li = l as i64;
-            let mag = (li.abs() * qstep as i64) & 0xffffff;
+            let mag = (li.abs() * crate::av2::qm::step(qm, qstep, col * 32 + row)) & 0xffffff;
             let rounded = (mag + (1 << 2)) >> 3; // ROUND_POWER_OF_TWO(_, 3)
             let dqmag = (rounded >> 1) as i32; // >> tx_scale (TX_32X32 => 1)
             coeff[col * 32 + row] = if li < 0 { -dqmag } else { dqmag };

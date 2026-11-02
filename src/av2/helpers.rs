@@ -506,6 +506,11 @@ pub(crate) fn rect_sse_f32(
     width: usize,
     height: usize,
 ) -> f32 {
+    if wsse_on() {
+        return weighted_sse(height, width, |r, c| {
+            a.plane[(a.y + r) * a.stride + a.x + c] - b.plane[(b.y + r) * b.stride + b.x + c]
+        });
+    }
     let f = resolve_pixel_sse_f32();
     rect_rows(a.plane, a.stride, a.y, a.x, width, height)
         .zip(rect_rows(b.plane, b.stride, b.y, b.x, width, height))
@@ -1076,6 +1081,11 @@ pub(crate) fn pixel_sse_rounded_block(
     w: usize,
     h: usize,
 ) -> f32 {
+    if wsse_on() {
+        return weighted_sse(h, w, |r, c| {
+            src[(src_y + r) * src_stride + src_x + c] - rec[r * rec_stride + c].round()
+        });
+    }
     let f = resolve_pixel_sse_rounded();
     rect_rows(src, src_stride, src_y, src_x, w, h)
         .zip(rec.chunks_exact(rec_stride).map(|row| &row[..w]))
@@ -1222,6 +1232,11 @@ pub(crate) const TX16_TYPE_RATE_DELTA: [f32; 4] = [0.0, 0.527_067_7, 3.126_745_2
 /// approximately the same scale as pixel SSE (and therefore the existing lambda).
 pub(crate) fn tx16_distortion(src: &[f32; 256], rec: &[f32]) -> f32 {
     debug_assert_eq!(rec.len(), 256);
+    if wsse_on() {
+        return weighted_sse(16, 16, |r, c| {
+            src[r * 16 + c].round() - rec[r * 16 + c].round()
+        });
+    }
     let mut pixel = 0.0f32;
     let mut edge = 0.0f32;
     for y in 0..16 {
@@ -1264,11 +1279,14 @@ pub(crate) fn tx16_dc_only(lev: &[f32]) -> bool {
 }
 
 pub(crate) fn levels_to_coeffs(lev: &[f32]) -> Vec<Coeff> {
-    lev.iter()
-        .enumerate()
-        .filter(|&(_, l)| *l != 0.0)
-        .map(|(k, &l)| (k, l as i32))
-        .collect()
+    let mut out = Vec::with_capacity(lev.iter().filter(|&&l| l != 0.0).count());
+    out.extend(
+        lev.iter()
+            .enumerate()
+            .filter(|&(_, l)| *l != 0.0)
+            .map(|(k, &l)| (k, l as i32)),
+    );
+    out
 }
 
 pub(crate) fn sb_tu4_contexts(
@@ -1414,7 +1432,9 @@ where
         return (0..n).map(f).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let wsse = wsse_on();
     let work = || {
+        WSSE.with(|c| c.set(wsse));
         let mut got: Vec<(usize, T)> = Vec::new();
         loop {
             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1702,8 +1722,13 @@ where
     std::thread::scope(|scope| {
         // Main thread is one of the `nthreads` workers (mirrors par_map_indexed).
         let workers = nthreads.min(n);
+        let wsse = wsse_on();
+        let worker = &worker;
         for _ in 0..workers - 1 {
-            scope.spawn(worker);
+            scope.spawn(move || {
+                WSSE.with(|c| c.set(wsse));
+                worker()
+            });
         }
         worker();
     });
@@ -2259,5 +2284,211 @@ mod tests {
             stats: crate::av2::avx::sum_sumsq_f32_avx2,
             cfl: crate::av2::avx::cfl_sse_i32_avx2,
         });
+    }
+}
+
+/// TEMP: log (area, eob, nnz, proxy, actual bits) per emitted luma TU to $MT_PLOG.
+pub(crate) fn mt_plog(area: usize, nz: &[Coeff], bits: f32) {
+    use std::io::Write;
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let f = F.get_or_init(|| {
+        std::env::var("MT_PLOG")
+            .ok()
+            .map(|p| std::sync::Mutex::new(std::fs::File::create(p).unwrap()))
+    });
+    if let Some(m) = f {
+        let eob = nz.iter().map(|&(s, _)| s).max().unwrap_or(0);
+        let l1: u32 = nz.iter().map(|&(_, l)| l.unsigned_abs()).sum();
+        let mut g = m.lock().unwrap();
+        let _ = writeln!(
+            g,
+            "{} {} {} {} {:.2} {:.2}",
+            area,
+            eob,
+            nz.len(),
+            l1,
+            coeff_tu_rate_proxy_f32(nz),
+            bits
+        );
+    }
+}
+
+thread_local! {
+    /// Whether this thread's RD decisions measure distortion with
+    /// [`weighted_sse`]; set per frame by the format's encoder ([`set_wsse`]) and
+    /// carried into the worker threads.
+    static WSSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether RD decisions use [`weighted_sse`] on this thread.
+#[inline]
+pub(crate) fn wsse_on() -> bool {
+    WSSE.with(|c| c.get())
+}
+
+/// Select this thread's decision distortion for a frame: weighted when `on`
+/// (TEMP knob WSSE overrides).
+pub(crate) fn set_wsse(on: bool) {
+    let on = crate::av2::rd::knob_or("WSSE", if on { 1.0 } else { 0.0 }) > 0.0;
+    WSSE.with(|c| c.set(on));
+}
+
+/// Weights of [`weighted_sse`] on a 4x4 DCT of the error: DC error is dearer,
+/// the lowest AC at par, the second band discounted, high frequencies cheap
+/// (the hpvca decision distortion).
+static DISTORTION_WEIGHTS: [[f32; 4]; 4] = {
+    const DC: f32 = 1.8;
+    const DIAG: f32 = 0.8;
+    const AXIS: f32 = 0.4;
+    const HF: f32 = 0.2;
+    [
+        [DC, 1.0, AXIS, HF],
+        [1.0, DIAG, HF, HF],
+        [AXIS, HF, HF, HF],
+        [HF, HF, HF, HF],
+    ]
+};
+
+/// Orthonormal 4-point DCT-II basis, `DCT4[k][i]`.
+static DCT4: [[f32; 4]; 4] = {
+    const A: f32 = 0.5;
+    const B: f32 = 0.653_281_5;
+    const C: f32 = 0.270_598_05;
+    [[A, A, A, A], [B, C, -C, -B], [A, -A, -A, A], [C, -B, B, -C]]
+};
+
+/// Perceptual squared error of an `h x w` region with sample errors `err(r, c)`:
+/// each 4x4 tile goes through an orthonormal DCT and its squared coefficients
+/// are weighted by `DISTORTION_WEIGHTS` (all weights 1 would be the plain SSE).
+/// Tiles past the region edge are padded with zero error.
+pub(crate) fn weighted_sse(h: usize, w: usize, err: impl Fn(usize, usize) -> f32) -> f32 {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { weighted_sse_neon(h, w, err) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    weighted_sse_scalar(h, w, err)
+}
+
+/// NEON [`weighted_sse`]: the four lanes carry four columns through the column
+/// DCT, then a lane-broadcast row DCT leaves coefficient (k, l) in lane l; one
+/// accumulator per frequency row (the hpvca kernel, with zero-padded edges).
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+#[target_feature(enable = "neon")]
+fn weighted_sse_neon(h: usize, w: usize, err: impl Fn(usize, usize) -> f32) -> f32 {
+    use core::arch::aarch64::*;
+    unsafe {
+        let basis: [float32x4_t; 4] = std::array::from_fn(|j| {
+            let column = std::array::from_fn::<_, 4, _>(|k| DCT4[k][j]);
+            vld1q_f32(column.as_ptr())
+        });
+        let weights: [float32x4_t; 4] =
+            std::array::from_fn(|k| vld1q_f32(DISTORTION_WEIGHTS[k].as_ptr()));
+        let mut total = [vdupq_n_f32(0.0); 4];
+        for r0 in (0..h).step_by(4) {
+            for c0 in (0..w).step_by(4) {
+                let rows: [float32x4_t; 4] = std::array::from_fn(|i| {
+                    let row = std::array::from_fn::<_, 4, _>(|j| {
+                        if r0 + i < h && c0 + j < w {
+                            err(r0 + i, c0 + j)
+                        } else {
+                            0.0
+                        }
+                    });
+                    vld1q_f32(row.as_ptr())
+                });
+                for k in 0..4 {
+                    let mut t = vmulq_n_f32(rows[0], DCT4[k][0]);
+                    t = vfmaq_n_f32(t, rows[1], DCT4[k][1]);
+                    t = vfmaq_n_f32(t, rows[2], DCT4[k][2]);
+                    t = vfmaq_n_f32(t, rows[3], DCT4[k][3]);
+                    let mut c = vmulq_laneq_f32::<0>(basis[0], t);
+                    c = vfmaq_laneq_f32::<1>(c, basis[1], t);
+                    c = vfmaq_laneq_f32::<2>(c, basis[2], t);
+                    c = vfmaq_laneq_f32::<3>(c, basis[3], t);
+                    total[k] = vfmaq_f32(total[k], vmulq_f32(weights[k], c), c);
+                }
+            }
+        }
+        vaddvq_f32(vaddq_f32(
+            vaddq_f32(total[0], total[1]),
+            vaddq_f32(total[2], total[3]),
+        ))
+    }
+}
+
+/// Scalar [`weighted_sse`].
+#[cfg_attr(all(target_arch = "aarch64", feature = "neon"), allow(dead_code))]
+fn weighted_sse_scalar(h: usize, w: usize, err: impl Fn(usize, usize) -> f32) -> f32 {
+    let mut total = 0.0f32;
+    for r0 in (0..h).step_by(4) {
+        for c0 in (0..w).step_by(4) {
+            let mut e = [[0.0f32; 4]; 4];
+            for (i, row) in e.iter_mut().enumerate().take(h - r0) {
+                for (j, v) in row.iter_mut().enumerate().take(w - c0) {
+                    *v = err(r0 + i, c0 + j);
+                }
+            }
+            let mut t = [[0.0f32; 4]; 4];
+            for k in 0..4 {
+                for j in 0..4 {
+                    t[k][j] = DCT4[k][0] * e[0][j]
+                        + DCT4[k][1] * e[1][j]
+                        + DCT4[k][2] * e[2][j]
+                        + DCT4[k][3] * e[3][j];
+                }
+            }
+            for k in 0..4 {
+                for l in 0..4 {
+                    let c = t[k][0] * DCT4[l][0]
+                        + t[k][1] * DCT4[l][1]
+                        + t[k][2] * DCT4[l][2]
+                        + t[k][3] * DCT4[l][3];
+                    total += DISTORTION_WEIGHTS[k][l] * c * c;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Decision distortion of a `w x h` block: `src` vs rounded `rec` (both
+/// row-major with their own strides) — plain or (WSSE) weighted squared error.
+pub(crate) fn dist_rounded(
+    src: &[f32],
+    src_stride: usize,
+    rec: &[f32],
+    rec_stride: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    if wsse_on() {
+        weighted_sse(h, w, |r, c| {
+            src[r * src_stride + c] - rec[r * rec_stride + c].round()
+        })
+    } else {
+        let mut d = 0.0f32;
+        for r in 0..h {
+            for (&a, &b) in src[r * src_stride..r * src_stride + w]
+                .iter()
+                .zip(&rec[r * rec_stride..r * rec_stride + w])
+            {
+                d += (a - b.round()).powi(2);
+            }
+        }
+        d
+    }
+}
+
+/// Decision distortion of two row-major `w`-wide blocks (`rec` rounded): plain
+/// [`pixel_sse_rounded`] or (WSSE) [`weighted_sse`].
+pub(crate) fn dist_flat(src: &[f32], rec: &[f32], w: usize) -> f32 {
+    if wsse_on() {
+        let h = rec.len() / w;
+        weighted_sse(h, w, |r, c| src[r * w + c] - rec[r * w + c].round())
+    } else {
+        pixel_sse_rounded(src, rec)
     }
 }

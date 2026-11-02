@@ -111,6 +111,8 @@ pub(crate) struct LeafDecision {
     pub tu: Vec<Coeff>,
     /// Luma intra mode (32×32 split leaf) or 16×16 tx-type index; 0 where unused.
     pub mode_idx: usize,
+    /// The leaf's luma (internal mode, angle delta).
+    pub dir: (usize, i8),
     /// The leaf's luma reconstruction, row-major `bw_mi*4 × bh_mi*4`, restored via
     /// `put_block(_rect)` in replay so neighbors + emit contexts match the search.
     pub recon_y: Vec<f32>,
@@ -129,6 +131,8 @@ pub(crate) struct Leaf400 {
     pub bh_mi: usize,
     pub tus: Vec<Vec<Coeff>>,
     pub mode_idx: usize,
+    /// Angle delta of a directional `mode_idx` (0 otherwise).
+    pub angle_delta: i8,
     pub tx_idx: usize,
     pub recon_y: Vec<f32>,
 }
@@ -157,6 +161,8 @@ pub(crate) struct Leaf420 {
     pub bh_mi: usize,
     pub tus: Vec<Vec<Coeff>>,
     pub mode_idx: usize,
+    /// Angle delta of a directional `mode_idx` (0 otherwise).
+    pub angle_delta: i8,
     pub tx_idx: usize,
     pub recon_y: Vec<f32>,
     pub chroma: Option<CflChoice>,
@@ -226,6 +232,27 @@ pub(crate) struct DecisionRecord {
     /// entry per SB): `Walk` reuses the captured leaf luma + chroma winners,
     /// `Fallback` re-searches. Populated by the 4:2:0 partition walk.
     luma420_walk: Vec<Sb420>,
+    /// Split-leaf luma search winners ([`leaf_choice`] tokens) in call order, so
+    /// the replay pass codes each leaf's captured mode / tx type without
+    /// re-running its search.
+    leaf_choices: Vec<u32>,
+    /// SDP chroma-tree plan per SB (4:2:0).
+    chroma_plans: Vec<u8>,
+}
+
+/// Pack a split-leaf luma search winner: internal mode, angle delta, tx type.
+pub(crate) fn leaf_choice(mode: usize, angle_delta: i32, tx: usize) -> u32 {
+    debug_assert!(mode < 16 && (-3..=3).contains(&angle_delta) && tx < 16);
+    mode as u32 | (((angle_delta + 3) as u32) << 4) | ((tx as u32) << 8)
+}
+
+/// Unpack a [`leaf_choice`] token into (mode, angle delta, tx type).
+pub(crate) fn unpack_leaf_choice(c: u32) -> (usize, i32, usize) {
+    (
+        (c & 15) as usize,
+        ((c >> 4) & 15) as i32 - 3,
+        ((c >> 8) & 15) as usize,
+    )
 }
 
 impl DecisionRecord {
@@ -238,6 +265,8 @@ impl DecisionRecord {
             chroma422_whole: Vec::new(),
             luma400: Vec::new(),
             luma420_walk: Vec::new(),
+            leaf_choices: Vec::new(),
+            chroma_plans: Vec::new(),
         }
     }
     pub(crate) fn push(&mut self, d: SbDecision) {
@@ -248,6 +277,10 @@ impl DecisionRecord {
     }
     pub(crate) fn push_mhccp(&mut self, m: Option<CflChoice>) {
         self.mhccp.push(m);
+    }
+    /// The MHCCP choices logged so far, emptying the record's list.
+    pub(crate) fn take_mhccp(&mut self) -> Vec<Option<CflChoice>> {
+        std::mem::take(&mut self.mhccp)
     }
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -266,6 +299,8 @@ impl DecisionRecord {
         self.chroma422_whole.append(&mut other.chroma422_whole);
         self.luma400.append(&mut other.luma400);
         self.luma420_walk.append(&mut other.luma420_walk);
+        self.leaf_choices.append(&mut other.leaf_choices);
+        self.chroma_plans.append(&mut other.chroma_plans);
     }
 
     pub(crate) fn push_sb400(&mut self, s: Sb400) {
@@ -287,6 +322,8 @@ pub(crate) struct DecisionCursor<'a> {
     chroma422_whole_at: usize,
     luma400_at: usize,
     luma420_walk_at: usize,
+    leaf_choice_at: usize,
+    chroma_plan_at: usize,
 }
 
 impl<'a> DecisionCursor<'a> {
@@ -300,6 +337,8 @@ impl<'a> DecisionCursor<'a> {
             chroma422_whole_at: 0,
             luma400_at: 0,
             luma420_walk_at: 0,
+            leaf_choice_at: 0,
+            chroma_plan_at: 0,
         }
     }
     /// Next 4:0:0 walk decision in call order, or `None` if exhausted (defensive
@@ -394,6 +433,62 @@ impl<'a> DecisionCursor<'a> {
             self.chroma422_whole_at += 1;
         }
         c
+    }
+}
+
+impl DecideMode<'_> {
+    /// The captured winner of the next split-leaf luma search (replay pass), or
+    /// `None` to run the search.
+    pub(crate) fn replay_leaf(&mut self) -> Option<u32> {
+        let DecideMode::Replay(cur) = self else {
+            return None;
+        };
+        let c = cur.rec.leaf_choices.get(cur.leaf_choice_at).copied();
+        if c.is_some() {
+            cur.leaf_choice_at += 1;
+        }
+        c
+    }
+    /// The captured SDP chroma-tree plan of the next SB (replay pass).
+    pub(crate) fn replay_chroma_plan(&mut self) -> Option<u8> {
+        let DecideMode::Replay(cur) = self else {
+            return None;
+        };
+        let c = cur.rec.chroma_plans.get(cur.chroma_plan_at).copied();
+        if c.is_some() {
+            cur.chroma_plan_at += 1;
+        }
+        c
+    }
+    /// Log an SB's SDP chroma-tree plan (capture pass).
+    pub(crate) fn capture_chroma_plan(&mut self, k: u8) {
+        if let DecideMode::Capture(rec) = self {
+            rec.chroma_plans.push(k);
+        }
+    }
+    /// Log a split-leaf luma search winner (capture pass).
+    pub(crate) fn capture_leaf(&mut self, c: u32) {
+        if let DecideMode::Capture(rec) = self {
+            rec.leaf_choices.push(c);
+        }
+    }
+    /// The captured MHCCP choice of the next chroma leaf (replay pass), or
+    /// `None` to run the fit.
+    pub(crate) fn replay_mhccp(&mut self) -> Option<Option<CflChoice>> {
+        match self {
+            DecideMode::Replay(cur) => cur.next_mhccp(),
+            _ => None,
+        }
+    }
+    /// Whether decisions are being logged (capture pass).
+    pub(crate) fn is_capture(&self) -> bool {
+        matches!(self, DecideMode::Capture(_))
+    }
+    /// Log a chroma leaf's MHCCP choice (capture pass).
+    pub(crate) fn capture_mhccp(&mut self, m: &Option<CflChoice>) {
+        if let DecideMode::Capture(rec) = self {
+            rec.push_mhccp(m.clone());
+        }
     }
 }
 

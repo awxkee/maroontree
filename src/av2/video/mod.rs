@@ -250,6 +250,10 @@ impl Av2VideoEncoder {
         // multithreaded single-tile SB-wavefront default.
         cfg.video_mode
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Video keeps round-to-nearest quantization (the still dead zone and the
+        // square-TU trellis RDOQ are tuned on stills only).
+        cfg.bases.set_dead_zone(0.5);
+        cfg.bases.set_square_rdoq(0, 0.0, 0.0);
         let n = if threads == 0 {
             std::thread::available_parallelism()
                 .map(|x| x.get())

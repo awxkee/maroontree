@@ -31,6 +31,7 @@ mod api;
 mod core;
 mod lossless;
 mod partition;
+mod sdp;
 #[cfg(test)]
 pub(crate) use partition::{
     INTER_MOTION_SKIP_RECT_COUNT, INTER_NEARMV_SKIP_16_COUNT, INTER_NEARMV_SKIP_32_COUNT,
@@ -39,6 +40,7 @@ pub(crate) use partition::{
     INTER_RESIDUAL_32_HIGH_EOB_COUNT, INTER_RESIDUAL_64_COUNT, INTER_SKIP_32_COUNT,
     INTER_SKIP_RECT_COUNT, INTRA_LEAF_COUNT, TOTAL_LEAF_COUNT,
 };
+pub(crate) use sdp::ChromaTree420;
 mod tiles;
 
 /// Whole-64 blocks committed on reference rank 1 (two-reference frames).

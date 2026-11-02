@@ -58,6 +58,11 @@ impl Av2Encoder {
         let cbf = to_plane(&planar_image.planes[1]);
         let crf = to_plane(&planar_image.planes[2]);
         let (pw, ph) = (sb_align(width), sb_align(height));
+        self.detect_screen_content(&yf, width, height);
+        if std::env::var("MT_DUMP_RECON").is_ok() {
+            self.capture_recon
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let config = self.config(Layout::I420);
         // Respect the caller's configured tile grid. In particular, a latency-tuned
         // caller may deliberately request many small tiles; silently replacing that

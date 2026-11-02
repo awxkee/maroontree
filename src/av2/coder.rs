@@ -368,6 +368,42 @@ impl LumaRateTable {
     }
 }
 
+impl LumaRateTable {
+    /// Rate table of the TX_16X16 (`size` 16) or TX_8X8 (`size` 8) luma token
+    /// CDFs; the base-range tables are shared by every size.
+    fn new_sized(qc: usize, size: usize) -> Self {
+        let mut t = Self::new(qc);
+        let (base_lf, eob_lf, base_hf, eob_hf) = if size == 16 {
+            (
+                &LUMA16_BASE_TOK_LF_QC[qc],
+                &LUMA16_EOB_TOK_LF_QC[qc],
+                &LUMA16_BASE_TOK_HF_QC[qc],
+                &LUMA16_EOB_TOK_HF_QC[qc],
+            )
+        } else {
+            (
+                &LUMA8_BASE_TOK_LF_QC[qc],
+                &LUMA8_EOB_TOK_LF_QC[qc],
+                &LUMA8_BASE_TOK_HF_QC[qc],
+                &LUMA8_EOB_TOK_HF_QC[qc],
+            )
+        };
+        t.base_lf = std::array::from_fn(|ctx| std::array::from_fn(|s| tok_cost(&base_lf[ctx], s)));
+        t.eob_lf = std::array::from_fn(|ctx| std::array::from_fn(|s| tok_cost(&eob_lf[ctx], s)));
+        t.base_hf = std::array::from_fn(|ctx| std::array::from_fn(|s| tok_cost(&base_hf[ctx], s)));
+        t.eob_hf = std::array::from_fn(|ctx| std::array::from_fn(|s| tok_cost(&eob_hf[ctx], s)));
+        t
+    }
+}
+
+/// [`luma_rate_table`] for the TX_16X16 (`size` 16) and TX_8X8 (`size` 8) tokens.
+fn luma_rate_table_sized(qc: usize, size: usize) -> &'static LumaRateTable {
+    static T16: std::sync::OnceLock<[LumaRateTable; 4]> = std::sync::OnceLock::new();
+    static T8: std::sync::OnceLock<[LumaRateTable; 4]> = std::sync::OnceLock::new();
+    let t = if size == 16 { &T16 } else { &T8 };
+    &t.get_or_init(|| std::array::from_fn(|q| LumaRateTable::new_sized(q, size)))[qc]
+}
+
 #[inline]
 fn luma_rate_table(qc: usize) -> &'static LumaRateTable {
     static TABLES: std::sync::OnceLock<[LumaRateTable; 4]> = std::sync::OnceLock::new();
@@ -491,11 +527,18 @@ pub(crate) fn rdoq_luma(
         let hi = q.max(lo);
         let mut best_l = hi;
         let mut best_cost = f32::INFINITY;
-        for l in lo..=hi {
+        // Downward from the rounded level: below it the distortion only grows and
+        // the bits are never negative, so once the distortion alone exceeds the
+        // best cost no lower level can win. `<=` keeps the smallest level on ties
+        // (as an upward `<` scan would).
+        for l in (lo..=hi).rev() {
             let d = (a - l as f32) * (a - l as f32);
+            if lambda >= 0.0 && d > best_cost {
+                break;
+            }
             let r = luma_level_bits(l, is_eob, bc, hc, high_freq, rates);
             let cost = d + lambda * r;
-            if cost < best_cost {
+            if cost <= best_cost {
                 best_cost = cost;
                 best_l = l;
             }
@@ -531,6 +574,104 @@ pub(crate) fn rdoq_luma(
         }
     }
     total_bits
+}
+
+/// RD-optimise the quantised luma levels of one square TX_16X16 (`bwl` 4) or
+/// TX_8X8 (`bwl` 3) in place, priced with that size's token CDFs and the exact
+/// contexts of `encode_luma16_tokens_scan_w` / `encode_luma8_tokens_scan_w`.
+/// `prm[k]` = |unquantised level| at scan position k; each level may drop to any
+/// value from its rounded magnitude down to zero, then the EOB is trimmed while
+/// dropping the last coefficient saves more rate than it costs distortion.
+pub(crate) fn rdoq_luma_sq(
+    prm: &[f32],
+    lev: &mut [f32],
+    qc: usize,
+    scan: &[u16],
+    bwl: i32,
+    lambda: f32,
+) {
+    let area = 1usize << (2 * bwl);
+    let n = lev.len().min(area);
+    let Some(mut eob) = lev[..n].iter().rposition(|&l| l != 0.0) else {
+        return;
+    };
+    let rates = luma_rate_table_sized(qc, 1 << bwl);
+    let (th1, th2) = (area / 8, area / 4);
+    let mask = (1 << bwl) - 1;
+    let high_freq = |k: usize| {
+        let rc = scan[k] as i32;
+        ((rc >> bwl) + (rc & mask)) >= 4
+    };
+    let eob_ctx = |k: usize| -> (usize, usize) {
+        if k == 0 {
+            (0, 0)
+        } else {
+            (
+                1 + (k > th1) as usize + (k > th2) as usize,
+                if high_freq(k) { 0 } else { 7 },
+            )
+        }
+    };
+    let mut levels = [0i32; PLVL_BUF];
+    let store = |levels: &mut [i32], k: usize, mag: i32| {
+        let limit = if high_freq(k) { 3 } else { 5 };
+        levels[plvl_w(scan[k] as i32, bwl) as usize] = if mag < limit {
+            mag
+        } else {
+            limit + (mag - limit).min(3)
+        };
+    };
+    for k in (0..=eob).rev() {
+        let is_eob = k == eob;
+        let hf = high_freq(k);
+        let a = prm[k];
+        let (bc, hc) = if is_eob {
+            eob_ctx(k)
+        } else {
+            let rc = scan[k] as i32;
+            luma_coeff_context_w(&levels, rc, (rc >> bwl) + (rc & mask), bwl)
+        };
+        let lo = is_eob as u32;
+        let hi = (lev[k].abs() as u32).max((a + 0.5) as u32).max(lo);
+        // Candidates: the rounded level, one below it, and zero (or 1 at the EOB).
+        let mut best_l = hi;
+        let mut best_cost = f32::INFINITY;
+        for l in [hi, hi.saturating_sub(1).max(lo), lo] {
+            let d = (a - l as f32) * (a - l as f32);
+            let cost = d + lambda * luma_level_bits(l, is_eob, bc, hc, hf, rates);
+            if cost < best_cost {
+                best_cost = cost;
+                best_l = l;
+            }
+            if l == lo {
+                break;
+            }
+        }
+        let sign = if lev[k] < 0.0 { -1.0 } else { 1.0 };
+        lev[k] = best_l as f32 * sign;
+        store(&mut levels, k, best_l as i32);
+    }
+    // EOB trim: drop the last nonzero while its rate outweighs its distortion.
+    while eob > 0 {
+        let Some(p) = lev[..=eob].iter().rposition(|&l| l != 0.0) else {
+            return;
+        };
+        eob = p;
+        if p == 0 {
+            break;
+        }
+        let (bc, hc) = eob_ctx(p);
+        let a = prm[p];
+        let m = lev[p].abs() as u32;
+        let keep =
+            (a - m as f32).powi(2) + lambda * luma_level_bits(m, true, bc, hc, high_freq(p), rates);
+        if a * a < keep {
+            lev[p] = 0.0;
+            levels[plvl_w(scan[p] as i32, bwl) as usize] = 0;
+        } else {
+            break;
+        }
+    }
 }
 
 /// Estimated bits to code a chroma coefficient of magnitude `level` at the given
@@ -658,11 +799,15 @@ pub(crate) fn rdoq_chroma(
         let hi = q.max(lo);
         let mut best_l = hi;
         let mut best_cost = f32::INFINITY;
-        for l in lo..=hi {
+        // Bounded downward scan, as `rdoq_luma`.
+        for l in (lo..=hi).rev() {
             let d = (a - l as f32) * (a - l as f32);
+            if lambda >= 0.0 && d > best_cost {
+                break;
+            }
             let r = chroma_level_bits(l, is_eob, is_dc, bc, hc, qc);
             let cost = d + lambda * r;
-            if cost < best_cost {
+            if cost <= best_cost {
                 best_cost = cost;
                 best_l = l;
             }
@@ -1465,6 +1610,109 @@ pub(crate) fn encode_intra_modes_dir(
     lmidx: u8,
     amidx: u8,
 ) -> u8 {
+    let midx = encode_intra_modes_dir_inner(
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        partition_cdf,
+        bw4,
+        bh4,
+        lmidx,
+        amidx,
+    );
+    maybe_emit_palette(enc, mode_idx, bw4, bh4);
+    midx
+}
+
+/// Screen-content frames: the luma palette syntax that ends a DC block's mode
+/// info (`palette_y_mode`, size, colors) and the color map that follows it, then
+/// the block's palette as a neighbour color-cache entry. Every luma block of the
+/// frame passes here, so the cache grids never hold a stale palette.
+fn maybe_emit_palette(enc: &mut RangeEncoder, mode_idx: usize, bw4: usize, bh4: usize) {
+    if !enc.sct {
+        return;
+    }
+    let pal = enc.palette_next.take();
+    let (r, c) = enc.pal_pos;
+    let mut id = 0u32;
+    if mode_idx == 0 && crate::av2::palette::block_allowed(bw4, bh4) {
+        enc.sym_palette_y_mode(pal.is_some() as usize);
+        if let Some(p) = pal {
+            debug_assert!(p.w == bw4 * 4 && p.h == bh4 * 4);
+            let entry = |id: u32| -> &[u16] {
+                if id == 0 {
+                    &[]
+                } else {
+                    &enc.pal_store[id as usize - 1]
+                }
+            };
+            // AVM av2_get_palette_cache: above only inside the 64-px SB row,
+            // entries interleaved above/left, duplicates kept.
+            let above = if r % 16 != 0 {
+                entry(enc.pal_above.get(c).copied().unwrap_or(0))
+            } else {
+                &[]
+            };
+            let left = if c > 0 {
+                entry(enc.pal_left.get(r).copied().unwrap_or(0))
+            } else {
+                &[]
+            };
+            let mut cache = Vec::with_capacity(above.len() + left.len());
+            for k in 0..above.len().max(left.len()) {
+                if k < above.len() && k < left.len() {
+                    cache.push(above[k]);
+                    cache.push(left[k]);
+                } else if k < above.len() {
+                    cache.push(above[k]);
+                } else {
+                    cache.push(left[k]);
+                }
+            }
+            let t0 = enc.tell_bits();
+            crate::av2::palette::emit_colors(enc, &p, &cache, p.bd);
+            crate::av2::palette::emit_map(enc, &p);
+            if crate::av2::rd::knob_or("PALDBG", 0.0) > 0.0 {
+                eprintln!(
+                    "PAL {}x{} n{} est {:.1} act {:.1} cache {}",
+                    p.w,
+                    p.h,
+                    p.colors.len(),
+                    p.bits,
+                    enc.tell_bits() - t0,
+                    cache.len()
+                );
+            }
+            enc.pal_store.push(p.colors.clone());
+            id = enc.pal_store.len() as u32;
+        }
+    } else {
+        debug_assert!(pal.is_none(), "palette on a non-palette block");
+    }
+    if enc.pal_above.len() < c + bw4 {
+        enc.pal_above.resize(c + bw4, 0);
+    }
+    if enc.pal_left.len() < r + bh4 {
+        enc.pal_left.resize(r + bh4, 0);
+    }
+    enc.pal_above[c..c + bw4].fill(id);
+    enc.pal_left[r..r + bh4].fill(id);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_intra_modes_dir_inner(
+    enc: &mut RangeEncoder,
+    mode_idx: usize,
+    angle_delta: i8,
+    has_chroma: bool,
+    partition_cdf: Option<u32>,
+    bw4: usize,
+    bh4: usize,
+    lmidx: u8,
+    amidx: u8,
+) -> u8 {
+    let has_chroma = has_chroma && !enc.sdp_luma;
     if let Some(cdf) = partition_cdf {
         enc.bool_do_split(cdf, 0);
     }
@@ -1479,9 +1727,10 @@ pub(crate) fn encode_intra_modes_dir(
         let allowed = crate::av2::cfl::is_mhccp_allowed(bw4, bh4, enc.mhccp_ssx, enc.mhccp_ssy);
         enc.mhccp_allowed = allowed;
         if allowed {
-            enc.mhccp_size_group = crate::av2::cfl::mhccp_size_group_wh4(bw4, bh4);
-            if !(bw4 == 16 && bh4 == 16) {
-                enc.mhccp_use = false; // predictor only valid for 64x64 fast path
+            // 64x64: the whole-64 fast path's own size group. Smaller leaves keep
+            // a caller-selected MHCCP (mhccp_decide_leaf), as in encode_intra_modes.
+            if (bw4 == 16 && bh4 == 16) || !enc.mhccp_use {
+                enc.mhccp_size_group = crate::av2::cfl::mhccp_size_group_wh4(bw4, bh4);
             }
         } else {
             enc.mhccp_use = false;
@@ -1500,6 +1749,7 @@ pub(crate) fn encode_intra_modes_dir(
         enc.sym_y_set(0);
         enc.sym_y_idx0(y_ctx, mode_idx, 7);
         midx = NO_MIDX;
+        enc.luma_class = crate::av2::leaf::midx_class(mode_idx);
     } else {
         let y_mode = internal_dir_to_ymode(mode_idx);
         // target midx encodes both mode and angle delta: nominal (pos*7+3) + delta.
@@ -1537,6 +1787,7 @@ pub(crate) fn encode_intra_modes_dir(
             enc.encode_bypass(bits, 4);
         }
         midx = target;
+        enc.luma_class = midx as i32;
     }
     if has_chroma {
         // Same read condition as encode_intra_modes: is_cfl is read whenever
@@ -1618,6 +1869,74 @@ pub(crate) fn encode_intra_modes_dir(
     midx
 }
 
+/// SDP chroma-tree leaf mode syntax: is_cfl (when CfL / MHCCP is allowed for the
+/// block and `cfl_sb_ok`, i.e. the SB's chroma root did not change direction
+/// family) with the MHCCP or CfL parameters, else the uv mode with its context
+/// from the co-located luma block (`luma_dir`: directional). Under a directional
+/// luma block the caller picks non-directional uv modes only (index `1 + uv`).
+pub(crate) fn encode_chroma_tree_mode(
+    enc: &mut RangeEncoder,
+    bw4: usize,
+    bh4: usize,
+    cfl_sb_ok: bool,
+    luma_dir: bool,
+) {
+    if enc.mhccp {
+        let allowed =
+            cfl_sb_ok && crate::av2::cfl::is_mhccp_allowed(bw4, bh4, enc.mhccp_ssx, enc.mhccp_ssy);
+        enc.mhccp_allowed = allowed;
+        if !allowed {
+            enc.mhccp_use = false;
+        } else if !enc.mhccp_use {
+            enc.mhccp_size_group = crate::av2::cfl::mhccp_size_group_wh4(bw4, bh4);
+        }
+    } else {
+        enc.mhccp_allowed = false;
+        enc.mhccp_use = false;
+    }
+    if (enc.cfl && cfl_sb_ok) || (enc.mhccp && enc.mhccp_allowed) {
+        let isc = crate::av2::cfl::CFL_IS_CDF[enc.cfl_ctx];
+        if enc.cfl_use {
+            enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 1);
+            if enc.mhccp && enc.mhccp_allowed {
+                if enc.cfl {
+                    enc.bool_cfl_mhccp(
+                        crate::av2::cfl::CFL_MHCCP_SWITCH_CDF as u32,
+                        enc.mhccp_use as u32,
+                    );
+                }
+                if !enc.mhccp_use {
+                    enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+                }
+            } else {
+                enc.bool_cfl_index(crate::av2::cfl::CFL_INDEX_CDF as u32, 0);
+            }
+            if enc.mhccp && enc.mhccp_allowed && enc.mhccp_use {
+                enc.sym_mh_dir(enc.mhccp_size_group as usize, enc.mhccp_dir as usize);
+                return;
+            }
+            enc.sym_cfl_sign(enc.cfl_js as usize);
+            let su = crate::av2::cfl::cfl_sign_u(enc.cfl_js);
+            let sv = crate::av2::cfl::cfl_sign_v(enc.cfl_js);
+            if su != 0 {
+                enc.sym_cfl_alpha(enc.cfl_ctx_u, enc.cfl_mag_u as usize);
+            }
+            if sv != 0 {
+                enc.sym_cfl_alpha(enc.cfl_ctx_v, enc.cfl_mag_v as usize);
+            }
+            return;
+        }
+        enc.bool_cfl_is(enc.cfl_ctx, isc as u32, 0);
+    }
+    debug_assert!(!luma_dir || enc.uv_mode < 5);
+    let uv_idx = if luma_dir {
+        1 + enc.uv_mode
+    } else {
+        enc.uv_mode
+    };
+    emit_uv_mode_idx(enc, luma_dir as usize, uv_idx);
+}
+
 fn emit_uv_mode_idx(enc: &mut RangeEncoder, uv_ctx: usize, uv_idx: usize) {
     if uv_idx < 7 {
         enc.sym_uv_mode(uv_ctx, uv_idx, 7);
@@ -1656,6 +1975,31 @@ fn encode_intra_modes_with_dpcm(
     y_ctx: usize,
     dpcm: LosslessDpcm,
 ) {
+    encode_intra_modes_with_dpcm_inner(
+        enc,
+        mode_idx,
+        has_chroma,
+        lossless,
+        partition_cdf,
+        y_ctx,
+        dpcm,
+    );
+    if !lossless {
+        let (bw4, bh4) = (enc.cur_bw4, enc.cur_bh4);
+        maybe_emit_palette(enc, mode_idx, bw4, bh4);
+    }
+}
+
+fn encode_intra_modes_with_dpcm_inner(
+    enc: &mut RangeEncoder,
+    mode_idx: usize,
+    has_chroma: bool,
+    lossless: bool,
+    partition_cdf: Option<u32>,
+    y_ctx: usize,
+    dpcm: LosslessDpcm,
+) {
+    let has_chroma = has_chroma && !enc.sdp_luma;
     // do_split bool (=0, PARTITION_NONE) with the leaf's per-bsize/context cdf.
     // None for non-partition-point leaves (4x4 / narrow ext blocks), which read
     // no partition bit at all.
@@ -1699,7 +2043,9 @@ fn encode_intra_modes_with_dpcm(
     if let Some(mode) = dpcm.y {
         debug_assert!(lossless);
         enc.encode_bool(16384, mode.bit());
+        enc.luma_class = -1;
     } else {
+        enc.luma_class = crate::av2::leaf::midx_class(mode_idx);
         enc.sym_y_set(0); // intra_y mode set 0
         // y_mode_idx context = count of directional bottom-left / above-right
         // neighbors (decoder get_y_mode_idx_ctx).
@@ -1896,6 +2242,9 @@ pub(crate) fn encode_chroma_block_rect(
     eob_hi: u16,
     area: usize,
 ) {
+    if enc.sdp_luma {
+        return;
+    }
     encode_chroma_block_rect_w(
         enc, coeffs, skip_cdf, is_u_plane, scan, eob_cdf, eob_hi, area, 5,
     )
@@ -1912,6 +2261,9 @@ pub(crate) fn encode_chroma_block_rect_w(
     area: usize,
     bwl: i32,
 ) {
+    if enc.sdp_luma {
+        return;
+    }
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     let skip_tbl: u8 = if is_u_plane { 1 } else { 2 };
     if nonzero.is_empty() {
@@ -1969,6 +2321,9 @@ pub(crate) fn encode_chroma_block(
     skip_cdf: u32,
     is_u_plane: bool,
 ) {
+    if enc.sdp_luma {
+        return;
+    }
     encode_chroma_block_ex(enc, coeffs, skip_cdf, is_u_plane, true)
 }
 
@@ -1980,6 +2335,9 @@ pub(crate) fn encode_chroma_block_ex(
     is_u_plane: bool,
     u_tx64: bool,
 ) {
+    if enc.sdp_luma {
+        return;
+    }
     let nonzero: Vec<Coeff> = coeffs.iter().cloned().filter(|&(_, l)| l != 0).collect();
     let emit = |enc: &mut RangeEncoder, bit: u32| {
         let ctx = skip_cdf as usize;
@@ -2186,13 +2544,75 @@ pub(crate) fn encode_luma_leaf_16x16_full(
         false,
         enc.y_ctx,
     );
+    encode_luma16_residual(enc, tu, skip_cdf, dc_sign_ctx, do_part_cdf, tx_type_idx)
+}
+
+/// [`encode_luma_leaf_16x16_full`] for a directional luma mode (`mode_idx` 5..=12
+/// with `angle_delta`); returns the coded midx for the neighbour mode-set arrays.
+/// `tx_type_idx` 0..=3 maps to the same types as DC at TX_16X16 for every
+/// directional mode class (av2_md_idx2type size class 2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_leaf_16x16_dir(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    mode_idx: usize,
+    angle_delta: i8,
+    has_chroma: bool,
+    part_cdf: u32,
+    do_part_cdf: u32,
+    tx_type_idx: usize,
+    left_midx: u8,
+    above_midx: u8,
+) -> u8 {
+    enc.cur_bw4 = 4;
+    enc.cur_bh4 = 4;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        Some(part_cdf),
+        4,
+        4,
+        left_midx,
+        above_midx,
+    );
+    encode_luma16_residual(enc, tu, skip_cdf, dc_sign_ctx, do_part_cdf, tx_type_idx);
+    midx
+}
+
+/// TX_16X16 luma residual of a 16x16 leaf: NONE tx partition, skip, EOB, tx type,
+/// tokens and signs. Returns the clamped level-magnitude sum.
+fn encode_luma16_residual(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    do_part_cdf: u32,
+    tx_type_idx: usize,
+) -> u32 {
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single TX_16X16
+    encode_luma_tu16(enc, tu, skip_cdf, dc_sign_ctx, tx_type_idx)
+}
+
+/// One intra TX_16X16 luma TU: skip, EOB, tx type, tokens and signs. Returns the
+/// clamped level-magnitude sum.
+fn encode_luma_tu16(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    tx_type_idx: usize,
+) -> u32 {
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
         enc.bool_txb_skip(skip_cdf, 1);
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
+    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob256, EOB_HI_BIT_QC[enc.qc], 1, 7);
     if eob >= 1 {
@@ -2200,6 +2620,7 @@ pub(crate) fn encode_luma_leaf_16x16_full(
     }
     let stored = encode_luma16_tokens_scan_w(enc, &nonzero, eob, &SCAN16, 256, 4);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    crate::av2::helpers::mt_plog(256, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -2363,6 +2784,51 @@ pub(crate) fn encode_luma_leaf_8x8(
         false,
         enc.y_ctx,
     );
+    encode_luma8_residual(enc, tu, skip_cdf, dc_sign_ctx, do_part_cdf, tx_type_cdf)
+}
+
+/// [`encode_luma_leaf_8x8`] for a directional luma mode (`mode_idx` >= 5, with its
+/// angle delta). Returns the leaf's luma mode-set index for the neighbour context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_leaf_8x8_dir(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    (mode_idx, angle_delta): (usize, i8),
+    has_chroma: bool,
+    part_cdf: u32,
+    do_part_cdf: u32,
+    tx_type_cdf: Option<(&'static [u16], usize, usize)>,
+    (left_midx, above_midx): (u8, u8),
+) -> u8 {
+    enc.cur_bw4 = 2;
+    enc.cur_bh4 = 2;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        Some(part_cdf),
+        2,
+        2,
+        left_midx,
+        above_midx,
+    );
+    encode_luma8_residual(enc, tu, skip_cdf, dc_sign_ctx, do_part_cdf, tx_type_cdf);
+    midx
+}
+
+/// TX_8X8 luma residual of an 8x8 leaf: NONE tx partition, skip, EOB, tx type,
+/// tokens and signs. Returns the clamped level-magnitude sum.
+fn encode_luma8_residual(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    do_part_cdf: u32,
+    tx_type_cdf: Option<(&'static [u16], usize, usize)>,
+) -> u32 {
     enc.bool_txfm_part(do_part_cdf, 0); // tx do_partition = NONE -> single TX_8X8
     let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
     if nonzero.is_empty() {
@@ -2370,6 +2836,7 @@ pub(crate) fn encode_luma_leaf_8x8(
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
+    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
     if eob >= 1
@@ -2382,6 +2849,7 @@ pub(crate) fn encode_luma_leaf_8x8(
     }
     let stored = encode_luma8_tokens_scan_w(enc, &nonzero, eob, &SCAN8X8, 64, 3);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    crate::av2::helpers::mt_plog(64, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -2536,6 +3004,7 @@ pub(crate) fn encode_luma_tu32(
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
+    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::EobBin, EOB_HI_BIT_QC[enc.qc], 2, 7);
     if enc.inter_txb {
@@ -2555,6 +3024,7 @@ pub(crate) fn encode_luma_tu32(
     }
     let stored = encode_luma32_tokens(enc, &nonzero, eob);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    crate::av2::helpers::mt_plog(1024, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -2664,6 +3134,47 @@ pub(crate) fn encode_luma_block_split(
         cul[i] = encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
     }
     cul
+}
+
+/// A 64x64 luma leaf coded as one TX_64X64 (tx partition NONE; DCT_DCT only, so
+/// no tx type; the 32x32 low-frequency coefficients use the txs_ctx 4 token
+/// CDFs). Any luma mode. Returns the block's midx.
+pub(crate) fn encode_luma_block_tx64(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    dc_sign_ctx: usize,
+    mode: (usize, i8),
+    part_cdf: u32,
+    nb_midx: (u8, u8),
+) -> u8 {
+    enc.cur_bw4 = 16;
+    enc.cur_bh4 = 16;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode.0,
+        mode.1,
+        true,
+        Some(part_cdf),
+        16,
+        16,
+        nb_midx.0,
+        nb_midx.1,
+    );
+    enc.bool_txfm_part(TX_SPLIT_64 as u32, 0); // tx_split = 0: one TX_64X64
+    let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    // block == tx: txb_skip ctx 0 of the TX_64X64 table.
+    if nonzero.is_empty() {
+        enc.bool_u_skip64(0, 1);
+        return midx;
+    }
+    enc.bool_u_skip64(0, 0);
+    let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
+    encode_eob(enc, eob, EobCdf::EobBin, EOB_HI_BIT_QC[enc.qc], 2, 7);
+    enc.tx64 = true;
+    let stored = encode_luma32_tokens(enc, &nonzero, eob);
+    enc.tx64 = false;
+    encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    midx
 }
 
 /// Directional-aware 64x64 PARTITION_NONE emit. Identical to
@@ -2849,6 +3360,46 @@ const TX_DO_PART_INTER_16X16: u32 = 2283;
 
 /// Encode an intra 32x64 luma leaf (right-edge) as TX_PARTITION_HORZ → two stacked
 /// TX_32X32 (top, bottom). `part_cdf` is the leaf's do_split cdf from the walk.
+/// Directional 64x32 / 32x64 luma leaf: the directional mode syntax for the
+/// `bw4` x `bh4` block, then the leaf's two TX_32X32 (`vert` = 64x32, split
+/// VERT; else 32x64, split HORZ). Returns the block's midx.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_leaf_rect64_dir(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>; 2],
+    skip_cdfs: &[u32; 2],
+    dc_sign_ctxs: &[usize; 2],
+    mode: (usize, i8),
+    part_cdf: u32,
+    vert: bool,
+    nb_midx: (u8, u8),
+) -> u8 {
+    let (bw4, bh4) = if vert { (16, 8) } else { (8, 16) };
+    enc.cur_bw4 = bw4;
+    enc.cur_bh4 = bh4;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode.0,
+        mode.1,
+        true,
+        Some(part_cdf),
+        bw4,
+        bh4,
+        nb_midx.0,
+        nb_midx.1,
+    );
+    enc.bool_txfm_part(TX_DO_PART_64X32, 1);
+    if vert {
+        enc.sym_tx_part_64x32(2, 6);
+    } else {
+        enc.sym_tx_part_32x64(1, 6);
+    }
+    for i in 0..2 {
+        encode_luma_tu32(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
+    }
+    midx
+}
+
 pub(crate) fn encode_luma_leaf_32x64(
     enc: &mut RangeEncoder,
     tus: &[Vec<Coeff>; 2],
@@ -3125,6 +3676,89 @@ pub(crate) fn encode_luma_tu_rect_long32_w(
 /// Right×bottom corner 16×32 intra luma leaf (residue-4 width × residue-{6,8} height).
 /// BLOCK_16X32 is tx-part group 4 (tx_split cdf 19451); NONE → single TX_16X32, coeff
 /// region 16×32, scan SCAN16X32, eob class 512.
+/// A rect luma leaf (`bw4` x `bh4`, 2:1 or 4:1) coded as square TUs along its long
+/// side: tx partition VERT / HORZ (2 TUs) or VERT4 / HORZ4 (4 TUs), any luma mode.
+/// TUs are TX_16X16 or TX_8X8 (the short side). Returns the block's midx.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_leaf_multi_tu(
+    enc: &mut RangeEncoder,
+    tus: &[Vec<Coeff>],
+    skip_cdfs: &[u32],
+    dc_sign_ctxs: &[usize],
+    tx_types: &[usize],
+    mode: (usize, i8),
+    part_cdf: u32,
+    (bw4, bh4): (usize, usize),
+    nb_midx: (u8, u8),
+) -> u8 {
+    enc.cur_bw4 = bw4;
+    enc.cur_bh4 = bh4;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode.0,
+        mode.1,
+        true,
+        Some(part_cdf),
+        bw4,
+        bh4,
+        nb_midx.0,
+        nb_midx.1,
+    );
+    // do_partition cdf: txfm_do_partition_cdf[0][0][size_to_tx_part_group]
+    // (group 2: 16X8 / 8X16, group 4: 16X32 / 32X16, group 8: the 4:1 shapes).
+    let do_part = match (bw4, bh4) {
+        (4, 2) | (2, 4) => 12348,
+        (8, 4) | (4, 8) => 19451,
+        _ => 18958,
+    };
+    enc.bool_txfm_part(do_part, 1);
+    // 4-way type = partition - 1: HORZ 1, VERT 2, HORZ4 3, VERT4 4.
+    let ty = if bw4 > bh4 {
+        if bw4 == 2 * bh4 { 2 } else { 4 }
+    } else if bh4 == 2 * bw4 {
+        1
+    } else {
+        3
+    };
+    match (bw4, bh4) {
+        (8, 4) => enc.sym_tx_part_32x16(ty, 6),
+        (4, 8) => enc.sym_tx_part_16x32(ty, 6),
+        _ => enc.sym_tx_part_4way(bw4, bh4, ty),
+    }
+    for i in 0..tus.len() {
+        if bw4.min(bh4) == 4 {
+            encode_luma_tu16(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i], tx_types[i]);
+        } else {
+            encode_luma_tu8(enc, &tus[i], skip_cdfs[i], dc_sign_ctxs[i]);
+        }
+    }
+    midx
+}
+
+/// One intra TX_8X8 luma TU (DCT_DCT): skip, EOB, tx type, tokens and signs.
+fn encode_luma_tu8(enc: &mut RangeEncoder, tu: &[Coeff], skip_cdf: u32, dc_sign_ctx: usize) -> u32 {
+    let nonzero: Vec<Coeff> = tu.iter().cloned().filter(|&(_, l)| l != 0).collect();
+    if nonzero.is_empty() {
+        enc.bool_txb_skip(skip_cdf, 1);
+        return 0;
+    }
+    enc.bool_txb_skip(skip_cdf, 0);
+    let mt_t0 = enc.tell_bits();
+    let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
+    encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
+    if eob >= 1 {
+        enc.sym_intra_ext_tx8(0, 6);
+    }
+    let stored = encode_luma8_tokens_scan_w(enc, &nonzero, eob, &SCAN8X8, 64, 3);
+    encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
+    crate::av2::helpers::mt_plog(64, &nonzero, enc.tell_bits() - mt_t0);
+    nonzero
+        .iter()
+        .map(|&(_, l)| l.unsigned_abs())
+        .sum::<u32>()
+        .min(63)
+}
+
 pub(crate) fn encode_luma_leaf_16x32(
     enc: &mut RangeEncoder,
     tu: &[Coeff],
@@ -3306,6 +3940,39 @@ pub(crate) fn encode_luma_leaf_32x32(
     );
     enc.bool_txfm_part(TX_DO_PART_32X32, 0); // do_partition = 0 → single TX_32X32
     encode_luma_tu32(enc, tu, skip_cdf, dc_sign_ctx)
+}
+
+/// [`encode_luma_leaf_32x32`] for a directional luma mode (`mode_idx` 5..=12 with
+/// `angle_delta`); returns the coded midx for the neighbour mode-set arrays.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_luma_leaf_32x32_dir(
+    enc: &mut RangeEncoder,
+    tu: &[Coeff],
+    skip_cdf: u32,
+    dc_sign_ctx: usize,
+    mode_idx: usize,
+    angle_delta: i8,
+    has_chroma: bool,
+    part_cdf: u32,
+    left_midx: u8,
+    above_midx: u8,
+) -> u8 {
+    enc.cur_bw4 = 8;
+    enc.cur_bh4 = 8;
+    let midx = encode_intra_modes_dir(
+        enc,
+        mode_idx,
+        angle_delta,
+        has_chroma,
+        Some(part_cdf),
+        8,
+        8,
+        left_midx,
+        above_midx,
+    );
+    enc.bool_txfm_part(TX_DO_PART_32X32, 0); // do_partition = 0 → single TX_32X32
+    encode_luma_tu32(enc, tu, skip_cdf, dc_sign_ctx);
+    midx
 }
 
 // Padded levels grid: bwl=2, stride = (1<<2)+TX_PAD_HOR(4) = 8. get_padded_idx.
@@ -3672,6 +4339,9 @@ pub(crate) fn encode_chroma_tu4(
     skip_cdf: u32,
     plane_v: bool,
 ) -> u32 {
+    if enc.sdp_luma {
+        return 0;
+    }
     if coeffs.is_empty() {
         enc.bool_txb_skip(skip_cdf, 1);
         return 0;
@@ -3751,6 +4421,9 @@ pub(crate) fn encode_chroma_tu4_scan(
     scan: &[u16],
     skip_ctx: usize,
 ) -> u32 {
+    if enc.sdp_luma {
+        return 0;
+    }
     if coeffs.is_empty() {
         enc.bool_txb_skip_tx4_ctx(skip_cdf, 1, plane_v, skip_ctx);
         return 0;
@@ -3964,67 +4637,6 @@ fn encode_luma_palette_colors(
     }
 }
 
-fn palette_color_ctx(
-    map: &[u8],
-    stride: usize,
-    y: usize,
-    x: usize,
-    size: usize,
-) -> (usize, [u8; 8]) {
-    let mut order = [0u8; 8];
-    let mut used = [false; 8];
-    let mut count = 0usize;
-    macro_rules! push {
-        ($color:expr) => {{
-            let color = $color;
-            if !used[color as usize] {
-                order[count] = color;
-                used[color as usize] = true;
-                count += 1;
-            }
-        }};
-    }
-    let ctx = if y == 0 {
-        push!(map[x - 1]);
-        0
-    } else if x == 0 {
-        push!(map[(y - 1) * stride]);
-        0
-    } else {
-        let left = map[y * stride + x - 1];
-        let diag = map[(y - 1) * stride + x - 1];
-        let top = map[(y - 1) * stride + x];
-        if left == diag && left == top {
-            push!(left);
-            4
-        } else if left == top {
-            push!(left);
-            push!(diag);
-            3
-        } else if left == diag {
-            push!(left);
-            push!(top);
-            2
-        } else if diag == top {
-            push!(top);
-            push!(left);
-            2
-        } else {
-            // This AVM palette-simplification revision keeps neighbor order
-            // (left, top, top-left); it does not sort left/top here.
-            push!(left);
-            push!(top);
-            push!(diag);
-            1
-        }
-    };
-    for color in 0..size as u8 {
-        push!(color);
-    }
-    debug_assert_eq!(count, size);
-    (ctx, order)
-}
-
 fn encode_luma_palette_map(enc: &mut RangeEncoder, palette: &crate::av2::lossless::LumaPalette) {
     let (w, h) = (palette.width, palette.height);
     let size = palette.colors.len();
@@ -4039,7 +4651,7 @@ fn encode_luma_palette_map(enc: &mut RangeEncoder, palette: &crate::av2::lossles
             if y == 0 && x == 0 {
                 enc.encode_uniform(color as u32, size as u32);
             } else {
-                let (ctx, order) = palette_color_ctx(&palette.map, w, y, x, size);
+                let (ctx, order) = crate::av2::palette::color_ctx(&palette.map, w, y, x, size);
                 let symbol = order[..size].iter().position(|&v| v == color).unwrap();
                 enc.sym_palette_y_color(size, ctx, symbol);
             }

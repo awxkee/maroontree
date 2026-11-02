@@ -144,6 +144,28 @@ pub(crate) static UV_MODE_INIT: [[u16; 7]; 2] = [
 pub(crate) static DELTA_Q_INIT: [u16; 7] = [16174, 9443, 6344, 4543, 3410, 2669, 2155];
 pub(crate) static TX_PART_64X32_INIT: [u16; 6] = [28067, 19266, 7810, 6355, 4602, 2639];
 pub(crate) static TX_PART_32X64_INIT: [u16; 6] = [30413, 15167, 11065, 6718, 4887, 1371];
+/// AVM default_txfm_4way_partition_type_cdf[0][0][4] (BLOCK_16X32) / [5]
+/// (BLOCK_32X16), both PARA7(-1, -1, -1).
+pub(crate) static TX_PART_16X32_INIT: [u16; 6] = [29713, 13119, 10611, 5730, 5302, 1122];
+pub(crate) static TX_PART_32X16_INIT: [u16; 6] = [26724, 21513, 6598, 6275, 4183, 3184];
+/// AVM default_txfm_4way_partition_type_cdf[0][0][g] for g = 1 (8X16), 2 (16X8),
+/// 10 (8X32), 11 (32X8), 12 (16X64), 13 (64X16), and their PARA.
+pub(crate) static TX_PART_4WAY_INIT: [[u16; 6]; 6] = [
+    [29762, 9880, 5636, 2796, 2792, 44],
+    [29095, 23919, 5116, 5112, 2824, 2820],
+    [30242, 15680, 13125, 3390, 3386, 44],
+    [30470, 28362, 8882, 8878, 2620, 2616],
+    [31215, 16608, 14089, 4785, 3176, 629],
+    [30452, 28054, 10037, 8971, 3254, 2691],
+];
+pub(crate) static TX_PART_4WAY_PARA: [(u8, u8, u8); 6] = [
+    (2, 3, 4),
+    (2, 3, 4),
+    (2, 3, 4),
+    (2, 3, 4),
+    (2, 3, 3),
+    (2, 2, 3),
+];
 pub(crate) static TX_PART_64X16_INIT: [u16; 6] = [30452, 28054, 10037, 8971, 3254, 2691];
 pub(crate) static TX_PART_16X64_INIT: [u16; 6] = [31215, 16608, 14089, 4785, 3176, 629];
 pub(crate) static INTRA_EXT_TX16_INIT: [u16; 6] = [19009, 6660, 5080, 2975, 2503, 1192];
@@ -160,6 +182,7 @@ pub(crate) static TX_SHORT_SIDE_INIT: [[u16; 3]; 2] = [
 /// Every field is a mutable working copy of the corresponding static table,
 /// extended with [counter, para_r0, para_r1, para_r2] words.
 #[allow(non_snake_case)]
+#[derive(Clone)]
 pub(crate) struct CdfState {
     pub(crate) qc: usize,
 
@@ -175,6 +198,11 @@ pub(crate) struct CdfState {
     pub(crate) luma32_lf: Vec<Vec<u16>>,
     pub(crate) luma32_eob_hf: Vec<Vec<u16>>,
     pub(crate) luma32_eob_lf: Vec<Vec<u16>>,
+    /// Luma TX_64X64 coefficient token CDFs (AVM txs_ctx 4).
+    pub(crate) luma64_hf: Vec<Vec<u16>>,
+    pub(crate) luma64_lf: Vec<Vec<u16>>,
+    pub(crate) luma64_eob_hf: Vec<Vec<u16>>,
+    pub(crate) luma64_eob_lf: Vec<Vec<u16>>,
     pub(crate) br_hf: Vec<Vec<u16>>, // [7]
     pub(crate) br: Vec<Vec<u16>>,    // [14]
     pub(crate) eob_bin: Vec<u16>,
@@ -210,6 +238,9 @@ pub(crate) struct CdfState {
     pub(crate) tx_part_64: Vec<u16>,            // nsyms=5
     pub(crate) tx_part_64x32: Vec<u16>,
     pub(crate) tx_part_32x64: Vec<u16>,
+    pub(crate) tx_part_16x32: Vec<u16>,
+    pub(crate) tx_part_32x16: Vec<u16>,
+    pub(crate) tx_part_4way: Vec<Vec<u16>>,
     pub(crate) tx_part_64x16: Vec<u16>,
     pub(crate) tx_part_16x64: Vec<u16>,
     pub(crate) tx_short_side: Vec<Vec<u16>>, // [2 ctx] nsyms=2
@@ -241,6 +272,15 @@ pub(crate) struct CdfState {
     pub(crate) do_split: Vec<Vec<u16>>, // [64 partition_ctx]
     pub(crate) do_square_split: Vec<Vec<u16>>, // [8 square_split_ctx]
     pub(crate) rect_type: Vec<Vec<u16>>, // [64 partition_ctx]
+    /// Plane-1 (SDP chroma tree) do_split / rect_type, [64 partition_ctx] each.
+    pub(crate) do_split_c: Vec<Vec<u16>>,
+    /// Luma palette: palette_y_mode, size, identity-row flag [4], color index
+    /// [size - 2][5].
+    pub(crate) pal_y_mode: Vec<u16>,
+    pub(crate) pal_y_size: Vec<u16>,
+    pub(crate) pal_row: Vec<Vec<u16>>,
+    pub(crate) pal_color: Vec<Vec<Vec<u16>>>,
+    pub(crate) rect_type_c: Vec<Vec<u16>>,
     pub(crate) txfm_bools: HashMap<u16, Vec<u16>>,
     /// CCSO per-superblock on/off flag, adaptive 2-symbol CDF. Indexed
     /// [plane][ctx] with CCSO_PLANES=3, CCSO_CONTEXT=4. Phase 1 only uses
@@ -274,6 +314,121 @@ pub(crate) struct CdfState {
     pub(crate) tx_do_partition: Vec<u16>,
     /// inter 64x64 4-way tx partition type [0][1][9], 7 syms (SPLIT=0).
     pub(crate) tx_part_type: Vec<u16>,
+}
+
+impl CdfState {
+    /// `*self = o.clone()` reusing this state's allocations (trial encoders are
+    /// refreshed many times per superblock).
+    pub(crate) fn assign_from(&mut self, o: &Self) {
+        self.qc.clone_from(&o.qc);
+        self.luma8_hf.clone_from(&o.luma8_hf);
+        self.luma8_lf.clone_from(&o.luma8_lf);
+        self.luma8_eob_hf.clone_from(&o.luma8_eob_hf);
+        self.luma8_eob_lf.clone_from(&o.luma8_eob_lf);
+        self.luma16_hf.clone_from(&o.luma16_hf);
+        self.luma16_lf.clone_from(&o.luma16_lf);
+        self.luma16_eob_hf.clone_from(&o.luma16_eob_hf);
+        self.luma16_eob_lf.clone_from(&o.luma16_eob_lf);
+        self.luma32_hf.clone_from(&o.luma32_hf);
+        self.luma32_lf.clone_from(&o.luma32_lf);
+        self.luma32_eob_hf.clone_from(&o.luma32_eob_hf);
+        self.luma32_eob_lf.clone_from(&o.luma32_eob_lf);
+        self.luma64_hf.clone_from(&o.luma64_hf);
+        self.luma64_lf.clone_from(&o.luma64_lf);
+        self.luma64_eob_hf.clone_from(&o.luma64_eob_hf);
+        self.luma64_eob_lf.clone_from(&o.luma64_eob_lf);
+        self.br_hf.clone_from(&o.br_hf);
+        self.br.clone_from(&o.br);
+        self.eob_bin.clone_from(&o.eob_bin);
+        self.eob_bin_inter.clone_from(&o.eob_bin_inter);
+        self.eob64_luma.clone_from(&o.eob64_luma);
+        self.eob128_luma.clone_from(&o.eob128_luma);
+        self.eob256.clone_from(&o.eob256);
+        self.eob256_inter.clone_from(&o.eob256_inter);
+        self.eob512.clone_from(&o.eob512);
+        self.chr_eob_bin.clone_from(&o.chr_eob_bin);
+        self.chr_eob32.clone_from(&o.chr_eob32);
+        self.chr_eob64.clone_from(&o.chr_eob64);
+        self.chr_eob128.clone_from(&o.chr_eob128);
+        self.chr_eob256.clone_from(&o.chr_eob256);
+        self.chr_eob512.clone_from(&o.chr_eob512);
+        self.eob16_q0.clone_from(&o.eob16_q0);
+        self.base_lf_tx4.clone_from(&o.base_lf_tx4);
+        self.base_tx4.clone_from(&o.base_tx4);
+        self.base_lf_eob_tx4.clone_from(&o.base_lf_eob_tx4);
+        self.base_eob_tx4.clone_from(&o.base_eob_tx4);
+        self.br_lf_q0.clone_from(&o.br_lf_q0);
+        self.br_q0.clone_from(&o.br_q0);
+        self.base_lf_uv.clone_from(&o.base_lf_uv);
+        self.base_uv.clone_from(&o.base_uv);
+        self.br_uv.clone_from(&o.br_uv);
+        self.base_lf_eob_uv.clone_from(&o.base_lf_eob_uv);
+        self.base_eob_uv.clone_from(&o.base_eob_uv);
+        self.y_set.clone_from(&o.y_set);
+        self.y_idx0.clone_from(&o.y_idx0);
+        self.y_idx1.clone_from(&o.y_idx1);
+        self.uv_mode.clone_from(&o.uv_mode);
+        self.delta_q.clone_from(&o.delta_q);
+        self.tx_part_64.clone_from(&o.tx_part_64);
+        self.tx_part_64x32.clone_from(&o.tx_part_64x32);
+        self.tx_part_32x64.clone_from(&o.tx_part_32x64);
+        self.tx_part_16x32.clone_from(&o.tx_part_16x32);
+        self.tx_part_32x16.clone_from(&o.tx_part_32x16);
+        self.tx_part_4way.clone_from(&o.tx_part_4way);
+        self.tx_part_64x16.clone_from(&o.tx_part_64x16);
+        self.tx_part_16x64.clone_from(&o.tx_part_16x64);
+        self.tx_short_side.clone_from(&o.tx_short_side);
+        self.cfl_sign.clone_from(&o.cfl_sign);
+        self.cfl_alpha.clone_from(&o.cfl_alpha);
+        self.intra_ext_tx16.clone_from(&o.intra_ext_tx16);
+        self.intra_ext_tx8.clone_from(&o.intra_ext_tx8);
+        self.txb_skip.clone_from(&o.txb_skip);
+        self.txb_skip_inter.clone_from(&o.txb_skip_inter);
+        self.inter_ext_tx3.clone_from(&o.inter_ext_tx3);
+        self.inter_tx16_set.clone_from(&o.inter_tx16_set);
+        self.inter_tx16_idx.clone_from(&o.inter_tx16_idx);
+        self.skip_tx16.clone_from(&o.skip_tx16);
+        self.skip_tx16_inter.clone_from(&o.skip_tx16_inter);
+        self.skip_tx8.clone_from(&o.skip_tx8);
+        self.skip_tx8_inter.clone_from(&o.skip_tx8_inter);
+        self.skip_tx4.clone_from(&o.skip_tx4);
+        self.cfl_is.clone_from(&o.cfl_is);
+        self.cfl_index.clone_from(&o.cfl_index);
+        self.cfl_mhccp.clone_from(&o.cfl_mhccp);
+        self.filter_dir.clone_from(&o.filter_dir);
+        self.skip_tx64.clone_from(&o.skip_tx64);
+        self.skip_tx64_inter.clone_from(&o.skip_tx64_inter);
+        self.skip_v.clone_from(&o.skip_v);
+        self.dc_sign.clone_from(&o.dc_sign);
+        self.eob_extra.clone_from(&o.eob_extra);
+        self.do_split.clone_from(&o.do_split);
+        self.do_square_split.clone_from(&o.do_square_split);
+        self.rect_type.clone_from(&o.rect_type);
+        self.do_split_c.clone_from(&o.do_split_c);
+        self.pal_y_mode.clone_from(&o.pal_y_mode);
+        self.pal_y_size.clone_from(&o.pal_y_size);
+        self.pal_row.clone_from(&o.pal_row);
+        self.pal_color.clone_from(&o.pal_color);
+        self.rect_type_c.clone_from(&o.rect_type_c);
+        self.txfm_bools.clone_from(&o.txfm_bools);
+        self.ccso.clone_from(&o.ccso);
+        self.cdef.clone_from(&o.cdef);
+        self.intra_inter.clone_from(&o.intra_inter);
+        self.inter_single_mode.clone_from(&o.inter_single_mode);
+        self.drl.clone_from(&o.drl);
+        self.single_ref.clone_from(&o.single_ref);
+        self.mvd_shell_set.clone_from(&o.mvd_shell_set);
+        self.mvd_shell_class0.clone_from(&o.mvd_shell_class0);
+        self.mvd_shell_class1.clone_from(&o.mvd_shell_class1);
+        self.mvd_offset_low.clone_from(&o.mvd_offset_low);
+        self.mvd_offset_class2.clone_from(&o.mvd_offset_class2);
+        self.mvd_offset_other.clone_from(&o.mvd_offset_other);
+        self.mvd_col_greater.clone_from(&o.mvd_col_greater);
+        self.mvd_col_index.clone_from(&o.mvd_col_index);
+        self.skip_txfm_blk.clone_from(&o.skip_txfm_blk);
+        self.tx_do_partition.clone_from(&o.tx_do_partition);
+        self.tx_part_type.clone_from(&o.tx_part_type);
+    }
 }
 
 impl CdfState {
@@ -328,6 +483,22 @@ impl CdfState {
                 &LUMA32_EOB_TOK_LF_QC[qc],
                 &cdf_para::PARA_LUMA32_EOB_TOK_LF[qc],
             ),
+            luma64_hf: e1d_para(
+                &crate::av2::cdfs_qctx::LUMA64_BASE_TOK_HF_QC[qc],
+                &cdf_para::PARA_LUMA64_BASE_TOK_HF[qc],
+            ),
+            luma64_lf: e1d_para(
+                &crate::av2::cdfs_qctx::LUMA64_BASE_TOK_LF_QC[qc],
+                &cdf_para::PARA_LUMA64_BASE_TOK_LF[qc],
+            ),
+            luma64_eob_hf: e1d_para(
+                &crate::av2::cdfs_qctx::LUMA64_EOB_TOK_HF_QC[qc],
+                &cdf_para::PARA_LUMA64_EOB_TOK_HF[qc],
+            ),
+            luma64_eob_lf: e1d_para(
+                &crate::av2::cdfs_qctx::LUMA64_EOB_TOK_LF_QC[qc],
+                &cdf_para::PARA_LUMA64_EOB_TOK_LF[qc],
+            ),
             br_hf: e1d_para(&BR_TOK_HF_QC[qc], &cdf_para::PARA_BR_TOK_HF[qc]),
             br: e1d_para(&BR_TOK_QC[qc], &cdf_para::PARA_BR_TOK[qc]),
             eob_bin: expand_para(&EOB_BIN_QC[qc], 7, cdf_para::PARA_EOB_BIN[qc]),
@@ -378,6 +549,11 @@ impl CdfState {
             tx_part_64: expand_para(&TX_PART_2D_64, 6, (2, 3, 3)),
             tx_part_64x32: expand_para(&TX_PART_64X32_INIT, 6, (2, 3, 3)),
             tx_part_32x64: expand_para(&TX_PART_32X64_INIT, 6, (2, 3, 3)),
+            tx_part_16x32: expand_para(&TX_PART_16X32_INIT, 6, (2, 3, 4)),
+            tx_part_32x16: expand_para(&TX_PART_32X16_INIT, 6, (2, 3, 4)),
+            tx_part_4way: (0..6)
+                .map(|i| expand_para(&TX_PART_4WAY_INIT[i], 6, TX_PART_4WAY_PARA[i]))
+                .collect(),
             tx_part_64x16: expand_para(&TX_PART_64X16_INIT, 6, (2, 2, 3)),
             tx_part_16x64: expand_para(&TX_PART_16X64_INIT, 6, (2, 3, 3)),
             tx_short_side: (0..2)
@@ -503,6 +679,53 @@ impl CdfState {
                     bool_wc(
                         crate::av2::partition::RECT_TYPE_CDF0[c] as u16,
                         cdf_para::PARA_RECT_TYPE[c],
+                    )
+                })
+                .collect(),
+            do_split_c: (0..64)
+                .map(|c| {
+                    bool_wc(
+                        crate::av2::partition::DO_SPLIT_CDF1[c] as u16,
+                        cdf_para::PARA_DO_SPLIT1[c],
+                    )
+                })
+                .collect(),
+            pal_y_mode: bool_wc(
+                crate::av2::palette::Y_MODE_ICDF,
+                crate::av2::palette::Y_MODE_PARA,
+            ),
+            pal_y_size: expand_para(
+                &crate::av2::palette::Y_SIZE_ICDF,
+                6,
+                crate::av2::palette::Y_SIZE_PARA,
+            ),
+            pal_row: (0..4)
+                .map(|c| {
+                    expand_para(
+                        &crate::av2::palette::ROW_ICDF[c],
+                        2,
+                        crate::av2::palette::ROW_PARA[c],
+                    )
+                })
+                .collect(),
+            pal_color: (0..7)
+                .map(|n| {
+                    (0..5)
+                        .map(|c| {
+                            expand_para(
+                                &crate::av2::palette::COLOR_ICDF[n][c],
+                                n + 1,
+                                crate::av2::palette::COLOR_PARA[n][c],
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+            rect_type_c: (0..64)
+                .map(|c| {
+                    bool_wc(
+                        crate::av2::partition::RECT_TYPE_CDF1[c] as u16,
+                        cdf_para::PARA_RECT_TYPE1[c],
                     )
                 })
                 .collect(),

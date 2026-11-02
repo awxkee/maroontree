@@ -96,6 +96,8 @@ impl Av2Encoder {
         // luma mode-search winner; `Replay` reuses it (skips `encode_luma_sb`).
         mut decide_mode: replay::DecideMode<'_>,
     ) -> RangeEncoder {
+        // Perceptual (4x4 DCT-weighted) decision distortion for stills.
+        crate::av2::helpers::set_wsse(self.still_rd());
         let bases = &self.bases;
         let (pw, ph) = (sb_align(width), sb_align(height));
         let (pcw, pch) = (pw / 2, ph / 2);
@@ -120,6 +122,7 @@ impl Av2Encoder {
             enc.enable_adaptive_cdf(enc.qc);
         }
         enc.cfl = self.tune.cfl && self.base_q_idx != 0;
+        enc.sct = self.sct(crate::av2::layout::Layout::I420);
         enc.mhccp = self.tune.mhccp && self.base_q_idx != 0;
         enc.mhccp_ssx = true;
         enc.mhccp_ssy = true;
@@ -137,10 +140,14 @@ impl Av2Encoder {
             let qs = quant::qstep(self.base_q_idx as u32) as i32;
             ((qs + 4) >> 3) >> 6
         };
-        let luma_deblock_active = self.tune.deblock && df_quant >= 1;
+        let luma_deblock_active =
+            self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
         // recy is byte-exact post-deblock luma when the DF is applied (AQ off) or inert.
         let recy_is_post_deblock = !luma_deblock_active || !enc.delta_q_present;
-        let ccso_ok = self.tune.ccso && self.base_q_idx != 0 && recy_is_post_deblock;
+        let ccso_ok = self.tune.ccso
+            && std::env::var("MT_NOCCSO").is_err()
+            && self.base_q_idx != 0
+            && recy_is_post_deblock;
         enc.ccso_u_enable = ccso_ok;
         enc.ccso_v_enable = ccso_ok;
         enc.ccso_cols = pw / 64;
@@ -217,6 +224,7 @@ impl Av2Encoder {
         if needs_partition {
             let mut tx_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
             let mut skip_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
+            let mut chroma_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
             let mut sb_qidx = vec![self.base_q_idx as u16; sb_rows * sb_cols];
             self.encode_yuv420_partition(
                 &mut enc,
@@ -261,6 +269,7 @@ impl Av2Encoder {
                 tile_ref,
                 &mut tx_leaves,
                 &mut skip_leaves,
+                &mut chroma_leaves,
                 &mut sb_qidx,
                 decide_mode,
             );
@@ -268,7 +277,8 @@ impl Av2Encoder {
             // the luma transform-boundary grid from the recorded leaves (each leaf
             // tiles into min(dim,32)-sized TUs) plus the per-SB qindex, and apply the
             // loop filter. Works with AQ on (per-SB qindex feeds the DF thresholds).
-            let filter_active = self.tune.deblock && df_quant >= 1;
+            let filter_active =
+                self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
             if filter_active {
                 let eff_dy = if self.tune.db_delta_y == i32::MIN {
                     if df_quant >= 5 { 0 } else { 1 }
@@ -294,7 +304,11 @@ impl Av2Encoder {
                     sb_cols,
                     sb_qidx: &sb_qidx,
                     leaves: &tx_leaves,
-                    chroma_leaves: &tx_leaves,
+                    chroma_leaves: if chroma_leaves.is_empty() {
+                        &tx_leaves
+                    } else {
+                        &chroma_leaves
+                    },
                     skip_leaves: &skip_leaves,
                     luma_tx_cap: (8, 8),
 
@@ -316,7 +330,10 @@ impl Av2Encoder {
                     self.bit_depth,
                     &crate::av2::cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
                 );
-            } else if self.tune.cdef && !replay::in_tile_subencode() {
+            } else if self.tune.cdef
+                && crate::av2::rd::knob("CDEF") > 0.0
+                && !replay::in_tile_subencode()
+            {
                 enc.cdef_decided = crate::av2::cdef_est::search_per_block(
                     &filtered_recon,
                     &[yp.clone(), up.clone(), vp.clone()],
@@ -360,7 +377,7 @@ impl Av2Encoder {
         )
         .with_variance_boost(
             self.tune.vb_octile,
-            self.tune.vb_strength,
+            self.tune.vb_strength * crate::av2::rd::knob("VB"),
             self.tune.vb_boost_only,
         )
         .with_dark_aq(self.tune.dark_aq);
@@ -1351,12 +1368,14 @@ impl Av2Encoder {
                                 x: sb_x,
                             },
                             &LumaQuantSpec {
+                                prune: leaf::PRUNE_PROBE | leaf::PRUNE_LARGE,
                                 basis: &bases.luma,
                                 qstep: sb_qstep,
                                 scan: &tables::SCAN,
                                 neutral,
                                 quant_context: qc,
                                 rdoq_lambda: self.tune.rdoq_lambda,
+                                pixel_lambda: self.still_rd(),
                                 speed: self.speed,
                                 bit_depth: self.bit_depth as i32,
                             },
@@ -1468,7 +1487,7 @@ impl Av2Encoder {
                             &cfl::ChromaRdSpec {
                                 basis: &bases.chroma420,
                                 qstep: qstep_i,
-                                lambda: leaf::part_lambda(qstep_i, self.tune.part_lambda_c),
+                                lambda: leaf::part_lambda(qstep_i, self.subsampled_part_lambda_c()),
                                 bit_depth: bd,
                             },
                         )
@@ -1492,7 +1511,7 @@ impl Av2Encoder {
                     // the incumbent (DC or classic CfL) on J = SSE + lambda*bits.
                     let mhccp_choice = if enc.mhccp {
                         let bd = self.bit_depth as i32;
-                        let lam = leaf::part_lambda(qstep_i, self.tune.part_lambda_c);
+                        let lam = leaf::part_lambda(qstep_i, self.subsampled_part_lambda_c());
                         let dc_u_f = chroma_dc(&recu);
                         let dc_v_f = chroma_dc(&recv);
                         // Chroma source blocks (same extraction cfl_decide uses).
@@ -1631,7 +1650,7 @@ impl Av2Encoder {
                         } else {
                             &[0, 1, 2, 3, 4]
                         };
-                        let lambda = leaf::part_lambda(sb_qstep, self.tune.part_lambda_c);
+                        let lambda = leaf::part_lambda(sb_qstep, self.subsampled_part_lambda_c());
                         let mut best_mode = 0usize;
                         let mut best_cost = f32::INFINITY;
                         let mut best = None;
@@ -1905,7 +1924,7 @@ impl Av2Encoder {
         // deblock -> (snapshot ext_rec_y) -> CDEF -> CCSO, so this runs before them.
         // Whole-SB path: synthesize one 64x64 luma leaf per SB (SPLIT tx -> 4x 32x32).
         // Gated to AQ off here (uniform qindex); the partition path handles AQ.
-        let filter_active = self.tune.deblock && df_quant >= 1;
+        let filter_active = self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
         if filter_active && !enc.delta_q_present {
             let eff_dy = if self.tune.db_delta_y == i32::MIN {
                 if df_quant >= 5 { 0 } else { 1 }
@@ -1950,7 +1969,11 @@ impl Av2Encoder {
         // recon to the post-CCSO result — the decoder applies CDEF before CCSO, so
         // the CDEF decision must see the pre-CCSO recon. The multi-tile path forces
         // `capture_recon` and searches the stitched recon instead.
-        if self.tune.cdef && cdef_pre.is_none() && !replay::in_tile_subencode() {
+        if self.tune.cdef
+            && crate::av2::rd::knob("CDEF") > 0.0
+            && cdef_pre.is_none()
+            && !replay::in_tile_subencode()
+        {
             enc.cdef_decided = crate::av2::cdef_est::search_per_block(
                 &[recy.clone(), recu.clone(), recv.clone()],
                 &[yp.clone(), up.clone(), vp.clone()],

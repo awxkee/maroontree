@@ -653,9 +653,18 @@ pub(crate) fn inv_txfm_recon_f32<F: Fn(usize) -> i32>(
     bd: i32,
     pred_fn: F,
 ) {
+    let pmax = (1 << bd) - 1;
+    // All-zero coefficients: every pass rounds 0 to 0, so the reconstruction is
+    // the (clamped) prediction.
+    if coeff.iter().all(|&c| c == 0) {
+        let (tw, th, _, _) = DIM[tx];
+        for (i, o) in out[..16 * tw * th].iter_mut().enumerate() {
+            *o = pred_fn(i).clamp(0, pmax) as f32;
+        }
+        return;
+    }
     let mut tmp = [0i32; 32 * 32];
     let (sw, sh, w, h, s1) = txfm_passes(&mut tmp, coeff, txtp, tx, bd);
-    let pmax = (1 << bd) - 1;
     let rnd1 = (1 << s1) >> 1;
     // AVM clamps each column-pass output (the residual) to [-2^bd, 2^bd-1]
     // (idct.c col_rng_min/max); required for enc/dec recon match at large qstep.

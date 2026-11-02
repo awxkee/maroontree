@@ -65,13 +65,18 @@ fn paeth_single(left: i32, top: i32, top_left: i32) -> i32 {
 /// PAETH predictor for a `bs`x`bs` block → row-major `bs*bs` f32 samples.
 pub(crate) fn paeth(bs: usize, above: &[i32], left: &[i32], corner: i32) -> Vec<f32> {
     let mut out = vec![0f32; bs * bs];
+    paeth_into(bs, above, left, corner, &mut out);
+    out
+}
+
+/// [`paeth`] into `out[..bs*bs]`.
+pub(crate) fn paeth_into(bs: usize, above: &[i32], left: &[i32], corner: i32, out: &mut [f32]) {
     for (r, &l) in left[..bs].iter().enumerate() {
         let row = &mut out[r * bs..r * bs + bs];
         for (dst, &top) in row[..bs].iter_mut().zip(above[..bs].iter()) {
             *dst = paeth_single(l, top, corner) as f32;
         }
     }
-    out
 }
 
 #[rustfmt::skip]
@@ -87,7 +92,7 @@ fn smooth_scale(bs: usize) -> usize {
     (n_pel >= 64) as usize + (n_pel > 512) as usize
 }
 
-fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+fn smooth_scalar(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
     // AV2 highbd_smooth_predictor (avm_dsp/intrapred.c).
     let bl = left[bs];
     let tr = above[bs];
@@ -95,7 +100,6 @@ fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
     let scale = ((lg - 2) + (lg - 2) + 2) >> 2;
     let blend_max_log2 = blk_size_log2(32);
     let dr = |v: i32, bits: i32| (v + (1 << (bits - 1))) >> bits;
-    let mut out = vec![0f32; bs * bs];
     for r in 0..bs {
         let s_top = 32 >> blk_size_log2(64).min(((r as i32) << 1) >> scale);
         let l = left[r];
@@ -109,17 +113,15 @@ fn smooth_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
             out[r * bs + c] = dr(predv + predh, 1) as f32;
         }
     }
-    out
 }
 
 /// AV2/AVM SMOOTH_V: vertical half of [`smooth`]. Bit-exact to dav2d
 /// `ipred_smooth_v_c`. `left[bs]` = bottom-left.
-fn smooth_v_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+fn smooth_v_scalar(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
     let log2 = blk_size_log2(bs);
     let rnd = (bs as i32) >> 1;
     let w = &SM_WEIGHTS[smooth_scale(bs)];
     let bottom = left[bs];
-    let mut out = vec![0f32; bs * bs];
     for y in 0..bs {
         let (off, w_ver) = (bs as i32 - 1 - y as i32, w[y]);
         let row = &mut out[y * bs..y * bs + bs];
@@ -128,17 +130,15 @@ fn smooth_v_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
             *dst = (pred + (((above_x - pred) * w_ver + 32) >> 6)) as f32;
         }
     }
-    out
 }
 
 /// AV2/AVM SMOOTH_H: horizontal half of [`smooth`]. Bit-exact to dav2d
 /// `ipred_smooth_h_c`. `above[bs]` = top-right.
-fn smooth_h_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+fn smooth_h_scalar(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
     let log2 = blk_size_log2(bs);
     let rnd = (bs as i32) >> 1;
     let w = &SM_WEIGHTS[smooth_scale(bs)];
     let right = above[bs];
-    let mut out = vec![0f32; bs * bs];
     for (y, &l) in left[..bs].iter().enumerate() {
         let diff = l - right;
         let row = &mut out[y * bs..y * bs + bs];
@@ -147,35 +147,55 @@ fn smooth_h_scalar(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
             *dst = (pred + (((l - pred) * w[x] + 32) >> 6)) as f32;
         }
     }
-    out
 }
 
 /// Public SMOOTH dispatch: NEON (4-lane, MAC) on aarch64, scalar elsewhere. The
 /// NEON kernel is bit-exact to [`smooth_scalar`] (validated lane-for-lane).
 pub(crate) fn smooth(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
-    smooth_scalar(bs, above, left)
+    let mut out = vec![0f32; bs * bs];
+    smooth_into(bs, above, left, &mut out);
+    out
+}
+
+/// [`smooth`] into `out[..bs*bs]`.
+pub(crate) fn smooth_into(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
+    smooth_scalar(bs, above, left, out)
 }
 
 /// Public SMOOTH_V dispatch (see [`smooth`]).
 pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    let mut out = vec![0f32; bs * bs];
+    smooth_v_into(bs, above, left, &mut out);
+    out
+}
+
+/// [`smooth_v`] into `out[..bs*bs]`.
+pub(crate) fn smooth_v_into(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         if bs.is_multiple_of(4) {
-            return unsafe { neon::smooth_v(bs, above, left) };
+            return unsafe { neon::smooth_v(bs, above, left, out) };
         }
     }
-    smooth_v_scalar(bs, above, left)
+    smooth_v_scalar(bs, above, left, out)
 }
 
 /// Public SMOOTH_H dispatch (see [`smooth`]).
 pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    let mut out = vec![0f32; bs * bs];
+    smooth_h_into(bs, above, left, &mut out);
+    out
+}
+
+/// [`smooth_h`] into `out[..bs*bs]`.
+pub(crate) fn smooth_h_into(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         if bs.is_multiple_of(4) {
-            return unsafe { neon::smooth_h(bs, above, left) };
+            return unsafe { neon::smooth_h(bs, above, left, out) };
         }
     }
-    smooth_h_scalar(bs, above, left)
+    smooth_h_scalar(bs, above, left, out)
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -211,12 +231,11 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
-    pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    pub(crate) fn smooth_v(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
         let log2 = 31 - (bs as u32).leading_zeros() as i32;
         let rnd = bs as i32 >> 1;
         let w = &SM_WEIGHTS[smooth_scale(bs)];
         let bottom = left[bs];
-        let mut out = vec![0f32; bs * bs];
         let (bb, r32, rndb) = (vdupq_n_s32(bottom), vdupq_n_s32(32), vdupq_n_s32(rnd));
         for y in 0..bs {
             let (off, w_ver) = (bs as i32 - 1 - y as i32, w[y]);
@@ -232,16 +251,14 @@ mod neon {
                 }
             }
         }
-        out
     }
 
     #[target_feature(enable = "neon")]
-    pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32]) -> Vec<f32> {
+    pub(crate) fn smooth_h(bs: usize, above: &[i32], left: &[i32], out: &mut [f32]) {
         let log2 = 31 - (bs as u32).leading_zeros() as i32;
         let rnd = bs as i32 >> 1;
         let w = &SM_WEIGHTS[smooth_scale(bs)];
         let right = above[bs];
-        let mut out = vec![0f32; bs * bs];
         let (rb, r32, rndb) = (vdupq_n_s32(right), vdupq_n_s32(32), vdupq_n_s32(rnd));
         for (y, &l) in left[..bs].iter().enumerate() {
             let diff = l - right;
@@ -259,7 +276,6 @@ mod neon {
                 x += 4;
             }
         }
-        out
     }
 }
 
@@ -279,7 +295,14 @@ pub(crate) struct IntraRefSpec {
     pub(crate) available_left: usize,
 }
 
-pub(crate) fn build_refs(rec: &[f32], spec: &IntraRefSpec) -> (Vec<i32>, Vec<i32>, i32) {
+/// Capacity of a [`build_refs`] edge: `2 * block_size` for blocks up to 64.
+pub(crate) const REF_CAP: usize = 128;
+
+/// Above / left reference rings (`[..2*bs]` valid) and the corner sample.
+pub(crate) fn build_refs(
+    rec: &[f32],
+    spec: &IntraRefSpec,
+) -> ([i32; REF_CAP], [i32; REF_CAP], i32) {
     let IntraRefSpec {
         stride: pw,
         y: y0,
@@ -301,8 +324,9 @@ pub(crate) fn build_refs(rec: &[f32], spec: &IntraRefSpec) -> (Vec<i32>, Vec<i32
     // blocks along frame/tile/partition edges.
     let base: i32 = neutral.fast_round() as i32;
     let g = |y: usize, x: usize| (rec[y * pw + x] + 0.5) as i32;
-    let mut above = vec![0i32; 2 * bs];
-    let mut left = vec![0i32; 2 * bs];
+    assert!(2 * bs <= REF_CAP);
+    let mut above = [0i32; REF_CAP];
+    let mut left = [0i32; REF_CAP];
     let n_top = if have_above { bs } else { 0 };
     let n_left = if have_left { bs } else { 0 };
 
@@ -326,11 +350,11 @@ pub(crate) fn build_refs(rec: &[f32], spec: &IntraRefSpec) -> (Vec<i32>, Vec<i32
         }
     } else if n_left > 0 {
         let v = g(y0, x0 - 1);
-        for s in above.iter_mut() {
+        for s in above[..2 * bs].iter_mut() {
             *s = v;
         }
     } else {
-        for s in above.iter_mut() {
+        for s in above[..2 * bs].iter_mut() {
             *s = base - 1;
         }
     }
@@ -356,11 +380,11 @@ pub(crate) fn build_refs(rec: &[f32], spec: &IntraRefSpec) -> (Vec<i32>, Vec<i32
         }
     } else if n_top > 0 {
         let v = g(y0 - 1, x0);
-        for s in left.iter_mut() {
+        for s in left[..2 * bs].iter_mut() {
             *s = v;
         }
     } else {
-        for s in left.iter_mut() {
+        for s in left[..2 * bs].iter_mut() {
             *s = base + 1;
         }
     }

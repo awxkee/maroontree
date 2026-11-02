@@ -28,8 +28,7 @@
  */
 
 use crate::av2::helpers::{
-    BoundedIntraRect, cfl_sse_i32, coeff_rate_f32, dc_pred_bounded,
-    dc_pred_rect_subsampled_bounded, pixel_sse_rounded,
+    BoundedIntraRect, cfl_sse_i32, coeff_rate_f32, dc_pred_bounded, dc_pred_rect_subsampled_bounded,
 };
 use crate::av2::mhccp;
 use crate::av2::proj::Basis;
@@ -419,11 +418,17 @@ pub(crate) fn cfl_avg_l(
         for (kk, t) in top.iter_mut().enumerate() {
             *t = match (ssx, ssy) {
                 (false, false) => l(sb_y - 1, sb_x + kk) << 3,
-                // 4:2:0, is_top_sb_boundary=1: single row sb_y-1 counted twice, <<1.
+                // 4:2:0 (avm top_offset = 2 - is_top_sb_boundary): on a superblock's top
+                // edge the single row sb_y-1 is counted twice; inside a superblock the
+                // 2x2 box covers rows sb_y-2 and sb_y-1. <<1.
                 (true, true) => {
                     let a = l(sb_y - 1, sb_x + 2 * kk);
                     let b = l(sb_y - 1, sb_x + 2 * kk + 1);
-                    (a + b + a + b) << 1
+                    if sb_y % 64 == 0 {
+                        (a + b + a + b) << 1
+                    } else {
+                        (l(sb_y - 2, sb_x + 2 * kk) + l(sb_y - 2, sb_x + 2 * kk + 1) + a + b) << 1
+                    }
                 }
                 // 4:2:2: horizontal luma pair of row sb_y-1, <<2.
                 (true, false) => (l(sb_y - 1, sb_x + 2 * kk) + l(sb_y - 1, sb_x + 2 * kk + 1)) << 2,
@@ -773,7 +778,8 @@ pub(crate) fn cfl_decide(input: &CflDecisionInput<'_>, rd: &ChromaRdSpec<'_>) ->
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
     let rec_dc_u = itx422::reconstruct_chroma(dc_u_f, &lev_dc_u, qstep, scan, cw, ch, bd);
     let rec_dc_v = itx422::reconstruct_chroma(dc_v_f, &lev_dc_v, qstep, scan, cw, ch, bd);
-    let j_dc = (pixel_sse_rounded(src_u, &rec_dc_u) + pixel_sse_rounded(src_v, &rec_dc_v))
+    let j_dc = (crate::av2::helpers::dist_flat(src_u, &rec_dc_u, cw)
+        + crate::av2::helpers::dist_flat(src_v, &rec_dc_v, cw))
         + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v));
     let res_cf_u: Vec<f32> = src_u[..n]
         .iter()
@@ -793,7 +799,8 @@ pub(crate) fn cfl_decide(input: &CflDecisionInput<'_>, rd: &ChromaRdSpec<'_>) ->
         + 3.0
         + if cand.sign_u != 0 { 3.0 } else { 0.0 }
         + if cand.sign_v != 0 { 3.0 } else { 0.0 };
-    let j_cfl = (pixel_sse_rounded(src_u, &rec_cf_u) + pixel_sse_rounded(src_v, &rec_cf_v)) as f32
+    let j_cfl = (crate::av2::helpers::dist_flat(src_u, &rec_cf_u, cw)
+        + crate::av2::helpers::dist_flat(src_v, &rec_cf_v, cw)) as f32
         + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f32 + alpha_bits);
     if j_cfl < j_dc { Some(cand) } else { None }
 }
@@ -833,7 +840,8 @@ pub(crate) fn score_predictor(input: &PredictorScoreInput<'_>, rd: &ChromaRdSpec
     let lev_v = chroma.project(&res_v, 0.0);
     let rec_u = itx422::reconstruct_chroma_cfl(pred_u, &lev_u, qstep, scan, cw, ch, bd);
     let rec_v = itx422::reconstruct_chroma_cfl(pred_v, &lev_v, qstep, scan, cw, ch, bd);
-    (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v))
+    (crate::av2::helpers::dist_flat(src_u, &rec_u, cw)
+        + crate::av2::helpers::dist_flat(src_v, &rec_v, cw))
         + lambda * ((coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v)) + mode_bits)
 }
 
@@ -1106,12 +1114,61 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
         return None;
     }
 
-    let mut best: Option<(f32, CflChoice)> = None;
-    for dir in 0u8..mhccp::MHCCP_MODE_NUM as u8 {
+    // Per-direction buffers reused across the directions; the winner's predictors
+    // are swapped out.
+    let mut best: Option<(f32, u8)> = None;
+    let (mut best_u, mut best_v) = (Vec::new(), Vec::new());
+    let (mut pred_u, mut pred_v) = (vec![0i32; n], vec![0i32; n]);
+    let (mut res_u, mut res_v) = (vec![0f32; n], vec![0f32; n]);
+    let (mut lev_u, mut lev_v) = (Vec::new(), Vec::new());
+    let (mut rec_u, mut rec_v) = (vec![0f32; cw * ch], vec![0f32; cw * ch]);
+    // Direction pre-screen: rank the filter directions by their prediction SSE
+    // and fully code only the best `keep`.
+    let keep = crate::av2::rd::knob_or("MHK", 0.0) as usize;
+    let mut dirs: Vec<u8> = (0u8..mhccp::MHCCP_MODE_NUM as u8).collect();
+    if keep > 0 && keep < dirs.len() {
+        let pred_sse = |pred: &[i32], src: &[f32]| -> f32 {
+            src[..n]
+                .iter()
+                .zip(pred)
+                .map(|(&s, &p)| (s - p as f32).powi(2))
+                .sum()
+        };
+        let mut ranked: Vec<(f32, u8)> = dirs
+            .iter()
+            .map(|&dir| {
+                let pu = mhccp::derive_params(&luma_ref, &cref_u, dir, bd);
+                let pv = mhccp::derive_params(&luma_ref, &cref_v, dir, bd);
+                mhccp::predict_block(
+                    &luma_ref,
+                    &pu,
+                    dir,
+                    ctx.have_top,
+                    ctx.have_left,
+                    bd,
+                    &mut pred_u,
+                );
+                mhccp::predict_block(
+                    &luma_ref,
+                    &pv,
+                    dir,
+                    ctx.have_top,
+                    ctx.have_left,
+                    bd,
+                    &mut pred_v,
+                );
+                (pred_sse(&pred_u, src_u) + pred_sse(&pred_v, src_v), dir)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        dirs = ranked.into_iter().take(keep).map(|(_, d)| d).collect();
+        dirs.sort_unstable();
+    }
+    for dir in dirs {
         let pu = mhccp::derive_params(&luma_ref, &cref_u, dir, bd);
         let pv = mhccp::derive_params(&luma_ref, &cref_v, dir, bd);
-        let mut pred_u = vec![0i32; n];
-        let mut pred_v = vec![0i32; n];
+        pred_u.resize(n, 0);
+        pred_v.resize(n, 0);
         mhccp::predict_block(
             &luma_ref,
             &pu,
@@ -1130,47 +1187,51 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
             bd,
             &mut pred_v,
         );
-        let res_u: Vec<f32> = src_u[..n]
-            .iter()
-            .zip(pred_u.iter())
-            .map(|(&s, &c)| s - c as f32)
-            .collect();
-        let res_v: Vec<f32> = src_v[..n]
-            .iter()
-            .zip(pred_v.iter())
-            .map(|(&s, &c)| s - c as f32)
-            .collect();
-        let lev_u = chroma.project_scan(&res_u, 0.0, scan);
-        let lev_v = chroma.project_scan(&res_v, 0.0, scan);
-        let rec_u = itx422::reconstruct_chroma_cfl(&pred_u, &lev_u, qstep, scan, cw, ch, bd);
-        let rec_v = itx422::reconstruct_chroma_cfl(&pred_v, &lev_v, qstep, scan, cw, ch, bd);
+        for ((r, &s), &c) in res_u.iter_mut().zip(&src_u[..n]).zip(pred_u.iter()) {
+            *r = s - c as f32;
+        }
+        for ((r, &s), &c) in res_v.iter_mut().zip(&src_v[..n]).zip(pred_v.iter()) {
+            *r = s - c as f32;
+        }
+        chroma.project_scan_into(&res_u, 0.0, scan, &mut lev_u);
+        chroma.project_scan_into(&res_v, 0.0, scan, &mut lev_v);
+        itx422::reconstruct_chroma_pred_tx_into(
+            &pred_u, &lev_u, qstep, scan, cw, ch, bd, 0, &mut rec_u,
+        );
+        itx422::reconstruct_chroma_pred_tx_into(
+            &pred_v, &lev_v, qstep, scan, cw, ch, bd, 0, &mut rec_v,
+        );
         // filter_dir bits from the size-group default CDF.
         let dir_bits = filter_dir_bits(ctx.size_group as usize, dir);
-        let j = (pixel_sse_rounded(src_u, &rec_u) + pixel_sse_rounded(src_v, &rec_v)) as f32
-            + lambda
-                * ((coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v) + switch_bits + dir_bits)
-                    as f32);
+        let j = crate::av2::helpers::dist_flat(src_u, &rec_u, cw)
+            + crate::av2::helpers::dist_flat(src_v, &rec_v, cw)
+            + lambda * (coeff_rate_f32(&lev_u) + coeff_rate_f32(&lev_v) + switch_bits + dir_bits);
         if best.as_ref().map(|(bj, _)| j < *bj).unwrap_or(true) {
-            best = Some((
-                j,
-                CflChoice {
-                    js: 0,
-                    sign_u: 0,
-                    sign_v: 0,
-                    mag_u: 0,
-                    mag_v: 0,
-                    ctx_u: 0,
-                    ctx_v: 0,
-                    pred_u,
-                    pred_v,
-                    mhccp: Some(MhccpDecision {
-                        mh_dir: dir,
-                        size_group: ctx.size_group,
-                    }),
-                },
-            ));
+            best = Some((j, dir));
+            std::mem::swap(&mut best_u, &mut pred_u);
+            std::mem::swap(&mut best_v, &mut pred_v);
         }
     }
+    let best = best.map(|(j, dir)| {
+        (
+            j,
+            CflChoice {
+                js: 0,
+                sign_u: 0,
+                sign_v: 0,
+                mag_u: 0,
+                mag_v: 0,
+                ctx_u: 0,
+                ctx_v: 0,
+                pred_u: best_u,
+                pred_v: best_v,
+                mhccp: Some(MhccpDecision {
+                    mh_dir: dir,
+                    size_group: ctx.size_group,
+                }),
+            },
+        )
+    });
 
     match best {
         Some((j, choice)) => {
@@ -1268,7 +1329,8 @@ pub(crate) fn mhccp_eval_leaf(input: &MhccpLeafInput<'_>) -> Option<CflChoice> {
     // baseline underestimate the DC path, letting MHCCP win when DC was better.
     let brec_u = itx422::reconstruct_chroma(dc_u, &blev_u, qstep, scan, cw, ch, bd);
     let brec_v = itx422::reconstruct_chroma(dc_v, &blev_v, qstep, scan, cw, ch, bd);
-    let sse = (pixel_sse_rounded(&src_u[..n], &brec_u) + pixel_sse_rounded(&src_v[..n], &brec_v))
+    let sse = (crate::av2::helpers::dist_flat(&src_u[..n], &brec_u, cw)
+        + crate::av2::helpers::dist_flat(&src_v[..n], &brec_v, cw))
         + lambda * (coeff_rate_f32(&blev_u) + coeff_rate_f32(&blev_v));
     let bw4 = (cw << (ssx as usize)) / 4;
     let bh4 = (ch << (ssy as usize)) / 4;
@@ -1571,7 +1633,8 @@ pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Op
     let lev_dc_v = chroma.project(&res_dc_v, 0.0);
     let rec_dc_u = itx422::reconstruct_chroma(predu_f, &lev_dc_u, qstep, scan, 64, 64, bd);
     let rec_dc_v = itx422::reconstruct_chroma(predv_f, &lev_dc_v, qstep, scan, 64, 64, bd);
-    let j_dc = (pixel_sse_rounded(&suf, &rec_dc_u) + pixel_sse_rounded(&svf, &rec_dc_v)) as f32
+    let j_dc = (crate::av2::helpers::dist_flat(&suf, &rec_dc_u, 64)
+        + crate::av2::helpers::dist_flat(&svf, &rec_dc_v, 64)) as f32
         + lambda * (coeff_rate_f32(&lev_dc_u) + coeff_rate_f32(&lev_dc_v)) as f32;
     // CfL candidate for both planes.
     let res_cf_u: Vec<f32> = suf
@@ -1593,7 +1656,8 @@ pub(crate) fn cfl_decide_64(input: &Cfl64Input<'_>, rd: &ChromaRdSpec<'_>) -> Op
         + 3.0
         + if cand.sign_u != 0 { 3.0 } else { 0.0 }
         + if cand.sign_v != 0 { 3.0 } else { 0.0 };
-    let j_cfl = (pixel_sse_rounded(&suf, &rec_cf_u) + pixel_sse_rounded(&svf, &rec_cf_v)) as f32
+    let j_cfl = (crate::av2::helpers::dist_flat(&suf, &rec_cf_u, 64)
+        + crate::av2::helpers::dist_flat(&svf, &rec_cf_v, 64)) as f32
         + lambda * ((coeff_rate_f32(&lev_cf_u) + coeff_rate_f32(&lev_cf_v)) as f32 + alpha_bits);
     if j_cfl < j_dc { Some(cand) } else { None }
 }

@@ -187,15 +187,13 @@ pub(crate) fn adjust_pri(pri: i32, var: i32) -> i32 {
     (pri * (4 + l) + 8) >> 4
 }
 
-/// Apply the CDEF filter to one 8x8 block in place into `dst`, reading from
-/// `src` (the deblocked reconstruction). `pri`/`sec` are the primary/secondary
-/// strengths, `dir` the block direction, `damping` the frame damping, `bd` the
-/// bit depth. Out-of-frame / skip taps are marked `CDEF_VERY_LARGE` in `src`
-/// and excluded. Mirrors spec `cdef_filter` for one 8x8.
+/// Apply the CDEF filter to one 8x8 block of an `i32` plane into `dst`, reading
+/// from `src` (the deblocked reconstruction): [`cdef_filter_block_i32`] on one
+/// 8x8. Out-of-frame / skip taps are marked `CDEF_VERY_LARGE` in `src`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cdef_filter_8x8<P: crate::intrapred::Pel>(
-    dst: &mut [P],
-    src: &[P],
+pub(crate) fn cdef_filter_8x8_i32(
+    dst: &mut [i32],
+    src: &[i32],
     stride: usize,
     x: usize,
     y: usize,
@@ -205,7 +203,179 @@ pub(crate) fn cdef_filter_8x8<P: crate::intrapred::Pel>(
     damping: i32,
     bd: u8,
 ) {
-    cdef_filter_block(dst, 0, src, stride, x, y, 8, 8, pri, sec, dir, damping, bd);
+    cdef_filter_block_i32(dst, 0, src, stride, x, y, 8, 8, pri, sec, dir, damping, bd);
+}
+
+/// [`cdef_filter_block`] for `i32` planes (the AV2 path): interior blocks whose
+/// width is a multiple of 4 run a 4-lane NEON kernel, everything else the
+/// scalar filter. Bit-exact with [`cdef_filter_block`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cdef_filter_block_i32(
+    dst: &mut [i32],
+    dst_y0: usize,
+    src: &[i32],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bw: usize,
+    bh: usize,
+    pri: i32,
+    sec: i32,
+    dir: usize,
+    damping: i32,
+    bd: u8,
+) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        let rows = src.len() / stride;
+        if bw % 4 == 0
+            && x >= 2
+            && y >= 2
+            && x + bw + 2 <= stride
+            && y + bh + 2 <= rows
+            && dst.len() >= (y + bh - dst_y0) * stride
+        {
+            // SAFETY: every tap is within 2 samples of a centre that lies inside the
+            // 2-sample in-plane margin checked above.
+            unsafe {
+                cdef_filter_block_i32_neon(
+                    dst, dst_y0, src, stride, x, y, bw, bh, pri, sec, dir, damping, bd,
+                )
+            };
+            return;
+        }
+    }
+    cdef_filter_block(
+        dst, dst_y0, src, stride, x, y, bw, bh, pri, sec, dir, damping, bd,
+    );
+}
+
+/// The interior branch of [`cdef_filter_block`], 4 samples per step. A
+/// `CDEF_VERY_LARGE` tap constrains to 0 for every legal strength / damping (its
+/// distance to any pixel exceeds `strength << shift`), so only the max clamp
+/// masks it; a `CDEF_VERY_LARGE` centre leaves its output untouched.
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn cdef_filter_block_i32_neon(
+    dst: &mut [i32],
+    dst_y0: usize,
+    src: &[i32],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bw: usize,
+    bh: usize,
+    pri: i32,
+    sec: i32,
+    dir: usize,
+    damping: i32,
+    bd: u8,
+) {
+    use core::arch::aarch64::*;
+    let coeff_shift = (bd - 8) as i32;
+    let damping = damping.max(1);
+    let pri_taps = CDEF_PRI_TAPS[((pri >> coeff_shift) & 1) as usize];
+    let (enable_pri, enable_sec) = (pri != 0, sec != 0);
+    let clipping = enable_pri && enable_sec;
+    let s = stride as isize;
+    let off = |(dr, dc): (i32, i32)| dr as isize * s + dc as isize;
+    let pri_off = [off(CDEF_DIRECTIONS[dir][0]), off(CDEF_DIRECTIONS[dir][1])];
+    let (s2, s6) = ((dir + 2) & 7, (dir + 6) & 7);
+    let sec_off = [
+        [off(CDEF_DIRECTIONS[s2][0]), off(CDEF_DIRECTIONS[s6][0])],
+        [off(CDEF_DIRECTIONS[s2][1]), off(CDEF_DIRECTIONS[s6][1])],
+    ];
+    let shift = |strength: i32| {
+        if strength == 0 {
+            0
+        } else {
+            (damping - log2_floor(strength)).max(0)
+        }
+    };
+    unsafe {
+        let (vpri, vsec) = (vdupq_n_s32(pri), vdupq_n_s32(sec));
+        let (npri_shift, nsec_shift) = (vdupq_n_s32(-shift(pri)), vdupq_n_s32(-shift(sec)));
+        let zero = vdupq_n_s32(0);
+        let very_large = vdupq_n_s32(CDEF_VERY_LARGE);
+        let maxpx = vdupq_n_s32((1i32 << bd) - 1);
+        let eight = vdupq_n_s32(8);
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        // sign(d) * clamp(strength - (|d| >> shift), 0, |d|)
+        let constrain = |d: int32x4_t, strength: int32x4_t, nshift: int32x4_t| {
+            let a = vabsq_s32(d);
+            let c = vminq_s32(
+                vmaxq_s32(vsubq_s32(strength, vshlq_s32(a, nshift)), zero),
+                a,
+            );
+            let sgn = vshrq_n_s32::<31>(d);
+            vsubq_s32(veorq_s32(c, sgn), sgn)
+        };
+        for i in 0..bh {
+            let row = ((y + i) * stride + x) as isize;
+            let drow = (y + i - dst_y0) * stride + x;
+            let mut j = 0;
+            while j < bw {
+                let idx = row + j as isize;
+                let c = vld1q_s32(sp.offset(idx));
+                let mut sum = zero;
+                let (mut mn, mut mx) = (c, c);
+                let mut acc = |p: int32x4_t, w: i32, strength, nshift| {
+                    sum = vmlaq_n_s32(sum, constrain(vsubq_s32(p, c), strength, nshift), w);
+                    if clipping {
+                        mn = vminq_s32(mn, p);
+                        // A CDEF_VERY_LARGE tap never raises the max.
+                        mx = vmaxq_s32(mx, vbslq_s32(vceqq_s32(p, very_large), c, p));
+                    }
+                };
+                for k in 0..2usize {
+                    if enable_pri {
+                        acc(
+                            vld1q_s32(sp.offset(idx + pri_off[k])),
+                            pri_taps[k],
+                            vpri,
+                            npri_shift,
+                        );
+                        acc(
+                            vld1q_s32(sp.offset(idx - pri_off[k])),
+                            pri_taps[k],
+                            vpri,
+                            npri_shift,
+                        );
+                    }
+                    if enable_sec {
+                        for o in sec_off[k] {
+                            acc(
+                                vld1q_s32(sp.offset(idx + o)),
+                                CDEF_SEC_TAPS[k],
+                                vsec,
+                                nsec_shift,
+                            );
+                            acc(
+                                vld1q_s32(sp.offset(idx - o)),
+                                CDEF_SEC_TAPS[k],
+                                vsec,
+                                nsec_shift,
+                            );
+                        }
+                    }
+                }
+                // centre + ((8 + sum - (sum < 0)) >> 4)
+                let rounded =
+                    vshrq_n_s32::<4>(vaddq_s32(vaddq_s32(eight, sum), vshrq_n_s32::<31>(sum)));
+                let mut out = vaddq_s32(c, rounded);
+                if clipping {
+                    out = vminq_s32(vmaxq_s32(out, mn), mx);
+                }
+                out = vminq_s32(vmaxq_s32(out, zero), maxpx);
+                let dst_ptr = dp.add(drow + j);
+                let keep = vceqq_s32(c, very_large);
+                vst1q_s32(dst_ptr, vbslq_s32(keep, vld1q_s32(dst_ptr), out));
+                j += 4;
+            }
+        }
+    }
 }
 
 /// CDEF filter over a `bw` x `bh` block at (x, y). 8x8 for luma and 4:4:4
@@ -941,6 +1111,42 @@ pub(crate) fn cdef_dist_from_sums(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The i32 NEON kernel matches the scalar filter on random planes with
+    /// skip-marked taps, every direction, strength mix and bit depth.
+    #[test]
+    fn cdef_filter_block_i32_matches_scalar() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for &bd in &[8u8, 10, 12] {
+            let (w, h) = (24usize, 20usize);
+            for trial in 0..200 {
+                let maxv = (1u64 << bd) - 1;
+                let src: Vec<i32> = (0..w * h)
+                    .map(|_| {
+                        if xorshift(&mut seed, 23) == 0 {
+                            CDEF_VERY_LARGE
+                        } else {
+                            xorshift(&mut seed, maxv + 1) as i32
+                        }
+                    })
+                    .collect();
+                let pri = (xorshift(&mut seed, 16) as i32) << (bd - 8);
+                let sec = [0, 1, 2, 4][xorshift(&mut seed, 4) as usize] << (bd - 8);
+                let dir = xorshift(&mut seed, 8) as usize;
+                let damping = 3 + xorshift(&mut seed, 4) as i32 + (bd as i32 - 8);
+                let (bw, bh) = [(8, 8), (4, 8), (4, 4)][trial % 3];
+                let (x, y) = (2 + xorshift(&mut seed, (w - bw - 3) as u64) as usize, 4);
+                let mut a = vec![7i32; w * h];
+                let mut b = a.clone();
+                cdef_filter_block(&mut a, 0, &src, w, x, y, bw, bh, pri, sec, dir, damping, bd);
+                cdef_filter_block_i32(&mut b, 0, &src, w, x, y, bw, bh, pri, sec, dir, damping, bd);
+                assert_eq!(
+                    a, b,
+                    "bd {bd} pri {pri} sec {sec} dir {dir} damping {damping}"
+                );
+            }
+        }
+    }
 
     fn xorshift(seed: &mut u64, m: u64) -> u64 {
         *seed ^= *seed << 13;

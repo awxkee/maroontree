@@ -538,6 +538,10 @@ pub(crate) fn deblock_plane(
     }
 }
 
+/// Flag on a leaf's `bw` / `bh` (mi): the leaf is a single transform of its own size
+/// (no 32-px tiling), e.g. a luma TX_64X64.
+pub(crate) const TU_WHOLE: usize = 1 << 12;
+
 /// Build a per-MI TX-boundary grid for a plane. `leaves` are the luma prediction
 /// blocks `(mi_row, mi_col, bw_mi, bh_mi)` in LUMA MI; `ssx`/`ssy` subsample them
 /// into this plane's grid (0 for luma / 4:4:4; 1 for a halved chroma dimension).
@@ -560,11 +564,14 @@ fn build_tx_grid(
     let mut sq_w = vec![0u8; n];
     let mut sq_h = vec![0u8; n];
     for &(lmr, lmc, bw, bh) in leaves {
+        let whole = bw & TU_WHOLE != 0;
+        let (bw, bh) = (bw & !TU_WHOLE, bh & !TU_WHOLE);
         let (blr, blc) = (lmr >> ssy, lmc >> ssx);
         let (bbw, bbh) = ((bw >> ssx).max(1), (bh >> ssy).max(1));
         // The cap models the 32-px TX tiling of 32/64-px leaves; 16x64 / 64x16 leaves
-        // are a single TX_16X64 / TX_64X16 and must not get an inner TU edge.
-        let (txw, txh) = if matches!((bbw, bbh), (4, 16) | (16, 4)) {
+        // are a single TX_16X64 / TX_64X16 and must not get an inner TU edge, nor
+        // does a leaf marked `TU_WHOLE` (a luma TX_64X64).
+        let (txw, txh) = if whole || matches!((bbw, bbh), (4, 16) | (16, 4)) {
             (bbw, bbh)
         } else {
             (bbw.min(cap_w), bbh.min(cap_h))
