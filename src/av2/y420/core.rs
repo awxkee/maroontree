@@ -140,14 +140,10 @@ impl Av2Encoder {
             let qs = quant::qstep(self.base_q_idx as u32) as i32;
             ((qs + 4) >> 3) >> 6
         };
-        let luma_deblock_active =
-            self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
+        let luma_deblock_active = self.tune.deblock && df_quant >= 1;
         // recy is byte-exact post-deblock luma when the DF is applied (AQ off) or inert.
         let recy_is_post_deblock = !luma_deblock_active || !enc.delta_q_present;
-        let ccso_ok = self.tune.ccso
-            && std::env::var("MT_NOCCSO").is_err()
-            && self.base_q_idx != 0
-            && recy_is_post_deblock;
+        let ccso_ok = self.tune.ccso && self.base_q_idx != 0 && recy_is_post_deblock;
         enc.ccso_u_enable = ccso_ok;
         enc.ccso_v_enable = ccso_ok;
         enc.ccso_cols = pw / 64;
@@ -277,8 +273,7 @@ impl Av2Encoder {
             // the luma transform-boundary grid from the recorded leaves (each leaf
             // tiles into min(dim,32)-sized TUs) plus the per-SB qindex, and apply the
             // loop filter. Works with AQ on (per-SB qindex feeds the DF thresholds).
-            let filter_active =
-                self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
+            let filter_active = self.tune.deblock && df_quant >= 1;
             if filter_active {
                 let eff_dy = if self.tune.db_delta_y == i32::MIN {
                     if df_quant >= 5 { 0 } else { 1 }
@@ -330,10 +325,7 @@ impl Av2Encoder {
                     self.bit_depth,
                     &crate::av2::cdef_est::cdef_regions(&[(0, 0, width, height)], width, height),
                 );
-            } else if self.tune.cdef
-                && crate::av2::rd::knob("CDEF") > 0.0
-                && !replay::in_tile_subencode()
-            {
+            } else if self.tune.cdef && !replay::in_tile_subencode() {
                 enc.cdef_decided = crate::av2::cdef_est::search_per_block(
                     &filtered_recon,
                     &[yp.clone(), up.clone(), vp.clone()],
@@ -377,7 +369,7 @@ impl Av2Encoder {
         )
         .with_variance_boost(
             self.tune.vb_octile,
-            self.tune.vb_strength * crate::av2::rd::knob("VB"),
+            self.tune.vb_strength,
             self.tune.vb_boost_only,
         )
         .with_dark_aq(self.tune.dark_aq);
@@ -1924,7 +1916,7 @@ impl Av2Encoder {
         // deblock -> (snapshot ext_rec_y) -> CDEF -> CCSO, so this runs before them.
         // Whole-SB path: synthesize one 64x64 luma leaf per SB (SPLIT tx -> 4x 32x32).
         // Gated to AQ off here (uniform qindex); the partition path handles AQ.
-        let filter_active = self.tune.deblock && crate::av2::rd::knob("DB") > 0.0 && df_quant >= 1;
+        let filter_active = self.tune.deblock && df_quant >= 1;
         if filter_active && !enc.delta_q_present {
             let eff_dy = if self.tune.db_delta_y == i32::MIN {
                 if df_quant >= 5 { 0 } else { 1 }
@@ -1969,11 +1961,7 @@ impl Av2Encoder {
         // recon to the post-CCSO result — the decoder applies CDEF before CCSO, so
         // the CDEF decision must see the pre-CCSO recon. The multi-tile path forces
         // `capture_recon` and searches the stitched recon instead.
-        if self.tune.cdef
-            && crate::av2::rd::knob("CDEF") > 0.0
-            && cdef_pre.is_none()
-            && !replay::in_tile_subencode()
-        {
+        if self.tune.cdef && cdef_pre.is_none() && !replay::in_tile_subencode() {
             enc.cdef_decided = crate::av2::cdef_est::search_per_block(
                 &[recy.clone(), recu.clone(), recv.clone()],
                 &[yp.clone(), up.clone(), vp.clone()],

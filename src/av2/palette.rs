@@ -588,7 +588,7 @@ pub(crate) fn search(src: &[f32], w: usize, h: usize, bd: u32, lambda: f32) -> O
     // Weighted histogram of the distinct values.
     let mut hist_buf = [(0f64, 0f64, 0f64); 64];
     let mut nh = 0usize;
-    let pald = (crate::av2::rd::knob_or("PALD", 32.0) as usize).min(64);
+    let pald = 32;
     let mut cur = u16::MAX;
     for &v in vals.iter() {
         let f = v as f64;
@@ -638,7 +638,7 @@ pub(crate) fn search(src: &[f32], w: usize, h: usize, bd: u32, lambda: f32) -> O
                 continue;
             }
             let bound = match &best {
-                Some((bj, _)) if crate::av2::rd::knob_or("PALBB", 1.0) > 0.0 => *bj,
+                Some((bj, _)) => *bj,
                 _ => f32::INFINITY,
             };
             let Some((map, flags, sse, mbits)) =

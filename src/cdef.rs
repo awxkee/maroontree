@@ -228,7 +228,7 @@ pub(crate) fn cdef_filter_block_i32(
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         let rows = src.len() / stride;
-        if bw % 4 == 0
+        if bw.is_multiple_of(4)
             && x >= 2
             && y >= 2
             && x + bw + 2 <= stride

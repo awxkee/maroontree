@@ -541,11 +541,7 @@ impl Av2Encoder {
         bases.set_bit_depth(bit_depth);
         bases.set_dead_zone(STILL_DEAD_ZONE);
         if base_q_idx != 0 {
-            bases.set_square_rdoq(
-                get_q_ctx(base_q_idx),
-                crate::av2::rd::knob_or("RQ16", 0.11),
-                crate::av2::rd::knob_or("RQ8", 0.16),
-            );
+            bases.set_square_rdoq(get_q_ctx(base_q_idx), 0.11, 0.16);
         }
         let mut enc = Av2Encoder {
             bases,
@@ -606,7 +602,7 @@ impl Av2Encoder {
     /// as does video.
     pub(crate) fn subsampled_part_lambda_c(&self) -> f32 {
         if self.still_rd() {
-            self.tune.part_lambda_c * crate::av2::rd::knob_or("PART", 0.25)
+            self.tune.part_lambda_c * 0.25
         } else {
             self.tune.part_lambda_c
         }
@@ -649,14 +645,10 @@ impl Av2Encoder {
         } else {
             pal as f32 / blocks as f32
         };
-        let th = crate::av2::rd::knob_or("SCTTH", 0.05);
         self.sct_frame.store(
-            self.tune.palette && share >= th,
+            self.tune.palette && share >= 0.05,
             std::sync::atomic::Ordering::Relaxed,
         );
-        if crate::av2::rd::knob_or("SCTDBG", 0.0) > 0.0 {
-            eprintln!("sct: palette-block share {share:.4} (th {th})");
-        }
     }
 
     pub(crate) fn sdp_still(&self) -> bool {
@@ -1008,18 +1000,6 @@ impl Av2Encoder {
             });
         }
         let config = &config;
-        // TEMP debug: dump the encoder's reconstruction planes (u8, padded stride).
-        if let Ok(path) = std::env::var("MT_DUMP_RECON") {
-            let mut bytes: Vec<u8> = Vec::new();
-            for pl in &recon {
-                bytes.extend(pl.iter().map(|v| v.round().clamp(0.0, 255.0) as u8));
-            }
-            let _ = std::fs::write(&path, bytes);
-            eprintln!(
-                "recon planes {:?}",
-                recon.iter().map(|p| p.len()).collect::<Vec<_>>()
-            );
-        }
         let mut frame = frame_header(config, sw as u32, sh as u32, (0, 0, 1));
         frame.extend(&tile);
         let mut data = vec![];

@@ -1670,20 +1670,8 @@ fn maybe_emit_palette(enc: &mut RangeEncoder, mode_idx: usize, bw4: usize, bh4: 
                     cache.push(left[k]);
                 }
             }
-            let t0 = enc.tell_bits();
             crate::av2::palette::emit_colors(enc, &p, &cache, p.bd);
             crate::av2::palette::emit_map(enc, &p);
-            if crate::av2::rd::knob_or("PALDBG", 0.0) > 0.0 {
-                eprintln!(
-                    "PAL {}x{} n{} est {:.1} act {:.1} cache {}",
-                    p.w,
-                    p.h,
-                    p.colors.len(),
-                    p.bits,
-                    enc.tell_bits() - t0,
-                    cache.len()
-                );
-            }
             enc.pal_store.push(p.colors.clone());
             id = enc.pal_store.len() as u32;
         }
@@ -2612,7 +2600,6 @@ fn encode_luma_tu16(
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
-    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob256, EOB_HI_BIT_QC[enc.qc], 1, 7);
     if eob >= 1 {
@@ -2620,7 +2607,6 @@ fn encode_luma_tu16(
     }
     let stored = encode_luma16_tokens_scan_w(enc, &nonzero, eob, &SCAN16, 256, 4);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    crate::av2::helpers::mt_plog(256, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -2836,7 +2822,6 @@ fn encode_luma8_residual(
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
-    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
     if eob >= 1
@@ -2849,7 +2834,6 @@ fn encode_luma8_residual(
     }
     let stored = encode_luma8_tokens_scan_w(enc, &nonzero, eob, &SCAN8X8, 64, 3);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    crate::av2::helpers::mt_plog(64, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -3004,7 +2988,6 @@ pub(crate) fn encode_luma_tu32(
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
-    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::EobBin, EOB_HI_BIT_QC[enc.qc], 2, 7);
     if enc.inter_txb {
@@ -3024,7 +3007,6 @@ pub(crate) fn encode_luma_tu32(
     }
     let stored = encode_luma32_tokens(enc, &nonzero, eob);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    crate::av2::helpers::mt_plog(1024, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())
@@ -3743,7 +3725,6 @@ fn encode_luma_tu8(enc: &mut RangeEncoder, tu: &[Coeff], skip_cdf: u32, dc_sign_
         return 0;
     }
     enc.bool_txb_skip(skip_cdf, 0);
-    let mt_t0 = enc.tell_bits();
     let eob = nonzero.iter().map(|&(s, _)| s).max().unwrap();
     encode_eob(enc, eob, EobCdf::Eob64Luma, EOB_HI_BIT_QC[enc.qc], 0, 6);
     if eob >= 1 {
@@ -3751,7 +3732,6 @@ fn encode_luma_tu8(enc: &mut RangeEncoder, tu: &[Coeff], skip_cdf: u32, dc_sign_
     }
     let stored = encode_luma8_tokens_scan_w(enc, &nonzero, eob, &SCAN8X8, 64, 3);
     encode_luma_signs(enc, &nonzero, &stored, dc_sign_ctx);
-    crate::av2::helpers::mt_plog(64, &nonzero, enc.tell_bits() - mt_t0);
     nonzero
         .iter()
         .map(|&(_, l)| l.unsigned_abs())

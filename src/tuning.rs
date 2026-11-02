@@ -557,6 +557,15 @@ pub(crate) struct Tuning {
     pub(crate) tilt_extra_444: f32,
     pub(crate) tilt_base_420: f32,
     pub(crate) tilt_extra_420: f32,
+    /// Decision distortion = 4x4-DCT perceptually weighted SSE
+    /// (`rd_sse::weighted_sse_scalar`, the hpvca weights) instead of plain
+    /// SSE, per chroma format
+    pub(crate) wsse_420: bool,
+    pub(crate) wsse_422: bool,
+    pub(crate) wsse_444: bool,
+    pub(crate) wsse_400: bool,
+    /// Multiplier on the weighted distortion.
+    pub(crate) wsse_scale: f32,
 }
 
 impl Tuning {
@@ -763,6 +772,11 @@ impl Tuning {
         tilt_extra_444: 1.4,
         tilt_base_420: 3.5,
         tilt_extra_420: 0.7,
+        wsse_420: true,
+        wsse_422: true,
+        wsse_444: true,
+        wsse_400: true,
+        wsse_scale: 6.0,
     };
 }
 
@@ -1031,6 +1045,11 @@ mod imp {
                 "tilt_extra_444" => t.tilt_extra_444 = num(value),
                 "tilt_base_420" => t.tilt_base_420 = num(value),
                 "tilt_extra_420" => t.tilt_extra_420 = num(value),
+                "wsse_420" => t.wsse_420 = flag(value),
+                "wsse_422" => t.wsse_422 = flag(value),
+                "wsse_444" => t.wsse_444 = flag(value),
+                "wsse_400" => t.wsse_400 = flag(value),
+                "wsse_scale" => t.wsse_scale = num(value),
                 other => panic!("MT_TUNING_JSON: unknown key {other:?}"),
             }
         }

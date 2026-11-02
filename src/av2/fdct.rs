@@ -692,6 +692,10 @@ pub(crate) fn fdct_rect(resid: &[i32], w: usize, h: usize, out: &mut [i32]) -> u
 mod tests {
     use super::*;
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     const TX_SIZES: &[(usize, usize)] = &[
         (4, 4),
         (8, 8),
@@ -747,6 +751,10 @@ mod tests {
         assert_eq!(&fwd8x8(&r, false, false)[..], &out[..n]);
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     unsafe fn assert_fdct_impl_matches_scalar(name: &str, simd: FdctRectFn) {
         // Run a few sequences in intentionally mixed order so TLS scratch reuse is exercised.
         for seed in 0..8u32 {

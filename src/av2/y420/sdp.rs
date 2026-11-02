@@ -70,8 +70,6 @@ pub(crate) struct ChromaTree420<'a, 'r> {
     pub(crate) mhccp_bounds: cfl::MhccpBounds,
     /// Chroma subsampling `(ssx, ssy)`: (1, 1) 4:2:0, (1, 0) 4:2:2.
     pub(crate) ss: (usize, usize),
-    /// A chroma-plan trial (not the coded plan): may use a reduced leaf search.
-    pub(crate) trial: bool,
 }
 
 /// TU spec of a chroma block (`cw` x `ch` px); 4:2:0 4x4 is coded separately and
@@ -263,7 +261,7 @@ impl Av2Encoder {
             let p = luma_part(r, c, b);
             // 4:2:2 keeps a 16x16 luma node's chroma whole: below it the chroma
             // blocks would be 4x8, whose coders are frame-edge only.
-            if ss_is_422 && b == 6 && crate::av2::rd::knob_or("A8_422", 1.0) > 0.0 {
+            if ss_is_422 && b == 6 {
                 return NONE;
             }
             if !ss_is_420 || p == NONE {
@@ -369,12 +367,9 @@ impl Av2Encoder {
             let mut best_rel = f32::INFINITY;
             // Plan 2 (tall halves) is never picked: with the usual VERT luma root
             // the chroma root is inferred VERT, which makes it plan 1.
-            let only: Option<usize> = std::env::var("MT_CPLAN").ok().and_then(|v| v.parse().ok());
-            let sq_plan = crate::av2::rd::knob_or("CPL6", 1.0) > 0.0
-                && partition::luma_has_rects(t.luma_leaves);
+            let sq_plan = partition::luma_has_rects(t.luma_leaves);
             let mut te = t.enc.trial_clone();
             let capture = t.decide_mode.is_capture();
-            let adopt = crate::av2::rd::knob_or("CPADOPT", 1.0) > 0.0;
             // A plan whose chroma ops equal an earlier plan's codes identically (and
             // ties keep the earlier plan), so only distinct trees are trialled.
             let (above0, left0) = (t.enc.sdp_above_c.clone(), t.enc.sdp_left_c);
@@ -396,19 +391,14 @@ impl Av2Encoder {
             };
             let mut tried: Vec<(Vec<partition::ChromaOp>, bool)> = Vec::new();
             for k in [0usize, 1, 3, 4, 5, 6] {
-                if (k == 6 && !sq_plan) || (k == 5 && crate::av2::rd::knob_or("CPL5", 1.0) == 0.0) {
+                if k == 6 && !sq_plan {
                     continue;
                 }
-                if only.is_some_and(|o| o != k) {
+                let ops = ops_of(k);
+                if tried.contains(&ops) {
                     continue;
                 }
-                if crate::av2::rd::knob_or("CPDEDUP", 1.0) > 0.0 {
-                    let ops = ops_of(k);
-                    if tried.contains(&ops) {
-                        continue;
-                    }
-                    tried.push(ops);
-                }
+                tried.push(ops);
                 t.enc.trial_clone_into(&mut te);
                 let mut trial_rec = replay::DecisionRecord::default();
                 let mut trial_mode = if capture {
@@ -446,14 +436,12 @@ impl Av2Encoder {
                     sb_qstep: t.sb_qstep,
                     mhccp_bounds: t.mhccp_bounds,
                     ss: t.ss,
-                    trial: true,
                 };
                 // The abort test measures bits from this trial's start (the plan
                 // decision keeps its own formula), against the best plan's cost on
                 // the same footing.
                 let tb0 = tt.enc.tell_bits();
-                let bound = (crate::av2::rd::knob_or("CPABORT", 1.0) > 0.0 && best_rel.is_finite())
-                    .then_some((best_rel, lambda, tb0));
+                let bound = (best_rel.is_finite()).then_some((best_rel, lambda, tb0));
                 let complete =
                     self.code_chroma_plan_420(&mut tt, &|r, c, b| plan(k, r, c, b), bound);
                 let sse = |rec: &[f32], src: &[f32]| -> f32 {
@@ -484,26 +472,23 @@ impl Av2Encoder {
                     if j < best.0 {
                         best = (j, k);
                         best_rel = d + lambda * (te.tell_bits() - tb0);
-                        if adopt {
-                            let mut enc =
-                                adopted.take().map_or_else(|| t.enc.trial_clone(), |a| a.0);
-                            std::mem::swap(&mut enc, &mut te);
-                            adopted = Some((
-                                enc,
-                                save(&*t.recu),
-                                save(&*t.recv),
-                                [
-                                    span(t.u_above, c0),
-                                    span(t.v_above, c0),
-                                    span(t.cfl_above, c0),
-                                    span(t.u_left, r0),
-                                    span(t.v_left, r0),
-                                    span(t.cfl_left, r0),
-                                ],
-                                t.chroma_leaves[n_ch..].to_vec(),
-                                trial_rec.take_mhccp(),
-                            ));
-                        }
+                        let mut enc = adopted.take().map_or_else(|| t.enc.trial_clone(), |a| a.0);
+                        std::mem::swap(&mut enc, &mut te);
+                        adopted = Some((
+                            enc,
+                            save(&*t.recu),
+                            save(&*t.recv),
+                            [
+                                span(t.u_above, c0),
+                                span(t.v_above, c0),
+                                span(t.cfl_above, c0),
+                                span(t.u_left, r0),
+                                span(t.v_left, r0),
+                                span(t.cfl_left, r0),
+                            ],
+                            t.chroma_leaves[n_ch..].to_vec(),
+                            trial_rec.take_mhccp(),
+                        ));
                     }
                 }
                 for (dst, src) in
@@ -530,9 +515,6 @@ impl Av2Encoder {
             0
         };
         t.decide_mode.capture_chroma_plan(best as u8);
-        if std::env::var("MT_GDBG").is_ok() {
-            eprintln!("CPLAN sb ({},{}) {}", t.row, t.col, best);
-        }
         match adopted {
             Some((enc, ru, rv, ctx, leaves, mhccp)) => {
                 t.enc.adopt_trial(enc);
@@ -681,12 +663,11 @@ impl Av2Encoder {
         let luma_dir = t.luma_midx[(r & 15) * 16 + (c & 15)] != 0xff;
         let bd = self.bit_depth as i32;
         let lambda = leaf::part_lambda(t.sb_qstep, self.subsampled_part_lambda_c());
-        let cpfast = crate::av2::rd::knob_or("CPFAST", 0.0) as u32;
         let (u_nz, v_nz) = if t.ss == (1, 1) && cw == 4 && ch == 4 {
             self.chroma4_leaf_420(t, r, c, cfl_ok, luma_dir, (ua, ul, va, vl))
         } else {
             let spec = chroma_spec(&self.bases, cw, ch, t.qc);
-            let mhccp = if cfl_ok && !(t.trial && cpfast & 1 != 0) {
+            let mhccp = if cfl_ok {
                 chroma422::mhccp_decide_leaf(
                     t.enc,
                     t.decide_mode,
@@ -853,13 +834,8 @@ impl Av2Encoder {
             }
             let mut uv_pred: Option<(Vec<f32>, Vec<f32>)> = None;
             let mut uv_m = 0usize;
-            // 32x32 chroma (derived tx type DCT): 4:2:0, and 4:4:4 under UV444.
-            if (t.ss == (1, 1) || (t.ss == (0, 0) && crate::av2::rd::knob_or("UV444", 0.0) > 0.0))
-                && cw == 32
-                && ch == 32
-                && self.tune.chroma_mode_search
-                && !(t.trial && cpfast & 2 != 0)
-            {
+            // 32x32 chroma (derived tx type DCT), 4:2:0 only.
+            if t.ss == (1, 1) && cw == 32 && ch == 32 && self.tune.chroma_mode_search {
                 let (tr, bl) = leaf::square_edge_px(
                     &leaf::SquareLumaBlock {
                         stride: t.pw,
@@ -878,46 +854,7 @@ impl Av2Encoder {
                 } else {
                     &[1, 2, 3, 4, 5, 6]
                 };
-                // CUVK = K: only the K uv modes with the lowest U+V prediction SATD
-                // get the full RD.
-                let cuvk = crate::av2::rd::knob_or("CUVK", 0.0) as usize;
-                let mut kept: Vec<usize> = modes.to_vec();
-                if cuvk > 0 && kept.len() > cuvk {
-                    let mut ranked: Vec<(u64, usize)> = kept
-                        .iter()
-                        .map(|&m| {
-                            let p = |rec: &[f32]| {
-                                chroma422::predict_chroma_sq(
-                                    rec,
-                                    t.pcw,
-                                    cy,
-                                    cx,
-                                    cw,
-                                    m,
-                                    t.neutral,
-                                    t.mhccp_bounds.chroma_width,
-                                    t.mhccp_bounds.chroma_height,
-                                    Some((tr >> ssx, bl >> ssy)),
-                                )
-                            };
-                            let satd =
-                                crate::av2::metrics::satd_f32(&su, cw, &p(&*t.recu), cw, cw, ch)
-                                    + crate::av2::metrics::satd_f32(
-                                        &sv,
-                                        cw,
-                                        &p(&*t.recv),
-                                        cw,
-                                        cw,
-                                        ch,
-                                    );
-                            (satd, m)
-                        })
-                        .collect();
-                    ranked.sort_by_key(|&(sc, _)| sc);
-                    kept = ranked.into_iter().take(cuvk).map(|(_, m)| m).collect();
-                    kept.sort_unstable();
-                }
-                for &m in &kept {
+                for &m in modes {
                     let pred = |rec: &[f32]| {
                         chroma422::predict_chroma_sq(
                             rec,
@@ -1151,9 +1088,7 @@ impl Av2Encoder {
         let mut pred_uv: ([i32; 16], [i32; 16]) = ([dcu; 16], [dcv; 16]);
         let mut tx_i = 0usize;
         let mut best_j = j([&pred_uv.0, &pred_uv.1], 0.0, 0);
-        if self.tune.chroma_mode_search
-            && !(t.trial && crate::av2::rd::knob_or("CPFAST", 0.0) as u32 & 4 != 0)
-        {
+        if self.tune.chroma_mode_search {
             let (tr, bl) = leaf::square_edge_px(
                 &leaf::SquareLumaBlock {
                     stride: t.pw,
@@ -1192,28 +1127,7 @@ impl Av2Encoder {
                 );
                 pf.map(|p| (p + 0.5) as i32)
             };
-            // CUVK4 = K: only the K uv modes with the lowest U+V prediction SAD get
-            // the full RD.
-            let cuvk4 = crate::av2::rd::knob_or("CUVK4", 0.0) as usize;
-            let mut kept4: Vec<usize> = modes.to_vec();
-            if cuvk4 > 0 && kept4.len() > cuvk4 {
-                let sad = |src: &[f32], p: &[i32; 16]| -> f32 {
-                    src.iter().zip(p).map(|(&a, &b)| (a - b as f32).abs()).sum()
-                };
-                let mut ranked: Vec<(f32, usize)> = kept4
-                    .iter()
-                    .map(|&m| {
-                        (
-                            sad(&su4, &pred4(m, &*t.recu)) + sad(&sv4, &pred4(m, &*t.recv)),
-                            m,
-                        )
-                    })
-                    .collect();
-                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-                kept4 = ranked.into_iter().take(cuvk4).map(|(_, m)| m).collect();
-                kept4.sort_unstable();
-            }
-            for &m in &kept4 {
+            for &m in modes {
                 let pred = |rec: &[f32]| pred4(m, rec);
                 let (pu, pv) = (pred(&*t.recu), pred(&*t.recv));
                 let cj = j([&pu, &pv], 2.0, uv_tx(m));

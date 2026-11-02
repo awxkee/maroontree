@@ -605,7 +605,7 @@ pub(crate) fn part_lambda(qstep: i32, c: f32) -> f32 {
 fn luma_mode_lambda(rdoq_lambda: f32, qstep: i32, pixel_lambda: bool) -> f32 {
     let level_lambda = rdoq_lambda.max(proj::DEFAULT_RDOQ_LAMBDA);
     if pixel_lambda {
-        crate::av2::rd::lambda_from_level(level_lambda, qstep) * crate::av2::rd::knob("LUMA")
+        crate::av2::rd::lambda_from_level(level_lambda, qstep)
     } else {
         level_lambda * (qstep as f32) * (qstep as f32)
     }
@@ -857,24 +857,14 @@ pub(super) fn encode_luma_sb(
         }
         satd
     };
-    let keep = crate::av2::rd::knob_or(
-        "W64K",
-        if quant.prune & PRUNE_LARGE != 0 || !speed.try_angle_deltas() {
-            4.0
-        } else {
-            8.0
-        },
-    ) as usize;
-    // W64R = R: hierarchical screen — nominal angles first, then the angle
-    // deltas around the R SATD-best directional modes only.
-    let refine = crate::av2::rd::knob_or(
-        "W64R",
-        if quant.prune & PRUNE_PROBE != 0 {
-            2.0
-        } else {
-            0.0
-        },
-    ) as usize;
+    let keep = if quant.prune & PRUNE_LARGE != 0 || !speed.try_angle_deltas() {
+        4
+    } else {
+        8
+    };
+    // Hierarchical screen when `refine` > 0: nominal angles first, then the angle
+    // deltas around the `refine` SATD-best directional modes only.
+    let refine = if quant.prune & PRUNE_PROBE != 0 { 2 } else { 0 };
     let cands: Vec<(usize, i32)> = if cands.len() > keep {
         let mut ranked: Vec<(u64, (usize, i32))> = if refine > 0 {
             let mut r: Vec<(u64, (usize, i32))> = cands
@@ -1043,7 +1033,7 @@ pub(super) fn encode_luma_leaf32(
     let mut best_mode = (0usize, 0i32);
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = [0f32; 64 * 32];
-    let nm = crate::av2::rd::knob_or("R64M", 5.0) as usize;
+    let nm = 5;
     let cands: &[usize] = if speed.reduced_modes() {
         &[0usize, 1, 2][..nm.min(3)]
     } else {
@@ -1125,7 +1115,7 @@ pub(super) fn encode_luma_leaf32(
                 *tu = levels_to_coeffs(&lev);
             }
             if m >= 5 {
-                cost += crate::av2::rd::knob_or("MBDIR", 9.0);
+                cost += 9.0;
             } else if m != 0 {
                 cost += 6.0;
             }
@@ -1134,7 +1124,7 @@ pub(super) fn encode_luma_leaf32(
     let mut cands: Vec<(usize, i32)> = cands.iter().map(|&m| (m, 0)).collect();
     if let Some(ds) = dir.filter(|_| speed.try_directional()) {
         cands.extend(screen_directional(
-            crate::av2::rd::knob_or("DIR32", 3.0) as usize,
+            3,
             speed.try_angle_deltas(),
             ds.refine,
             |m, d| {
@@ -1301,7 +1291,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     let mut best_mode = (0usize, 0i32);
     let mut best_tus: [Vec<Coeff>; 2] = [Vec::new(), Vec::new()];
     let mut best_region = [0f32; 32 * 64];
-    let nm = crate::av2::rd::knob_or("R64M", 5.0) as usize;
+    let nm = 5;
     let cands: &[usize] = if speed.reduced_modes() {
         &[0usize, 1, 2][..nm.min(3)]
     } else {
@@ -1394,7 +1384,7 @@ pub(super) fn encode_luma_leaf_v32x64(
                 tus[k] = levels_to_coeffs(&lev);
             }
             if m >= 5 {
-                cost += crate::av2::rd::knob_or("MBDIR", 9.0);
+                cost += 9.0;
             } else if m != 0 {
                 cost += 6.0;
             }
@@ -1403,7 +1393,7 @@ pub(super) fn encode_luma_leaf_v32x64(
     let mut cands: Vec<(usize, i32)> = cands.iter().map(|&m| (m, 0)).collect();
     if let Some(ds) = dir.filter(|_| speed.try_directional()) {
         cands.extend(screen_directional(
-            crate::av2::rd::knob_or("DIR32", 3.0) as usize,
+            3,
             speed.try_angle_deltas(),
             ds.refine,
             |m, d| {
@@ -1597,7 +1587,7 @@ pub(super) fn encode_luma_leaf_s32x32(
             if m == palette::PAL_MODE {
                 cost += pal.as_ref().map_or(0.0, |p| p.1);
             } else if m >= 5 {
-                cost += crate::av2::rd::knob_or("MBDIR", 9.0);
+                cost += 9.0;
             } else if m != 0 {
                 cost += 6.0;
             }
@@ -1623,16 +1613,9 @@ pub(super) fn encode_luma_leaf_s32x32(
     // SATD prune (same as encode_luma_sb): this is a single 32x32 TU with no
     // intra-leaf feedback, so every mode's prediction is independent — SATD-rank
     // them (predict-only) and full-encode just the top-K.
-    // Unified prune (knob PRK32 = K): every non-DC candidate, directional ones
+    // Unified prune (`prk32` = K): every non-DC candidate, directional ones
     // included, is SATD-ranked together and only the best K are coded.
-    let prk32 = crate::av2::rd::knob_or(
-        "PRK32",
-        if quant.prune & PRUNE_LARGE != 0 {
-            2.0
-        } else {
-            0.0
-        },
-    ) as usize;
+    let prk32 = if quant.prune & PRUNE_LARGE != 0 { 2 } else { 0 };
     let keep = if prk32 > 0 {
         usize::MAX
     } else if speed.reduced_modes() {
@@ -1677,7 +1660,7 @@ pub(super) fn encode_luma_leaf_s32x32(
         cands.to_vec()
     };
     let mut cands: Vec<(usize, i32)> = cands.into_iter().map(|m| (m, 0)).collect();
-    let dir_keep = crate::av2::rd::knob_or("DIR32", 3.0) as usize;
+    let dir_keep = 3;
     if let Some(md) = forced {
         // Replay of a captured winner: code just that candidate.
         cands.push(md);
@@ -1875,7 +1858,6 @@ impl ChromaProbe<'_> {
             _ => (self.bases[3], &crate::av2::coder::SCAN4X4_LOSSY_PACKED),
         };
         let scale = basis.qstep as f32 / quant.qstep as f32;
-        let weight = crate::av2::rd::knob("CW");
         let (mut sse, mut bits) = (0.0, 0.0);
         for (src, rec) in [
             (self.src_u, &mut *self.rec_u),
@@ -1911,7 +1893,7 @@ impl ChromaProbe<'_> {
             );
             bits += coeff_rate_f32(&lev);
         }
-        (sse * weight, bits * weight)
+        (sse, bits)
     }
 
     /// Plane position and size of a probe chroma block given in 4:2:0 units.
@@ -1956,23 +1938,11 @@ fn probe_square_luma(
     basis: &Basis,
     quant: &LumaQuantSpec<'_>,
     lambda: f32,
-    rate_scale: f32,
-    exact_modes: bool,
     leaf_modes: bool,
 ) -> (f32, f32) {
     let pw = source.stride;
-    // Exact luma-mode bits from the live CDFs (y_ctx 0: the coded path has no
-    // directional neighbours), else the flat 0 (DC) / 6 bits.
-    let flat = crate::av2::rd::knob_or(if n == 16 { "MB16" } else { "MB8" }, 6.0);
-    let mode_bits = |m: usize| -> f32 {
-        if exact_modes && crate::av2::rd::knob_or("EXACTMODE", 0.0) > 0.0 {
-            crate::av2::entropy::RangeEncoder::y_mode_nondir_bits(0, m)
-        } else if m == 0 {
-            0.0
-        } else {
-            flat
-        }
-    };
+    // Flat mode cost: 0 bits for DC, 6 for the other non-directional modes.
+    let mode_bits = |m: usize| -> f32 { if m == 0 { 0.0 } else { 6.0 } };
     let scan: &[u16] = if n == 16 { &SCAN16 } else { &SCAN8X8 };
     let scale = basis.qstep as f32 / quant.qstep as f32;
     debug_assert!(n <= 16);
@@ -2023,9 +1993,9 @@ fn probe_square_luma(
     };
     let d0 = sse(&rec);
     let mut best = (rec, d0, 0.0f32);
-    let mut best_rate = coeff_rate_f32(&lev) * rate_scale + mode_bits(0);
+    let mut best_rate = coeff_rate_f32(&lev) + mode_bits(0);
     let mut best_cost = crate::av2::rd::rd_cost(best.1, best_rate, lambda);
-    if leaf_modes && crate::av2::rd::knob("PMODES") > 0.0 {
+    if leaf_modes {
         let block = SquareLumaBlock {
             stride: pw,
             frame_width: frame.0,
@@ -2045,17 +2015,15 @@ fn probe_square_luma(
         let mut cands: Vec<SquareLumaMode> = (1..=4usize).map(SquareLumaMode::nondir).collect();
         // 16x16 and 8x8 leaves also code directional modes: the SATD-best few join
         // the RD.
-        let dir_keep =
-            crate::av2::rd::knob_or(if n == 8 { "PDIRK8" } else { "PDIR" }, 3.0) as usize;
-        let dir_size = n == 16 || (n == 8 && crate::av2::rd::knob_or("PDIR8", 1.0) > 0.0);
+        let dir_keep = 3;
+        let dir_size = n == 16 || (n == 8);
         if dir_size && dir_keep > 0 && quant.speed.try_directional() {
             let dir_lm = |mode, angle_delta| SquareLumaMode {
                 mode,
                 angle_delta,
                 smooth_neighbour: false,
             };
-            let refine =
-                crate::av2::rd::knob_or(if n == 8 { "PDREF8" } else { "PDREF" }, 2.0) as usize;
+            let refine = 2;
             let picked =
                 screen_directional(dir_keep, quant.speed.try_angle_deltas(), refine, |m, d| {
                     let p = &mut pbuf[..n * n];
@@ -2078,28 +2046,12 @@ fn probe_square_luma(
             }
             cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
         }
-        // Unified SATD prune: rank every candidate by its prediction SATD (+ mode
-        // bits) and fully code only the best `keep`, or those within `ratio` of
-        // the best.
-        let keep = crate::av2::rd::knob_or(
-            "PRK",
-            if quant.prune & PRUNE_PROBE != 0 {
-                2.0
-            } else {
-                0.0
-            },
-        ) as usize;
-        let ratio = crate::av2::rd::knob_or("PRT", 0.0);
-        if keep > 0 || ratio > 0.0 {
-            let wbits = crate::av2::rd::knob_or("PRKL", 0.0) * lambda.sqrt();
+        // Unified SATD prune: rank every candidate by its prediction SATD and fully
+        // code only the best 2.
+        if quant.prune & PRUNE_PROBE != 0 {
             let mut ranked: Vec<(f32, SquareLumaMode)> = cands
                 .iter()
                 .map(|&lm| {
-                    let bits = if lm.mode >= 5 {
-                        9.0
-                    } else {
-                        mode_bits(lm.mode)
-                    };
                     let screened = dir_scores
                         .iter()
                         .find(|&&(md, _)| lm.mode >= 5 && md == (lm.mode, lm.angle_delta));
@@ -2125,19 +2077,11 @@ fn probe_square_luma(
                             crate::av2::metrics::satd_f32(src, n, pf, n, n, n)
                         }
                     } as f32;
-                    (satd + wbits * bits, lm)
+                    (satd, lm)
                 })
                 .collect();
             ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let best_s = ranked.first().map_or(0.0, |r| r.0);
-            cands = ranked
-                .into_iter()
-                .enumerate()
-                .filter(|&(i, (sc, _))| {
-                    (keep == 0 || i < keep) && (ratio <= 0.0 || sc <= best_s * ratio)
-                })
-                .map(|(_, (_, lm))| lm)
-                .collect();
+            cands = ranked.into_iter().take(2).map(|(_, lm)| lm).collect();
         }
         for lm in cands {
             let m = lm.mode;
@@ -2163,12 +2107,8 @@ fn probe_square_luma(
             }
             code(&p[..n * n], &mut cand_lev, &mut cand_rec);
             let d = sse(&cand_rec);
-            let bits = if m >= 5 {
-                crate::av2::rd::knob_or(if n == 8 { "MBDIR8" } else { "MBDIR" }, 9.0)
-            } else {
-                mode_bits(m)
-            };
-            let r = coeff_rate_f32(&cand_lev) * rate_scale + bits;
+            let bits = if m >= 5 { 9.0 } else { mode_bits(m) };
+            let r = coeff_rate_f32(&cand_lev) + bits;
             let c = crate::av2::rd::rd_cost(d, r, lambda);
             if c < best_cost {
                 best_cost = c;
@@ -2183,7 +2123,7 @@ fn probe_square_luma(
         let p: Vec<i32> = pal.pred().iter().map(|&v| v as i32).collect();
         code(&p, &mut cand_lev, &mut cand_rec);
         let d = sse(&cand_rec);
-        let r = coeff_rate_f32(&cand_lev) * rate_scale + pal.bits;
+        let r = coeff_rate_f32(&cand_lev) + pal.bits;
         let c = crate::av2::rd::rd_cost(d, r, lambda);
         if c < best_cost {
             best = (cand_rec, d, 0.0);
@@ -2203,21 +2143,14 @@ pub(super) fn choose_luma_64x64_partition(
     grid: &LumaGridBlock,
     search: &LumaPartitionSearch<'_>,
     mut chroma: Option<&mut ChromaProbe<'_>>,
-    pricer: Option<&crate::av2::partition::PartitionPricer>,
 ) -> LumaPartitionDecision {
     let quant = &search.quant;
     let pw = source.stride;
     // Flat split-signalling cost. With chroma priced the probe needs none (4:2:0:
     // 5 -> 0 bits is -0.43% SS2 luma-only, -1.26% with chroma); luma-only callers
     // keep 5 (0 bits costs 4:0:0 +0.83%).
-    let split_bits = crate::av2::rd::knob_or("SPLITB", if chroma.is_some() { 0.0 } else { 5.0 });
-    // Exact partition signalling (when a pricer is given): each decision is charged
-    // the marginal bits of its subtree given the decisions made so far (`t32`/`t16`);
-    // otherwise the flat `split_bits` per split.
-    let pricer = pricer.filter(|_| crate::av2::rd::knob_or("EXACTPART", 0.0) > 0.0);
-    let (mut t32, mut t16) = ([false; 4], [false; 16]);
+    let split_bits = if chroma.is_some() { 0.0 } else { 5.0 };
     let mut dir8 = [[0u32; 32]; 2];
-    let (r32_scale, r16_scale) = (crate::av2::rd::knob("R32"), crate::av2::rd::knob("R16"));
     let mut saved = [0f32; 64 * 64];
     for (dst, src) in saved
         .as_chunks_mut::<64>()
@@ -2292,22 +2225,20 @@ pub(super) fn choose_luma_64x64_partition(
         };
         // The coded 32x32 leaf searches directional modes when the leaves are
         // equipped; the probe follows with its own coded-quadrant mask.
-        let dir32 = (search.leaf_modes && crate::av2::rd::knob_or("PDIR32", 1.0) > 0.0).then_some(
-            LeafDirSearch {
-                refine: crate::av2::rd::knob_or("PDREF", 2.0) as usize,
-                coded: &probe_coded,
-                frame_width: block.frame_width,
-                frame_height: block.frame_height,
-            },
-        );
+        let dir32 = (search.leaf_modes).then_some(LeafDirSearch {
+            refine: 2,
+            coded: &probe_coded,
+            frame_width: block.frame_width,
+            frame_height: block.frame_height,
+        });
         let (tu, mode, _) = encode_luma_leaf_s32x32(recy, source, &leaf, quant, dir32, None);
         let rate32 = coeff_tu_rate_proxy_f32(&tu);
-        let rate32 = rate32 * r32_scale
+        let rate32 = rate32
             + if mode == palette::PAL_MODE {
                 let frame = (block.frame_width, block.frame_height);
                 luma_palette(source, frame, leaf.y, leaf.x, 32, 32, quant).map_or(0.0, |p| p.bits)
             } else if mode >= 5 {
-                crate::av2::rd::knob_or("MBDIR", 9.0)
+                9.0
             } else if mode != 0 {
                 6.0
             } else {
@@ -2380,8 +2311,6 @@ pub(super) fn choose_luma_64x64_partition(
                 search.basis16,
                 quant,
                 lambda16,
-                r16_scale,
-                pricer.is_some(),
                 search.leaf_modes,
             );
             let rec: Vec<f32> = rect_rows(recy, pw, y, x, 16, 16)
@@ -2405,11 +2334,7 @@ pub(super) fn choose_luma_64x64_partition(
             let index16 = ((dy + sy) / 16) * 4 + (dx + sx) / 16;
             let mut rate8 = 0.0;
             let mut chroma8_sse = 0.0f32;
-            // Early out: a 16x16 candidate already cheaper than `P8J` bits of lambda
-            // leaves its 8x8 split nothing to win.
-            let p8j = crate::av2::rd::knob_or("P8J", 0.0);
-            let cheap16 = p8j > 0.0 && sse16c + lambda16 * rate16c < p8j * lambda16;
-            if (search.allow_8x8 || crate::av2::rd::knob_or("ALLOW8", 0.0) > 0.0) && !cheap16 {
+            if search.allow_8x8 {
                 let lambda8 = luma_mode_lambda(quant.rdoq_lambda, quant.qstep, quant.pixel_lambda);
                 for (ey, ex) in [(0usize, 0usize), (0, 8), (8, 0), (8, 8)] {
                     PROBE_DIR8_LAST.with(|c| c.set(0));
@@ -2423,8 +2348,6 @@ pub(super) fn choose_luma_64x64_partition(
                         search.basis8,
                         quant,
                         lambda8,
-                        1.0,
-                        pricer.is_some(),
                         search.leaf_modes8,
                     );
                     let i = ((y + ey - block.y) / 8) * 8 + (x + ex - block.x) / 8;
@@ -2450,24 +2373,11 @@ pub(super) fn choose_luma_64x64_partition(
                 }
                 sse8 += chroma8_sse * search.split8_chroma_weight;
                 let lambda = luma_mode_lambda(quant.rdoq_lambda, quant.qstep, quant.pixel_lambda);
-                let d16 = match pricer {
-                    Some(p) => {
-                        let mut s32 = t32;
-                        s32[child] = true;
-                        let mut s16 = t16;
-                        s16[index16] = true;
-                        let with = p.split_bits(s32, s16);
-                        s16[index16] = false;
-                        with - p.split_bits(s32, s16)
-                    }
-                    None => split_bits,
-                };
-                split16[index16] = crate::av2::rd::rd_cost(sse8, rate8 + d16, lambda)
+                split16[index16] = crate::av2::rd::rd_cost(sse8, rate8 + split_bits, lambda)
                     < crate::av2::rd::rd_cost(candidate16_sse, candidate16_rate, lambda);
-                t16[index16] = split16[index16];
             }
             if split16[index16] {
-                rate16 += rate8 + if pricer.is_some() { 0.0 } else { split_bits };
+                rate16 += rate8 + split_bits;
                 chroma16_sse += chroma8_sse;
             } else {
                 restore16(recy);
@@ -2490,30 +2400,11 @@ pub(super) fn choose_luma_64x64_partition(
             32,
         ) + chroma16_sse;
         let lambda = luma_mode_lambda(quant.rdoq_lambda, quant.qstep, quant.pixel_lambda);
-        let d32 = match pricer {
-            Some(p) => {
-                let mut s32 = t32;
-                s32[child] = true;
-                let with = p.split_bits(s32, t16);
-                s32[child] = false;
-                with - p.split_bits(s32, t16)
-            }
-            None => split_bits,
-        };
         split32[child] = search.allow_16x16
-            && crate::av2::rd::rd_cost(sse16, rate16 + d32, lambda)
+            && crate::av2::rd::rd_cost(sse16, rate16 + split_bits, lambda)
                 < crate::av2::rd::rd_cost(sse32, rate32, lambda);
-        t32[child] = split32[child];
-        if !split32[child] {
-            for (k, t) in t16.iter_mut().enumerate() {
-                if (k / 4) / 2 == child / 2 && (k % 4) / 2 == child % 2 {
-                    *t = false;
-                }
-            }
-        }
         if split32[child] {
-            // With a pricer the tree's signalling is added once at the 64 level below.
-            split_rate += rate16 + if pricer.is_some() { 0.0 } else { split_bits };
+            split_rate += rate16 + split_bits;
             split_chroma_sse += chroma16_sse;
         } else {
             // Not split: restore the cached 32x32 leaf recon (no re-encode).
@@ -2544,12 +2435,7 @@ pub(super) fn choose_luma_64x64_partition(
         c.restore(cy0, cx0, 32, saved);
     }
 
-    // With a pricer the children carried only their own marginal bits; add the 64
-    // split-vs-whole difference (the whole side's own do_split symbol included).
-    split_rate += match pricer {
-        Some(p) => p.split_bits(t32, t16) - p.whole_bits(),
-        None => split_bits,
-    };
+    split_rate += split_bits;
     let lambda = luma_mode_lambda(quant.rdoq_lambda, quant.qstep, quant.pixel_lambda);
     LumaPartitionDecision {
         split64: crate::av2::rd::rd_cost(split_sse, split_rate, lambda)

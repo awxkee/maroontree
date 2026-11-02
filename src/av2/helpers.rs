@@ -1625,6 +1625,28 @@ where
         queue: std::collections::VecDeque<usize>,
         deps: Vec<u8>,
         remaining: usize,
+        /// A worker panicked: its cell never completes, so its dependents
+        /// never become ready and `remaining` never reaches 0. Sleepers must
+        /// stop waiting, or the scope join below hangs instead of re-raising.
+        aborted: bool,
+    }
+    // Marks the queue aborted and wakes every sleeper when its worker unwinds.
+    struct AbortOnUnwind<'a> {
+        ready: &'a std::sync::Mutex<Ready>,
+        wake: &'a std::sync::Condvar,
+    }
+    impl Drop for AbortOnUnwind<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let mut state = self
+                    .ready
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.aborted = true;
+                drop(state);
+                self.wake.notify_all();
+            }
+        }
     }
     // The above-right edge of (r, c) targets (r - 1, min(c + g, cols - 1));
     // with g > 1 several cells of row r share the row's last cell as that
@@ -1646,16 +1668,21 @@ where
         queue,
         deps,
         remaining: n,
+        aborted: false,
     });
     let wake = std::sync::Condvar::new();
     let ready = &ready;
     let wake = &wake;
     let worker = || {
+        let _abort = AbortOnUnwind { ready, wake };
         let mut s = mk();
         loop {
             let cell = {
                 let mut state = ready.lock().expect("wavefront queue poisoned");
                 loop {
+                    if state.aborted {
+                        break None;
+                    }
                     if let Some(i) = state.queue.pop_front() {
                         break Some(i);
                     }
@@ -1837,6 +1864,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn weighted_sse_simd_matches_scalar() {
+        let err = |r: usize, c: usize| (((r * 64 + c) * 7919) % 513) as f32 - 256.0;
+        for &(h, w) in &[
+            (4usize, 4usize),
+            (4, 8),
+            (16, 4),
+            (16, 16),
+            (8, 32),
+            (64, 64),
+            (5, 7),
+            (13, 22),
+            (3, 2),
+        ] {
+            let want = weighted_sse_scalar(h, w, err);
+            let got = weighted_sse(h, w, err);
+            assert!(
+                (got - want).abs() <= 1e-5 * want,
+                "{h}x{w}: {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
     fn wavefront_respects_top_left_deps() {
         use std::sync::atomic::{AtomicBool, Ordering};
         for &(rows, cols) in &[(1usize, 1usize), (1, 8), (8, 1), (5, 7), (16, 12), (3, 20)] {
@@ -1972,6 +2022,21 @@ mod tests {
         }
     }
 
+    /// A panicking cell must re-raise from the pool, not leave the other
+    /// workers asleep on cells that can never become ready.
+    #[test]
+    fn wavefront_pool_propagates_cell_panic() {
+        for (pr, pc) in [(0, 0), (2, 3), (5, 7)] {
+            let res = std::panic::catch_unwind(|| {
+                par_wavefront_pool(4, 6, 8, true, |r, c| {
+                    assert!((r, c) != (pr, pc), "forced cell panic");
+                    r * 8 + c
+                })
+            });
+            assert!(res.is_err(), "cell ({pr},{pc}) panic was swallowed");
+        }
+    }
+
     #[test]
     fn wavefront_plane_writer_disjoint_blocks_are_correct() {
         // Each SB cell writes its own bs×bs block in parallel via the wavefront;
@@ -2024,6 +2089,10 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn coeff_rate_case(len: usize, seed: u32) -> Vec<f32> {
         let mut state = seed
             .wrapping_mul(747_796_405)
@@ -2042,6 +2111,10 @@ mod tests {
         out
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn assert_coeff_rate_impl_matches_scalar(name: &str, simd: CoeffRateF32Fn) {
         for len in [
             0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 256, 1024,
@@ -2059,6 +2132,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn assert_coeff_abs_rate_impl_matches_scalar(name: &str, simd: CoeffAbsRateF32Fn) {
         for len in [
             0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 256, 1024,
@@ -2076,6 +2153,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     struct MetricCase {
         a8: Vec<u8>,
         b8: Vec<u8>,
@@ -2086,6 +2167,10 @@ mod tests {
         weights: Vec<f32>,
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn metric_case(len: usize, seed: u32) -> MetricCase {
         let mut state = seed.wrapping_mul(747_796_405).wrapping_add(len as u32);
         let mut a8 = Vec::with_capacity(len);
@@ -2117,6 +2202,10 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     struct MetricImpls {
         name: &'static str,
         sad8: SadU8Fn,
@@ -2127,6 +2216,10 @@ mod tests {
         cfl: CflSseI32Fn,
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn assert_metric_impls_match_scalar(imp: &MetricImpls) {
         let MetricImpls {
             name,
@@ -2287,33 +2380,6 @@ mod tests {
     }
 }
 
-/// TEMP: log (area, eob, nnz, proxy, actual bits) per emitted luma TU to $MT_PLOG.
-pub(crate) fn mt_plog(area: usize, nz: &[Coeff], bits: f32) {
-    use std::io::Write;
-    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    let f = F.get_or_init(|| {
-        std::env::var("MT_PLOG")
-            .ok()
-            .map(|p| std::sync::Mutex::new(std::fs::File::create(p).unwrap()))
-    });
-    if let Some(m) = f {
-        let eob = nz.iter().map(|&(s, _)| s).max().unwrap_or(0);
-        let l1: u32 = nz.iter().map(|&(_, l)| l.unsigned_abs()).sum();
-        let mut g = m.lock().unwrap();
-        let _ = writeln!(
-            g,
-            "{} {} {} {} {:.2} {:.2}",
-            area,
-            eob,
-            nz.len(),
-            l1,
-            coeff_tu_rate_proxy_f32(nz),
-            bits
-        );
-    }
-}
-
 thread_local! {
     /// Whether this thread's RD decisions measure distortion with
     /// [`weighted_sse`]; set per frame by the format's encoder ([`set_wsse`]) and
@@ -2327,10 +2393,8 @@ pub(crate) fn wsse_on() -> bool {
     WSSE.with(|c| c.get())
 }
 
-/// Select this thread's decision distortion for a frame: weighted when `on`
-/// (TEMP knob WSSE overrides).
+/// Select this thread's decision distortion for a frame: weighted when `on`.
 pub(crate) fn set_wsse(on: bool) {
-    let on = crate::av2::rd::knob_or("WSSE", if on { 1.0 } else { 0.0 }) > 0.0;
     WSSE.with(|c| c.set(on));
 }
 
@@ -2368,8 +2432,83 @@ pub(crate) fn weighted_sse(h: usize, w: usize, err: impl Fn(usize, usize) -> f32
         // SAFETY: NEON is part of the aarch64 baseline.
         unsafe { weighted_sse_neon(h, w, err) }
     }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: AVX2 and FMA were detected above.
+        return unsafe { weighted_sse_avx2(h, w, err) };
+    }
     #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
     weighted_sse_scalar(h, w, err)
+}
+
+/// AVX2 [`weighted_sse`]: the NEON kernel with one 4x4 tile per 128-bit
+/// half (two tiles side by side) and an in-half lane broadcast for the row
+/// DCT; a lone last tile column runs the same steps on 128-bit vectors.
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+#[target_feature(enable = "avx2,fma")]
+fn weighted_sse_avx2(h: usize, w: usize, err: impl Fn(usize, usize) -> f32) -> f32 {
+    use core::arch::x86_64::*;
+    let sample = |r: usize, c: usize| if r < h && c < w { err(r, c) } else { 0.0 };
+    let column = |j: usize| -> [f32; 4] { std::array::from_fn(|k| DCT4[k][j]) };
+    unsafe {
+        let basis: [__m128; 4] = std::array::from_fn(|j| _mm_loadu_ps(column(j).as_ptr()));
+        let weights: [__m128; 4] =
+            std::array::from_fn(|k| _mm_loadu_ps(DISTORTION_WEIGHTS[k].as_ptr()));
+        let basis2: [__m256; 4] = std::array::from_fn(|j| _mm256_set_m128(basis[j], basis[j]));
+        let weights2: [__m256; 4] =
+            std::array::from_fn(|k| _mm256_set_m128(weights[k], weights[k]));
+        let tiles = w.div_ceil(4);
+        let pairs = tiles / 2 * 8;
+        let mut total = [_mm256_setzero_ps(); 4];
+        let mut tail = _mm_setzero_ps();
+        for r0 in (0..h).step_by(4) {
+            for c0 in (0..pairs).step_by(8) {
+                let rows: [__m256; 4] = std::array::from_fn(|i| {
+                    let row = std::array::from_fn::<_, 8, _>(|j| sample(r0 + i, c0 + j));
+                    _mm256_loadu_ps(row.as_ptr())
+                });
+                for (k, acc) in total.iter_mut().enumerate() {
+                    let mut t = _mm256_mul_ps(rows[0], _mm256_set1_ps(DCT4[k][0]));
+                    t = _mm256_fmadd_ps(rows[1], _mm256_set1_ps(DCT4[k][1]), t);
+                    t = _mm256_fmadd_ps(rows[2], _mm256_set1_ps(DCT4[k][2]), t);
+                    t = _mm256_fmadd_ps(rows[3], _mm256_set1_ps(DCT4[k][3]), t);
+                    let mut c = _mm256_mul_ps(basis2[0], _mm256_permute_ps::<0x00>(t));
+                    c = _mm256_fmadd_ps(basis2[1], _mm256_permute_ps::<0x55>(t), c);
+                    c = _mm256_fmadd_ps(basis2[2], _mm256_permute_ps::<0xAA>(t), c);
+                    c = _mm256_fmadd_ps(basis2[3], _mm256_permute_ps::<0xFF>(t), c);
+                    *acc = _mm256_fmadd_ps(_mm256_mul_ps(weights2[k], c), c, *acc);
+                }
+            }
+            if pairs < tiles * 4 {
+                let c0 = pairs;
+                let rows: [__m128; 4] = std::array::from_fn(|i| {
+                    let row = std::array::from_fn::<_, 4, _>(|j| sample(r0 + i, c0 + j));
+                    _mm_loadu_ps(row.as_ptr())
+                });
+                for k in 0..4 {
+                    let mut t = _mm_mul_ps(rows[0], _mm_set1_ps(DCT4[k][0]));
+                    t = _mm_fmadd_ps(rows[1], _mm_set1_ps(DCT4[k][1]), t);
+                    t = _mm_fmadd_ps(rows[2], _mm_set1_ps(DCT4[k][2]), t);
+                    t = _mm_fmadd_ps(rows[3], _mm_set1_ps(DCT4[k][3]), t);
+                    let mut c = _mm_mul_ps(basis[0], _mm_permute_ps::<0x00>(t));
+                    c = _mm_fmadd_ps(basis[1], _mm_permute_ps::<0x55>(t), c);
+                    c = _mm_fmadd_ps(basis[2], _mm_permute_ps::<0xAA>(t), c);
+                    c = _mm_fmadd_ps(basis[3], _mm_permute_ps::<0xFF>(t), c);
+                    tail = _mm_fmadd_ps(_mm_mul_ps(weights[k], c), c, tail);
+                }
+            }
+        }
+        let all = _mm256_add_ps(
+            _mm256_add_ps(total[0], total[1]),
+            _mm256_add_ps(total[2], total[3]),
+        );
+        let sum = _mm_add_ps(
+            _mm_add_ps(_mm256_castps256_ps128(all), _mm256_extractf128_ps::<1>(all)),
+            tail,
+        );
+        let pair = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+        _mm_cvtss_f32(_mm_add_ss(pair, _mm_shuffle_ps::<0x55>(pair, pair)))
+    }
 }
 
 /// NEON [`weighted_sse`]: the four lanes carry four columns through the column

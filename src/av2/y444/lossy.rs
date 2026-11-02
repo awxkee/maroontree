@@ -739,7 +739,7 @@ impl Av2Encoder {
                         bit_depth: self.bit_depth as i32,
                     },
                     self.still_rd().then_some(leaf::LeafDirSearch {
-                        refine: crate::av2::rd::knob_or("DREF", 8.0) as usize,
+                        refine: 8,
                         coded: &enc.sb_coded,
                         frame_width: frame.0,
                         frame_height: frame.1,
@@ -1417,22 +1417,19 @@ impl Av2Encoder {
         // at size class 2 av2_md_idx2type maps idx 0..=3 to the same types
         // for every intra mode class. Directional (mode, delta) pairs are
         // SATD-ranked and only the best few get the full RD.
-        // Mode bits: exact from the default luma-mode CDFs, or flat.
-        let exact_modes = crate::av2::rd::knob_or("EXACTMODE", 0.0) > 0.0;
+        // Mode bits: flat.
         let mb16 = |m: usize| -> f32 {
             if m >= 5 {
-                crate::av2::rd::knob_or("MBDIR", 9.0)
-            } else if exact_modes {
-                crate::av2::entropy::RangeEncoder::y_mode_nondir_bits(0, m)
+                9.0
             } else if m == 0 {
                 0.0
             } else {
-                crate::av2::rd::knob_or("MB16", 6.0)
+                6.0
             }
         };
         let mut best_cost = [cost_dct, cost_adst, cost_ad, cost_da][tx_idx] + lambda * mb16(0);
         let mut best: Option<(Vec<f32>, [f32; 256], usize, leaf::SquareLumaMode)> = None;
-        if self.still_rd() && crate::av2::rd::knob("LMODE16") > 0.0 {
+        if self.still_rd() {
             let scale = bases.luma16x16.qstep as f32 / split_qstep as f32;
             let block = leaf::SquareLumaBlock {
                 stride: pw,
@@ -1460,18 +1457,15 @@ impl Av2Encoder {
             };
             let mut cands: Vec<leaf::SquareLumaMode> =
                 (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
-            let dir_keep = crate::av2::rd::knob_or("DIR16", 3.0) as usize;
+            let dir_keep = 3;
             if dir_keep > 0 && self.speed.try_directional() {
                 let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
                     mode,
                     angle_delta,
                     smooth_neighbour,
                 };
-                let picked = leaf::screen_directional(
-                    dir_keep,
-                    self.speed.try_angle_deltas(),
-                    crate::av2::rd::knob_or("DREF", 8.0) as usize,
-                    |m, d| {
+                let picked =
+                    leaf::screen_directional(dir_keep, self.speed.try_angle_deltas(), 8, |m, d| {
                         crate::av2::metrics::satd_f32(
                             &src16,
                             16,
@@ -1480,14 +1474,13 @@ impl Av2Encoder {
                             16,
                             16,
                         )
-                    },
-                );
+                    });
                 cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
             }
-            // Unified SATD prune (PRK16 = K) and DCT-winner-only ADST search (TX16W),
-            // as the 4:2:0 16x16 leaf.
-            let prk16 = crate::av2::rd::knob_or("PRK16", 2.0) as usize;
-            if prk16 > 0 && cands.len() > prk16 {
+            // Unified SATD prune (`prk16` SATD-best candidates) and DCT-winner-only ADST
+            // search, as the 4:2:0 16x16 leaf.
+            let prk16 = 2;
+            if cands.len() > prk16 {
                 let mut ranked: Vec<(u64, leaf::SquareLumaMode)> = cands
                     .iter()
                     .map(|&lm| {
@@ -1499,10 +1492,9 @@ impl Av2Encoder {
                 ranked.sort_by_key(|&(sc, _)| sc);
                 cands = ranked.into_iter().take(prk16).map(|(_, lm)| lm).collect();
             }
-            let tx16w = crate::av2::rd::knob_or("TX16W", 1.0) > 0.0;
             let n_first = cands.len();
             let mut order: Vec<(leaf::SquareLumaMode, bool)> =
-                cands.into_iter().map(|lm| (lm, !tx16w)).collect();
+                cands.into_iter().map(|lm| (lm, false)).collect();
             let mut dct_best: Option<(f32, leaf::SquareLumaMode)> = None;
             let mut k = 0;
             while k < order.len() {
@@ -1561,8 +1553,7 @@ impl Av2Encoder {
                         best = Some((lev_m, rec_m, tx, lm));
                     }
                 }
-                if tx16w
-                    && k == n_first
+                if k == n_first
                     && let Some((_, blm)) = dct_best
                 {
                     order.push((blm, true));
@@ -1958,19 +1949,13 @@ impl Av2Encoder {
         };
         let mut lev = bases.c8x8.project_scan(&resid8, 0.0, &SCAN8X8);
         let mut rec8 = itx422::reconstruct_chroma(pred, &lev, split_qstep, &SCAN8X8, 8, 8, bd);
-        // Non-directional and (DIR8_444) the SATD-best directional luma modes
+        // Non-directional and the SATD-best directional luma modes
         // against DC (DCT only: the 8x8 leaf codes tx index 0).
         let mut mode8 = 0usize;
         let mut adelta8 = 0i32;
-        if self.still_rd() && crate::av2::rd::knob("LMODE8") > 0.0 {
+        if self.still_rd() {
             let lambda = leaf::part_lambda(split_qstep, self.tune.part_lambda_c);
-            let mb8 = |m: usize| -> f32 {
-                if m == 0 {
-                    0.0
-                } else {
-                    crate::av2::rd::knob_or("MB8", 6.0)
-                }
-            };
+            let mb8 = |m: usize| -> f32 { if m == 0 { 0.0 } else { 6.0 } };
             let scale8 = bases.c8x8.qstep as f32 / split_qstep as f32;
             let src8: Vec<f32> = rect_rows(yp, pw, sb_y, sb_x, 8, 8)
                 .flatten()
@@ -2005,7 +1990,7 @@ impl Av2Encoder {
             };
             let mut cands: Vec<leaf::SquareLumaMode> =
                 (1..=4usize).map(leaf::SquareLumaMode::nondir).collect();
-            let dir_keep = crate::av2::rd::knob_or("DIR8_444", 3.0) as usize;
+            let dir_keep = 3;
             if dir_keep > 0 && self.speed.try_directional() {
                 let dir_lm = |mode, angle_delta| leaf::SquareLumaMode {
                     mode,
@@ -2018,22 +2003,7 @@ impl Av2Encoder {
                     });
                 cands.extend(picked.into_iter().map(|(m, d)| dir_lm(m, d)));
             }
-            // PRK8_444 = K: only the K SATD-best candidates get the full RD.
-            let prk8 = crate::av2::rd::knob_or("PRK8_444", 0.0) as usize;
-            if prk8 > 0 && cands.len() > prk8 {
-                let mut ranked: Vec<(u64, leaf::SquareLumaMode)> = cands
-                    .iter()
-                    .map(|&lm| {
-                        (
-                            crate::av2::metrics::satd_f32(&src8, 8, &predict(lm), 8, 8, 8),
-                            lm,
-                        )
-                    })
-                    .collect();
-                ranked.sort_by_key(|&(sc, _)| sc);
-                cands = ranked.into_iter().take(prk8).map(|(_, lm)| lm).collect();
-            }
-            let mb_dir = crate::av2::rd::knob_or("MBDIR8", 9.0);
+            let mb_dir = 9.0;
             for lm in cands {
                 let m = lm.mode;
                 let p = predict(lm);
@@ -4767,33 +4737,20 @@ impl Av2Encoder {
                         basis8: &bases.c8x8,
                         allow_16x16: true,
                         allow_8x8: true,
-                        leaf_modes: self.still_rd() && crate::av2::rd::knob_or("LM444", 1.0) > 0.0,
-                        leaf_modes8: self.still_rd()
-                            && crate::av2::rd::knob_or("LM8_444", 1.0) > 0.0,
-                        split8_chroma_weight: crate::av2::rd::knob_or("S8CW_444", 1.0),
+                        leaf_modes: self.still_rd(),
+                        leaf_modes8: self.still_rd(),
+                        split8_chroma_weight: 1.0,
                     },
                     // Stills price chroma in the probe (full-resolution planes).
-                    (self.still_rd() && crate::av2::rd::knob_or("CP444", 1.0) > 0.0).then_some(
-                        &mut crate::av2::leaf::ChromaProbe {
-                            src_u: up,
-                            src_v: vp,
-                            rec_u: &mut *recu,
-                            rec_v: &mut *recv,
-                            stride: pw,
-                            bases: [&bases.chroma420, &bases.luma16x16, &bases.c8x8, &bases.c4x4],
-                            full: true,
-                        },
-                    ),
-                    (self.still_rd() && crate::av2::rd::knob_or("PR444", 0.0) > 0.0).then_some(
-                        &partition::PartitionPricer {
-                            above_pctx: above_pctx.to_vec(),
-                            left_pctx: left_pctx.to_vec(),
-                            sb_row: row,
-                            sb_col: col,
-                            mi_rows: tmr as usize,
-                            mi_cols: tmc as usize,
-                        },
-                    ),
+                    (self.still_rd()).then_some(&mut crate::av2::leaf::ChromaProbe {
+                        src_u: up,
+                        src_v: vp,
+                        rec_u: &mut *recu,
+                        rec_v: &mut *recv,
+                        stride: pw,
+                        bases: [&bases.chroma420, &bases.luma16x16, &bases.c8x8, &bases.c4x4],
+                        full: true,
+                    }),
                 );
                 if let crate::av2::replay::DecideMode::Capture(rec) = &mut decide_mode {
                     rec.push_part(p);
@@ -4901,7 +4858,6 @@ impl Av2Encoder {
                     sb_qstep: sb_qstep_c,
                     mhccp_bounds,
                     ss: (0, 0),
-                    trial: false,
                 });
             }
             return;
@@ -5606,7 +5562,6 @@ impl Av2Encoder {
                 sb_qstep: split_qstep_c,
                 mhccp_bounds,
                 ss: (0, 0),
-                trial: false,
             });
         }
         // One `entries` push per walk SB (paired with the pop above), keeping the

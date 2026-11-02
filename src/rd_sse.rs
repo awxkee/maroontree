@@ -41,6 +41,8 @@ type SumU16StridedFn = fn(&[u16], usize, usize) -> i32;
 type AllZeroI32Fn = fn(&[i32]) -> bool;
 /// `(sum, sum of squares)` of `src - pred` over a `w`x`h` block.
 type ResidualMomentsFn = fn(&[u16], usize, &[i32], usize, usize, usize) -> (i64, i64);
+/// [`weighted_sse_scalar`] of a `w`-pitched `w`x`h` error block.
+type WeightedSseFn = fn(&[i32], usize, usize) -> f32;
 
 /// Largest block any distortion kernel sees (64x64).
 const MAX_BLOCK_PIXELS: usize = 64 * 64;
@@ -175,6 +177,9 @@ pub(crate) struct RdDispatch {
     sum_u16_strided: SumU16StridedFn,
     all_zero_i32: AllZeroI32Fn,
     residual_moments: ResidualMomentsFn,
+    weighted_sse: WeightedSseFn,
+    /// Scale on the weighted decision distortion; 0 = plain SSE.
+    wsse_scale: f32,
 }
 
 impl RdDispatch {
@@ -193,7 +198,68 @@ impl RdDispatch {
             sum_u16_strided: sum_u16_strided_scalar,
             all_zero_i32: all_zero_i32_scalar,
             residual_moments: residual_moments_scalar,
+            weighted_sse: weighted_sse_scalar,
+            wsse_scale: 0.0,
         }
+    }
+
+    /// Measure [`Self::sse_recon`], [`Self::sse_u16`] and [`Self::chroma_sse`]
+    /// as `scale` x the 4x4-DCT weighted SSE ([`weighted_sse_scalar`]) instead
+    /// of the plain SSE; `None` keeps the plain SSE.
+    pub(crate) fn with_weighted_sse(mut self, scale: Option<f32>) -> Self {
+        self.wsse_scale = scale.unwrap_or(0.0);
+        self
+    }
+
+    /// The weighted distortion of the VISIBLE part of `src` against
+    /// `reference(x, y)` (block coordinates), or `None` when this dispatch
+    /// measures plain SSE. For references [`Self::sse_u16`] cannot borrow as a
+    /// slice (the wavefront's shared reconstruction).
+    #[inline]
+    pub(crate) fn weighted_sse_with(
+        &self,
+        src: SrcBlock<'_>,
+        reference: impl Fn(usize, usize) -> u16,
+    ) -> Option<i64> {
+        if self.wsse_scale <= 0.0 {
+            return None;
+        }
+        let (vw, vh) = (src.vis_w, src.vis_h);
+        Some(self.weighted_dist(vw, vh, |x, y| {
+            i32::from(src.data[y * src.stride + x]) - i32::from(reference(x, y))
+        }))
+    }
+
+    /// Scaled weighted SSE of the visible `vw`x`vh` error `err(x, y)`, zero
+    /// padded to whole 4x4 tiles anchored at the block origin.
+    #[inline]
+    fn weighted_dist(&self, vw: usize, vh: usize, err: impl Fn(usize, usize) -> i32) -> i64 {
+        #[inline(always)]
+        fn run<const N: usize>(
+            f: WeightedSseFn,
+            pw: usize,
+            ph: usize,
+            vw: usize,
+            vh: usize,
+            err: impl Fn(usize, usize) -> i32,
+        ) -> f32 {
+            let mut buf = [0i32; N];
+            for y in 0..vh {
+                for (x, v) in buf[y * pw..][..vw].iter_mut().enumerate() {
+                    *v = err(x, y);
+                }
+            }
+            f(&buf[..pw * ph], pw, ph)
+        }
+        let (pw, ph) = (vw.next_multiple_of(4), vh.next_multiple_of(4));
+        let f = self.weighted_sse;
+        let d = match pw * ph {
+            0..=64 => run::<64>(f, pw, ph, vw, vh, err),
+            65..=256 => run::<256>(f, pw, ph, vw, vh, err),
+            257..=1024 => run::<1024>(f, pw, ph, vw, vh, err),
+            _ => run::<MAX_BLOCK_PIXELS>(f, pw, ph, vw, vh, err),
+        };
+        (d * self.wsse_scale).round() as i64
     }
 
     pub(crate) fn selected() -> Self {
@@ -214,6 +280,7 @@ impl RdDispatch {
             dispatch.sum_u16_strided = sum_u16_strided_neon_wrap;
             dispatch.all_zero_i32 = all_zero_i32_neon_wrap;
             dispatch.residual_moments = residual_moments_neon_wrap;
+            dispatch.weighted_sse = weighted_sse_neon_wrap;
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::is_x86_feature_detected!("avx2") {
@@ -229,6 +296,9 @@ impl RdDispatch {
             dispatch.sum_u16 = sum_u16_avx2_wrap;
             dispatch.sum_u16_strided = sum_u16_strided_avx2_wrap;
             dispatch.all_zero_i32 = all_zero_i32_avx2_wrap;
+            if std::is_x86_feature_detected!("fma") {
+                dispatch.weighted_sse = weighted_sse_avx2_wrap;
+            }
         }
         dispatch
     }
@@ -346,6 +416,13 @@ impl RdDispatch {
             return 0;
         }
         let maxv = (1i32 << bd) - 1;
+        if self.wsse_scale > 0.0 {
+            let stride = src.stride;
+            return self.weighted_dist(vw, vh, |x, y| {
+                let i = y * w + x;
+                i32::from(src.data[y * stride + x]) - (pred[i] + resid[i]).clamp(0, maxv)
+            });
+        }
         if vw == w {
             self.sse_recon_raw(pred, resid, src.data, src.stride, 0, 0, w, vh, maxv)
         } else {
@@ -397,6 +474,11 @@ impl RdDispatch {
         let (vw, vh) = (src.vis_w, src.vis_h);
         if vw == 0 || vh == 0 {
             return 0;
+        }
+        if let Some(d) =
+            self.weighted_sse_with(src, |x, y| reference[(ref_y + y) * ref_stride + ref_x + x])
+        {
+            return d;
         }
         self.sse_u16_raw(
             src.data, src.stride, 0, 0, reference, ref_stride, ref_x, ref_y, vw, vh,
@@ -569,6 +651,15 @@ impl RdDispatch {
             return 0.0;
         }
         let maxv = (1i32 << bd) - 1;
+        if self.wsse_scale > 0.0 {
+            let stride = src.stride;
+            return self.weighted_dist(vw, vh, |x, y| {
+                let i = y * w + x;
+                let p = if pred.is_empty() { dc } else { pred[i] };
+                let r = if residual.is_empty() { 0 } else { residual[i] };
+                i32::from(src.data[y * stride + x]) - (p + r).clamp(0, maxv)
+            }) as f32;
+        }
         let sse = if vw == w {
             self.chroma_sse_raw(src.data, src.stride, 0, 0, w, vh, maxv, pred, dc, residual)
         } else {
@@ -756,6 +847,11 @@ fn sse_recon_neon_wrap(
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn weighted_sse_neon_wrap(err: &[i32], w: usize, h: usize) -> f32 {
+    unsafe { crate::neon::weighted_sse_neon(err, w, h) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
 fn sse_u16_neon_wrap(
     src: &[u16],
     src_stride: usize,
@@ -843,6 +939,11 @@ fn sum_u16_avx2_wrap(values: &[u16]) -> i32 {
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 fn sum_u16_strided_avx2_wrap(values: &[u16], stride: usize, len: usize) -> i32 {
     unsafe { crate::avx::sum_u16_strided_avx2(values, stride, len) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn weighted_sse_avx2_wrap(err: &[i32], w: usize, h: usize) -> f32 {
+    unsafe { crate::avx::weighted_sse_avx2(err, w, h) }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -1213,6 +1314,58 @@ pub(crate) fn sse_u16_scalar(
         }
     }
     sse
+}
+
+/// Weights of [`weighted_sse_scalar`] on the 4x4 DCT of the error, `[row
+/// frequency][column frequency]`: DC error is dearer, the lowest AC at par,
+/// the second band discounted, high frequencies cheap (the hpvca decision
+/// distortion).
+pub(crate) const WSSE_WEIGHTS: [[f32; 4]; 4] = {
+    const DC: f32 = 1.8;
+    const DIAG: f32 = 0.8;
+    const AXIS: f32 = 0.4;
+    const HF: f32 = 0.2;
+    [
+        [DC, 1.0, AXIS, HF],
+        [1.0, DIAG, HF, HF],
+        [AXIS, HF, HF, HF],
+        [HF, HF, HF, HF],
+    ]
+};
+
+/// Orthonormal 4-point DCT-II basis, `WSSE_DCT4[k][i]`.
+pub(crate) const WSSE_DCT4: [[f32; 4]; 4] = {
+    const A: f32 = 0.5;
+    const B: f32 = 0.653_281_5;
+    const C: f32 = 0.270_598_05;
+    [[A, A, A, A], [B, C, -C, -B], [A, -A, -A, A], [C, -B, B, -C]]
+};
+
+/// Perceptual squared error of a `w`-pitched `w`x`h` error block (both
+/// multiples of 4): every 4x4 tile goes through an orthonormal DCT and its
+/// squared coefficients are weighted by [`WSSE_WEIGHTS`] (all weights 1 would
+/// be the plain SSE). The SIMD kernels fuse multiply-adds and sum in their own
+/// order, so they match this only to float rounding.
+pub(crate) fn weighted_sse_scalar(err: &[i32], w: usize, h: usize) -> f32 {
+    debug_assert!(w.is_multiple_of(4) && h.is_multiple_of(4));
+    let d = &WSSE_DCT4;
+    let mut total = 0.0f32;
+    for r0 in (0..h).step_by(4) {
+        for c0 in (0..w).step_by(4) {
+            let e: [[f32; 4]; 4] =
+                std::array::from_fn(|i| std::array::from_fn(|j| err[(r0 + i) * w + c0 + j] as f32));
+            for k in 0..4 {
+                let t: [f32; 4] = std::array::from_fn(|j| {
+                    e[0][j] * d[k][0] + e[1][j] * d[k][1] + e[2][j] * d[k][2] + e[3][j] * d[k][3]
+                });
+                for l in 0..4 {
+                    let c = d[l][0] * t[0] + d[l][1] * t[1] + d[l][2] * t[2] + d[l][3] * t[3];
+                    total += WSSE_WEIGHTS[k][l] * c * c;
+                }
+            }
+        }
+    }
+    total
 }
 
 pub(crate) fn sum_i32_scalar(values: &[i32]) -> i32 {
@@ -1723,6 +1876,79 @@ mod satd_tests {
                     dispatch.satd_sad_proxy_raw(&a[y * pw + x..], pw, &pred, w, w, h)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn weighted_sse_kernels_match_and_weight_dc() {
+        // A flat 4x4 error e is all DC: coefficient 4e, weight 1.8.
+        let flat = [3i32; 16];
+        assert_eq!(weighted_sse_scalar(&flat, 4, 4), 1.8 * 144.0);
+        // All-weights-1 sanity: the transform is orthonormal, so a single
+        // tile's unweighted coefficient energy equals the pixel SSE.
+        let err: Vec<i32> = (0..64 * 64).map(|i| ((i * 7919) % 513) - 256).collect();
+        let dispatch = RdDispatch::selected();
+        for &(w, h) in &[
+            (4usize, 4usize),
+            (8, 4),
+            (4, 16),
+            (16, 16),
+            (32, 8),
+            (64, 64),
+        ] {
+            let e = &err[..w * h];
+            let want = weighted_sse_scalar(e, w, h);
+            let got = (dispatch.weighted_sse)(e, w, h);
+            assert!(
+                (got - want).abs() <= 1e-5 * want,
+                "{w}x{h}: {got} vs {want}"
+            );
+            let plain: f32 = e.iter().map(|&v| (v * v) as f32).sum();
+            assert!(want > 0.2 * plain && want < 1.8 * plain, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn weighted_distortion_ignores_invisible_pixels() {
+        let dispatch = RdDispatch::selected().with_weighted_sse(Some(1.0));
+        let (pw, ph) = (72usize, 40usize);
+        for &(x, y, w, h, vw, vh) in &[
+            (8usize, 8usize, 16usize, 16usize, 72usize, 40usize),
+            (0, 32, 16, 8, 72, 35),
+            (64, 0, 8, 16, 67, 40),
+            (56, 24, 16, 16, 61, 37),
+            (64, 32, 8, 8, 65, 33),
+        ] {
+            let a = edge_plane(pw, ph, vw, vh, 0, 7);
+            let b = edge_plane(pw, ph, vw, vh, 1023, 7);
+            let (ba, bb) = (
+                SrcBlock::new(&a, pw, x, y, w, h, vw, vh),
+                SrcBlock::new(&b, pw, x, y, w, h, vw, vh),
+            );
+            let n = w * h;
+            let pred: Vec<i32> = (0..n as i32).map(|i| (i * 37) % 900 + 40).collect();
+            let resid: Vec<i32> = (0..n as i32).map(|i| (i * 13) % 61 - 30).collect();
+            let (cvw, cvh) = ba.vis();
+            let tag = format!("{w}x{h} at ({x},{y}) vis {cvw}x{cvh}");
+            let sa = dispatch.sse_recon(&pred, &resid, ba, 10);
+            assert!(sa > 0, "{tag}");
+            assert_eq!(sa, dispatch.sse_recon(&pred, &resid, bb, 10), "{tag}");
+            assert_eq!(
+                dispatch.chroma_sse(ba, 10, &pred, 0, &resid),
+                sa as f32,
+                "{tag}"
+            );
+            assert_eq!(
+                dispatch.chroma_sse(bb, 10, &pred, 0, &resid),
+                sa as f32,
+                "{tag}"
+            );
+            let recon = edge_plane(pw, ph, pw, ph, 0, 99);
+            assert_eq!(
+                dispatch.sse_u16(ba, &recon, pw, x, y),
+                dispatch.sse_u16(bb, &recon, pw, x, y),
+                "sse_u16 {tag}"
+            );
         }
     }
 }

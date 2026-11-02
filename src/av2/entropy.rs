@@ -472,38 +472,6 @@ impl RangeEncoder {
         -dirty_log2f(probability)
     }
 
-    // Intra still RD pricing uses the DEFAULT (init) probabilities, not the live
-    // adapted CDFs: multi-threaded stills decide superblocks in a wavefront pass with
-    // fresh contexts and replay them serially, so anything priced from live CDF state
-    // could be decided differently in the two passes (avmdec mismatches at -t4).
-
-    /// Bits of a static bool (`cdf` = P(1)·32768, as `encode_bool` uses it).
-    fn static_bool_bits(cdf: u32, bit: u32) -> f32 {
-        let p1 = (cdf as f32 / 32768.0).clamp(1.0 / 32768.0, 1.0 - 1.0 / 32768.0);
-        -dirty_log2f(if bit != 0 { p1 } else { 1.0 - p1 })
-    }
-
-    /// Default-CDF bits of a `do_split` bool (see `bool_do_split`).
-    pub(crate) fn do_split_bits(static_cdf: u32, bit: u32) -> f32 {
-        Self::static_bool_bits(static_cdf, bit)
-    }
-
-    /// Default-CDF bits of a `do_square_split` bool.
-    pub(crate) fn do_square_split_bits(static_cdf: u32, bit: u32) -> f32 {
-        Self::static_bool_bits(static_cdf, bit)
-    }
-
-    /// Default-CDF bits of a `rect_type` bool (see `bool_rect_type`).
-    pub(crate) fn rect_type_bits(static_cdf: u32, bit: u32) -> f32 {
-        Self::static_bool_bits(static_cdf, bit)
-    }
-
-    /// Default-CDF bits of a non-directional luma mode (`y_set` 0 + `y_idx0[ctx]`).
-    pub(crate) fn y_mode_nondir_bits(ctx: usize, mode: usize) -> f32 {
-        use crate::av2::cdf_state::{Y_IDX0_INIT, Y_SET_INIT};
-        Self::symbol_bits(&Y_SET_INIT, 0, 4) + Self::symbol_bits(&Y_IDX0_INIT[ctx], mode, 8)
-    }
-
     /// Estimate the syntax rate from the tile's current adaptive CDFs without
     /// advancing either the range coder or the adaptation state. The constants
     /// are neutral fallbacks for non-adaptive callers; video tiles use the live

@@ -424,7 +424,7 @@ pub(crate) fn cfl_avg_l(
                 (true, true) => {
                     let a = l(sb_y - 1, sb_x + 2 * kk);
                     let b = l(sb_y - 1, sb_x + 2 * kk + 1);
-                    if sb_y % 64 == 0 {
+                    if sb_y.is_multiple_of(64) {
                         (a + b + a + b) << 1
                     } else {
                         (l(sb_y - 2, sb_x + 2 * kk) + l(sb_y - 2, sb_x + 2 * kk + 1) + a + b) << 1
@@ -1122,49 +1122,7 @@ pub(crate) fn mhccp_decide(ctx: &MhccpCtx, input: &MhccpDecisionInput<'_>) -> Op
     let (mut res_u, mut res_v) = (vec![0f32; n], vec![0f32; n]);
     let (mut lev_u, mut lev_v) = (Vec::new(), Vec::new());
     let (mut rec_u, mut rec_v) = (vec![0f32; cw * ch], vec![0f32; cw * ch]);
-    // Direction pre-screen: rank the filter directions by their prediction SSE
-    // and fully code only the best `keep`.
-    let keep = crate::av2::rd::knob_or("MHK", 0.0) as usize;
-    let mut dirs: Vec<u8> = (0u8..mhccp::MHCCP_MODE_NUM as u8).collect();
-    if keep > 0 && keep < dirs.len() {
-        let pred_sse = |pred: &[i32], src: &[f32]| -> f32 {
-            src[..n]
-                .iter()
-                .zip(pred)
-                .map(|(&s, &p)| (s - p as f32).powi(2))
-                .sum()
-        };
-        let mut ranked: Vec<(f32, u8)> = dirs
-            .iter()
-            .map(|&dir| {
-                let pu = mhccp::derive_params(&luma_ref, &cref_u, dir, bd);
-                let pv = mhccp::derive_params(&luma_ref, &cref_v, dir, bd);
-                mhccp::predict_block(
-                    &luma_ref,
-                    &pu,
-                    dir,
-                    ctx.have_top,
-                    ctx.have_left,
-                    bd,
-                    &mut pred_u,
-                );
-                mhccp::predict_block(
-                    &luma_ref,
-                    &pv,
-                    dir,
-                    ctx.have_top,
-                    ctx.have_left,
-                    bd,
-                    &mut pred_v,
-                );
-                (pred_sse(&pred_u, src_u) + pred_sse(&pred_v, src_v), dir)
-            })
-            .collect();
-        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-        dirs = ranked.into_iter().take(keep).map(|(_, d)| d).collect();
-        dirs.sort_unstable();
-    }
-    for dir in dirs {
+    for dir in 0u8..mhccp::MHCCP_MODE_NUM as u8 {
         let pu = mhccp::derive_params(&luma_ref, &cref_u, dir, bd);
         let pv = mhccp::derive_params(&luma_ref, &cref_v, dir, bd);
         pred_u.resize(n, 0);

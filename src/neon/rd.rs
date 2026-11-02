@@ -580,3 +580,45 @@ pub(crate) fn satd_sad_proxy_neon(
     let satd = vpaddd_s64(satd_acc);
     (sad as u64) + ((satd as u64) >> 2)
 }
+
+/// NEON `rd_sse::weighted_sse_scalar`: the four lanes carry four columns
+/// through the column DCT, then a lane-broadcast row DCT leaves coefficient
+/// (k, l) in lane l of row accumulator k. Fused multiply-adds, so the sum
+/// differs from the scalar kernel in the last bits.
+#[target_feature(enable = "neon")]
+pub(crate) fn weighted_sse_neon(err: &[i32], w: usize, h: usize) -> f32 {
+    use crate::rd_sse::{WSSE_DCT4 as D, WSSE_WEIGHTS};
+    debug_assert!(w.is_multiple_of(4) && h.is_multiple_of(4));
+    debug_assert!(err.len() >= w * h);
+    unsafe {
+        let basis: [float32x4_t; 4] = std::array::from_fn(|j| {
+            let column: [f32; 4] = std::array::from_fn(|l| D[l][j]);
+            vld1q_f32(column.as_ptr())
+        });
+        let weights: [float32x4_t; 4] =
+            std::array::from_fn(|k| vld1q_f32(WSSE_WEIGHTS[k].as_ptr()));
+        let mut total = [vdupq_n_f32(0.0); 4];
+        for r0 in (0..h).step_by(4) {
+            for c0 in (0..w).step_by(4) {
+                let rows: [float32x4_t; 4] = std::array::from_fn(|i| {
+                    vcvtq_f32_s32(vld1q_s32(err[(r0 + i) * w + c0..][..4].as_ptr()))
+                });
+                for (k, acc) in total.iter_mut().enumerate() {
+                    let mut t = vmulq_n_f32(rows[0], D[k][0]);
+                    t = vfmaq_n_f32(t, rows[1], D[k][1]);
+                    t = vfmaq_n_f32(t, rows[2], D[k][2]);
+                    t = vfmaq_n_f32(t, rows[3], D[k][3]);
+                    let mut c = vmulq_laneq_f32::<0>(basis[0], t);
+                    c = vfmaq_laneq_f32::<1>(c, basis[1], t);
+                    c = vfmaq_laneq_f32::<2>(c, basis[2], t);
+                    c = vfmaq_laneq_f32::<3>(c, basis[3], t);
+                    *acc = vfmaq_f32(*acc, vmulq_f32(weights[k], c), c);
+                }
+            }
+        }
+        vaddvq_f32(vaddq_f32(
+            vaddq_f32(total[0], total[1]),
+            vaddq_f32(total[2], total[3]),
+        ))
+    }
+}

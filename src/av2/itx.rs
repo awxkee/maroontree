@@ -1171,8 +1171,16 @@ mod neon_lane {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     use super::*;
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn valid_1d_types(sz: usize) -> &'static [usize] {
         match sz {
             0 => &[0, 1, 2, 3],
@@ -1183,6 +1191,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn coeff_case(sw: usize, sh: usize, tx: usize, hor: usize, ver: usize, seed: u32) -> Vec<i32> {
         let mut state = seed
             .wrapping_mul(747_796_405)
@@ -1201,6 +1213,10 @@ mod tests {
         coeff
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn coeff_clip_case(sw: usize, sh: usize, bd: i32) -> Vec<i32> {
         let mut coeff = vec![0i32; sw * sh];
         let lim = 1 << (bd + 7);
@@ -1216,6 +1232,10 @@ mod tests {
         coeff
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     unsafe fn assert_itx_impl_matches_scalar(name: &str, simd: ItxPassesFn) {
         for (tx, &(tw, th, lw, lh)) in DIM.iter().enumerate() {
             let sw = (4 * tw).min(32);

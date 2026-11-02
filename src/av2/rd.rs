@@ -50,30 +50,6 @@ pub(crate) fn rd_cost(dist: f32, bits: f32, lambda: f32) -> f32 {
     dist + lambda * bits
 }
 
-/// TEMPORARY experiment knob (`MT_RD_<NAME>` env var, default 1.0); removed once
-/// the RD study settles each scale.
-pub(crate) fn knob(name: &str) -> f32 {
-    knob_or(name, 1.0)
-}
-
-/// TEMPORARY, like [`knob`] with an explicit default.
-pub(crate) fn knob_or(name: &str, default: f32) -> f32 {
-    thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<(usize, usize, u32), f32>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    CACHE.with(|c| {
-        *c.borrow_mut()
-            .entry((name.as_ptr() as usize, name.len(), default.to_bits()))
-            .or_insert_with(|| {
-                std::env::var(format!("MT_RD_{name}"))
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(default)
-            })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

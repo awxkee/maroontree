@@ -777,6 +777,10 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
     fn assert_loop_filter_batch_matches_scalar(name: &str, simd: LoopFilterFn, lanes: usize) {
         for bd in [8u8, 10, 12] {
             for vertical in [false, true] {
