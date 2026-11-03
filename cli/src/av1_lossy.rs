@@ -86,6 +86,9 @@ pub(crate) fn encode_av1(
         None => cfg,
     };
 
+    if let Some(quality) = args.alpha_quality {
+        cfg = cfg.with_alpha_quality(quality);
+    }
     for option in &args.overrides {
         option.apply_av1(&mut cfg).map_err(anyhow::Error::msg)?;
     }

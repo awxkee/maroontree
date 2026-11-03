@@ -1748,7 +1748,7 @@ impl<'a> LossyTile<'a> {
                     D157_PRED,
                 ];
                 let directional_top = if ru.is_none() {
-                    self.rank_chroma_modes::<64>(&CANDIDATES, px, py, px, py, 8, 8)
+                    self.rank_chroma_modes::<64>(&CANDIDATES, px, py, px, py, 8, 8, false, false)
                 } else {
                     DirectionalTopK::new()
                 };
@@ -2253,7 +2253,7 @@ impl<'a> LossyTile<'a> {
                     D157_PRED,
                 ];
                 let directional_top = if ru.is_none() {
-                    self.rank_chroma_modes::<16>(candidates, px, py, cx, cy, 4, 4)
+                    self.rank_chroma_modes::<16>(candidates, px, py, cx, cy, 4, 4, false, false)
                 } else {
                     DirectionalTopK::new()
                 };
@@ -2551,7 +2551,7 @@ impl<'a> LossyTile<'a> {
                     D157_PRED,
                 ];
                 let directional_top = if ru.is_none() {
-                    self.rank_chroma_modes::<32>(candidates, px, py, cx, py, 4, 8)
+                    self.rank_chroma_modes::<32>(candidates, px, py, cx, py, 4, 8, false, false)
                 } else {
                     DirectionalTopK::new()
                 };

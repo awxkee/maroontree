@@ -465,8 +465,11 @@ impl<'a> LossyTile<'a> {
         cy: usize,
         w: usize,
         h: usize,
+        have_tr: bool,
+        have_bl: bool,
     ) -> DirectionalTopK {
         debug_assert_eq!(N, w * h);
+        let ch = if self.ss420 { self.h / 2 } else { self.h };
         let mut top = DirectionalTopK::new();
         for &mode in modes {
             if mode != V_PRED && mode != H_PRED && !self.speed.chroma_angle_directional()
@@ -484,10 +487,10 @@ impl<'a> LossyTile<'a> {
                     cy,
                     w,
                     h,
-                    false,
-                    false,
+                    have_tr,
+                    have_bl,
                     self.cw,
-                    self.h,
+                    ch,
                     self.chroma_filter_type(px, py),
                     &mut pred,
                     self.bd,

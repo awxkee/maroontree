@@ -74,6 +74,7 @@ av1 overrides (maroontree):
   Syntax: -O 'av1:KEY=VALUE,KEY=VALUE,...' (repeatable)
 
   quality (q)            1..100
+  alpha-quality (qalpha) 1..100; 100 = lossless alpha (default: quality)
   speed (s)             extraslow|slow|medium|fast
   threads (t)           nonnegative integer; 0 uses all available cores
   updating-cdf          boolean
@@ -82,7 +83,7 @@ av1 overrides (maroontree):
   dark-aq               boolean (lossy; requires adaptive-quant)
   screen-content        boolean
   intrabc               boolean
-  cdef                  boolean (lossy; extraslow always enables CDEF)
+  cdef                  boolean (lossy; slow and extraslow always enable CDEF)
   wiener                boolean (lossy)
   quantization-matrices boolean (lossy)
   qmatrix-level (qm)    auto|0..15 (lossy; also enables matrices)
@@ -207,6 +208,7 @@ impl FromStr for EncoderOverride {
             "d" | "bit-depth" => "depth",
             "c" => "chroma",
             "q" => "quality",
+            "qalpha" => "alpha-quality",
             "s" => "speed",
             "t" | "num-threads" => "threads",
             "qm" => "qmatrix-level",
