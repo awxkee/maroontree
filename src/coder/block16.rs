@@ -142,7 +142,9 @@ impl<'a> LossyTile<'a> {
                 &mut self.cdfs.angle_delta[y_mode - V_PRED],
             );
         }
-        self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 16, 16);
+        if !self.mono {
+            self.emit_uv_mode(y_mode, uv_mode, cfl, px, py, 16, 16);
+        }
         self.emit_palette_mode_info(px, py, 16, 16, y_mode, !self.mono, palette, uv_palette);
         if palette.is_none() {
             self.emit_filter_intra(y_mode, 16, 16, filter_intra);
@@ -660,6 +662,9 @@ impl<'a> LossyTile<'a> {
             let mut uv_delta16 = 0i32;
             let mut best_ccf16 = [self.sbuf_i256(), self.sbuf_i256()];
             let mut best_pred16 = [self.sbuf_i256(), self.sbuf_i256()];
+            // D45/D67/D203 read the top-right / bottom-left edge. A square leaf's
+            // single chroma transform inherits the luma leaf's edge flags (dav1d
+            // recon_tmpl.c `uv_sb_has_tr/bl`), so they predict exactly here.
             let candidates = &[
                 SMOOTH_V_PRED,
                 PAETH_PRED,
@@ -670,9 +675,12 @@ impl<'a> LossyTile<'a> {
                 D135_PRED,
                 D113_PRED,
                 D157_PRED,
+                D45_PRED,
+                VERT_LEFT_PRED,
+                D203_PRED,
             ];
             let directional_top = if ru.is_none() {
-                self.rank_chroma_modes::<256>(candidates, px, py, px, py, 16, 16)
+                self.rank_chroma_modes::<256>(candidates, px, py, px, py, 16, 16, have_tr, have_bl)
             } else {
                 DirectionalTopK::new()
             };
@@ -709,8 +717,8 @@ impl<'a> LossyTile<'a> {
                         py,
                         16,
                         16,
-                        false,
-                        false,
+                        have_tr,
+                        have_bl,
                         self.w,
                         self.h,
                         self.chroma_filter_type(px, py),
@@ -1025,6 +1033,56 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    /// 4:0:0 16x16 leaf: the shared luma header/coefficients only. Keeps the
+    /// uv record cursor aligned with a DC placeholder, like the 8x8 mono leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn code_block16_mono(
+        &mut self,
+        x8: usize,
+        y8: usize,
+        lcf: &[i32; 256],
+        lpred: &[i32; 256],
+        y_mode: usize,
+        luma_zero: bool,
+        txtp16: u8,
+        s8_txtps: [u8; 4],
+        s16_txtps: [u8; 16],
+        angle_delta: i32,
+        filter_intra: Option<FilterIntraMode>,
+        palette: Option<&LossyLumaPalette>,
+        have_tr: bool,
+        have_bl: bool,
+    ) {
+        let _ = self.uv_sel_replay();
+        let _ = self.uv_cf_replay();
+        self.push_uv_sel(UvSel {
+            uv: DC_PRED as u8,
+            palette: 0,
+            delta: 0,
+        });
+        self.push_uv_cf(&[], &[], [0, 0]);
+        self.uv_delta = 0;
+        self.code_header_luma16(
+            x8,
+            y8,
+            lcf,
+            lpred,
+            y_mode,
+            palette.is_none() && luma_zero,
+            DC_PRED,
+            None,
+            txtp16,
+            s8_txtps,
+            s16_txtps,
+            angle_delta,
+            filter_intra,
+            palette,
+            None,
+            have_tr,
+            have_bl,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn code_block16_420(
         &mut self,
@@ -1192,6 +1250,9 @@ impl<'a> LossyTile<'a> {
                 best_pred = cfl_px;
             }
         }
+        // D45/D67/D203 read the top-right / bottom-left edge. A square leaf's
+        // single chroma transform inherits the luma leaf's edge flags (dav1d
+        // recon_tmpl.c `uv_sb_has_tr/bl`), so they predict exactly here.
         let candidates = &[
             SMOOTH_V_PRED,
             PAETH_PRED,
@@ -1202,9 +1263,12 @@ impl<'a> LossyTile<'a> {
             D135_PRED,
             D113_PRED,
             D157_PRED,
+            D45_PRED,
+            VERT_LEFT_PRED,
+            D203_PRED,
         ];
         let directional_top = if ru.is_none() {
-            self.rank_chroma_modes::<64>(candidates, px, py, cx, cy, 8, 8)
+            self.rank_chroma_modes::<64>(candidates, px, py, cx, cy, 8, 8, have_tr, have_bl)
         } else {
             DirectionalTopK::new()
         };
@@ -1240,10 +1304,10 @@ impl<'a> LossyTile<'a> {
                     cy,
                     8,
                     8,
-                    false,
-                    false,
+                    have_tr,
+                    have_bl,
                     self.cw,
-                    self.h,
+                    self.h / 2,
                     self.chroma_filter_type(px, py),
                     &mut cand_pred[ci],
                     self.bd,
@@ -1642,7 +1706,8 @@ impl<'a> LossyTile<'a> {
                 D113_PRED,
                 D157_PRED,
             ];
-            let directional_top = self.rank_chroma_modes::<128>(candidates, px, py, cx, py, 8, 16);
+            let directional_top =
+                self.rank_chroma_modes::<128>(candidates, px, py, cx, py, 8, 16, false, false);
             let eval = |this: &Self, cand: usize, d: i32| {
                 let tx = chroma_tx_for_mode(cand);
                 let mut sig = this.uv_mode_bits(y_mode, cand, None);

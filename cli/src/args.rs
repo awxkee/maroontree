@@ -23,6 +23,9 @@ fn command() -> Command {
         .arg(Arg::new("quality").short('q').long("quality").value_name("1-100")
             .value_parser(value_parser!(u8).range(1..=100))
             .help("Quality; defaults: JPEG 92, AV1/HEVC 80, AV2/VVC 60, JXL 70"))
+        .arg(Arg::new("qalpha").long("qalpha").value_name("1-100")
+            .value_parser(value_parser!(u8).range(1..=100))
+            .help("AV1 alpha quality, 100 = lossless alpha [default: same as --quality]"))
         .arg(Arg::new("chroma").short('c').long("chroma").value_name("CHROMA")
             .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: JPEG 444, others 422; lossless 444]"))
         .arg(Arg::new("depth").short('d').long("depth").value_name("DEPTH")
@@ -45,7 +48,11 @@ fn command() -> Command {
         ("no-alpha", None, "Discard alpha channel"),
         ("no-screen-content", None, "Skip AV1 palette search"),
         ("no-intrabc", None, "Disable lossy AV1 IntraBC"),
-        ("cdef", None, "Enable AV1 CDEF"),
+        (
+            "cdef",
+            None,
+            "Enable AV1 CDEF (always on at slow and extraslow)",
+        ),
         ("wiener", None, "Enable AV1 luma Wiener loop restoration"),
         ("no-exif", None, "Strip EXIF metadata"),
         (
@@ -248,6 +255,7 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
                 Encoder::JpegXl => 70,
             }),
         lossless,
+        alpha_quality: matches.get_one::<u8>("qalpha").copied(),
         chroma: Some(chroma),
         depth: matches
             .get_one::<String>("depth")

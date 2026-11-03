@@ -1611,7 +1611,8 @@ impl<'a> LossyTile<'a> {
             D113_PRED,
             D157_PRED,
         ];
-        let directional_top = self.rank_chroma_modes::<128>(candidates, px, py, px, py, w, h);
+        let directional_top =
+            self.rank_chroma_modes::<128>(candidates, px, py, px, py, w, h, false, false);
         let mut best_total = cur_total;
         #[allow(clippy::type_complexity)]
         let mut best: Option<(usize, [[i32; 128]; 2], [[i32; 128]; 2])> = None;
@@ -2393,7 +2394,7 @@ impl<'a> LossyTile<'a> {
                     D157_PRED,
                 ];
                 let directional_top =
-                    self.rank_chroma_modes::<32>(candidates, px, py, cx, cy, cw, ch);
+                    self.rank_chroma_modes::<32>(candidates, px, py, cx, cy, cw, ch, false, false);
                 for &cand in candidates {
                     if cand != V_PRED
                         && cand != H_PRED
@@ -4530,7 +4531,24 @@ impl<'a> LossyTile<'a> {
         });
         self.push_luma_cf(&lcf[..]);
         let luma_zero = self.rd.all_zero_i32(&lcf[..]);
-        if self.ss420 {
+        if self.mono {
+            self.code_block16_mono(
+                x8,
+                y8,
+                &lcf,
+                &lpred_arr,
+                best_mode,
+                luma_zero,
+                txtp16,
+                s8_txtps,
+                s16_txtps,
+                best_delta,
+                best_filter_intra,
+                best_palette16.as_ref(),
+                have_tr,
+                have_bl,
+            );
+        } else if self.ss420 {
             self.code_block16_420(
                 x8,
                 y8,

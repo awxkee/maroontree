@@ -36,6 +36,7 @@ impl EncoderOverride {
                 });
             }
             "quality" => cfg.quality = self.number(1, 100, "1..100")?,
+            "alpha-quality" => cfg.alpha_quality = Some(self.number(1, 100, "1..100")?),
             "threads" => cfg.threads = self.threads()?,
             "speed" => {
                 cfg.speed = match self.value.as_str() {

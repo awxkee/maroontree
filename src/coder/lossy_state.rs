@@ -328,6 +328,7 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: false,
             mono: false,
+            mono_large: false,
             chroma_part_weight: chroma_part_rd_weight(false, false, src, bd),
             allow_intrabc: false,
             screen_content: true,
@@ -427,6 +428,7 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: false,
             mono: true,
+            mono_large: false,
             chroma_part_weight: 0.0,
             allow_intrabc: false,
             screen_content: true,
@@ -535,6 +537,7 @@ impl<'a> LossyTile<'a> {
             ss422: true,
             ss420: false,
             mono: false,
+            mono_large: false,
             chroma_part_weight: chroma_part_rd_weight(false, true, src, bd),
             allow_intrabc: false,
             screen_content: true,
@@ -643,6 +646,7 @@ impl<'a> LossyTile<'a> {
             ss422: false,
             ss420: true,
             mono: false,
+            mono_large: false,
             chroma_part_weight: chroma_part_rd_weight(true, false, src, bd),
             allow_intrabc: false,
             screen_content: true,
@@ -2632,6 +2636,9 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
         refine: bool,
     ) -> f32 {
+        if self.mono {
+            return 0.0;
+        }
         let key = ((cx as u128) << 96)
             | ((cy as u128) << 64)
             | ((cw as u128) << 56)
@@ -2805,6 +2812,9 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
         refine: bool,
     ) -> f32 {
+        if self.mono {
+            return 0.0;
+        }
         let sub_x = (self.ss420 || self.ss422) as usize;
         let sub_y = self.ss420 as usize;
         let blocks: &[(usize, usize, usize, usize)] = match part {
@@ -3112,8 +3122,8 @@ impl<'a> LossyTile<'a> {
     /// The cost is what a parent SPLIT leg should charge for this child — the
     /// child's BEST achievable total, not its forced-NONE cost.
     fn rd_choice_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32) {
-        if self.mono {
-            return (Part16::Split, f32::INFINITY); // monochrome codes 8x8 luma blocks only
+        if self.mono && !self.mono_large {
+            return (Part16::Split, f32::INFINITY); // grey 4:0:0 codes 8x8 luma leaves
         }
         // Edge flags are part of the identity: the same block reached with
         // different intra-edge availability prices differently.
@@ -3509,7 +3519,7 @@ impl<'a> LossyTile<'a> {
         };
         // IntraBC candidate: whole-16 exact-copy (all planes priced inside
         // rd_cost_intrabc, so no chroma_cost leg is added here).
-        let rd_ibc = if self.allow_intrabc {
+        let rd_ibc = if self.allow_intrabc && !self.mono {
             self.rd_cost_intrabc(px, py, 16, thr, prdo)
                 .unwrap_or(f32::INFINITY)
         } else {

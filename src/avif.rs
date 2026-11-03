@@ -276,7 +276,7 @@ pub struct EncodeConfig {
     pub adaptive_quant: bool,
     pub variance_boost: bool,
     pub dark_aq: bool,
-    /// Enable AV1 CDEF (ExtraSlow always enables it). AV2 stills always search
+    /// Enable AV1 CDEF (Slow and ExtraSlow always enable it). AV2 stills always search
     /// CDEF per superblock and ignore this flag.
     pub cdef: bool,
     /// Enable luma Wiener loop restoration (off by default)
@@ -304,6 +304,11 @@ pub struct EncodeConfig {
     /// plus a `tmap` derived item (see [`GainMap`]). Applies to every lossy
     /// and lossless entry point; the image being encoded is the base rendition.
     pub gain_map: Option<GainMap>,
+    /// Alpha-plane quality on the same 0..=100 scale as [`Self::quality`];
+    /// 100 codes the alpha plane losslessly. `None` follows `quality`, as
+    /// libavif does. Only the lossy `*_with_alpha` / `gray_alpha*` entry
+    /// points read it; the lossless entry points keep alpha lossless.
+    pub alpha_quality: Option<u8>,
 }
 
 impl Default for EncodeConfig {
@@ -329,6 +334,7 @@ impl Default for EncodeConfig {
             intrabc: true,
             qmatrix_level: None,
             gain_map: None,
+            alpha_quality: None,
         }
     }
 }
@@ -434,10 +440,71 @@ impl EncodeConfig {
         self
     }
 
-    /// CDEF as actually coded: on when requested, and always at
-    /// [`Speed::ExtraSlow`], whose extra effort is the per-unit CDEF RD search.
+    /// CDEF as actually coded: on when requested, and always at Slow and
+    /// ExtraSlow. The per-unit RD search costs Slow +5-11% time for
+    /// -0.2..-0.5% BD on photos and -1.3..-1.7% on synthetic/illustration
+    /// (s_abstract -5.6, s_mascot -3.9); no image worse than +0.13%.
     pub(crate) fn cdef_enabled(&self) -> bool {
-        self.cdef || self.speed == Speed::ExtraSlow
+        self.cdef || self.speed.at_least_slow()
+    }
+
+    /// Alpha-plane quality (0..=100, 100 = lossless). Defaults to the colour
+    /// quality.
+    pub fn with_alpha_quality(mut self, quality: u8) -> Self {
+        self.alpha_quality = Some(quality);
+        self
+    }
+
+    /// Encode an alpha plane as the auxiliary 4:0:0 image: lossless at alpha
+    /// quality 100, otherwise lossy with the alpha profile. Composited error is
+    /// linear in alpha error, so the profile trades the perceptual colour
+    /// tools for fidelity: no AQ, no palette (lossy palettes posterize
+    /// anti-aliased edges) and no IntraBC, plus 16x16/32x32 leaves for the
+    /// large flat regions masks are made of. On the 10-mask alpha corpus vs
+    /// the old 8x8-only lossy path vs libaom s6 alpha (tune=psnr): SS2 BD
+    /// -2.3% -> +2.5%, PSNR BD -17.4% -> -6.6% (positive = ours smaller).
+    pub(crate) fn encode_alpha_obu<T: crate::pixel::Pixel>(
+        &self,
+        alpha: &PlanarImage<T>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let quality = self.alpha_quality.unwrap_or(self.quality);
+        if quality >= 100 {
+            return encode_lossless_gray_obu_with_cdf(alpha, true, self.threads, self.updating_cdf);
+        }
+        let q = quality_to_q(quality);
+        let mut vb = crate::coder::VarianceBoost::off();
+        vb.qm = if self.quantization_matrices {
+            self.qmatrix_level
+                .map(crate::quant::QmLevels::uniform)
+                .unwrap_or_else(|| {
+                    // The subsampled-format law: what the alpha profile was
+                    // measured with, independent of the colour format.
+                    let c = crate::quant::qm_chroma_level_law(q, 2);
+                    crate::quant::QmLevels {
+                        y: crate::quant::qm_level_law(q, 2),
+                        u: c,
+                        v: c,
+                    }
+                })
+        } else {
+            crate::quant::QmLevels::FLAT
+        };
+        vb.mono_large = true;
+        encode_lossy_gray_obu(
+            alpha,
+            alpha.bit_depth,
+            q,
+            true,
+            self.threads,
+            self.speed,
+            false,
+            vb,
+            self.cdef_enabled(),
+            false,
+            self.updating_cdf,
+            false,
+            false,
+        )
     }
 
     /// Enable the in-loop CDEF filter
@@ -510,6 +577,9 @@ impl EncodeConfig {
 
     pub(crate) fn validate(&self) -> Result<(), EncodeError> {
         validate_quality(self.quality)?;
+        if let Some(q) = self.alpha_quality {
+            validate_quality(q)?;
+        }
         if self.qmatrix_level.is_some_and(|level| level > 15) {
             return Err(EncodeError::InvalidQuality);
         }
@@ -953,12 +1023,7 @@ pub fn encode_rgba8_with_alpha(
             cfg,
         );
     }
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1085,12 +1150,7 @@ pub fn encode_rgba10_with_alpha(
             cfg,
         );
     }
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1221,12 +1281,7 @@ pub fn encode_rgba12_with_alpha(
             cfg,
         );
     }
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1482,12 +1537,7 @@ pub fn encode_yuva8_with_alpha(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1528,12 +1578,7 @@ pub fn encode_yuva10_with_alpha(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1575,12 +1620,7 @@ pub fn encode_yuva12_with_alpha(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_4(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_4())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1620,12 +1660,7 @@ pub fn encode_gray_alpha8(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_2(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_2())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1665,12 +1700,7 @@ pub fn encode_gray_alpha10(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_2(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_2())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,
@@ -1710,12 +1740,7 @@ pub fn encode_gray_alpha12(
         cfg.screen_content,
         cfg.intrabc,
     )?;
-    let alpha_obu = encode_lossless_gray_obu_with_cdf(
-        &img.packed_alpha_2(),
-        true,
-        cfg.threads,
-        cfg.updating_cdf,
-    )?;
+    let alpha_obu = cfg.encode_alpha_obu(&img.packed_alpha_2())?;
     finalize_with_alpha(
         color_obu,
         alpha_obu,

@@ -1055,6 +1055,9 @@ pub(crate) struct VarianceBoost {
     /// the AQ protection side anchors to `base_q - base_shift`.
     pub base_shift: i32,
     pub qm: QmLevels,
+    /// 4:0:0 alpha profile: allow 16x16/32x32 luma leaves (bottom-up priced).
+    /// Plain grey images keep the 8x8 leaves, which measured better there.
+    pub mono_large: bool,
 }
 
 impl VarianceBoost {
@@ -1068,6 +1071,7 @@ impl VarianceBoost {
             dark: DarkAq::off(),
             base_shift: 0,
             qm: QmLevels::FLAT,
+            mono_large: false,
         }
     }
 
@@ -1080,6 +1084,7 @@ impl VarianceBoost {
             dark: DarkAq::on(),
             base_shift: 0,
             qm: QmLevels::FLAT,
+            mono_large: false,
         }
     }
 }
@@ -1305,6 +1310,8 @@ struct LossyTile<'a> {
     ss422: bool, // chroma horizontally subsampled (4:2:2)
     ss420: bool, // chroma horizontally + vertically subsampled (4:2:0)
     mono: bool,  // monochrome: code luma only (NumPlanes=1, no chroma syntax)
+    /// 4:0:0 with 16x16/32x32 leaves (see `VarianceBoost::mono_large`).
+    mono_large: bool,
     /// Frame-level U/V weight used by the shared-tree partition proxy.
     chroma_part_weight: f32,
     allow_intrabc: bool,
@@ -2011,6 +2018,7 @@ fn wavefront_capture(
         .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
+        t.mono_large = mono && vb.mono_large;
         t.frame_x0 = r.x0;
         t.frame_y0 = r.y0;
         t.frame_w = full_w;
@@ -2737,6 +2745,7 @@ fn encode_one_tile(
         .with_intrabc(allow_intrabc, ibc_index)
         .with_screen_content(screen_content)
         .with_updating_cdf(updating_cdf);
+        tile.mono_large = mono && vb.mono_large;
         tile.sb_mode = sb_mode;
         tile.rec = rec_in;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
@@ -6083,6 +6092,7 @@ mod aq_tests {
                         dark: DarkAq::on(),
                         base_shift: 0,
                         qm: QmLevels::FLAT,
+                        mono_large: false,
                     };
                     t.enable_aq(base_q, ref_act, &vb);
                     t

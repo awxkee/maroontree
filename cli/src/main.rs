@@ -90,6 +90,7 @@ struct Args {
     encoder: Encoder,
     quality: u8,
     lossless: bool,
+    alpha_quality: Option<u8>,
     chroma: Option<Chroma>,
     depth: Option<Depth>,
     threads: usize,

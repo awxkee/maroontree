@@ -870,6 +870,7 @@ mod tests {
                 encoder: crate::Encoder::JpegXl,
                 quality: 90,
                 lossless,
+                alpha_quality: None,
                 chroma: None,
                 depth: None,
                 threads: 1,

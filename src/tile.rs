@@ -4761,6 +4761,48 @@ mod tests {
     }
 
     #[test]
+    fn alpha_plane_lossy_profile_decodes_and_quality_100_is_lossless() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // A mask: flat 0/255 regions, an anti-aliased disc edge and a hard
+        // rectangle -- the shapes the 16x16/32x32 alpha leaves are for.
+        let (w, h) = (192usize, 128usize);
+        let mut mask = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as f32 - 80.0).powi(2) + (y as f32 - 64.0).powi(2)).sqrt();
+                let soft = ((40.0 - r) / 6.0 + 0.5).clamp(0.0, 1.0) * 255.0;
+                mask[y * w + x] = if x >= 152 && y < 40 {
+                    255
+                } else {
+                    soft.round() as u8
+                };
+            }
+        }
+        let img = PlanarImage {
+            width: w,
+            height: h,
+            bit_depth: BitDepth::Eight,
+            planes: [mask.clone(), vec![], vec![], vec![]],
+        };
+        let base = crate::EncodeConfig::new().with_quality(60).with_threads(1);
+        let lossy = base.clone().encode_alpha_obu(&img).unwrap();
+        let lossless = base.with_alpha_quality(100).encode_alpha_obu(&img).unwrap();
+        assert!(lossy.len() < lossless.len());
+        assert_eq!(decode_obu(&decoder, &lossless, "alpha-100"), mask);
+        let decoded = decode_obu(&decoder, &lossy, "alpha-60");
+        assert_eq!(decoded.len(), mask.len());
+        let mse = decoded
+            .iter()
+            .zip(&mask)
+            .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+            .sum::<f64>()
+            / mask.len() as f64;
+        assert!(mse < 4.0, "alpha MSE {mse}");
+    }
+
+    #[test]
     fn lossy_intrabc_odd_dv_420_chroma_matches_dav1d_bilinear() {
         let Some(decoder) = dav1d() else {
             return;
