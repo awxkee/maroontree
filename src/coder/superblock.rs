@@ -594,6 +594,9 @@ impl<'a> LossyTile<'a> {
     /// map (`blk4h`), so a non-square block stores its true width and height
     /// separately — no longer the conservative min().
     fn record_blk_rect(&mut self, x8: usize, y8: usize, w4: u8, h4: u8) {
+        // A rect emission changes recon, modes, skip and coefficient contexts
+        // exactly like a square one: invalidate epoch-keyed partition caches.
+        self.emit_epoch.set(self.emit_epoch.get() + 1);
         let nc4 = self.w / 4;
         let nr4 = self.h / 4;
         let bx4 = x8 * 2;

@@ -764,14 +764,14 @@ impl<'a> LossyTile<'a> {
                     let mut joint_best = f32::INFINITY;
                     for candidate in joint_beam.into_iter().flatten() {
                         let score = candidate.0
-                            + self.joint_uv_cost16(
+                            + self.proxy_wsse(self.joint_uv_cost16(
                                 &candidate.2,
                                 &candidate.4,
                                 candidate.1,
                                 px,
                                 py,
                                 prdo,
-                            );
+                            ));
                         if !joint_best.is_finite() || score < joint_best * crate::tuning::get().joint_large_gain {
                             joint_best = score;
                         }
@@ -890,7 +890,8 @@ impl<'a> LossyTile<'a> {
                 if coupled {
                     let mut joint_best = f32::INFINITY;
                     for (cost, mode, pred, cf) in joint_beam.into_iter().flatten() {
-                        let score = cost + self.joint_uv_cost32(&pred, &cf, mode, px, py, prdo);
+                        let score =
+                            cost + self.proxy_wsse(self.joint_uv_cost32(&pred, &cf, mode, px, py, prdo));
                         if !joint_best.is_finite() || score < joint_best * crate::tuning::get().joint_large_gain {
                             joint_best = score;
                         }
@@ -937,8 +938,11 @@ impl<'a> LossyTile<'a> {
         // selected partition receives the unchanged full mode/transform
         // refinement in its emitter; doing both here duplicated winner work.
         let dlam = trellis_lambda() * prdo;
+        // The mode / TX selection inside the leaf is a wSSE decision
+        // (`lambda_d`); only the returned leaf is priced on SATD with `mlam`.
+        let lam_d = self.lambda_d() * prdo;
         let (y_mode, _, pred, resid, cf, rpal) =
-            self.rect16_luma_mode_search(px, py, vert, dc, dlam, mlam, rect_dec_refine());
+            self.rect16_luma_mode_search(px, py, vert, dc, dlam, lam_d, rect_dec_refine());
         let (txtp, cf) = self.rect_leaf_tx_trial(
             &resid,
             &cf,
@@ -948,7 +952,7 @@ impl<'a> LossyTile<'a> {
             vert,
             y_mode,
             dlam,
-            mlam,
+            lam_d,
             rect_dec_refine(),
             rpal.is_some(),
             self.rect_split_allowed(),
@@ -1202,7 +1206,9 @@ impl<'a> LossyTile<'a> {
             && self.try_palette()
             && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h)
         {
-            for (palette, pred) in self.rank_luma_palette_candidates::<128>(&hist, px, py, w, h, mlam) {
+            for (palette, pred) in
+                self.rank_luma_palette_candidates::<128>(&hist, px, py, w, h, mlam * K_PART_LAMBDA)
+            {
                 // Exact bound: distortion and coefficient bits are >= 0, so a
                 // finalist whose signalling alone loses cannot win.
                 let pal_bits = self.palette_rate_bits(px, py, &palette);
@@ -1302,7 +1308,7 @@ impl<'a> LossyTile<'a> {
                 mlam,
                 self.luma_rect_bits(&acf, scan, w, h, px, py, y_mode, txtp),
             );
-            if sse <= best_sse + (best_sse >> 5) && c < best.0 {
+            if sse <= best_sse + self.tx_guard(best_sse) && c < best.0 {
                 best = (c, txtp, acf);
                 best_sse = sse;
             }
@@ -2142,13 +2148,23 @@ impl<'a> LossyTile<'a> {
         let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
         self.code_skip_and_sb_tokens(block_skip, sctx);
         self.record_blk_rect4(bx4, by4, (lw / 4) as u8, (lh / 4).max(1) as u8);
-        // skip8 is 8px-granular (CDEF only); the second strip of each 8px band
-        // overwrites the first — acceptable while CDEF search reads it only as
-        // a hint.
-        if vert {
-            self.mark_skip8_rect(px / 8, py / 8, 1, 2, block_skip);
+        // skip8 is 8px-granular and is NOT a hint: it decides which 8x8s CDEF
+        // filters and which 64x64 units count as signaled. Two strips share
+        // each 8px band, and the decoder skips CDEF on an 8x8 only when ALL its
+        // 4x4s are skip, so the odd (closing) strip ANDs into the even strip's
+        // mark instead of overwriting it (a coded strip followed by a skipped
+        // one used to suppress CDEF that the decoder applies — external review
+        // round 3; same bug class as block32's 8x4 pairs).
+        let band_skip = if idx % 2 == 1 {
+            let sb8w = self.w.div_ceil(8);
+            block_skip && self.skip8.get((py / 8) * sb8w + px / 8).copied().unwrap_or(true)
         } else {
-            self.mark_skip8_rect(px / 8, py / 8, 2, 1, block_skip);
+            block_skip
+        };
+        if vert {
+            self.mark_skip8_rect(px / 8, py / 8, 1, 2, band_skip);
+        } else {
+            self.mark_skip8_rect(px / 8, py / 8, 2, 1, band_skip);
         }
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
@@ -3261,7 +3277,7 @@ impl<'a> LossyTile<'a> {
                 // highest bit count that could still win (byte-identical —
                 // see real_block_bits_bounded).
                 let gate = if txtp >= 4 {
-                    asse <= dct_sse + (dct_sse >> 5)
+                    asse <= dct_sse + self.tx_guard(dct_sse)
                 } else {
                     asse <= best.2
                 };
@@ -3514,7 +3530,7 @@ impl<'a> LossyTile<'a> {
                             bits_bound,
                         )
                     };
-                    if asse <= dct_sse + (dct_sse >> 5)
+                    if asse <= dct_sse + self.tx_guard(dct_sse)
                         && rd_cost_i64(asse, rd_lam, abits) < rd_cost_i64(best.2, rd_lam, best.3)
                     {
                         best = (acf, arr, asse, abits, txtp);
@@ -3817,7 +3833,7 @@ impl<'a> LossyTile<'a> {
             && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, 16, 16)
         {
             for (palette, pred) in
-                self.rank_luma_palette_candidates::<256>(&hist, px, py, 16, 16, mlam)
+                self.rank_luma_palette_candidates::<256>(&hist, px, py, 16, 16, mlam * K_PART_LAMBDA)
             {
                 let mut resid = self.sbuf_i256();
                 self.rd.residual_pred(
@@ -4172,6 +4188,12 @@ impl<'a> LossyTile<'a> {
                 self.quant.qm_level(),
                 self.quant.qidx() as i32,
             );
+            // Re-price the DCT baseline after RDOQ: the ADST/IDTX legs below
+            // compare trellised costs against it (external review round 3).
+            let rr = self.idct.idct_dequant_16x16(&lcf, &self.quant);
+            best_dct_sse =
+                sse_recon::<256, 16>(&self.rd, &lpred_arr, &rr, self.src_blk(0, px, py, 16, 16), self.bd);
+            best_dct_bits = self.luma_bits(&lcf[..], &SCAN_16X16, 16, px, py, best_mode, 1);
         }
         // Winner-only ADST_ADST refinement. Full and Medium try it; only Fast
         // prunes the transform-type search to DCT_DCT (libaom-style). Palette
@@ -4227,7 +4249,7 @@ impl<'a> LossyTile<'a> {
             );
             let candidate_rd = rd_cost_i64(asse, mlam, abits);
             if rl.is_some()
-                || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
+                || (asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd)
             {
                 *lcf = acf;
                 txtp16 = 1;
@@ -4310,7 +4332,7 @@ impl<'a> LossyTile<'a> {
                 let base_rd = rd_cost_i64(best_txtp16_sse, mlam, best_txtp16_bits);
                 let candidate_rd = rd_cost_i64(asse, mlam, abits);
                 if rl.is_some()
-                    || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
+                    || (asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd)
                 {
                     *lcf = acf;
                     txtp16 = if inv_dctadst { 3 } else { 2 };
@@ -4378,7 +4400,7 @@ impl<'a> LossyTile<'a> {
             };
             let base_rd = rd_cost_i64(cur_sse, mlam, cur_bits);
             let candidate_rd = rd_cost_i64(isse, mlam, ibits);
-            if isse <= cur_sse + (cur_sse >> 5) && candidate_rd < base_rd {
+            if isse <= cur_sse + self.tx_guard(cur_sse) && candidate_rd < base_rd {
                 *lcf = icf;
                 txtp16 = 5;
             }
@@ -4416,13 +4438,14 @@ impl<'a> LossyTile<'a> {
                     _ => 1, // DCT_DCT
                 },
             );
-            let (cf4, _rec, sse_s, bits_s, split_txtps) =
+            let (cf4, _rec, mut sse_s, mut bits_s, split_txtps) =
                 self.split16_luma_try(px, py, best_mode, best_delta, have_tr, have_bl, lam, mlam);
             let d0_bits = self.tx_depth_bits(px, py, 16, 16, 0);
             let d1_bits = self.tx_depth_bits(px, py, 16, 16, 1);
             let base_rd = rd_cost_i64(none_sse, mlam, none_bits + d0_bits);
             let candidate_rd = rd_cost_i64(sse_s, mlam, bits_s + d1_bits);
-            let guarded_take = if self.banding_risk(px, py, 16) {
+            let banding = self.banding_risk(px, py, 16);
+            let guarded_take = if banding {
                 sse_s <= none_sse + (none_sse >> 2)
             } else {
                 candidate_rd < base_rd
@@ -4431,6 +4454,40 @@ impl<'a> LossyTile<'a> {
                 txtp16 = 4;
                 s8_txtps = split_txtps;
                 *lcf = cf4;
+            }
+            // DC re-decision under the split. The mode above was chosen by its
+            // whole-TX_16X16 cost, but the block may be coded as four TX_8X8,
+            // each re-predicted from its own neighbours — which helps DC (a
+            // per-8x8 DC) far more than a directional mode. Medium cannot fall
+            // back to 8x8 partitions (`min_size_16`), so on grainy full-res
+            // content diagonals won at TX_16X16 and were then split anyway:
+            // digital_art_portrait 444 q80 Medium coded +9.6% bytes at -0.25
+            // SS2 vs Fast. Compared with mode syntax on both sides.
+            if !banding
+                && self.speed.split16_dc_redecide()
+                && (best_mode, best_delta) != (DC_PRED, 0)
+            {
+                let cur_syn = self.luma_intra_syntax_bits(px, py, 16, 16, best_mode, best_delta);
+                let cur_rd = if txtp16 == 4 {
+                    rd_cost_i64(sse_s, mlam, bits_s + d1_bits + cur_syn)
+                } else {
+                    rd_cost_i64(none_sse, mlam, none_bits + d0_bits + cur_syn)
+                };
+                let (dcf, _drec, dsse, dbits, dtxtps) =
+                    self.split16_luma_try(px, py, DC_PRED, 0, have_tr, have_bl, lam, mlam);
+                let dc_syn = self.luma_intra_syntax_bits(px, py, 16, 16, DC_PRED, 0);
+                if rd_cost_i64(dsse, mlam, dbits + d1_bits + dc_syn) < cur_rd {
+                    best_mode = DC_PRED;
+                    best_delta = 0;
+                    txtp16 = 4;
+                    s8_txtps = dtxtps;
+                    *lcf = dcf;
+                    (sse_s, bits_s) = (dsse, dbits);
+                    let d = self
+                        .intrapred
+                        .dc_pred_16x16(&self.recon[0], self.w, px, py, self.bd as i32);
+                    *lpred_arr = [d; 256];
+                }
             }
             // Depth-2 candidate: sixteen TX_4X4. Competes against the current
             // winner (whole or depth-1) on plain RD; ~2.5 bit allowance for

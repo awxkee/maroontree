@@ -568,7 +568,11 @@ impl<'a> LossyTile<'a> {
         extra_dy: f64,
     ) -> f64 {
         let child = crate::tuning::get().trial_child_prdo;
+        // The axis scale `lam` is the node's `lambda_part`; the per-plane
+        // divisors are the wSSE lambdas (`lambda_d`, `emit_mlam_c`) so the
+        // distortion terms are in bits.
         let lam = (self.mlam() * self.perceptual_rd_scale(px, py, dim)) as f64;
+        let ly_node = (self.lambda_d() * self.perceptual_rd_scale(px, py, dim)) as f64;
         let lam_c = self.emit_mlam_c(px, py, dim) as f64;
         let half = dim / 2;
         let mut j = 0f64;
@@ -576,11 +580,11 @@ impl<'a> LossyTile<'a> {
             let (ly, lc) = if child {
                 let (qx, qy) = (px + (qi & 1) * half, py + (qi >> 1) * half);
                 (
-                    (self.mlam() * self.perceptual_rd_scale(qx, qy, half)) as f64,
+                    (self.lambda_d() * self.perceptual_rd_scale(qx, qy, half)) as f64,
                     self.emit_mlam_c(qx, qy, half) as f64,
                 )
             } else {
-                (lam, lam_c)
+                (ly_node, lam_c)
             };
             j += lam * (dy_w * dy as f64 / ly + if self.mono { 0.0 } else { dc as f64 / lc });
         }
@@ -659,7 +663,15 @@ impl<'a> LossyTile<'a> {
             tokens.push(self.enc.take_semantic());
             stats.push(skip_stats_sub(&self.cdfs.skip_stats, &stats0));
             dists.push(self.trial_distortion(px, py, dim));
-            pens.push(if struct_k > 0.0 { struct_k * self.trial_struct_penalty(px, py, dim) } else { 0.0 });
+            // Unification V5: the penalty is a plain-SSE quantity added to the
+            // trial axis, whose unit is `K_PART_LAMBDA` x wSSE
+            // (`trial_struct_wsse` lifts it there).
+            let unit = if crate::tuning::get().trial_struct_wsse {
+                f64::from(K_PART_LAMBDA)
+            } else {
+                1.0
+            };
+            pens.push(if struct_k > 0.0 { struct_k * unit * self.trial_struct_penalty(px, py, dim) } else { 0.0 });
             // The last leg's state is live; earlier legs need a snapshot to
             // be restorable if they win.
             snaps.push((i + 1 < legs.len()).then(|| self.trial_snapshot(x8, y8, sz8)));

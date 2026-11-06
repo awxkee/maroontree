@@ -48,6 +48,31 @@ pub(crate) fn luma_satd_scale(base_q_idx: u8, subsampled: bool) -> f32 {
     }
 }
 
+/// `K_satd(q, format)`: the SATD partition price (`luma_partition_distortion`)
+/// per unit of normalized weighted SSE of the same reconstruction, measured by
+/// the `MT_UNITS` probe (2026-11-06, kodak05 / x_screen / x_volcanic, medians
+/// at qindex 28 / 81 / 140; see docs/units-probe-phase0-summary.txt),
+/// interpolated linearly in qindex and clamped outside. The 4:4:4 fine-q
+/// value carries the `satd_top` ramp.
+pub(crate) fn k_satd(base_q_idx: u8, subsampled: bool) -> f32 {
+    const QI: [f32; 3] = [28.0, 81.0, 140.0];
+    let k: [f32; 3] = if subsampled {
+        [24.5, 21.3, 18.2]
+    } else {
+        [35.0, 21.2, 18.1]
+    };
+    let qi = base_q_idx as f32;
+    if qi <= QI[0] {
+        k[0]
+    } else if qi >= QI[2] {
+        k[2]
+    } else if qi <= QI[1] {
+        k[0] + (k[1] - k[0]) * (qi - QI[0]) / (QI[1] - QI[0])
+    } else {
+        k[1] + (k[2] - k[1]) * (qi - QI[1]) / (QI[2] - QI[1])
+    }
+}
+
 #[inline(always)]
 fn had4(a: i32, b: i32, c: i32, d: i32) -> [i32; 4] {
     let (e, f, g, h) = (a + c, a - c, b + d, b - d);

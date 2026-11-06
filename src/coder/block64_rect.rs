@@ -816,7 +816,7 @@ impl<'a> LossyTile<'a> {
                         &rr[..n],
                     );
                     chroma += crate::partition_rd::rd_cost(
-                        sse,
+                        self.proxy_chroma_wsse(sse),
                         mlam_c,
                         self.chroma_rect_bits(&q[..n], scan, c.tw, c.th, plane, x, y),
                     );
@@ -857,7 +857,6 @@ impl<'a> LossyTile<'a> {
         let subs = Self::rect64_subs(vert);
 
         // Deblock footprint: one prediction block, two TX_32X32 transforms.
-        self.emit_epoch.set(self.emit_epoch.get() + 1);
         self.record_blk_rect(x8, y8, (lw / 4) as u8, (lh / 4) as u8);
         for (sx, sy) in subs {
             self.record_tx_blk((px + sx) / 8, (py + sy) / 8, 8);
@@ -935,7 +934,7 @@ impl<'a> LossyTile<'a> {
         };
         if ru.is_none() {
             let cftype = self.chroma_filter_type(px, py);
-            let mlam_c = self.mlam_c() * prdo;
+            let mlam_c = self.lambda_d_c() * prdo;
             self.uv64_pass(c.cx, c.cy, c.grid, c.tw, c.th, uv_mode, cftype, lam, mlam_c, &mut uv);
         }
         let chroma_zero = uv.iter().all(|q| self.rd.all_zero_i32(&q[..ng * n]));

@@ -154,6 +154,17 @@ impl Speed {
         }
     }
 
+    /// Whether a 16x16 luma leaf re-tries DC_PRED under the TX_8X8 split
+    /// (`code_block16`). Medium only: SS2 BD (q50-90; 5 corpus photos/illus +
+    /// 2 crops of digital_art_portrait) 420 -3.0 / 422 -3.7 / 444 -3.5
+    /// (corpus alone -0.5..-0.9, portrait crops -7..-13) for +2% (420) /
+    /// +10% (444) time. Slow is unaffected (its 8x8 partitions already cover
+    /// the case); Fast 444 measured -2.7 for +13% time, left off for speed.
+    /// Trying SMOOTH/PAETH as well adds only ~-0.4 more for 2-4x the cost.
+    pub(crate) fn split16_dc_redecide(self) -> bool {
+        matches!(self, Speed::Medium)
+    }
+
     /// Whether the intra candidate set is reduced. Only [`Speed::Fast`] does.
     pub(crate) fn reduced_modes(self) -> bool {
         matches!(self, Speed::Fast)
@@ -441,14 +452,12 @@ impl EncodeConfig {
     }
 
     /// CDEF as actually coded: on when requested, and always at Slow and
-    /// ExtraSlow. The per-unit RD search costs Slow +5-11% time for
-    /// -0.2..-0.5% BD on photos and -1.3..-1.7% on synthetic/illustration
-    /// (s_abstract -5.6, s_mascot -3.9); no image worse than +0.13%.
+    /// ExtraSlow.
     pub(crate) fn cdef_enabled(&self) -> bool {
         self.cdef || self.speed.at_least_slow()
     }
 
-    /// Alpha-plane quality (0..=100, 100 = lossless). Defaults to the colour
+    /// Alpha-plane quality (0..=100, 100 = lossless). Defaults to the color
     /// quality.
     pub fn with_alpha_quality(mut self, quality: u8) -> Self {
         self.alpha_quality = Some(quality);
@@ -457,12 +466,8 @@ impl EncodeConfig {
 
     /// Encode an alpha plane as the auxiliary 4:0:0 image: lossless at alpha
     /// quality 100, otherwise lossy with the alpha profile. Composited error is
-    /// linear in alpha error, so the profile trades the perceptual colour
-    /// tools for fidelity: no AQ, no palette (lossy palettes posterize
-    /// anti-aliased edges) and no IntraBC, plus 16x16/32x32 leaves for the
-    /// large flat regions masks are made of. On the 10-mask alpha corpus vs
-    /// the old 8x8-only lossy path vs libaom s6 alpha (tune=psnr): SS2 BD
-    /// -2.3% -> +2.5%, PSNR BD -17.4% -> -6.6% (positive = ours smaller).
+    /// linear in alpha error, so the profile trades the perceptual color
+    /// tools for fidelity.
     pub(crate) fn encode_alpha_obu<T: crate::pixel::Pixel>(
         &self,
         alpha: &PlanarImage<T>,
@@ -478,7 +483,7 @@ impl EncodeConfig {
                 .map(crate::quant::QmLevels::uniform)
                 .unwrap_or_else(|| {
                     // The subsampled-format law: what the alpha profile was
-                    // measured with, independent of the colour format.
+                    // measured with, independent of the color format.
                     let c = crate::quant::qm_chroma_level_law(q, 2);
                     crate::quant::QmLevels {
                         y: crate::quant::qm_level_law(q, 2),
@@ -633,14 +638,7 @@ pub(crate) fn checked_buffer_size<T>(w: usize, h: usize, ch: usize) -> Result<us
 
 /// Map quality 1..=100 → AV1 base_q_idx 1..=255.
 /// quality 100 → q = 1 (near-lossless), quality 1 → q = 255.
-/// Quality -> AV1 `base_q_idx`, recalibrated 2026-07-25 to LIBAVIF PARITY:
-/// each label targets the same output size as `avifenc -q <label>` (fit on a
-/// 4-image photo corpus at 4:2:0, per-image spread ~+-5 qindex; the old
-/// linear map ran 25-40 qindex COARSER than aom at every label, which is why
-/// same-label ladders showed us "20 SS2 points behind" while matched-rate
-/// comparisons were at parity). Labels are now comparable across encoders;
-/// BD curves are unaffected (pure re-labeling of the same RD curve).
-/// q100 stays near-lossless (qindex 1) by design; parity resumes at q98.
+/// Quality -> AV1 `base_q_idx`.
 pub(crate) fn quality_to_q(quality: u8) -> u8 {
     const ANCHORS: [(u8, u8); 14] = [
         (1, 215),

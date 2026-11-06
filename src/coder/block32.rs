@@ -397,6 +397,13 @@ impl<'a> LossyTile<'a> {
         } else {
             f32::INFINITY
         };
+        #[cfg(feature = "tuning")]
+        if units_probe_on() {
+            eprintln!(
+                "MARGIN lvl=32 none={rd_none:.1} split={rd_split:.1} ibc={rd_ibc:.1} chroma_split={chroma_split:.1} lam_bits={:.1}",
+                rate_cost(self.mlam() * prdo, self.part_rate_bl(2, x8, y8, 3))
+            );
+        }
         if rd_ibc < rd_none.min(rd_split) {
             return (Part16::Intrabc, rd_ibc);
         }
@@ -866,7 +873,7 @@ impl<'a> LossyTile<'a> {
             && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, 32, 32)
         {
             for (palette, pred) in
-                self.rank_luma_palette_candidates::<1024>(&hist, px, py, 32, 32, mlam)
+                self.rank_luma_palette_candidates::<1024>(&hist, px, py, 32, 32, mlam * K_PART_LAMBDA)
             {
                 let mut resid = self.sbuf_i1024();
                 self.rd.residual_pred(
@@ -2196,7 +2203,7 @@ impl<'a> LossyTile<'a> {
                 let asse = sse_recon::<256, 16>(&self.rd, &pred, &arr, self.src_blk(0, bx, by, 16, 16), self.bd);
                 let gate_sse = if rdoq {
                     // +3% tolerance for the trellis'd 2-D family.
-                    asse <= dct_sse + (dct_sse >> 5)
+                    asse <= dct_sse + self.tx_guard(dct_sse)
                 } else {
                     // STRICT for IDTX.
                     asse <= best.1
@@ -2834,7 +2841,7 @@ impl<'a> LossyTile<'a> {
                     };
                     let asse = sse_recon::<64, 8>(&self.rd, &pred, &arr, self.src_blk(0, bx, by, 8, 8), self.bd);
                     let gate = if txtp >= 4 {
-                        asse <= dct_sse + (dct_sse >> 5)
+                        asse <= dct_sse + self.tx_guard(dct_sse)
                     } else {
                         asse <= best.2
                     };
@@ -3551,7 +3558,7 @@ impl<'a> LossyTile<'a> {
                             32,
                         );
                     }
-                    let raw_sse = sum_sq(&resids[0][..]) + sum_sq(&resids[1][..]);
+                    let raw_sse = self.uv_pal_gate_dist(&resids[0][..], &resids[1][..], 32, 32);
                     let gate_ref = win.as_ref().map_or(best_total, |w| w.0.min(best_total));
                     if self.uv_palette_gate(raw_sse, bits, mlam, gate_ref) {
                         continue;

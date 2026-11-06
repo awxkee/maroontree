@@ -1,0 +1,6 @@
+kodak05 420  P0 9.23G  P2 9.22G  -0.09%
+kodak05 444  P0 12.32G  P2 12.51G  +1.54%
+x_screen 420  P0 16.87G  P2 16.87G  -0.03%
+x_screen 444  P0 24.79G  P2 24.78G  -0.02%
+x_volcanic 420  P0 9.65G  P2 9.82G  +1.82%
+x_volcanic 444  P0 14.32G  P2 14.59G  +1.89%

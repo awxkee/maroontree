@@ -269,6 +269,14 @@ pub(crate) const MODE_LAMBDA0: f32 = 0.02;
 
 pub(crate) const MODE_AOM_CALIB: f32 = 0.009005174719460433;
 
+/// `lambda_part / lambda_d`: the SATD-domain partition proxy prices its bits
+/// 2.775x dearer than the normalized-wSSE decisions. This is the re-centring
+/// that shipped as `wsse_scale` 6 = 2.162 (unit normalization, now in
+/// `WSSE_WEIGHTS`) x 2.775 (this constant), made explicit by Phase 1 of the
+/// decision-metric unification plan; Phase 3 replaces it with the measured
+/// `K_satd(q, format)` bridge on the proxy's luma side.
+pub(crate) const K_PART_LAMBDA: f32 = 2.775;
+
 #[inline]
 pub(crate) fn mode_lambda_q(dc_q: f32) -> f32 {
     MODE_AOM_CALIB * lambda_scale() * dc_q * dc_q * def_kf_rd_multiplier(dc_q)

@@ -629,7 +629,13 @@ impl<'a> LossyTile<'a> {
                 self.cquant.ac_q() as f32,
                 trellis_lambda(),
             );
-            let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
+            // Unification V9: the chroma lambda for a chroma decision
+            // (`uv16_444_mlam_c`); the luma lambda is the pre-unification law.
+            let mlam = if crate::tuning::get().uv16_444_mlam_c {
+                self.emit_mlam_c(x8 * 8, y8 * 8, 16)
+            } else {
+                self.emit_mlam(x8 * 8, y8 * 8, 16)
+            };
             // Reconstructed R-D of the CURRENT chroma choice (DC or CfL), using the
             // coeffs/prediction already selected above.
             let mut cur_total = rate_cost(
@@ -886,7 +892,7 @@ impl<'a> LossyTile<'a> {
                             16,
                         );
                     }
-                    let raw_sse = sum_sq(&resids[0][..]) + sum_sq(&resids[1][..]);
+                    let raw_sse = self.uv_pal_gate_dist(&resids[0][..], &resids[1][..], 16, 16);
                     if self.uv_palette_gate(raw_sse, bits, mlam, best_total) {
                         continue;
                     }
@@ -2125,7 +2131,7 @@ impl<'a> LossyTile<'a> {
                         ),
                     };
                     let candidate_rd = rd_cost_i64(asse, mlam, abits);
-                    if asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd {
+                    if asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd {
                         lcf = acf;
                         tx4 = sel;
                         best_txtp_sse = asse;

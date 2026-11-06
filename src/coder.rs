@@ -1420,6 +1420,10 @@ struct LossyTile<'a> {
     /// (INFINITY when a leg was pruned or IntraBC won); read by the 32-node
     /// trial gate right after `choose_rect32`.
     proxy_margin32: std::cell::Cell<f32>,
+    /// Set while `rd_pick_luma64` runs under `Tuning::luma64_wsse`: its
+    /// `luma_partition_distortion` calls measure the decision wSSE (in proxy
+    /// units) instead of the SATD price.
+    luma64_pick_wsse: std::cell::Cell<bool>,
     /// Epoch-stamped memo for the decision-stage rect16 leaf proxy
     #[allow(clippy::type_complexity)]
     rect_leaf_cache: std::cell::RefCell<HashMap<(u64, u32), (u64, f32, f32)>>,
@@ -1521,6 +1525,42 @@ fn sse_recon<const N: usize, const D: usize>(
     debug_assert_eq!(N, D * D);
     debug_assert!(src.w() == D && src.h() == D);
     rd.sse_recon(pred, resid, src, bd)
+}
+
+/// The tile decision dispatch's weighted-SSE configuration (per-format
+/// `Tuning::wsse_*`, `wsse_scale`) for a frame-level filter decision.
+fn frame_decision_rd(rd: &crate::rd_sse::RdDispatch, sub_x: usize, sub_y: usize, mono: bool) -> crate::rd_sse::RdDispatch {
+    let t = crate::tuning::get();
+    let on = if mono {
+        t.wsse_400
+    } else if sub_x == 1 && sub_y == 1 {
+        t.wsse_420
+    } else if sub_x == 1 {
+        t.wsse_422
+    } else {
+        t.wsse_444
+    };
+    rd.with_weighted_sse(on.then_some(t.wsse_scale))
+}
+
+/// The frame-level `lambda_d` (normalized-wSSE units per bit): the tile
+/// `LossyTile::lambda_d` law without a perceptual anchor.
+fn frame_lambda_d(base_q_idx: u8, bd: u8, sub_x: usize, sub_y: usize) -> f32 {
+    let sub = if sub_x == 1 && sub_y == 1 {
+        2
+    } else if sub_x == 1 {
+        1
+    } else {
+        0
+    };
+    mode_lambda_q(dc_q(base_q_idx, bd) as f32) * mode_lambda_weight(base_q_idx, sub) / K_PART_LAMBDA
+}
+
+/// TX-type guard tolerance (`Tuning::tx_guard_shift` / `_444`): the wSSE a
+/// candidate may exceed the DCT's by and still be admitted on RD.
+#[inline]
+fn tx_guard_shift(d: i64, s: u32) -> i64 {
+    if s >= 63 { 0 } else { d >> s }
 }
 
 #[inline]
@@ -1657,7 +1697,8 @@ const SPLIT32_SSE_MARGIN: i64 = 64;
 
 #[inline]
 fn chroma_part_rd_weight(ss420: bool, ss422: bool, _src: &[Vec<u16>; 3], _bd: u8) -> f32 {
-    if ss420 || ss422 { 0.0625 } else { 0.03125 }
+    let t = crate::tuning::get();
+    if ss420 || ss422 { t.chroma_part_w_sub } else { t.chroma_part_w_444 }
 }
 
 pub(crate) fn align8(n: usize) -> usize {
@@ -3649,7 +3690,7 @@ pub(crate) fn encode_lossy_tilegroup(
             bd,
         };
         let (lvl_y, lvl_u, lvl_v) = if crate::tuning::get().lf_search && base_q_idx != 0 {
-            let l = frame_lf_search(&context.loopfilter, pool, &recon, src, &geom, lvl_y, lvl_uv);
+            let l = frame_lf_search(&context.loopfilter, pool, &rd, &recon, src, &geom, lvl_y, lvl_uv);
             lf_levels = Some(l);
             l
         } else {
@@ -3670,6 +3711,7 @@ pub(crate) fn encode_lossy_tilegroup(
     let cdef_decision = if !allow_intrabc && cdef_on && base_q_idx != 0 {
         frame_cdef(
             &context.cdef,
+            &frame_decision_rd(&rd, sub_x, sub_y, mono),
             &mut recon,
             src,
             &skip8,
@@ -3695,7 +3737,16 @@ pub(crate) fn encode_lossy_tilegroup(
     // Frame-level luma Wiener loop restoration (searched on the CDEF-filtered
     // recon, matching the decoder's filter order).
     let lr_unit = if !allow_intrabc && wiener_on && base_q_idx != 0 {
-        frame_wiener_search(&recon[0], &src[0], w8, h8, bd, pool)
+        frame_wiener_search(
+            &recon[0],
+            &src[0],
+            w8,
+            h8,
+            bd,
+            pool,
+            &frame_decision_rd(&rd, sub_x, sub_y, mono),
+            frame_lambda_d(base_q_idx, bd, sub_x, sub_y),
+        )
     } else {
         None
     };
@@ -3747,6 +3798,7 @@ fn cdef_damping(base_q_idx: u8) -> u8 {
     3 + ((base_q_idx as u32) / 64).min(3) as u8
 }
 
+#[allow(clippy::too_many_arguments)]
 fn frame_wiener_search(
     recon: &[u16],
     src: &[u16],
@@ -3754,9 +3806,30 @@ fn frame_wiener_search(
     h: usize,
     bd: u8,
     pool: &Pool,
+    rd: &crate::rd_sse::RdDispatch,
+    lambda_d: f32,
 ) -> Option<crate::wiener::WienerUnit> {
-    use crate::wiener::{WienerKernel, wiener_filter_plane_sse};
-    let base = plane_sse_vis(recon, src, w, w, h);
+    use crate::wiener::{WienerKernel, wiener_filter_plane_sse, wiener_filter_plane_wsse};
+    // Unification V7: the decision on normalized wSSE + lambda_d x the LR
+    // syntax (one `use_wiener` per 64x64 unit plus the first unit's taps;
+    // later units delta-code zero against the reference). Identity = 0 bits.
+    let wsse = crate::tuning::get().wiener_wsse;
+    let base = if wsse {
+        let mut err = vec![0i32; w * h];
+        for (e, (&r, &s)) in err.iter_mut().zip(recon.iter().zip(src.iter())) {
+            *e = i32::from(r) - i32::from(s);
+        }
+        rd.wsse_err(&err, w, h)
+    } else {
+        plane_sse_vis(recon, src, w, w, h)
+    };
+    let count_units = |frame: usize| -> usize { 1.max((frame + 32) / 64) };
+    let lr_bits = if wsse {
+        (count_units(w) * count_units(h)) as f32 + 6.0 * 5.0
+    } else {
+        0.0
+    };
+    let rate = (lambda_d * lr_bits).round() as i64;
     // Small candidate set of separable low-pass Wiener kernels (coded taps
     // [t0,t1,t2]); the identity is implicit via `base`. These span gentle to
     // moderate smoothing within the spec tap ranges.
@@ -3772,7 +3845,11 @@ fn frame_wiener_search(
         let (h_taps, v_taps) = cands[i];
         let hk = WienerKernel::from_coded(*h_taps);
         let vk = WienerKernel::from_coded(*v_taps);
-        wiener_filter_plane_sse(recon, src, w, h, &hk, &vk, bd)
+        if wsse {
+            wiener_filter_plane_wsse(recon, src, w, h, &hk, &vk, bd, rd) + rate
+        } else {
+            wiener_filter_plane_sse(recon, src, w, h, &hk, &vk, bd)
+        }
     });
     let mut best: Option<(i64, crate::wiener::WienerUnit)> = None;
     for (&(h_taps, v_taps), &s) in cands.iter().zip(sses.iter()) {
@@ -3802,6 +3879,7 @@ pub(crate) struct CdefFrameDecision {
 #[allow(clippy::too_many_arguments)]
 fn frame_cdef(
     dsp: &crate::cdef::CdefDispatch,
+    rd: &crate::rd_sse::RdDispatch,
     recon: &mut [Vec<u16>; 3],
     src: &[Vec<u16>; 3],
     skip8: &[bool],
@@ -3897,7 +3975,13 @@ fn frame_cdef(
     //   margin per mille distortion margin a unit must clear to filter
     let tun = crate::tuning::get();
     let gate_thresh = tun.cdef_gate as i64;
-    let perceptual = true;
+    // Unification V6: one metric (normalized wSSE, luma and chroma) and the
+    // frame `lambda_d`, or the legacy libaom `cdef_dist_8x8` + plain chroma.
+    let metric = if tun.cdef_wsse {
+        CdefMetric::Wsse
+    } else {
+        CdefMetric::CdefDist
+    };
     let margin = tun.cdef_margin as i64;
     let chroma_w = tun.cdef_chroma_w;
 
@@ -3932,8 +4016,8 @@ fn frame_cdef(
     // Every candidate strength pair is filtered in one pass over the frame;
     // the staged search below only reads these tables.
     let luma_all = cdef_luma_unit_dists_all(
-        dsp, &snap_y, &src[0], w8, h8, disp_w, disp_h, &ldirs, &lvars, &lskip, nbx, uc, damping,
-        bd, perceptual, pool,
+        dsp, rd, &snap_y, &src[0], w8, h8, disp_w, disp_h, &ldirs, &lvars, &lskip, nbx, uc,
+        damping, bd, metric, pool,
     );
     let luma_tab = |pri: i32, sec: i32| -> Vec<i64> {
         let c = cdef::cand_index(pri, sec);
@@ -4023,6 +4107,7 @@ fn frame_cdef(
         let plane_all = |pl: usize| {
             cdef_chroma_unit_sse_all(
                 dsp,
+                rd,
                 &snap_uv[pl],
                 &src[1 + pl],
                 cw8,
@@ -4038,6 +4123,7 @@ fn frame_cdef(
                 sub_y,
                 chroma_damping,
                 bd,
+                metric,
                 pool,
             )
         };
@@ -4189,7 +4275,11 @@ fn frame_cdef(
     // Rate deltas against the always-written noop CDEF header: each strength
     // entry past the first costs 12 header bits (6 mono), and every signaled
     // unit carries a raw `cdef_idx` literal of `cdef_bits` bits.
-    let lambda = mode_lambda_q(dc_q(base_q_idx, bd) as f32);
+    let lambda = if tun.cdef_lambda_d {
+        frame_lambda_d(base_q_idx, bd, sub_x, sub_y)
+    } else {
+        mode_lambda_q(dc_q(base_q_idx, bd) as f32)
+    };
     let total_off: i64 = d_off.iter().sum();
     let cost_off = total_off as f32;
     let per_entry_bits = if mono { 6.0f32 } else { 12.0f32 };
@@ -4351,8 +4441,22 @@ fn cdef_block_dist_vis(
 /// sec, ..)[u]` for candidate `c`. Unit rows are independent, so they run in
 /// parallel.
 #[allow(clippy::too_many_arguments)]
+/// Per-8x8 CDEF decision distortion (see `Tuning::cdef_wsse`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CdefMetric {
+    /// Plain SSE on every plane (tests).
+    #[cfg(test)]
+    Sse,
+    /// libaom variance-masked `cdef_dist_8x8` on luma, plain SSE on chroma.
+    CdefDist,
+    /// Normalized weighted SSE on every plane (partial edge blocks: plain SSE).
+    Wsse,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cdef_luma_unit_dists_all(
     dsp: &crate::cdef::CdefDispatch,
+    rd: &crate::rd_sse::RdDispatch,
     recon: &[u16],
     src: &[u16],
     w: usize,
@@ -4366,10 +4470,11 @@ fn cdef_luma_unit_dists_all(
     uc: usize,
     damping: i32,
     bd: u8,
-    perceptual: bool,
+    metric: CdefMetric,
     pool: &Pool,
 ) -> Vec<[i64; crate::cdef::N_CAND]> {
     let coeff_shift = (bd - 8) as u32;
+    let perceptual = metric == CdefMetric::CdefDist;
     let ur = h.div_ceil(64);
     let rows = pool.map_indexed(pool.width().min(ur), ur, |uy| {
         let mut out = vec![[0i64; crate::cdef::N_CAND]; uc];
@@ -4396,8 +4501,23 @@ fn cdef_luma_unit_dists_all(
                     bd,
                     &mut cand,
                 );
-                let full = perceptual && x + 8 <= disp_w && y + 8 <= disp_h;
+                let whole = x + 8 <= disp_w && y + 8 <= disp_h;
+                let full = perceptual && whole;
                 let (vw, vh) = ((disp_w - x).min(8), (disp_h - y).min(8));
+                let acc = &mut out[x / 64];
+                if metric == CdefMetric::Wsse && whole {
+                    let mut err = [0i32; 64];
+                    for (a, cb) in acc.iter_mut().zip(cand.iter()) {
+                        for i in 0..8 {
+                            let srow = &src[(y + i) * w + x..][..8];
+                            for (e, (&d, &sv)) in err[i * 8..i * 8 + 8].iter_mut().zip(cb[i * 8..i * 8 + 8].iter().zip(srow)) {
+                                *e = d - i32::from(sv);
+                            }
+                        }
+                        *a += rd.wsse_err(&err, 8, 8);
+                    }
+                    continue;
+                }
                 let (mut ss, mut ss2) = (0i64, 0i64);
                 if full {
                     for i in 0..8 {
@@ -4407,7 +4527,6 @@ fn cdef_luma_unit_dists_all(
                         }
                     }
                 }
-                let acc = &mut out[x / 64];
                 if full {
                     let mut sums = [[0i64; 3]; crate::cdef::N_CAND];
                     dsp.cand_sums(src, w, x, y, &cand, &mut sums);
@@ -4449,6 +4568,7 @@ fn cdef_luma_unit_dists_all(
 #[allow(clippy::too_many_arguments)]
 fn cdef_chroma_unit_sse_all(
     dsp: &crate::cdef::CdefDispatch,
+    rd: &crate::rd_sse::RdDispatch,
     recon: &[u16],
     src: &[u16],
     cw: usize,
@@ -4464,6 +4584,7 @@ fn cdef_chroma_unit_sse_all(
     sub_y: usize,
     damping: i32,
     bd: u8,
+    metric: CdefMetric,
     pool: &Pool,
 ) -> Vec<[i64; crate::cdef::N_CAND]> {
     let (cbw, cbh) = (8 >> sub_x, 8 >> sub_y);
@@ -4488,6 +4609,19 @@ fn cdef_chroma_unit_sse_all(
                 );
                 let (vw, vh) = ((cw_vis - cx).min(cbw), (ch_vis - cy).min(cbh));
                 let acc = &mut out[lbx / 8];
+                if metric == CdefMetric::Wsse && vw == cbw && vh == cbh {
+                    let mut err = [0i32; 64];
+                    for (a, cb) in acc.iter_mut().zip(cand.iter()) {
+                        for i in 0..cbh {
+                            let srow = &src[(cy + i) * cw + cx..][..cbw];
+                            for (e, (&d, &sv)) in err[i * cbw..i * cbw + cbw].iter_mut().zip(cb[i * cbw..i * cbw + cbw].iter().zip(srow)) {
+                                *e = d - i32::from(sv);
+                            }
+                        }
+                        *a += rd.wsse_err(&err, cbw, cbh);
+                    }
+                    continue;
+                }
                 for (a, cb) in acc.iter_mut().zip(cand.iter()) {
                     let mut s = 0i64;
                     for i in 0..vh {
@@ -5012,6 +5146,7 @@ fn frame_deblock(
 /// Luma deblock-search distortion over the visible window: plain SSE, or the
 /// libaom perceptual `cdef_dist_8x8` per full 8x8 block (partial edge blocks
 /// fall back to SSE).
+#[allow(clippy::too_many_arguments)]
 fn plane_dist_vis(
     dst: &[u16],
     src: &[u16],
@@ -5019,9 +5154,22 @@ fn plane_dist_vis(
     vis_w: usize,
     vis_h: usize,
     bd: u8,
-    perceptual: bool,
+    metric: u32,
+    rd: &crate::rd_sse::RdDispatch,
 ) -> i64 {
-    if !perceptual {
+    if metric == 2 {
+        // Unification V7: normalized wSSE over the visible window, zero-padded
+        // to whole 4x4 tiles at the right / bottom edge.
+        let (pw, ph) = (vis_w.next_multiple_of(4), vis_h.next_multiple_of(4));
+        let mut err = vec![0i32; pw * ph];
+        for y in 0..vis_h {
+            for x in 0..vis_w {
+                err[y * pw + x] = i32::from(dst[y * stride + x]) - i32::from(src[y * stride + x]);
+            }
+        }
+        return rd.wsse_err(&err, pw, ph);
+    }
+    if metric != 1 {
         return plane_sse_vis(dst, src, stride, vis_w, vis_h);
     }
     let rows = dst.len() / stride;
@@ -5112,9 +5260,11 @@ fn lf_bisect(mut try_level: impl FnMut(i32) -> i64, start: i32, bias_scale: f32)
 /// Frame-level deblock level search (libaom `LPF_PICK_FROM_FULL_IMAGE_NON_DUAL`,
 /// used by its allintra speeds <= 5): luma (one level for both directions),
 /// then U and V, each by SSE bisection on the stitched reconstruction.
+#[allow(clippy::too_many_arguments)]
 fn frame_lf_search(
     loopfilter: &crate::loopfilter::LoopFilterDispatch,
     pool: &Pool,
+    rd: &crate::rd_sse::RdDispatch,
     recon: &[Vec<u16>; 3],
     src: &[Vec<u16>; 3],
     g: &DeblockGeom<'_>,
@@ -5127,6 +5277,7 @@ fn frame_lf_search(
     } else {
         (law_y, law_uv)
     };
+    let rd = frame_decision_rd(rd, g.sub_x, g.sub_y, g.mono);
     let mut scratch = recon[0].clone();
     let lvl_y = lf_bisect(
         |lvl| {
@@ -5139,7 +5290,8 @@ fn frame_lf_search(
                 g.disp_w,
                 g.disp_h,
                 g.bd,
-                t.lf_search_metric == 1,
+                t.lf_search_metric,
+                &rd,
             )
         },
         start_y,
@@ -5157,7 +5309,11 @@ fn frame_lf_search(
             |lvl| {
                 scratch.copy_from_slice(plane);
                 deblock_chroma_plane(loopfilter, pool, &mut scratch, g, &cg, lvl);
-                plane_sse_vis(&scratch, &src[pl + 1], g.cw8, cg.vis_w, cg.vis_h)
+                if t.lf_search_metric == 2 {
+                    plane_dist_vis(&scratch, &src[pl + 1], g.cw8, cg.vis_w, cg.vis_h, g.bd, 2, &rd)
+                } else {
+                    plane_sse_vis(&scratch, &src[pl + 1], g.cw8, cg.vis_w, cg.vis_h)
+                }
             },
             start_uv,
             t.lf_search_bias,
@@ -5565,6 +5721,7 @@ mod aq_tests {
                 for perceptual in [false, true] {
                     let all = cdef_luma_unit_dists_all(
                         &crate::cdef::CdefDispatch::selected(),
+                        &crate::rd_sse::RdDispatch::selected(),
                         &recon,
                         &src,
                         w,
@@ -5578,7 +5735,7 @@ mod aq_tests {
                         uc,
                         damping,
                         bd,
-                        perceptual,
+                        if perceptual { CdefMetric::CdefDist } else { CdefMetric::Sse },
                         &pool,
                     );
                     for c in 0..cdef::N_CAND {
@@ -5608,6 +5765,7 @@ mod aq_tests {
                         .collect();
                     let all = cdef_chroma_unit_sse_all(
                         &crate::cdef::CdefDispatch::selected(),
+                        &crate::rd_sse::RdDispatch::selected(),
                         &crec,
                         &csrc,
                         cw,
@@ -5623,6 +5781,7 @@ mod aq_tests {
                         sub_y,
                         damping - 1,
                         bd,
+                        CdefMetric::Sse,
                         &pool,
                     );
                     for c in 0..cdef::N_CAND {

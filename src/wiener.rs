@@ -233,6 +233,56 @@ pub(crate) fn wiener_filter_plane_sse(
     sse
 }
 
+/// [`wiener_filter_plane_sse`] measured as the decision distortion of `rd`
+/// (normalized weighted SSE per 64-row stripe; `w`, `h` multiples of 4).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wiener_filter_plane_wsse(
+    src: &[u16],
+    reference: &[u16],
+    w: usize,
+    h: usize,
+    hk: &WienerKernel,
+    vk: &WienerKernel,
+    bd: u8,
+    rd: &crate::rd_sse::RdDispatch,
+) -> i64 {
+    let mut stripe = vec![0u16; w * h.min(64)];
+    let mut err = vec![0i32; w * h.min(64)];
+    let mut total = 0i64;
+    let mut ytop = 0usize;
+    while ytop < h {
+        let stripe_h = if ytop == 0 { 56 } else { 64 };
+        let ybot = (ytop + stripe_h).min(h);
+        let rh = ybot - ytop;
+        wiener_filter_rect(
+            &mut stripe,
+            ytop,
+            src,
+            w,
+            w,
+            h,
+            0,
+            ytop,
+            w,
+            rh,
+            ytop.saturating_sub(2),
+            (ybot + 2).min(h) - 1,
+            hk,
+            vk,
+            bd,
+        );
+        for (e, (&f, &r)) in err[..w * rh]
+            .iter_mut()
+            .zip(stripe[..w * rh].iter().zip(&reference[ytop * w..][..w * rh]))
+        {
+            *e = i32::from(f) - i32::from(r);
+        }
+        total += rd.wsse_err(&err, w, rh);
+        ytop = ybot;
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -227,6 +227,17 @@ const fn quad4_enabled(ss420: bool) -> bool {
     ss420
 }
 
+/// `MT_UNITS` (tuning builds, -t 1): print, at every partition-proxy site,
+/// the SATD price next to the normalized weighted SSE and the plain SSE of
+/// the same reconstruction (`UNITS` lines), and at every NONE-vs-SPLIT node
+/// the priced legs (`MARGIN` lines), for the decision-metric unification
+/// study.
+#[cfg(feature = "tuning")]
+pub(crate) fn units_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MT_UNITS").is_some())
+}
+
 impl<'a> LossyTile<'a> {
     pub(crate) fn adaptive_skip_price_enabled(&self) -> bool {
         self.speed.at_least_slow()
@@ -375,6 +386,7 @@ impl<'a> LossyTile<'a> {
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             proxy_margin32: std::cell::Cell::new(f32::INFINITY),
+            luma64_pick_wsse: std::cell::Cell::new(false),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -475,6 +487,7 @@ impl<'a> LossyTile<'a> {
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             proxy_margin32: std::cell::Cell::new(f32::INFINITY),
+            luma64_pick_wsse: std::cell::Cell::new(false),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -584,6 +597,7 @@ impl<'a> LossyTile<'a> {
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             proxy_margin32: std::cell::Cell::new(f32::INFINITY),
+            luma64_pick_wsse: std::cell::Cell::new(false),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -693,6 +707,7 @@ impl<'a> LossyTile<'a> {
             chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
             rd16_cache: std::cell::RefCell::new(HashMap::new()),
             proxy_margin32: std::cell::Cell::new(f32::INFINITY),
+            luma64_pick_wsse: std::cell::Cell::new(false),
             rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
             scratch: Default::default(),
             split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
@@ -1966,6 +1981,11 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    /// `lambda_part`: the mode lambda of the SATD-DOMAIN partition proxy
+    /// (every `luma_partition_distortion`-priced leg, the partition-symbol
+    /// fees, the plain-SSE palette and source-moment models). Equals
+    /// [`K_PART_LAMBDA`] x [`Self::lambda_d`]; see the decision-metric
+    /// unification plan (docs/decision-metric-unification-plan-2026-11-06.md).
     fn mlam(&self) -> f32 {
         mode_lambda_q(self.quant.dc_q() as f32) * self.tune_weight()
     }
@@ -1974,6 +1994,61 @@ impl<'a> LossyTile<'a> {
     #[inline]
     fn mlam_c(&self) -> f32 {
         mode_lambda_q(self.cquant.dc_q() as f32) * self.tune_weight()
+    }
+
+    /// `lambda_d`: THE decision lambda, in normalized-wSSE units per bit.
+    /// Every cost whose distortion comes from `rd.sse_recon / sse_u16 /
+    /// chroma_sse` (mode, TX, chroma, palette, IntraBC, trial legs) prices its
+    /// bits with this (through [`Self::emit_mlam`] / [`Self::emit_mlam_c`]
+    /// in the emitters). Phase 1 of the unification: the shipped
+    /// `wsse_scale` 6 = 2.162 (unit) x 2.775 (lambda cut); the unit moved into
+    /// `WSSE_WEIGHTS`, the cut lives here.
+    #[inline]
+    fn lambda_d(&self) -> f32 {
+        self.mlam() / K_PART_LAMBDA
+    }
+
+    /// Chroma-quantiser [`Self::lambda_d`].
+    #[inline]
+    fn lambda_d_c(&self) -> f32 {
+        self.mlam_c() / K_PART_LAMBDA
+    }
+
+    /// A normalized-wSSE distortion expressed in the SATD-domain proxy unit
+    /// (`lambda_part` = [`K_PART_LAMBDA`] x `lambda_d`): the chroma legs of the
+    /// partition proxies, the IntraBC legs and the rect64 estimator add wSSE
+    /// to SATD-priced luma and are priced with `mlam`, so their wSSE must be
+    /// scaled by the same factor. Phase 3 replaces this with the measured
+    /// `K_satd` bridge on the luma side.
+    #[inline]
+    fn proxy_wsse(&self, d: f32) -> f32 {
+        d * K_PART_LAMBDA
+    }
+
+    /// TX-type guard tolerance of this format (`Tuning::tx_guard_shift`).
+    #[inline]
+    fn tx_guard(&self, d: i64) -> i64 {
+        let t = crate::tuning::get();
+        let s = if self.ss420 || self.ss422 || self.mono {
+            t.tx_guard_shift
+        } else {
+            t.tx_guard_shift_444
+        };
+        tx_guard_shift(d, s)
+    }
+
+    /// The chroma leg of a partition proxy in proxy units
+    /// (`Tuning::proxy_chroma_factor`; 2.775 = [`Self::proxy_wsse`]).
+    #[inline]
+    fn proxy_chroma_wsse(&self, d: f32) -> f32 {
+        d * crate::tuning::get().proxy_chroma_factor
+    }
+
+    /// The [`Self::emit_mlam_c`] law on `lambda_part` instead of `lambda_d`:
+    /// for the chroma of a SATD-domain leg (IntraBC residual plan).
+    #[inline]
+    fn part_mlam_c(&self, px: usize, py: usize, dim: usize) -> f32 {
+        self.emit_mlam_c(px, py, dim) * K_PART_LAMBDA
     }
 
     fn chroma_partition_weight_at(&self, px: usize, py: usize, lw: usize, lh: usize) -> f32 {
@@ -2505,14 +2580,49 @@ impl<'a> LossyTile<'a> {
         dc: i32,
         residual: &[i32],
     ) -> f32 {
+        if self.luma64_pick_wsse.get() {
+            // Phase 3 (V3): the whole-64 emitter picks on the decision wSSE,
+            // expressed in proxy units so its `mlam` pricing is `lambda_d`.
+            let d = self.rd.chroma_sse(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
+            return self.proxy_wsse(d);
+        }
         let satd = self.rd.luma_satd(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
-        satd as f32
+        let subsampled = self.ss420 || self.ss422 || self.mono;
+        let mut price = satd as f32
             * qstep.max(1.0)
             * 0.25
-            * crate::partition_rd::luma_satd_scale(
+            * crate::partition_rd::luma_satd_scale(self.aq.base_q, subsampled);
+        let t = crate::tuning::get();
+        if t.proxy_luma_bridge {
+            // Phase 3: into the proxy unit (K_PART_LAMBDA x normalized wSSE)
+            // through the measured bridge, so the SATD leg shares the unit of
+            // the chroma / IntraBC / trial legs priced with `mlam`.
+            price *= K_PART_LAMBDA / crate::partition_rd::k_satd(self.aq.base_q, subsampled)
+                * t.proxy_luma_scale;
+        }
+        #[cfg(feature = "tuning")]
+        if units_probe_on() {
+            let (wsse_raw, sse) =
+                self.rd
+                    .probe_units(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
+            // `WSSE_WEIGHTS` is normalized (mean weight 1): `wsse_raw` is
+            // already the normalized unit.
+            let fmt = if self.mono {
+                400
+            } else if self.ss420 {
+                420
+            } else if self.ss422 {
+                422
+            } else {
+                444
+            };
+            eprintln!(
+                "UNITS fmt={fmt} qi={} {w}x{h} satd={satd} price={price:.1} wsse_n={:.1} sse={sse}",
                 self.aq.base_q,
-                self.ss420 || self.ss422 || self.mono,
-            )
+                wsse_raw
+            );
+        }
+        price
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2550,7 +2660,7 @@ impl<'a> LossyTile<'a> {
             let rr = inv(&cf, &self.cquant);
             let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &[], dc, &rr);
             dc_total += crate::partition_rd::rd_cost(
-                distortion,
+                self.proxy_chroma_wsse(distortion),
                 mlam,
                 self.chroma_rect_bits(&cf, scan, cw, ch, plane, cx, cy),
             );
@@ -2608,7 +2718,7 @@ impl<'a> LossyTile<'a> {
             let rr = inv(&cf, &self.cquant);
             let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &cpred, 0, &rr);
             cfl_body += crate::partition_rd::rd_cost(
-                distortion,
+                self.proxy_chroma_wsse(distortion),
                 mlam,
                 self.chroma_rect_bits(&cf, scan, cw, ch, plane, cx, cy),
             );
@@ -3593,6 +3703,25 @@ impl<'a> LossyTile<'a> {
         } else {
             split_bound_margin
         };
+        #[cfg(feature = "tuning")]
+        if units_probe_on() {
+            let (cn, cs) = if full_part_rdo {
+                (
+                    self.rd_cost_chroma_partition(px, py, 16, Part16::None, prdo, false),
+                    self.rd_cost_chroma_partition(px, py, 16, Part16::Split, prdo, false),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            eprintln!(
+                "MARGIN lvl=16 none={:.1} split={:.1} ibc={:.1} chroma_none={cn:.1} chroma_split={cs:.1} lam_bits={:.1} chosen={:?}",
+                cands[1].0,
+                cands[2].0,
+                cands[0].0,
+                split_signal,
+                chosen.1
+            );
+        }
         (chosen.1, chosen_cost, margin)
     }
 
@@ -4205,14 +4334,19 @@ impl<'a> LossyTile<'a> {
     /// -0.11 over the plain law (cumulative vs the luma lambda -0.38 / -0.47 /
     /// -0.41). 4:2:2 untested at 0.5 and kept at the plain law.
     #[inline]
+    /// Chroma `lambda_d` of the emitters (normalized-wSSE units per bit).
     fn emit_mlam_c(&self, px: usize, py: usize, dim: usize) -> f32 {
-        let scale = if self.ss420 { 0.5 } else { 1.0 };
-        self.mlam().min(self.mlam_c()) * scale * self.emit_scale(px, py, dim)
+        let scale = if self.ss420 {
+            crate::tuning::get().emit_mlam_c_420
+        } else {
+            1.0
+        };
+        self.lambda_d().min(self.lambda_d_c()) * scale * self.emit_scale(px, py, dim)
     }
 
-
+    /// Luma `lambda_d` of the emitters (normalized-wSSE units per bit).
     fn emit_mlam(&self, px: usize, py: usize, dim: usize) -> f32 {
-        self.mlam() * self.emit_scale(px, py, dim)
+        self.lambda_d() * self.emit_scale(px, py, dim)
     }
 
     fn emit_prdo(&self, px: usize, py: usize, dim: usize) -> f32 {

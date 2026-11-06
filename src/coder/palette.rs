@@ -1512,6 +1512,8 @@ impl<'a> LossyTile<'a> {
     /// 2..=8 x {Lloyd, top-frequency} -- cheapest first. Builds NO per-pixel
     /// map, so the partition proxy can afford the same shortlist the emitter
     /// uses instead of guessing at Lloyd 8/4/2.
+    /// `mlam` is `lambda_part`: the ranking distortion is a plain histogram
+    /// SSE, so wSSE-domain callers pass `lambda_d x K_PART_LAMBDA`.
     fn rank_palette_centers(
         &self,
         hist: &[(i32, u32)],
@@ -1812,7 +1814,27 @@ impl<'a> LossyTile<'a> {
         if rate_cost(mlam, hdr_bits) >= best_total {
             return true;
         }
-        rd_cost_i64(raw_sse, mlam, hdr_bits) > k * best_total
+        // V4 of the unification plan. `uv_pal_gate_wsse`: `raw_sse` is the
+        // normalized wSSE of the prediction error, one unit with `best_total`.
+        // Otherwise a plain SSE, and both sides are lifted to the proxy unit
+        // so the gate keeps its pre-unification operating point.
+        let k_unit = if crate::tuning::get().uv_pal_gate_wsse {
+            1.0
+        } else {
+            crate::cost::K_PART_LAMBDA
+        };
+        rd_cost_i64(raw_sse, mlam * k_unit, hdr_bits) > k * k_unit * best_total
+    }
+
+    /// Distortion of a UV palette candidate's prediction error for
+    /// [`Self::uv_palette_gate`]: plain SSE, or the decision wSSE
+    /// (`Tuning::uv_pal_gate_wsse`).
+    fn uv_pal_gate_dist(&self, resid_u: &[i32], resid_v: &[i32], w: usize, h: usize) -> i64 {
+        if crate::tuning::get().uv_pal_gate_wsse {
+            self.rd.wsse_err(resid_u, w, h) + self.rd.wsse_err(resid_v, w, h)
+        } else {
+            sum_sq(&resid_u[..w * h]) + sum_sq(&resid_v[..w * h])
+        }
     }
 
     /// Index-map smoothing tolerance in pixel units (`Tuning::palette_smooth`).
@@ -1825,7 +1847,8 @@ impl<'a> LossyTile<'a> {
     }
 
     /// Index-map construction options for this tile (see [`PalMapOpts`]).
-    /// The Viterbi lambda is `mlam()` (quantiser only, no perceptual anchor)
+    /// The Viterbi lambda is `mlam()` (`lambda_part`: the map DP measures
+    /// plain index-error, not wSSE; quantiser only, no perceptual anchor)
     /// so the map stays a function of (position, selector): the lambda-free
     /// palette memos and the wavefront replay both depend on that.
     fn palette_map_opts(&self) -> PalMapOpts {

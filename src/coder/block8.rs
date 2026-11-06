@@ -248,7 +248,7 @@ impl<'a> LossyTile<'a> {
                     _ => self.idct.iidentity_dequant_4x4(&acf, &self.quant),
                 };
                 let asse = sse_recon::<16, 4>(&self.rd, &pred, &arr, self.src_blk(0, bx, by, 4, 4), self.bd);
-                if asse > dct_sse + (dct_sse >> 5) {
+                if asse > dct_sse + self.tx_guard(dct_sse) {
                     continue;
                 }
                 let bits_bound = (rd_cost_i64(best.2, rd_lam, best.3) - asse as f32) / rd_lam;
@@ -306,7 +306,8 @@ impl<'a> LossyTile<'a> {
         recon_add_pred(&mut luma_rec, lpred, &lrr, (1 << self.bd) - 1);
         let (dcq, acq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
-        let mlam = self.mlam_c() * prdo;
+        // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
+        let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
 
         macro_rules! score_shape {
@@ -466,7 +467,8 @@ impl<'a> LossyTile<'a> {
         let mut luma_rec = self.sbuf_u256();
         recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.bd) - 1);
         let lam = trellis_lambda() * prdo;
-        let mlam = self.mlam_c() * prdo;
+        // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
+        let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
         if self.ss420 {
             let cy = py >> 1;
@@ -580,7 +582,8 @@ impl<'a> LossyTile<'a> {
         let mut luma_rec = self.sbuf_u1024();
         recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.bd) - 1);
         let lam = trellis_lambda() * prdo;
-        let mlam = self.mlam_c() * prdo;
+        // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
+        let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
         if self.ss420 {
             let cy = py >> 1;
@@ -697,6 +700,9 @@ impl<'a> LossyTile<'a> {
         // chosen prediction is per-pixel; reconstruction uses the same array so
         // the decoder (which re-derives the identical prediction) stays bit-exact.
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        // Chroma coefficients are quantized with `cquant`, so their trellis
+        // must reconstruct with the chroma steps too (external review round 3).
+        let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
         let mlam = self.emit_mlam(x8 * 8, y8 * 8, 8);
         // emit_prdo/emit_mlam already carry the perceptual scale
@@ -864,7 +870,7 @@ impl<'a> LossyTile<'a> {
                 && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, 8, 8)
             {
                 for (palette, pred) in
-                    self.rank_luma_palette_candidates::<64>(&hist, px, py, 8, 8, mlam)
+                    self.rank_luma_palette_candidates::<64>(&hist, px, py, 8, 8, mlam * K_PART_LAMBDA)
                 {
                     let mut resid = [0i32; 64];
                     self.rd
@@ -1201,6 +1207,14 @@ impl<'a> LossyTile<'a> {
                 self.quant.qm_level(),
                 self.quant.qidx() as i32,
             );
+            // The ADST/IDTX legs below compare their TRELLISED cost against the
+            // DCT baseline, so the baseline must be the post-RDOQ DCT too —
+            // the stale pre-trellis (sse, bits) let ADST win against a DCT
+            // representation that no longer exists (external review round 3).
+            let rr = self.idct.idct_dequant_8x8(&lcf, &self.quant);
+            best_dct_sse =
+                sse_recon::<64, 8>(&self.rd, &lpred_arr, &rr, self.src_blk(0, px, py, 8, 8), self.bd);
+            best_dct_bits = self.luma_bits(&lcf, &SCAN_8X8, 8, px, py, best_mode, 1);
         }
         let mut best_txtp_sse = best_dct_sse;
         let mut best_txtp_bits = best_dct_bits;
@@ -1247,7 +1261,7 @@ impl<'a> LossyTile<'a> {
             );
             let candidate_rd = rd_cost_i64(asse, mlam, abits);
             if rl.is_some()
-                || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
+                || (asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd)
             {
                 lcf = acf;
                 best_is_adst = true;
@@ -1314,7 +1328,7 @@ impl<'a> LossyTile<'a> {
                 );
                 let candidate_rd = rd_cost_i64(asse, mlam, abits);
                 if rl.is_some()
-                    || (asse <= best_dct_sse + (best_dct_sse >> 5) && candidate_rd < base_rd)
+                    || (asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd)
                 {
                     lcf = acf;
                     best_is_adst = false;
@@ -1342,7 +1356,7 @@ impl<'a> LossyTile<'a> {
             let base_rd = rd_cost_i64(best_txtp_sse, mlam, best_txtp_bits);
             let candidate_rd = rd_cost_i64(isse, mlam, ibits);
             if rl.is_some()
-                || (isse <= best_txtp_sse + (best_txtp_sse >> 5) && candidate_rd < base_rd)
+                || (isse <= best_txtp_sse + self.tx_guard(best_txtp_sse) && candidate_rd < base_rd)
             {
                 lcf = icf;
                 best_is_adst = false;
@@ -1496,7 +1510,7 @@ impl<'a> LossyTile<'a> {
                     .residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, 4, 4, pred);
                 let (q, qt) = self.dct.dct4x4_t(&resid, &self.cquant);
                 ccf44[ci] = q;
-                trellis_optimize(&mut ccf44[ci], &qt, dcq, acq, &SCAN_4X4, lam);
+                trellis_optimize(&mut ccf44[ci], &qt, cdcq, cacq, &SCAN_4X4, lam);
             } else if self.ss422 {
                 let pred =
                     self.intrapred
@@ -1510,8 +1524,8 @@ impl<'a> LossyTile<'a> {
                 self.chroma_rect_trellis(
                     &mut ccf48[ci],
                     &qt,
-                    dcq,
-                    acq,
+                    cdcq,
+                    cacq,
                     &SCAN_4X8,
                     lam,
                     4,
@@ -1533,8 +1547,8 @@ impl<'a> LossyTile<'a> {
                 self.chroma_rect_trellis(
                     &mut ccf8[ci],
                     &qt,
-                    dcq,
-                    acq,
+                    cdcq,
+                    cacq,
                     &SCAN_8X8,
                     lam,
                     8,
@@ -1624,7 +1638,7 @@ impl<'a> LossyTile<'a> {
                         self.rd.residual_pred_blk(&mut resid, &cpr, src);
                         let (mut q, qt) = self.dct.dct8x8_t(&resid, &self.cquant);
                         self.chroma_rect_trellis(
-                            &mut q, &qt, dcq, acq, &SCAN_8X8, lam, 8, 8, plane, px, py,
+                            &mut q, &qt, cdcq, cacq, &SCAN_8X8, lam, 8, 8, plane, px, py,
                         );
                         let rr = self.idct.idct_dequant_8x8(&q, &self.cquant);
                         let sse = sse_recon::<64, 8>(&self.rd, &cpr, &rr, src, self.bd);
@@ -1799,7 +1813,7 @@ impl<'a> LossyTile<'a> {
                             .residual_pred_blk(&mut resid, &pp, src_planes[ci]);
                         let (mut q, qt) = fwd_chroma_8x8(&self.dct, tx, &resid, &self.cquant);
                         self.chroma_rect_trellis(
-                            &mut q, &qt, dcq, acq, &SCAN_8X8, lam, 8, 8, plane, px, py,
+                            &mut q, &qt, cdcq, cacq, &SCAN_8X8, lam, 8, 8, plane, px, py,
                         );
                         let rr = inv_chroma_8x8(&self.idct, tx, &q, &self.cquant);
                         let sse = sse_recon::<64, 8>(&self.rd, &pp, &rr, src_planes[ci], self.bd);
@@ -1876,7 +1890,7 @@ impl<'a> LossyTile<'a> {
                                 8,
                             );
                         }
-                        let raw_sse = sum_sq(&resids[0]) + sum_sq(&resids[1]);
+                        let raw_sse = self.uv_pal_gate_dist(&resids[0], &resids[1], 8, 8);
                         if self.uv_palette_gate(raw_sse, bits, mlam, best_total) {
                             continue;
                         }

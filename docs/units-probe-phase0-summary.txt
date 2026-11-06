@@ -1,0 +1,16 @@
+K_satd = SATD price / normalized wSSE (median, p10, p90), price/SSE, wSSE_n/SSE, n
+ 420 q   0-48  qi=28: K= 24.51 [11.63.. 33.97]  price/SSE= 19.29  wn/SSE= 0.81  n=738133
+ 420 q   130+ qi=140: K= 18.16 [11.29.. 34.40]  price/SSE= 18.88  wn/SSE= 1.08  n=361943
+ 420 q 48-130  qi=81: K= 21.28 [12.48.. 32.49]  price/SSE= 17.71  wn/SSE= 0.87  n=497922
+ 444 q   0-48  qi=28: K= 34.99 [ 4.90.. 60.22]  price/SSE= 42.45  wn/SSE= 1.25  n=1059897
+ 444 q   130+ qi=140: K= 18.05 [ 9.77.. 37.23]  price/SSE= 20.32  wn/SSE= 1.21  n=487516
+ 444 q 48-130  qi=81: K= 21.23 [11.69.. 33.36]  price/SSE= 18.53  wn/SSE= 0.93  n=595844
+
+Decisiveness: relative NONE-vs-SPLIT margin
+lvl 16: median  9.55%  <1%:  7.4%  <3%: 19.5%  n=42753
+lvl 32: median 15.81%  <1%:  5.8%  <3%: 16.1%  n=12152
+lvl 64: median  3.74%  <1%:  3.9%  <3%: 30.5%  n=3834
+lvl 16: chroma leg share of NONE: median   0.4%  n=67459
+lvl 16: IBC / best(none,split): median  0.47  n=8163
+lvl 32: IBC / best(none,split): median  1.50  n=2415
+lvl 64: IBC / best(none,split): median  0.10  n=410

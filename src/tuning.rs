@@ -83,7 +83,9 @@ pub(crate) struct Tuning {
     /// `top_band()` qindex ceiling: which frames count as "top band" at all.
     pub(crate) top_band_q: u32,
     /// NONE-vs-SPLIT thumbs at 32 and 64 (the SATD proxy under-values the
-    /// detail a merged large block loses).
+    /// detail a merged large block loses). Re-fit jointly with the Phase 3
+    /// bridge (study `p3bridge`, 2026-11-06): 1.054 / 1.249; resetting them
+    /// to 1.0 under the bridge costs +1.2..+1.6.
     pub(crate) none32_split_bias: f32,
     pub(crate) none64_split_bias: f32,
     /// 4:2:0 top-band NONE bias, split at qindex 20.
@@ -109,7 +111,8 @@ pub(crate) struct Tuning {
     pub(crate) lf_search_bias: f32,
     /// 0 = search starts at the q-law levels, 1 = starts at 0 (aom intra).
     pub(crate) lf_search_start0: bool,
-    /// 0 = SSE, 1 = libaom perceptual `cdef_dist_8x8` on luma (chroma stays SSE).
+    /// 0 = SSE, 1 = libaom perceptual `cdef_dist_8x8` on luma (chroma stays SSE),
+    /// 2 = normalized wSSE on every plane (unification V7).
     pub(crate) lf_search_metric: u32,
     /// CDEF per-unit distortion margin (per mille) a unit must clear to filter.
     /// SHIPPED 40 (2026-10-08, re-fit after the chroma SSE wrap fix: synth 420
@@ -119,6 +122,76 @@ pub(crate) struct Tuning {
     pub(crate) cdef_gate: f32,
     /// Weight on the chroma SSE in the joint (luma perceptual + chroma) CDEF metric.
     pub(crate) cdef_chroma_w: f32,
+    /// Decision-metric unification Phase 2 (V6): CDEF per-unit distortion is
+    /// the normalized wSSE of luma AND chroma (one metric) instead of libaom
+    /// `cdef_dist_8x8` luma + plain chroma SSE. SHIPPED true (2026-11-06):
+    /// with `cdef_lambda_d` and the 40 per-mille margin kept, tuning32 -0.21 /
+    /// -0.18 / -0.22 (420 / 422 / 444), holdout -0.31 / -0.43 / -0.42, no
+    /// image worse than +0.06; margin 0 (pure RD) was +0.11 / +0.11 / -0.14
+    /// (x_volcanic +1.4) and stays out. +0.75% instr at Slow.
+    pub(crate) cdef_wsse: bool,
+    /// (V6) CDEF header / `cdef_idx` bits priced with the frame `lambda_d`
+    /// (SS2 weight, `mlam_scale`, / `K_PART_LAMBDA`) instead of the bare
+    /// `mode_lambda_q`. SHIPPED true (with `cdef_wsse`; alone it is inert to
+    /// 2 decimals).
+    pub(crate) cdef_lambda_d: bool,
+    /// (V7) Wiener search on normalized wSSE + `lambda_d` x signalling bits.
+    /// SHIPPED true for consistency; Wiener is off by default (`--wiener`),
+    /// so this is not measured on the corpora.
+    pub(crate) wiener_wsse: bool,
+    /// (V4) `uv_palette_gate` compares the normalized wSSE of the palette
+    /// prediction error with the wSSE best total, no unit lift. SHIPPED true
+    /// (444 tuning -0.00, holdout +0.01: a unit fix, BD-neutral).
+    pub(crate) uv_pal_gate_wsse: bool,
+    /// (V5) `trial_struct_penalty` lifted to the trial axis unit (x `K_PART_LAMBDA`).
+    pub(crate) trial_struct_wsse: bool,
+    /// (V9) 4:4:4 16x16 uv search prices on `emit_mlam_c`, not the luma lambda.
+    /// INERT by value: at 4:4:4 the chroma quantiser equals luma, so
+    /// `emit_mlam_c == emit_mlam` (32 / 32 images 0.00). Kept off.
+    pub(crate) uv16_444_mlam_c: bool,
+    /// (V8) TX-type guard tolerance at 4:2:0 / 4:2:2 / 4:0:0: a candidate's
+    /// wSSE may exceed the DCT's by `1 / 2^shift` and still win on RD. SHIPPED
+    /// 4 (1/16; 2026-11-06 re-sweep after the kernel normalization: tuning
+    /// 420 -0.04 / 422 -0.05, holdout -0.15 / -0.15; 1/64 and strict were
+    /// neutral or worse). 63 = strict.
+    pub(crate) tx_guard_shift: u32,
+    /// (V8) The same at 4:4:4: 1/16 measured tuning -0.01 but holdout +0.08
+    /// (h_abstract +0.61), so 4:4:4 keeps 1/32.
+    pub(crate) tx_guard_shift_444: u32,
+    /// Phase 3: the SATD partition price is bridged into the proxy unit
+    /// (`K_PART_LAMBDA` x normalized wSSE) through the measured
+    /// `partition_rd::k_satd(q, format)`: luma = SATD price x K_PART_LAMBDA /
+    /// K_satd x `proxy_luma_scale`, so luma, chroma, IntraBC and trial legs
+    /// share one unit and the proxy lambda equals the decision lambda.
+    pub(crate) proxy_luma_bridge: bool,
+    /// Phase 3: scale on the bridged luma price (1.0 = the unified law).
+    /// SHIPPED 7.13 (Optuna `p3bridge`, 2026-11-06, q30 + screen crops): the
+    /// unit-exact law (1.0) loses +1.9 / +1.6 on kodak05 + x_screen and every
+    /// good trial sits at 6.4-7.3, i.e. the proxy wants the old effective
+    /// SATD weight (K_satd / K_PART_LAMBDA) back; what the bridge buys is the
+    /// q-flat unit and the joint re-fit of the biases below: tuning32
+    /// -0.06 / -0.40 / -0.13, holdout -0.93 / -0.48 / -0.12, new444 -0.63 /
+    /// -0.82 / -0.12 (420 / 422 / 444), ExtraSlow -0.22 / -0.30 / -0.07.
+    pub(crate) proxy_luma_scale: f32,
+    /// Phase 3 (V1): multiplier on the normalized-wSSE chroma leg of the
+    /// partition proxies, in proxy units. 2.775 (= K_PART_LAMBDA) is the
+    /// Phase 1/2 state (what the x6 landed), 1.0 the pre-wSSE calibration,
+    /// 6.0 the raw-kernel x6.
+    pub(crate) proxy_chroma_factor: f32,
+    /// Phase 3 (V3): `rd_pick_luma64` picks mode / delta / TX on the decision
+    /// wSSE like every other emitter instead of on the SATD price. SHIPPED
+    /// true (420 tuning -0.02 / holdout -0.00; inert at 4:4:4).
+    pub(crate) luma64_wsse: bool,
+    /// Chroma weight of the partition proxies (`coder::chroma_part_rd_weight`)
+    /// at 4:2:0 / 4:2:2 and at 4:4:4. Were 1/16 and 1/32; re-fit with the
+    /// bridge (study `p3bridge`) to 0.082 / 0.054. Keeping the old weights with
+    /// the rest of the re-fit trims the worst images but loses the 4:4:4
+    /// holdout sign (+0.05) and new444 gain (0.00 vs -0.12).
+    pub(crate) chroma_part_w_sub: f32,
+    pub(crate) chroma_part_w_444: f32,
+    /// `emit_mlam_c` law: the 4:2:0 chroma decision lambda is
+    /// `min(lambda_d, lambda_d_c) x this` (0.5 shipped, see `emit_mlam_c`).
+    pub(crate) emit_mlam_c_420: f32,
     /// 4:2:0 chroma qindex delta held at qindex >= 136 (see `quant::uv420_mid_delta`).
     /// SHIPPED 28 = the mid-band -28 never decays.
     pub(crate) uv420_tail_delta: f32,
@@ -242,6 +315,8 @@ pub(crate) struct Tuning {
     /// shortlist of the five filter modes); 0 = FILTER_DC only.
     pub(crate) filter_intra_budget: u32,
     /// 4:2:0 8x8 leaf: CfL-vs-DC decided on the chroma lambda (emit_mlam_c).
+    /// SHIPPED true (unification V9, 2026-11-06): 420 tuning -0.03, holdout
+    /// -0.19 (h_springtree -0.73, worst kodak05 +0.22).
     pub(crate) uv8_cfl_mlam_c: bool,
     /// 4:2:0 8x8 leaf: zone-2 chroma angle deltas for the directional winner
     pub(crate) uv8_ad: bool,
@@ -251,13 +326,16 @@ pub(crate) struct Tuning {
     /// TX_32X32 (~45 B per non-skipped 32x32 on jake_cat vs aom's 0.9 B).
     pub(crate) tx32_depth2: bool,
     pub(crate) uv422_mid_scale: f32,
-    /// Source-domain SPLIT breakout ratio at Slow.
+    /// Source-domain SPLIT breakout ratio at Slow. 1.5 -> 2.77 in the Phase 3
+    /// re-fit (fewer breakouts; most of the Phase 3 +2% instr, x_volcanic 444
+    /// +7.6%).
     pub(crate) split_breakout_slow: f32,
     pub(crate) fixed_size_fast: u32,
     pub(crate) fixed_size_medium: u32,
     pub(crate) fixed_size_slow: u32,
 
     /// Partition-signaling entry fee, in bits, charged to every non-NONE candidate.
+    /// 24 -> 33.9 in the Phase 3 re-fit (importance 0.007: a weak knob).
     pub(crate) part_signal_bits: f32,
     /// How much of it the 4:2:0/4:2:2 seam ramp removes at full strength.
     pub(crate) part_signal_seam_drop: f32,
@@ -277,7 +355,9 @@ pub(crate) struct Tuning {
     pub(crate) joint_large_gain: f32,
     /// luma_satd_scale base: SATD-to-SSE bridge for partition pricing.
     pub(crate) satd_base: f32,
-    /// luma_satd_scale at the top quality band (4:4:4 only).
+    /// luma_satd_scale at the top quality band (4:4:4 only). 2.5 -> 2.92 in
+    /// the Phase 3 re-fit (the bridge divides the price by K_satd, which
+    /// carries the old ramp, so this ramp is re-fit on top of a flat unit).
     pub(crate) satd_top: f32,
     /// qindex at/below which satd_top applies.
     pub(crate) satd_knee_lo: f32,
@@ -431,6 +511,9 @@ pub(crate) struct Tuning {
     /// behind the `screen_frame` gate (2026-10-24): x_screen -1.94 / -0.45,
     /// n_bbscreen -1.10 / -3.40, every non-screen frame byte-identical;
     /// lam >= 2.0 over-merges and loses on every image.
+    /// 1.0 -> 0.35 (unification Phase 4, 2026-11-06, 2-point check + 0.25):
+    /// the only images that exercise it (444 screen frames) x_screen -2.47,
+    /// n_bbscreen -1.26; 0.5 -1.67 / 0.25 -1.81 on the pair; holdout flat.
     pub(crate) palette_viterbi_444: f32,
     pub(crate) palette_viterbi_420: f32,
     /// Also build the partition proxy's palette estimates (`rd_cost_square`
@@ -564,7 +647,9 @@ pub(crate) struct Tuning {
     pub(crate) wsse_422: bool,
     pub(crate) wsse_444: bool,
     pub(crate) wsse_400: bool,
-    /// Multiplier on the weighted distortion.
+    /// Multiplier on the (mean-1 normalized) weighted distortion. 1.0 = the
+    /// normalized unit; the historical 6.0 = 2.162 (unit) x 2.775
+    /// (`cost::K_PART_LAMBDA`, now an explicit lambda ratio).
     pub(crate) wsse_scale: f32,
 }
 
@@ -576,9 +661,9 @@ impl Tuning {
         rect16_horz_444: true,
         rect16_vert_444: true,
         rect16_420_medium: false,
-        none16_top_bias_420: 1.15,
+        none16_top_bias_420: 1.17077,
         none16_top_bias_422: 1.25,
-        none16_top_bias_444: 1.0441984,
+        none16_top_bias_444: 1.103276,
         quad4_bias: 1.1,
         part_budget_slow: 3,
         part_budget_qmin: 0,
@@ -596,8 +681,8 @@ impl Tuning {
         qm_hq_knee: 12.0,
         qm_hq_width: 5.0,
         top_band_q: 55,
-        none32_split_bias: 1.03,
-        none64_split_bias: 1.03,
+        none32_split_bias: 1.05446,
+        none64_split_bias: 1.248794,
         top_none_bias_420_hi: 1.45,
         top_none_bias_420_lo: 1.15,
         top_444_uac: 6.0,
@@ -615,6 +700,21 @@ impl Tuning {
         cdef_margin: 40.0,
         cdef_gate: 15000.0,
         cdef_chroma_w: 1.0,
+        cdef_wsse: true,
+        cdef_lambda_d: true,
+        wiener_wsse: true,
+        uv_pal_gate_wsse: true,
+        trial_struct_wsse: false,
+        uv16_444_mlam_c: false,
+        tx_guard_shift: 4,
+        tx_guard_shift_444: 5,
+        proxy_luma_bridge: true,
+        proxy_luma_scale: 7.130643,
+        proxy_chroma_factor: 2.775,
+        luma64_wsse: true,
+        chroma_part_w_sub: 0.08221585,
+        emit_mlam_c_420: 0.5,
+        chroma_part_w_444: 0.05426356,
         uv420_tail_delta: 28.0,
         uv420_mid_d: 28.0,
         mode_budget_slow_sub: 3,
@@ -652,15 +752,15 @@ impl Tuning {
         cfl_alpha_rd_steps: 0,
         cfl_alpha_rd_mode: 0,
         filter_intra_budget: 0,
-        uv8_cfl_mlam_c: false,
+        uv8_cfl_mlam_c: true,
         uv8_ad: true,
         tx32_depth2: true,
         uv422_mid_scale: 0.5,
-        split_breakout_slow: 1.5,
+        split_breakout_slow: 2.771115,
         fixed_size_fast: 16,
         fixed_size_medium: 0,
         fixed_size_slow: 0,
-        part_signal_bits: 24.0,
+        part_signal_bits: 33.8797,
         part_signal_seam_drop: 22.0,
         split32_signal_mult: 1.0,
         b64_refinement_window: 0.95,
@@ -670,7 +770,7 @@ impl Tuning {
         seam_w_422: 60.0,
         joint_large_gain: 0.995,
         satd_base: 1.25,
-        satd_top: 2.5,
+        satd_top: 2.921556,
         satd_knee_lo: 20.0,
         satd_knee_hi: 48.0,
         aq_slope: 5.0,
@@ -740,7 +840,7 @@ impl Tuning {
         split4_decision_txtypes: false,
         palette_smooth: 24,
         palette_smooth_guard: true,
-        palette_viterbi_444: 1.0,
+        palette_viterbi_444: 0.35,
         palette_viterbi_420: 0.5,
         palette_viterbi_proxy: true,
         palette_viterbi_screen_only: 1,
@@ -776,7 +876,7 @@ impl Tuning {
         wsse_422: true,
         wsse_444: true,
         wsse_400: true,
-        wsse_scale: 6.0,
+        wsse_scale: 1.0,
     };
 }
 
@@ -888,6 +988,21 @@ mod imp {
                 "cdef_margin" => t.cdef_margin = num(value),
                 "cdef_gate" => t.cdef_gate = num(value),
                 "cdef_chroma_w" => t.cdef_chroma_w = num(value),
+                "cdef_wsse" => t.cdef_wsse = flag(value),
+                "cdef_lambda_d" => t.cdef_lambda_d = flag(value),
+                "wiener_wsse" => t.wiener_wsse = flag(value),
+                "uv_pal_gate_wsse" => t.uv_pal_gate_wsse = flag(value),
+                "trial_struct_wsse" => t.trial_struct_wsse = flag(value),
+                "uv16_444_mlam_c" => t.uv16_444_mlam_c = flag(value),
+                "tx_guard_shift" => t.tx_guard_shift = num(value) as u32,
+                "tx_guard_shift_444" => t.tx_guard_shift_444 = num(value) as u32,
+                "proxy_luma_bridge" => t.proxy_luma_bridge = flag(value),
+                "proxy_luma_scale" => t.proxy_luma_scale = num(value),
+                "proxy_chroma_factor" => t.proxy_chroma_factor = num(value),
+                "luma64_wsse" => t.luma64_wsse = flag(value),
+                "chroma_part_w_sub" => t.chroma_part_w_sub = num(value),
+                "chroma_part_w_444" => t.chroma_part_w_444 = num(value),
+                "emit_mlam_c_420" => t.emit_mlam_c_420 = num(value),
                 "uv420_tail_delta" => t.uv420_tail_delta = num(value),
                 "uv420_mid_d" => t.uv420_mid_d = num(value),
                 "mode_budget_slow_sub" => t.mode_budget_slow_sub = num(value) as u32,

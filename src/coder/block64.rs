@@ -1081,7 +1081,9 @@ impl<'a> LossyTile<'a> {
         let (cw, chh) = (size >> sx, size >> sy);
         let cn = cw * chh;
         let (cx, cy) = (px >> sx, py >> sy);
-        let mlam_c = self.emit_mlam_c(px, py, size);
+        // SATD-domain leg (luma priced on `luma_partition_distortion`): its
+        // chroma wSSE and lambda are in the proxy unit.
+        let mlam_c = self.part_mlam_c(px, py, size);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         let mut cpred = [vec![0i32; cn], vec![0i32; cn]];
         let mut ccf = [Vec::new(), Vec::new()];
@@ -1121,7 +1123,7 @@ impl<'a> LossyTile<'a> {
                 }
             };
             let d = self.rd.sse_recon(&cpred[ci], &rr, self.src_blk(plane, cx, cy, cw, chh), self.bd);
-            cost += rd_cost_i64(d, mlam_c, bits);
+            cost += crate::partition_rd::rd_cost(self.proxy_wsse(d as f32), mlam_c, bits);
             ccf[ci] = q;
             crr[ci] = rr;
         }
@@ -1319,12 +1321,37 @@ impl<'a> LossyTile<'a> {
                 );
             }
         }
+        // Chroma: the emitter copies every plane, and every competing
+        // candidate (and the residual IBC plan) carries its chroma error, so
+        // the skip copy must too (external review round 3: a 4:2:2 copy added
+        // 4.2M chroma SSE at an unchanged cost). Priced 1:1 like
+        // `ibc_residual_rd`; `ibc_reference` realises odd-DV bilinear chroma.
+        if !self.mono {
+            let sx = usize::from(self.ss420 || self.ss422);
+            let sy = usize::from(self.ss420);
+            let (cw, chh) = (size >> sx, size >> sy);
+            let cn = cw * chh;
+            let (cx, cy) = (px >> sx, py >> sy);
+            let zeros = [0i32; 64 * 64];
+            let mut cpred = [0i32; 64 * 64];
+            for plane in 1..3 {
+                self.ibc_reference(plane, rx, ry, size, &mut cpred[..cn]);
+                distortion += self.rd.sse_recon(
+                    &cpred[..cn],
+                    &zeros[..cn],
+                    self.src_blk(plane, cx, cy, cw, chh),
+                    self.bd,
+                );
+            }
+        }
         let residual_pixels = ((i32::from(mv.0) - i32::from(pred.0)).unsigned_abs()
             + (i32::from(mv.1) - i32::from(pred.1)).unsigned_abs())
             as f32
             / 8.0;
-        Some(rd_cost_i64(
-            distortion,
+        // Compared against SATD-priced NONE / SPLIT legs: proxy unit (V2 of
+        // the unification plan; Phase 3 brings both sides to one unit).
+        Some(crate::partition_rd::rd_cost(
+            self.proxy_wsse(distortion as f32),
             self.mlam() * prdo,
             8.0 + dirty_log2f(residual_pixels.max(1.0)) * 2.0,
         ))
@@ -1790,6 +1817,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
         let tx64 = self.tx64_allowed();
+        self.luma64_pick_wsse.set(crate::tuning::get().luma64_wsse);
         // tx_depth symbol difference (TX_64X64 = depth 0, 4xTX_32X32 = depth 1);
         // constant over modes, so only the TX64 leg carries it.
         let tx64_depth_rate = if tx64 {
@@ -1982,6 +2010,7 @@ impl<'a> LossyTile<'a> {
         }
         restore(&mut self.recon[0]);
         self.sc().put_u4096(saved);
+        self.luma64_pick_wsse.set(false);
         (best.0, best.1, best.2, best.3, best_pal)
     }
 
@@ -2158,8 +2187,8 @@ impl<'a> LossyTile<'a> {
                 );
                 let rr = self.idct.idct_dequant_32x32(&cf, &self.cquant);
                 let sse = sse_recon::<1024, 32>(&self.rd, &[dc; 1024], &rr, self.src_blk(plane, tx0, ty0, 32, 32), self.bd);
-                total += rd_cost_i64(
-                    sse,
+                total += crate::partition_rd::rd_cost(
+                    self.proxy_chroma_wsse(sse as f32),
                     mlam,
                     self.chroma_bits(&cf, &SCAN_32X32, 32, plane, tx0, ty0),
                 );
@@ -2264,6 +2293,13 @@ impl<'a> LossyTile<'a> {
             rd_split_upper += child_none[i];
         }
         let rd_ibc = self.rd_cost_intrabc(px, py, 64, thr, prdo);
+        #[cfg(feature = "tuning")]
+        if units_probe_on() {
+            eprintln!(
+                "MARGIN lvl=64 none={rd_none:.1} split_upper={rd_split_upper:.1} ibc={:.1} lam_bits={split_signal:.1}",
+                rd_ibc.unwrap_or(f32::INFINITY)
+            );
+        }
         let best_whole = rd_leaf.min(rd_ibc.unwrap_or(f32::INFINITY));
         if rd_split_upper < best_whole {
             return Part16::Split;
@@ -2517,7 +2553,7 @@ impl<'a> LossyTile<'a> {
         };
         if ru.is_none() {
             let cftype = self.chroma_filter_type(px, py);
-            let mlam_c = self.mlam_c() * prdo;
+            let mlam_c = self.lambda_d_c() * prdo;
             self.uv64_pass(cx, cy, cgrid, 32, 32, uv_mode, cftype, lam, mlam_c, &mut uvf);
         }
         let [uflat, vflat] = uvf;

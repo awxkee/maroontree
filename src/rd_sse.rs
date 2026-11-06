@@ -262,6 +262,52 @@ impl RdDispatch {
         (d * self.wsse_scale).round() as i64
     }
 
+    /// `MT_UNITS` probe (tuning builds): the un-normalized weighted SSE and
+    /// the plain SSE of the reconstruction `pred + residual` (or `dc +
+    /// residual` for an empty `pred`) against the visible part of `src`.
+    #[cfg(feature = "tuning")]
+    pub(crate) fn probe_units(
+        &self,
+        src: SrcBlock<'_>,
+        bd: u8,
+        pred: &[i32],
+        dc: i32,
+        residual: &[i32],
+    ) -> (f32, i64) {
+        let (w, vw, vh) = (src.w, src.vis_w, src.vis_h);
+        let maxv = (1i32 << bd) - 1;
+        let err = |x: usize, y: usize| {
+            let i = y * w + x;
+            let p = if pred.is_empty() { dc } else { pred[i] };
+            let r = if residual.is_empty() { 0 } else { residual[i] };
+            i32::from(src.data[y * src.stride + x]) - (p + r).clamp(0, maxv)
+        };
+        let (pw, ph) = (vw.next_multiple_of(4), vh.next_multiple_of(4));
+        let mut buf = vec![0i32; pw * ph];
+        let mut sse = 0i64;
+        for y in 0..vh {
+            for x in 0..vw {
+                let e = err(x, y);
+                buf[y * pw + x] = e;
+                sse += i64::from(e) * i64::from(e);
+            }
+        }
+        (weighted_sse_scalar(&buf, pw, ph), sse)
+    }
+
+    /// Decision distortion of a packed `w`x`h` error block (multiples of 4):
+    /// the scaled weighted SSE, or the plain SSE when this dispatch measures
+    /// plain SSE. For callers that already hold the error (filters, gates).
+    #[inline]
+    pub(crate) fn wsse_err(&self, err: &[i32], w: usize, h: usize) -> i64 {
+        debug_assert!(err.len() >= w * h);
+        if self.wsse_scale > 0.0 {
+            debug_assert!(w.is_multiple_of(4) && h.is_multiple_of(4));
+            return ((self.weighted_sse)(&err[..w * h], w, h) * self.wsse_scale).round() as i64;
+        }
+        err[..w * h].iter().map(|&e| i64::from(e) * i64::from(e)).sum()
+    }
+
     pub(crate) fn selected() -> Self {
         #[allow(unused_mut)]
         let mut dispatch = Self::scalar();
@@ -1319,19 +1365,27 @@ pub(crate) fn sse_u16_scalar(
 /// Weights of [`weighted_sse_scalar`] on the 4x4 DCT of the error, `[row
 /// frequency][column frequency]`: DC error is dearer, the lowest AC at par,
 /// the second band discounted, high frequencies cheap (the hpvca decision
-/// distortion).
+/// distortion: 1.8 / 1.0 / 0.8 / 0.4 / 0.2), divided by the table's mean
+/// (7.4 / 16 = [`WSSE_RAW_MEAN`]) so the weighted SSE of a white error equals
+/// its plain SSE: the normalized wSSE is THE decision-distortion unit, and
+/// every re-centring lives in a lambda, never in the kernel.
 pub(crate) const WSSE_WEIGHTS: [[f32; 4]; 4] = {
-    const DC: f32 = 1.8;
-    const DIAG: f32 = 0.8;
-    const AXIS: f32 = 0.4;
-    const HF: f32 = 0.2;
+    const DC: f32 = 1.8 / WSSE_RAW_MEAN;
+    const DIAG: f32 = 0.8 / WSSE_RAW_MEAN;
+    const AXIS: f32 = 0.4 / WSSE_RAW_MEAN;
+    const HF: f32 = 0.2 / WSSE_RAW_MEAN;
+    const AC1: f32 = 1.0 / WSSE_RAW_MEAN;
     [
-        [DC, 1.0, AXIS, HF],
-        [1.0, DIAG, HF, HF],
+        [DC, AC1, AXIS, HF],
+        [AC1, DIAG, HF, HF],
         [AXIS, HF, HF, HF],
         [HF, HF, HF, HF],
     ]
 };
+
+/// Mean of the raw hpvca weight table (7.4 / 16); [`WSSE_WEIGHTS`] is the raw
+/// table divided by it.
+pub(crate) const WSSE_RAW_MEAN: f32 = 0.4625;
 
 /// Orthonormal 4-point DCT-II basis, `WSSE_DCT4[k][i]`.
 pub(crate) const WSSE_DCT4: [[f32; 4]; 4] = {
@@ -1881,9 +1935,13 @@ mod satd_tests {
 
     #[test]
     fn weighted_sse_kernels_match_and_weight_dc() {
-        // A flat 4x4 error e is all DC: coefficient 4e, weight 1.8.
+        // A flat 4x4 error e is all DC: coefficient 4e, weight 1.8 / 0.4625.
         let flat = [3i32; 16];
-        assert_eq!(weighted_sse_scalar(&flat, 4, 4), 1.8 * 144.0);
+        let want = 1.8 / WSSE_RAW_MEAN * 144.0;
+        assert!((weighted_sse_scalar(&flat, 4, 4) - want).abs() < 1e-3 * want);
+        // Mean weight 1: the table is normalized.
+        let mean: f32 = WSSE_WEIGHTS.iter().flatten().sum::<f32>() / 16.0;
+        assert!((mean - 1.0).abs() < 1e-5, "{mean}");
         // All-weights-1 sanity: the transform is orthonormal, so a single
         // tile's unweighted coefficient energy equals the pixel SSE.
         let err: Vec<i32> = (0..64 * 64).map(|i| ((i * 7919) % 513) - 256).collect();
