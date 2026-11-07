@@ -45,8 +45,12 @@ jxl overrides (jixel):
   progressive-dc-levels  auto|positive integer
   patches               boolean
   splines               boolean; experimental spline detection
+  edge-splines          boolean; experimental edge-detail splines (default: false)
+                        slow/extraslow, decoding-speed=slow, XYB, distance > 1,
+                        single-pass non-progressive lossy frames
   dots                  boolean; experimental spot detection
-  grain                 off|photon:ISO|measured:STRENGTH (lossy VarDCT)
+  grain                 off|auto|photon:ISO|measured:STRENGTH (lossy VarDCT)
+                        auto detects source grain and synthesizes what quantization removes
   photon-noise-iso      nonnegative finite ISO; selects photon grain
   grain-strength       nonnegative finite multiplier; selects measured grain
   grain-lut            [8 finite values in 0..1]; selects explicit grain
@@ -417,9 +421,9 @@ mod tests {
 
     #[test]
     fn bracketed_jxl_lists_stay_inside_their_grouped_setting() {
-        let group = "jxl:progressive-shifts=[2, 1, 0],grain-lut=[0,0.01,0.02,0.03,0.04,0.05,0.06,0.07],splines=true,dots=true,orientation=rotate-90"
+        let group = "jxl:progressive-shifts=[2, 1, 0],grain-lut=[0,0.01,0.02,0.03,0.04,0.05,0.06,0.07],splines=true,edge-splines=true,dots=true,orientation=rotate-90"
             .parse::<OverrideGroup>().unwrap();
-        assert_eq!(group.0.len(), 5);
+        assert_eq!(group.0.len(), 6);
         let mut cfg = jixel::EncodeConfig::default();
         for option in &group.0 {
             option.apply_jxl(&mut cfg).unwrap();
@@ -429,7 +433,7 @@ mod tests {
             cfg.grain,
             jixel::Grain::Lut([0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
         );
-        assert!(cfg.splines && cfg.dots);
+        assert!(cfg.splines && cfg.edge_splines && cfg.dots);
         assert_eq!(cfg.orientation, jixel::Orientation::Rotate90);
         "jxl:progressive-passes=2"
             .parse::<EncoderOverride>()
@@ -446,6 +450,7 @@ mod tests {
         for (setting, grain) in [
             ("grain=photon:3200", jixel::Grain::PhotonIso(3200.0)),
             ("grain=measured:1.5", jixel::Grain::Measured(1.5)),
+            ("grain=auto", jixel::Grain::Auto),
             ("grain=off", jixel::Grain::Off),
         ] {
             format!("jxl:{setting}")
@@ -530,6 +535,8 @@ mod tests {
             "jxl:grain-lut=[0,0,0,0,0,0,0,NaN]",
             "jxl:grain=photon:inf",
             "jxl:grain=measured:-1",
+            "jxl:grain=auto:1",
+            "jxl:edge-splines=maybe",
             "av1:depth=16",
             "jxl:chroma=420",
             "jxl:orientation=9",
