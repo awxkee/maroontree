@@ -1273,14 +1273,109 @@ impl<'a> LossyTile<'a> {
             VERT_LEFT_PRED,
             D203_PRED,
         ];
-        let directional_top = if ru.is_none() {
+        // `uv16_joint`: joint (mode, delta) SATD shortlist (see `uv8_joint`).
+        let joint16 = ru.is_none() && crate::tuning::get().uv16_joint;
+        let mut joint_delta = 0i32;
+        let directional_top = if ru.is_none() && !joint16 {
             self.rank_chroma_modes::<64>(candidates, px, py, cx, cy, 8, 8, have_tr, have_bl)
         } else {
             DirectionalTopK::new()
         };
+        if joint16 {
+            let k = (crate::tuning::get().uv8_joint_k as usize).clamp(1, 12);
+            let ad_ok = self.speed.try_angle_deltas_av1(16, self.base_q_idx);
+            let mut all = FixedList::<(u64, usize, i32), 84>::new((0, DC_PRED, 0));
+            for &m in candidates {
+                let deltas: &[i32] = if ad_ok && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                    &[-3, -2, -1, 0, 1, 2, 3]
+                } else {
+                    &[0]
+                };
+                for &d in deltas {
+                    let mut cost = 0u64;
+                    for plane in 1..=2 {
+                        let mut pp = [0i32; 64];
+                        self.intrapred.predict_nd_ad(
+                            m,
+                            d,
+                            &self.recon[plane],
+                            self.cw,
+                            cx,
+                            cy,
+                            8,
+                            8,
+                            have_tr,
+                            have_bl,
+                            self.cw,
+                            self.h / 2,
+                            self.chroma_filter_type(px, py),
+                            &mut pp,
+                            self.bd,
+                        );
+                        cost += self.rd.satd_sad_proxy(self.src_blk(plane, cx, cy, 8, 8), &pp, 8);
+                    }
+                    all.push((cost, m, d));
+                }
+            }
+            all.as_mut_slice().sort_unstable_by_key(|&(c, m, d)| (c, m, d));
+            for &(_, cand, jd) in all.as_slice().iter().take(k) {
+                let tx = chroma_tx_for_mode(cand);
+                let ad_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    let ad = &self.dcdf().angle_delta[cand - V_PRED];
+                    cdf_cost(ad, (jd + 3) as usize) - cdf_cost(ad, 3)
+                } else {
+                    0.0
+                };
+                let mut cand_ccf = [[0i32; 64]; 2];
+                let mut cand_rr = [[0i32; 64]; 2];
+                let mut cand_pred = [[0i32; 64]; 2];
+                let mut cand_total = rate_cost(mlam, self.uv_mode_bits(y_mode, cand, None) + ad_bits);
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    self.intrapred.predict_nd_ad(
+                        cand,
+                        jd,
+                        &self.recon[plane],
+                        self.cw,
+                        cx,
+                        cy,
+                        8,
+                        8,
+                        have_tr,
+                        have_bl,
+                        self.cw,
+                        self.h / 2,
+                        self.chroma_filter_type(px, py),
+                        &mut cand_pred[ci],
+                        self.bd,
+                    );
+                    let mut resid = [0i32; 64];
+                    self.rd.residual_pred(&mut resid, &cand_pred[ci], &self.src[plane], self.cw, cx, cy, 8, 8);
+                    let (mut q, qt) = fwd_chroma_8x8(&self.dct, tx, &resid, &self.cquant);
+                    self.chroma_rect_trellis(&mut q, &qt, dcq, acq, &SCAN_8X8, lam, 8, 8, plane, cx, cy);
+                    self.rd.preserve_dc(&mut q[0], &resid[..]);
+                    cand_ccf[ci] = q;
+                    cand_rr[ci] = inv_chroma_8x8(&self.idct, tx, &q, &self.cquant);
+                    let sse = sse_recon::<64, 8>(&self.rd, &cand_pred[ci], &cand_rr[ci], self.src_blk(plane, cx, cy, 8, 8), self.bd);
+                    cand_total += rd_cost_i64(sse, mlam, self.chroma_bits(&q, &SCAN_8X8, 8, plane, cx, cy));
+                    if ci == 0 && cand_total >= best_total {
+                        break; // cannot win: skip the second plane (non-negative costs)
+                    }
+                }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    chosen_uv = cand;
+                    joint_delta = jd;
+                    use_cfl = false;
+                    best_ccf = cand_ccf;
+                    best_rr = cand_rr;
+                    best_pred = cand_pred;
+                }
+            }
+        }
         for &cand in candidates {
             // Pure-emit replay: no candidate runs; the winner installs below.
-            if ru.is_some() {
+            if ru.is_some() || joint16 {
                 break;
             }
             // V/H are cheap enough for every tier; Fast skips diagonal angles.
@@ -1352,8 +1447,9 @@ impl<'a> LossyTile<'a> {
         // Chroma angle-delta refinement (`uv_ad`) of a directional winner:
         // the zone-2 deltas only (V +1..3, H -1..-3, D113/D135/D157 +-1..3), so
         // the tr/bl-free chroma edge setup stays exact.
-        let mut uv_delta = 0i32;
+        let mut uv_delta = if joint16 && !use_cfl { joint_delta } else { 0 };
         if ru.is_none()
+            && !joint16
             && !use_cfl
             && crate::tuning::get().uv_ad
             && self.speed.try_angle_deltas_av1(16, self.base_q_idx)

@@ -227,17 +227,6 @@ const fn quad4_enabled(ss420: bool) -> bool {
     ss420
 }
 
-/// `MT_UNITS` (tuning builds, -t 1): print, at every partition-proxy site,
-/// the SATD price next to the normalized weighted SSE and the plain SSE of
-/// the same reconstruction (`UNITS` lines), and at every NONE-vs-SPLIT node
-/// the priced legs (`MARGIN` lines), for the decision-metric unification
-/// study.
-#[cfg(feature = "tuning")]
-pub(crate) fn units_probe_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MT_UNITS").is_some())
-}
-
 impl<'a> LossyTile<'a> {
     pub(crate) fn adaptive_skip_price_enabled(&self) -> bool {
         self.speed.at_least_slow()
@@ -2600,28 +2589,6 @@ impl<'a> LossyTile<'a> {
             price *= K_PART_LAMBDA / crate::partition_rd::k_satd(self.aq.base_q, subsampled)
                 * t.proxy_luma_scale;
         }
-        #[cfg(feature = "tuning")]
-        if units_probe_on() {
-            let (wsse_raw, sse) =
-                self.rd
-                    .probe_units(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
-            // `WSSE_WEIGHTS` is normalized (mean weight 1): `wsse_raw` is
-            // already the normalized unit.
-            let fmt = if self.mono {
-                400
-            } else if self.ss420 {
-                420
-            } else if self.ss422 {
-                422
-            } else {
-                444
-            };
-            eprintln!(
-                "UNITS fmt={fmt} qi={} {w}x{h} satd={satd} price={price:.1} wsse_n={:.1} sse={sse}",
-                self.aq.base_q,
-                wsse_raw
-            );
-        }
         price
     }
 
@@ -3217,7 +3184,10 @@ impl<'a> LossyTile<'a> {
             + child(c1x, c1y);
         let (lw, lh) = if horz { (16, 8) } else { (8, 16) };
         let rd_rect = (rate_cost(part_lam, self.edge_partition_bits(3, x8, y8, horz, false))
-            + self.rd_cost_rect16_leaf(px, py, !horz, prdo)
+            + {
+                let (tr, bl) = self.rect_edge_flags(px, py, !horz, false, thr, lhb);
+                self.rd_cost_rect16_leaf(px, py, !horz, tr, bl, prdo)
+            }
             + chroma(0, 0, lw, lh))
             * tune.edge_rect_bias;
         if rd_rect < rd_split {
@@ -3532,7 +3502,7 @@ impl<'a> LossyTile<'a> {
         let rd_horz = if !horz_on || !refine_part(Part16::Horz) {
             f32::INFINITY
         } else {
-            let luma = self.rd_cost_horz(px, py, prdo);
+            let luma = self.rd_cost_horz(px, py, thr, lhb, prdo);
             if luma * rect_bias >= best_complete {
                 f32::INFINITY
             } else {
@@ -3544,7 +3514,7 @@ impl<'a> LossyTile<'a> {
         let rd_vert = if !vert_on || !refine_part(Part16::Vert) {
             f32::INFINITY
         } else {
-            let luma = self.rd_cost_vert(px, py, prdo);
+            let luma = self.rd_cost_vert(px, py, thr, lhb, prdo);
             if luma * rect_bias >= best_complete {
                 f32::INFINITY
             } else {
@@ -3568,14 +3538,20 @@ impl<'a> LossyTile<'a> {
                     let luma = asym_signal
                         + square8[0]
                         + square8[1]
-                        + self.rd_cost_rect16_dependent(px, py + 8, false, true, false, prdo);
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py + 8, false, true, thr, lhb);
+                            self.rd_cost_rect16_dependent(px, py + 8, false, tr, bl, true, false, prdo)
+                        };
                     finish_asym(luma, Part16::HorzA)
                 } else {
                     f32::INFINITY
                 };
                 let rd_horz_b = if refine_part(Part16::HorzB) {
                     let luma = asym_signal
-                        + self.rd_cost_rect16_leaf(px, py, false, prdo)
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py, false, false, thr, lhb);
+                            self.rd_cost_rect16_leaf(px, py, false, tr, bl, prdo)
+                        }
                         + square8[2]
                         + square8[3];
                     finish_asym(luma, Part16::HorzB)
@@ -3586,14 +3562,20 @@ impl<'a> LossyTile<'a> {
                     let luma = asym_signal
                         + square8[0]
                         + square8[2]
-                        + self.rd_cost_rect16_dependent(px + 8, py, true, false, true, prdo);
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px + 8, py, true, true, thr, lhb);
+                            self.rd_cost_rect16_dependent(px + 8, py, true, tr, bl, false, true, prdo)
+                        };
                     finish_asym(luma, Part16::VertA)
                 } else {
                     f32::INFINITY
                 };
                 let rd_vert_b = if refine_part(Part16::VertB) {
                     let luma = asym_signal
-                        + self.rd_cost_rect16_leaf(px, py, true, prdo)
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py, true, false, thr, lhb);
+                            self.rd_cost_rect16_leaf(px, py, true, tr, bl, prdo)
+                        }
                         + square8[1]
                         + square8[3];
                     finish_asym(luma, Part16::VertB)
@@ -3703,25 +3685,6 @@ impl<'a> LossyTile<'a> {
         } else {
             split_bound_margin
         };
-        #[cfg(feature = "tuning")]
-        if units_probe_on() {
-            let (cn, cs) = if full_part_rdo {
-                (
-                    self.rd_cost_chroma_partition(px, py, 16, Part16::None, prdo, false),
-                    self.rd_cost_chroma_partition(px, py, 16, Part16::Split, prdo, false),
-                )
-            } else {
-                (0.0, 0.0)
-            };
-            eprintln!(
-                "MARGIN lvl=16 none={:.1} split={:.1} ibc={:.1} chroma_none={cn:.1} chroma_split={cs:.1} lam_bits={:.1} chosen={:?}",
-                cands[1].0,
-                cands[2].0,
-                cands[0].0,
-                split_signal,
-                chosen.1
-            );
-        }
         (chosen.1, chosen_cost, margin)
     }
 
@@ -4371,6 +4334,12 @@ impl<'a> LossyTile<'a> {
         var / (q * q).max(1.0)
     }
 
+    /// Chroma is 4:4:4 (neither subsampled format, not monochrome).
+    #[inline]
+    fn ss444(&self) -> bool {
+        !self.ss420 && !self.ss422 && !self.mono
+    }
+
     fn perceptual_rd_scale(&self, px: usize, py: usize, dim: usize) -> f32 {
         let mut k = if !self.ss420 && !self.ss422 && !self.mono {
             prdo_k_444()
@@ -4509,4 +4478,6 @@ mod tests {
         );
     }
 }
+
+
 

@@ -397,13 +397,6 @@ impl<'a> LossyTile<'a> {
         } else {
             f32::INFINITY
         };
-        #[cfg(feature = "tuning")]
-        if units_probe_on() {
-            eprintln!(
-                "MARGIN lvl=32 none={rd_none:.1} split={rd_split:.1} ibc={rd_ibc:.1} chroma_split={chroma_split:.1} lam_bits={:.1}",
-                rate_cost(self.mlam() * prdo, self.part_rate_bl(2, x8, y8, 3))
-            );
-        }
         if rd_ibc < rd_none.min(rd_split) {
             return (Part16::Intrabc, rd_ibc);
         }
@@ -987,28 +980,14 @@ impl<'a> LossyTile<'a> {
         }
         if rl.is_none() && self.speed.at_least_slow() {
             let bsize = av1_block_size_index(32, 32);
-            for &filter_mode in self
-                .rank_filter_intra_modes::<1024>(
-                    px,
-                    py,
-                    32,
-                    32,
-                    self.speed.filter_intra_refine_budget(),
-                )
+            let mut fi_preds = [[0i32; 1024]; 5];
+            for (fi_si, &filter_mode) in self
+                .rank_filter_intra_modes::<1024>(px, py, 32, 32, self.speed.filter_intra_refine_budget(self.ss444()), &mut fi_preds)
                 .iter()
+                .enumerate()
             {
                 let mut pred = self.sbuf_i1024();
-                self.intrapred.filter_predict(
-                    filter_mode,
-                    &self.recon[0],
-                    self.w,
-                    px,
-                    py,
-                    32,
-                    32,
-                    &mut pred[..],
-                    self.bd,
-                );
+                pred[..].copy_from_slice(&fi_preds[fi_si]);
                 let mut resid = self.sbuf_i1024();
                 self.rd.residual_pred(
                     &mut resid[..],
@@ -1040,13 +1019,19 @@ impl<'a> LossyTile<'a> {
                 );
                 let rr = self.idct.idct_dequant_32x32(&cf, &self.quant);
                 let sse = sse_recon::<1024, 32>(&self.rd, &pred, &rr, self.src_blk(0, px, py, 32, 32), self.bd);
+                // The admission below needs `sse <= best_dct_sse` (unless the RD-only
+                // study knob is on) and a replay accepts regardless: a candidate that
+                // already lost on SSE skips the entropy-accurate rate pass.
+                if rl.is_none() && !crate::tuning::get().filter_intra_rd_only && sse > best_dct_sse {
+                    continue;
+                }
                 let bits = self.luma_bits(&cf, &SCAN_32X32, 32, px, py, DC_PRED, 0);
                 let syntax_bits = self.mode_bits(px, py, DC_PRED)
                     + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
                     + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
                 if rl.is_some()
-                    || (sse <= best_dct_sse && cost < best_eff)
+                    || ((crate::tuning::get().filter_intra_rd_only || sse <= best_dct_sse) && cost < best_eff)
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;
@@ -1163,10 +1148,11 @@ impl<'a> LossyTile<'a> {
         // distortion is not meaningfully worse.
         let mut tx_split = false;
         let mut d1_rd: Option<f32> = None;
+        let banding32 = self.banding_risk(px, py, 32);
         if rl.is_none()
             && best_filter_intra.is_none()
             && best_palette32.is_none()
-            && self.banding_risk(px, py, 32)
+            && (banding32 || crate::tuning::get().tx32_split_rd)
         {
             let none_sse = sse_recon::<1024, 32>(&self.rd, &lpred, &self.idct.idct_dequant_32x32(&lcf, &self.quant), self.src_blk(0, px, py, 32, 32), self.bd);
             let (cf4, sse_s, bits_s) =
@@ -1176,8 +1162,16 @@ impl<'a> LossyTile<'a> {
             // syntax than four TX_8X8 do, so copying that tolerance here lets in
             // bad splits — measured +6.7% BD-rate on detailed content. Requiring
             // a real improvement keeps the banding win and removes the loss.
-            let guarded_take =
-                (sse_s as i128) * 1024 <= (none_sse as i128) * (1024 - SPLIT32_SSE_MARGIN as i128);
+            // `tx32_split_rd`: outside the banding trigger, plain RD decides
+            // (the synthetic-gap transplant found 32x32 gradient+edge blocks
+            // coded whole at 2x the bytes and 3x the error of aom's four TX16).
+            let guarded_take = if banding32 {
+                (sse_s as i128) * 1024 <= (none_sse as i128) * (1024 - SPLIT32_SSE_MARGIN as i128)
+            } else {
+                let none_bits = self.luma_bits(&lcf[..], &SCAN_32X32, 32, px, py, best_mode, 0);
+                rd_cost_i64(sse_s, mlam, bits_s + self.tx_depth_bits(px, py, 32, 32, 1))
+                    < rd_cost_i64(none_sse, mlam, none_bits + self.tx_depth_bits(px, py, 32, 32, 0))
+            };
             if guarded_take {
                 tx_split = true;
                 d1_rd = Some(rd_cost_i64(

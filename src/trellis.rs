@@ -280,11 +280,248 @@ pub(crate) fn trellis_optimize_ctx(
             b + 1.0 // AC sign (bypass)
         };
 
+        // EOB position (eob_pt + eob_extra) rate for a terminal at scan index e.
+        let eob_pt_cost = |e: usize| -> f32 {
+            let bin = if e < 2 {
+                e
+            } else {
+                32 - (e as u32).leading_zeros() as usize
+            };
+            let mut c = cdf_cost_with_table(eob_bin_cdf, bin, cost_table);
+            if bin > 1 {
+                let nbits = bin - 2;
+                c += cdf_cost_with_table(&eob_hi[bin], (e >> nbits) & 1, cost_table);
+                c += nbits as f32; // remaining eob offset bits (bypass)
+            }
+            c
+        };
+
+        if tun.trellis_aom {
+            // Port of libaom `av1_optimize_txb` (av1/encoder/txb_rdopt.c) on
+            // OUR rate model and lambda. Structure, not costs, is what this
+            // path tests: (1) the last coefficient is priced as a terminal
+            // (level and level-1); (2) walking down the scan, every nonzero
+            // is a candidate NEW EOB, compared against the accumulated
+            // (rate, dist) of everything above it, as long as at most two
+            // nonzeros have been kept above (`max_nz_num = 2`); each such
+            // step also tries level-1 in the accumulated frame; coefficients
+            // dropped by an EOB move are zeroed in the level map BEFORE the
+            // lower positions are priced; (3) the all-zero alternative is
+            // tested only if the walk reached DC with <= 2 nonzeros; (4) the
+            // remaining interior positions try level-1 only (never lower),
+            // and only when the level is not already rounded down; (5) DC
+            // last, level and level-1. Distortion is accounted relative to
+            // the zero level, exactly as libaom's `accu_dist`.
+            let cur = |cf: &[i32], rc: usize| cf[rc].unsigned_abs();
+            // Levels only fall, so the DC sign is fixed for the whole search.
+            let dc_neg = (cf[scan[0] as usize] < 0) as usize;
+            let ctx_eob = |e: usize| -> usize {
+                if e == 0 {
+                    0
+                } else if e <= n / 8 {
+                    1
+                } else if e <= n / 4 {
+                    2
+                } else {
+                    3
+                }
+            };
+            // Terminal (EOB coefficient) rate at scan index e, magnitude k >= 1:
+            // eob_base token in the position-only context, br ladder in the
+            // position-only br context, sign (DC sign is context coded).
+            let term_rate = |e: usize, k: u32| -> f32 {
+                let tok = k.min(3);
+                let mut c =
+                    cdf_cost_with_table(&eob_base[ctx_eob(e)], tok as usize - 1, cost_table);
+                if tok == 3 {
+                    let rc = scan[e] as usize;
+                    let bc = if e == 0 {
+                        0
+                    } else {
+                        let (ex, ey) = (rc >> log2h, rc & (h - 1));
+                        if (ex | ey) > 1 { 14 } else { 7 }
+                    };
+                    c += hi_cost(k, bc);
+                }
+                c + if e == 0 {
+                    cdf_cost_with_table(&dc_sign[dcs_ctx], dc_neg, cost_table)
+                } else {
+                    1.0
+                }
+            };
+            // Interior (non-terminal) rate at scan index i, magnitude k >= 0,
+            // contexts from the CURRENT level map.
+            let gen_rate = |levels: &[u8], i: usize, k: u32| -> f32 {
+                let rc = scan[i] as usize;
+                if i == 0 {
+                    if k == 0 {
+                        return cdf_cost_with_table(&base_tok[0], 0, cost_table);
+                    }
+                    let tok = k.min(3);
+                    let mut b = cdf_cost_with_table(&base_tok[0], tok as usize, cost_table);
+                    if tok == 3 {
+                        b += hi_cost(k, dc_brc(levels));
+                    }
+                    b + cdf_cost_with_table(&dc_sign[dcs_ctx], dc_neg, cost_table)
+                } else {
+                    let (ctx, bc) = interior_ctx(levels, rc);
+                    interior_rate(ctx, bc, k)
+                }
+            };
+            let lower_cf = |cf: &mut [i32], rc: usize, k: u32| {
+                cf[rc] = if cf[rc] < 0 { -(k as i32) } else { k as i32 };
+            };
+
+            // (1) the last coefficient.
+            let mut accu_rate = eob_pt_cost(eu);
+            let mut accu_dist = 0.0f32;
+            {
+                let rc = scan[eu] as usize;
+                let l = cur(cf, rc);
+                let d0 = distw(eu, rc, 0);
+                let r = term_rate(eu, l);
+                let d = distw(eu, rc, l as i32) - d0;
+                let (mut bl, mut br, mut bd) = (l, r, d);
+                if l >= 2 {
+                    let rl = term_rate(eu, l - 1);
+                    let dl = distw(eu, rc, l as i32 - 1) - d0;
+                    if rate_cost(lambda, rl) + dl < rate_cost(lambda, r) + d {
+                        (bl, br, bd) = (l - 1, rl, dl);
+                    }
+                }
+                if bl != l {
+                    lower_cf(cf, rc, bl);
+                    set_level(levels, rc, bl);
+                }
+                accu_rate += br;
+                accu_dist += bd;
+            }
+            // (2) EOB walk.
+            let mut nz: [usize; 3] = [scan[eu] as usize, 0, 0];
+            let mut nz_num = 1usize;
+            let mut si: isize = eu as isize - 1;
+            while si >= 0 && nz_num <= 2 {
+                let i = si as usize;
+                let rc = scan[i] as usize;
+                let l = cur(cf, rc);
+                if l == 0 {
+                    accu_rate += gen_rate(levels, i, 0);
+                    si -= 1;
+                    continue;
+                }
+                let d0 = distw(i, rc, 0);
+                let mut rate = gen_rate(levels, i, l);
+                let mut dist = distw(i, rc, l as i32) - d0;
+                let mut rd = rate_cost(lambda, accu_rate + rate) + accu_dist + dist;
+                let (rate_low, dist_low) = if l == 1 {
+                    (gen_rate(levels, i, 0), 0.0)
+                } else {
+                    (gen_rate(levels, i, l - 1), distw(i, rc, l as i32 - 1) - d0)
+                };
+                let rd_low = rate_cost(lambda, accu_rate + rate_low) + accu_dist + dist_low;
+                // New EOB at i (everything above dropped).
+                let ec = eob_pt_cost(i);
+                let mut rate_eob = ec + term_rate(i, l);
+                let mut dist_eob = dist;
+                let mut rd_eob = rate_cost(lambda, rate_eob) + dist_eob;
+                let mut low_eob = false;
+                if l >= 2 {
+                    let re = ec + term_rate(i, l - 1);
+                    let rde = rate_cost(lambda, re) + dist_low;
+                    if rde < rd_eob {
+                        low_eob = true;
+                        rd_eob = rde;
+                        rate_eob = re;
+                        dist_eob = dist_low;
+                    }
+                }
+                let mut lower = false;
+                if rd_low < rd {
+                    lower = true;
+                    rd = rd_low;
+                    rate = rate_low;
+                    dist = dist_low;
+                }
+                if rd_eob < rd {
+                    for &q in &nz[..nz_num] {
+                        cf[q] = 0;
+                        set_level(levels, q, 0);
+                    }
+                    nz_num = 0;
+                    accu_rate = rate_eob;
+                    accu_dist = dist_eob;
+                    lower = low_eob;
+                } else {
+                    accu_rate += rate;
+                    accu_dist += dist;
+                }
+                if lower {
+                    lower_cf(cf, rc, l - 1);
+                    set_level(levels, rc, l - 1);
+                }
+                if cf[rc] != 0 {
+                    nz[nz_num] = rc;
+                    nz_num += 1;
+                }
+                si -= 1;
+            }
+            // (3) all-zero alternative.
+            if si < 0 && nz_num <= 2 {
+                let rd = rate_cost(lambda, accu_rate) + accu_dist;
+                let rd_skip = rate_cost(lambda, tun.trellis_zero_bits);
+                if rd_skip < rd {
+                    for &rc32 in scan[..m].iter() {
+                        cf[rc32 as usize] = 0;
+                    }
+                    return;
+                }
+            }
+            // (4) interior, level-1 only.
+            while si >= 1 {
+                let i = si as usize;
+                let rc = scan[i] as usize;
+                let l = cur(cf, rc);
+                si -= 1;
+                if l == 0 || (l as f32) < tf[rc].abs() {
+                    continue;
+                }
+                let rate = gen_rate(levels, i, l);
+                let rd = rate_cost(lambda, rate) + distw(i, rc, l as i32);
+                let rd_low =
+                    rate_cost(lambda, gen_rate(levels, i, l - 1)) + distw(i, rc, l as i32 - 1);
+                if rd_low < rd {
+                    lower_cf(cf, rc, l - 1);
+                    set_level(levels, rc, l - 1);
+                }
+            }
+            // (5) DC, if the walk did not reach it.
+            if si == 0 {
+                let rc = scan[0] as usize;
+                let l = cur(cf, rc);
+                if l != 0 {
+                    let rd = rate_cost(lambda, gen_rate(levels, 0, l)) + distw(0, rc, l as i32);
+                    let rd_low =
+                        rate_cost(lambda, gen_rate(levels, 0, l - 1)) + distw(0, rc, l as i32 - 1);
+                    if rd_low < rd {
+                        lower_cf(cf, rc, l - 1);
+                        set_level(levels, rc, l - 1);
+                    }
+                }
+            }
+            return;
+        }
+
         // Step A: reverse-scan per-coefficient RD-best level (interior), then DC.
+        let dz = tun.trellis_dz;
         for i in (1..(eob as usize)).rev() {
             let rc = scan[i] as usize;
             let l = cf[rc].unsigned_abs();
             if l == 0 {
+                continue;
+            }
+            if dz > 0.0 && l == 1 && tf[rc].abs() < dz {
+                cf[rc] = 0;
+                set_level(levels, rc, 0);
                 continue;
             }
             let (ctx, bc) = interior_ctx(levels, rc);
@@ -372,20 +609,6 @@ pub(crate) fn trellis_optimize_ctx(
         }
 
         // Step B: EOB-position selection with accurate eob_pt / eob_base costs.
-        let eob_pt_cost = |e: usize| -> f32 {
-            let bin = if e < 2 {
-                e
-            } else {
-                32 - (e as u32).leading_zeros() as usize
-            };
-            let mut c = cdf_cost_with_table(eob_bin_cdf, bin, cost_table);
-            if bin > 1 {
-                let nbits = bin - 2;
-                c += cdf_cost_with_table(&eob_hi[bin], (e >> nbits) & 1, cost_table);
-                c += nbits as f32; // remaining eob offset bits (bypass)
-            }
-            c
-        };
         let eob_coeff_cost = |e: usize, m: u32| -> f32 {
             let ctx_e = 1 + (e > n / 8) as usize + (e > n / 4) as usize;
             let tok = m.min(3);

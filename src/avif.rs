@@ -116,14 +116,6 @@ impl Speed {
 
     /// AV1-coder RDOQ staging. Split from [`Self::per_candidate_rdoq`] so the
     /// AV1 winner-only experiment cannot silently change AV2 behavior.
-    /// MEASURED 2026-07-25 — winner-only at Slow is a BAD trade in every
-    /// form: pure winner-only = 420 +1.25/+0.85/+1.76 (tuning/holdout/mid),
-    /// 444 tuning +0.61 with UNIFORM kodak damage (+0.4..+1.5; the 5-image
-    /// holdout's +0.01 was luck), for only ~4% time. Staged (plain-trellis
-    /// candidates + ctx winner) is DOMINATED: worse than winner-only at 444
-    /// (+1.71 holdout) and worse than per-candidate at 420. Per-candidate
-    /// exact-ctx RDOQ at Slow EARNS its time; winner-only IS the Medium
-    /// tier, and the delta is real quality, not fat.
     pub(crate) fn per_candidate_rdoq_av1(self) -> bool {
         self.at_least_slow()
     }
@@ -155,12 +147,7 @@ impl Speed {
     }
 
     /// Whether a 16x16 luma leaf re-tries DC_PRED under the TX_8X8 split
-    /// (`code_block16`). Medium only: SS2 BD (q50-90; 5 corpus photos/illus +
-    /// 2 crops of digital_art_portrait) 420 -3.0 / 422 -3.7 / 444 -3.5
-    /// (corpus alone -0.5..-0.9, portrait crops -7..-13) for +2% (420) /
-    /// +10% (444) time. Slow is unaffected (its 8x8 partitions already cover
-    /// the case); Fast 444 measured -2.7 for +13% time, left off for speed.
-    /// Trying SMOOTH/PAETH as well adds only ~-0.4 more for 2-4x the cost.
+    /// (`code_block16`).
     pub(crate) fn split16_dc_redecide(self) -> bool {
         matches!(self, Speed::Medium)
     }
@@ -220,12 +207,18 @@ impl Speed {
         }) as usize
     }
 
-    /// Filter-intra finalists given full RD. 0 on every tier: a budget of 2
-    /// measured +-1% with no consistent sign even as an ExtraSlow-only extra.
-    /// (`filter_intra_budget` re-opens it for offline studies; 0 keeps the
-    /// FILTER_DC-only trial.)
-    pub(crate) fn filter_intra_refine_budget(self) -> usize {
-        crate::tuning::get().filter_intra_budget as usize
+    /// Filter-intra finalists given full RD at the square Slow leaves
+    /// (`Tuning::filter_intra_budget`, 3 at 4:2:0/4:2:2, 0 at 4:4:4; 0 = no
+    /// filter-intra trial). Earlier probes of budget 1/2 on four mixed images
+    /// read +0.4; on the 2026-11 tree the full ladders read -0.3/-0.4.
+    pub(crate) fn filter_intra_refine_budget(self, ss444: bool) -> usize {
+        let t = crate::tuning::get();
+        let b = if ss444 {
+            t.filter_intra_budget_444
+        } else {
+            t.filter_intra_budget
+        };
+        b as usize
     }
 
     /// Fast codes chroma with the baseline DC predictor. CfL and directional

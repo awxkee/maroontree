@@ -271,10 +271,11 @@ pub(crate) fn wiener_filter_plane_wsse(
             vk,
             bd,
         );
-        for (e, (&f, &r)) in err[..w * rh]
-            .iter_mut()
-            .zip(stripe[..w * rh].iter().zip(&reference[ytop * w..][..w * rh]))
-        {
+        for (e, (&f, &r)) in err[..w * rh].iter_mut().zip(
+            stripe[..w * rh]
+                .iter()
+                .zip(&reference[ytop * w..][..w * rh]),
+        ) {
             *e = i32::from(f) - i32::from(r);
         }
         total += rd.wsse_err(&err, w, rh);

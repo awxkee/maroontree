@@ -262,39 +262,6 @@ impl RdDispatch {
         (d * self.wsse_scale).round() as i64
     }
 
-    /// `MT_UNITS` probe (tuning builds): the un-normalized weighted SSE and
-    /// the plain SSE of the reconstruction `pred + residual` (or `dc +
-    /// residual` for an empty `pred`) against the visible part of `src`.
-    #[cfg(feature = "tuning")]
-    pub(crate) fn probe_units(
-        &self,
-        src: SrcBlock<'_>,
-        bd: u8,
-        pred: &[i32],
-        dc: i32,
-        residual: &[i32],
-    ) -> (f32, i64) {
-        let (w, vw, vh) = (src.w, src.vis_w, src.vis_h);
-        let maxv = (1i32 << bd) - 1;
-        let err = |x: usize, y: usize| {
-            let i = y * w + x;
-            let p = if pred.is_empty() { dc } else { pred[i] };
-            let r = if residual.is_empty() { 0 } else { residual[i] };
-            i32::from(src.data[y * src.stride + x]) - (p + r).clamp(0, maxv)
-        };
-        let (pw, ph) = (vw.next_multiple_of(4), vh.next_multiple_of(4));
-        let mut buf = vec![0i32; pw * ph];
-        let mut sse = 0i64;
-        for y in 0..vh {
-            for x in 0..vw {
-                let e = err(x, y);
-                buf[y * pw + x] = e;
-                sse += i64::from(e) * i64::from(e);
-            }
-        }
-        (weighted_sse_scalar(&buf, pw, ph), sse)
-    }
-
     /// Decision distortion of a packed `w`x`h` error block (multiples of 4):
     /// the scaled weighted SSE, or the plain SSE when this dispatch measures
     /// plain SSE. For callers that already hold the error (filters, gates).
@@ -305,7 +272,10 @@ impl RdDispatch {
             debug_assert!(w.is_multiple_of(4) && h.is_multiple_of(4));
             return ((self.weighted_sse)(&err[..w * h], w, h) * self.wsse_scale).round() as i64;
         }
-        err[..w * h].iter().map(|&e| i64::from(e) * i64::from(e)).sum()
+        err[..w * h]
+            .iter()
+            .map(|&e| i64::from(e) * i64::from(e))
+            .sum()
     }
 
     pub(crate) fn selected() -> Self {

@@ -58,8 +58,24 @@ pub(crate) struct Tuning {
     /// 4:2:0 rect16 leaf: full chroma uv-mode search on the 8x4/4x8 chroma
     /// (was DC/CfL only).
     pub(crate) rect_uv_search: bool,
+    /// 4:2:0 rect16 leaf: joint (mode, delta) SATD shortlist for the 8x4/4x8
+    /// chroma (tr/bl-free set), full RD per kept pair
+    pub(crate) rect_uv_joint: bool,
+    /// Shortlist size of `rect_uv_joint`.
+    pub(crate) rect_uv_joint_k: u32,
+    /// Rect16 leaf luma: decoder-exact edge flags (dav1d `init_edges` for the
+    /// halves.
+    pub(crate) rect_full_modes: bool,
+    /// H4/V4 strip leaves (16x4 / 4x16)
+    pub(crate) strip_modes: bool,
+    /// H4/V4 strip pairs at 4:2:0.
+    pub(crate) strip_uv_joint: bool,
+    /// Rect16 leaf: re-decide whole-TX vs two TX_8X8 at the coding site with
+    /// the decoder-faithful split (half 1 predicted from the reconstructed
+    /// half 0) instead of the whole-prediction estimate alone.
+    pub(crate) rect_split_seq: bool,
     /// Pre-fill the tile reconstruction with the source so decision-stage
-    /// predictions of not-yet-coded neighbours (later leaves of a candidate
+    /// predictions of not-yet-coded neighbors (later leaves of a candidate
     /// partition) see a proxy of the eventual reconstruction, not zeros.
     pub(crate) recon_src_init: bool,
     /// Multiplier on the 16-level SPLIT leg (all bands; `none16_top_bias_*`
@@ -302,21 +318,43 @@ pub(crate) struct Tuning {
     pub(crate) ad16_full: bool,
     /// 4:2:0 8x8 leaf: directional chroma candidates compete against CfL
     pub(crate) uv8_vs_cfl: bool,
+    /// 4:2:0 8x8 leaf: joint (uv mode, angle delta) SATD shortlist over the
+    /// full directional set incl. zone-1/3 (D45/D67/D203), predicted with the
+    /// leaf's real top-right / bottom-left availability (decoder-exact), in
+    /// place of the delta-0 top-3 + winner-only delta refinement (`uv8_ad`).
+    pub(crate) uv8_joint: bool,
+    /// Shortlist size of `uv8_joint` (full RD per kept candidate).
+    pub(crate) uv8_joint_k: u32,
+    /// 4:2:0 16x16 leaf: the same joint (uv mode, angle delta) shortlist.
+    pub(crate) uv16_joint: bool,
+    /// Masking (perceptual RD) strength K for subsampled / 4:4:4 formats
+    /// (`perceptual_rd_scale`); 0 = masking off.
+    pub(crate) prdo_k: f32,
+    pub(crate) prdo_k_444: f32,
+    /// Contextual trellis Step A dead-zone: an interior level-1 coefficient
+    /// whose quantization target is below this many steps is zeroed before the
+    /// local R-D choice (0 = off). Synthetic-gap equilibrium study.
+    pub(crate) trellis_dz: f32,
     /// Rate-aware CfL alpha refinement at the square leaves (8/16/32, every
     /// chroma format): from the energy-optimal alpha, step at most this many
-    /// alphas toward zero while the realised per-plane RD cost (recon SSE +
+    /// alphas toward zero while the realized per-plane RD cost (recon SSE +
     /// lambda x coef bits + the plane's alpha-signal bits) keeps falling, else
     /// the same away from zero (aom `cfl_pick_plane_rd`). 0 = energy pick only.
     pub(crate) cfl_alpha_rd_steps: u32,
     /// What the alpha walk scores: 0 = recon SSE + lambda x (coef + alpha
-    /// bits), 1 = SSE + lambda x coef bits only, 2 = realised SSE only.
+    /// bits), 1 = SSE + lambda x coef bits only, 2 = realized SSE only.
     pub(crate) cfl_alpha_rd_mode: u32,
-    /// Filter-intra finalists given full RD at the square leaves (SATD-ranked
-    /// shortlist of the five filter modes); 0 = FILTER_DC only.
+    /// Filter-intra finalists given full RD at the square 8/16/32 leaves
     pub(crate) filter_intra_budget: u32,
+    /// Same at 4:4:4, where the budget is BD-neutral (new444 14 images
+    /// -0.00) and only costs time: stays 0.
+    pub(crate) filter_intra_budget_444: u32,
+    /// Admit a filter-intra candidate on RD cost alone (libaom), instead of
+    /// requiring it to also beat the best plain candidate's SSE.
+    pub(crate) filter_intra_rd_only: bool,
+    /// Filter-intra candidates on the 16x8 / 8x16 leaves.
+    pub(crate) filter_intra_rect: bool,
     /// 4:2:0 8x8 leaf: CfL-vs-DC decided on the chroma lambda (emit_mlam_c).
-    /// SHIPPED true (unification V9, 2026-11-06): 420 tuning -0.03, holdout
-    /// -0.19 (h_springtree -0.73, worst kodak05 +0.22).
     pub(crate) uv8_cfl_mlam_c: bool,
     /// 4:2:0 8x8 leaf: zone-2 chroma angle deltas for the directional winner
     pub(crate) uv8_ad: bool,
@@ -325,6 +363,9 @@ pub(crate) struct Tuning {
     /// block with one outline edge in a corner coded its residual with one
     /// TX_32X32 (~45 B per non-skipped 32x32 on jake_cat vs aom's 0.9 B).
     pub(crate) tx32_depth2: bool,
+    /// 32x32 luma: try the depth-1 split (four TX_16X16) on plain RD on every
+    /// block, not only under `banding_risk` (synthetic-gap study P2).
+    pub(crate) tx32_split_rd: bool,
     pub(crate) uv422_mid_scale: f32,
     /// Source-domain SPLIT breakout ratio at Slow. 1.5 -> 2.77 in the Phase 3
     /// re-fit (fewer breakouts; most of the Phase 3 +2% instr, x_volcanic 444
@@ -610,6 +651,10 @@ pub(crate) struct Tuning {
     /// Contextual trellis: also scan lower DC levels for the DC-only
     /// terminal (the Step-A DC level was optimized assuming the AC stays).
     pub(crate) trellis_dc_only_scan: bool,
+    /// Contextual trellis: run the libaom `av1_optimize_txb` search
+    /// structure (terminal-first EOB walk with max 2 kept nonzeros,
+    /// level-1-only interior lowering) on our rate model and lambda.
+    pub(crate) trellis_aom: bool,
     /// Contextual trellis: price every EOB candidate in ITS OWN contexts.
     /// The prefix costs were built once from the post-Step-A level map and
     /// reused for every shorter EOB, although zeroing the suffix lowers the
@@ -670,6 +715,12 @@ impl Tuning {
         part_budget_444_only: true,
         rect_tx_split: true,
         rect_uv_search: false,
+        rect_uv_joint: true,
+        rect_uv_joint_k: 4,
+        rect_full_modes: true,
+        strip_modes: true,
+        strip_uv_joint: true,
+        rect_split_seq: true,
         recon_src_init: false,
         split16_bias: 1.0,
         split4_bias: 1.0,
@@ -749,12 +800,22 @@ impl Tuning {
         proxy_ad: false,
         ad16_full: false,
         uv8_vs_cfl: true,
+        uv8_joint: true,
+        uv8_joint_k: 4,
+        uv16_joint: true,
+        prdo_k: 0.4,
+        prdo_k_444: 0.5,
+        trellis_dz: 0.0,
         cfl_alpha_rd_steps: 0,
         cfl_alpha_rd_mode: 0,
-        filter_intra_budget: 0,
+        filter_intra_budget: 3,
+        filter_intra_budget_444: 0,
+        filter_intra_rd_only: false,
+        filter_intra_rect: true,
         uv8_cfl_mlam_c: true,
         uv8_ad: true,
         tx32_depth2: true,
+        tx32_split_rd: false,
         uv422_mid_scale: 0.5,
         split_breakout_slow: 2.771115,
         fixed_size_fast: 16,
@@ -863,6 +924,7 @@ impl Tuning {
         trellis_dc_ctx0: true,
         trellis_zero_bits: 1.0,
         trellis_dc_only_scan: false,
+        trellis_aom: false,
         trellis_eob_reprice: false,
         trellis_eob_zero_term: false,
         trellis_pad_stride: false,
@@ -958,6 +1020,12 @@ mod imp {
                 "part_budget_444_only" => t.part_budget_444_only = flag(value),
                 "rect_tx_split" => t.rect_tx_split = flag(value),
                 "rect_uv_search" => t.rect_uv_search = flag(value),
+                "rect_uv_joint" => t.rect_uv_joint = flag(value),
+                "rect_uv_joint_k" => t.rect_uv_joint_k = num(value) as u32,
+                "rect_full_modes" => t.rect_full_modes = flag(value),
+                "strip_modes" => t.strip_modes = flag(value),
+                "strip_uv_joint" => t.strip_uv_joint = flag(value),
+                "rect_split_seq" => t.rect_split_seq = flag(value),
                 "recon_src_init" => t.recon_src_init = flag(value),
                 "split16_bias" => t.split16_bias = num(value),
                 "split4_bias" => t.split4_bias = num(value),
@@ -1037,12 +1105,22 @@ mod imp {
                 "proxy_ad" => t.proxy_ad = flag(value),
                 "ad16_full" => t.ad16_full = flag(value),
                 "uv8_vs_cfl" => t.uv8_vs_cfl = flag(value),
+                "uv8_joint" => t.uv8_joint = flag(value),
+                "uv8_joint_k" => t.uv8_joint_k = num(value) as u32,
+                "uv16_joint" => t.uv16_joint = flag(value),
+                "prdo_k" => t.prdo_k = num(value),
+                "prdo_k_444" => t.prdo_k_444 = num(value),
+                "trellis_dz" => t.trellis_dz = num(value),
                 "cfl_alpha_rd_steps" => t.cfl_alpha_rd_steps = num(value) as u32,
                 "cfl_alpha_rd_mode" => t.cfl_alpha_rd_mode = num(value) as u32,
                 "filter_intra_budget" => t.filter_intra_budget = num(value) as u32,
+                "filter_intra_budget_444" => t.filter_intra_budget_444 = num(value) as u32,
+                "filter_intra_rd_only" => t.filter_intra_rd_only = flag(value),
+                "filter_intra_rect" => t.filter_intra_rect = flag(value),
                 "uv8_cfl_mlam_c" => t.uv8_cfl_mlam_c = flag(value),
                 "uv8_ad" => t.uv8_ad = flag(value),
                 "tx32_depth2" => t.tx32_depth2 = flag(value),
+                "tx32_split_rd" => t.tx32_split_rd = flag(value),
                 "uv422_mid_scale" => t.uv422_mid_scale = num(value),
                 "split_breakout_slow" => t.split_breakout_slow = num(value),
                 "fixed_size_fast" => t.fixed_size_fast = num(value) as u32,
@@ -1151,6 +1229,7 @@ mod imp {
                 "trellis_dc_ctx0" => t.trellis_dc_ctx0 = flag(value),
                 "trellis_zero_bits" => t.trellis_zero_bits = num(value),
                 "trellis_dc_only_scan" => t.trellis_dc_only_scan = flag(value),
+                "trellis_aom" => t.trellis_aom = flag(value),
                 "trellis_eob_reprice" => t.trellis_eob_reprice = flag(value),
                 "trellis_eob_zero_term" => t.trellis_eob_zero_term = flag(value),
                 "trellis_pad_stride" => t.trellis_pad_stride = flag(value),

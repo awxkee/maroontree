@@ -1325,7 +1325,7 @@ impl<'a> LossyTile<'a> {
         // candidate (and the residual IBC plan) carries its chroma error, so
         // the skip copy must too (external review round 3: a 4:2:2 copy added
         // 4.2M chroma SSE at an unchanged cost). Priced 1:1 like
-        // `ibc_residual_rd`; `ibc_reference` realises odd-DV bilinear chroma.
+        // `ibc_residual_rd`; `ibc_reference` realizes odd-DV bilinear chroma.
         if !self.mono {
             let sx = usize::from(self.ss420 || self.ss422);
             let sy = usize::from(self.ss420);
@@ -2293,13 +2293,6 @@ impl<'a> LossyTile<'a> {
             rd_split_upper += child_none[i];
         }
         let rd_ibc = self.rd_cost_intrabc(px, py, 64, thr, prdo);
-        #[cfg(feature = "tuning")]
-        if units_probe_on() {
-            eprintln!(
-                "MARGIN lvl=64 none={rd_none:.1} split_upper={rd_split_upper:.1} ibc={:.1} lam_bits={split_signal:.1}",
-                rd_ibc.unwrap_or(f32::INFINITY)
-            );
-        }
         let best_whole = rd_leaf.min(rd_ibc.unwrap_or(f32::INFINITY));
         if rd_split_upper < best_whole {
             return Part16::Split;

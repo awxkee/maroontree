@@ -31,6 +31,18 @@
 /// `cf[..64]`, second in `cf[64..]`), see [`rect_half_offset`].
 const RECT_SPLIT_TXTP: usize = 7;
 
+/// A rect16 leaf's luma winner: (mode, angle delta, prediction, residual,
+/// coefficients, palette, filter-intra mode).
+type RectLumaWin = (
+    usize,
+    i32,
+    [i32; 128],
+    [i32; 128],
+    [i32; 128],
+    Option<LossyLumaPalette>,
+    Option<FilterIntraMode>,
+);
+
 /// Luma offset of half `i` of a rect16 leaf: HORZ halves sit side by side,
 /// VERT halves are stacked. Decode order is half 0 then half 1.
 fn rect_half_offset(vert: bool, i: usize) -> (usize, usize) {
@@ -908,11 +920,14 @@ impl<'a> LossyTile<'a> {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rd_cost_rect16_leaf_with_dc(
         &self,
         px: usize,
         py: usize,
         vert: bool,
+        have_tr: bool,
+        have_bl: bool,
         prdo: f32,
         dc: i32,
     ) -> f32 {
@@ -923,7 +938,12 @@ impl<'a> LossyTile<'a> {
         // `trellis_lambda() * prdo` — so prdo is part of the key (external
         // review round 2, finding 7).
         let key = (
-            ((px as u64) << 40) | ((py as u64) << 20) | ((dc as u64) << 1) | vert as u64,
+            ((px as u64) << 40)
+                | ((py as u64) << 20)
+                | ((dc as u64) << 1)
+                | vert as u64
+                | ((have_tr as u64) << 62)
+                | ((have_bl as u64) << 63),
             prdo.to_bits(),
         );
         let epoch = self.emit_epoch.get();
@@ -941,8 +961,18 @@ impl<'a> LossyTile<'a> {
         // The mode / TX selection inside the leaf is a wSSE decision
         // (`lambda_d`); only the returned leaf is priced on SATD with `mlam`.
         let lam_d = self.lambda_d() * prdo;
-        let (y_mode, _, pred, resid, cf, rpal) =
-            self.rect16_luma_mode_search(px, py, vert, dc, dlam, lam_d, rect_dec_refine());
+        let (y_mode, y_delta, pred, resid, cf, rpal, rfi) = self.rect16_luma_mode_search(
+            px,
+            py,
+            vert,
+            have_tr,
+            have_bl,
+            dc,
+            dlam,
+            lam_d,
+            rect_dec_refine(),
+        );
+        let tx_mode = filter_intra_tx_mode(rfi, y_mode);
         let (txtp, cf) = self.rect_leaf_tx_trial(
             &resid,
             &cf,
@@ -950,12 +980,12 @@ impl<'a> LossyTile<'a> {
             px,
             py,
             vert,
-            y_mode,
+            tx_mode,
             dlam,
             lam_d,
             rect_dec_refine(),
             rpal.is_some(),
-            self.rect_split_allowed(),
+            self.rect_split_allowed() && rfi.is_none() && (crate::tuning::get().rect_full_modes || Self::rect_tbfree(y_mode, y_delta)),
         );
         let rr = inv_rect_luma_128(&self.idct, &cf, &self.quant, vert, txtp);
         let distortion = self.luma_partition_distortion(
@@ -978,12 +1008,16 @@ impl<'a> LossyTile<'a> {
         if let Some(p) = rpal.as_ref() {
             bits += self.palette_rate_bits(px, py, p);
         }
+        if let Some(f) = rfi {
+            bits += cdf_cost(&self.dcdf().filter_intra[av1_block_size_index(w, h)], 1)
+                + cdf_cost(&self.dcdf().filter_intra_mode, f as usize);
+        }
         bits += if txtp == 2 || txtp == 3 {
-            self.luma_rect_bits_1d(&cf, w, txtp == 2, px, py, y_mode)
+            self.luma_rect_bits_1d(&cf, w, txtp == 2, px, py, tx_mode)
         } else if txtp == RECT_SPLIT_TXTP {
             self.rect_split_bits(&cf, vert, px, py, y_mode)
         } else {
-            self.luma_rect_bits(&cf, scan, w, h, px, py, y_mode, txtp)
+            self.luma_rect_bits(&cf, scan, w, h, px, py, tx_mode, txtp)
         };
         self.rect_leaf_cache
             .borrow_mut()
@@ -991,13 +1025,21 @@ impl<'a> LossyTile<'a> {
         crate::partition_rd::rd_cost(distortion, mlam, bits)
     }
 
-    fn rd_cost_rect16_leaf(&self, px: usize, py: usize, vert: bool, prdo: f32) -> f32 {
+    fn rd_cost_rect16_leaf(
+        &self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        have_tr: bool,
+        have_bl: bool,
+        prdo: f32,
+    ) -> f32 {
         let dc = if vert {
             self.intrapred.dc_pred_8x16(&self.recon[0], self.w, px, py, self.bd as i32)
         } else {
             self.intrapred.dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32)
         };
-        self.rd_cost_rect16_leaf_with_dc(px, py, vert, prdo, dc)
+        self.rd_cost_rect16_leaf_with_dc(px, py, vert, have_tr, have_bl, prdo, dc)
     }
 
     /// Reprice a rectangular leaf whose top or left edge belongs to an earlier
@@ -1005,16 +1047,19 @@ impl<'a> LossyTile<'a> {
     /// stale pixels there; source samples are a close proxy for the sibling's
     /// eventual reconstruction and, by taking the worst cost, prevent a stale
     /// zero edge from making the partition look artificially cheap.
+    #[allow(clippy::too_many_arguments)]
     fn rd_cost_rect16_dependent(
         &self,
         px: usize,
         py: usize,
         vert: bool,
+        have_tr: bool,
+        have_bl: bool,
         source_above: bool,
         source_left: bool,
         prdo: f32,
     ) -> f32 {
-        let base = self.rd_cost_rect16_leaf(px, py, vert, prdo);
+        let base = self.rd_cost_rect16_leaf(px, py, vert, have_tr, have_bl, prdo);
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
         let above = py > 0;
         let left = px > 0;
@@ -1047,7 +1092,7 @@ impl<'a> LossyTile<'a> {
         } else {
             (sum + count / 2) / count
         };
-        base.max(self.rd_cost_rect16_leaf_with_dc(px, py, vert, prdo, dc))
+        base.max(self.rd_cost_rect16_leaf_with_dc(px, py, vert, have_tr, have_bl, prdo, dc))
     }
 
     const RECT_LEAF_MODES: [usize; 7] = [
@@ -1064,16 +1109,56 @@ impl<'a> LossyTile<'a> {
     /// decision-stage DC/DCT proxy; emitters pass `true` and retain the full
     /// mode beam. Returns mode, prediction, residual, and DCT coefficients.
     #[allow(clippy::too_many_arguments)]
+    /// Decoder-exact (`have_tr`, `have_bl`) of a rect16 leaf, dav1d
+    /// `init_edges` / `decode_sb`: HORZ top = (node tr, true), HORZ bottom =
+    /// (false, node bl), VERT left = (true, node bl), VERT right = (node tr,
+    /// false); the T-shapes' rect part carries the same half's flags
+    /// (HORZ_A bottom = h[1], HORZ_B top = h[0], VERT_A right = v[1], VERT_B
+    /// left = v[0]). Then the frame-bounds clip the square leaves get.
+    fn rect_edge_flags(
+        &self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        second: bool,
+        thr: bool,
+        lhb: bool,
+    ) -> (bool, bool) {
+        let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
+        let (tr, bl) = match (vert, second) {
+            (false, false) => (thr, true),
+            (false, true) => (false, lhb),
+            (true, false) => (true, lhb),
+            (true, true) => (thr, false),
+        };
+        (tr && py > 0 && px + w < self.w, bl && px > 0 && py + h < self.h)
+    }
+
+    /// A (mode, delta) whose prediction never reads above-right / below-left
+    /// (zone 2 and the non-directional modes): exact under any edge flags,
+    /// so the per-half re-prediction of the split-TX path stays exact.
+    fn rect_tbfree(m: usize, d: i32) -> bool {
+        !is_directional_mode(m)
+            || (m == V_PRED && d >= 0)
+            || (m == H_PRED && d <= 0)
+            || m == D113_PRED
+            || m == D135_PRED
+            || m == D157_PRED
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rect16_luma_mode_search(
         &self,
         px: usize,
         py: usize,
         vert: bool,
+        have_tr: bool,
+        have_bl: bool,
         dc: i32,
         lam: f32,
         mlam: f32,
         refine: bool,
-    ) -> (usize, i32, [i32; 128], [i32; 128], [i32; 128], Option<LossyLumaPalette>) {
+    ) -> RectLumaWin {
         let (w, h) = if vert { (8usize, 16usize) } else { (16, 8) };
         let scan: &[u32] = if vert { &SCAN_8X16 } else { &SCAN_16X8 };
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
@@ -1102,7 +1187,22 @@ impl<'a> LossyTile<'a> {
         // top-right nor the bottom-left edge, so the leaf's tr/bl-free edge
         // setup stays exact.
         let rect_ad = refine && self.speed.at_least_slow() && crate::tuning::get().rect_ad;
-        let mut all = FixedList::<(usize, i32), 13>::new((DC_PRED, 0));
+        // `rect_full_modes`: the leaf predicts with its decoder-exact edge
+        // flags and offers every directional mode and delta (zone 1/3 too);
+        // off, the tr/bl-free set predicted without the edges (exact).
+        let full = refine && self.speed.at_least_slow() && crate::tuning::get().rect_full_modes;
+        let (ptr, pbl) = if full { (have_tr, have_bl) } else { (false, false) };
+        // Filter-intra on the rect leaf (`filter_intra_rect`): the square
+        // leaves' SATD-ranked shortlist, priced like every other candidate;
+        // the DC candidates then also carry the filter_intra=0 flag they
+        // signal, so the comparison is fair.
+        let fi_budget = if refine && self.speed.at_least_slow() && crate::tuning::get().filter_intra_rect {
+            self.speed.filter_intra_refine_budget(self.ss444())
+        } else {
+            0
+        };
+        let fi_bsize = av1_block_size_index(w, h);
+        let mut all = FixedList::<(usize, i32), 64>::new((DC_PRED, 0));
         for &m in modes {
             all.push((m, 0));
         }
@@ -1110,6 +1210,22 @@ impl<'a> LossyTile<'a> {
             for d in 1..=3 {
                 all.push((V_PRED, d));
                 all.push((H_PRED, -d));
+            }
+        }
+        if full {
+            for m in [D45_PRED, D135_PRED, D113_PRED, D157_PRED, D203_PRED, VERT_LEFT_PRED] {
+                all.push((m, 0));
+            }
+            if rect_ad {
+                for d in 1..=3 {
+                    all.push((V_PRED, -d));
+                    all.push((H_PRED, d));
+                }
+                for m in [D45_PRED, D203_PRED, VERT_LEFT_PRED] {
+                    for d in [-3, -2, -1, 1, 2, 3] {
+                        all.push((m, d));
+                    }
+                }
             }
         }
         let mut all_diag = FixedList::<(usize, i32), 21>::new((DC_PRED, 0));
@@ -1133,8 +1249,8 @@ impl<'a> LossyTile<'a> {
                     py,
                     w,
                     h,
-                    false,
-                    false,
+                    ptr,
+                    pbl,
                     self.w,
                     self.h,
                     ftype,
@@ -1143,7 +1259,7 @@ impl<'a> LossyTile<'a> {
                 );
             }
         };
-        let mut cands = FixedList::<(u64, usize, i32), 34>::new((0, DC_PRED, 0));
+        let mut cands = FixedList::<(u64, usize, i32), 90>::new((0, DC_PRED, 0));
         for &(m, d) in all.iter().chain(all_diag.iter()) {
             let mut pred = [0i32; 128];
             predict(m, d, dc, &mut pred);
@@ -1170,6 +1286,7 @@ impl<'a> LossyTile<'a> {
             [0i32; 128],
             0i32,
         );
+        let mut best_sse = i64::MAX;
         for &(_, m, d) in &cands {
             let mut pred = [0i32; 128];
             predict(m, d, dc, &mut pred);
@@ -1193,9 +1310,57 @@ impl<'a> LossyTile<'a> {
             if rect_ad && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
                 bits += cdf_cost(&self.dcdf().angle_delta[m - V_PRED], (d + 3) as usize);
             }
+            if fi_budget > 0 && m == DC_PRED {
+                bits += cdf_cost(&self.dcdf().filter_intra[fi_bsize], 0);
+            }
             let cost = rd_cost_i64(sse, mlam, bits);
             if cost < best.0 {
                 best = (cost, m, pred, resid, cf, d);
+                best_sse = sse;
+            }
+        }
+        let mut best_fi: Option<FilterIntraMode> = None;
+        if fi_budget > 0 {
+            let mut fi_preds = [[0i32; 128]; 5];
+            for (fi_si, &filter_mode) in self
+                .rank_filter_intra_modes::<128>(px, py, w, h, fi_budget, &mut fi_preds)
+                .iter()
+                .enumerate()
+            {
+                let pred = fi_preds[fi_si];
+                let mut resid = [0i32; 128];
+                self.rd.residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, w, h);
+                let (mut cf, tf) = if vert {
+                    self.dct.dct8x16_t(&resid, &self.quant)
+                } else {
+                    self.dct.dct16x8_t(&resid, &self.quant)
+                };
+                self.luma_rect_trellis(&mut cf, &tf, dcq, acq, scan, lam, w, h, px, py);
+                self.rd.preserve_dc(&mut cf[0], &resid[..]);
+                let rr = if vert {
+                    self.idct.idct_dequant_8x16(&cf, &self.quant)
+                } else {
+                    self.idct.idct_dequant_16x8(&cf, &self.quant)
+                };
+                let sse =
+                    self.rd.sse_recon(&pred, &rr, self.src_blk(0, px, py, w, h), self.bd);
+                // Admission needs `sse <= best_sse`: skip the rate pass otherwise.
+                if sse > best_sse {
+                    continue;
+                }
+                // The tx-type set is keyed on the filter mode's intra direction.
+                let tx_mode = filter_intra_tx_mode(Some(filter_mode), DC_PRED);
+                let bits = self.luma_rect_bits(&cf, scan, w, h, px, py, tx_mode, 1)
+                    + cdf_cost(kf, DC_PRED)
+                    + cdf_cost(&self.dcdf().filter_intra[fi_bsize], 1)
+                    + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
+                let cost = rd_cost_i64(sse, mlam, bits);
+                // Same admission as the square leaves: must not lose SSE.
+                if sse <= best_sse && cost < best.0 {
+                    best = (cost, DC_PRED, pred, resid, cf, 0);
+                    best_sse = sse;
+                    best_fi = Some(filter_mode);
+                }
             }
         }
         // Palette leaf: 16x8 / 8x16 is the dominant palette shape on text
@@ -1236,10 +1401,11 @@ impl<'a> LossyTile<'a> {
                 if cost < best.0 {
                     best = (cost, DC_PRED, pred, resid, cf, 0);
                     best_pal = Some(palette);
+                    best_fi = None;
                 }
             }
         }
-        (best.1, best.5, best.2, best.3, best.4, best_pal)
+        (best.1, best.5, best.2, best.3, best.4, best_pal, best_fi)
     }
 
     /// Transform-type trial for a rectangular luma leaf: ADST_ADST against the
@@ -1375,11 +1541,37 @@ impl<'a> LossyTile<'a> {
     /// reference). Edge flags: the rect leaf's mode set never reads
     /// above-right / below-left (see `rect16_luma_mode_search`), same as the
     /// whole leaf.
+    /// Per-transform edge flags of the two TX_8X8 inside a rect16 leaf whose
+    /// block flags are (`have_tr`, `have_bl`), dav1d `recon_tmpl.c`: a TX has
+    /// above-right if it is in the first TX row and the block has it, or it
+    /// is not the rightmost TX column; below-left if it is in the leftmost TX
+    /// column and (the block has it, or it is not the last TX row). The
+    /// in-block edges exist iff the block's top row / left column do.
+    fn rect_tx_flags(
+        &self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        i: usize,
+        have_tr: bool,
+        have_bl: bool,
+    ) -> (bool, bool) {
+        match (vert, i) {
+            (false, 0) => (py > 0, have_bl),
+            (false, _) => (have_tr, false),
+            (true, 0) => (have_tr, px > 0),
+            (true, _) => (false, have_bl),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rect_split_commit(
         &mut self,
         px: usize,
         py: usize,
         vert: bool,
+        have_tr: bool,
+        have_bl: bool,
         y_mode: usize,
         y_delta: i32,
         lam: f32,
@@ -1393,6 +1585,11 @@ impl<'a> LossyTile<'a> {
         for (i, half_cf) in split_cf.iter_mut().enumerate() {
             let (dx, dy) = rect_half_offset(vert, i);
             let (bx, by) = (px + dx, py + dy);
+            let (tx_tr, tx_bl) = if crate::tuning::get().rect_full_modes {
+                self.rect_tx_flags(px, py, vert, i, have_tr, have_bl)
+            } else {
+                (false, false)
+            };
             let mut pred8 = [0i32; 64];
             if y_mode == DC_PRED && y_delta == 0 {
                 let d = self.intrapred.dc_pred_8x8(&self.recon[0], self.w, bx, by, self.bd as i32);
@@ -1407,8 +1604,8 @@ impl<'a> LossyTile<'a> {
                     by,
                     8,
                     8,
-                    false,
-                    false,
+                    tx_tr,
+                    tx_bl,
                     self.w,
                     self.h,
                     block_ftype,
@@ -1450,6 +1647,93 @@ impl<'a> LossyTile<'a> {
                 .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..lw]);
         }
         (split_cf, luma_rec)
+    }
+
+    /// `rect_split_seq`: the decoder-faithful split-TX estimate the leaf's
+    /// transform trial cannot make from `&self`: run [`Self::rect_split_commit`]
+    /// (half 1 predicted from the RECONSTRUCTED half 0, per-TX edge flags),
+    /// read the leaf's SSE and bits, and put the reconstruction back. The
+    /// `&self` estimator (`rect_split_try`) predicts both halves from the
+    /// whole-leaf prediction and under-reads the split's distortion gain:
+    /// under aom's tree the blocks aom splits and we kept whole cost x1.31
+    /// bits at x1.49 SSE, the same-TX blocks x1.09 at x1.10.
+    /// `rect_split_seq`: re-decide a rect leaf's whole-TX winner `ltxtp`
+    /// against two TX_8X8 coded the way the decoder sees them (half 1
+    /// predicted from the reconstructed half 0, [`Self::rect_split_probe`]).
+    /// Returns the transform type to code; the coefficients are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn rect_split_seq_txtp(
+        &mut self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        have_tr: bool,
+        have_bl: bool,
+        y_mode: usize,
+        y_delta: i32,
+        tx_mode: usize,
+        lam: f32,
+        emlam: f32,
+        ltxtp: usize,
+        lcf: &[i32; 128],
+        lpred: &[i32; 128],
+    ) -> usize {
+        if ltxtp == RECT_SPLIT_TXTP || !crate::tuning::get().rect_split_seq {
+            return ltxtp;
+        }
+        let (lw, lh) = if vert { (8usize, 16usize) } else { (16, 8) };
+        let scan: &[u32] = if vert { &SCAN_8X16 } else { &SCAN_16X8 };
+        let rr_w = inv_rect_luma_128(&self.idct, lcf, &self.quant, vert, ltxtp);
+        let sse_w = self.rd.sse_recon(lpred, &rr_w, self.src_blk(0, px, py, lw, lh), self.bd);
+        let bits_w = if ltxtp == 2 || ltxtp == 3 {
+            self.luma_rect_bits_1d(lcf, lw, ltxtp == 2, px, py, tx_mode)
+        } else {
+            self.luma_rect_bits(lcf, scan, lw, lh, px, py, tx_mode, ltxtp)
+        };
+        let (sse_s, bits_s) =
+            self.rect_split_probe(px, py, vert, have_tr, have_bl, y_mode, y_delta, tx_mode, lam);
+        if rd_cost_i64(sse_s, emlam, bits_s) < rd_cost_i64(sse_w, emlam, bits_w) {
+            RECT_SPLIT_TXTP
+        } else {
+            ltxtp
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rect_split_probe(
+        &mut self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        have_tr: bool,
+        have_bl: bool,
+        y_mode: usize,
+        y_delta: i32,
+        tx_mode: usize,
+        lam: f32,
+    ) -> (i64, f32) {
+        let (lw, lh) = if vert { (8usize, 16usize) } else { (16, 8) };
+        let mut saved = [0u16; 128];
+        for ry in 0..lh {
+            saved[ry * lw..ry * lw + lw]
+                .copy_from_slice(&self.recon[0][(py + ry) * self.w + px..][..lw]);
+        }
+        let (split_cf, luma_rec) =
+            self.rect_split_commit(px, py, vert, have_tr, have_bl, y_mode, y_delta, lam);
+        for ry in 0..lh {
+            self.recon[0][(py + ry) * self.w + px..][..lw]
+                .copy_from_slice(&saved[ry * lw..ry * lw + lw]);
+        }
+        let mut rec = [0i32; 128];
+        for (r, &v) in rec.iter_mut().zip(luma_rec.iter()) {
+            *r = v as i32;
+        }
+        let sse = self.rd.sse_recon(&rec, &[0i32; 128], self.src_blk(0, px, py, lw, lh), self.bd);
+        let mut cf128 = [0i32; 128];
+        cf128[..64].copy_from_slice(&split_cf[0]);
+        cf128[64..].copy_from_slice(&split_cf[1]);
+        let bits = self.rect_split_bits(&cf128, vert, px, py, tx_mode);
+        (sse, bits)
     }
 
     /// Emit a split rect16 leaf's two TX_8X8 coefficient blocks in decode
@@ -1574,18 +1858,22 @@ impl<'a> LossyTile<'a> {
         bits
     }
 
-    fn rd_cost_horz(&self, px: usize, py: usize, prdo: f32) -> f32 {
+    fn rd_cost_horz(&self, px: usize, py: usize, thr: bool, lhb: bool, prdo: f32) -> f32 {
         let mlam = self.mlam() * prdo;
+        let (t0, b0) = self.rect_edge_flags(px, py, false, false, thr, lhb);
+        let (t1, b1) = self.rect_edge_flags(px, py + 8, false, true, thr, lhb);
         rate_cost(mlam, self.part16_rate(px / 8, py / 8, 1))
-            + self.rd_cost_rect16_leaf(px, py, false, prdo)
-            + self.rd_cost_rect16_leaf(px, py + 8, false, prdo)
+            + self.rd_cost_rect16_leaf(px, py, false, t0, b0, prdo)
+            + self.rd_cost_rect16_leaf(px, py + 8, false, t1, b1, prdo)
     }
 
-    fn rd_cost_vert(&self, px: usize, py: usize, prdo: f32) -> f32 {
+    fn rd_cost_vert(&self, px: usize, py: usize, thr: bool, lhb: bool, prdo: f32) -> f32 {
         let mlam = self.mlam() * prdo;
+        let (t0, b0) = self.rect_edge_flags(px, py, true, false, thr, lhb);
+        let (t1, b1) = self.rect_edge_flags(px + 8, py, true, true, thr, lhb);
         rate_cost(mlam, self.part16_rate(px / 8, py / 8, 2))
-            + self.rd_cost_rect16_leaf(px, py, true, prdo)
-            + self.rd_cost_rect16_leaf(px + 8, py, true, prdo)
+            + self.rd_cost_rect16_leaf(px, py, true, t0, b0, prdo)
+            + self.rd_cost_rect16_leaf(px + 8, py, true, t1, b1, prdo)
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -1694,29 +1982,41 @@ impl<'a> LossyTile<'a> {
         best
     }
 
-    fn code_block16_vert_444(&mut self, x8: usize, y8: usize, halves: usize) {
+    fn code_block16_vert_444(&mut self, x8: usize, y8: usize, halves: usize, thr: bool, lhb: bool) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         for half in 0..halves {
             let (px, py) = (x8 * 8 + half * 8, y8 * 8);
+            let (tr_h, bl_h) = self.rect_edge_flags(px, py, true, half == 1, thr, lhb);
             let (bx4, by4) = (px / 4, py / 4);
             let dc_l = self.intrapred.dc_pred_8x16(&self.recon[0], self.w, px, py, self.bd as i32);
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
-                self.rect16_luma_mode_search(px, py, true, dc_l, lam, emlam, true);
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal, rfi) =
+                self.rect16_luma_mode_search(px, py, true, tr_h, bl_h, dc_l, lam, emlam, true);
+            let tx_mode = filter_intra_tx_mode(rfi, y_mode);
+            let allow_split = self.rect_split_allowed() && rpal.is_none() && rfi.is_none() && (crate::tuning::get().rect_full_modes || Self::rect_tbfree(y_mode, y_delta));
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, true, y_mode, lam, emlam, true, rpal.is_some(),
-                self.rect_split_allowed() && rpal.is_none());
+                &lresid, &lcf, &lpred_arr, px, py, true, tx_mode, lam, emlam, true, rpal.is_some(),
+                allow_split);
+            // Decoder-faithful split-TX check (`rect_split_seq`): re-decide whole vs
+            // two TX_8X8 with half 1 predicted from the reconstructed half 0.
+            let ltxtp = if allow_split {
+                self.rect_split_seq_txtp(
+                    px, py, true, tr_h, bl_h, y_mode, y_delta, tx_mode, lam, emlam, ltxtp, &lcf, &lpred_arr,
+                )
+            } else {
+                ltxtp
+            };
             let idct = self.idct;
             let inv8x16 = |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, true, ltxtp);
             let split = ltxtp == RECT_SPLIT_TXTP;
             let mut split_cf = [[0i32; 64]; 2];
             let mut split_rec = [0u16; 128];
             if split {
-                (split_cf, split_rec) = self.rect_split_commit(px, py, true, y_mode, y_delta, lam);
+                (split_cf, split_rec) = self.rect_split_commit(px, py, true, tr_h, bl_h, y_mode, y_delta, lam);
             }
             let mut ccf = [[0i32; 128]; 2];
             let mut cpred = [0i32; 2];
@@ -1844,7 +2144,7 @@ impl<'a> LossyTile<'a> {
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 8, 16);
             self.emit_palette_mode_info(px, py, 8, 16, y_mode, !self.mono, rpal.as_ref(), None);
             if rpal.is_none() {
-                self.emit_filter_intra(y_mode, 8, 16, None);
+                self.emit_filter_intra(y_mode, 8, 16, rfi);
             }
             if let Some(p) = rpal.as_ref() {
                 self.emit_palette_map(p);
@@ -1873,7 +2173,7 @@ impl<'a> LossyTile<'a> {
                             ltxtp == 2,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                         )
                     } else {
                         encode_8x16_luma_coeffs(
@@ -1882,7 +2182,7 @@ impl<'a> LossyTile<'a> {
                             &lcf,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                             ltxtp,
                         )
                     }
@@ -1943,14 +2243,15 @@ impl<'a> LossyTile<'a> {
     }
 
     /// 4:2:0 rect: HORZ = two 16x8 luma + 8x4 chroma; VERT = two 8x16 + 4x8.
-    fn code_block16_rect_420(&mut self, x8: usize, y8: usize, vert: bool) {
+    fn code_block16_rect_420(&mut self, x8: usize, y8: usize, vert: bool, thr: bool, lhb: bool) {
         for half in 0..2 {
             let (sx8, sy8) = if vert {
                 (x8 + half, y8)
             } else {
                 (x8, y8 + half)
             };
-            self.code_block16_rect_leaf_420(sx8, sy8, vert);
+            let (tr, bl) = self.rect_edge_flags(sx8 * 8, sy8 * 8, vert, half == 1, thr, lhb);
+            self.code_block16_rect_leaf_420(sx8, sy8, vert, tr, bl);
         }
     }
 }
@@ -2045,27 +2346,183 @@ fn encode_chroma_strip(
 }
 
 impl<'a> LossyTile<'a> {
+    /// Decoder-exact (`have_tr`, `have_bl`) of strip `i` of a HORZ_4 / VERT_4
+    /// 16x16 node (dav1d `init_edges` + `decode_sb`): HORZ_4 strips take
+    /// h[0] = (node tr, true), h4 = (false, true), (false, true), h[1] =
+    /// (false, node bl); VERT_4 strips v[0] = (true, node bl), v4 = (true,
+    /// false), (true, false), v[1] = (node tr, false). Frame-bounds clipped.
+    fn strip_edge_flags(
+        &self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        i: usize,
+        thr: bool,
+        lhb: bool,
+    ) -> (bool, bool) {
+        let (w, h) = if vert { (4usize, 16usize) } else { (16, 4) };
+        let (tr, bl) = match (vert, i) {
+            (false, 0) => (thr, true),
+            (false, 3) => (false, lhb),
+            (false, _) => (false, true),
+            (true, 0) => (true, lhb),
+            (true, 3) => (thr, false),
+            (true, _) => (true, false),
+        };
+        (tr && py > 0 && px + w < self.w, bl && px > 0 && py + h < self.h)
+    }
+
+    /// `strip_modes`: luma mode search of a 16x4 / 4x16 strip (every intra
+    /// mode, angle deltas, decoder-exact edge flags), SATD beam then the full
+    /// pipeline; returns (mode, delta, prediction, residual, coefficients).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn strip16_luma_mode_search(
+        &self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        have_tr: bool,
+        have_bl: bool,
+        lam: f32,
+        mlam: f32,
+    ) -> (usize, i32, [i32; 64], [i32; 64], [i32; 64]) {
+        let (lw, lh) = if vert { (4usize, 16usize) } else { (16, 4) };
+        let scan: &[u32] = if vert { &SCAN_4X16 } else { &SCAN_16X4 };
+        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let ftype = self.luma_filter_type(px, py);
+        let (bx4, by4) = (px / 4, py / 4);
+        let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
+            + INTRA_MODE_CTX[self.l_mode[by4] as usize];
+        let kf = &self.dcdf().kf_y[yctx];
+        let ad_ok = self.speed.try_angle_deltas_av1(16, self.base_q_idx);
+        const STRIP_MODES: [usize; 13] = [
+            DC_PRED,
+            V_PRED,
+            H_PRED,
+            D45_PRED,
+            D135_PRED,
+            D113_PRED,
+            D157_PRED,
+            D203_PRED,
+            VERT_LEFT_PRED,
+            SMOOTH_PRED,
+            SMOOTH_V_PRED,
+            SMOOTH_H_PRED,
+            PAETH_PRED,
+        ];
+        let mut all = FixedList::<(usize, i32), 64>::new((DC_PRED, 0));
+        for &m in &STRIP_MODES {
+            all.push((m, 0));
+            if ad_ok && (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                for d in [-3, -2, -1, 1, 2, 3] {
+                    all.push((m, d));
+                }
+            }
+        }
+        let predict = |m: usize, d: i32, pred: &mut [i32; 64]| {
+            if m == DC_PRED {
+                let dc = self.intrapred.dc_pred(&self.recon[0], self.w, px, py, lw, lh, self.bd as i32);
+                pred.fill(dc);
+            } else {
+                self.intrapred.predict_nd_ad(
+                    m,
+                    d,
+                    &self.recon[0],
+                    self.w,
+                    px,
+                    py,
+                    lw,
+                    lh,
+                    have_tr,
+                    have_bl,
+                    self.w,
+                    self.h,
+                    ftype,
+                    &mut pred[..],
+                    self.bd,
+                );
+            }
+        };
+        let mut cands = FixedList::<(u64, usize, i32), 64>::new((0, DC_PRED, 0));
+        for &(m, d) in all.iter() {
+            let mut pred = [0i32; 64];
+            predict(m, d, &mut pred);
+            let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, lw, lh), &pred, lw);
+            cands.push((score, m, d));
+        }
+        const STRIP_BEAM: usize = 3;
+        if cands.len() > STRIP_BEAM {
+            cands
+                .as_mut_slice()
+                .sort_unstable_by_key(|&(score, mode, d)| (score, mode, d));
+            let dc_pos = cands.iter().position(|&(_, m, _)| m == DC_PRED).unwrap();
+            if dc_pos >= STRIP_BEAM {
+                cands.as_mut_slice().swap(STRIP_BEAM - 1, dc_pos);
+            }
+            cands.truncate(STRIP_BEAM);
+        }
+        let mut best = (f32::INFINITY, DC_PRED, 0i32, [0i32; 64], [0i32; 64], [0i32; 64]);
+        for &(_, m, d) in &cands {
+            let mut pred = [0i32; 64];
+            predict(m, d, &mut pred);
+            let mut resid = [0i32; 64];
+            self.rd.residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, lw, lh);
+            let (mut cf, tf) = if vert {
+                self.dct.dct4x16_t(&resid, &self.quant)
+            } else {
+                self.dct.dct16x4_t(&resid, &self.quant)
+            };
+            trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
+            self.rd.preserve_dc(&mut cf[0], &resid[..]);
+            let rr = if vert {
+                self.idct.idct_dequant_4x16(&cf, &self.quant)
+            } else {
+                self.idct.idct_dequant_16x4(&cf, &self.quant)
+            };
+            let sse = self.rd.sse_recon(&pred, &rr, self.src_blk(0, px, py, lw, lh), self.bd);
+            let mut bits = self.luma_rect_bits(&cf, scan, lw, lh, px, py, m, 1) + cdf_cost(kf, m);
+            if (V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                bits += cdf_cost(&self.dcdf().angle_delta[m - V_PRED], (d + 3) as usize);
+            }
+            let cost = rd_cost_i64(sse, mlam, bits);
+            if cost < best.0 {
+                best = (cost, m, d, pred, resid, cf);
+            }
+        }
+        (best.1, best.2, best.3, best.4, best.5)
+    }
+
     /// Code a 16x16 region as PARTITION_HORZ_4 (four stacked 16x4 strips) or
-    /// PARTITION_VERT_4 (four side-by-side 4x16). DC luma prediction + DCT
-    /// (RTX_16X4/RTX_4X16), DC chroma. Chroma per format:
+    /// PARTITION_VERT_4 (four side-by-side 4x16), each strip with its own
+    /// mode search and an RTX_16X4 / RTX_4X16 luma transform. Chroma per format:
     /// - 4:4:4: every strip carries its own 16x4/4x16 chroma transform;
     /// - 4:2:2: HORZ_4 strips carry 8x4 chroma each (VERT_4 not selected at
     ///   4:2:2, matching the VERT rule);
     /// - 4:2:0: the subsampled dimension pairs strips — chroma is coded once
     ///   per pair, on strips 1 and 3, covering the pair's 8x4 / 4x8 region;
     /// - mono: luma only.
-    fn code_block16_quad(&mut self, x8: usize, y8: usize, vert: bool) {
+    fn code_block16_quad(&mut self, x8: usize, y8: usize, vert: bool, thr: bool, lhb: bool) {
         for i in 0..4 {
             let (px, py) = if vert {
                 (x8 * 8 + 4 * i, y8 * 8)
             } else {
                 (x8 * 8, y8 * 8 + 4 * i)
             };
-            self.code_strip16(px, py, vert, i);
+            let (tr, bl) = self.strip_edge_flags(px, py, vert, i, thr, lhb);
+            self.code_strip16(px, py, vert, i, tr, bl);
         }
     }
 
-    fn code_strip16(&mut self, px: usize, py: usize, vert: bool, idx: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn code_strip16(
+        &mut self,
+        px: usize,
+        py: usize,
+        vert: bool,
+        idx: usize,
+        have_tr: bool,
+        have_bl: bool,
+    ) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda() * self.emit_prdo(px, py, 16);
         let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
@@ -2074,17 +2531,24 @@ impl<'a> LossyTile<'a> {
         let (bx4, by4) = (px / 4, py / 4);
         let lscan: &[u32] = if vert { &SCAN_4X16 } else { &SCAN_16X4 };
 
-        // --- luma: DC predict, forward, trellis, dc-preservation nudge ---
-        let lpred = self.intrapred.dc_pred(&self.recon[0], self.w, px, py, lw, lh, self.bd as i32);
-        let mut lresid = [0i32; 64];
-        self.rd.residual_dc(&mut lresid, &self.src[0], self.w, px, py, lw, lh, lpred);
-        let (mut lcf, ltf) = if vert {
-            self.dct.dct4x16_t(&lresid, &self.quant)
+        // --- luma: mode search (`strip_modes`) or the DC-only leaf ---
+        let strip_modes = crate::tuning::get().strip_modes && self.speed.at_least_slow();
+        let (y_mode, y_delta, lpred_arr, _lresid, lcf) = if strip_modes {
+            let emlam = self.emit_mlam(px, py, 16);
+            self.strip16_luma_mode_search(px, py, vert, have_tr, have_bl, lam, emlam)
         } else {
-            self.dct.dct16x4_t(&lresid, &self.quant)
+            let lpred = self.intrapred.dc_pred(&self.recon[0], self.w, px, py, lw, lh, self.bd as i32);
+            let mut lresid = [0i32; 64];
+            self.rd.residual_dc(&mut lresid, &self.src[0], self.w, px, py, lw, lh, lpred);
+            let (mut lcf, ltf) = if vert {
+                self.dct.dct4x16_t(&lresid, &self.quant)
+            } else {
+                self.dct.dct16x4_t(&lresid, &self.quant)
+            };
+            trellis_optimize(&mut lcf, &ltf, dcq, acq, lscan, lam);
+            self.rd.preserve_dc(&mut lcf[0], &lresid[..]);
+            (DC_PRED, 0i32, [lpred; 64], lresid, lcf)
         };
-        trellis_optimize(&mut lcf, &ltf, dcq, acq, lscan, lam);
-        self.rd.preserve_dc(&mut lcf[0], &lresid[..]);
 
         // --- chroma geometry per format ---
         // (cx, cy, cw, ch) of the chroma transform this strip carries, if any.
@@ -2137,6 +2601,136 @@ impl<'a> LossyTile<'a> {
                 ccf[ci] = q;
             }
         }
+        // `strip_uv_joint`: the rect leaf's joint (mode, delta) chroma
+        // shortlist (section 18 of the synthetic-gap doc) on the strip pair's
+        // 8x4 / 4x8 chroma, tr/bl-free set so the prediction is exact under
+        // any edge flags; full RD per kept pair against the DC leaf.
+        let mut chosen_uv = DC_PRED;
+        let mut uv_delta_strip = 0i32;
+        let mut uv_tx = ChromaTx::DctDct;
+        let mut uv_pred = [[0i32; 32]; 2];
+        if let Some((cx, cy, cw, ch)) = chroma
+            && cw * ch == 32
+            && crate::tuning::get().strip_uv_joint
+            && self.speed.at_least_slow()
+        {
+            let tune = crate::tuning::get();
+            let vert = cw == 4;
+            let n = 32usize;
+            let cscan = chroma_scan_for(cw, ch);
+            let mlam = self.emit_mlam_c(px, py, 16);
+            let mut dc_cost = 0f32;
+            for ci in 0..2 {
+                let plane = ci + 1;
+                let src = self.src_blk(plane, cx, cy, cw, ch);
+                let rr = inv_chroma_strip(&self.idct, cw, ch, &ccf[ci], &self.cquant);
+                let s0 = self.rd.sse_recon(&[cpred[ci]; 32][..n], &rr[..n], src, self.bd);
+                dc_cost += rd_cost_i64(
+                    s0,
+                    mlam,
+                    self.chroma_rect_bits(&ccf[ci][..n], cscan, cw, ch, plane, cx, cy),
+                );
+            }
+            let mut best_total = dc_cost + rate_cost(mlam, self.uv_mode_bits(y_mode, DC_PRED, None));
+            const STRIP_JOINT_MODES: [usize; 9] = [
+                PAETH_PRED,
+                SMOOTH_PRED,
+                SMOOTH_V_PRED,
+                SMOOTH_H_PRED,
+                V_PRED,
+                H_PRED,
+                D135_PRED,
+                D113_PRED,
+                D157_PRED,
+            ];
+            let k = (tune.rect_uv_joint_k as usize).clamp(1, 12);
+            let ad_ok = self.speed.try_angle_deltas_av1(16, self.base_q_idx);
+            let joint_ch = if self.ss420 { self.h.div_ceil(2) } else { self.h };
+            let ftype = self.chroma_filter_type(px, py);
+            let mut all = FixedList::<(u64, usize, i32), 45>::new((0, DC_PRED, 0));
+            for &m in &STRIP_JOINT_MODES {
+                let deltas: &[i32] = if !ad_ok || !(V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                    &[0]
+                } else if m == V_PRED {
+                    &[0, 1, 2, 3]
+                } else if m == H_PRED {
+                    &[-3, -2, -1, 0]
+                } else {
+                    &[-3, -2, -1, 0, 1, 2, 3]
+                };
+                for &d in deltas {
+                    let mut cost = 0u64;
+                    for plane in 1..=2 {
+                        let mut pp = [0i32; 32];
+                        self.intrapred.predict_nd_ad(
+                            m, d, &self.recon[plane], self.cw, cx, cy, cw, ch, false, false,
+                            self.cw, joint_ch, ftype, &mut pp, self.bd,
+                        );
+                        cost += self.rd.satd_sad_proxy(self.src_blk(plane, cx, cy, cw, ch), &pp, cw);
+                    }
+                    all.push((cost, m, d));
+                }
+            }
+            all.as_mut_slice().sort_unstable_by_key(|&(c, m, d)| (c, m, d));
+            for &(_, cand, jd) in all.as_slice().iter().take(k) {
+                let tx = chroma_tx_for_mode(cand);
+                let ad_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                    let ad = &self.dcdf().angle_delta[cand - V_PRED];
+                    cdf_cost(ad, (jd + 3) as usize) - cdf_cost(ad, 3)
+                } else {
+                    0.0
+                };
+                let mut cand_ccf = [[0i32; 32]; 2];
+                let mut cand_pred = [[0i32; 32]; 2];
+                let mut cand_total =
+                    rate_cost(mlam, self.uv_mode_bits(y_mode, cand, None) + ad_bits);
+                for ci in 0..2 {
+                    let plane = ci + 1;
+                    let src = self.src_blk(plane, cx, cy, cw, ch);
+                    let mut pp = [0i32; 32];
+                    self.intrapred.predict_nd_ad(
+                        cand, jd, &self.recon[plane], self.cw, cx, cy, cw, ch, false, false,
+                        self.cw, joint_ch, ftype, &mut pp, self.bd,
+                    );
+                    let mut resid = [0i32; 32];
+                    self.rd.residual_pred_blk(&mut resid, &pp, src);
+                    let (mut q, qt) = if vert {
+                        fwd_chroma_4x8(&self.dct, tx, &resid, &self.cquant)
+                    } else {
+                        fwd_chroma_8x4(&self.dct, tx, &resid, &self.cquant)
+                    };
+                    trellis_optimize(&mut q, &qt, cdcq, cacq, cscan, lam);
+                    self.rd.preserve_dc(&mut q[0], &resid[..n]);
+                    let rr = if vert {
+                        inv_chroma_4x8(&self.idct, tx, &q, &self.cquant)
+                    } else {
+                        inv_chroma_8x4(&self.idct, tx, &q, &self.cquant)
+                    };
+                    let sse = self.rd.sse_recon(&pp[..n], &rr[..n], src, self.bd);
+                    cand_total += rd_cost_i64(
+                        sse,
+                        mlam,
+                        self.chroma_rect_bits(&q, cscan, cw, ch, plane, cx, cy),
+                    );
+                    cand_ccf[ci] = q;
+                    cand_pred[ci] = pp;
+                    if ci == 0 && cand_total >= best_total {
+                        break; // cannot win: skip the second plane (non-negative costs)
+                    }
+                }
+                if cand_total < best_total {
+                    best_total = cand_total;
+                    chosen_uv = cand;
+                    uv_delta_strip = jd;
+                    uv_tx = tx;
+                    uv_pred = cand_pred;
+                    for ci in 0..2 {
+                        ccf[ci] = [0i32; 64];
+                        ccf[ci][..n].copy_from_slice(&cand_ccf[ci]);
+                    }
+                }
+            }
+        }
 
         let luma_zero = self.rd.all_zero_i32(&lcf[..]);
         let chroma_zero = chroma.is_none()
@@ -2168,19 +2762,26 @@ impl<'a> LossyTile<'a> {
         }
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
-        self.enc.encode_symbol(DC_PRED, &mut self.cdfs.kf_y[yctx]);
-        if chroma.is_some() {
-            self.emit_uv_mode(DC_PRED, DC_PRED, None, px, py, lw, lh);
+        self.enc.encode_symbol(y_mode, &mut self.cdfs.kf_y[yctx]);
+        // BLOCK_16X4 / BLOCK_4X16 sort above BLOCK_8X8, so a directional
+        // strip codes its angle_delta symbol.
+        if (V_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
+            self.enc
+                .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
         }
-        self.emit_palette_mode_info(px, py, lw, lh, DC_PRED, chroma.is_some(), None, None);
-        self.emit_filter_intra(DC_PRED, lw, lh, None);
+        if chroma.is_some() {
+            self.uv_delta = uv_delta_strip;
+            self.emit_uv_mode(y_mode, chosen_uv, None, px, py, lw, lh);
+        }
+        self.emit_palette_mode_info(px, py, lw, lh, y_mode, chroma.is_some(), None, None);
+        self.emit_filter_intra(y_mode, lw, lh, None);
         self.code_tx_depth(px, py, lw, lh, 0);
         let sv = block_skip as u8;
         let (aw, ah) = (lw / 4, (lh / 4).max(1));
         self.a_skip[bx4..bx4 + aw].fill(sv);
         self.l_skip[by4..by4 + ah].fill(sv);
-        self.a_mode[bx4..bx4 + aw].fill(DC_PRED as u8);
-        self.l_mode[by4..by4 + ah].fill(DC_PRED as u8);
+        self.a_mode[bx4..bx4 + aw].fill(y_mode as u8);
+        self.l_mode[by4..by4 + ah].fill(y_mode as u8);
 
         // --- luma coefficients + recon ---
         let lres_ctx = if block_skip {
@@ -2188,9 +2789,9 @@ impl<'a> LossyTile<'a> {
         } else {
             let ds = self.dc_sign_ctx_span(0, bx4, by4, aw, ah);
             if vert {
-                encode_4x16_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, 0, ds, DC_PRED, 1)
+                encode_4x16_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, 0, ds, y_mode, 1)
             } else {
-                encode_16x4_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, 0, ds, DC_PRED, 1)
+                encode_16x4_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, 0, ds, y_mode, 1)
             }
         };
         self.a_coef[0][bx4..bx4 + aw].fill(lres_ctx);
@@ -2204,7 +2805,7 @@ impl<'a> LossyTile<'a> {
         };
         for ry in 0..lh {
             let drow = &mut self.recon[0][(py + ry) * self.w + px..];
-            recon_add_dc(&mut drow[..lw], lpred, &lrr[ry * lw..], maxval);
+            recon_add_pred(&mut drow[..lw], &lpred_arr[ry * lw..], &lrr[ry * lw..], maxval);
         }
 
         // --- chroma coefficients + recon ---
@@ -2232,19 +2833,40 @@ impl<'a> LossyTile<'a> {
                 self.l_coef[plane][cby4..cby4 + cah].fill(cres_ctx);
                 let rr = if block_skip {
                     [0i32; 64]
+                } else if chosen_uv != DC_PRED {
+                    let q: &[i32; 32] = ccf[ci][..32].try_into().unwrap();
+                    let r = if cw == 4 {
+                        inv_chroma_4x8(&self.idct, uv_tx, q, &self.cquant)
+                    } else {
+                        inv_chroma_8x4(&self.idct, uv_tx, q, &self.cquant)
+                    };
+                    let mut out = [0i32; 64];
+                    out[..32].copy_from_slice(&r);
+                    out
                 } else {
                     inv_chroma_strip(&self.idct, cw, ch, &ccf[ci], &self.cquant)
                 };
                 for ry in 0..ch {
                     let drow = &mut self.recon[plane][(cy + ry) * self.cw + cx..];
-                    recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
+                    if chosen_uv != DC_PRED {
+                        recon_add_pred(&mut drow[..cw], &uv_pred[ci][ry * cw..], &rr[ry * cw..], maxval);
+                    } else {
+                        recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
+                    }
                 }
             }
         }
     }
 
     /// Emit one 16x8/8x16 leaf. Used by binary and asymmetric partitions.
-    fn code_block16_rect_leaf_420(&mut self, x8: usize, y8: usize, vert: bool) {
+    fn code_block16_rect_leaf_420(
+        &mut self,
+        x8: usize,
+        y8: usize,
+        vert: bool,
+        have_tr: bool,
+        have_bl: bool,
+    ) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
@@ -2260,8 +2882,10 @@ impl<'a> LossyTile<'a> {
         let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
             + INTRA_MODE_CTX[self.l_mode[by4] as usize];
         let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-        let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
-            self.rect16_luma_mode_search(px, py, vert, dc_l, lam, emlam, true);
+        let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal, rfi) =
+            self.rect16_luma_mode_search(px, py, vert, have_tr, have_bl, dc_l, lam, emlam, true);
+        let tx_mode = filter_intra_tx_mode(rfi, y_mode);
+        let allow_split = self.rect_split_allowed() && rpal.is_none() && rfi.is_none() && (crate::tuning::get().rect_full_modes || Self::rect_tbfree(y_mode, y_delta));
         let (ltxtp, lcf) = self.rect_leaf_tx_trial(
             &lresid,
             &lcf,
@@ -2269,13 +2893,22 @@ impl<'a> LossyTile<'a> {
             px,
             py,
             vert,
-            y_mode,
+            tx_mode,
             lam,
             emlam,
             true,
             rpal.is_some(),
-            self.rect_split_allowed() && rpal.is_none(),
+            allow_split,
         );
+        // Decoder-faithful split-TX check (`rect_split_seq`): re-decide whole vs
+        // two TX_8X8 with half 1 predicted from the reconstructed half 0.
+        let ltxtp = if allow_split {
+            self.rect_split_seq_txtp(
+                px, py, vert, have_tr, have_bl, y_mode, y_delta, tx_mode, lam, emlam, ltxtp, &lcf, &lpred_arr,
+            )
+        } else {
+            ltxtp
+        };
         let idct = self.idct;
         let inv_luma = |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, vert, ltxtp);
         let split = ltxtp == RECT_SPLIT_TXTP;
@@ -2288,7 +2921,7 @@ impl<'a> LossyTile<'a> {
         let mut split_cf = [[0i32; 64]; 2];
         let mut luma_rec = [0u16; 128];
         if split {
-            (split_cf, luma_rec) = self.rect_split_commit(px, py, vert, y_mode, y_delta, lam);
+            (split_cf, luma_rec) = self.rect_split_commit(px, py, vert, have_tr, have_bl, y_mode, y_delta, lam);
         } else {
             let lrr_cfl = inv_luma(&lcf, &self.quant);
             recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, maxval);
@@ -2327,6 +2960,7 @@ impl<'a> LossyTile<'a> {
         let mut chosen_uv = DC_PRED;
         let mut uv_pred = [[0i32; 32]; 2];
         let mut uv_tx = ChromaTx::DctDct;
+        let mut uv_delta_rect = 0i32;
         if !self.mono {
             let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
             let mut ac = [0i32; 32];
@@ -2397,7 +3031,78 @@ impl<'a> LossyTile<'a> {
             // 16x16 block's 8x8 chroma path (SATD top-K shortlist, spec
             // transform type per uv_mode). Without it the rect leaf's chroma
             // was DC/CfL-only while the squares it competes with are not.
-            if crate::tuning::get().rect_uv_search {
+            let tune = crate::tuning::get();
+            // `rect_uv_joint`: (mode, delta) pairs ranked jointly on SATD, the
+            // shipped 8x8/16x16 chroma shortlist carried to the rect leaf. Only
+            // the above-right / below-left-free set (SMOOTH*, PAETH, V with
+            // delta >= 0, H with delta <= 0, D113 / D135 / D157 at any delta),
+            // so the tr/bl-free prediction is exact whatever the decoder's
+            // edge flags are, same as the leaf's luma modes. aom codes these
+            // blocks' chroma with D135 / D113 / D157 / H / SMOOTH far more
+            // often than with CfL or DC (synthetic-gap coverage leg 3).
+            let joint = tune.rect_uv_joint;
+            let mut joint_list = FixedList::<(u64, usize, i32), 12>::new((0, DC_PRED, 0));
+            if joint {
+                const RECT_JOINT_MODES: [usize; 9] = [
+                    PAETH_PRED,
+                    SMOOTH_PRED,
+                    SMOOTH_V_PRED,
+                    SMOOTH_H_PRED,
+                    V_PRED,
+                    H_PRED,
+                    D135_PRED,
+                    D113_PRED,
+                    D157_PRED,
+                ];
+                let k = (tune.rect_uv_joint_k as usize).clamp(1, 12);
+                let ad_ok = self.speed.try_angle_deltas_av1(16, self.base_q_idx);
+                let joint_ch = self.h.div_ceil(2);
+                let ftype = self.chroma_filter_type(px, py);
+                let mut all = FixedList::<(u64, usize, i32), 45>::new((0, DC_PRED, 0));
+                for &m in &RECT_JOINT_MODES {
+                    let deltas: &[i32] = if !ad_ok || !(V_PRED..=VERT_LEFT_PRED).contains(&m) {
+                        &[0]
+                    } else if m == V_PRED {
+                        &[0, 1, 2, 3]
+                    } else if m == H_PRED {
+                        &[-3, -2, -1, 0]
+                    } else {
+                        &[-3, -2, -1, 0, 1, 2, 3]
+                    };
+                    for &d in deltas {
+                        let mut cost = 0u64;
+                        for plane in 1..=2 {
+                            let mut pp = [0i32; 32];
+                            self.intrapred.predict_nd_ad(
+                                m,
+                                d,
+                                &self.recon[plane],
+                                self.cw,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                false,
+                                false,
+                                self.cw,
+                                joint_ch,
+                                ftype,
+                                &mut pp,
+                                self.bd,
+                            );
+                            cost += self
+                                .rd
+                                .satd_sad_proxy(self.src_blk(plane, cx, cy, cw, ch), &pp, cw);
+                        }
+                        all.push((cost, m, d));
+                    }
+                }
+                all.as_mut_slice().sort_unstable_by_key(|&(c, m, d)| (c, m, d));
+                for &e in all.as_slice().iter().take(k) {
+                    joint_list.push(e);
+                }
+            }
+            if tune.rect_uv_search || joint {
                 let candidates = &[
                     SMOOTH_V_PRED,
                     PAETH_PRED,
@@ -2409,43 +3114,80 @@ impl<'a> LossyTile<'a> {
                     D113_PRED,
                     D157_PRED,
                 ];
-                let directional_top =
-                    self.rank_chroma_modes::<32>(candidates, px, py, cx, cy, cw, ch, false, false);
-                for &cand in candidates {
-                    if cand != V_PRED
-                        && cand != H_PRED
-                        && (V_PRED..=VERT_LEFT_PRED).contains(&cand)
-                        && !self.speed.chroma_angle_directional()
-                    {
-                        continue;
+                let directional_top = if joint {
+                    DirectionalTopK::new()
+                } else {
+                    self.rank_chroma_modes::<32>(candidates, px, py, cx, cy, cw, ch, false, false)
+                };
+                let mut plain_list = FixedList::<(u64, usize, i32), 12>::new((0, DC_PRED, 0));
+                if !joint {
+                    for &cand in candidates {
+                        if cand != V_PRED
+                            && cand != H_PRED
+                            && (V_PRED..=VERT_LEFT_PRED).contains(&cand)
+                            && !self.speed.chroma_angle_directional()
+                        {
+                            continue;
+                        }
+                        if !directional_top.contains(cand) {
+                            continue;
+                        }
+                        plain_list.push((0, cand, 0));
                     }
-                    if !directional_top.contains(cand) {
-                        continue;
-                    }
+                }
+                let list = if joint { joint_list.as_slice() } else { plain_list.as_slice() };
+                for &(_, cand, jd) in list {
                     let tx = chroma_tx_for_mode(cand);
+                    let ad_bits = if (V_PRED..=VERT_LEFT_PRED).contains(&cand) {
+                        let ad = &self.dcdf().angle_delta[cand - V_PRED];
+                        cdf_cost(ad, (jd + 3) as usize) - cdf_cost(ad, 3)
+                    } else {
+                        0.0
+                    };
                     let mut cand_ccf = [[0i32; 32]; 2];
                     let mut cand_pred = [[0i32; 32]; 2];
-                    let mut cand_total = rate_cost(mlam, self.uv_mode_bits(y_mode, cand, None));
+                    let mut cand_total =
+                        rate_cost(mlam, self.uv_mode_bits(y_mode, cand, None) + ad_bits);
                     for ci in 0..2 {
                         let plane = ci + 1;
                         let src = self.src_blk(plane, cx, cy, cw, ch);
                         let mut pp = [0i32; 32];
-                        self.intrapred.predict_nd(
-                            cand,
-                            &self.recon[plane],
-                            self.cw,
-                            cx,
-                            cy,
-                            cw,
-                            ch,
-                            false,
-                            false,
-                            self.cw,
-                            self.h,
-                            self.chroma_filter_type(px, py),
-                            &mut pp,
-                            self.bd,
-                        );
+                        if joint {
+                            self.intrapred.predict_nd_ad(
+                                cand,
+                                jd,
+                                &self.recon[plane],
+                                self.cw,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                false,
+                                false,
+                                self.cw,
+                                self.h.div_ceil(2),
+                                self.chroma_filter_type(px, py),
+                                &mut pp,
+                                self.bd,
+                            );
+                        } else {
+                            self.intrapred.predict_nd(
+                                cand,
+                                &self.recon[plane],
+                                self.cw,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                false,
+                                false,
+                                self.cw,
+                                self.h,
+                                self.chroma_filter_type(px, py),
+                                &mut pp,
+                                self.bd,
+                            );
+                        }
                         let mut resid = [0i32; 32];
                         self.rd.residual_pred_blk(&mut resid, &pp, src);
                         let (mut q, qt) = if vert {
@@ -2470,11 +3212,15 @@ impl<'a> LossyTile<'a> {
                         );
                         cand_ccf[ci] = q;
                         cand_pred[ci] = pp;
+                        if ci == 0 && cand_total >= best_total {
+                            break; // cannot win: skip the second plane (non-negative costs)
+                        }
                     }
                     if cand_total < best_total {
                         best_total = cand_total;
                         use_cfl = false;
                         chosen_uv = cand;
+                        uv_delta_rect = jd;
                         uv_tx = tx;
                         uv_pred = cand_pred;
                         ccf = cand_ccf;
@@ -2512,6 +3258,7 @@ impl<'a> LossyTile<'a> {
             self.enc
                 .encode_symbol((y_delta + 3) as usize, &mut self.cdfs.angle_delta[y_mode - V_PRED]);
         }
+        self.uv_delta = if use_cfl { 0 } else { uv_delta_rect };
         self.emit_uv_mode(
             y_mode,
             chosen_uv,
@@ -2523,7 +3270,7 @@ impl<'a> LossyTile<'a> {
         );
         self.emit_palette_mode_info(px, py, lw, lh, y_mode, !self.mono, rpal.as_ref(), None);
         if rpal.is_none() {
-            self.emit_filter_intra(y_mode, lw, lh, None);
+            self.emit_filter_intra(y_mode, lw, lh, rfi);
         }
         if let Some(p) = rpal.as_ref() {
             self.emit_palette_map(p);
@@ -2561,16 +3308,16 @@ impl<'a> LossyTile<'a> {
                     ltxtp == 2,
                     sk,
                     ds,
-                    y_mode,
+                    tx_mode,
                 )
             } else if vert {
                 let sk = self.skip_ctx_8x16_luma();
                 let ds = self.dc_sign_ctx_8x16_luma(bx4, by4);
-                encode_8x16_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, sk, ds, y_mode, ltxtp)
+                encode_8x16_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, sk, ds, tx_mode, ltxtp)
             } else {
                 let sk = self.skip_ctx_16x8_luma();
                 let ds = self.dc_sign_ctx_16x8_luma(bx4, by4);
-                encode_16x8_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, sk, ds, y_mode, ltxtp)
+                encode_16x8_luma_coeffs(&mut self.enc, &mut self.cdfs, &lcf, sk, ds, tx_mode, ltxtp)
             };
             self.a_coef[0][bx4..bx4 + aw].fill(lres_ctx);
             self.l_coef[0][by4..by4 + ah].fill(lres_ctx);
@@ -2637,23 +3384,35 @@ impl<'a> LossyTile<'a> {
     }
 
     /// 4:2:2 HORZ: two 16x8 luma + 8x8 chroma (h-subsampled, v-full). V forbidden in 422.
-    fn code_block16_horz_422(&mut self, x8: usize, y8: usize, halves: usize) {
+    fn code_block16_horz_422(&mut self, x8: usize, y8: usize, halves: usize, thr: bool, lhb: bool) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         for half in 0..halves {
             let (px, py) = (x8 * 8, y8 * 8 + half * 8);
+            let (tr_h, bl_h) = self.rect_edge_flags(px, py, false, half == 1, thr, lhb);
             let (bx4, by4) = (px / 4, py / 4);
             // Luma 16x8: mode search + 7-type transform trial (shared with 444).
             let dc_l = self.intrapred.dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32);
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
-                self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal, rfi) =
+                self.rect16_luma_mode_search(px, py, false, tr_h, bl_h, dc_l, lam, emlam, true);
+            let tx_mode = filter_intra_tx_mode(rfi, y_mode);
+            let allow_split = self.rect_split_allowed() && rpal.is_none() && rfi.is_none() && (crate::tuning::get().rect_full_modes || Self::rect_tbfree(y_mode, y_delta));
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some(),
-                self.rect_split_allowed() && rpal.is_none());
+                &lresid, &lcf, &lpred_arr, px, py, false, tx_mode, lam, emlam, true, rpal.is_some(),
+                allow_split);
+            // Decoder-faithful split-TX check (`rect_split_seq`): re-decide whole vs
+            // two TX_8X8 with half 1 predicted from the reconstructed half 0.
+            let ltxtp = if allow_split {
+                self.rect_split_seq_txtp(
+                    px, py, false, tr_h, bl_h, y_mode, y_delta, tx_mode, lam, emlam, ltxtp, &lcf, &lpred_arr,
+                )
+            } else {
+                ltxtp
+            };
             let idct = self.idct;
             let inv16x8 =
                 |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, false, ltxtp);
@@ -2661,7 +3420,7 @@ impl<'a> LossyTile<'a> {
             let mut split_cf = [[0i32; 64]; 2];
             let mut split_rec = [0u16; 128];
             if split {
-                (split_cf, split_rec) = self.rect_split_commit(px, py, false, y_mode, y_delta, lam);
+                (split_cf, split_rec) = self.rect_split_commit(px, py, false, tr_h, bl_h, y_mode, y_delta, lam);
             }
             let (cx, cy) = (px / 2, py);
             let (cbx4, cby4) = (cx / 4, cy / 4);
@@ -2774,7 +3533,7 @@ impl<'a> LossyTile<'a> {
             );
             self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, rpal.as_ref(), None);
             if rpal.is_none() {
-                self.emit_filter_intra(y_mode, 16, 8, None);
+                self.emit_filter_intra(y_mode, 16, 8, rfi);
             }
             if let Some(p) = rpal.as_ref() {
                 self.emit_palette_map(p);
@@ -2803,7 +3562,7 @@ impl<'a> LossyTile<'a> {
                             ltxtp == 2,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                         )
                     } else {
                         encode_16x8_luma_coeffs(
@@ -2812,7 +3571,7 @@ impl<'a> LossyTile<'a> {
                             &lcf,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                             ltxtp,
                         )
                     }
@@ -2876,24 +3635,36 @@ impl<'a> LossyTile<'a> {
         }
     }
 
-    fn code_block16_horz_444(&mut self, x8: usize, y8: usize, halves: usize) {
+    fn code_block16_horz_444(&mut self, x8: usize, y8: usize, halves: usize, thr: bool, lhb: bool) {
         let maxval = (1 << self.bd) - 1;
         let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
         // Two sub-blocks: half = 0 (top, py), half = 1 (bottom, py+8).
         for half in 0..halves {
             let (px, py) = (x8 * 8, y8 * 8 + half * 8);
+            let (tr_h, bl_h) = self.rect_edge_flags(px, py, false, half == 1, thr, lhb);
             let (bx4, by4) = (px / 4, py / 4); // luma 4-unit coords
             // --- luma 16x8: mode search + 7-type transform trial ---
             let dc_l = self.intrapred.dc_pred_16x8(&self.recon[0], self.w, px, py, self.bd as i32);
             let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
                 + INTRA_MODE_CTX[self.l_mode[by4] as usize];
             let emlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
-            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal) =
-                self.rect16_luma_mode_search(px, py, false, dc_l, lam, emlam, true);
+            let (y_mode, y_delta, lpred_arr, lresid, lcf, rpal, rfi) =
+                self.rect16_luma_mode_search(px, py, false, tr_h, bl_h, dc_l, lam, emlam, true);
+            let tx_mode = filter_intra_tx_mode(rfi, y_mode);
+            let allow_split = self.rect_split_allowed() && rpal.is_none() && rfi.is_none() && (crate::tuning::get().rect_full_modes || Self::rect_tbfree(y_mode, y_delta));
             let (ltxtp, lcf) = self.rect_leaf_tx_trial(
-                &lresid, &lcf, &lpred_arr, px, py, false, y_mode, lam, emlam, true, rpal.is_some(),
-                self.rect_split_allowed() && rpal.is_none());
+                &lresid, &lcf, &lpred_arr, px, py, false, tx_mode, lam, emlam, true, rpal.is_some(),
+                allow_split);
+            // Decoder-faithful split-TX check (`rect_split_seq`): re-decide whole vs
+            // two TX_8X8 with half 1 predicted from the reconstructed half 0.
+            let ltxtp = if allow_split {
+                self.rect_split_seq_txtp(
+                    px, py, false, tr_h, bl_h, y_mode, y_delta, tx_mode, lam, emlam, ltxtp, &lcf, &lpred_arr,
+                )
+            } else {
+                ltxtp
+            };
             let idct = self.idct;
             let inv16x8 =
                 |cf: &[i32; 128], q: &Quant| inv_rect_luma_128(&idct, cf, q, false, ltxtp);
@@ -2901,7 +3672,7 @@ impl<'a> LossyTile<'a> {
             let mut split_cf = [[0i32; 64]; 2];
             let mut split_rec = [0u16; 128];
             if split {
-                (split_cf, split_rec) = self.rect_split_commit(px, py, false, y_mode, y_delta, lam);
+                (split_cf, split_rec) = self.rect_split_commit(px, py, false, tr_h, bl_h, y_mode, y_delta, lam);
             }
             // --- chroma 16x8 (4:4:4): DC predict each plane ---
             let mut ccf = [[0i32; 128]; 2];
@@ -3032,7 +3803,7 @@ impl<'a> LossyTile<'a> {
             self.emit_uv_mode(y_mode, chosen_uv, cfl_opt, px, py, 16, 8);
             self.emit_palette_mode_info(px, py, 16, 8, y_mode, !self.mono, rpal.as_ref(), None);
             if rpal.is_none() {
-                self.emit_filter_intra(y_mode, 16, 8, None);
+                self.emit_filter_intra(y_mode, 16, 8, rfi);
             }
             if let Some(p) = rpal.as_ref() {
                 self.emit_palette_map(p);
@@ -3063,7 +3834,7 @@ impl<'a> LossyTile<'a> {
                             ltxtp == 2,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                         )
                     } else {
                         encode_16x8_luma_coeffs(
@@ -3072,7 +3843,7 @@ impl<'a> LossyTile<'a> {
                             &lcf,
                             sk,
                             ds,
-                            y_mode,
+                            tx_mode,
                             ltxtp,
                         )
                     }
@@ -3951,28 +4722,14 @@ impl<'a> LossyTile<'a> {
         }
         if rl.is_none() && self.speed.at_least_slow() {
             let bsize = av1_block_size_index(16, 16);
-            for &filter_mode in self
-                .rank_filter_intra_modes::<256>(
-                    px,
-                    py,
-                    16,
-                    16,
-                    self.speed.filter_intra_refine_budget(),
-                )
+            let mut fi_preds = [[0i32; 256]; 5];
+            for (fi_si, &filter_mode) in self
+                .rank_filter_intra_modes::<256>(px, py, 16, 16, self.speed.filter_intra_refine_budget(self.ss444()), &mut fi_preds)
                 .iter()
+                .enumerate()
             {
                 let mut pred = self.sbuf_i256();
-                self.intrapred.filter_predict(
-                    filter_mode,
-                    &self.recon[0],
-                    self.w,
-                    px,
-                    py,
-                    16,
-                    16,
-                    &mut pred[..],
-                    self.bd,
-                );
+                pred[..].copy_from_slice(&fi_preds[fi_si]);
                 let mut resid = self.sbuf_i256();
                 self.rd.residual_pred(
                     &mut resid[..],
@@ -4004,13 +4761,19 @@ impl<'a> LossyTile<'a> {
                 );
                 let rr = self.idct.idct_dequant_16x16(&cf, &self.quant);
                 let sse = sse_recon::<256, 16>(&self.rd, &pred, &rr, self.src_blk(0, px, py, 16, 16), self.bd);
+                // The admission below needs `sse <= best_dct_sse` (unless the RD-only
+                // study knob is on) and a replay accepts regardless: a candidate that
+                // already lost on SSE skips the entropy-accurate rate pass.
+                if rl.is_none() && !crate::tuning::get().filter_intra_rd_only && sse > best_dct_sse {
+                    continue;
+                }
                 let bits = self.luma_bits(&cf, &SCAN_16X16, 16, px, py, DC_PRED, 1);
                 let syntax_bits = self.mode_bits(px, py, DC_PRED)
                     + cdf_cost(&self.dcdf().filter_intra[bsize], 1)
                     + cdf_cost(&self.dcdf().filter_intra_mode, filter_mode as usize);
                 let cost = rd_cost_i64(sse, mlam, bits + syntax_bits);
                 if rl.is_some()
-                    || (sse <= best_dct_sse && cost < best_eff)
+                    || ((crate::tuning::get().filter_intra_rd_only || sse <= best_dct_sse) && cost < best_eff)
                 {
                     best_eff = cost;
                     best_mode = DC_PRED;

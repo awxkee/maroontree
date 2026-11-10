@@ -358,15 +358,20 @@ impl<'a> LossyTile<'a> {
         w: usize,
         h: usize,
         budget: usize,
+        preds: &mut [[i32; N]; 5],
     ) -> FixedList<FilterIntraMode, 5> {
         debug_assert_eq!(N, w * h);
         if budget == 0 {
             return FixedList::new(FILTER_INTRA_MODES[0]);
         }
+        // The five predictions are computed once here; the shortlist's are
+        // handed back in shortlist order so the full-RD trial does not
+        // predict them a second time.
+        let mut all = [[0i32; N]; 5];
         let mut ranked =
             FixedList::<(u64, usize, FilterIntraMode), 5>::new((0, 0, FILTER_INTRA_MODES[0]));
         for (order, mode) in FILTER_INTRA_MODES.into_iter().enumerate() {
-            let mut pred = [0i32; N];
+            let pred = &mut all[order];
             self.intrapred.filter_predict(
                 mode,
                 &self.recon[0],
@@ -375,18 +380,19 @@ impl<'a> LossyTile<'a> {
                 py,
                 w,
                 h,
-                &mut pred,
+                pred,
                 self.bd,
             );
-            let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, w, h), &pred, w);
+            let score = self.rd.satd_sad_proxy(self.src_blk(0, px, py, w, h), pred, w);
             ranked.push((score, order, mode));
         }
         ranked
             .as_mut_slice()
             .sort_unstable_by_key(|&(score, order, _)| (score, order));
         let mut shortlist = FixedList::new(FILTER_INTRA_MODES[0]);
-        for &(_, _, mode) in ranked.iter().take(budget) {
+        for (si, &(_, order, mode)) in ranked.iter().take(budget).enumerate() {
             shortlist.push(mode);
+            preds[si] = all[order];
         }
         shortlist
     }
@@ -815,11 +821,11 @@ impl<'a> LossyTile<'a> {
                         self.enc
                             .encode_symbol(1, &mut self.cdfs.part_split[bl - 1][ctx]); // HORZ
                         if self.ss420 {
-                            self.code_block16_rect_420(x8, y8, false);
+                            self.code_block16_rect_420(x8, y8, false, thr, lhb);
                         } else if self.ss422 {
-                            self.code_block16_horz_422(x8, y8, 2);
+                            self.code_block16_horz_422(x8, y8, 2, thr, lhb);
                         } else {
-                            self.code_block16_horz_444(x8, y8, 2);
+                            self.code_block16_horz_444(x8, y8, 2, thr, lhb);
                         }
                         self.a_part[x8..x8 + 2].fill(0x1c);
                         self.l_part[y8..y8 + 2].fill(0x1e);
@@ -830,9 +836,9 @@ impl<'a> LossyTile<'a> {
                         self.enc
                             .encode_symbol(2, &mut self.cdfs.part_split[bl - 1][ctx]); // VERT
                         if self.ss420 {
-                            self.code_block16_rect_420(x8, y8, true);
+                            self.code_block16_rect_420(x8, y8, true, thr, lhb);
                         } else {
-                            self.code_block16_vert_444(x8, y8, 2);
+                            self.code_block16_vert_444(x8, y8, 2, thr, lhb);
                         }
                         self.a_part[x8..x8 + 2].fill(0x1e);
                         self.l_part[y8..y8 + 2].fill(0x1c);
@@ -842,7 +848,7 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(8, &mut self.cdfs.part_split[bl - 1][ctx]); // HORZ_4
-                        self.code_block16_quad(x8, y8, false);
+                        self.code_block16_quad(x8, y8, false, thr, lhb);
                         // dav1d `al_part_ctx` bl16: h4 -> above 0x1c, left 0x1f.
                         self.a_part[x8..x8 + 2].fill(0x1c);
                         self.l_part[y8..y8 + 2].fill(0x1f);
@@ -852,7 +858,7 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(9, &mut self.cdfs.part_split[bl - 1][ctx]); // VERT_4
-                        self.code_block16_quad(x8, y8, true);
+                        self.code_block16_quad(x8, y8, true, thr, lhb);
                         // dav1d `al_part_ctx` bl16: v4 -> above 0x1f, left 0x1c.
                         self.a_part[x8..x8 + 2].fill(0x1f);
                         self.l_part[y8..y8 + 2].fill(0x1c);
@@ -869,7 +875,10 @@ impl<'a> LossyTile<'a> {
                             x8 > 0 && (y8 * 8 + 8) < self.h,
                         );
                         self.code_block(x8 + 1, y8, thr && y8 > 0 && (x8 * 8 + 16) < self.w, false);
-                        self.code_block16_rect_leaf_420(x8, y8 + 1, false);
+                        {
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8, y8 * 8 + 8, false, true, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8, y8 + 1, false, tr, bl);
+                        }
                         self.a_part[x8..x8 + 2].fill(0x1c);
                         self.l_part[y8..y8 + 2].fill(0x1e);
                         return;
@@ -878,7 +887,10 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(5, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block16_rect_leaf_420(x8, y8, false);
+                        {
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8, y8 * 8, false, false, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8, y8, false, tr, bl);
+                        }
                         self.code_block(
                             x8,
                             y8 + 1,
@@ -901,7 +913,10 @@ impl<'a> LossyTile<'a> {
                             x8 > 0 && (y8 * 8 + 8) < self.h,
                         );
                         self.code_block(x8, y8 + 1, false, lhb && x8 > 0 && (y8 * 8 + 16) < self.h);
-                        self.code_block16_rect_leaf_420(x8 + 1, y8, true);
+                        {
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8 + 8, y8 * 8, true, true, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8 + 1, y8, true, tr, bl);
+                        }
                         self.a_part[x8..x8 + 2].fill(0x1e);
                         self.l_part[y8..y8 + 2].fill(0x1c);
                         return;
@@ -910,7 +925,10 @@ impl<'a> LossyTile<'a> {
                         let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
                         self.enc
                             .encode_symbol(7, &mut self.cdfs.part_split[bl - 1][ctx]);
-                        self.code_block16_rect_leaf_420(x8, y8, true);
+                        {
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8, y8 * 8, true, false, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8, y8, true, tr, bl);
+                        }
                         self.code_block(x8 + 1, y8, thr && y8 > 0 && (x8 * 8 + 16) < self.w, true);
                         self.code_block(x8 + 1, y8 + 1, false, false);
                         self.a_part[x8..x8 + 2].fill(0x1e);
@@ -952,16 +970,20 @@ impl<'a> LossyTile<'a> {
                         .encode_gathered_partition(horz, false, &self.cdfs.part_split[bl - 1][ctx]);
                     if horz {
                         if self.ss420 {
-                            self.code_block16_rect_leaf_420(x8, y8, false);
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8, y8 * 8, false, false, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8, y8, false, tr, bl);
                         } else if self.ss422 {
-                            self.code_block16_horz_422(x8, y8, 1);
+                            self.code_block16_horz_422(x8, y8, 1, thr, lhb);
                         } else {
-                            self.code_block16_horz_444(x8, y8, 1);
+                            self.code_block16_horz_444(x8, y8, 1, thr, lhb);
                         }
                     } else if self.ss420 {
-                        self.code_block16_rect_leaf_420(x8, y8, true);
+                        {
+                            let (tr, bl) = self.rect_edge_flags(x8 * 8, y8 * 8, true, false, thr, lhb);
+                            self.code_block16_rect_leaf_420(x8, y8, true, tr, bl);
+                        }
                     } else {
-                        self.code_block16_vert_444(x8, y8, 1);
+                        self.code_block16_vert_444(x8, y8, 1, thr, lhb);
                     }
                     // dav1d `al_part_ctx` bl16 h / v, clipped to the in-frame
                     // context entries (the out-of-frame ones are never read).

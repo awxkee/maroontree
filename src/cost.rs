@@ -306,15 +306,15 @@ pub(crate) fn rd_cost_i64(distortion: i64, lambda: f32, rate: f32) -> f32 {
 }
 
 /// Rate-aware CfL alpha refinement (aom `cfl_pick_plane_rd` analogue). `a0`
-/// is the pre-quantisation energy optimum, already realised by the caller as
-/// `(cost0, payload0)`. `eval(a)` realises alpha `a` for ONE plane (predict,
+/// is the pre-quantization energy optimum, already realized by the caller as
+/// `(cost0, payload0)`. `eval(a)` realizes alpha `a` for ONE plane (predict,
 /// transform, trellis, reconstruct) and returns its full RD cost — recon
 /// distortion + lambda x (coefficient bits + this plane's alpha-signal bits) —
 /// with whatever the caller needs to install that alpha. Steps toward zero
 /// while the cost keeps falling, otherwise away from zero, at most `steps`
 /// either way. The payload returned belongs to the alpha returned.
 /// Score of one alpha candidate inside [`cfl_alpha_rd_refine`]'s walk
-/// (`cfl_alpha_rd_mode`): full RD, coefficient-bits-only, or realised SSE.
+/// (`cfl_alpha_rd_mode`): full RD, coefficient-bits-only, or realized SSE.
 #[inline]
 pub(crate) fn cfl_alpha_walk_cost(dist: i64, lambda: f32, coef_bits: f32, sig_bits: f32) -> f32 {
     match crate::tuning::get().cfl_alpha_rd_mode {

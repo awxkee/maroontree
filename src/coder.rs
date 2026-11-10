@@ -1529,7 +1529,12 @@ fn sse_recon<const N: usize, const D: usize>(
 
 /// The tile decision dispatch's weighted-SSE configuration (per-format
 /// `Tuning::wsse_*`, `wsse_scale`) for a frame-level filter decision.
-fn frame_decision_rd(rd: &crate::rd_sse::RdDispatch, sub_x: usize, sub_y: usize, mono: bool) -> crate::rd_sse::RdDispatch {
+fn frame_decision_rd(
+    rd: &crate::rd_sse::RdDispatch,
+    sub_x: usize,
+    sub_y: usize,
+    mono: bool,
+) -> crate::rd_sse::RdDispatch {
     let t = crate::tuning::get();
     let on = if mono {
         t.wsse_400
@@ -1658,11 +1663,11 @@ fn is_directional_mode(mode: usize) -> bool {
 }
 
 fn prdo_k() -> f32 {
-    0.4
+    crate::tuning::get().prdo_k
 }
 
 fn prdo_k_444() -> f32 {
-    0.5
+    crate::tuning::get().prdo_k_444
 }
 
 /// Clamp `C` for the perceptual RD scale: the per-block scale is limited to
@@ -1698,7 +1703,11 @@ const SPLIT32_SSE_MARGIN: i64 = 64;
 #[inline]
 fn chroma_part_rd_weight(ss420: bool, ss422: bool, _src: &[Vec<u16>; 3], _bd: u8) -> f32 {
     let t = crate::tuning::get();
-    if ss420 || ss422 { t.chroma_part_w_sub } else { t.chroma_part_w_444 }
+    if ss420 || ss422 {
+        t.chroma_part_w_sub
+    } else {
+        t.chroma_part_w_444
+    }
 }
 
 pub(crate) fn align8(n: usize) -> usize {
@@ -3690,7 +3699,16 @@ pub(crate) fn encode_lossy_tilegroup(
             bd,
         };
         let (lvl_y, lvl_u, lvl_v) = if crate::tuning::get().lf_search && base_q_idx != 0 {
-            let l = frame_lf_search(&context.loopfilter, pool, &rd, &recon, src, &geom, lvl_y, lvl_uv);
+            let l = frame_lf_search(
+                &context.loopfilter,
+                pool,
+                &rd,
+                &recon,
+                src,
+                &geom,
+                lvl_y,
+                lvl_uv,
+            );
             lf_levels = Some(l);
             l
         } else {
@@ -3780,7 +3798,6 @@ pub(crate) fn encode_lossy_tilegroup(
         });
     }
     let lr = lr_unit.map(|_| crate::obu::LrParams { luma_wiener: true });
-
     let tilegroup = assemble_tilegroup(payloads);
     (
         tilegroup,
@@ -4510,7 +4527,10 @@ fn cdef_luma_unit_dists_all(
                     for (a, cb) in acc.iter_mut().zip(cand.iter()) {
                         for i in 0..8 {
                             let srow = &src[(y + i) * w + x..][..8];
-                            for (e, (&d, &sv)) in err[i * 8..i * 8 + 8].iter_mut().zip(cb[i * 8..i * 8 + 8].iter().zip(srow)) {
+                            for (e, (&d, &sv)) in err[i * 8..i * 8 + 8]
+                                .iter_mut()
+                                .zip(cb[i * 8..i * 8 + 8].iter().zip(srow))
+                            {
                                 *e = d - i32::from(sv);
                             }
                         }
@@ -4614,7 +4634,10 @@ fn cdef_chroma_unit_sse_all(
                     for (a, cb) in acc.iter_mut().zip(cand.iter()) {
                         for i in 0..cbh {
                             let srow = &src[(cy + i) * cw + cx..][..cbw];
-                            for (e, (&d, &sv)) in err[i * cbw..i * cbw + cbw].iter_mut().zip(cb[i * cbw..i * cbw + cbw].iter().zip(srow)) {
+                            for (e, (&d, &sv)) in err[i * cbw..i * cbw + cbw]
+                                .iter_mut()
+                                .zip(cb[i * cbw..i * cbw + cbw].iter().zip(srow))
+                            {
                                 *e = d - i32::from(sv);
                             }
                         }
@@ -5310,7 +5333,16 @@ fn frame_lf_search(
                 scratch.copy_from_slice(plane);
                 deblock_chroma_plane(loopfilter, pool, &mut scratch, g, &cg, lvl);
                 if t.lf_search_metric == 2 {
-                    plane_dist_vis(&scratch, &src[pl + 1], g.cw8, cg.vis_w, cg.vis_h, g.bd, 2, &rd)
+                    plane_dist_vis(
+                        &scratch,
+                        &src[pl + 1],
+                        g.cw8,
+                        cg.vis_w,
+                        cg.vis_h,
+                        g.bd,
+                        2,
+                        &rd,
+                    )
                 } else {
                     plane_sse_vis(&scratch, &src[pl + 1], g.cw8, cg.vis_w, cg.vis_h)
                 }
@@ -5735,7 +5767,11 @@ mod aq_tests {
                         uc,
                         damping,
                         bd,
-                        if perceptual { CdefMetric::CdefDist } else { CdefMetric::Sse },
+                        if perceptual {
+                            CdefMetric::CdefDist
+                        } else {
+                            CdefMetric::Sse
+                        },
                         &pool,
                     );
                     for c in 0..cdef::N_CAND {
