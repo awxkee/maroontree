@@ -191,9 +191,6 @@ struct LossyUvPalette {
     map: Vec<u8>,
     width: usize,
     height: usize,
-    /// Candidate family, mirroring [`LossyLumaPalette::top`]: `true` = the n
-    /// most frequent (U, V) pairs used directly. Sel-encoded as `n + 8*top`.
-    top: bool,
 }
 
 /// Exact chroma palette for a `w`x`h` chroma block at (cx, cy): succeeds iff
@@ -257,7 +254,6 @@ fn exact_uv_palette(
         map,
         width: w,
         height: h,
-        top: false,
     })
 }
 
@@ -308,31 +304,13 @@ fn uv_pair_histogram(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lossy_uv_palette(
-    kmeans: &crate::kmeans::KmeansDispatch,
-    src_u: &[u16],
-    src_v: &[u16],
-    stride: usize,
-    cx: usize,
-    cy: usize,
-    w: usize,
-    h: usize,
-    colors: usize,
-    top: bool,
-    opts: &UvMapOpts,
-) -> Option<LossyUvPalette> {
-    let hist = uv_pair_histogram(src_u, src_v, stride, cx, cy, w, h);
-    lossy_uv_palette_from_hist(kmeans, &hist, src_u, src_v, stride, cx, cy, w, h, colors, top, opts)
-}
-
 /// UV index-map construction: `Some((palette_uv_color cost tables, lambda))`
 /// runs [`viterbi_uv_palette_map`], None keeps the nearest-pair map. Built by
 /// `uv_palette_map_opts`; quantiser-only lambda, so search and replay build
 /// the same map.
 type UvMapOpts = Option<([[[f32; 8]; 5]; 7], f32)>;
 
-/// [`lossy_uv_palette`] over a precomputed [`uv_pair_histogram`].
+/// Lossy UV palette over a precomputed [`uv_pair_histogram`].
 #[allow(clippy::too_many_arguments)]
 fn lossy_uv_palette_from_hist(
     kmeans: &crate::kmeans::KmeansDispatch,
@@ -449,35 +427,7 @@ fn lossy_uv_palette_from_hist(
         map,
         width: w,
         height: h,
-        top,
     })
-}
-
-/// Re-derive the captured UV palette during wavefront replay: the capture
-/// tried exact first, then lossy — so an exact palette exists iff the capture
-/// used it (and then its size equals `k`); otherwise the lossy clustering is
-/// deterministic and reproduces the recorded candidate from `k` alone.
-#[allow(clippy::too_many_arguments)]
-fn uv_palette_rederive(
-    kmeans: &crate::kmeans::KmeansDispatch,
-    src_u: &[u16],
-    src_v: &[u16],
-    stride: usize,
-    cx: usize,
-    cy: usize,
-    w: usize,
-    h: usize,
-    sel: usize,
-    opts: &UvMapOpts,
-) -> LossyUvPalette {
-    let top = sel > 8;
-    let k = if top { sel - 8 } else { sel };
-    if !top && let Some(up) = exact_uv_palette(src_u, src_v, stride, cx, cy, w, h) {
-        debug_assert_eq!(up.u.len(), k);
-        return up;
-    }
-    lossy_uv_palette(kmeans, src_u, src_v, stride, cx, cy, w, h, k, top, opts)
-        .expect("uv palette replay: lossy re-derivation failed")
 }
 
 fn sum_sq(resid: &[i32]) -> i64 {
@@ -913,6 +863,7 @@ fn dp_palette_center_sets(hist: &[(i32, u32)], kmax: usize) -> [FixedList<i32, 8
     sets
 }
 
+#[cfg(test)]
 /// Palette candidate for a `w`x`h` luma block with `colors` entries: centers
 /// via [`palette_centers`], plus the per-sample index map. Deterministic (the
 /// wavefront replay re-derives it from (position, colors) alone).
@@ -1395,12 +1346,12 @@ impl<'a> LossyTile<'a> {
         py: usize,
         mlam: f32,
     ) -> Option<PaletteEstimateContext> {
-        if !self.screen_frame {
+        if !self.cfg.screen_frame {
             return None;
         }
         let (bx4, by4) = (px / 4, py / 4);
         let mut colors = [0u16; 18];
-        for (i, palette) in [&self.a_palette[bx4], &self.l_palette[by4]]
+        for (i, palette) in [&self.ctx.a_palette[bx4], &self.ctx.l_palette[by4]]
             .iter()
             .enumerate()
         {
@@ -1411,7 +1362,7 @@ impl<'a> LossyTile<'a> {
         }
         Some(PaletteEstimateContext {
             colors,
-            modes: [self.a_mode[bx4], self.l_mode[by4]],
+            modes: [self.ctx.a_mode[bx4], self.ctx.l_mode[by4]],
             mlam: mlam.to_bits(),
         })
     }
@@ -1420,59 +1371,11 @@ impl<'a> LossyTile<'a> {
     /// (text) afford Slow twice the photo budget: their blocks pass the
     /// histogram gate densely and the extra finalists measured -0.4..-1.4%.
     fn palette_refine_budget(&self) -> usize {
-        let b = self.speed.palette_refine_budget();
-        match self.speed {
-            Speed::Slow | Speed::ExtraSlow if self.screen_frame => 4,
+        let b = self.cfg.speed.palette_refine_budget();
+        match self.cfg.speed {
+            Speed::Slow | Speed::ExtraSlow if self.cfg.screen_frame => 4,
             _ => b,
         }
-    }
-
-    /// Re-derive the selected palette (`sel` = requested centers before
-    /// snapping, +8 for the dominant-color family) as the search built it:
-    /// same centers, same cache snapping (the color cache is identical at
-    /// decision and emit — it crosses the wavefront handoff), same map.
-    fn rederive_luma_palette(
-        &self,
-        px: usize,
-        py: usize,
-        w: usize,
-        h: usize,
-        sel: usize,
-    ) -> Option<LossyLumaPalette> {
-        if !self.screen_frame {
-            return lossy_luma_palette(
-                &self.kmeans,
-                &self.src[0],
-                self.w,
-                px,
-                py,
-                w,
-                h,
-                sel,
-                &self.palette_map_opts(),
-            );
-        }
-        let hist = block_color_histogram(&self.src[0], self.w, px, py, w, h)?;
-        let top = sel > 8;
-        let colors = if top { sel - 8 } else { sel };
-        let centers = if top {
-            top_palette_centers(&hist, colors)?
-        } else {
-            palette_centers(&hist, colors)?
-        };
-        let centers = self.snap_palette_to_cache(px, py, centers)?;
-        Some(lossy_luma_palette_from_centers(
-            &self.kmeans,
-            &self.src[0],
-            self.w,
-            px,
-            py,
-            w,
-            h,
-            centers.as_slice().to_vec(),
-            sel,
-            &self.palette_map_opts(),
-        ))
     }
 
     /// libaom `av1_optimize_palette_colors`: move every center within 4
@@ -1486,11 +1389,11 @@ impl<'a> LossyTile<'a> {
         mut centers: FixedList<i32, 8>,
     ) -> Option<FixedList<i32, 8>> {
         let (bx4, by4) = (px / 4, py / 4);
-        let cache = palette_cache(&self.a_palette[bx4], &self.l_palette[by4], !py.is_multiple_of(64));
+        let cache = palette_cache(&self.ctx.a_palette[bx4], &self.ctx.l_palette[by4], !py.is_multiple_of(64));
         if cache.is_empty() {
             return Some(centers);
         }
-        let thr = 4i32 << (self.bd - 8);
+        let thr = 4i32 << (self.cfg.bd - 8);
         for c in centers.as_mut_slice() {
             let mut best = (i32::MAX, *c);
             for &k in cache.iter() {
@@ -1559,7 +1462,7 @@ impl<'a> LossyTile<'a> {
             }) else {
                 continue;
             };
-            let centers = if self.screen_frame {
+            let centers = if self.cfg.screen_frame {
                 let (px, py, _, _) = at;
                 match self.snap_palette_to_cache(px, py, centers) {
                     Some(c) => c,
@@ -1571,7 +1474,7 @@ impl<'a> LossyTile<'a> {
             // Cache snapping and the two center families often converge to
             // the same predictor. Refine each distinct screen palette once,
             // keeping the first selector so ties remain deterministic.
-            if self.screen_frame
+            if self.cfg.screen_frame
                 && ranked
                     .iter()
                     .any(|&(_, _, c, _)| c.as_slice() == centers.as_slice())
@@ -1605,11 +1508,11 @@ impl<'a> LossyTile<'a> {
             // snapped centers most colors are 1-bit cache reuses, and the flat
             // `n * bd` charge ranked the 7-8 color palettes text needs out of
             // the finalists.
-            let model_bits = if self.screen_frame {
+            let model_bits = if self.cfg.screen_frame {
                 let (px, py, w, h) = at;
                 self.palette_header_bits_for(px, py, w, h, centers.as_slice()) + entropy_bits * 0.5
             } else {
-                centers.len() as f32 * self.bd as f32 + entropy_bits * 0.5 + 8.0
+                centers.len() as f32 * self.cfg.bd as f32 + entropy_bits * 0.5 + 8.0
             };
             ranked.push((rd_cost_i64(sse, mlam, model_bits), order, centers, top));
         }
@@ -1639,9 +1542,9 @@ impl<'a> LossyTile<'a> {
             .take(self.palette_refine_budget())
             .map(|&(_, order, centers, top)| {
                 let palette = lossy_luma_palette_from_centers(
-                    &self.kmeans,
-                    &self.src[0],
-                    self.w,
+                    &self.k.kmeans,
+                    &self.cfg.src[0],
+                    self.cfg.w,
                     px,
                     py,
                     w,
@@ -1661,9 +1564,9 @@ impl<'a> LossyTile<'a> {
     /// at Slow+ only, so photos never pay for the extra histogram/map work.
     fn palette_big_enabled(&self) -> bool {
         crate::tuning::get().palette64
-            && self.screen_frame
+            && self.cfg.screen_frame
             && self.try_palette()
-            && self.speed.at_least_slow()
+            && self.cfg.speed.at_least_slow()
     }
 
     /// [`Self::rank_luma_palette_candidates`] for the large shapes (64x64,
@@ -1688,9 +1591,9 @@ impl<'a> LossyTile<'a> {
             .take(take)
             .map(|&(_, order, centers, top)| {
                 let palette = lossy_luma_palette_from_centers(
-                    &self.kmeans,
-                    &self.src[0],
-                    self.w,
+                    &self.k.kmeans,
+                    &self.cfg.src[0],
+                    self.cfg.w,
                     px,
                     py,
                     w,
@@ -1715,7 +1618,7 @@ impl<'a> LossyTile<'a> {
         if !self.palette_big_enabled() {
             return f32::INFINITY;
         }
-        let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h) else {
+        let Some(hist) = block_color_histogram(&self.cfg.src[0], self.cfg.w, px, py, w, h) else {
             return f32::INFINITY;
         };
         // EXACT palettes only (<= 8 values): the bound is then tight (zero
@@ -1733,18 +1636,18 @@ impl<'a> LossyTile<'a> {
         let key = ((px as u64) << 34) | ((py as u64) << 8) | (((w / 8) as u64) << 4) | (h / 8) as u64;
         let context = self.palette_estimate_context(px, py, mlam);
         let cached = if let Some(context) = context {
-            self.screen_pal_est_cache
+            self.memo.screen_pal_est_cache
                 .borrow()
                 .get(&key)
                 .filter(|(saved, _)| *saved == context)
                 .map(|&(_, pairs)| pairs)
         } else {
-            self.pal_est_cache.borrow().get(&key).copied()
+            self.memo.pal_est_cache.borrow().get(&key).copied()
         };
         let pairs = if let Some(pairs) = cached {
             pairs
         } else {
-            let acq = self.quant.ac_q() as f32;
+            let acq = self.ctx.quant.ac_q() as f32;
             let mut pairs = [(f32::INFINITY, 0.0f32); 3];
             for (i, (p, pred)) in self
                 .rank_luma_palette_candidates_dyn(
@@ -1765,11 +1668,11 @@ impl<'a> LossyTile<'a> {
                 pairs[i] = (dist, bits);
             }
             if let Some(context) = context {
-                self.screen_pal_est_cache
+                self.memo.screen_pal_est_cache
                     .borrow_mut()
                     .insert(key, (context, pairs));
             } else {
-                self.pal_est_cache.borrow_mut().insert(key, pairs);
+                self.memo.pal_est_cache.borrow_mut().insert(key, pairs);
             }
             pairs
         };
@@ -1793,7 +1696,7 @@ impl<'a> LossyTile<'a> {
         if !self.palette_big_enabled() {
             return Vec::new();
         }
-        let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, w, h) else {
+        let Some(hist) = block_color_histogram(&self.cfg.src[0], self.cfg.w, px, py, w, h) else {
             return Vec::new();
         };
         if hist.len() > 8 {
@@ -1831,7 +1734,7 @@ impl<'a> LossyTile<'a> {
     /// (`Tuning::uv_pal_gate_wsse`).
     fn uv_pal_gate_dist(&self, resid_u: &[i32], resid_v: &[i32], w: usize, h: usize) -> i64 {
         if crate::tuning::get().uv_pal_gate_wsse {
-            self.rd.wsse_err(resid_u, w, h) + self.rd.wsse_err(resid_v, w, h)
+            self.k.rd.wsse_err(resid_u, w, h) + self.k.rd.wsse_err(resid_v, w, h)
         } else {
             sum_sq(&resid_u[..w * h]) + sum_sq(&resid_v[..w * h])
         }
@@ -1840,10 +1743,10 @@ impl<'a> LossyTile<'a> {
     /// Index-map smoothing tolerance in pixel units (`Tuning::palette_smooth`).
     #[inline]
     pub(super) fn palette_smooth_t(&self) -> i32 {
-        if self.ss420 || self.ss422 || self.mono {
+        if !self.cfg.is_444() {
             return 0;
         }
-        (self.quant.ac_q() * crate::tuning::get().palette_smooth as i32) >> 8
+        (self.ctx.quant.ac_q() * crate::tuning::get().palette_smooth as i32) >> 8
     }
 
     /// Index-map construction options for this tile (see [`PalMapOpts`]).
@@ -1853,7 +1756,7 @@ impl<'a> LossyTile<'a> {
     /// palette memos and the wavefront replay both depend on that.
     fn palette_map_opts(&self) -> PalMapOpts {
         let t = crate::tuning::get();
-        let k = if self.ss420 || self.ss422 || self.mono {
+        let k = if !self.cfg.is_444() {
             t.palette_viterbi_420
         } else {
             t.palette_viterbi_444
@@ -1868,8 +1771,8 @@ impl<'a> LossyTile<'a> {
     fn palette_viterbi_frame(&self) -> bool {
         match crate::tuning::get().palette_viterbi_screen_only {
             0 => true,
-            1 => self.screen_frame,
-            _ => self.screen_content,
+            1 => self.cfg.screen_frame,
+            _ => self.cfg.screen_content,
         }
     }
 
@@ -1878,7 +1781,7 @@ impl<'a> LossyTile<'a> {
     /// quantiser only, so replay re-derives the identical map.
     fn uv_palette_map_opts(&self) -> UvMapOpts {
         let k = crate::tuning::get().palette_viterbi_uv;
-        let on = k > 0.0 && !(self.ss420 || self.ss422 || self.mono) && self.palette_viterbi_frame();
+        let on = k > 0.0 && !(!self.cfg.is_444()) && self.palette_viterbi_frame();
         on.then(|| (**self.pal_uv_cost_tables(), self.mlam().min(self.mlam_c()) * k))
     }
 
@@ -1886,9 +1789,9 @@ impl<'a> LossyTile<'a> {
     /// pinned frame-initial snapshot.
     fn pal_uv_cost_tables(&self) -> std::cell::Ref<'_, Box<[[[f32; 8]; 5]; 7]>> {
         {
-            let mut slot = self.pal_uv_cost.borrow_mut();
+            let mut slot = self.model.pal_uv_cost.borrow_mut();
             if slot.is_none() {
-                let c = self.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
+                let c = self.model.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
                 let mut m = Box::new([[[0f32; 8]; 5]; 7]);
                 for ns in 2..=8usize {
                     for ctx in 0..5 {
@@ -1900,7 +1803,7 @@ impl<'a> LossyTile<'a> {
                 *slot = Some(m);
             }
         }
-        std::cell::Ref::map(self.pal_uv_cost.borrow(), |o| {
+        std::cell::Ref::map(self.model.pal_uv_cost.borrow(), |o| {
             o.as_ref().expect("initialized above")
         })
     }
@@ -1918,9 +1821,9 @@ impl<'a> LossyTile<'a> {
     /// Flat per-tile `palette_y_color` decision-cost tables (see field doc).
     fn pal_y_cost_tables(&self) -> std::cell::Ref<'_, Box<[[[f32; 8]; 5]; 7]>> {
         {
-            let mut slot = self.pal_y_cost.borrow_mut();
+            let mut slot = self.model.pal_y_cost.borrow_mut();
             if slot.is_none() {
-                let c = self.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
+                let c = self.model.pal_cdfs.as_deref().unwrap_or_else(|| self.dcdf());
                 let mut m = Box::new([[[0f32; 8]; 5]; 7]);
                 for ns in 2..=8usize {
                     for ctx in 0..5 {
@@ -1932,7 +1835,7 @@ impl<'a> LossyTile<'a> {
                 *slot = Some(m);
             }
         }
-        std::cell::Ref::map(self.pal_y_cost.borrow(), |o| {
+        std::cell::Ref::map(self.model.pal_y_cost.borrow(), |o| {
             o.as_ref().expect("initialized above")
         })
     }
@@ -1958,13 +1861,13 @@ impl<'a> LossyTile<'a> {
         // cache credit matters most exactly where palette matters — dense
         // same-palette regions (screen content) — where the context-free
         // model overpriced every block's colors as new.
-        let mctx = usize::from(!self.a_palette[bx4].is_empty())
-            + usize::from(!self.l_palette[by4].is_empty());
+        let mctx = usize::from(!self.ctx.a_palette[bx4].is_empty())
+            + usize::from(!self.ctx.l_palette[by4].is_empty());
         let mut bits = cdf_cost(&c.palette_y_mode[bctx][mctx], 1)
             + cdf_cost(&c.palette_y_size[bctx], colors.len() - 2);
         let cache = palette_cache(
-            &self.a_palette[bx4],
-            &self.l_palette[by4],
+            &self.ctx.a_palette[bx4],
+            &self.ctx.l_palette[by4],
             !py.is_multiple_of(64),
         );
         let mut found = 0;
@@ -1983,14 +1886,14 @@ impl<'a> LossyTile<'a> {
         }
         if let Some(&first) = out.first() {
             let _ = first;
-            bits += self.bd as f32;
+            bits += self.cfg.bd as f32;
             if out.len() > 1 {
                 let max_delta = out.array_windows::<2>().map(|w| w[1] - w[0]).max().unwrap();
-                let min_bits = self.bd - 3;
+                let min_bits = self.cfg.bd - 3;
                 let mut nb = (32 - (max_delta - 1).leading_zeros()) as u8;
                 nb = nb.max(min_bits);
                 bits += 2.0;
-                let mut range = (1u32 << self.bd) - out[0] - 1;
+                let mut range = (1u32 << self.cfg.bd) - out[0] - 1;
                 for w in out.array_windows::<2>() {
                     let delta = w[1] - w[0];
                     bits += nb as f32;
@@ -2046,39 +1949,39 @@ impl<'a> LossyTile<'a> {
         // uv_pal when the strip has chroma) for them, so the old `< 8` gate
         // silently desynced every quad-split bitstream.
         if width.max(height) > 64 || width + height < 16 {
-            let xe = (bx4 + width.div_ceil(4)).min(self.a_palette.len());
-            let ye = (by4 + height.div_ceil(4)).min(self.l_palette.len());
-            self.a_palette[bx4..xe].fill(Vec::new());
-            self.l_palette[by4..ye].fill(Vec::new());
+            let xe = (bx4 + width.div_ceil(4)).min(self.ctx.a_palette.len());
+            let ye = (by4 + height.div_ceil(4)).min(self.ctx.l_palette.len());
+            self.ctx.a_palette[bx4..xe].fill(Vec::new());
+            self.ctx.l_palette[by4..ye].fill(Vec::new());
             // The UV state must clear too (the decoder zeroes pal_sz for
             // EVERY block, eligible or not). Leaving it stale poisoned the
             // next UV palette's color cache — invisible while palettes were
             // exact-only (too sparse to ever bracket a 4x4 run), decode-fatal
             // once lossy UV palettes made them dense (x_fractal 444 q80).
-            self.a_palette_uv[bx4..xe].fill(Vec::new());
-            self.l_palette_uv[by4..ye].fill(Vec::new());
+            self.ctx.a_palette_uv[bx4..xe].fill(Vec::new());
+            self.ctx.l_palette_uv[by4..ye].fill(Vec::new());
             return;
         }
         let bctx = palette_bsize_ctx(width, height);
-        let mctx = usize::from(!self.a_palette[bx4].is_empty())
-            + usize::from(!self.l_palette[by4].is_empty());
+        let mctx = usize::from(!self.ctx.a_palette[bx4].is_empty())
+            + usize::from(!self.ctx.l_palette[by4].is_empty());
         if y_mode == DC_PRED {
-            self.enc.encode_symbol(
+            self.ent.enc.encode_symbol(
                 usize::from(palette.is_some()),
-                &mut self.cdfs.palette_y_mode[bctx][mctx],
+                &mut self.ent.cdfs.palette_y_mode[bctx][mctx],
             );
             if let Some(p) = palette {
                 #[cfg(test)]
-                if !self.enc.sink {
+                if !self.ent.enc.sink {
                     LOSSY_PALETTE_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                self.enc
-                    .encode_symbol(p.colors.len() - 2, &mut self.cdfs.palette_y_size[bctx]);
+                self.ent.enc
+                    .encode_symbol(p.colors.len() - 2, &mut self.ent.cdfs.palette_y_size[bctx]);
                 // AV1 excludes the above palette from the color cache at a
                 // superblock-row boundary (the mode context still sees it).
                 let cache = palette_cache(
-                    &self.a_palette[bx4],
-                    &self.l_palette[by4],
+                    &self.ctx.a_palette[bx4],
+                    &self.ctx.l_palette[by4],
                     !py.is_multiple_of(64),
                 );
                 let mut found = 0;
@@ -2087,7 +1990,7 @@ impl<'a> LossyTile<'a> {
                         break;
                     }
                     let yes = p.colors.binary_search(&c).is_ok();
-                    self.enc.encode_bool(yes, 16384);
+                    self.ent.enc.encode_bool(yes, 16384);
                     found += usize::from(yes);
                 }
                 let mut out = FixedList::<u32, 8>::new(0);
@@ -2097,18 +2000,18 @@ impl<'a> LossyTile<'a> {
                     }
                 }
                 if let Some(&first) = out.first() {
-                    self.enc.encode_literal(first, self.bd as u32);
+                    self.ent.enc.encode_literal(first, self.cfg.bd as u32);
                     if out.len() > 1 {
                         let max_delta =
                             out.array_windows::<2>().map(|w| w[1] - w[0]).max().unwrap();
-                        let min_bits = self.bd - 3;
+                        let min_bits = self.cfg.bd - 3;
                         let mut bits = (32 - (max_delta - 1).leading_zeros()) as u8;
                         bits = bits.max(min_bits);
-                        self.enc.encode_literal(u32::from(bits - min_bits), 2);
-                        let mut range = (1u32 << self.bd) - out[0] - 1;
+                        self.ent.enc.encode_literal(u32::from(bits - min_bits), 2);
+                        let mut range = (1u32 << self.cfg.bd) - out[0] - 1;
                         for w in out.array_windows::<2>() {
                             let delta = w[1] - w[0];
-                            self.enc.encode_literal(delta - 1, bits as u32);
+                            self.ent.enc.encode_literal(delta - 1, bits as u32);
                             range -= delta;
                             let rb = if range <= 1 {
                                 0
@@ -2121,21 +2024,21 @@ impl<'a> LossyTile<'a> {
                 }
             }
         }
-        if has_chroma && !self.mono && self.a_uv_mode[bx4] as usize == DC_PRED {
-            self.enc.encode_symbol(
+        if has_chroma && !self.cfg.is_mono() && self.ctx.a_uv_mode[bx4] as usize == DC_PRED {
+            self.ent.enc.encode_symbol(
                 usize::from(uv_palette.is_some()),
-                &mut self.cdfs.palette_uv_mode[usize::from(palette.is_some())],
+                &mut self.ent.cdfs.palette_uv_mode[usize::from(palette.is_some())],
             );
             if let Some(up) = uv_palette {
                 let bctx = palette_bsize_ctx(width, height);
-                self.enc
-                    .encode_symbol(up.u.len() - 2, &mut self.cdfs.palette_uv_size[bctx]);
+                self.ent.enc
+                    .encode_symbol(up.u.len() - 2, &mut self.ent.cdfs.palette_uv_size[bctx]);
                 // U plane: the Y color-coding machinery with a NON-DECREASING
                 // list (deltas may be 0, increment +0) and the same cache
                 // mechanism, over the U-plane neighbor palettes.
                 let cache = palette_cache(
-                    &self.a_palette_uv[bx4],
-                    &self.l_palette_uv[by4],
+                    &self.ctx.a_palette_uv[bx4],
+                    &self.ctx.l_palette_uv[by4],
                     !py.is_multiple_of(64),
                 );
                 // The U list may hold DUPLICATES (pairs sharing U). Each
@@ -2155,7 +2058,7 @@ impl<'a> LossyTile<'a> {
                         break;
                     }
                     let yes = up.u.binary_search(&c).is_ok();
-                    self.enc.encode_bool(yes, 16384);
+                    self.ent.enc.encode_bool(yes, 16384);
                     if yes {
                         found += 1;
                         if let Ok(pos) = rem.binary_search(&c) {
@@ -2168,23 +2071,23 @@ impl<'a> LossyTile<'a> {
                     out.push(color as u32);
                 }
                 if let Some(&first) = out.first() {
-                    self.enc.encode_literal(first, self.bd as u32);
+                    self.ent.enc.encode_literal(first, self.cfg.bd as u32);
                     if out.len() > 1 {
-                        let max = (1u32 << self.bd) - 1;
+                        let max = (1u32 << self.cfg.bd) - 1;
                         let max_delta =
                             out.array_windows::<2>().map(|w| w[1] - w[0]).max().unwrap();
-                        let min_bits = self.bd - 3;
+                        let min_bits = self.cfg.bd - 3;
                         let mut bits = if max_delta == 0 {
                             0
                         } else {
                             (32 - max_delta.leading_zeros()) as u8
                         };
-                        bits = bits.max(min_bits).min(self.bd);
-                        self.enc.encode_literal(u32::from(bits - min_bits), 2);
+                        bits = bits.max(min_bits).min(self.cfg.bd);
+                        self.ent.enc.encode_literal(u32::from(bits - min_bits), 2);
                         let mut prev = out[0];
                         for w in out.array_windows::<2>() {
                             let delta = w[1] - w[0];
-                            self.enc.encode_literal(delta, bits as u32);
+                            self.ent.enc.encode_literal(delta, bits as u32);
                             prev = (prev + delta).min(max);
                             if prev >= max {
                                 // decoder fills the rest with max and stops
@@ -2201,42 +2104,42 @@ impl<'a> LossyTile<'a> {
                 // magnitudes with a sign bool on nonzero steps; the decoder
                 // wraps `(prev + delta) & max`). `uv_v_plane_plan` is shared
                 // with `palette_uv_rate_bits`.
-                let bd = self.bd as u32;
+                let bd = self.cfg.bd as u32;
                 match uv_v_plane_plan(&up.v, bd).1 {
                     Some((bits, deltas)) => {
-                        self.enc.encode_bool(true, 16384);
-                        self.enc.encode_literal(bits - (bd - 4), 2);
-                        self.enc.encode_literal(up.v[0] as u32, bd);
+                        self.ent.enc.encode_bool(true, 16384);
+                        self.ent.enc.encode_literal(bits - (bd - 4), 2);
+                        self.ent.enc.encode_literal(up.v[0] as u32, bd);
                         for &d in deltas.iter() {
-                            self.enc.encode_literal(d.unsigned_abs(), bits);
+                            self.ent.enc.encode_literal(d.unsigned_abs(), bits);
                             if d != 0 {
-                                self.enc.encode_bool(d < 0, 16384);
+                                self.ent.enc.encode_bool(d < 0, 16384);
                             }
                         }
                     }
                     None => {
-                        self.enc.encode_bool(false, 16384);
+                        self.ent.enc.encode_bool(false, 16384);
                         for &v in &up.v {
-                            self.enc.encode_literal(v as u32, bd);
+                            self.ent.enc.encode_literal(v as u32, bd);
                         }
                     }
                 }
             }
         }
         let stored = palette.map_or_else(Vec::new, |p| p.colors.clone());
-        let xe = (bx4 + width / 4).min(self.a_palette.len());
-        let ye = (by4 + height / 4).min(self.l_palette.len());
-        for v in &mut self.a_palette[bx4..xe] {
+        let xe = (bx4 + width / 4).min(self.ctx.a_palette.len());
+        let ye = (by4 + height / 4).min(self.ctx.l_palette.len());
+        for v in &mut self.ctx.a_palette[bx4..xe] {
             v.clone_from(&stored);
         }
-        for v in &mut self.l_palette[by4..ye] {
+        for v in &mut self.ctx.l_palette[by4..ye] {
             v.clone_from(&stored);
         }
         let stored_uv = uv_palette.map_or_else(Vec::new, |p| p.u.clone());
-        for v in &mut self.a_palette_uv[bx4..xe] {
+        for v in &mut self.ctx.a_palette_uv[bx4..xe] {
             v.clone_from(&stored_uv);
         }
-        for v in &mut self.l_palette_uv[by4..ye] {
+        for v in &mut self.ctx.l_palette_uv[by4..ye] {
             v.clone_from(&stored_uv);
         }
     }
@@ -2250,13 +2153,13 @@ impl<'a> LossyTile<'a> {
     fn palette_uv_rate_bits(&self, px: usize, py: usize, y_pal: bool, up: &LossyUvPalette) -> f32 {
         let (bx4, by4) = (px / 4, py / 4);
         let c = self.dcdf();
-        let bd = self.bd as u32;
+        let bd = self.cfg.bd as u32;
         let bctx = palette_bsize_ctx(up.width, up.height);
         let mut bits = cdf_cost(&c.palette_uv_mode[usize::from(y_pal)], 1)
             + cdf_cost(&c.palette_uv_size[bctx], up.u.len() - 2);
         let cache = palette_cache(
-            &self.a_palette_uv[bx4],
-            &self.l_palette_uv[by4],
+            &self.ctx.a_palette_uv[bx4],
+            &self.ctx.l_palette_uv[by4],
             !py.is_multiple_of(64),
         );
         let mut rem = FixedList::<i32, 8>::new(0);
@@ -2297,30 +2200,30 @@ impl<'a> LossyTile<'a> {
     }
 
     fn emit_palette_uv_map(&mut self, p: &LossyUvPalette) {
-        self.enc.encode_ns(p.map[0] as u32, p.u.len() as u32);
+        self.ent.enc.encode_ns(p.map[0] as u32, p.u.len() as u32);
         for diagonal in 1..p.width + p.height - 1 {
             let first_x = diagonal.min(p.width - 1);
             let last_x = diagonal.saturating_sub(p.height - 1);
             for x in (last_x..=first_x).rev() {
                 let y = diagonal - x;
                 let (ctx, symbol) = palette_color_ctx(&p.map, p.width, y, x, p.u.len());
-                self.enc
-                    .encode_symbol(symbol, &mut self.cdfs.palette_uv_color[p.u.len() - 2][ctx]);
+                self.ent.enc
+                    .encode_symbol(symbol, &mut self.ent.cdfs.palette_uv_color[p.u.len() - 2][ctx]);
             }
         }
     }
 
     fn emit_palette_map(&mut self, p: &LossyLumaPalette) {
-        self.enc.encode_ns(p.map[0] as u32, p.colors.len() as u32);
+        self.ent.enc.encode_ns(p.map[0] as u32, p.colors.len() as u32);
         for diagonal in 1..p.width + p.height - 1 {
             let first_x = diagonal.min(p.width - 1);
             let last_x = diagonal.saturating_sub(p.height - 1);
             for x in (last_x..=first_x).rev() {
                 let y = diagonal - x;
                 let (ctx, symbol) = palette_color_ctx(&p.map, p.width, y, x, p.colors.len());
-                self.enc.encode_symbol(
+                self.ent.enc.encode_symbol(
                     symbol,
-                    &mut self.cdfs.palette_y_color[p.colors.len() - 2][ctx],
+                    &mut self.ent.cdfs.palette_y_color[p.colors.len() - 2][ctx],
                 );
             }
         }
@@ -2338,80 +2241,19 @@ mod palette_generalization_tests {
             .map(|i| [10, 14, 100, 160][(i % w / 4) % 4])
             .collect();
         let src = [luma, vec![128; w * h], vec![128; w * h]];
-        let mut tile = LossyTile::new(120, 8, w, h, &src, QmLevels::FLAT);
-        tile.screen_frame = true;
+        let mut tile = LossyTile::new(Chroma::I444, 120, 8, w, h, &src, QmLevels::FLAT);
+        tile.cfg.screen_frame = true;
         let key = (8u64 << 34) | (8u64 << 8) | 16;
         tile.rd_cost_square(8, 8, 16, false, false, 1.0);
-        tile.l_palette[2] = vec![12, 100, 160];
-        tile.l_mode[2] = DC_PRED as u8;
+        tile.ctx.l_palette[2] = vec![12, 100, 160];
+        tile.ctx.l_mode[2] = DC_PRED as u8;
         let cached_cost = tile.rd_cost_square(8, 8, 16, false, false, 1.25);
-        let cached_pairs = tile.screen_pal_est_cache.borrow()[&key].1;
-        tile.screen_pal_est_cache.borrow_mut().clear();
+        let cached_pairs = tile.memo.screen_pal_est_cache.borrow()[&key].1;
+        tile.memo.screen_pal_est_cache.borrow_mut().clear();
         let fresh_cost = tile.rd_cost_square(8, 8, 16, false, false, 1.25);
-        let fresh_pairs = tile.screen_pal_est_cache.borrow()[&key].1;
+        let fresh_pairs = tile.memo.screen_pal_est_cache.borrow()[&key].1;
         assert_eq!(cached_cost, fresh_cost);
         assert_eq!(cached_pairs, fresh_pairs);
-    }
-
-    #[test]
-    fn snapped_palette_replay_preserves_the_selected_candidate() {
-        let (w, h) = (64, 64);
-        for bd in [8, 10, 12] {
-            let shift = bd - 8;
-            let luma: Vec<u16> = (0..w * h)
-                .map(|i| {
-                    let value = match (i * 37 + i / w * 11) % 64 {
-                        0..24 => 10,
-                        24..44 => 14,
-                        44..56 => 100,
-                        _ => 160,
-                    };
-                    value << shift
-                })
-                .collect();
-            let src = [luma, vec![128 << shift; w * h], vec![128 << shift; w * h]];
-            let mut tile = LossyTile::new(120, bd, w, h, &src, QmLevels::FLAT);
-            tile.screen_frame = true;
-            tile.l_palette[2] = vec![12 << shift];
-            for size in [8, 16, 32] {
-                let hist = block_color_histogram(&src[0], w, 8, 8, size, size).unwrap();
-                let ranked = tile.rank_palette_centers(&hist, tile.mlam(), (8, 8, size, size));
-                assert!(!ranked.is_empty());
-                assert!(
-                    ranked
-                        .iter()
-                        .any(|&(_, order, centers, _)| centers.len() < order / 2 + 2)
-                );
-                for (i, &(_, _, centers, _)) in ranked.iter().enumerate() {
-                    assert!(
-                        ranked[..i]
-                            .iter()
-                            .all(|&(_, _, previous, _)| previous.as_slice() != centers.as_slice())
-                    );
-                }
-                for &(_, order, centers, top) in ranked.iter() {
-                    let selected = lossy_luma_palette_from_centers(
-                        &tile.kmeans,
-                        &src[0],
-                        w,
-                        8,
-                        8,
-                        size,
-                        size,
-                        centers.as_slice().to_vec(),
-                        order / 2 + 2 + if top { 8 } else { 0 },
-                        &tile.palette_map_opts(),
-                    );
-                    let selector = selected.sel as usize;
-                    let replayed = tile.rederive_luma_palette(8, 8, size, size, selector);
-                    assert_eq!(
-                        replayed.as_ref(),
-                        Some(&selected),
-                        "bd={bd} size={size} selector={selector}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]

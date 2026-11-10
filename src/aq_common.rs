@@ -163,7 +163,7 @@ pub(crate) fn variance_boost_delta_av2(
     )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DarkAq {
     pub enabled: bool,
     /// Only active at base_q >= this (qstep-extinction range, roughly q<=45 in 8-bit).

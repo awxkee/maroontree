@@ -323,7 +323,7 @@ impl<T: Dct> Dct for FlatDct<'_, T> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Quant {
     dc: i32,
     ac: i32,
