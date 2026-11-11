@@ -294,7 +294,7 @@ impl<'a> LossyTile<'a> {
         let mut luma_rec = [0u16; 64];
         recon_add_pred(&mut luma_rec, lpred, &lrr, (1 << self.cfg.bd) - 1);
         let (dcq, acq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
         let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
@@ -455,7 +455,7 @@ impl<'a> LossyTile<'a> {
         let lrr = self.k.idct.idct_dequant_16x16(lcf, &self.ctx.quant);
         let mut luma_rec = self.sbuf_u256();
         recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
         let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
@@ -570,7 +570,7 @@ impl<'a> LossyTile<'a> {
         let lrr = self.k.idct.idct_dequant_32x32(lcf, &self.ctx.quant);
         let mut luma_rec = self.sbuf_u1024();
         recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
         let mlam = self.lambda_d_c() * prdo;
         let cx = px >> 1;
@@ -694,7 +694,7 @@ impl<'a> LossyTile<'a> {
         // Chroma coefficients are quantized with `cquant`, so their trellis
         // must reconstruct with the chroma steps too (external review round 3).
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
         let mlam = self.emit_mlam(x8 * 8, y8 * 8, 8);
         // emit_prdo/emit_mlam already carry the perceptual scale
         let prdo = self.perceptual_rd_scale(px, py, 8);
@@ -1778,7 +1778,7 @@ impl<'a> LossyTile<'a> {
                                 self.ctx.cquant.dc_q() as f32,
                                 self.ctx.cquant.ac_q() as f32,
                                 &SCAN_8X8,
-                                trellis_lambda(),
+                                self.trellis_lambda(),
                             );
                             let rr = self.k.idct.idct_dequant_8x8(&q, &self.ctx.cquant);
                             sse += sse_recon::<64, 8>(&self.k.rd, &pal_pred[ci], &rr, self.src_blk(plane, px, py, 8, 8), self.cfg.bd);
@@ -1831,7 +1831,7 @@ impl<'a> LossyTile<'a> {
                 let (dcq2, acq2, lam2) = (
                     self.ctx.cquant.dc_q() as f32,
                     self.ctx.cquant.ac_q() as f32,
-                    trellis_lambda(),
+                    self.trellis_lambda(),
                 );
                 let mlam_c = self.mlam_c() * (self.emit_mlam(x8 * 8, y8 * 8, 8) / self.mlam());
                 let sv_tx = chroma_tx_for_mode(SMOOTH_V_PRED);
@@ -1909,7 +1909,7 @@ impl<'a> LossyTile<'a> {
                 let (dcq2, acq2, lam2) = (
                     self.ctx.cquant.dc_q() as f32,
                     self.ctx.cquant.ac_q() as f32,
-                    trellis_lambda(),
+                    self.trellis_lambda(),
                 );
                 // `uv8_cfl_mlam_c`: decide CfL-vs-DC on the chroma lambda (the
                 // directional closure below already does), not the luma one.
@@ -2338,7 +2338,7 @@ impl<'a> LossyTile<'a> {
                 let (dcq2, acq2, lam2) = (
                     self.ctx.cquant.dc_q() as f32,
                     self.ctx.cquant.ac_q() as f32,
-                    trellis_lambda(),
+                    self.trellis_lambda(),
                 );
                 let lrr = if best_is_vdct {
                     self.k.idct.ivdct_dequant_8x8(&lcf, &self.ctx.quant)

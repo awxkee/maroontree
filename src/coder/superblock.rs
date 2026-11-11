@@ -759,7 +759,7 @@ impl<'a> LossyTile<'a> {
             let prdo = self.perceptual_rd_scale(px, py, 8);
             let mut alt = self.rd_cost_square(px, py, 8, tr, bl, prdo);
             if !self.cfg.is_mono() && ibc < alt {
-                alt = alt.min(self.rd_cost_split4_luma(px, py, trellis_lambda() * prdo, self.mlam() * prdo));
+                alt = alt.min(self.rd_cost_split4_luma(px, py, self.trellis_lambda() * prdo, self.mlam() * prdo));
             }
             if ibc < alt {
                 return Part16::Intrabc;

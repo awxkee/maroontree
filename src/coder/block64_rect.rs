@@ -350,7 +350,7 @@ impl<'a> LossyTile<'a> {
             return DC_PRED;
         }
         let cftype = self.chroma_filter_type(px, py);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam_c = self.mlam_c() * prdo;
         let mut ranked = FixedList::<(u64, usize), 10>::new((0, DC_PRED));
         for &uv in UV64_MODES.iter().skip(1) {
@@ -634,7 +634,7 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
     ) -> (usize, i32, Option<LossyLumaPalette>) {
         let (lw, lh) = Self::rect64_dims(vert);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
         let ftype = self.luma_filter_type(px, py);
         let mut saved = self.sc().take_u4096();
@@ -712,7 +712,7 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
     ) -> f32 {
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
         let ftype = self.luma_filter_type(px, py);
         let mut best = (u64::MAX, DC_PRED);
@@ -783,7 +783,7 @@ impl<'a> LossyTile<'a> {
     /// [`Self::rd_cost_luma_region64`], DC chroma), excluding the partition
     /// symbol. Compared against [`Self::rd_cost_whole64_modes`].
     fn rd_cost_rect64(&self, x8: usize, y8: usize, vert: bool, thr: bool, lhb: bool, prdo: f32) -> f32 {
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam_c = self.mlam_c() * prdo;
         let (lw, lh) = Self::rect64_dims(vert);
         let subs = Self::rect64_subs(vert);
@@ -855,7 +855,7 @@ impl<'a> LossyTile<'a> {
     ) -> Rect64Coded {
         let (lw, lh) = Self::rect64_dims(vert);
         let (x8, y8) = (px / 8, py / 8);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
         let subs = Self::rect64_subs(vert);
 

@@ -219,7 +219,7 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
     ) -> f32 {
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let (lam, mlam) = (trellis_lambda() * prdo, self.mlam() * prdo);
+        let (lam, mlam) = (self.trellis_lambda() * prdo, self.mlam() * prdo);
         let (lw, lh) = if vert { (4usize, 8) } else { (8, 4) };
         let scan: &[u32] = if vert { &SCAN_4X8 } else { &SCAN_8X4 };
         let ftype = self.luma_filter_type(px, py);
@@ -449,7 +449,7 @@ impl<'a> LossyTile<'a> {
             return self.rd_cost_square(px, py, 32, have_tr, have_bl, prdo);
         }
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let lam = trellis_lambda();
+        let lam = self.trellis_lambda();
         let mlam = self.mlam();
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         let dc = self.k.intrapred.dc_pred_32x32(&self.ctx.recon[0], self.cfg.w, px, py, self.cfg.bd as i32);
@@ -526,7 +526,7 @@ impl<'a> LossyTile<'a> {
             return total;
         }
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let lam = trellis_lambda();
+        let lam = self.trellis_lambda();
         let mlam = self.mlam();
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         // This is an empirical proxy-gap allowance, not literal partition
@@ -709,7 +709,7 @@ impl<'a> LossyTile<'a> {
     fn pick_luma32(&mut self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) -> Luma32Pick {
         let (px, py) = (x8 * 8, y8 * 8);
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 32);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 32);
         let mlam = self.emit_mlam(x8 * 8, y8 * 8, 32);
         // emit_prdo/emit_mlam already carry the perceptual scale; the extra
         // multiplication here ran square leaves at scale^2 while rect leaves,
@@ -1564,7 +1564,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
     ) -> Rect8Pick {
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
         let sel_mlam = self.emit_mlam(x8 * 8, y8 * 8, 8);
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
@@ -2256,7 +2256,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq, lam) = (
             self.ctx.cquant.dc_q() as f32,
             self.ctx.cquant.ac_q() as f32,
-            trellis_lambda(),
+            self.trellis_lambda(),
         );
         // Chroma winner (popped here, pushed before the emit below; exactly one
         // per code_block32 call — this helper is its only chroma path).
@@ -2409,7 +2409,7 @@ impl<'a> LossyTile<'a> {
             }
             let dcq2 = self.ctx.cquant.dc_q() as f32;
             let acq2 = self.ctx.cquant.ac_q() as f32;
-            let lam2 = trellis_lambda();
+            let lam2 = self.trellis_lambda();
             let mlam = self.mlam_c() * (self.emit_mlam(x8 * 8, y8 * 8, 32) / self.mlam());
             // R-D of the current winner (DC or CfL), residual already in `cf_use`.
             let mut cur_total = 0f32;
@@ -2668,7 +2668,7 @@ impl<'a> LossyTile<'a> {
                         let plane = ci + 1;
                         let resid = &resids[ci];
                         let (mut q, qt) = self.k.dct.dct32x32_t(resid, &self.ctx.cquant);
-                        trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_32X32, trellis_lambda());
+                        trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_32X32, self.trellis_lambda());
                         let rr = self.k.idct.idct_dequant_32x32(&q, &self.ctx.cquant);
                         sse += self.k.rd.sse_recon(&pal_pred[ci][..], &rr, self.src_blk(plane, px, py, 32, 32), self.cfg.bd);
                         *pal_ccf[ci] = q;
@@ -2789,7 +2789,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq, lam) = (
             self.ctx.cquant.dc_q() as f32,
             self.ctx.cquant.ac_q() as f32,
-            trellis_lambda(),
+            self.trellis_lambda(),
         );
         // Chroma winner (popped here, pushed before the emit below; exactly one
         // per code_block32 call — this helper is its only chroma path).
@@ -3189,7 +3189,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq, lam) = (
             self.ctx.cquant.dc_q() as f32,
             self.ctx.cquant.ac_q() as f32,
-            trellis_lambda(),
+            self.trellis_lambda(),
         );
         let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 32);
         let mut ccf = [self.sbuf_i512(), self.sbuf_i512()];

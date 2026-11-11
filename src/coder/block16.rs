@@ -473,7 +473,7 @@ impl<'a> LossyTile<'a> {
                 self.ctx.cquant.dc_q() as f32,
                 self.ctx.cquant.ac_q() as f32,
                 &SCAN_16X16,
-                trellis_lambda(),
+                self.trellis_lambda(),
             );
             self.k.rd.preserve_dc(&mut ccf[ci][0], &resid[..]);
         }
@@ -503,7 +503,7 @@ impl<'a> LossyTile<'a> {
             let (dcq, acq, lam) = (
                 self.ctx.cquant.dc_q() as f32,
                 self.ctx.cquant.ac_q() as f32,
-                trellis_lambda(),
+                self.trellis_lambda(),
             );
             let mut cfl_ccf = [self.sbuf_i256(), self.sbuf_i256()];
             let mut cfl_a = [0i32; 2];
@@ -602,7 +602,7 @@ impl<'a> LossyTile<'a> {
             let (dcq, acq, lam) = (
                 self.ctx.cquant.dc_q() as f32,
                 self.ctx.cquant.ac_q() as f32,
-                trellis_lambda(),
+                self.trellis_lambda(),
             );
             // Unification V9: the chroma lambda for a chroma decision
             // (`uv16_444_mlam_c`); the luma lambda is the pre-unification law.
@@ -866,7 +866,7 @@ impl<'a> LossyTile<'a> {
                         let plane = ci + 1;
                         let resid = &resids[ci];
                         let (mut q, qt) = self.k.dct.dct16x16_t(resid, &self.ctx.cquant);
-                        trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_16X16, trellis_lambda());
+                        trellis_optimize(&mut q, &qt, dcq2, acq2, &SCAN_16X16, self.trellis_lambda());
                         let rr = self.k.idct.idct_dequant_16x16(&q, &self.ctx.cquant);
                         sse += sse_recon::<256, 16>(&self.k.rd, &pal_pred[ci], &rr, self.src_blk(plane, px, py, 16, 16), self.cfg.bd);
                         *pal_ccf[ci] = q;
@@ -994,7 +994,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq, lam) = (
             self.ctx.cquant.dc_q() as f32,
             self.ctx.cquant.ac_q() as f32,
-            trellis_lambda(),
+            self.trellis_lambda(),
         );
         let maxval = (1 << self.cfg.bd) - 1;
         // DC path.
@@ -1458,7 +1458,7 @@ impl<'a> LossyTile<'a> {
         let (dcq, acq, lam) = (
             self.ctx.cquant.dc_q() as f32,
             self.ctx.cquant.ac_q() as f32,
-            trellis_lambda(),
+            self.trellis_lambda(),
         );
         let mlam = self.emit_mlam_c(x8 * 8, y8 * 8, 16);
         let mut ccf = [[0i32; 128]; 2];
@@ -1803,7 +1803,7 @@ impl<'a> LossyTile<'a> {
         let (px, py) = (x8 * 8, y8 * 8);
         let maxv = (1 << self.cfg.bd) - 1;
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 8);
 
 
         // Chroma layout differs by subsampling:

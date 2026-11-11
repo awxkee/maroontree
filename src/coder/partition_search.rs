@@ -346,7 +346,7 @@ impl<'a> LossyTile<'a> {
     ) -> f32 {
         let acq = self.ctx.quant.ac_q() as f32;
         let dcq = self.ctx.quant.dc_q() as f32;
-        let lam = trellis_lambda();
+        let lam = self.trellis_lambda();
         let mlam = self.mlam();
         let (lam, mlam) = (lam * prdo, mlam * prdo);
         let mut best = f32::INFINITY;
@@ -935,7 +935,7 @@ impl<'a> LossyTile<'a> {
         // Epoch-stamped memo: the same leaf is re-priced by HORZ/VERT, the
         // A/B legs and the x3 bottom-up recompute. The (distortion, bits) pair
         // is NOT lambda-free — the cached coefficients were trellised at
-        // `trellis_lambda() * prdo` — so prdo is part of the key (external
+        // `self.trellis_lambda() * prdo` — so prdo is part of the key (external
         // review round 2, finding 7).
         let key = (
             ((px as u64) << 40)
@@ -957,7 +957,7 @@ impl<'a> LossyTile<'a> {
         // Use the baseline DC/DCT representation for partition staging. The
         // selected partition receives the unchanged full mode/transform
         // refinement in its emitter; doing both here duplicated winner work.
-        let dlam = trellis_lambda() * prdo;
+        let dlam = self.trellis_lambda() * prdo;
         // The mode / TX selection inside the leaf is a wSSE decision
         // (`lambda_d`); only the returned leaf is priced on SATD with `mlam`.
         let lam_d = self.lambda_d() * prdo;
@@ -1995,7 +1995,7 @@ impl<'a> LossyTile<'a> {
     /// tile (each half predicts from the other), before the chroma search.
     fn pick_rect16_v444(&mut self, x8: usize, y8: usize, half: usize, thr: bool, lhb: bool) -> Rect16PickV444 {
         let maxval = (1 << self.cfg.bd) - 1;
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let (px, py) = (x8 * 8 + half * 8, y8 * 8);
         let (tr_h, bl_h) = self.rect_edge_flags(px, py, true, half == 1, thr, lhb);
@@ -2591,7 +2591,7 @@ impl<'a> LossyTile<'a> {
         have_tr: bool,
         have_bl: bool,
     ) -> Strip16Pick {
-        let lam = trellis_lambda() * self.emit_prdo(px, py, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(px, py, 16);
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let (lw, lh) = if vert { (4usize, 16usize) } else { (16, 4) };
@@ -2987,7 +2987,7 @@ impl<'a> LossyTile<'a> {
         have_bl: bool,
     ) -> Rect16Pick420 {
         let maxval = (1 << self.cfg.bd) - 1;
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let (px, py) = (x8 * 8, y8 * 8);
         let (lw, _) = if vert { (8usize, 16usize) } else { (16, 8) };
@@ -3584,7 +3584,7 @@ impl<'a> LossyTile<'a> {
     /// tile (each half predicts from the other), before the chroma search.
     fn pick_rect16_h422(&mut self, x8: usize, y8: usize, half: usize, thr: bool, lhb: bool) -> Rect16PickH422 {
         let maxval = (1 << self.cfg.bd) - 1;
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let (px, py) = (x8 * 8, y8 * 8 + half * 8);
         let (tr_h, bl_h) = self.rect_edge_flags(px, py, false, half == 1, thr, lhb);
@@ -3905,7 +3905,7 @@ impl<'a> LossyTile<'a> {
     /// tile (each half predicts from the other), before the chroma search.
     fn pick_rect16_h444(&mut self, x8: usize, y8: usize, half: usize, thr: bool, lhb: bool) -> Rect16PickH444 {
         let maxval = (1 << self.cfg.bd) - 1;
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let (cdcq, cacq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let (px, py) = (x8 * 8, y8 * 8 + half * 8);
         let (tr_h, bl_h) = self.rect_edge_flags(px, py, false, half == 1, thr, lhb);
@@ -4757,7 +4757,7 @@ impl<'a> LossyTile<'a> {
         // luma 16x16 (identical for all subsampling modes)
         // Luma 16x16: same non-directional intra mode search as the 8x8 path.
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
-        let lam = trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
+        let lam = self.trellis_lambda() * self.emit_prdo(x8 * 8, y8 * 8, 16);
         let mlam = self.emit_mlam(x8 * 8, y8 * 8, 16);
         let dcs16 = self.dc_sign_ctx_16(0, px / 4, py / 4);
         // emit_prdo/emit_mlam already carry the perceptual scale; the extra
