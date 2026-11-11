@@ -680,6 +680,27 @@ pub(crate) struct Tuning {
     pub(crate) beam_sparse_slot: bool,
     /// Multiplier on the trellis lambda calibration (TRELLIS_AOM_CALIB)
     pub(crate) trellis_calib: f32,
+    /// High-bit-depth (bd > 8) top-band trellis law: the trellis lambda is
+    /// scaled by a factor that ramps linearly from 1 at frame qindex
+    /// `hbd_trellis_hi` down to `hbd_trellis_top` at `hbd_trellis_lo` and
+    /// below. 8-bit encodes are untouched. These three are 4:2:0; 4:2:2 has
+    /// its own triplet; 4:4:4 and 4:0:0 keep the full lambda.
+    ///
+    /// SHIPPED 2026-11-11 at 4:2:0: 0.174 (= trellis_calib 0.2 / 1.15) over
+    /// qindex 36 -> 20. At the top the shipped trellis discards ~1.7x aom's
+    /// distortion per step^2 at 10 bits and the encoder buys it back with a
+    /// finer qindex. Fit (q65-96, SS2 BD): 10-bit tuning -0.31, hi-bd SDR
+    /// -0.26, hi-bd PQ -0.55; q65-80 +0.00..+0.03. Held out: holdout@10
+    /// -0.81, HLG -0.55, PQ (jyrki31) -0.98, downscaled HDR -0.70/-0.69;
+    /// Fast -0.60, Medium -0.20, ExtraSlow -0.47. 4:2:2 measured neutral
+    /// (-0.11..+0.22 for 0.174/0.3 ramps at 24->10 / 20->8) and 4:4:4
+    /// neutral (+0.1), so both stay at 1.0.
+    pub(crate) hbd_trellis_top: f32,
+    pub(crate) hbd_trellis_hi: f32,
+    pub(crate) hbd_trellis_lo: f32,
+    pub(crate) hbd_trellis_top_422: f32,
+    pub(crate) hbd_trellis_hi_422: f32,
+    pub(crate) hbd_trellis_lo_422: f32,
     /// Band-tilt `ramped_tilt(base, q, extra)` per format (444 / 420)
     pub(crate) tilt_base_444: f32,
     pub(crate) tilt_extra_444: f32,
@@ -930,6 +951,12 @@ impl Tuning {
         trellis_pad_stride: false,
         beam_sparse_slot: true,
         trellis_calib: 1.15,
+        hbd_trellis_top: 0.174,
+        hbd_trellis_hi: 36.0,
+        hbd_trellis_lo: 20.0,
+        hbd_trellis_top_422: 1.0,
+        hbd_trellis_hi_422: 24.0,
+        hbd_trellis_lo_422: 10.0,
         tilt_base_444: 1.9,
         tilt_extra_444: 1.4,
         tilt_base_420: 3.5,
@@ -1235,6 +1262,12 @@ mod imp {
                 "trellis_pad_stride" => t.trellis_pad_stride = flag(value),
                 "beam_sparse_slot" => t.beam_sparse_slot = flag(value),
                 "trellis_calib" => t.trellis_calib = num(value),
+                "hbd_trellis_top" => t.hbd_trellis_top = num(value),
+                "hbd_trellis_hi" => t.hbd_trellis_hi = num(value),
+                "hbd_trellis_lo" => t.hbd_trellis_lo = num(value),
+                "hbd_trellis_top_422" => t.hbd_trellis_top_422 = num(value),
+                "hbd_trellis_hi_422" => t.hbd_trellis_hi_422 = num(value),
+                "hbd_trellis_lo_422" => t.hbd_trellis_lo_422 = num(value),
                 "tilt_base_444" => t.tilt_base_444 = num(value),
                 "tilt_extra_444" => t.tilt_extra_444 = num(value),
                 "tilt_base_420" => t.tilt_base_420 = num(value),

@@ -153,6 +153,22 @@ fn clamp_aq_delta_relative(base_q: i32, delta: i32, bd: u8) -> i32 {
     d
 }
 
+/// Top-band trellis lambda factor for bd > 8: 1.0 at 8 bits, at 4:4:4 /
+/// 4:0:0, and above the format's `hbd_trellis_hi*` frame qindex.
+fn hbd_trellis_scale(chroma: Chroma, bd: u8, base_q: u8) -> f32 {
+    if bd <= 8 {
+        return 1.0;
+    }
+    let t = crate::tuning::get();
+    let (top, hi, lo) = match chroma {
+        Chroma::I420 => (t.hbd_trellis_top, t.hbd_trellis_hi, t.hbd_trellis_lo),
+        Chroma::I422 => (t.hbd_trellis_top_422, t.hbd_trellis_hi_422, t.hbd_trellis_lo_422),
+        Chroma::I444 | Chroma::Mono => return 1.0,
+    };
+    let w = ((hi - base_q as f32) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+    f_fmlaf(top - 1.0, w, 1.0)
+}
+
 fn ramped_tilt(base: f32, qindex: u8, extra: f32) -> f32 {
     let t = ((qindex as f32 - 50.0) / 50.0).clamp(0.0, 1.0);
     base * (1.0 + extra * t) * f_fmlaf(-top_ease(), top_ease_t(qindex), 1.0)
@@ -1591,6 +1607,15 @@ impl<'a> LossyTile<'a> {
         })
     }
 
+    /// Trellis lambda for this tile: the global constant, scaled down at the
+    /// top of the quality range for high-bit-depth encodes
+    /// (`Tuning::hbd_trellis_*`). Every trellis call site takes its lambda
+    /// from here.
+    #[inline]
+    fn trellis_lambda(&self) -> f32 {
+        trellis_lambda() * hbd_trellis_scale(self.cfg.chroma, self.cfg.bd, self.cfg.base_q_idx)
+    }
+
     fn top_band(&self) -> bool {
         self.ctx.aq.enabled
             && !self.cfg.is_mono()
@@ -1798,7 +1823,7 @@ impl<'a> LossyTile<'a> {
         let (ptr, pbl) = if s4ad { (have_tr, have_bl) } else { (false, false) };
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let prdo = self.perceptual_rd_scale(px, py, 8);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
         let modes = if self.cfg.speed.reduced_modes() {
             fast_nd_modes()
@@ -2325,7 +2350,7 @@ impl<'a> LossyTile<'a> {
         inv: impl Fn(&[i32; N], &Quant) -> [i32; N],
     ) -> f32 {
         let (dcq, acq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam_c() * prdo;
         // Stage 1 is DC-only for every partition candidate; `refine` adds the
         // CfL leg and is paid only for the shortlist of candidates that are
@@ -2716,7 +2741,7 @@ impl<'a> LossyTile<'a> {
     /// exactly this, so the estimate prices what will actually be coded.
     fn rd_cost_quad16(&self, px: usize, py: usize, vert: bool, prdo: f32) -> f32 {
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let (lam, mlam) = (trellis_lambda() * prdo, self.mlam() * prdo);
+        let (lam, mlam) = (self.trellis_lambda() * prdo, self.mlam() * prdo);
         let mut total = rate_cost(mlam, self.partition_signal_bits());
         let (lw, lh) = if vert { (4usize, 16) } else { (16, 4) };
         let scan: &[u32] = if vert { &SCAN_4X16 } else { &SCAN_16X4 };
@@ -2886,7 +2911,7 @@ impl<'a> LossyTile<'a> {
                 best = best.min(ibc);
             }
             let mut s4 =
-                self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
+                self.rd_cost_split4_luma(bx, by, self.trellis_lambda() * prdo, self.mlam() * prdo);
             if self.cfg.is_422() && s4.is_finite() {
                 // 4:2:2 pair conversion the luma-only split4 price misses.
                 s4 += self.chroma_partition_weight_at(bx, by, 8, 8)
@@ -3100,7 +3125,7 @@ impl<'a> LossyTile<'a> {
             }
             if split4_ok {
                 let mut s4 =
-                    self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
+                    self.rd_cost_split4_luma(bx, by, self.trellis_lambda() * prdo, self.mlam() * prdo);
                 if self.cfg.is_422() && s4.is_finite() {
                     // 4:2:2 pair conversion the luma-only split4 price misses:
                     // splitting turns the child's one 4x8 chroma into two

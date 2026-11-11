@@ -1004,7 +1004,7 @@ impl<'a> LossyTile<'a> {
         let (rx, ry, mv, pred_mv) = self.ibc_make_mv(px, py, rx, ry, pred_dv)?;
         let n = size * size;
         let mlam = self.mlam() * prdo;
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let (bx4, by4) = (px / 4, py / 4);
         let mut lpred = vec![0i32; n];
@@ -1818,7 +1818,7 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
     ) -> (usize, i32, f32, Luma64Tx, Option<LossyLumaPalette>) {
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let tx64 = self.tx64_allowed();
         // `luma64_wsse`: this pick measures the decision wSSE instead of the SATD price.
         let metric = if crate::tuning::get().luma64_wsse {
@@ -2075,7 +2075,7 @@ impl<'a> LossyTile<'a> {
 
     fn rd_cost_none64_luma(&self, px: usize, py: usize, prdo: f32) -> f32 {
         let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
         let modes: &[usize] = &[DC_PRED];
         let mut best = f32::INFINITY;
@@ -2159,7 +2159,7 @@ impl<'a> LossyTile<'a> {
 
     fn rd_cost_chroma64(&self, px: usize, py: usize, prdo: f32) -> f32 {
         let (dcq, acq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam_c() * prdo;
         let (cx, cy, cgrid, _) = self.chroma64_geom(px, py);
         let mut total = 0.0f32;
@@ -2366,7 +2366,7 @@ impl<'a> LossyTile<'a> {
         let maxv = (1i32 << self.cfg.bd) - 1;
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let prdo = self.perceptual_rd_scale(px, py, 64);
-        let lam = trellis_lambda() * prdo;
+        let lam = self.trellis_lambda() * prdo;
 
         // Intra-edge smooth-filter flag: dav1d derives it ONCE at the BLOCK
         // origin from the neighbor modes and reuses it for every sub-transform.
