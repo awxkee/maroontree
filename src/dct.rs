@@ -60,7 +60,7 @@ pub(crate) const SQRT2: i32 = 92682; // 1.414214  * 65536
 fn mul_q16(data: i32, coeff: i32) -> i32 {
     // Rounding, not truncation: every butterfly stage truncated toward -inf,
     // and the bias accumulated coherently across ~5 stages x 2 passes. Only
-    // the 32x32 kernels escaped it (they prescale by B=6 and normalise with
+    // the 32x32 kernels escaped it (they prescale by B=6 and normalize with
     // shr_round); 4/8/16 carried a measurable negative bias into `cf` AND the
     // `tf` the trellis prices against.
     (((data as i64) * (coeff as i64) + 32768) >> 16) as i32
@@ -101,7 +101,7 @@ const fn forward_qm_scales() -> [f32; 256] {
     scales
 }
 
-pub(crate) const FORWARD_QM_SCALES: [f32; 256] = forward_qm_scales();
+pub(crate) static FORWARD_QM_SCALES: [f32; 256] = forward_qm_scales();
 
 /// Applies one inverse-QM row to dynamically-sized quantized coefficient
 /// buffers. Keeping the hot operation slice-based lets one SIMD function serve
@@ -4318,6 +4318,84 @@ mod adst_roundtrip_tests {
             rest > 0,
             "DCT_ADST must be horizontal ADST (energy leaks past fx==0)"
         );
+    }
+
+    /// Round-trip error of the plain quantiser per transform size on the same
+    /// 32x32 content: one TX_32X32 vs four TX_16X16 vs sixteen TX_8X8. A
+    /// precision defect in a kernel shows as that size's SSE standing out.
+    #[test]
+    fn tx_roundtrip_sizes() {
+        let sc = DctDispatch::scalar();
+        let isc = IdctDispatch::scalar();
+        let mut pats: Vec<(&str, [i32; 1024])> = Vec::new();
+        let mut ramp = [0i32; 1024];
+        let mut edge = [0i32; 1024];
+        let mut curve = [0i32; 1024];
+        let mut rng = 777u32;
+        let mut rnd = [0i32; 1024];
+        for y in 0..32 {
+            for x in 0..32 {
+                ramp[y * 32 + x] = (x as i32) * 3 + (y as i32) * 2 - 80;
+                edge[y * 32 + x] = if x + y / 2 < 20 { -60 } else { 70 };
+                let fx = x as f64 / 31.0;
+                let fy = y as f64 / 31.0;
+                curve[y * 32 + x] = (90.0 * (fx * fx - fy * 0.7).sin() - 10.0) as i32;
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                rnd[y * 32 + x] = (rng % 61) as i32 - 30;
+            }
+        }
+        pats.push(("ramp", ramp));
+        pats.push(("edge", edge));
+        pats.push(("curve", curve));
+        pats.push(("noise", rnd));
+        for &qi in &[4u8, 40, 67, 104] {
+            let q = Quant::new(qi, 8);
+            for (name, r) in &pats {
+                let en = energy(r);
+                let (c32, _) = sc.dct32x32_t(r, &q);
+                let r32 = isc.idct_dequant_32x32(&c32, &q);
+                let sse32 = sse(r, &r32);
+                let nz32 = c32.iter().filter(|&&v| v != 0).count();
+                let mut sse16 = 0.0;
+                let mut nz16 = 0;
+                for (oy, ox) in [(0, 0), (0, 16), (16, 0), (16, 16)] {
+                    let mut b = [0i32; 256];
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            b[y * 16 + x] = r[(oy + y) * 32 + ox + x];
+                        }
+                    }
+                    let (c, _) = sc.dct16x16_t(&b, &q);
+                    let rr = isc.idct_dequant_16x16(&c, &q);
+                    sse16 += sse(&b, &rr);
+                    nz16 += c.iter().filter(|&&v| v != 0).count();
+                }
+                let mut sse8 = 0.0;
+                let mut nz8 = 0;
+                for oy in (0..32).step_by(8) {
+                    for ox in (0..32).step_by(8) {
+                        let mut b = [0i32; 64];
+                        for y in 0..8 {
+                            for x in 0..8 {
+                                b[y * 8 + x] = r[(oy + y) * 32 + ox + x];
+                            }
+                        }
+                        let (c, _) = sc.dct8x8_t(&b, &q);
+                        let rr = isc.idct_dequant_8x8(&c, &q);
+                        sse8 += sse(&b, &rr);
+                        nz8 += c.iter().filter(|&&v| v != 0).count();
+                    }
+                }
+                println!(
+                    "qi {qi:3} {name:6}: energy {en:9.0}  TX32 sse {sse32:8.0} nz {nz32:4}  | 4xTX16 sse {sse16:8.0} nz {nz16:4}  | 16xTX8 sse {sse8:8.0} nz {nz8:4}"
+                );
+                if qi == 4 {
+                    assert!(sse32 / en < 2e-3, "TX32 does not round-trip at qi 4");
+                }
+            }
+        }
     }
 
     #[test]

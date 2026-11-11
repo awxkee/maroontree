@@ -4034,6 +4034,9 @@ mod tests {
             })
             .collect();
         let image = PlanarImage::from_luma(w, h, BitDepth::Eight, &pixels).unwrap();
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::coder::LOSSY_PALETTE_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         crate::coder::LOSSY_PALETTE_RESIDUAL_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         let obu = encode_lossy_gray_obu(
@@ -4674,6 +4677,9 @@ mod tests {
         }
         let plane = [first.clone(), first].concat();
         let src = [plane.clone(), plane.clone(), plane];
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         let pool = crate::par::Pool::new(1);
         let obu = crate::dispatch::encode_lossy_444(
@@ -4721,6 +4727,9 @@ mod tests {
             plane.copy_within(y * w + 64..y * w + 128, y * w + 448);
         }
         let src = [plane.clone(), plane.clone(), plane];
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         let pool = crate::par::Pool::new(1);
         let obu = crate::dispatch::encode_lossy_444(
@@ -4837,6 +4846,9 @@ mod tests {
                 v[r * cw + i] = (v[r * cw + k] + v[r * cw + k + 1] + 1) >> 1;
             }
         }
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         crate::coder::LOSSY_INTRABC_ODD_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         let pool = crate::par::Pool::new(1);
@@ -4928,6 +4940,9 @@ mod tests {
         }
         let u = vec![128u16; cw * ch];
         let v = vec![128u16; cw * ch];
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::coder::LOSSY_INTRABC_RESID_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
         let pool = crate::par::Pool::new(1);
         let obu = crate::dispatch::encode_lossy_420(

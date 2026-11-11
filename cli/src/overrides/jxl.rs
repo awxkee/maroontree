@@ -131,15 +131,18 @@ impl EncoderOverride {
             }
             "patches" => cfg.patches = self.boolean()?,
             "splines" => cfg.splines = self.boolean()?,
+            "edge-splines" => cfg.edge_splines = self.boolean()?,
             "dots" => cfg.dots = self.boolean()?,
             "grain" => {
                 cfg.grain = if self.value == "off" {
                     jixel::Grain::Off
+                } else if self.value == "auto" {
+                    jixel::Grain::Auto
                 } else {
                     let (mode, raw) = self
                         .value
                         .split_once(':')
-                        .ok_or_else(|| self.invalid("off|photon:ISO|measured:STRENGTH"))?;
+                        .ok_or_else(|| self.invalid("off|auto|photon:ISO|measured:STRENGTH"))?;
                     let value = self.number_value(
                         raw,
                         0.0f32,
@@ -149,7 +152,7 @@ impl EncoderOverride {
                     match mode {
                         "photon" => jixel::Grain::PhotonIso(value),
                         "measured" => jixel::Grain::Measured(value),
-                        _ => return Err(self.invalid("off|photon:ISO|measured:STRENGTH")),
+                        _ => return Err(self.invalid("off|auto|photon:ISO|measured:STRENGTH")),
                     }
                 }
             }

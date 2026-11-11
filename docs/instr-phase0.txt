@@ -1,0 +1,6 @@
+        0.83 real         0.79 user         0.01 sys           9211202649  instructions retired  kodak05 420
+        1.20 real         1.03 user         0.01 sys          12269013118  instructions retired  kodak05 444
+        1.43 real         1.39 user         0.01 sys          16866455856  instructions retired  x_screen 420
+        1.96 real         1.91 user         0.01 sys          24787703349  instructions retired  x_screen 444
+        0.84 real         0.81 user         0.01 sys           9651342036  instructions retired  x_volcanic 420
+        1.23 real         1.20 user         0.01 sys          14309315306  instructions retired  x_volcanic 444

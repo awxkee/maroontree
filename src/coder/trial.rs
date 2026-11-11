@@ -47,45 +47,33 @@
 //
 // State contract: everything `decode_sb` mutates for one square node is
 // region-local (the block's own recon rectangle, its own above/left context
-// segments, its own map cells) plus a few scalars; [`TrialSnap`] captures
+// segments, its own map cells) plus a few scalars; `CodingCtx::snapshot_region` captures
 // exactly that and debug builds assert the restore against a full clone.
 // The epoch-stamped R-D memos are kept valid by rewinding the emit epoch to
 // its pre-trial value after a restore and purging every entry stamped later.
 
-/// Region snapshot of the state one square node's coding mutates.
-struct TrialSnap {
-    recon: [Vec<u16>; 3],
-    a_coef: [Vec<u8>; 3],
-    l_coef: [Vec<u8>; 3],
-    a_tx: Vec<i8>,
-    l_tx: Vec<i8>,
-    a_part: Vec<u8>,
-    l_part: Vec<u8>,
-    a_skip: Vec<u8>,
-    l_skip: Vec<u8>,
-    a_mode: Vec<u8>,
-    l_mode: Vec<u8>,
-    a_uv_mode: Vec<u8>,
-    l_uv_mode: Vec<u8>,
-    a_palette: Vec<Vec<i32>>,
-    a_palette_uv: Vec<Vec<i32>>,
-    l_palette: Vec<Vec<i32>>,
-    l_palette_uv: Vec<Vec<i32>>,
-    blk4: Vec<u8>,
-    blk4h: Vec<u8>,
-    blk4v: Vec<bool>,
-    blk4t: Vec<bool>,
-    pblk4: Vec<u8>,
-    pblk4h: Vec<u8>,
-    pblk4v: Vec<bool>,
-    pblk4t: Vec<bool>,
-    skip8: Vec<bool>,
-    ibc_mv: Vec<Option<(i16, i16)>>,
-    aq: AqCtx,
-    quant: Quant,
-    cquant: Quant,
-    cdef_point_marked: bool,
-    uv_delta: i32,
+/// Placement of the square node a trial snapshot covers.
+#[derive(Clone, Copy)]
+struct SnapRegion {
+    x8: usize,
+    y8: usize,
+    sz8: usize,
+    /// Luma plane width (stride of the luma-grid maps).
+    w: usize,
+    /// Chroma plane width.
+    cw: usize,
+    /// Chroma (horizontal, vertical) subsampling shifts.
+    sub: (usize, usize),
+}
+
+impl SnapRegion {
+    /// Plane `p`'s (x, y, width, height) of the node, in that plane's samples.
+    #[inline]
+    fn plane_rect(&self, p: usize) -> (usize, usize, usize, usize) {
+        let (sx, sy) = if p == 0 { (0, 0) } else { self.sub };
+        let (px, py, dim) = (self.x8 * 8, self.y8 * 8, self.sz8 * 8);
+        (px >> sx, py >> sy, dim >> sx, dim >> sy)
+    }
 }
 
 #[inline]
@@ -124,42 +112,166 @@ fn restore_2d<T: Clone>(v: &mut [T], stride: usize, x: usize, y: usize, w: usize
     }
 }
 
-/// Everything the region snapshot claims to cover, cloned whole (debug-only
-/// proof that a restore is complete).
-#[cfg(debug_assertions)]
-#[derive(PartialEq)]
-struct TrialFullState {
-    recon: [Vec<u16>; 3],
-    a_coef: [Vec<u8>; 3],
-    l_coef: [Vec<u8>; 3],
-    a_tx: Vec<i8>,
-    l_tx: Vec<i8>,
-    a_part: Vec<u8>,
-    l_part: Vec<u8>,
-    a_skip: Vec<u8>,
-    l_skip: Vec<u8>,
-    a_mode: Vec<u8>,
-    l_mode: Vec<u8>,
-    a_uv_mode: Vec<u8>,
-    l_uv_mode: Vec<u8>,
-    a_palette: Vec<Vec<i32>>,
-    a_palette_uv: Vec<Vec<i32>>,
-    l_palette: Vec<Vec<i32>>,
-    l_palette_uv: Vec<Vec<i32>>,
-    blk4: Vec<u8>,
-    blk4h: Vec<u8>,
-    blk4v: Vec<bool>,
-    blk4t: Vec<bool>,
-    pblk4: Vec<u8>,
-    pblk4h: Vec<u8>,
-    pblk4v: Vec<bool>,
-    pblk4t: Vec<bool>,
-    skip8: Vec<bool>,
-    ibc_mv: Vec<Option<(i16, i16)>>,
-    aq: (i32, i32, bool, i32),
-    q: (u8, u8),
-    cdef_point_marked: bool,
-    uv_delta: i32,
+impl CodingCtx {
+    /// Region snapshot of the state one square node's coding mutates: a
+    /// `CodingCtx` whose arrays hold only the node's own segments. Built as a
+    /// full struct literal, so a field added to `CodingCtx` does not compile
+    /// until it is classified here and in [`CodingCtx::restore_region`].
+    fn snapshot_region(&self, r: &SnapRegion) -> CodingCtx {
+        let (x8, y8, sz8) = (r.x8, r.y8, r.sz8);
+        let (x4, y4, n4) = (x8 * 2, y8 * 2, sz8 * 2);
+        let mut recon: [Vec<u16>; 3] = Default::default();
+        let mut a_coef: [Vec<u8>; 3] = Default::default();
+        let mut l_coef: [Vec<u8>; 3] = Default::default();
+        for p in 0..3 {
+            let (bx, by, bw, bh) = r.plane_rect(p);
+            if !self.recon[p].is_empty() {
+                let pw = if p == 0 { r.w } else { r.cw };
+                let ph = self.recon[p].len() / pw;
+                recon[p] = region_2d(&self.recon[p], pw, bx, by, bw.min(pw - bx), bh.min(ph - by));
+            }
+            a_coef[p] = region_1d(&self.a_coef[p], bx / 4, bw / 4);
+            l_coef[p] = region_1d(&self.l_coef[p], by / 4, bh / 4);
+        }
+        let s4 = r.w / 4;
+        let s8 = r.w.div_ceil(8);
+        let m = &self.maps;
+        CodingCtx {
+            // Scalars: copied whole.
+            quant: self.quant,
+            cquant: self.cquant,
+            cdef_point_marked: self.cdef_point_marked,
+            aq: self.aq.clone(),
+            lr_ref_h: self.lr_ref_h,
+            lr_ref_v: self.lr_ref_v,
+            // Per-plane sample / coefficient-context segments.
+            recon,
+            a_coef,
+            l_coef,
+            // Above rows (per 4x4 column) and left columns (per 4x4 row).
+            a_tx: region_1d(&self.a_tx, x4, n4),
+            l_tx: region_1d(&self.l_tx, y4, n4),
+            a_skip: region_1d(&self.a_skip, x4, n4),
+            l_skip: region_1d(&self.l_skip, y4, n4),
+            a_mode: region_1d(&self.a_mode, x4, n4),
+            l_mode: region_1d(&self.l_mode, y4, n4),
+            a_uv_mode: region_1d(&self.a_uv_mode, x4, n4),
+            l_uv_mode: region_1d(&self.l_uv_mode, y4, n4),
+            a_palette: region_1d(&self.a_palette, x4, n4),
+            a_palette_uv: region_1d(&self.a_palette_uv, x4, n4),
+            l_palette: region_1d(&self.l_palette, y4, n4),
+            l_palette_uv: region_1d(&self.l_palette_uv, y4, n4),
+            // Partition context (per 8x8).
+            a_part: region_1d(&self.a_part, x8, sz8),
+            l_part: region_1d(&self.l_part, y8, sz8),
+            // 4x4-grid and 8x8-grid maps.
+            ibc_mv: if self.ibc_mv.is_empty() {
+                Vec::new()
+            } else {
+                region_2d(&self.ibc_mv, s4, x4, y4, n4, n4)
+            },
+            maps: BlockMaps {
+                blk4: region_2d(&m.blk4, s4, x4, y4, n4, n4),
+                blk4h: region_2d(&m.blk4h, s4, x4, y4, n4, n4),
+                blk4v: region_2d(&m.blk4v, s4, x4, y4, n4, n4),
+                blk4t: region_2d(&m.blk4t, s4, x4, y4, n4, n4),
+                pblk4: region_2d(&m.pblk4, s4, x4, y4, n4, n4),
+                pblk4h: region_2d(&m.pblk4h, s4, x4, y4, n4, n4),
+                pblk4v: region_2d(&m.pblk4v, s4, x4, y4, n4, n4),
+                pblk4t: region_2d(&m.pblk4t, s4, x4, y4, n4, n4),
+                skip8: region_2d(&m.skip8, s8, x8, y8, sz8, sz8),
+            },
+        }
+    }
+
+    /// Write a [`CodingCtx::snapshot_region`] of the same region back.
+    fn restore_region(&mut self, r: &SnapRegion, s: &CodingCtx) {
+        // Exhaustive on purpose: see `snapshot_region`.
+        let CodingCtx {
+            quant,
+            cquant,
+            cdef_point_marked,
+            aq,
+            lr_ref_h,
+            lr_ref_v,
+            recon,
+            a_coef,
+            l_coef,
+            a_tx,
+            l_tx,
+            a_skip,
+            l_skip,
+            a_mode,
+            l_mode,
+            a_uv_mode,
+            l_uv_mode,
+            a_palette,
+            a_palette_uv,
+            l_palette,
+            l_palette_uv,
+            a_part,
+            l_part,
+            ibc_mv,
+            maps:
+                BlockMaps {
+                    blk4,
+                    blk4h,
+                    blk4v,
+                    blk4t,
+                    pblk4,
+                    pblk4h,
+                    pblk4v,
+                    pblk4t,
+                    skip8,
+                },
+        } = s;
+        let (x8, y8, sz8) = (r.x8, r.y8, r.sz8);
+        let (x4, y4, n4) = (x8 * 2, y8 * 2, sz8 * 2);
+        self.quant = *quant;
+        self.cquant = *cquant;
+        self.cdef_point_marked = *cdef_point_marked;
+        self.aq = aq.clone();
+        self.lr_ref_h = *lr_ref_h;
+        self.lr_ref_v = *lr_ref_v;
+        for p in 0..3 {
+            let (bx, by, bw, _) = r.plane_rect(p);
+            if !self.recon[p].is_empty() {
+                let pw = if p == 0 { r.w } else { r.cw };
+                restore_2d(&mut self.recon[p], pw, bx, by, bw.min(pw - bx), &recon[p]);
+            }
+            restore_1d(&mut self.a_coef[p], bx / 4, &a_coef[p]);
+            restore_1d(&mut self.l_coef[p], by / 4, &l_coef[p]);
+        }
+        restore_1d(&mut self.a_tx, x4, a_tx);
+        restore_1d(&mut self.l_tx, y4, l_tx);
+        restore_1d(&mut self.a_skip, x4, a_skip);
+        restore_1d(&mut self.l_skip, y4, l_skip);
+        restore_1d(&mut self.a_mode, x4, a_mode);
+        restore_1d(&mut self.l_mode, y4, l_mode);
+        restore_1d(&mut self.a_uv_mode, x4, a_uv_mode);
+        restore_1d(&mut self.l_uv_mode, y4, l_uv_mode);
+        restore_1d(&mut self.a_palette, x4, a_palette);
+        restore_1d(&mut self.a_palette_uv, x4, a_palette_uv);
+        restore_1d(&mut self.l_palette, y4, l_palette);
+        restore_1d(&mut self.l_palette_uv, y4, l_palette_uv);
+        restore_1d(&mut self.a_part, x8, a_part);
+        restore_1d(&mut self.l_part, y8, l_part);
+        let s4 = r.w / 4;
+        let s8 = r.w.div_ceil(8);
+        if !self.ibc_mv.is_empty() {
+            restore_2d(&mut self.ibc_mv, s4, x4, y4, n4, ibc_mv);
+        }
+        let m = &mut self.maps;
+        restore_2d(&mut m.blk4, s4, x4, y4, n4, blk4);
+        restore_2d(&mut m.blk4h, s4, x4, y4, n4, blk4h);
+        restore_2d(&mut m.blk4v, s4, x4, y4, n4, blk4v);
+        restore_2d(&mut m.blk4t, s4, x4, y4, n4, blk4t);
+        restore_2d(&mut m.pblk4, s4, x4, y4, n4, pblk4);
+        restore_2d(&mut m.pblk4h, s4, x4, y4, n4, pblk4h);
+        restore_2d(&mut m.pblk4v, s4, x4, y4, n4, pblk4v);
+        restore_2d(&mut m.pblk4t, s4, x4, y4, n4, pblk4t);
+        restore_2d(&mut m.skip8, s8, x8, y8, sz8, skip8);
+    }
 }
 
 impl<'a> LossyTile<'a> {
@@ -169,7 +281,7 @@ impl<'a> LossyTile<'a> {
     fn trial_levels(&self) -> u32 {
         let t = crate::tuning::get();
         let mut m = t.trial_part;
-        if self.speed == Speed::ExtraSlow {
+        if self.cfg.speed == Speed::ExtraSlow {
             m |= t.trial_part_xslow;
         }
         m
@@ -179,7 +291,7 @@ impl<'a> LossyTile<'a> {
     #[inline]
     fn trial_rect_on(&self) -> bool {
         let t = crate::tuning::get();
-        t.trial_rect || (self.speed == Speed::ExtraSlow && t.trial_rect_xslow)
+        t.trial_rect || (self.cfg.speed == Speed::ExtraSlow && t.trial_rect_xslow)
     }
 
     /// Effective `trial_rect_sse_gate` (study knob first, else the ExtraSlow
@@ -189,7 +301,7 @@ impl<'a> LossyTile<'a> {
         let t = crate::tuning::get();
         if t.trial_rect_sse_gate != 0 {
             t.trial_rect_sse_gate
-        } else if self.speed == Speed::ExtraSlow && t.trial_rect_xslow {
+        } else if self.cfg.speed == Speed::ExtraSlow && t.trial_rect_xslow {
             t.trial_rect_sse_gate_xslow
         } else {
             0
@@ -202,7 +314,7 @@ impl<'a> LossyTile<'a> {
         let t = crate::tuning::get();
         if t.trial_struct_k > 0.0 {
             t.trial_struct_k as f64
-        } else if self.speed == Speed::ExtraSlow && t.trial_rect_xslow {
+        } else if self.cfg.speed == Speed::ExtraSlow && t.trial_rect_xslow {
             t.trial_struct_k_xslow as f64
         } else {
             0.0
@@ -210,16 +322,14 @@ impl<'a> LossyTile<'a> {
     }
 
     /// Whether the node of size `sz8` at this call takes the trial path:
-    /// enabled for the level, a plain decide+emit tile (no capture/replay),
-    /// not already inside a forced leg at this node, chroma present (mono has
-    /// no whole-32/16 emitters), and no fixed-size short circuit.
+    /// enabled for the level, chroma present (mono has no whole-32/16
+    /// emitters), and no fixed-size short circuit. The caller additionally skips a node whose partition is
+    /// already forced.
     #[inline]
     fn trial_level_on(&self, sz8: usize) -> bool {
         self.trial_levels() & sz8 as u32 != 0
-            && !self.mono
-            && self.sb_mode == SbMode::Off
-            && self.force_part.is_none()
-            && crate::tuning::fixed_size(self.speed) == 0
+            && !self.cfg.is_mono()
+            && crate::tuning::fixed_size(self.cfg.speed) == 0
     }
 
     /// Whether a proxy verdict is one the trial re-decides under `trial_gate`
@@ -282,12 +392,12 @@ impl<'a> LossyTile<'a> {
             return true;
         }
         let (hi, lo) = (edge_hi * edge_hi, edge_lo * edge_lo);
-        let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
+        let (bw, bh) = (dim.min(self.cfg.w.saturating_sub(px)), dim.min(self.cfg.h.saturating_sub(py)));
         let (mut any_hi, mut any_lo) = (false, edge_lo <= 0.0);
         for y in (0..bh).step_by(8) {
             for x in (0..bw).step_by(8) {
                 let (w, h) = ((bw - x).min(8), (bh - y).min(8));
-                let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px + x, py + y, w, h);
+                let (sum, sum_sq) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px + x, py + y, w, h);
                 let cnt = (w * h) as f32;
                 let mean = sum as f32 / cnt;
                 let var = (sum_sq as f32 / cnt - mean * mean).max(0.0);
@@ -303,157 +413,29 @@ impl<'a> LossyTile<'a> {
         if p == 0 {
             (0, 0)
         } else {
-            (usize::from(self.ss420 || self.ss422), usize::from(self.ss420))
+            (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y())
         }
     }
 
-    fn trial_snapshot(&self, x8: usize, y8: usize, sz8: usize) -> TrialSnap {
-        let (px, py, dim) = (x8 * 8, y8 * 8, sz8 * 8);
-        let (x4, y4, n4) = (px / 4, py / 4, dim / 4);
-        let mut recon: [Vec<u16>; 3] = Default::default();
-        let mut a_coef: [Vec<u8>; 3] = Default::default();
-        let mut l_coef: [Vec<u8>; 3] = Default::default();
-        for p in 0..3 {
-            let (sx, sy) = self.plane_shift(p);
-            let (bx, by, bw, bh) = (px >> sx, py >> sy, dim >> sx, dim >> sy);
-            if !self.recon[p].is_empty() {
-                let pw = if p == 0 { self.w } else { self.cw };
-                let ph = self.recon[p].len() / pw;
-                recon[p] = region_2d(&self.recon[p], pw, bx, by, bw.min(pw - bx), bh.min(ph - by));
-            }
-            a_coef[p] = region_1d(&self.a_coef[p], bx / 4, bw / 4);
-            l_coef[p] = region_1d(&self.l_coef[p], by / 4, bh / 4);
-        }
-        let s4 = self.w / 4;
-        let s8 = self.w.div_ceil(8);
-        TrialSnap {
-            recon,
-            a_coef,
-            l_coef,
-            a_tx: region_1d(&self.a_tx, x4, n4),
-            l_tx: region_1d(&self.l_tx, y4, n4),
-            a_part: region_1d(&self.a_part, x8, sz8),
-            l_part: region_1d(&self.l_part, y8, sz8),
-            a_skip: region_1d(&self.a_skip, x4, n4),
-            l_skip: region_1d(&self.l_skip, y4, n4),
-            a_mode: region_1d(&self.a_mode, x4, n4),
-            l_mode: region_1d(&self.l_mode, y4, n4),
-            a_uv_mode: region_1d(&self.a_uv_mode, x4, n4),
-            l_uv_mode: region_1d(&self.l_uv_mode, y4, n4),
-            a_palette: region_1d(&self.a_palette, x4, n4),
-            a_palette_uv: region_1d(&self.a_palette_uv, x4, n4),
-            l_palette: region_1d(&self.l_palette, y4, n4),
-            l_palette_uv: region_1d(&self.l_palette_uv, y4, n4),
-            blk4: region_2d(&self.blk4, s4, x4, y4, n4, n4),
-            blk4h: region_2d(&self.blk4h, s4, x4, y4, n4, n4),
-            blk4v: region_2d(&self.blk4v, s4, x4, y4, n4, n4),
-            blk4t: region_2d(&self.blk4t, s4, x4, y4, n4, n4),
-            pblk4: region_2d(&self.pblk4, s4, x4, y4, n4, n4),
-            pblk4h: region_2d(&self.pblk4h, s4, x4, y4, n4, n4),
-            pblk4v: region_2d(&self.pblk4v, s4, x4, y4, n4, n4),
-            pblk4t: region_2d(&self.pblk4t, s4, x4, y4, n4, n4),
-            skip8: region_2d(&self.skip8, s8, x8, y8, sz8, sz8),
-            ibc_mv: if self.ibc_mv.is_empty() {
-                Vec::new()
-            } else {
-                region_2d(&self.ibc_mv, s4, x4, y4, n4, n4)
-            },
-            aq: self.aq.clone(),
-            quant: self.quant,
-            cquant: self.cquant,
-            cdef_point_marked: self.cdef_point_marked,
-            uv_delta: self.uv_delta,
+    #[inline]
+    fn snap_region(&self, x8: usize, y8: usize, sz8: usize) -> SnapRegion {
+        SnapRegion {
+            x8,
+            y8,
+            sz8,
+            w: self.cfg.w,
+            cw: self.cfg.cw,
+            sub: (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y()),
         }
     }
 
-    fn trial_restore(&mut self, x8: usize, y8: usize, sz8: usize, s: &TrialSnap) {
-        let (px, py, dim) = (x8 * 8, y8 * 8, sz8 * 8);
-        let (x4, y4, n4) = (px / 4, py / 4, dim / 4);
-        for p in 0..3 {
-            let (sx, sy) = self.plane_shift(p);
-            let (bx, by, bw) = (px >> sx, py >> sy, dim >> sx);
-            if !self.recon[p].is_empty() {
-                let pw = if p == 0 { self.w } else { self.cw };
-                restore_2d(&mut self.recon[p], pw, bx, by, bw.min(pw - bx), &s.recon[p]);
-            }
-            restore_1d(&mut self.a_coef[p], bx / 4, &s.a_coef[p]);
-            restore_1d(&mut self.l_coef[p], by / 4, &s.l_coef[p]);
-        }
-        let s4 = self.w / 4;
-        let s8 = self.w.div_ceil(8);
-        restore_1d(&mut self.a_tx, x4, &s.a_tx);
-        restore_1d(&mut self.l_tx, y4, &s.l_tx);
-        restore_1d(&mut self.a_part, x8, &s.a_part);
-        restore_1d(&mut self.l_part, y8, &s.l_part);
-        restore_1d(&mut self.a_skip, x4, &s.a_skip);
-        restore_1d(&mut self.l_skip, y4, &s.l_skip);
-        restore_1d(&mut self.a_mode, x4, &s.a_mode);
-        restore_1d(&mut self.l_mode, y4, &s.l_mode);
-        restore_1d(&mut self.a_uv_mode, x4, &s.a_uv_mode);
-        restore_1d(&mut self.l_uv_mode, y4, &s.l_uv_mode);
-        restore_1d(&mut self.a_palette, x4, &s.a_palette);
-        restore_1d(&mut self.a_palette_uv, x4, &s.a_palette_uv);
-        restore_1d(&mut self.l_palette, y4, &s.l_palette);
-        restore_1d(&mut self.l_palette_uv, y4, &s.l_palette_uv);
-        restore_2d(&mut self.blk4, s4, x4, y4, n4, &s.blk4);
-        restore_2d(&mut self.blk4h, s4, x4, y4, n4, &s.blk4h);
-        restore_2d(&mut self.blk4v, s4, x4, y4, n4, &s.blk4v);
-        restore_2d(&mut self.blk4t, s4, x4, y4, n4, &s.blk4t);
-        restore_2d(&mut self.pblk4, s4, x4, y4, n4, &s.pblk4);
-        restore_2d(&mut self.pblk4h, s4, x4, y4, n4, &s.pblk4h);
-        restore_2d(&mut self.pblk4v, s4, x4, y4, n4, &s.pblk4v);
-        restore_2d(&mut self.pblk4t, s4, x4, y4, n4, &s.pblk4t);
-        restore_2d(&mut self.skip8, s8, x8, y8, sz8, &s.skip8);
-        if !self.ibc_mv.is_empty() {
-            restore_2d(&mut self.ibc_mv, s4, x4, y4, n4, &s.ibc_mv);
-        }
-        self.aq = s.aq.clone();
-        self.quant = s.quant;
-        self.cquant = s.cquant;
-        self.cdef_point_marked = s.cdef_point_marked;
-        self.uv_delta = s.uv_delta;
+    fn trial_snapshot(&self, x8: usize, y8: usize, sz8: usize) -> CodingCtx {
+        self.ctx.snapshot_region(&self.snap_region(x8, y8, sz8))
     }
 
-    #[cfg(debug_assertions)]
-    fn trial_full_state(&self) -> TrialFullState {
-        TrialFullState {
-            recon: self.recon.clone(),
-            a_coef: self.a_coef.clone(),
-            l_coef: self.l_coef.clone(),
-            a_tx: self.a_tx.clone(),
-            l_tx: self.l_tx.clone(),
-            a_part: self.a_part.clone(),
-            l_part: self.l_part.clone(),
-            a_skip: self.a_skip.clone(),
-            l_skip: self.l_skip.clone(),
-            a_mode: self.a_mode.clone(),
-            l_mode: self.l_mode.clone(),
-            a_uv_mode: self.a_uv_mode.clone(),
-            l_uv_mode: self.l_uv_mode.clone(),
-            a_palette: self.a_palette.clone(),
-            a_palette_uv: self.a_palette_uv.clone(),
-            l_palette: self.l_palette.clone(),
-            l_palette_uv: self.l_palette_uv.clone(),
-            blk4: self.blk4.clone(),
-            blk4h: self.blk4h.clone(),
-            blk4v: self.blk4v.clone(),
-            blk4t: self.blk4t.clone(),
-            pblk4: self.pblk4.clone(),
-            pblk4h: self.pblk4h.clone(),
-            pblk4v: self.pblk4v.clone(),
-            pblk4t: self.pblk4t.clone(),
-            skip8: self.skip8.clone(),
-            ibc_mv: self.ibc_mv.clone(),
-            aq: (
-                self.aq.cur_qidx,
-                self.aq.prev_qidx,
-                self.aq.read_deltas,
-                self.aq.pending,
-            ),
-            q: (self.quant.qidx(), self.cquant.qidx()),
-            cdef_point_marked: self.cdef_point_marked,
-            uv_delta: self.uv_delta,
-        }
+    fn trial_restore(&mut self, x8: usize, y8: usize, sz8: usize, s: &CodingCtx) {
+        let r = self.snap_region(x8, y8, sz8);
+        self.ctx.restore_region(&r, s);
     }
 
     /// Drop every epoch-stamped R-D memo entry computed after `epoch`: after a
@@ -461,10 +443,10 @@ impl<'a> LossyTile<'a> {
     /// reconstruction that no longer exists, while entries at or before it
     /// are exact for the restored state.
     fn trial_purge_caches(&self, epoch: u64) {
-        self.chroma_rd_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
-        self.rd16_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
-        self.rect_leaf_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
-        self.split4_rd_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
+        self.memo.chroma_rd_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
+        self.memo.rd16_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
+        self.memo.rect_leaf_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
+        self.memo.split4_rd_cache.borrow_mut().retain(|_, v| v.0 <= epoch);
     }
 
     /// Per-quadrant (luma, chroma) SSE of the current reconstruction against
@@ -474,22 +456,22 @@ impl<'a> LossyTile<'a> {
         let mut out = [(0i64, 0i64); 4];
         for (qi, slot) in out.iter_mut().enumerate() {
             let (qx, qy) = (px + (qi & 1) * half, py + (qi >> 1) * half);
-            let y = self.rd.sse_u16(
+            let y = self.k.rd.sse_u16(
                 self.src_blk(0, qx, qy, half, half),
-                &self.recon[0],
-                self.w,
+                &self.ctx.recon[0],
+                self.cfg.w,
                 qx,
                 qy,
             );
             let mut c = 0i64;
-            if !self.mono {
+            if !self.cfg.is_mono() {
                 for p in 1..3 {
                     let (sx, sy) = self.plane_shift(p);
                     let (cx, cy, cw, ch) = (qx >> sx, qy >> sy, half >> sx, half >> sy);
-                    c += self.rd.sse_u16(
+                    c += self.k.rd.sse_u16(
                         self.src_blk(p, cx, cy, cw, ch),
-                        &self.recon[p],
-                        self.cw,
+                        &self.ctx.recon[p],
+                        self.cfg.cw,
                         cx,
                         cy,
                     );
@@ -504,9 +486,9 @@ impl<'a> LossyTile<'a> {
     /// `Cdfs::semantic_slots`), built lazily per decision snapshot.
     fn trial_cost_tables(&self) -> std::cell::Ref<'_, Vec<Vec<u16>>> {
         {
-            let mut slot = self.trial_cost.borrow_mut();
+            let mut slot = self.model.trial_cost.borrow_mut();
             if slot.is_none() {
-                let mut c = (*self.dec_cdfs).clone();
+                let mut c = (*self.model.dec_cdfs).clone();
                 let tables = c
                     .semantic_slots()
                     .iter()
@@ -519,7 +501,7 @@ impl<'a> LossyTile<'a> {
                 *slot = Some(tables);
             }
         }
-        std::cell::Ref::map(self.trial_cost.borrow(), |o| {
+        std::cell::Ref::map(self.model.trial_cost.borrow(), |o| {
             o.as_ref().expect("initialized above")
         })
     }
@@ -533,18 +515,18 @@ impl<'a> LossyTile<'a> {
     /// of source and reconstruction standard deviation times the cell area,
     /// i.e. lost (blurred) or invented (ringing) local contrast in SSE units.
     fn trial_struct_penalty(&self, px: usize, py: usize, dim: usize) -> f64 {
-        let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
+        let (bw, bh) = (dim.min(self.cfg.w.saturating_sub(px)), dim.min(self.cfg.h.saturating_sub(py)));
         let mut pen = 0f64;
         for y in (0..bh).step_by(8) {
             for x in (0..bw).step_by(8) {
                 let (w, h) = ((bw - x).min(8), (bh - y).min(8));
                 let n = (w * h) as f64;
                 let sd = |plane: &[u16]| {
-                    let (sum, sq) = block_moments_i32(plane, self.w, px + x, py + y, w, h);
+                    let (sum, sq) = block_moments_i32(plane, self.cfg.w, px + x, py + y, w, h);
                     let mean = sum as f64 / n;
                     (sq as f64 / n - mean * mean).max(0.0).sqrt()
                 };
-                let d = sd(&self.src[0]) - sd(&self.recon[0]);
+                let d = sd(&self.cfg.src[0]) - sd(&self.ctx.recon[0]);
                 pen += d * d * n;
             }
         }
@@ -568,7 +550,11 @@ impl<'a> LossyTile<'a> {
         extra_dy: f64,
     ) -> f64 {
         let child = crate::tuning::get().trial_child_prdo;
+        // The axis scale `lam` is the node's `lambda_part`; the per-plane
+        // divisors are the wSSE lambdas (`lambda_d`, `emit_mlam_c`) so the
+        // distortion terms are in bits.
         let lam = (self.mlam() * self.perceptual_rd_scale(px, py, dim)) as f64;
+        let ly_node = (self.lambda_d() * self.perceptual_rd_scale(px, py, dim)) as f64;
         let lam_c = self.emit_mlam_c(px, py, dim) as f64;
         let half = dim / 2;
         let mut j = 0f64;
@@ -576,13 +562,13 @@ impl<'a> LossyTile<'a> {
             let (ly, lc) = if child {
                 let (qx, qy) = (px + (qi & 1) * half, py + (qi >> 1) * half);
                 (
-                    (self.mlam() * self.perceptual_rd_scale(qx, qy, half)) as f64,
+                    (self.lambda_d() * self.perceptual_rd_scale(qx, qy, half)) as f64,
                     self.emit_mlam_c(qx, qy, half) as f64,
                 )
             } else {
-                (lam, lam_c)
+                (ly_node, lam_c)
             };
-            j += lam * (dy_w * dy as f64 / ly + if self.mono { 0.0 } else { dc as f64 / lc });
+            j += lam * (dy_w * dy as f64 / ly + if self.cfg.is_mono() { 0.0 } else { dc as f64 / lc });
         }
         // Extra luma-SSE-unit distortion (structural penalty), on the node's
         // own luma axis.
@@ -606,28 +592,28 @@ impl<'a> LossyTile<'a> {
         skip_none: bool,
     ) {
         let (px, py, dim) = (x8 * 8, y8 * 8, sz8 * 8);
-        let e0 = self.emit_epoch.get();
+        let e0 = self.memo.emit_epoch.get();
         let snap0 = self.trial_snapshot(x8, y8, sz8);
         #[cfg(debug_assertions)]
-        let full0 = self.trial_full_state();
+        let full0 = self.ctx.clone();
 
         // Swap in the scratch entropy state: a token sink plus the slot-tagged
         // CDF copy whose tags key the tokens (a nested trial finds these taken
         // and builds its own; the outer one wins the slot on the way back).
-        let mut enc = self.trial_enc.take().unwrap_or_default();
-        let mut cdfs = match self.trial_cdfs.take() {
+        let mut enc = self.run.trial_enc.take().unwrap_or_default();
+        let mut cdfs = match self.run.trial_cdfs.take() {
             Some(c) => c,
             None => {
-                let mut c = Box::new(self.cdfs.clone());
+                let mut c = Box::new(self.ent.cdfs.clone());
                 let slots = c.semantic_slots();
                 enc.set_semantic_cdfs(&slots);
                 c
             }
         };
         enc.begin_semantic_sink();
-        std::mem::swap(&mut self.enc, &mut enc);
-        std::mem::swap(&mut self.cdfs, &mut *cdfs);
-        let stats0 = self.cdfs.skip_stats;
+        std::mem::swap(&mut self.ent.enc, &mut enc);
+        std::mem::swap(&mut self.ent.cdfs, &mut *cdfs);
+        let stats0 = self.ent.cdfs.skip_stats;
 
         // Every leg codes the node for real from the same pre-trial state.
         let legs = self.trial_legs(sz8, skip_none);
@@ -636,7 +622,7 @@ impl<'a> LossyTile<'a> {
         let mut dists: Vec<[(i64, i64); 4]> = Vec::with_capacity(legs.len());
         let mut pens: Vec<f64> = Vec::with_capacity(legs.len());
         let struct_k = self.trial_struct_k();
-        let mut snaps: Vec<Option<TrialSnap>> = Vec::with_capacity(legs.len());
+        let mut snaps: Vec<Option<CodingCtx>> = Vec::with_capacity(legs.len());
         let mut e_max = e0;
         for (i, &leg) in legs.iter().enumerate() {
             if i > 0 {
@@ -644,26 +630,32 @@ impl<'a> LossyTile<'a> {
                 self.trial_restore(x8, y8, sz8, &snap0);
                 #[cfg(debug_assertions)]
                 debug_assert!(
-                    full0 == self.trial_full_state(),
+                    full0 == self.ctx,
                     "trial snapshot does not cover everything the {:?} leg mutated",
                     legs[i - 1]
                 );
                 self.trial_purge_caches(e0);
-                self.emit_epoch.set(e0);
-                self.cdfs.skip_stats = stats0;
-                self.enc.begin_semantic_sink();
+                self.memo.emit_epoch.set(e0);
+                self.ent.cdfs.skip_stats = stats0;
+                self.ent.enc.begin_semantic_sink();
             }
-            self.force_part = Some(leg);
-            self.decode_sb(bl, x8, y8, sz8, thr, lhb);
-            debug_assert!(self.force_part.is_none(), "forced {leg:?} leg was not consumed");
-            tokens.push(self.enc.take_semantic());
-            stats.push(skip_stats_sub(&self.cdfs.skip_stats, &stats0));
+            self.decode_sb(bl, x8, y8, sz8, thr, lhb, Some(leg));
+            tokens.push(self.ent.enc.take_semantic());
+            stats.push(skip_stats_sub(&self.ent.cdfs.skip_stats, &stats0));
             dists.push(self.trial_distortion(px, py, dim));
-            pens.push(if struct_k > 0.0 { struct_k * self.trial_struct_penalty(px, py, dim) } else { 0.0 });
+            // Unification V5: the penalty is a plain-SSE quantity added to the
+            // trial axis, whose unit is `K_PART_LAMBDA` x wSSE
+            // (`trial_struct_wsse` lifts it there).
+            let unit = if crate::tuning::get().trial_struct_wsse {
+                f64::from(K_PART_LAMBDA)
+            } else {
+                1.0
+            };
+            pens.push(if struct_k > 0.0 { struct_k * unit * self.trial_struct_penalty(px, py, dim) } else { 0.0 });
             // The last leg's state is live; earlier legs need a snapshot to
             // be restorable if they win.
             snaps.push((i + 1 < legs.len()).then(|| self.trial_snapshot(x8, y8, sz8)));
-            e_max = e_max.max(self.emit_epoch.get());
+            e_max = e_max.max(self.memo.emit_epoch.get());
         }
 
         let bits: Vec<f32> = {
@@ -724,16 +716,16 @@ impl<'a> LossyTile<'a> {
         let stats = stats[win];
         // Every memo entry now refers to a superseded reconstruction, exactly
         // as after any emitted block.
-        self.emit_epoch.set(e_max + 1);
+        self.memo.emit_epoch.set(e_max + 1);
 
         // Live entropy state back; commit the winner's symbols through it.
-        std::mem::swap(&mut self.enc, &mut enc);
-        std::mem::swap(&mut self.cdfs, &mut *cdfs);
-        self.trial_enc = Some(enc);
-        self.trial_cdfs = Some(cdfs);
-        let mut slots = self.cdfs.semantic_slots();
-        self.enc.replay_semantic(&tokens, &mut slots);
-        skip_stats_add(&mut self.cdfs.skip_stats, &stats);
+        std::mem::swap(&mut self.ent.enc, &mut enc);
+        std::mem::swap(&mut self.ent.cdfs, &mut *cdfs);
+        self.run.trial_enc = Some(enc);
+        self.run.trial_cdfs = Some(cdfs);
+        let mut slots = self.ent.cdfs.semantic_slots();
+        self.ent.enc.replay_semantic(&tokens, &mut slots);
+        skip_stats_add(&mut self.ent.cdfs.skip_stats, &stats);
     }
 
     /// The partitions the trial codes for real at a node of `sz8` 8px units:
@@ -744,7 +736,7 @@ impl<'a> LossyTile<'a> {
         let mut legs = if skip_none { vec![Part16::Split] } else { vec![Part16::None, Part16::Split] };
         if sz8 == 2 && self.trial_rect_on() {
             legs.push(Part16::Horz);
-            if !self.ss422 {
+            if !self.cfg.is_422() {
                 legs.push(Part16::Vert);
             }
         }

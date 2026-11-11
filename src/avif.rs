@@ -116,14 +116,6 @@ impl Speed {
 
     /// AV1-coder RDOQ staging. Split from [`Self::per_candidate_rdoq`] so the
     /// AV1 winner-only experiment cannot silently change AV2 behavior.
-    /// MEASURED 2026-07-25 — winner-only at Slow is a BAD trade in every
-    /// form: pure winner-only = 420 +1.25/+0.85/+1.76 (tuning/holdout/mid),
-    /// 444 tuning +0.61 with UNIFORM kodak damage (+0.4..+1.5; the 5-image
-    /// holdout's +0.01 was luck), for only ~4% time. Staged (plain-trellis
-    /// candidates + ctx winner) is DOMINATED: worse than winner-only at 444
-    /// (+1.71 holdout) and worse than per-candidate at 420. Per-candidate
-    /// exact-ctx RDOQ at Slow EARNS its time; winner-only IS the Medium
-    /// tier, and the delta is real quality, not fat.
     pub(crate) fn per_candidate_rdoq_av1(self) -> bool {
         self.at_least_slow()
     }
@@ -152,6 +144,12 @@ impl Speed {
             Speed::Medium => dim <= 16 || qidx >= 112,
             Speed::Fast => false,
         }
+    }
+
+    /// Whether a 16x16 luma leaf re-tries DC_PRED under the TX_8X8 split
+    /// (`code_block16`).
+    pub(crate) fn split16_dc_redecide(self) -> bool {
+        matches!(self, Speed::Medium)
     }
 
     /// Whether the intra candidate set is reduced. Only [`Speed::Fast`] does.
@@ -209,12 +207,18 @@ impl Speed {
         }) as usize
     }
 
-    /// Filter-intra finalists given full RD. 0 on every tier: a budget of 2
-    /// measured +-1% with no consistent sign even as an ExtraSlow-only extra.
-    /// (`filter_intra_budget` re-opens it for offline studies; 0 keeps the
-    /// FILTER_DC-only trial.)
-    pub(crate) fn filter_intra_refine_budget(self) -> usize {
-        crate::tuning::get().filter_intra_budget as usize
+    /// Filter-intra finalists given full RD at the square Slow leaves
+    /// (`Tuning::filter_intra_budget`, 3 at 4:2:0/4:2:2, 0 at 4:4:4; 0 = no
+    /// filter-intra trial). Earlier probes of budget 1/2 on four mixed images
+    /// read +0.4; on the 2026-11 tree the full ladders read -0.3/-0.4.
+    pub(crate) fn filter_intra_refine_budget(self, ss444: bool) -> usize {
+        let t = crate::tuning::get();
+        let b = if ss444 {
+            t.filter_intra_budget_444
+        } else {
+            t.filter_intra_budget
+        };
+        b as usize
     }
 
     /// Fast codes chroma with the baseline DC predictor. CfL and directional
@@ -441,14 +445,12 @@ impl EncodeConfig {
     }
 
     /// CDEF as actually coded: on when requested, and always at Slow and
-    /// ExtraSlow. The per-unit RD search costs Slow +5-11% time for
-    /// -0.2..-0.5% BD on photos and -1.3..-1.7% on synthetic/illustration
-    /// (s_abstract -5.6, s_mascot -3.9); no image worse than +0.13%.
+    /// ExtraSlow.
     pub(crate) fn cdef_enabled(&self) -> bool {
         self.cdef || self.speed.at_least_slow()
     }
 
-    /// Alpha-plane quality (0..=100, 100 = lossless). Defaults to the colour
+    /// Alpha-plane quality (0..=100, 100 = lossless). Defaults to the color
     /// quality.
     pub fn with_alpha_quality(mut self, quality: u8) -> Self {
         self.alpha_quality = Some(quality);
@@ -457,12 +459,8 @@ impl EncodeConfig {
 
     /// Encode an alpha plane as the auxiliary 4:0:0 image: lossless at alpha
     /// quality 100, otherwise lossy with the alpha profile. Composited error is
-    /// linear in alpha error, so the profile trades the perceptual colour
-    /// tools for fidelity: no AQ, no palette (lossy palettes posterize
-    /// anti-aliased edges) and no IntraBC, plus 16x16/32x32 leaves for the
-    /// large flat regions masks are made of. On the 10-mask alpha corpus vs
-    /// the old 8x8-only lossy path vs libaom s6 alpha (tune=psnr): SS2 BD
-    /// -2.3% -> +2.5%, PSNR BD -17.4% -> -6.6% (positive = ours smaller).
+    /// linear in alpha error, so the profile trades the perceptual color
+    /// tools for fidelity.
     pub(crate) fn encode_alpha_obu<T: crate::pixel::Pixel>(
         &self,
         alpha: &PlanarImage<T>,
@@ -478,7 +476,7 @@ impl EncodeConfig {
                 .map(crate::quant::QmLevels::uniform)
                 .unwrap_or_else(|| {
                     // The subsampled-format law: what the alpha profile was
-                    // measured with, independent of the colour format.
+                    // measured with, independent of the color format.
                     let c = crate::quant::qm_chroma_level_law(q, 2);
                     crate::quant::QmLevels {
                         y: crate::quant::qm_level_law(q, 2),
@@ -633,14 +631,7 @@ pub(crate) fn checked_buffer_size<T>(w: usize, h: usize, ch: usize) -> Result<us
 
 /// Map quality 1..=100 → AV1 base_q_idx 1..=255.
 /// quality 100 → q = 1 (near-lossless), quality 1 → q = 255.
-/// Quality -> AV1 `base_q_idx`, recalibrated 2026-07-25 to LIBAVIF PARITY:
-/// each label targets the same output size as `avifenc -q <label>` (fit on a
-/// 4-image photo corpus at 4:2:0, per-image spread ~+-5 qindex; the old
-/// linear map ran 25-40 qindex COARSER than aom at every label, which is why
-/// same-label ladders showed us "20 SS2 points behind" while matched-rate
-/// comparisons were at parity). Labels are now comparable across encoders;
-/// BD curves are unaffected (pure re-labeling of the same RD curve).
-/// q100 stays near-lossless (qindex 1) by design; parity resumes at q98.
+/// Quality -> AV1 `base_q_idx`.
 pub(crate) fn quality_to_q(quality: u8) -> u8 {
     const ANCHORS: [(u8, u8); 14] = [
         (1, 215),

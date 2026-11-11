@@ -229,7 +229,7 @@ const fn quad4_enabled(ss420: bool) -> bool {
 
 impl<'a> LossyTile<'a> {
     pub(crate) fn adaptive_skip_price_enabled(&self) -> bool {
-        self.speed.at_least_slow()
+        self.cfg.speed.at_least_slow()
     }
 
     /// Rebuild the all-zero price table from the dependency-cone counts `cone`,
@@ -250,28 +250,28 @@ impl<'a> LossyTile<'a> {
                 tbl[cls][ctx][0] = -dirty_log2f(1.0 - p1);
             }
         }
-        self.skip_price = Some(tbl);
+        self.model.skip_price = Some(tbl);
     }
 
     #[inline]
     fn skip_bits(&self, cls: usize, ctx: usize) -> Option<(f32, f32)> {
-        self.skip_price.as_ref().map(|t| (t[cls][ctx][1], t[cls][ctx][0]))
+        self.model.skip_price.as_ref().map(|t| (t[cls][ctx][1], t[cls][ctx][0]))
     }
 
     /// Frozen decision CDFs keep RDO independent of superblock coding order.
     #[inline]
     fn dcdf(&self) -> &Cdfs {
-        &self.dec_cdfs
+        &self.model.dec_cdfs
     }
 
     /// Entries from a completed superblock cannot be reused: reconstruction
     /// epochs have advanced and the next superblock has different coordinates.
     /// Retain capacity so cache storage is bounded by one superblock's search.
     fn clear_sb_rd_caches(&self) {
-        self.chroma_rd_cache.borrow_mut().clear();
-        self.rd16_cache.borrow_mut().clear();
-        self.rect_leaf_cache.borrow_mut().clear();
-        self.split4_rd_cache.borrow_mut().clear();
+        self.memo.chroma_rd_cache.borrow_mut().clear();
+        self.memo.rd16_cache.borrow_mut().clear();
+        self.memo.rect_leaf_cache.borrow_mut().clear();
+        self.memo.split4_rd_cache.borrow_mut().clear();
     }
 
     /// Install a different immutable decision-CDF snapshot. Every table
@@ -281,453 +281,156 @@ impl<'a> LossyTile<'a> {
     /// prefix) keep tables built from the frame-initial one — that made
     /// `-t5..-t8` 4:4:4 output diverge from `-t1` (found 2026-09-10).
     pub(crate) fn switch_decision_cdfs(&mut self, next: std::sync::Arc<Cdfs>, warmed: bool) {
-        if self.pal_cdfs.is_none() {
+        if self.model.pal_cdfs.is_none() {
             // Every tile starts on the frame-initial snapshot, so the first
             // switch always leaves it: pin it for the palette cost table.
-            self.pal_cdfs = Some(self.dec_cdfs.clone());
+            self.model.pal_cdfs = Some(self.model.dec_cdfs.clone());
         }
-        self.dec_cdfs = next;
-        self.decision_cdf_warmed = warmed;
-        *self.coef_cost.borrow_mut() = None;
-        *self.trial_cost.borrow_mut() = None;
+        self.model.dec_cdfs = next;
+        self.model.decision_cdf_warmed = warmed;
+        *self.model.coef_cost.borrow_mut() = None;
+        *self.model.trial_cost.borrow_mut() = None;
     }
 
     /// Token cost tables of the current decision snapshot (lazy).
     pub(crate) fn coef_cost_tables(&self) -> std::cell::Ref<'_, crate::rate::CoefCostTables> {
         {
-            let mut slot = self.coef_cost.borrow_mut();
+            let mut slot = self.model.coef_cost.borrow_mut();
             if slot.is_none() {
                 *slot = Some(Box::new(crate::rate::CoefCostTables::build(self.dcdf())));
             }
         }
-        std::cell::Ref::map(self.coef_cost.borrow(), |o| {
+        std::cell::Ref::map(self.model.coef_cost.borrow(), |o| {
             o.as_deref().expect("initialized above")
         })
     }
 
-    fn new(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
+    /// Fresh tile state for `chroma`: scalar kernels, frame-prior CDFs, AQ off.
+    fn new(chroma: Chroma, q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
+        let mono = chroma == Chroma::Mono;
+        let (cw, ch) = (w >> chroma.sub_x(), h >> chroma.sub_y());
+        // 4:0:0 keeps no chroma planes or chroma context rows.
+        let cplane = |n: usize, fill: u16| if mono { Vec::new() } else { vec![fill; n] };
+        let cctx = |n: usize| if mono { Vec::new() } else { vec![0x40u8; n] };
+        let band_tilt = {
+            let t = crate::tuning::get();
+            match chroma {
+                Chroma::I444 => ramped_tilt(t.tilt_base_444, q, t.tilt_extra_444),
+                Chroma::I420 => ramped_tilt(t.tilt_base_420, q, t.tilt_extra_420),
+                Chroma::I422 => ramped_tilt(2.45, q, 0.4),
+                Chroma::Mono => ramped_tilt(1.2, q, 0.4),
+            }
+        };
         LossyTile {
-            sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
-            dct: DctDispatch::scalar(),
-            idct: IdctDispatch::scalar(),
-            intrapred: IntraPredDispatch::scalar(),
-            kmeans: KmeansDispatch::scalar(),
-            rd: crate::rd_sse::RdDispatch::scalar(),
-            bd,
-            quant: Quant::new_with_qm(q, bd, qm.y),
-            cquant: Quant::new_chroma_with_delta_qm(
-                q,
-                chroma_dc_delta(q, 0),
-                chroma_ac_delta(q, 0),
+            cfg: TileCfg {
                 bd,
-                qm.u,
-            ),
-            w,
-            h,
-            cw: w,
-            ss422: false,
-            ss420: false,
-            mono: false,
-            mono_large: false,
-            chroma_part_weight: chroma_part_rd_weight(false, false, src, bd),
-            allow_intrabc: false,
-            screen_content: true,
-            screen_frame: false,
-            uv_delta: 0,
-            ibc_mv: Vec::new(),
-            ibc_end4: (w / 4, h / 4),
-            vis: [(w, h); 3],
-            ibc_match_cache: Default::default(),
-            src,
-            recon: [vec![0; w * h], vec![0; w * h], vec![0; w * h]],
-            a_coef: [vec![0x40; w / 4], vec![0x40; w / 4], vec![0x40; w / 4]],
-            l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
-            a_tx: vec![-1i8; w / 4],
-            l_tx: vec![-1i8; h / 4],
-            a_part: vec![0; w / 8],
-            l_part: vec![0; h / 8],
-            a_skip: vec![0; w / 4],
-            l_skip: vec![0; h / 4],
-            a_mode: vec![0; w / 4],
-            l_mode: vec![0; h / 4],
-            a_uv_mode: vec![0; w / 4],
-            l_uv_mode: vec![0; h / 4],
-            a_palette: vec![Vec::new(); w / 4],
-            a_palette_uv: vec![Vec::new(); w / 4],
-            l_palette: vec![Vec::new(); h / 4],
-            l_palette_uv: vec![Vec::new(); h / 4],
-            blk4: vec![0; (w / 4) * (h / 4)],
-            blk4h: vec![0; (w / 4) * (h / 4)],
-            blk4v: vec![false; (w / 4) * (h / 4)],
-            blk4t: vec![false; (w / 4) * (h / 4)],
-            pblk4: vec![0; (w / 4) * (h / 4)],
-            pblk4h: vec![0; (w / 4) * (h / 4)],
-            pblk4v: vec![false; (w / 4) * (h / 4)],
-            pblk4t: vec![false; (w / 4) * (h / 4)],
-            skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
-            cdef_point_marked: false,
-            pal_est_cache: std::cell::RefCell::new(HashMap::new()),
-            screen_pal_est_cache: Default::default(),
-            pal_y_cost: std::cell::RefCell::new(None),
-            pal_uv_cost: std::cell::RefCell::new(None),
-            pal_cdfs: None,
-            coef_cost: std::cell::RefCell::new(None),
-            chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            rd16_cache: std::cell::RefCell::new(HashMap::new()),
-            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
-            rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
-            scratch: Default::default(),
-            split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            emit_epoch: std::cell::Cell::new(0),
-            ibc_index: None,
-            ibc_shared: None,
-            enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(crate::tuning::get().tilt_base_444, q, crate::tuning::get().tilt_extra_444)),
-            updating_cdf: true,
-            dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(crate::tuning::get().tilt_base_444, q, crate::tuning::get().tilt_extra_444);
-                c.into()
+                w,
+                h,
+                cw,
+                chroma,
+                mono_large: false,
+                chroma_part_weight: if mono {
+                    0.0
+                } else {
+                    chroma_part_rd_weight(chroma == Chroma::I420, chroma == Chroma::I422, src, bd)
+                },
+                allow_intrabc: false,
+                screen_content: true,
+                screen_frame: false,
+                ibc_end4: (w / 4, h / 4),
+                vis: [(w, h), (cw, ch), (cw, ch)],
+                src,
+                ibc_index: None,
+                ibc_shared: None,
+                updating_cdf: true,
+                speed: Speed::Slow,
+                wiener: None,
+                frame_x0: 0,
+                frame_y0: 0,
+                frame_w: w,
+                frame_h: h,
+                base_q_idx: q,
             },
-            decision_cdf_warmed: false,
-            skip_price: None,
-            sb_mode: SbMode::Off,
-            rec: DecisionRecord::default(),
-            cur: RecordCursor::default(),
-            force_part: None,
-            trial_enc: None,
-            trial_cdfs: None,
-            trial_cost: std::cell::RefCell::new(None),
-            speed: Speed::Slow,
-            aq: AqCtx::off(),
-            wiener: None,
-            lr_ref_h: crate::wiener::WIENER_TAPS_MID,
-            lr_ref_v: crate::wiener::WIENER_TAPS_MID,
-            frame_x0: 0,
-            frame_y0: 0,
-            frame_w: w,
-            frame_h: h,
-            base_q_idx: q,
+            k: Kernels {
+                dct: DctDispatch::scalar(),
+                idct: IdctDispatch::scalar(),
+                intrapred: IntraPredDispatch::scalar(),
+                kmeans: KmeansDispatch::scalar(),
+                rd: crate::rd_sse::RdDispatch::scalar(),
+            },
+            ctx: CodingCtx {
+                quant: Quant::new_with_qm(q, bd, qm.y),
+                cquant: if mono {
+                    Quant::new_chroma(q, bd)
+                } else {
+                    let sub = chroma.sub_x() + chroma.sub_y();
+                    Quant::new_chroma_with_delta_qm(q, chroma_dc_delta(q, sub), chroma_ac_delta(q, sub), bd, qm.u)
+                },
+                ibc_mv: Vec::new(),
+                recon: [vec![0; w * h], cplane(cw * ch, 0), cplane(cw * ch, 0)],
+                a_coef: [vec![0x40; w / 4], cctx(cw / 4), cctx(cw / 4)],
+                l_coef: [vec![0x40; h / 4], cctx(ch / 4), cctx(ch / 4)],
+                a_tx: vec![-1i8; w / 4],
+                l_tx: vec![-1i8; h / 4],
+                a_part: vec![0; w / 8],
+                l_part: vec![0; h / 8],
+                a_skip: vec![0; w / 4],
+                l_skip: vec![0; h / 4],
+                a_mode: vec![0; w / 4],
+                l_mode: vec![0; h / 4],
+                a_uv_mode: if mono { Vec::new() } else { vec![0; w / 4] },
+                l_uv_mode: if mono { Vec::new() } else { vec![0; h / 4] },
+                a_palette: vec![Vec::new(); w / 4],
+                a_palette_uv: vec![Vec::new(); w / 4],
+                l_palette: vec![Vec::new(); h / 4],
+                l_palette_uv: vec![Vec::new(); h / 4],
+                maps: BlockMaps::new(w, h),
+                cdef_point_marked: false,
+                aq: AqCtx::off(),
+                lr_ref_h: crate::wiener::WIENER_TAPS_MID,
+                lr_ref_v: crate::wiener::WIENER_TAPS_MID,
+            },
+            ent: Entropy {
+                enc: OdEcEncoder::new(),
+                cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(band_tilt),
+            },
+            model: RateModel {
+                pal_y_cost: std::cell::RefCell::new(None),
+                pal_uv_cost: std::cell::RefCell::new(None),
+                pal_cdfs: None,
+                coef_cost: std::cell::RefCell::new(None),
+                dec_cdfs: {
+                    let mut c = if chroma == Chroma::I422 {
+                        Cdfs::decision_snapshot_422(crate::coef_q::qcat(q))
+                    } else {
+                        Cdfs::decision_snapshot(crate::coef_q::qcat(q))
+                    };
+                    c.band_tilt = band_tilt;
+                    c.into()
+                },
+                decision_cdf_warmed: false,
+                skip_price: None,
+                trial_cost: std::cell::RefCell::new(None),
+            },
+            memo: Memo {
+                sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
+                ibc_match_cache: Default::default(),
+                pal_est_cache: std::cell::RefCell::new(HashMap::new()),
+                screen_pal_est_cache: Default::default(),
+                chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
+                rd16_cache: std::cell::RefCell::new(HashMap::new()),
+                rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
+                split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
+                emit_epoch: std::cell::Cell::new(0),
+            },
+            run: SbRun {
+                trial_enc: None,
+                trial_cdfs: None,
+            },
+            scratch: Default::default(),
         }
     }
 
-    fn new_mono(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
-        LossyTile {
-            sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
-            dct: DctDispatch::scalar(),
-            idct: IdctDispatch::scalar(),
-            intrapred: IntraPredDispatch::scalar(),
-            kmeans: KmeansDispatch::scalar(),
-            rd: crate::rd_sse::RdDispatch::scalar(),
-            bd,
-            quant: Quant::new_with_qm(q, bd, qm.y),
-            cquant: Quant::new_chroma(q, bd),
-            w,
-            h,
-            cw: w,
-            ss422: false,
-            ss420: false,
-            mono: true,
-            mono_large: false,
-            chroma_part_weight: 0.0,
-            allow_intrabc: false,
-            screen_content: true,
-            screen_frame: false,
-            uv_delta: 0,
-            ibc_mv: Vec::new(),
-            ibc_end4: (w / 4, h / 4),
-            vis: [(w, h); 3],
-            ibc_match_cache: Default::default(),
-            src,
-            recon: [vec![0; w * h], Vec::new(), Vec::new()],
-            a_coef: [vec![0x40; w / 4], Vec::new(), Vec::new()],
-            l_coef: [vec![0x40; h / 4], Vec::new(), Vec::new()],
-            a_tx: vec![-1i8; w / 4],
-            l_tx: vec![-1i8; h / 4],
-            a_part: vec![0; w / 8],
-            l_part: vec![0; h / 8],
-            a_skip: vec![0; w / 4],
-            l_skip: vec![0; h / 4],
-            a_mode: vec![0; w / 4],
-            l_mode: vec![0; h / 4],
-            a_uv_mode: Vec::new(),
-            l_uv_mode: Vec::new(),
-            a_palette: vec![Vec::new(); w / 4],
-            a_palette_uv: vec![Vec::new(); w / 4],
-            l_palette: vec![Vec::new(); h / 4],
-            l_palette_uv: vec![Vec::new(); h / 4],
-            blk4: vec![0; (w / 4) * (h / 4)],
-            blk4h: vec![0; (w / 4) * (h / 4)],
-            blk4v: vec![false; (w / 4) * (h / 4)],
-            blk4t: vec![false; (w / 4) * (h / 4)],
-            pblk4: vec![0; (w / 4) * (h / 4)],
-            pblk4h: vec![0; (w / 4) * (h / 4)],
-            pblk4v: vec![false; (w / 4) * (h / 4)],
-            pblk4t: vec![false; (w / 4) * (h / 4)],
-            skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
-            cdef_point_marked: false,
-            pal_est_cache: std::cell::RefCell::new(HashMap::new()),
-            screen_pal_est_cache: Default::default(),
-            pal_y_cost: std::cell::RefCell::new(None),
-            pal_uv_cost: std::cell::RefCell::new(None),
-            pal_cdfs: None,
-            coef_cost: std::cell::RefCell::new(None),
-            chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            rd16_cache: std::cell::RefCell::new(HashMap::new()),
-            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
-            rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
-            scratch: Default::default(),
-            split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            emit_epoch: std::cell::Cell::new(0),
-            ibc_index: None,
-            ibc_shared: None,
-            enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(1.2, q, 0.4)),
-            updating_cdf: true,
-            dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(1.2, q, 0.4);
-                c.into()
-            },
-            decision_cdf_warmed: false,
-            skip_price: None,
-            sb_mode: SbMode::Off,
-            rec: DecisionRecord::default(),
-            cur: RecordCursor::default(),
-            force_part: None,
-            trial_enc: None,
-            trial_cdfs: None,
-            trial_cost: std::cell::RefCell::new(None),
-            speed: Speed::Slow,
-            aq: AqCtx::off(),
-            wiener: None,
-            lr_ref_h: crate::wiener::WIENER_TAPS_MID,
-            lr_ref_v: crate::wiener::WIENER_TAPS_MID,
-            frame_x0: 0,
-            frame_y0: 0,
-            frame_w: w,
-            frame_h: h,
-            base_q_idx: q,
-        }
-    }
-
-    /// 4:2:2 tile: luma is full w x h, chroma planes are subsampled to (w/2) x h.
-    /// `src[1]`/`src[2]` must already be the half-width chroma planes.
-    fn new_422(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
-        let cw = w / 2;
-        LossyTile {
-            sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
-            dct: DctDispatch::scalar(),
-            idct: IdctDispatch::scalar(),
-            intrapred: IntraPredDispatch::scalar(),
-            kmeans: KmeansDispatch::scalar(),
-            rd: crate::rd_sse::RdDispatch::scalar(),
-            bd,
-            quant: Quant::new_with_qm(q, bd, qm.y),
-            cquant: Quant::new_chroma_with_delta_qm(
-                q,
-                chroma_dc_delta(q, 1),
-                chroma_ac_delta(q, 1),
-                bd,
-                qm.u,
-            ),
-            w,
-            h,
-            cw,
-            ss422: true,
-            ss420: false,
-            mono: false,
-            mono_large: false,
-            chroma_part_weight: chroma_part_rd_weight(false, true, src, bd),
-            allow_intrabc: false,
-            screen_content: true,
-            screen_frame: false,
-            uv_delta: 0,
-            ibc_mv: Vec::new(),
-            ibc_end4: (w / 4, h / 4),
-            vis: [(w, h), (cw, h), (cw, h)],
-            ibc_match_cache: Default::default(),
-            src,
-            recon: [vec![0; w * h], vec![0; cw * h], vec![0; cw * h]],
-            a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
-            l_coef: [vec![0x40; h / 4], vec![0x40; h / 4], vec![0x40; h / 4]],
-            a_tx: vec![-1i8; w / 4],
-            l_tx: vec![-1i8; h / 4],
-            a_part: vec![0; w / 8],
-            l_part: vec![0; h / 8],
-            a_skip: vec![0; w / 4],
-            l_skip: vec![0; h / 4],
-            a_mode: vec![0; w / 4],
-            l_mode: vec![0; h / 4],
-            a_uv_mode: vec![0; w / 4],
-            l_uv_mode: vec![0; h / 4],
-            a_palette: vec![Vec::new(); w / 4],
-            a_palette_uv: vec![Vec::new(); w / 4],
-            l_palette: vec![Vec::new(); h / 4],
-            l_palette_uv: vec![Vec::new(); h / 4],
-            blk4: vec![0; (w / 4) * (h / 4)],
-            blk4h: vec![0; (w / 4) * (h / 4)],
-            blk4v: vec![false; (w / 4) * (h / 4)],
-            blk4t: vec![false; (w / 4) * (h / 4)],
-            pblk4: vec![0; (w / 4) * (h / 4)],
-            pblk4h: vec![0; (w / 4) * (h / 4)],
-            pblk4v: vec![false; (w / 4) * (h / 4)],
-            pblk4t: vec![false; (w / 4) * (h / 4)],
-            skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
-            cdef_point_marked: false,
-            pal_est_cache: std::cell::RefCell::new(HashMap::new()),
-            screen_pal_est_cache: Default::default(),
-            pal_y_cost: std::cell::RefCell::new(None),
-            pal_uv_cost: std::cell::RefCell::new(None),
-            pal_cdfs: None,
-            coef_cost: std::cell::RefCell::new(None),
-            chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            rd16_cache: std::cell::RefCell::new(HashMap::new()),
-            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
-            rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
-            scratch: Default::default(),
-            split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            emit_epoch: std::cell::Cell::new(0),
-            ibc_index: None,
-            ibc_shared: None,
-            enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(2.45, q, 0.4)),
-            updating_cdf: true,
-            dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot_422(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(2.45, q, 0.4);
-                c.into()
-            },
-            decision_cdf_warmed: false,
-            skip_price: None,
-            sb_mode: SbMode::Off,
-            rec: DecisionRecord::default(),
-            cur: RecordCursor::default(),
-            force_part: None,
-            trial_enc: None,
-            trial_cdfs: None,
-            trial_cost: std::cell::RefCell::new(None),
-            speed: Speed::Slow,
-            aq: AqCtx::off(),
-            wiener: None,
-            lr_ref_h: crate::wiener::WIENER_TAPS_MID,
-            lr_ref_v: crate::wiener::WIENER_TAPS_MID,
-            frame_x0: 0,
-            frame_y0: 0,
-            frame_w: w,
-            frame_h: h,
-            base_q_idx: q,
-        }
-    }
-
-    /// 4:2:0 tile: luma is full w x h, chroma planes are subsampled to
-    /// (w/2) x (h/2). `src[1]`/`src[2]` must already be the quarter-size planes.
-    fn new_420(q: u8, bd: u8, w: usize, h: usize, src: &'a [Vec<u16>; 3], qm: QmLevels) -> Self {
-        let (cw, ch) = (w / 2, h / 2);
-        LossyTile {
-            sb_act_cache: std::cell::Cell::new((u32::MAX, u32::MAX, 0.0)),
-            dct: DctDispatch::scalar(),
-            idct: IdctDispatch::scalar(),
-            intrapred: IntraPredDispatch::scalar(),
-            kmeans: KmeansDispatch::scalar(),
-            rd: crate::rd_sse::RdDispatch::scalar(),
-            bd,
-            quant: Quant::new_with_qm(q, bd, qm.y),
-            cquant: Quant::new_chroma_with_delta_qm(
-                q,
-                chroma_dc_delta(q, 2),
-                chroma_ac_delta(q, 2),
-                bd,
-                qm.u,
-            ),
-            w,
-            h,
-            cw,
-            ss422: false,
-            ss420: true,
-            mono: false,
-            mono_large: false,
-            chroma_part_weight: chroma_part_rd_weight(true, false, src, bd),
-            allow_intrabc: false,
-            screen_content: true,
-            screen_frame: false,
-            uv_delta: 0,
-            ibc_mv: Vec::new(),
-            ibc_end4: (w / 4, h / 4),
-            vis: [(w, h), (cw, ch), (cw, ch)],
-            ibc_match_cache: Default::default(),
-            src,
-            recon: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
-            a_coef: [vec![0x40; w / 4], vec![0x40; cw / 4], vec![0x40; cw / 4]],
-            l_coef: [vec![0x40; h / 4], vec![0x40; ch / 4], vec![0x40; ch / 4]],
-            a_tx: vec![-1i8; w / 4],
-            l_tx: vec![-1i8; h / 4],
-            a_part: vec![0; w / 8],
-            l_part: vec![0; h / 8],
-            a_skip: vec![0; w / 4],
-            l_skip: vec![0; h / 4],
-            a_mode: vec![0; w / 4],
-            l_mode: vec![0; h / 4],
-            a_uv_mode: vec![0; w / 4],
-            l_uv_mode: vec![0; h / 4],
-            a_palette: vec![Vec::new(); w / 4],
-            a_palette_uv: vec![Vec::new(); w / 4],
-            l_palette: vec![Vec::new(); h / 4],
-            l_palette_uv: vec![Vec::new(); h / 4],
-            blk4: vec![0; (w / 4) * (h / 4)],
-            blk4h: vec![0; (w / 4) * (h / 4)],
-            blk4v: vec![false; (w / 4) * (h / 4)],
-            blk4t: vec![false; (w / 4) * (h / 4)],
-            pblk4: vec![0; (w / 4) * (h / 4)],
-            pblk4h: vec![0; (w / 4) * (h / 4)],
-            pblk4v: vec![false; (w / 4) * (h / 4)],
-            pblk4t: vec![false; (w / 4) * (h / 4)],
-            skip8: vec![true; w.div_ceil(8) * h.div_ceil(8)],
-            cdef_point_marked: false,
-            pal_est_cache: std::cell::RefCell::new(HashMap::new()),
-            screen_pal_est_cache: Default::default(),
-            pal_y_cost: std::cell::RefCell::new(None),
-            pal_uv_cost: std::cell::RefCell::new(None),
-            pal_cdfs: None,
-            coef_cost: std::cell::RefCell::new(None),
-            chroma_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            rd16_cache: std::cell::RefCell::new(HashMap::new()),
-            proxy_margin32: std::cell::Cell::new(f32::INFINITY),
-            rect_leaf_cache: std::cell::RefCell::new(HashMap::new()),
-            scratch: Default::default(),
-            split4_rd_cache: std::cell::RefCell::new(HashMap::new()),
-            emit_epoch: std::cell::Cell::new(0),
-            ibc_index: None,
-            ibc_shared: None,
-            enc: OdEcEncoder::new(),
-            cdfs: Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(ramped_tilt(crate::tuning::get().tilt_base_420, q, crate::tuning::get().tilt_extra_420)),
-            updating_cdf: true,
-            dec_cdfs: {
-                let mut c = Cdfs::decision_snapshot(crate::coef_q::qcat(q));
-                c.band_tilt = ramped_tilt(crate::tuning::get().tilt_base_420, q, crate::tuning::get().tilt_extra_420);
-                c.into()
-            },
-            decision_cdf_warmed: false,
-            skip_price: None,
-            sb_mode: SbMode::Off,
-            rec: DecisionRecord::default(),
-            cur: RecordCursor::default(),
-            force_part: None,
-            trial_enc: None,
-            trial_cdfs: None,
-            trial_cost: std::cell::RefCell::new(None),
-            speed: Speed::Slow,
-            aq: AqCtx::off(),
-            wiener: None,
-            lr_ref_h: crate::wiener::WIENER_TAPS_MID,
-            lr_ref_v: crate::wiener::WIENER_TAPS_MID,
-            frame_x0: 0,
-            frame_y0: 0,
-            frame_w: w,
-            frame_h: h,
-            base_q_idx: q,
-        }
-    }
 
     /// Entropy-accurate rate for a square LUMA transform of width `w` covering
     /// the whole block at (px, py) — the shape every intra R-D comparison comes
@@ -785,7 +488,7 @@ impl<'a> LossyTile<'a> {
         dcs_ctx: usize,
         bound: f32,
     ) -> f32 {
-        if use_proxy_rate(self.speed) {
+        if use_proxy_rate(self.cfg.speed) {
             return block_rate_bits(cf, scan);
         }
         let c = self.dcdf();
@@ -821,7 +524,7 @@ impl<'a> LossyTile<'a> {
         // bound (205,679 finite vs 194,321 infinite in one encode). Block bits
         // are simply either well under or well over the bound, so a 15% squeeze
         // almost never lands in the accept/reject window. Not a lever.
-        let slack = crate::tuning::rate_bound_slack(self.speed);
+        let slack = crate::tuning::rate_bound_slack(self.cfg.speed);
         let bound = if slack < 1.0 { bound * slack } else { bound };
         crate::rate::real_block_bits_bounded(cf, scan, &ctx, bound)
     }
@@ -832,7 +535,7 @@ impl<'a> LossyTile<'a> {
     /// `txtp_inter2`, DCT_DCT; TX_32X32: `txtp_inter3[3]`, DCT_DCT = 1)
     /// instead of the intra per-mode CDF.
     pub(crate) fn luma_bits_inter(&self, cf: &[i32], scan: &[u32], w: usize, px: usize, py: usize) -> f32 {
-        if use_proxy_rate(self.speed) {
+        if use_proxy_rate(self.cfg.speed) {
             return block_rate_bits(cf, scan);
         }
         let (bx4, by4) = (px / 4, py / 4);
@@ -863,7 +566,7 @@ impl<'a> LossyTile<'a> {
     /// coefficient class 4, `txb_skip` ctx 0 (block == transform) and the
     /// 16-unit DC-sign span. DCT_DCT is implied (no txtp symbol).
     pub(crate) fn luma_bits_tx64(&self, cf: &[i32], px: usize, py: usize) -> f32 {
-        if use_proxy_rate(self.speed) {
+        if use_proxy_rate(self.cfg.speed) {
             return block_rate_bits(cf, &SCAN_32X32);
         }
         let c = self.dcdf();
@@ -922,7 +625,7 @@ impl<'a> LossyTile<'a> {
         y_mode: usize,
         txtp: usize,
     ) -> f32 {
-        if use_proxy_rate(self.speed) {
+        if use_proxy_rate(self.cfg.speed) {
             return block_rate_bits(cf, scan);
         }
         let c = self.dcdf();
@@ -996,8 +699,8 @@ impl<'a> LossyTile<'a> {
             0,
             eob_bin,
             self.dc_sign_ctx_span(0, px / 4, py / 4, w / 4, h / 4),
-            self.quant.qm_level(),
-            self.quant.qidx() as i32,
+            self.ctx.quant.qm_level(),
+            self.ctx.quant.qidx() as i32,
         );
     }
 
@@ -1032,7 +735,7 @@ impl<'a> LossyTile<'a> {
         cx: usize,
         cy: usize,
     ) -> f32 {
-        if use_proxy_rate(self.speed) {
+        if use_proxy_rate(self.cfg.speed) {
             return block_rate_bits(cf, scan);
         }
         let c = self.dcdf();
@@ -1050,7 +753,7 @@ impl<'a> LossyTile<'a> {
             (1024, 32) => (3, &c.eob_bin_1024_c),
             _ => unreachable!("unsupported chroma transform {w}x{h}"),
         };
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = a[bx4..(bx4 + nw).min(a.len())].iter().any(|&x| x != 0x40) as usize;
         let cl = l[by4..(by4 + nh).min(l.len())].iter().any(|&x| x != 0x40) as usize;
         let tables = self.coef_cost_tables();
@@ -1092,7 +795,7 @@ impl<'a> LossyTile<'a> {
         cx: usize,
         cy: usize,
     ) {
-        if (!self.ss420 && !self.ss422) || (self.speed == Speed::Fast && self.ss420) {
+        if (!self.cfg.is_420() && !self.cfg.is_422()) || (self.cfg.speed == Speed::Fast && self.cfg.is_420()) {
             trellis_optimize(cf, tf, dc_q, ac_q, scan, lambda0);
             return;
         }
@@ -1124,8 +827,8 @@ impl<'a> LossyTile<'a> {
             1,
             eob_bin,
             self.dc_sign_ctx_span(plane, bx4, by4, nw, nh),
-            self.cquant.qm_level(),
-            self.cquant.qidx() as i32,
+            self.ctx.cquant.qm_level(),
+            self.ctx.cquant.qidx() as i32,
         );
     }
 
@@ -1549,8 +1252,8 @@ impl<'a> LossyTile<'a> {
 
     pub(crate) fn mode_bits(&self, px: usize, py: usize, m: usize) -> f32 {
         let (bx4, by4) = (px / 4, py / 4);
-        let yctx = INTRA_MODE_CTX[self.a_mode[bx4] as usize] * 5
-            + INTRA_MODE_CTX[self.l_mode[by4] as usize];
+        let yctx = INTRA_MODE_CTX[self.ctx.a_mode[bx4] as usize] * 5
+            + INTRA_MODE_CTX[self.ctx.l_mode[by4] as usize];
 
         cdf_cost(&self.dcdf().kf_y[yctx], m)
     }
@@ -1612,8 +1315,8 @@ impl<'a> LossyTile<'a> {
         if !chroma {
             0 // luma: TX size == block size -> ctx 0
         } else {
-            let a = &self.a_coef[plane];
-            let l = &self.l_coef[plane];
+            let a = &self.ctx.a_coef[plane];
+            let l = &self.ctx.l_coef[plane];
             let ca = (a[bx4] != 0x40 || a[bx4 + 1] != 0x40) as usize;
             let cl = (l[by4] != 0x40 || l[by4 + 1] != 0x40) as usize;
             7 + ca + cl
@@ -1632,8 +1335,8 @@ impl<'a> LossyTile<'a> {
             [2, 4, 4, 4, 5],
             [3, 5, 5, 5, 6],
         ];
-        let a = &self.a_coef[0];
-        let l = &self.l_coef[0];
+        let a = &self.ctx.a_coef[0];
+        let l = &self.ctx.l_coef[0];
         let mut la = 0u8;
         for i in 0..tw4 {
             la |= a[bx4 + i];
@@ -1653,8 +1356,8 @@ impl<'a> LossyTile<'a> {
         nw: usize,
         nh: usize,
     ) -> usize {
-        let a = &self.a_coef[plane];
-        let l = &self.l_coef[plane];
+        let a = &self.ctx.a_coef[plane];
+        let l = &self.ctx.l_coef[plane];
         let mut s = 0i32;
         for &v in a[bx4..(bx4 + nw).min(a.len())].iter() {
             s += (v >> 6) as i32 - 1;
@@ -1666,8 +1369,8 @@ impl<'a> LossyTile<'a> {
     }
 
     fn dc_sign_ctx(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let a = &self.a_coef[plane];
-        let l = &self.l_coef[plane];
+        let a = &self.ctx.a_coef[plane];
+        let l = &self.ctx.l_coef[plane];
         let suma = (a[bx4] >> 6) as i32 + (a[bx4 + 1] >> 6) as i32;
         let suml = (l[by4] >> 6) as i32 + (l[by4 + 1] >> 6) as i32;
         let s = suma + suml - 4;
@@ -1681,8 +1384,8 @@ impl<'a> LossyTile<'a> {
         if !chroma {
             0
         } else {
-            let a = &self.a_coef[plane];
-            let l = &self.l_coef[plane];
+            let a = &self.ctx.a_coef[plane];
+            let l = &self.ctx.l_coef[plane];
             let ca = a[bx4..bx4 + 4].iter().any(|&x| x != 0x40) as usize;
             let cl = l[by4..by4 + 4].iter().any(|&x| x != 0x40) as usize;
             7 + ca + cl
@@ -1691,8 +1394,8 @@ impl<'a> LossyTile<'a> {
 
     /// dc_sign context for a 16x16 transform (4-unit footprint, baseline -8).
     fn dc_sign_ctx_16(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let a = &self.a_coef[plane];
-        let l = &self.l_coef[plane];
+        let a = &self.ctx.a_coef[plane];
+        let l = &self.ctx.l_coef[plane];
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 4]);
         let s = suma + suml - 8;
@@ -1709,7 +1412,7 @@ impl<'a> LossyTile<'a> {
     }
 
     fn dc_sign_ctx_8x16_luma(&self, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[0], &self.l_coef[0]);
+        let (a, l) = (&self.ctx.a_coef[0], &self.ctx.l_coef[0]);
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 4]);
         let s = suma + suml - 6;
@@ -1719,8 +1422,8 @@ impl<'a> LossyTile<'a> {
     /// dc_sign context for a luma RTX_16X8 transform: 4 above-units (16 wide) and
     /// 2 left-units (8 tall) top-bit sums, baseline -(4+2) = -6.
     fn dc_sign_ctx_16x8_luma(&self, bx4: usize, by4: usize) -> usize {
-        let a = &self.a_coef[0];
-        let l = &self.l_coef[0];
+        let a = &self.ctx.a_coef[0];
+        let l = &self.ctx.l_coef[0];
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 2]);
         let s = suma + suml - 6;
@@ -1730,8 +1433,8 @@ impl<'a> LossyTile<'a> {
     /// 4:4:4 chroma txb_skip context for an RTX_16X8 block (block == transform, so
     /// `not_one_blk` is 0): `7 + ca + cl` over 4 above-units and 2 left-units.
     fn skip_ctx_16x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let a = &self.a_coef[plane];
-        let l = &self.l_coef[plane];
+        let a = &self.ctx.a_coef[plane];
+        let l = &self.ctx.l_coef[plane];
         let ca = a[bx4..bx4 + 4].iter().any(|&x| x != 0x40) as usize;
         let cl = l[by4..by4 + 2].iter().any(|&x| x != 0x40) as usize;
         7 + ca + cl
@@ -1739,8 +1442,8 @@ impl<'a> LossyTile<'a> {
 
     /// 4:4:4 chroma dc_sign context for RTX_16X8: 4 above + 2 left, baseline -6.
     fn dc_sign_ctx_16x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let a = &self.a_coef[plane];
-        let l = &self.l_coef[plane];
+        let a = &self.ctx.a_coef[plane];
+        let l = &self.ctx.l_coef[plane];
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 4]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 2]);
         let s = suma + suml - 6;
@@ -1748,14 +1451,14 @@ impl<'a> LossyTile<'a> {
     }
 
     fn skip_ctx_8x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = a[bx4..bx4 + 2].iter().any(|&x| x != 0x40) as usize;
         let cl = l[by4..by4 + 4].iter().any(|&x| x != 0x40) as usize;
         7 + ca + cl
     }
 
     fn dc_sign_ctx_8x16_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 4]);
         let s = suma + suml - 6;
@@ -1763,41 +1466,41 @@ impl<'a> LossyTile<'a> {
     }
 
     fn dc_sign_ctx_8x4_luma(&self, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[0], &self.l_coef[0]);
+        let (a, l) = (&self.ctx.a_coef[0], &self.ctx.l_coef[0]);
         let sa: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let s = sa + (l[by4] >> 6) as i32 - 3;
         (s != 0) as usize + (s > 0) as usize
     }
 
     fn dc_sign_ctx_4x8_luma(&self, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[0], &self.l_coef[0]);
+        let (a, l) = (&self.ctx.a_coef[0], &self.ctx.l_coef[0]);
         let sl: i32 = sum_coef_sign(&l[by4..by4 + 2]);
         let s = (a[bx4] >> 6) as i32 + sl - 3;
         (s != 0) as usize + (s > 0) as usize
     }
 
     fn skip_ctx_4x4_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = (a[bx4] != 0x40) as usize;
         let cl = (l[by4] != 0x40) as usize;
         7 + ca + cl
     }
 
     fn dc_sign_ctx_4x4_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let s = (a[bx4] >> 6) as i32 + (l[by4] >> 6) as i32 - 2;
         (s != 0) as usize + (s > 0) as usize
     }
 
     fn skip_ctx_8x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = a[bx4..bx4 + 2].iter().any(|&x| x != 0x40) as usize;
         let cl = l[by4..by4 + 2].iter().any(|&x| x != 0x40) as usize;
         7 + ca + cl
     }
 
     fn dc_sign_ctx_8x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 2]);
         let s = suma + suml - 4;
@@ -1805,14 +1508,14 @@ impl<'a> LossyTile<'a> {
     }
 
     fn skip_ctx_8x4_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = a[bx4..bx4 + 2].iter().any(|&x| x != 0x40) as usize;
         let cl = (l[by4] != 0x40) as usize;
         7 + ca + cl
     }
 
     fn dc_sign_ctx_8x4_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let suma: i32 = sum_coef_sign(&a[bx4..bx4 + 2]);
         let suml = (l[by4] >> 6) as i32;
         let s = suma + suml - 3;
@@ -1820,14 +1523,14 @@ impl<'a> LossyTile<'a> {
     }
 
     fn skip_ctx_4x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let ca = (a[bx4] != 0x40) as usize;
         let cl = l[by4..by4 + 2].iter().any(|&x| x != 0x40) as usize;
         7 + ca + cl
     }
 
     fn dc_sign_ctx_4x8_chroma(&self, plane: usize, bx4: usize, by4: usize) -> usize {
-        let (a, l) = (&self.a_coef[plane], &self.l_coef[plane]);
+        let (a, l) = (&self.ctx.a_coef[plane], &self.ctx.l_coef[plane]);
         let suma = (a[bx4] >> 6) as i32;
         let suml: i32 = sum_coef_sign(&l[by4..by4 + 2]);
         let s = suma + suml - 3;
@@ -1838,9 +1541,9 @@ impl<'a> LossyTile<'a> {
     /// Chroma subsampling class for the frame-level delta laws:
     /// 0 = 4:4:4 / mono, 1 = 4:2:2, 2 = 4:2:0.
     fn chroma_sub(&self) -> usize {
-        if self.ss420 {
+        if self.cfg.is_420() {
             2
-        } else if self.ss422 {
+        } else if self.cfg.is_422() {
             1
         } else {
             0
@@ -1848,17 +1551,17 @@ impl<'a> LossyTile<'a> {
     }
 
     fn luma_mode_budget_eff(&self) -> usize {
-        self.speed
-            .luma_mode_budget(!self.ss420 && !self.ss422 && !self.mono)
+        self.cfg.speed
+            .luma_mode_budget(self.cfg.is_444())
     }
 
     /// 4:4:4 top-band ramp weight for the 32/64 NONE biases (0 outside).
     fn top_bias_t_444(&self) -> f32 {
-        if self.ss420 || self.ss422 || self.mono {
+        if !self.cfg.is_444() {
             return 0.0;
         }
         let t = crate::tuning::get();
-        ((t.top_bias_knee_444 - self.aq.base_q as f32) / t.top_bias_width_444).clamp(0.0, 1.0)
+        ((t.top_bias_knee_444 - self.ctx.aq.base_q as f32) / t.top_bias_width_444).clamp(0.0, 1.0)
     }
 
     fn none32_split_bias_at(&self) -> f32 {
@@ -1881,30 +1584,30 @@ impl<'a> LossyTile<'a> {
     /// gradient quantizes to a few ADJACENT shades per block too, and those
     /// regions still want the split pressure (s_buddha glow +3% rate without it).
     fn palette_exact(&self, px: usize, py: usize, dim: usize) -> bool {
-        block_color_histogram(&self.src[0], self.w, px, py, dim, dim).is_some_and(|hist| {
+        block_color_histogram(&self.cfg.src[0], self.cfg.w, px, py, dim, dim).is_some_and(|hist| {
             let values = hist.as_slice().iter().map(|&(v, _)| v);
             let span = values.clone().max().unwrap_or(0) - values.min().unwrap_or(0);
-            hist.len() <= 8 && span >= 64 << (self.bd - 8)
+            hist.len() <= 8 && span >= 64 << (self.cfg.bd - 8)
         })
     }
 
     fn top_band(&self) -> bool {
-        self.aq.enabled
-            && !self.mono
-            && (self.aq.base_q as u32) <= crate::tuning::get().top_band_q
-            && self.speed.at_least_slow()
+        self.ctx.aq.enabled
+            && !self.cfg.is_mono()
+            && (self.ctx.aq.base_q as u32) <= crate::tuning::get().top_band_q
+            && self.cfg.speed.at_least_slow()
     }
 
     fn partition_signal_bits(&self) -> f32 {
-        if (self.ss420 || self.ss422) && self.aq.enabled && !self.mono && self.speed.at_least_slow()
+        if (self.cfg.is_420() || self.cfg.is_422()) && self.ctx.aq.enabled && !self.cfg.is_mono() && self.cfg.speed.at_least_slow()
         {
             let tu = crate::tuning::get();
-            let w = if self.ss422 {
+            let w = if self.cfg.is_422() {
                 tu.seam_w_422
             } else {
                 tu.seam_w_420
             };
-            let t = seam_t(self.aq.base_q, w);
+            let t = seam_t(self.ctx.aq.base_q, w);
             if t > 0.0 {
                 return tu.part_signal_bits - tu.part_signal_seam_drop * t;
             }
@@ -1921,7 +1624,7 @@ impl<'a> LossyTile<'a> {
     /// Same, at an arbitrary partition level. `bl` follows `decode_sb`:
     /// 1 = 64x64, 2 = 32x32, 3 = 16x16, 4 = 8x8; the CDF row is `bl - 1`.
     fn partition_bits_bl(&self, bl: usize, x8: usize, y8: usize, symbol: usize) -> f32 {
-        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+        let ctx = get_partition_ctx(&self.ctx.a_part, &self.ctx.l_part, bl, x8, y8);
         cdf_cost(&self.dcdf().part_split[bl - 1][ctx], symbol)
     }
 
@@ -1931,7 +1634,7 @@ impl<'a> LossyTile<'a> {
     /// pays (`encode_gathered_partition`): symbol 1 (SPLIT) carries mass `p`,
     /// symbol 0 (HORZ / VERT) carries `32768 - p`.
     fn edge_partition_bits(&self, bl: usize, x8: usize, y8: usize, top: bool, split: bool) -> f32 {
-        let ctx = get_partition_ctx(&self.a_part, &self.l_part, bl, x8, y8);
+        let ctx = get_partition_ctx(&self.ctx.a_part, &self.ctx.l_part, bl, x8, y8);
         let p = i32::from(crate::coeffs::gather_split_prob_icdf(
             &self.dcdf().part_split[bl - 1][ctx],
             top,
@@ -1944,7 +1647,7 @@ impl<'a> LossyTile<'a> {
     /// level had: NONE was free while SPLIT paid the flat fee.
     pub(crate) fn part_rate_bl(&self, bl: usize, x8: usize, y8: usize, symbol: usize) -> f32 {
         let t = crate::tuning::get();
-        let ss444 = !self.ss420 && !self.ss422 && !self.mono;
+        let ss444 = self.cfg.is_444();
         if t.exact_part_bits_3264 || (t.exact_part_bits_3264_444 && ss444) {
             self.partition_bits_bl(bl, x8, y8, symbol)
         } else if symbol == 0 {
@@ -1957,7 +1660,7 @@ impl<'a> LossyTile<'a> {
     /// Partition-symbol rate for a 16x16 candidate: exact when
     /// `exact_part_bits` is on, else the legacy flat fee (NONE free).
     fn part16_rate(&self, x8: usize, y8: usize, symbol: usize) -> f32 {
-        if crate::tuning::get().exact_part_bits && !(self.ss422 && !self.mono) {
+        if crate::tuning::get().exact_part_bits && !(self.cfg.is_422() && !self.cfg.is_mono()) {
             self.partition16_bits(x8, y8, symbol)
         } else if symbol == 0 {
             0.0
@@ -1966,26 +1669,86 @@ impl<'a> LossyTile<'a> {
         }
     }
 
+    /// `lambda_part`: the mode lambda of the SATD-DOMAIN partition proxy
+    /// (every `luma_partition_distortion`-priced leg, the partition-symbol
+    /// fees, the plain-SSE palette and source-moment models). Equals
+    /// [`K_PART_LAMBDA`] x [`Self::lambda_d`]; see the decision-metric
+    /// unification plan (docs/decision-metric-unification-plan-2026-11-06.md).
     fn mlam(&self) -> f32 {
-        mode_lambda_q(self.quant.dc_q() as f32) * self.tune_weight()
+        mode_lambda_q(self.ctx.quant.dc_q() as f32) * self.tune_weight()
     }
 
     /// As [`Self::mlam`] but for chroma planes (uses `self.cquant`).
     #[inline]
     fn mlam_c(&self) -> f32 {
-        mode_lambda_q(self.cquant.dc_q() as f32) * self.tune_weight()
+        mode_lambda_q(self.ctx.cquant.dc_q() as f32) * self.tune_weight()
+    }
+
+    /// `lambda_d`: THE decision lambda, in normalized-wSSE units per bit.
+    /// Every cost whose distortion comes from `rd.sse_recon / sse_u16 /
+    /// chroma_sse` (mode, TX, chroma, palette, IntraBC, trial legs) prices its
+    /// bits with this (through [`Self::emit_mlam`] / [`Self::emit_mlam_c`]
+    /// in the emitters). Phase 1 of the unification: the shipped
+    /// `wsse_scale` 6 = 2.162 (unit) x 2.775 (lambda cut); the unit moved into
+    /// `WSSE_WEIGHTS`, the cut lives here.
+    #[inline]
+    fn lambda_d(&self) -> f32 {
+        self.mlam() / K_PART_LAMBDA
+    }
+
+    /// Chroma-quantiser [`Self::lambda_d`].
+    #[inline]
+    fn lambda_d_c(&self) -> f32 {
+        self.mlam_c() / K_PART_LAMBDA
+    }
+
+    /// A normalized-wSSE distortion expressed in the SATD-domain proxy unit
+    /// (`lambda_part` = [`K_PART_LAMBDA`] x `lambda_d`): the chroma legs of the
+    /// partition proxies, the IntraBC legs and the rect64 estimator add wSSE
+    /// to SATD-priced luma and are priced with `mlam`, so their wSSE must be
+    /// scaled by the same factor. Phase 3 replaces this with the measured
+    /// `K_satd` bridge on the luma side.
+    #[inline]
+    fn proxy_wsse(&self, d: f32) -> f32 {
+        d * K_PART_LAMBDA
+    }
+
+    /// TX-type guard tolerance of this format (`Tuning::tx_guard_shift`).
+    #[inline]
+    fn tx_guard(&self, d: i64) -> i64 {
+        let t = crate::tuning::get();
+        let s = if !self.cfg.is_444() {
+            t.tx_guard_shift
+        } else {
+            t.tx_guard_shift_444
+        };
+        tx_guard_shift(d, s)
+    }
+
+    /// The chroma leg of a partition proxy in proxy units
+    /// (`Tuning::proxy_chroma_factor`; 2.775 = [`Self::proxy_wsse`]).
+    #[inline]
+    fn proxy_chroma_wsse(&self, d: f32) -> f32 {
+        d * crate::tuning::get().proxy_chroma_factor
+    }
+
+    /// The [`Self::emit_mlam_c`] law on `lambda_part` instead of `lambda_d`:
+    /// for the chroma of a SATD-domain leg (IntraBC residual plan).
+    #[inline]
+    fn part_mlam_c(&self, px: usize, py: usize, dim: usize) -> f32 {
+        self.emit_mlam_c(px, py, dim) * K_PART_LAMBDA
     }
 
     fn chroma_partition_weight_at(&self, px: usize, py: usize, lw: usize, lh: usize) -> f32 {
-        if self.mono {
+        if self.cfg.is_mono() {
             return 0.0;
         }
         if !local_chroma_weight_enabled() {
-            return self.chroma_part_weight;
+            return self.cfg.chroma_part_weight;
         }
         let (sx, sy) = (
-            usize::from(self.ss420 || self.ss422),
-            usize::from(self.ss420),
+            self.cfg.chroma.sub_x(),
+            self.cfg.chroma.sub_y(),
         );
         let (cx, cy) = (px >> sx, py >> sy);
         let (cw, ch) = ((lw >> sx).max(1), (lh >> sy).max(1));
@@ -1995,24 +1758,24 @@ impl<'a> LossyTile<'a> {
             let sum = sum as f64;
             (sum_sq as f64 / n - (sum / n) * (sum / n)).max(0.0)
         };
-        let yv = variance(&self.src[0], self.w, px, py, lw, lh);
+        let yv = variance(&self.cfg.src[0], self.cfg.w, px, py, lw, lh);
         let cv = 0.5
-            * (variance(&self.src[1], self.cw, cx, cy, cw, ch)
-                + variance(&self.src[2], self.cw, cx, cy, cw, ch));
-        let depth_floor = ((1u32 << self.bd.saturating_sub(8)) as f64).powi(2);
+            * (variance(&self.cfg.src[1], self.cfg.cw, cx, cy, cw, ch)
+                + variance(&self.cfg.src[2], self.cfg.cw, cx, cy, cw, ch));
+        let depth_floor = ((1u32 << self.cfg.bd.saturating_sub(8)) as f64).powi(2);
         let local_share = cv / (cv + yv + depth_floor);
-        self.chroma_part_weight * f_fmlaf(0.5, local_share as f32, 1.0)
+        self.cfg.chroma_part_weight * f_fmlaf(0.5, local_share as f32, 1.0)
     }
 
     /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
     #[inline]
     fn tune_weight(&self) -> f32 {
-        mode_lambda_weight(self.base_q_idx, self.chroma_sub())
+        mode_lambda_weight(self.cfg.base_q_idx, self.chroma_sub())
     }
 
     pub(crate) fn part_bl8_rate(&self, x8: usize, y8: usize, symbol: usize) -> f32 {
         if crate::tuning::get().exact_part_bits_8 {
-            let ctx = get_partition_ctx(&self.a_part, &self.l_part, 4, x8, y8);
+            let ctx = get_partition_ctx(&self.ctx.a_part, &self.ctx.l_part, 4, x8, y8);
             return cdf_cost(&self.dcdf().part_bl8[ctx], symbol);
         }
         match symbol {
@@ -2023,7 +1786,7 @@ impl<'a> LossyTile<'a> {
     }
 
     fn prefer_8x8_none(&self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) -> bool {
-        if self.mono {
+        if self.cfg.is_mono() {
             return true;
         }
         let (px, py) = (x8 * 8, y8 * 8);
@@ -2033,11 +1796,11 @@ impl<'a> LossyTile<'a> {
         // cannot signal angle_delta at all) and the edge is coded 3-9x worse.
         let s4ad = crate::tuning::get().split4_ad;
         let (ptr, pbl) = if s4ad { (have_tr, have_bl) } else { (false, false) };
-        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
+        let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let lam = trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
-        let modes = if self.speed.reduced_modes() {
+        let modes = if self.cfg.speed.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()
@@ -2049,45 +1812,45 @@ impl<'a> LossyTile<'a> {
             let mut pred = [0i32; 64];
             if m == DC_PRED {
                 let d = self
-                    .intrapred
-                    .dc_pred_8x8(&self.recon[0], self.w, px, py, self.bd as i32);
+                    .k.intrapred
+                    .dc_pred_8x8(&self.ctx.recon[0], self.cfg.w, px, py, self.cfg.bd as i32);
                 pred = [d; 64];
             } else {
-                self.intrapred.predict_nd(
+                self.k.intrapred.predict_nd(
                     m,
-                    &self.recon[0],
-                    self.w,
+                    &self.ctx.recon[0],
+                    self.cfg.w,
                     px,
                     py,
                     8,
                     8,
                     ptr,
                     pbl,
-                    self.w,
-                    self.h,
+                    self.cfg.w,
+                    self.cfg.h,
                     self.luma_filter_type(px, py),
                     &mut pred,
-                    self.bd,
+                    self.cfg.bd,
                 );
             }
-            let mode_rate = if crate::tuning::get().exact_8x8_mode_rate && !self.ss422 && !self.mono {
+            let mode_rate = if crate::tuning::get().exact_8x8_mode_rate && !self.cfg.is_422() && !self.cfg.is_mono() {
                 self.mode_bits(px, py, m)
             } else {
                 0.0
             };
             let price8 = |pred: &[i32; 64], extra: f32| -> f32 {
                 let mut resid = [0i32; 64];
-                self.rd
-                    .residual_pred(&mut resid, pred, &self.src[0], self.w, px, py, 8, 8);
-                let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                self.k.rd
+                    .residual_pred(&mut resid, pred, &self.cfg.src[0], self.cfg.w, px, py, 8, 8);
+                let (mut cf, tf) = self.k.dct.dct8x8_t(&resid, &self.ctx.quant);
                 trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
-                let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                let rr = self.k.idct.idct_dequant_8x8(&cf, &self.ctx.quant);
                 let distortion = self.luma_partition_distortion(
                     px,
                     py,
                     8,
                     8,
-                    self.quant.ac_q() as f32,
+                    self.ctx.quant.ac_q() as f32,
                     &pred[..],
                     0,
                     &rr[..],
@@ -2105,22 +1868,22 @@ impl<'a> LossyTile<'a> {
             if s4ad && self.angle_delta_refines(m) {
                 let ad_cdf = &self.dcdf().angle_delta[m - V_PRED];
                 for d in [-3i32, -2, -1, 1, 2, 3] {
-                    self.intrapred.predict_nd_ad(
+                    self.k.intrapred.predict_nd_ad(
                         m,
                         d,
-                        &self.recon[0],
-                        self.w,
+                        &self.ctx.recon[0],
+                        self.cfg.w,
                         px,
                         py,
                         8,
                         8,
                         ptr,
                         pbl,
-                        self.w,
-                        self.h,
+                        self.cfg.w,
+                        self.cfg.h,
                         self.luma_filter_type(px, py),
                         &mut pred,
-                        self.bd,
+                        self.cfg.bd,
                     );
                     let eff = price8(&pred, cdf_cost(ad_cdf, (d + 3) as usize));
                     if eff < eff8 {
@@ -2132,9 +1895,9 @@ impl<'a> LossyTile<'a> {
         // Palette at 8x8: split4 leaves (4x4) cannot carry a palette, so a
         // palette-blind NONE price here sends every text/UI block to 4x4 DCT
         // before the emitter's palette search ever runs.
-        if self.screen_frame
+        if self.cfg.screen_frame
             && self.try_palette()
-            && let Some(hist) = block_color_histogram(&self.src[0], self.w, px, py, 8, 8)
+            && let Some(hist) = block_color_histogram(&self.cfg.src[0], self.cfg.w, px, py, 8, 8)
         {
             for (palette, pred) in self.rank_luma_palette_candidates::<64>(&hist, px, py, 8, 8, mlam) {
                 // Exact bound, as in the rect-leaf palette search.
@@ -2144,17 +1907,17 @@ impl<'a> LossyTile<'a> {
                     continue;
                 }
                 let mut resid = [0i32; 64];
-                self.rd
-                    .residual_pred(&mut resid, &pred, &self.src[0], self.w, px, py, 8, 8);
-                let (mut cf, tf) = self.dct.dct8x8_t(&resid, &self.quant);
+                self.k.rd
+                    .residual_pred(&mut resid, &pred, &self.cfg.src[0], self.cfg.w, px, py, 8, 8);
+                let (mut cf, tf) = self.k.dct.dct8x8_t(&resid, &self.ctx.quant);
                 trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_8X8, lam);
-                let rr = self.idct.idct_dequant_8x8(&cf, &self.quant);
+                let rr = self.k.idct.idct_dequant_8x8(&cf, &self.ctx.quant);
                 let distortion = self.luma_partition_distortion(
                     px,
                     py,
                     8,
                     8,
-                    self.quant.ac_q() as f32,
+                    self.ctx.quant.ac_q() as f32,
                     &pred[..],
                     0,
                     &rr[..],
@@ -2174,14 +1937,14 @@ impl<'a> LossyTile<'a> {
         // 8x8 block into four independently predicted 4x4 blocks. In 4:2:0 the
         // four sub-8x8 luma blocks share one 4x4 chroma reference block, so the
         // chroma geometry is unchanged and cancels from this comparison.
-        if !self.ss420 && !self.ss422 {
+        if !self.cfg.is_420() && !self.cfg.is_422() {
             eff8 += self.chroma_partition_weight_at(px, py, 8, 8)
                 * self.rd_cost_chroma_block(px, py, 8, 8, prdo, false);
             for (sx, sy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)] {
                 eff4_sum += self.chroma_partition_weight_at(px + sx, py + sy, 4, 4)
                     * self.rd_cost_chroma_block(px + sx, py + sy, 4, 4, prdo, false);
             }
-        } else if self.ss422 {
+        } else if self.cfg.is_422() {
             // Splitting changes chroma from one 4x8 into two paired 4x4s.
             eff8 += self.chroma_partition_weight_at(px, py, 8, 8)
                 * self.rd_cost_chroma_block(px / 2, py, 4, 8, prdo, false);
@@ -2203,8 +1966,8 @@ impl<'a> LossyTile<'a> {
             | ((py as u128) << 64)
             | ((lam.to_bits() as u128) << 32)
             | u128::from(mlam.to_bits());
-        let epoch = self.emit_epoch.get();
-        if let Some(&(cached_epoch, cost)) = self.split4_rd_cache.borrow().get(&key)
+        let epoch = self.memo.emit_epoch.get();
+        if let Some(&(cached_epoch, cost)) = self.memo.split4_rd_cache.borrow().get(&key)
             && cached_epoch == epoch
         {
             return cost;
@@ -2219,11 +1982,11 @@ impl<'a> LossyTile<'a> {
         // quadrant moments) plus a flat per-block bit charge, and skip the
         // real pricing when SPLIT4 cannot pay. The caller takes
         // `none8.min(this)`, so INFINITY simply drops the candidate.
-        let k4 = split4_breakout_k(self.speed);
+        let k4 = split4_breakout_k(self.cfg.speed);
         if k4.is_finite() {
             let (mut sum_t, mut sq_t, mut sse_split) = (0i64, 0i64, 0i64);
             for (qx, qy) in [(0usize, 0usize), (4, 0), (0, 4), (4, 4)] {
-                let (s, q) = block_moments_i32(&self.src[0], self.w, px + qx, py + qy, 4, 4);
+                let (s, q) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px + qx, py + qy, 4, 4);
                 sum_t += s;
                 sq_t += q;
                 sse_split += q - (s * s + 8) / 16;
@@ -2232,21 +1995,21 @@ impl<'a> LossyTile<'a> {
             let m_none = rd_cost_i64(sse_none.max(0), mlam, 4.0);
             let m_split = rd_cost_i64(sse_split.max(0), mlam, 16.0);
             if m_split > m_none * k4 {
-                self.split4_rd_cache
+                self.memo.split4_rd_cache
                     .borrow_mut()
                     .insert(key, (epoch, f32::INFINITY));
                 return f32::INFINITY;
             }
         }
-        let (dcq, acq) = (self.quant.dc_q() as f32, self.quant.ac_q() as f32);
-        let modes = if self.speed.reduced_modes() {
+        let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
+        let modes = if self.cfg.speed.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()
         };
         // Same 4x4 mode subset as the SPLIT4 emitter. Build it once for all
         // four children; this used to allocate and filter a Vec per child.
-        let full_set4 = self.ss420 || self.ss422 || self.mono;
+        let full_set4 = !self.cfg.is_444();
         let mut allowed_modes = FixedList::<usize, 13>::new(DC_PRED);
         for &mode in modes {
             if full_set4
@@ -2264,8 +2027,8 @@ impl<'a> LossyTile<'a> {
         // Parent-level availability, approximated (the exact spec flags depend
         // on the z-order position within the 16 block, which this pricing
         // proxy doesn't track; the emitter computes them exactly).
-        let par_tr = py > 0 && px + 8 < self.w;
-        let par_bl = px > 0 && py + 8 < self.h;
+        let par_tr = py > 0 && px + 8 < self.cfg.w;
+        let par_bl = px > 0 && py + 8 < self.cfg.h;
         // KNOWN MODELLING BUG.
         // Nothing reconstructs between the four children here: every one
         // predicts from `self.recon`, which still holds PRE-BLOCK pixels inside
@@ -2299,7 +2062,7 @@ impl<'a> LossyTile<'a> {
                 2 => (true, par_bl),
                 _ => (false, false),
             };
-            let mode_shortlist = if self.top_band() && !self.ss420 && !self.ss422 {
+            let mode_shortlist = if self.top_band() && !self.cfg.is_420() && !self.cfg.is_422() {
                 // Match the equipped 4x4 emitter in the target band. The
                 // historical two-mode proxy can miss the leaf's actual winner
                 // and make SPLIT4 look more expensive than it emits.
@@ -2312,47 +2075,47 @@ impl<'a> LossyTile<'a> {
                 let mut pred = [0i32; 16];
                 if m == DC_PRED {
                     let d =
-                        self.intrapred
-                            .dc_pred_4x4(&self.recon[0], self.w, bx, by, self.bd as i32);
+                        self.k.intrapred
+                            .dc_pred_4x4(&self.ctx.recon[0], self.cfg.w, bx, by, self.cfg.bd as i32);
                     pred = [d; 16];
                 } else {
-                    self.intrapred.predict_nd(
+                    self.k.intrapred.predict_nd(
                         m,
-                        &self.recon[0],
-                        self.w,
+                        &self.ctx.recon[0],
+                        self.cfg.w,
                         bx,
                         by,
                         4,
                         4,
                         sub_tr,
                         sub_bl,
-                        self.w,
-                        self.h,
+                        self.cfg.w,
+                        self.cfg.h,
                         self.luma_filter_type(bx, by),
                         &mut pred,
-                        self.bd,
+                        self.cfg.bd,
                     );
                 }
                 let mut resid = [0i32; 16];
-                self.rd
-                    .residual_pred(&mut resid, &pred, &self.src[0], self.w, bx, by, 4, 4);
-                let (mut cf, tf) = self.dct.dct4x4_t(&resid, &self.quant);
+                self.k.rd
+                    .residual_pred(&mut resid, &pred, &self.cfg.src[0], self.cfg.w, bx, by, 4, 4);
+                let (mut cf, tf) = self.k.dct.dct4x4_t(&resid, &self.ctx.quant);
                 trellis_optimize(&mut cf, &tf, dcq, acq, &SCAN_4X4, lam);
-                let rr = self.idct.idct_dequant_4x4(&cf, &self.quant);
+                let rr = self.k.idct.idct_dequant_4x4(&cf, &self.ctx.quant);
                 let distortion = self.luma_partition_distortion(
                     bx,
                     by,
                     4,
                     4,
-                    self.quant.ac_q() as f32,
+                    self.ctx.quant.ac_q() as f32,
                     &pred[..],
                     0,
                     &rr[..],
                 );
                 // +mode/skip signaling allowance per 4x4 sub-block
                 let mode_rate = if crate::tuning::get().exact_8x8_mode_rate
-                    && !self.ss422
-                    && !self.mono
+                    && !self.cfg.is_422()
+                    && !self.cfg.is_mono()
                 {
                     self.mode_bits(bx, by, m)
                 } else {
@@ -2366,22 +2129,22 @@ impl<'a> LossyTile<'a> {
                 if crate::tuning::get().split4_decision_txtypes {
                     for txtp in [4u8, 0] {
                         let (mut acf, atf) = match txtp {
-                            4 => self.dct.adst4x4_t(&resid, &self.quant),
-                            _ => self.dct.idtx4x4_t(&resid, &self.quant),
+                            4 => self.k.dct.adst4x4_t(&resid, &self.ctx.quant),
+                            _ => self.k.dct.idtx4x4_t(&resid, &self.ctx.quant),
                         };
                         if txtp == 4 {
                             trellis_optimize(&mut acf, &atf, dcq, acq, &SCAN_4X4, lam);
                         }
                         let arr = match txtp {
-                            4 => self.idct.iadst_dequant_4x4(&acf, &self.quant),
-                            _ => self.idct.iidentity_dequant_4x4(&acf, &self.quant),
+                            4 => self.k.idct.iadst_dequant_4x4(&acf, &self.ctx.quant),
+                            _ => self.k.idct.iidentity_dequant_4x4(&acf, &self.ctx.quant),
                         };
                         let adist = self.luma_partition_distortion(
                             bx,
                             by,
                             4,
                             4,
-                            self.quant.ac_q() as f32,
+                            self.ctx.quant.ac_q() as f32,
                             &pred[..],
                             0,
                             &arr[..],
@@ -2403,7 +2166,7 @@ impl<'a> LossyTile<'a> {
             }
             eff4_sum += best;
         }
-        self.split4_rd_cache
+        self.memo.split4_rd_cache
             .borrow_mut()
             .insert(key, (epoch, eff4_sum));
         eff4_sum
@@ -2415,7 +2178,7 @@ impl<'a> LossyTile<'a> {
     /// to steer and prune the decision before paying for full R-D.
     /// Mean of a luma source region (native depth).
     fn luma_mean(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
-        let sum = block_sum_i32(&self.src[0], self.w, px, py, w, h);
+        let sum = block_sum_i32(&self.cfg.src[0], self.cfg.w, px, py, w, h);
         sum as f32 / (w * h) as f32
     }
 
@@ -2423,11 +2186,11 @@ impl<'a> LossyTile<'a> {
         // High quality only: at coarse quantizers the sub-TX DCs quantize as
         // coarsely as the big block's (no banding win) and the extra rate of
         // four coded DCs is comparatively expensive.
-        if self.base_q_idx >= 100 {
+        if self.cfg.base_q_idx >= 100 {
             return false;
         }
-        let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
-        let pix_scale = 1.0 / (1u32 << (self.bd - 8)) as f32;
+        let var_scale = 1.0 / (1u32 << (2 * (self.cfg.bd - 8))) as f32;
+        let pix_scale = 1.0 / (1u32 << (self.cfg.bd - 8)) as f32;
         let var = self.luma_variance(px, py, dim, dim) * var_scale;
         if !(3.0..100.0).contains(&var) {
             return false;
@@ -2446,21 +2209,21 @@ impl<'a> LossyTile<'a> {
     }
 
     fn luma_variance(&self, px: usize, py: usize, w: usize, h: usize) -> f32 {
-        let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px, py, w, h);
+        let (sum, sum_sq) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px, py, w, h);
         let n = (w * h) as f32;
         let mean = sum as f32 / n;
         (sum_sq as f32 / n) - mean * mean
     }
 
     fn prefer_split64_from_source(&self, px: usize, py: usize, prdo: f32) -> bool {
-        if self.speed != Speed::Fast || self.allow_intrabc {
+        if self.cfg.speed != Speed::Fast || self.cfg.allow_intrabc {
             return false;
         }
         let mut sum = 0i64;
         let mut sum_sq = 0i64;
         let mut split_sse = 0i64;
         for (sx, sy) in [(0usize, 0usize), (32, 0), (0, 32), (32, 32)] {
-            let (s, q) = block_moments_i32(&self.src[0], self.w, px + sx, py + sy, 32, 32);
+            let (s, q) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px + sx, py + sy, 32, 32);
             sum += s;
             sum_sq += q;
             split_sse += q - (s * s + 512) / 1024;
@@ -2493,6 +2256,31 @@ impl<'a> LossyTile<'a> {
         )
     }
 
+    /// Luma distortion for a pick that can run on either decision metric:
+    /// the SATD price ([`Self::luma_partition_distortion`]) or the decision
+    /// wSSE in proxy units, so its `mlam` pricing is `lambda_d`.
+    #[allow(clippy::too_many_arguments)]
+    fn luma_pick_distortion(
+        &self,
+        metric: LumaDist,
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+        qstep: f32,
+        pred: &[i32],
+        dc: i32,
+        residual: &[i32],
+    ) -> f32 {
+        match metric {
+            LumaDist::Satd => self.luma_partition_distortion(px, py, w, h, qstep, pred, dc, residual),
+            LumaDist::Wsse => {
+                let d = self.k.rd.chroma_sse(self.src_blk(0, px, py, w, h), self.cfg.bd, pred, dc, residual);
+                self.proxy_wsse(d)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn luma_partition_distortion(
         &self,
@@ -2505,14 +2293,21 @@ impl<'a> LossyTile<'a> {
         dc: i32,
         residual: &[i32],
     ) -> f32 {
-        let satd = self.rd.luma_satd(self.src_blk(0, px, py, w, h), self.bd, pred, dc, residual);
-        satd as f32
+        let satd = self.k.rd.luma_satd(self.src_blk(0, px, py, w, h), self.cfg.bd, pred, dc, residual);
+        let subsampled = !self.cfg.is_444();
+        let mut price = satd as f32
             * qstep.max(1.0)
             * 0.25
-            * crate::partition_rd::luma_satd_scale(
-                self.aq.base_q,
-                self.ss420 || self.ss422 || self.mono,
-            )
+            * crate::partition_rd::luma_satd_scale(self.ctx.aq.base_q, subsampled);
+        let t = crate::tuning::get();
+        if t.proxy_luma_bridge {
+            // Phase 3: into the proxy unit (K_PART_LAMBDA x normalized wSSE)
+            // through the measured bridge, so the SATD leg shares the unit of
+            // the chroma / IntraBC / trial legs priced with `mlam`.
+            price *= K_PART_LAMBDA / crate::partition_rd::k_satd(self.ctx.aq.base_q, subsampled)
+                * t.proxy_luma_scale;
+        }
+        price
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2529,7 +2324,7 @@ impl<'a> LossyTile<'a> {
         fwd: impl Fn(&[i32; N], &Quant) -> ([i32; N], [f32; N]),
         inv: impl Fn(&[i32; N], &Quant) -> [i32; N],
     ) -> f32 {
-        let (dcq, acq) = (self.cquant.dc_q() as f32, self.cquant.ac_q() as f32);
+        let (dcq, acq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let lam = trellis_lambda() * prdo;
         let mlam = self.mlam_c() * prdo;
         // Stage 1 is DC-only for every partition candidate; `refine` adds the
@@ -2540,17 +2335,17 @@ impl<'a> LossyTile<'a> {
         let mut dc_total = 0.0f32;
         let mut dc_preds = [0i32; 2];
         for plane in 1..=2 {
-            let dc = pred(&self.recon[plane], self.cw, cx, cy, self.bd as i32);
+            let dc = pred(&self.ctx.recon[plane], self.cfg.cw, cx, cy, self.cfg.bd as i32);
             dc_preds[plane - 1] = dc;
             let mut resid = [0i32; N];
-            self.rd
-                .residual_dc(&mut resid, &self.src[plane], self.cw, cx, cy, cw, ch, dc);
-            let (mut cf, tf) = fwd(&resid, &self.cquant);
+            self.k.rd
+                .residual_dc(&mut resid, &self.cfg.src[plane], self.cfg.cw, cx, cy, cw, ch, dc);
+            let (mut cf, tf) = fwd(&resid, &self.ctx.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
-            let rr = inv(&cf, &self.cquant);
-            let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &[], dc, &rr);
+            let rr = inv(&cf, &self.ctx.cquant);
+            let distortion = self.k.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.cfg.bd, &[], dc, &rr);
             dc_total += crate::partition_rd::rd_cost(
-                distortion,
+                self.proxy_chroma_wsse(distortion),
                 mlam,
                 self.chroma_rect_bits(&cf, scan, cw, ch, plane, cx, cy),
             );
@@ -2568,7 +2363,7 @@ impl<'a> LossyTile<'a> {
         if crate::tuning::get().chroma_uv_mode_bits {
             dc_total += rate_cost(mlam, self.uv_mode_bits(DC_PRED, DC_PRED, None));
         }
-        if !refine || self.mono {
+        if !refine || self.cfg.is_mono() {
             return dc_total;
         }
         // CfL trial. The proxy has no reconstructed luma for this candidate --
@@ -2577,13 +2372,13 @@ impl<'a> LossyTile<'a> {
         // covers the un-subsampled (4:4:4) case, so one path serves all
         // formats.
         let (sub_x, sub_y) = (
-            usize::from(self.ss420 || self.ss422),
-            usize::from(self.ss420),
+            self.cfg.chroma.sub_x(),
+            self.cfg.chroma.sub_y(),
         );
         let mut ac = [0i32; N];
-        self.intrapred.cfl_ac_sub(
-            &self.src[0][(cy << sub_y) * self.w + (cx << sub_x)..],
-            self.w,
+        self.k.intrapred.cfl_ac_sub(
+            &self.cfg.src[0][(cy << sub_y) * self.cfg.w + (cx << sub_x)..],
+            self.cfg.w,
             cw,
             ch,
             sub_x == 1,
@@ -2596,19 +2391,19 @@ impl<'a> LossyTile<'a> {
             let plane = ci + 1;
             let dc = dc_preds[ci];
             let csrc = self.src_blk(plane, cx, cy, cw, ch);
-            let a = self.intrapred.cfl_best_alpha(&ac, csrc, dc, self.bd);
+            let a = self.k.intrapred.cfl_best_alpha(&ac, csrc, dc, self.cfg.bd);
             alpha[ci] = a;
             let mut cpred = [0i32; N];
-            self.intrapred.cfl_pred(&mut cpred, &ac, dc, a, self.bd);
+            self.k.intrapred.cfl_pred(&mut cpred, &ac, dc, a, self.cfg.bd);
             let mut resid = [0i32; N];
-            self.rd
+            self.k.rd
                 .residual_pred_blk(&mut resid, &cpred, csrc);
-            let (mut cf, tf) = fwd(&resid, &self.cquant);
+            let (mut cf, tf) = fwd(&resid, &self.ctx.cquant);
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
-            let rr = inv(&cf, &self.cquant);
-            let distortion = self.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.bd, &cpred, 0, &rr);
+            let rr = inv(&cf, &self.ctx.cquant);
+            let distortion = self.k.rd.chroma_sse(self.src_blk(plane, cx, cy, cw, ch), self.cfg.bd, &cpred, 0, &rr);
             cfl_body += crate::partition_rd::rd_cost(
-                distortion,
+                self.proxy_chroma_wsse(distortion),
                 mlam,
                 self.chroma_rect_bits(&cf, scan, cw, ch, plane, cx, cy),
             );
@@ -2636,7 +2431,7 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
         refine: bool,
     ) -> f32 {
-        if self.mono {
+        if self.cfg.is_mono() {
             return 0.0;
         }
         let key = ((cx as u128) << 96)
@@ -2645,8 +2440,8 @@ impl<'a> LossyTile<'a> {
             | ((ch as u128) << 48)
             | ((refine as u128) << 47)
             | prdo.to_bits() as u128;
-        let epoch = self.emit_epoch.get();
-        if let Some(&(e, cost)) = self.chroma_rd_cache.borrow().get(&key)
+        let epoch = self.memo.emit_epoch.get();
+        if let Some(&(e, cost)) = self.memo.chroma_rd_cache.borrow().get(&key)
             && e == epoch
         {
             return cost;
@@ -2660,9 +2455,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_4X4,
-                |r, st, x, y, bd| self.intrapred.dc_pred_4x4(r, st, x, y, bd),
-                |r, q| self.dct.dct4x4_t(r, q),
-                |levels, q| self.idct.idct_dequant_4x4(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_4x4(r, st, x, y, bd),
+                |r, q| self.k.dct.dct4x4_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_4x4(levels, q),
             ),
             (8, 4) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2672,9 +2467,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_8X4,
-                |r, st, x, y, bd| self.intrapred.dc_pred_8x4(r, st, x, y, bd),
-                |r, q| self.dct.dct8x4_t(r, q),
-                |levels, q| self.idct.idct_dequant_8x4(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_8x4(r, st, x, y, bd),
+                |r, q| self.k.dct.dct8x4_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_8x4(levels, q),
             ),
             (4, 8) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2684,9 +2479,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_4X8,
-                |r, st, x, y, bd| self.intrapred.dc_pred_4x8(r, st, x, y, bd),
-                |r, q| self.dct.dct4x8_t(r, q),
-                |levels, q| self.idct.idct_dequant_4x8(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_4x8(r, st, x, y, bd),
+                |r, q| self.k.dct.dct4x8_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_4x8(levels, q),
             ),
             (16, 4) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2696,9 +2491,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_16X4,
-                |r, st, x, y, bd| self.intrapred.dc_pred(r, st, x, y, 16, 4, bd),
-                |r, q| self.dct.dct16x4_t(r, q),
-                |levels, q| self.idct.idct_dequant_16x4(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred(r, st, x, y, 16, 4, bd),
+                |r, q| self.k.dct.dct16x4_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_16x4(levels, q),
             ),
             (4, 16) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2708,9 +2503,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_4X16,
-                |r, st, x, y, bd| self.intrapred.dc_pred(r, st, x, y, 4, 16, bd),
-                |r, q| self.dct.dct4x16_t(r, q),
-                |levels, q| self.idct.idct_dequant_4x16(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred(r, st, x, y, 4, 16, bd),
+                |r, q| self.k.dct.dct4x16_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_4x16(levels, q),
             ),
             (8, 8) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2720,9 +2515,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_8X8,
-                |r, st, x, y, bd| self.intrapred.dc_pred_8x8(r, st, x, y, bd),
-                |r, q| self.dct.dct8x8_t(r, q),
-                |levels, q| self.idct.idct_dequant_8x8(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_8x8(r, st, x, y, bd),
+                |r, q| self.k.dct.dct8x8_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_8x8(levels, q),
             ),
             (16, 8) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2732,9 +2527,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_16X8,
-                |r, st, x, y, bd| self.intrapred.dc_pred_16x8(r, st, x, y, bd),
-                |r, q| self.dct.dct16x8_t(r, q),
-                |levels, q| self.idct.idct_dequant_16x8(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_16x8(r, st, x, y, bd),
+                |r, q| self.k.dct.dct16x8_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_16x8(levels, q),
             ),
             (8, 16) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2744,9 +2539,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_8X16,
-                |r, st, x, y, bd| self.intrapred.dc_pred_8x16(r, st, x, y, bd),
-                |r, q| self.dct.dct8x16_t(r, q),
-                |levels, q| self.idct.idct_dequant_8x16(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_8x16(r, st, x, y, bd),
+                |r, q| self.k.dct.dct8x16_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_8x16(levels, q),
             ),
             (16, 16) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2756,9 +2551,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_16X16,
-                |r, st, x, y, bd| self.intrapred.dc_pred_16x16(r, st, x, y, bd),
-                |r, q| self.dct.dct16x16_t(r, q),
-                |levels, q| self.idct.idct_dequant_16x16(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_16x16(r, st, x, y, bd),
+                |r, q| self.k.dct.dct16x16_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_16x16(levels, q),
             ),
             (32, 16) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2768,9 +2563,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_32X16,
-                |r, st, x, y, bd| self.intrapred.dc_pred_32x16(r, st, x, y, bd),
-                |r, q| self.dct.dct32x16_t(r, q),
-                |levels, q| self.idct.idct_dequant_32x16(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_32x16(r, st, x, y, bd),
+                |r, q| self.k.dct.dct32x16_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_32x16(levels, q),
             ),
             (16, 32) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2780,9 +2575,9 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_16X32,
-                |r, st, x, y, bd| self.intrapred.dc_pred_16x32(r, st, x, y, bd),
-                |r, q| self.dct.dct16x32_t(r, q),
-                |levels, q| self.idct.idct_dequant_16x32(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_16x32(r, st, x, y, bd),
+                |r, q| self.k.dct.dct16x32_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_16x32(levels, q),
             ),
             (32, 32) => self.rd_cost_chroma_fixed(
                 cx,
@@ -2792,13 +2587,13 @@ impl<'a> LossyTile<'a> {
                 prdo,
                 refine,
                 &SCAN_32X32,
-                |r, st, x, y, bd| self.intrapred.dc_pred_32x32(r, st, x, y, bd),
-                |r, q| self.dct.dct32x32_t(r, q),
-                |levels, q| self.idct.idct_dequant_32x32(levels, q),
+                |r, st, x, y, bd| self.k.intrapred.dc_pred_32x32(r, st, x, y, bd),
+                |r, q| self.k.dct.dct32x32_t(r, q),
+                |levels, q| self.k.idct.idct_dequant_32x32(levels, q),
             ),
             _ => unreachable!("unsupported derived chroma block {cw}x{ch}"),
         };
-        self.chroma_rd_cache.borrow_mut().insert(key, (epoch, cost));
+        self.memo.chroma_rd_cache.borrow_mut().insert(key, (epoch, cost));
         cost
     }
 
@@ -2812,11 +2607,11 @@ impl<'a> LossyTile<'a> {
         prdo: f32,
         refine: bool,
     ) -> f32 {
-        if self.mono {
+        if self.cfg.is_mono() {
             return 0.0;
         }
-        let sub_x = (self.ss420 || self.ss422) as usize;
-        let sub_y = self.ss420 as usize;
+        let sub_x = self.cfg.chroma.sub_x();
+        let sub_y = self.cfg.chroma.sub_y();
         let blocks: &[(usize, usize, usize, usize)] = match part {
             Part16::Intrabc => unreachable!("IntraBC has no intra chroma partition"),
             Part16::None => &[(0, 0, luma_dim, luma_dim)],
@@ -2920,7 +2715,7 @@ impl<'a> LossyTile<'a> {
     /// chroma proxy. DC-only like the other rect estimators — the emitters code
     /// exactly this, so the estimate prices what will actually be coded.
     fn rd_cost_quad16(&self, px: usize, py: usize, vert: bool, prdo: f32) -> f32 {
-        let (acq, dcq) = (self.quant.ac_q() as f32, self.quant.dc_q() as f32);
+        let (acq, dcq) = (self.ctx.quant.ac_q() as f32, self.ctx.quant.dc_q() as f32);
         let (lam, mlam) = (trellis_lambda() * prdo, self.mlam() * prdo);
         let mut total = rate_cost(mlam, self.partition_signal_bits());
         let (lw, lh) = if vert { (4usize, 16) } else { (16, 4) };
@@ -2932,28 +2727,28 @@ impl<'a> LossyTile<'a> {
                 (px, py + 4 * i)
             };
             let dc = self
-                .intrapred
-                .dc_pred(&self.recon[0], self.w, sx, sy, lw, lh, self.bd as i32);
+                .k.intrapred
+                .dc_pred(&self.ctx.recon[0], self.cfg.w, sx, sy, lw, lh, self.cfg.bd as i32);
             let mut resid = [0i32; 64];
-            self.rd
-                .residual_dc(&mut resid, &self.src[0], self.w, sx, sy, lw, lh, dc);
+            self.k.rd
+                .residual_dc(&mut resid, &self.cfg.src[0], self.cfg.w, sx, sy, lw, lh, dc);
             let (mut cf, tf) = if vert {
-                self.dct.dct4x16_t(&resid, &self.quant)
+                self.k.dct.dct4x16_t(&resid, &self.ctx.quant)
             } else {
-                self.dct.dct16x4_t(&resid, &self.quant)
+                self.k.dct.dct16x4_t(&resid, &self.ctx.quant)
             };
             trellis_optimize(&mut cf, &tf, dcq, acq, scan, lam);
             let rr = if vert {
-                self.idct.idct_dequant_4x16(&cf, &self.quant)
+                self.k.idct.idct_dequant_4x16(&cf, &self.ctx.quant)
             } else {
-                self.idct.idct_dequant_16x4(&cf, &self.quant)
+                self.k.idct.idct_dequant_16x4(&cf, &self.ctx.quant)
             };
             let distortion = self.luma_partition_distortion(
                 sx,
                 sy,
                 lw,
                 lh,
-                self.quant.ac_q() as f32,
+                self.ctx.quant.ac_q() as f32,
                 &[],
                 dc,
                 &rr[..],
@@ -2967,7 +2762,7 @@ impl<'a> LossyTile<'a> {
 
     fn block_skip_bits(&self, px: usize, py: usize, skip: bool) -> f32 {
         let (bx4, by4) = (px / 4, py / 4);
-        let sctx = (self.a_skip[bx4] + self.l_skip[by4]) as usize;
+        let sctx = (self.ctx.a_skip[bx4] + self.ctx.l_skip[by4]) as usize;
         cdf_cost(&self.dcdf().skip[sctx], skip as usize)
     }
 
@@ -2994,7 +2789,7 @@ impl<'a> LossyTile<'a> {
         }
         let cat = max_l as usize - 1;
         let (bx4, by4) = (px / 4, py / 4);
-        let ctx = (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
+        let ctx = (self.ctx.l_tx[by4] >= max_lh) as usize + (self.ctx.a_tx[bx4] >= max_lw) as usize;
         let cdf = &self.dcdf().txsz[cat][ctx];
         if depth >= cdf.len() {
             return 0.0;
@@ -3029,8 +2824,8 @@ impl<'a> LossyTile<'a> {
         lhb: bool,
     ) -> (bool, bool) {
         (
-            thr && py > 0 && (px + dim) < self.w,
-            lhb && px > 0 && (py + dim) < self.h,
+            thr && py > 0 && (px + dim) < self.cfg.w,
+            lhb && px > 0 && (py + dim) < self.cfg.h,
         )
     }
 
@@ -3058,17 +2853,17 @@ impl<'a> LossyTile<'a> {
         // partition is SPEC-FORBIDDEN at 4:2:2; the fixed-size tiers and Fast
         // never run the node R-D.
         if !tune.edge_rect
-            || self.mono
-            || (!horz && self.ss422)
-            || !self.speed.full_partition_rdo()
-            || crate::tuning::fixed_size(self.speed) != 0
+            || self.cfg.is_mono()
+            || (!horz && self.cfg.is_422())
+            || !self.cfg.speed.full_partition_rdo()
+            || crate::tuning::fixed_size(self.cfg.speed) != 0
         {
             return Part16::Split;
         }
         let (px, py) = (x8 * 8, y8 * 8);
         let prdo = self.perceptual_rd_scale(px, py, 16);
         let part_lam = self.mlam() * prdo;
-        let (sub_x, sub_y) = ((self.ss420 || self.ss422) as usize, self.ss420 as usize);
+        let (sub_x, sub_y) = (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y());
         let chroma = |ox: usize, oy: usize, lw: usize, lh: usize| {
             self.chroma_partition_weight_at(px + ox, py + oy, lw, lh)
                 * self.rd_cost_chroma_block(
@@ -3085,14 +2880,14 @@ impl<'a> LossyTile<'a> {
             let (cthr, clhb) = Self::child_edge_flags(ox, oy, thr, lhb);
             let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);
             let mut best = self.rd_cost_square(bx, by, 8, htr8, hbl8, prdo);
-            if self.allow_intrabc
+            if self.cfg.allow_intrabc
                 && let Some(ibc) = self.rd_cost_intrabc(bx, by, 8, cthr, prdo)
             {
                 best = best.min(ibc);
             }
             let mut s4 =
                 self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
-            if self.ss422 && s4.is_finite() {
+            if self.cfg.is_422() && s4.is_finite() {
                 // 4:2:2 pair conversion the luma-only split4 price misses.
                 s4 += self.chroma_partition_weight_at(bx, by, 8, 8)
                     * (self.rd_cost_chroma_block(bx / 2, by, 4, 4, prdo, false)
@@ -3107,7 +2902,10 @@ impl<'a> LossyTile<'a> {
             + child(c1x, c1y);
         let (lw, lh) = if horz { (16, 8) } else { (8, 16) };
         let rd_rect = (rate_cost(part_lam, self.edge_partition_bits(3, x8, y8, horz, false))
-            + self.rd_cost_rect16_leaf(px, py, !horz, prdo)
+            + {
+                let (tr, bl) = self.rect_edge_flags(px, py, !horz, false, thr, lhb);
+                self.rd_cost_rect16_leaf(px, py, !horz, tr, bl, prdo)
+            }
             + chroma(0, 0, lw, lh))
             * tune.edge_rect_bias;
         if rd_rect < rd_split {
@@ -3122,20 +2920,20 @@ impl<'a> LossyTile<'a> {
     /// The cost is what a parent SPLIT leg should charge for this child — the
     /// child's BEST achievable total, not its forced-NONE cost.
     fn rd_choice_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> (Part16, f32) {
-        if self.mono && !self.mono_large {
+        if self.cfg.is_mono() && !self.cfg.mono_large {
             return (Part16::Split, f32::INFINITY); // grey 4:0:0 codes 8x8 luma leaves
         }
         // Edge flags are part of the identity: the same block reached with
         // different intra-edge availability prices differently.
         let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
-        let epoch = self.emit_epoch.get();
-        if let Some(&(e, p, c, _)) = self.rd16_cache.borrow().get(&key)
+        let epoch = self.memo.emit_epoch.get();
+        if let Some(&(e, p, c, _)) = self.memo.rd16_cache.borrow().get(&key)
             && e == epoch
         {
             return (p, c);
         }
         let out = self.rd_choice_16_inner(x8, y8, thr, lhb);
-        self.rd16_cache
+        self.memo.rd16_cache
             .borrow_mut()
             .insert(key, (epoch, out.0, out.1, out.2));
         (out.0, out.1)
@@ -3147,8 +2945,8 @@ impl<'a> LossyTile<'a> {
     fn proxy_margin_16(&self, x8: usize, y8: usize, thr: bool, lhb: bool) -> f32 {
         self.rd_choice_16(x8, y8, thr, lhb);
         let key = ((x8 as u32) << 18) | ((y8 as u32) << 2) | ((thr as u32) << 1) | lhb as u32;
-        let epoch = self.emit_epoch.get();
-        match self.rd16_cache.borrow().get(&key) {
+        let epoch = self.memo.emit_epoch.get();
+        match self.memo.rd16_cache.borrow().get(&key) {
             Some(&(e, _, _, m)) if e == epoch => m,
             _ => f32::INFINITY,
         }
@@ -3159,27 +2957,27 @@ impl<'a> LossyTile<'a> {
         // Fixed-partition mode: no R-D at this level either. See the matching
         // comment in `rd_choice_rect32` for why returning a placeholder cost is
         // sound (nothing compares it).
-        match crate::tuning::fixed_size(self.speed) {
+        match crate::tuning::fixed_size(self.cfg.speed) {
             0 => {}
             16 => return (Part16::None, 0.0, f32::INFINITY),
             n if n < 16 => return (Part16::Split, 0.0, f32::INFINITY),
             _ => {}
         }
 
-        let full_part_rdo = self.speed.full_partition_rdo();
+        let full_part_rdo = self.cfg.speed.full_partition_rdo();
         let coupled_square =
-            !self.mono && self.speed.at_least_slow() && joint_luma_uv_proxy_enabled();
+            !self.cfg.is_mono() && self.cfg.speed.at_least_slow() && joint_luma_uv_proxy_enabled();
 
         // 4:2:0 runs the rect legs at Slow; `rect16_420_medium` opens Medium
         // too. 4:4:4 is shipped OFF (the leg was disabled while the leaves were
         // under-tooled) and `rect16_horz_444` reopens it for the study.
         let tune = crate::tuning::get();
-        let ss444 = !self.ss420 && !self.ss422 && !self.mono;
+        let ss444 = self.cfg.is_444();
         let rect_tier =
-            self.speed.at_least_slow() || (tune.rect16_420_medium && self.speed == Speed::Medium);
+            self.cfg.speed.at_least_slow() || (tune.rect16_420_medium && self.cfg.speed == Speed::Medium);
         let horz_on = full_part_rdo
-            && (self.ss422
-                || (self.ss420 && rect_tier)
+            && (self.cfg.is_422()
+                || (self.cfg.is_420() && rect_tier)
                 || (ss444 && tune.rect16_horz_444 && rect_tier));
 
         // Anchor the perceptual R-D scale ONCE at the parent 16x16 region and use
@@ -3194,39 +2992,39 @@ impl<'a> LossyTile<'a> {
             }
         };
         #[allow(clippy::if_same_then_else)]
-        let part_budget = if self.ss420
-            && self.aq.enabled
-            && !self.mono
-            && self.aq.base_q <= 20
-            && self.speed.at_least_slow()
+        let part_budget = if self.cfg.is_420()
+            && self.ctx.aq.enabled
+            && !self.cfg.is_mono()
+            && self.ctx.aq.base_q <= 20
+            && self.cfg.speed.at_least_slow()
         {
             0
         } else if crate::tuning::get().part_budget_444_only
-            && (self.ss420 || self.ss422 || self.mono)
+            && (!self.cfg.is_444())
         {
             0
-        } else if (self.base_q_idx as u32) < crate::tuning::get().part_budget_qmin {
+        } else if (self.cfg.base_q_idx as u32) < crate::tuning::get().part_budget_qmin {
             // The non-square families only earn their rate at low quality; see
             // `part_budget_qmin` in src/tuning.rs for the measured band.
             0
         } else {
-            self.speed.partition_refine_budget()
+            self.cfg.speed.partition_refine_budget()
         };
         // The 4x4-cell moment grid drives both the non-square Top-K ranking
         // and the SPLIT breakout below, so compute it at most once.
-        let cells = (part_budget != 0 || split_breakout_k(self.speed).is_finite())
-            .then(|| block_moment_grid_16x16(&self.src[0], self.w, px, py));
+        let cells = (part_budget != 0 || split_breakout_k(self.cfg.speed).is_finite())
+            .then(|| block_moment_grid_16x16(&self.cfg.src[0], self.cfg.w, px, py));
         let guided = cells.as_ref().map(|c| {
             (
                 self.partition_model_cost16(Part16::None, part_lam, c),
                 self.partition_model_cost16(Part16::Split, part_lam, c),
             )
         });
-        let gk = crate::tuning::guided16_k(self.speed);
+        let gk = crate::tuning::guided16_k(self.cfg.speed);
         // MUST be false when the min-size floor is on: the floor forces
         // `skip_split`, so also skipping NONE would leave BOTH legs at INFINITY
         // and no valid partition at this node.
-        let skip_none = !crate::tuning::min_size_16(self.speed)
+        let skip_none = !crate::tuning::min_size_16(self.cfg.speed)
             && match guided {
                 Some((m_none, m_split)) if gk > 0.0 => m_split * gk < m_none,
                 _ => false,
@@ -3243,16 +3041,16 @@ impl<'a> LossyTile<'a> {
                     chroma_cost(Part16::None)
                 }
         };
-        let selection_only_bias_444 = self.top_band() && !self.ss420 && !self.ss422;
-        let none_bias = if self.ss420
-            && self.aq.enabled
-            && !self.mono
-            && self.speed.at_least_slow()
+        let selection_only_bias_444 = self.top_band() && !self.cfg.is_420() && !self.cfg.is_422();
+        let none_bias = if self.cfg.is_420()
+            && self.ctx.aq.enabled
+            && !self.cfg.is_mono()
+            && self.cfg.speed.at_least_slow()
             && !self.palette_exact(px, py, 16)
         {
-            1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.aq.base_q, SEAM_W_420)
-        } else if self.ss422 && self.aq.enabled && !self.mono && self.speed.at_least_slow() {
-            1.0 + (none16_top_bias_422() - 1.0) * seam_t(self.aq.base_q, SEAM_W_422)
+            1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.ctx.aq.base_q, SEAM_W_420)
+        } else if self.cfg.is_422() && self.ctx.aq.enabled && !self.cfg.is_mono() && self.cfg.speed.at_least_slow() {
+            1.0 + (none16_top_bias_422() - 1.0) * seam_t(self.ctx.aq.base_q, SEAM_W_422)
         } else if selection_only_bias_444 {
             none16_top_bias_444()
         } else {
@@ -3280,22 +3078,22 @@ impl<'a> LossyTile<'a> {
         // Measured and rejected gates: a <=64-colour 16x16 histogram (photos
         // pass it too) and the moment-model SPLIT/NONE ratio (k=1 == no floor,
         // k=1.5 == floor).
-        let floor16 = crate::tuning::min_size_16(self.speed) && !self.screen_frame;
+        let floor16 = crate::tuning::min_size_16(self.cfg.speed) && !self.cfg.screen_frame;
         let skip_split = floor16
             || match guided {
                 Some((m_none, m_split))
-                    if split_breakout_k(self.speed).is_finite() && !skip_none =>
+                    if split_breakout_k(self.cfg.speed).is_finite() && !skip_none =>
                 {
-                    m_split > m_none * split_breakout_k(self.speed)
+                    m_split > m_none * split_breakout_k(self.cfg.speed)
                 }
                 _ => false,
             };
-        let split4_ok = !self.mono;
+        let split4_ok = !self.cfg.is_mono();
         let best8 = |bx: usize, by: usize| -> f32 {
             let (cthr, clhb) = Self::child_edge_flags(bx - px, by - py, thr, lhb);
             let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);
             let mut none8 = self.rd_cost_square(bx, by, 8, htr8, hbl8, prdo);
-            if self.allow_intrabc
+            if self.cfg.allow_intrabc
                 && let Some(ibc8) = self.rd_cost_intrabc(bx, by, 8, cthr, prdo)
             {
                 none8 = none8.min(ibc8);
@@ -3303,7 +3101,7 @@ impl<'a> LossyTile<'a> {
             if split4_ok {
                 let mut s4 =
                     self.rd_cost_split4_luma(bx, by, trellis_lambda() * prdo, self.mlam() * prdo);
-                if self.ss422 && s4.is_finite() {
+                if self.cfg.is_422() && s4.is_finite() {
                     // 4:2:2 pair conversion the luma-only split4 price misses:
                     // splitting turns the child's one 4x8 chroma into two
                     // paired 4x4s.
@@ -3351,7 +3149,7 @@ impl<'a> LossyTile<'a> {
             (split_signal + square8.iter().sum::<f32>() + chroma_cost(Part16::Split))
                 * crate::tuning::get().split16_bias
         };
-        let rect_bias = if self.ss422 {
+        let rect_bias = if self.cfg.is_422() {
             tune.rect16_bias_422
         } else {
             rect16_bias()
@@ -3363,8 +3161,8 @@ impl<'a> LossyTile<'a> {
         // block size) — that gate is conformance, never a tuning knob.
         let vert_on = RECT16_VERT_ENABLED
             && full_part_rdo
-            && ((self.ss420 && rect_tier) || (ss444 && tune.rect16_vert_444 && rect_tier));
-        let quad4_on = quad4_enabled(self.ss420) && full_part_rdo;
+            && ((self.cfg.is_420() && rect_tier) || (ss444 && tune.rect16_vert_444 && rect_tier));
+        let quad4_on = quad4_enabled(self.cfg.is_420()) && full_part_rdo;
 
         // Source-domain partition staging: rank every legal non-square family
         // cheaply, then run the unchanged equipped-leaf + chroma RD pipeline on
@@ -3383,14 +3181,14 @@ impl<'a> LossyTile<'a> {
             if vert_on {
                 admit(Part16::Vert);
             }
-            if self.ss420 && full_part_rdo {
+            if self.cfg.is_420() && full_part_rdo {
                 for part in [Part16::HorzA, Part16::HorzB, Part16::VertA, Part16::VertB] {
                     admit(part);
                 }
             }
             if quad4_on {
                 admit(Part16::Horz4);
-                if !self.ss422 {
+                if !self.cfg.is_422() {
                     admit(Part16::Vert4);
                 }
             }
@@ -3405,11 +3203,11 @@ impl<'a> LossyTile<'a> {
         // text (t_dark -3.0%, t_side -2.2%). 4:4:4 stages rects natively; at
         // 4:2:2 the admission measured a wash (text -1..-2, n_bbscreen and
         // x_screen +1.6..+2.0) and stays off.
-        let pal_rect = self.screen_frame
-            && self.ss420
+        let pal_rect = self.cfg.screen_frame
+            && self.cfg.is_420()
             && part_budget == 0
             && self.try_palette()
-            && block_color_histogram(&self.src[0], self.w, px, py, 16, 16).is_some();
+            && block_color_histogram(&self.cfg.src[0], self.cfg.w, px, py, 16, 16).is_some();
         let refine_part = |part| {
             modeled_parts.iter().any(|&(_, p)| p == part)
                 || (pal_rect && matches!(part, Part16::Horz | Part16::Vert))
@@ -3422,7 +3220,7 @@ impl<'a> LossyTile<'a> {
         let rd_horz = if !horz_on || !refine_part(Part16::Horz) {
             f32::INFINITY
         } else {
-            let luma = self.rd_cost_horz(px, py, prdo);
+            let luma = self.rd_cost_horz(px, py, thr, lhb, prdo);
             if luma * rect_bias >= best_complete {
                 f32::INFINITY
             } else {
@@ -3434,7 +3232,7 @@ impl<'a> LossyTile<'a> {
         let rd_vert = if !vert_on || !refine_part(Part16::Vert) {
             f32::INFINITY
         } else {
-            let luma = self.rd_cost_vert(px, py, prdo);
+            let luma = self.rd_cost_vert(px, py, thr, lhb, prdo);
             if luma * rect_bias >= best_complete {
                 f32::INFINITY
             } else {
@@ -3453,19 +3251,25 @@ impl<'a> LossyTile<'a> {
             }
         };
         let (rd_horz_a, rd_horz_b, rd_vert_a, rd_vert_b) =
-            if self.ss420 && full_part_rdo && !skip_split {
+            if self.cfg.is_420() && full_part_rdo && !skip_split {
                 let rd_horz_a = if refine_part(Part16::HorzA) {
                     let luma = asym_signal
                         + square8[0]
                         + square8[1]
-                        + self.rd_cost_rect16_dependent(px, py + 8, false, true, false, prdo);
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py + 8, false, true, thr, lhb);
+                            self.rd_cost_rect16_dependent(px, py + 8, false, tr, bl, true, false, prdo)
+                        };
                     finish_asym(luma, Part16::HorzA)
                 } else {
                     f32::INFINITY
                 };
                 let rd_horz_b = if refine_part(Part16::HorzB) {
                     let luma = asym_signal
-                        + self.rd_cost_rect16_leaf(px, py, false, prdo)
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py, false, false, thr, lhb);
+                            self.rd_cost_rect16_leaf(px, py, false, tr, bl, prdo)
+                        }
                         + square8[2]
                         + square8[3];
                     finish_asym(luma, Part16::HorzB)
@@ -3476,14 +3280,20 @@ impl<'a> LossyTile<'a> {
                     let luma = asym_signal
                         + square8[0]
                         + square8[2]
-                        + self.rd_cost_rect16_dependent(px + 8, py, true, false, true, prdo);
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px + 8, py, true, true, thr, lhb);
+                            self.rd_cost_rect16_dependent(px + 8, py, true, tr, bl, false, true, prdo)
+                        };
                     finish_asym(luma, Part16::VertA)
                 } else {
                     f32::INFINITY
                 };
                 let rd_vert_b = if refine_part(Part16::VertB) {
                     let luma = asym_signal
-                        + self.rd_cost_rect16_leaf(px, py, true, prdo)
+                        + {
+                            let (tr, bl) = self.rect_edge_flags(px, py, true, false, thr, lhb);
+                            self.rd_cost_rect16_leaf(px, py, true, tr, bl, prdo)
+                        }
                         + square8[1]
                         + square8[3];
                     finish_asym(luma, Part16::VertB)
@@ -3507,7 +3317,7 @@ impl<'a> LossyTile<'a> {
             f32::INFINITY
         };
         best_complete = best_complete.min(rd_h4);
-        let rd_v4 = if quad4_on && !self.ss422 && refine_part(Part16::Vert4) {
+        let rd_v4 = if quad4_on && !self.cfg.is_422() && refine_part(Part16::Vert4) {
             let luma = self.rd_cost_quad16(px, py, true, prdo);
             if luma * q4b >= best_complete {
                 f32::INFINITY
@@ -3519,7 +3329,7 @@ impl<'a> LossyTile<'a> {
         };
         // IntraBC candidate: whole-16 exact-copy (all planes priced inside
         // rd_cost_intrabc, so no chroma_cost leg is added here).
-        let rd_ibc = if self.allow_intrabc && !self.mono {
+        let rd_ibc = if self.cfg.allow_intrabc && !self.cfg.is_mono() {
             self.rd_cost_intrabc(px, py, 16, thr, prdo)
                 .unwrap_or(f32::INFINITY)
         } else {
@@ -3544,7 +3354,7 @@ impl<'a> LossyTile<'a> {
         // and fold the difference back through each family's own bias -- the
         // biases multiply the chroma leg, so a raw delta cannot just be added.
         let mut rd_none_unbiased = rd_none_unbiased;
-        let chroma_refine = !self.ss420 && !self.ss422 && !self.mono && chroma_refine_topk() > 0;
+        let chroma_refine = self.cfg.is_444() && chroma_refine_topk() > 0;
         if full_part_rdo && chroma_refine {
             let mut order = FixedList::<(f32, usize), 11>::new((f32::INFINITY, 0));
             for (i, &(cost, part)) in cands.iter().enumerate() {
@@ -3583,7 +3393,7 @@ impl<'a> LossyTile<'a> {
             .fold((f32::INFINITY, Part16::Split), |b, c| {
                 if c.0 < b.0 { c } else { b }
             });
-        let chosen_cost = if chosen.1 == Part16::None && none_bias != 1.0 && !self.ss420 {
+        let chosen_cost = if chosen.1 == Part16::None && none_bias != 1.0 && !self.cfg.is_420() {
             rd_none_unbiased
         } else {
             chosen.0
@@ -3597,7 +3407,7 @@ impl<'a> LossyTile<'a> {
     }
 
     fn with_speed(mut self, speed: Speed) -> Self {
-        self.speed = speed;
+        self.cfg.speed = speed;
         // Decision-stage estimators predict the LATER leaves of a candidate
         // partition (SPLIT children 1-3, the second rect half, 4x4 siblings)
         // from `recon`, which still holds pre-block pixels there. Zero-filled,
@@ -3617,7 +3427,7 @@ impl<'a> LossyTile<'a> {
     /// optimistic (children predict from perfect edges: measured +8.5% BD,
     /// 4x4 count x6); zeros make them pessimistic (black edges).
     pub(crate) fn fill_recon_estimate(&mut self) {
-        self.fill_recon_estimate_region(0, 0, self.w, self.h);
+        self.fill_recon_estimate_region(0, 0, self.cfg.w, self.cfg.h);
     }
 
     /// Whether the `dim`x`dim` luma region at `(px, py)` holds a hard edge
@@ -3627,12 +3437,12 @@ impl<'a> LossyTile<'a> {
     pub(crate) fn edge_in_flat(&self, px: usize, py: usize, dim: usize) -> bool {
         let t = crate::tuning::get();
         let (hi, lo) = (t.edge_fill_hi * t.edge_fill_hi, t.edge_fill_lo * t.edge_fill_lo);
-        let (bw, bh) = (dim.min(self.w.saturating_sub(px)), dim.min(self.h.saturating_sub(py)));
+        let (bw, bh) = (dim.min(self.cfg.w.saturating_sub(px)), dim.min(self.cfg.h.saturating_sub(py)));
         let (mut n, mut n_hi, mut n_lo) = (0usize, 0usize, 0usize);
         for y in (0..bh).step_by(8) {
             for x in (0..bw).step_by(8) {
                 let (w, h) = ((bw - x).min(8), (bh - y).min(8));
-                let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px + x, py + y, w, h);
+                let (sum, sum_sq) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px + x, py + y, w, h);
                 let cnt = (w * h) as f32;
                 let mean = sum as f32 / cnt;
                 let var = (sum_sq as f32 / cnt - mean * mean).max(0.0);
@@ -3650,20 +3460,20 @@ impl<'a> LossyTile<'a> {
     /// `fill_recon_estimate` over one luma region (chroma follows the
     /// subsampling). Used per superblock by the `edge_fill` gate.
     pub(crate) fn fill_recon_estimate_region(&mut self, px: usize, py: usize, rw: usize, rh: usize) {
-        let maxv = (1i32 << self.bd) - 1;
-        let (sx, sy) = (usize::from(self.ss420 || self.ss422), usize::from(self.ss420));
+        let maxv = (1i32 << self.cfg.bd) - 1;
+        let (sx, sy) = (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y());
         for p in 0..3 {
-            if self.recon[p].is_empty() {
+            if self.ctx.recon[p].is_empty() {
                 continue;
             }
-            let (pw, q) = if p == 0 { (self.w, &self.quant) } else { (self.cw, &self.cquant) };
-            let ph = self.recon[p].len() / pw;
+            let (pw, q) = if p == 0 { (self.cfg.w, &self.ctx.quant) } else { (self.cfg.cw, &self.ctx.cquant) };
+            let ph = self.ctx.recon[p].len() / pw;
             let (x0, y0, x1, y1) = if p == 0 {
                 (px, py, (px + rw).min(pw), (py + rh).min(ph))
             } else {
                 (px >> sx, py >> sy, ((px + rw) >> sx).min(pw), ((py + rh) >> sy).min(ph))
             };
-            let src = &self.src[p];
+            let src = &self.cfg.src[p];
             let fk = crate::tuning::get().recon_fill_k;
             if crate::tuning::get().recon_fill_dim == 8 {
                 for by in (y0..y1).step_by(8) {
@@ -3673,7 +3483,7 @@ impl<'a> LossyTile<'a> {
                         let n = (bw * bh) as i64;
                         let mean = ((sum + n / 2) / n).clamp(0, maxv as i64) as u16;
                         for y in 0..bh {
-                            self.recon[p][(by + y) * pw + bx..][..bw].fill(mean);
+                            self.ctx.recon[p][(by + y) * pw + bx..][..bw].fill(mean);
                         }
                     }
                 }
@@ -3699,11 +3509,11 @@ impl<'a> LossyTile<'a> {
                             resid[y * 4 + x] = blk[y * 4 + x] - mean;
                         }
                     }
-                    let (cf, _) = self.dct.dct4x4_t(&resid, q);
-                    let rr = self.idct.idct_dequant_4x4(&cf, q);
+                    let (cf, _) = self.k.dct.dct4x4_t(&resid, q);
+                    let rr = self.k.idct.idct_dequant_4x4(&cf, q);
                     for y in 0..bh {
                         for x in 0..bw {
-                            self.recon[p][(by + y) * pw + bx + x] =
+                            self.ctx.recon[p][(by + y) * pw + bx + x] =
                                 (mean + (rr[y * 4 + x] as f32 * fk) as i32).clamp(0, maxv) as u16;
                         }
                     }
@@ -3715,10 +3525,10 @@ impl<'a> LossyTile<'a> {
     /// Clip RD distortion to the displayed `vis_w`x`vis_h` luma region of
     /// this tile (tile-local; larger values are capped at the tile size).
     fn with_visible(mut self, vis_w: usize, vis_h: usize) -> Self {
-        let (sx, sy) = (usize::from(self.ss420 || self.ss422), usize::from(self.ss420));
-        let (lw, lh) = (vis_w.min(self.w), vis_h.min(self.h));
-        self.vis[0] = (lw, lh);
-        for chroma in &mut self.vis[1..] {
+        let (sx, sy) = (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y());
+        let (lw, lh) = (vis_w.min(self.cfg.w), vis_h.min(self.cfg.h));
+        self.cfg.vis[0] = (lw, lh);
+        for chroma in &mut self.cfg.vis[1..] {
             let (cw, ch) = *chroma;
             *chroma = (lw.div_ceil(1 << sx).min(cw), lh.div_ceil(1 << sy).min(ch));
         }
@@ -3729,9 +3539,9 @@ impl<'a> LossyTile<'a> {
     /// (plane coordinates), clipped for distortion to the displayed region.
     #[inline]
     fn src_blk(&self, plane: usize, x: usize, y: usize, w: usize, h: usize) -> crate::rd_sse::SrcBlock<'a> {
-        let src: &'a [Vec<u16>; 3] = self.src;
-        let stride = if plane == 0 { self.w } else { self.cw };
-        let (vw, vh) = self.vis[plane];
+        let src: &'a [Vec<u16>; 3] = self.cfg.src;
+        let stride = if plane == 0 { self.cfg.w } else { self.cfg.cw };
+        let (vw, vh) = self.cfg.vis[plane];
         crate::rd_sse::SrcBlock::new(&src[plane], stride, x, y, w, h, vw, vh)
     }
 
@@ -3743,34 +3553,34 @@ impl<'a> LossyTile<'a> {
         kmeans: KmeansDispatch,
         rd: crate::rd_sse::RdDispatch,
     ) -> Self {
-        self.dct = dct;
-        self.idct = idct;
-        self.intrapred = intrapred;
-        self.kmeans = kmeans;
+        self.k.dct = dct;
+        self.k.idct = idct;
+        self.k.intrapred = intrapred;
+        self.k.kmeans = kmeans;
         let t = crate::tuning::get();
-        let wsse = if self.mono {
+        let wsse = if self.cfg.is_mono() {
             t.wsse_400
-        } else if self.ss420 {
+        } else if self.cfg.is_420() {
             t.wsse_420
-        } else if self.ss422 {
+        } else if self.cfg.is_422() {
             t.wsse_422
         } else {
             t.wsse_444
         };
-        self.rd = rd.with_weighted_sse(wsse.then_some(t.wsse_scale));
+        self.k.rd = rd.with_weighted_sse(wsse.then_some(t.wsse_scale));
         self
     }
 
     fn with_updating_cdf(mut self, updating_cdf: bool) -> Self {
-        self.updating_cdf = updating_cdf;
-        self.enc.updating_cdf = updating_cdf;
+        self.cfg.updating_cdf = updating_cdf;
+        self.ent.enc.updating_cdf = updating_cdf;
         self
     }
 
     /// Frame-level screen-content tool search (palette). See
     /// [`crate::EncodeConfig::with_screen_content`].
     fn with_screen_content(mut self, enabled: bool) -> Self {
-        self.screen_content = enabled;
+        self.cfg.screen_content = enabled;
         self
     }
 
@@ -3785,7 +3595,7 @@ impl<'a> LossyTile<'a> {
     }
 
     pub(crate) fn try_palette(&self) -> bool {
-        self.screen_content && self.speed.try_palette()
+        self.cfg.screen_content && self.cfg.speed.try_palette()
     }
 
     fn with_intrabc(
@@ -3793,11 +3603,11 @@ impl<'a> LossyTile<'a> {
         enabled: bool,
         index: Option<&'a std::sync::OnceLock<LossyIbcIndex>>,
     ) -> Self {
-        self.allow_intrabc = enabled;
+        self.cfg.allow_intrabc = enabled;
         if enabled {
-            self.ibc_mv.resize((self.w / 4) * (self.h / 4), None);
+            self.ctx.ibc_mv.resize((self.cfg.w / 4) * (self.cfg.h / 4), None);
         }
-        self.ibc_index = index;
+        self.cfg.ibc_index = index;
         self
     }
 
@@ -3806,7 +3616,7 @@ impl<'a> LossyTile<'a> {
     /// `CurrentQIndex` starts at the frame base. Must be paired with a frame
     /// header that signals `delta_q_present = 1` and the matching `delta_q_res`.
     fn enable_aq(&mut self, base_q: u8, ref_act: f32, vb: &VarianceBoost) {
-        self.aq = AqCtx {
+        self.ctx.aq = AqCtx {
             enabled: true,
             base_q,
             res_log2: AQ_RES_LOG2,
@@ -3814,12 +3624,12 @@ impl<'a> LossyTile<'a> {
             prev_qidx: base_q as i32,
             ref_act,
             ref_pick: tile_ref_picked(
-                &self.src[0],
-                self.w,
-                self.w,
-                self.h,
+                &self.cfg.src[0],
+                self.cfg.w,
+                self.cfg.w,
+                self.cfg.h,
                 vb.octile.clamp(1, 8),
-                self.bd,
+                self.cfg.bd,
             ),
             read_deltas: false,
             pending: 0,
@@ -3833,19 +3643,19 @@ impl<'a> LossyTile<'a> {
     }
 
     fn emit_lr_sb(&mut self, sb_x: usize, sb_y: usize) {
-        let Some(unit) = self.wiener else {
+        let Some(unit) = self.cfg.wiener else {
             return;
         };
         emit_lr_sb_syms(
-            &mut self.enc,
-            &mut self.cdfs.wiener_restore,
-            &mut self.lr_ref_v,
-            &mut self.lr_ref_h,
+            &mut self.ent.enc,
+            &mut self.ent.cdfs.wiener_restore,
+            &mut self.ctx.lr_ref_v,
+            &mut self.ctx.lr_ref_h,
             &unit,
-            self.frame_x0,
-            self.frame_y0,
-            self.frame_w,
-            self.frame_h,
+            self.cfg.frame_x0,
+            self.cfg.frame_y0,
+            self.cfg.frame_w,
+            self.cfg.frame_h,
             sb_x,
             sb_y,
         );
@@ -3856,53 +3666,53 @@ impl<'a> LossyTile<'a> {
     /// state), which is what makes the whole per-SB qindex sequence
     /// precomputable by [`precompute_aq_grid`] before any coding starts.
     fn aq_sb_target(&self, sb_x: usize, sb_y: usize) -> i32 {
-        let base_q = self.aq.base_q as i32;
+        let base_q = self.ctx.aq.base_q as i32;
         // Dark-structured-detail protection: an extra qindex reduction for dark SBs
         // carrying real cross-scale structure. Independent of the Variance Boost, it
         // is combined with the boost by `max` (see below), matching `av2/aq.rs`. The
         // AV1 luma plane is native-depth `i32`, normalized to 8-bit range so the
         // calibrated dark thresholds apply at every bit depth.
-        let dark_scale = 1.0 / (1u32 << (self.bd - 8)) as f32;
+        let dark_scale = 1.0 / (1u32 << (self.cfg.bd - 8)) as f32;
         let dark = crate::aq_common::dark_protection(
-            &self.aq.dark,
+            &self.ctx.aq.dark,
             base_q,
-            &self.src[0],
-            self.w,
+            &self.cfg.src[0],
+            self.cfg.w,
             sb_y,
             sb_x,
-            self.w,
-            self.h,
+            self.cfg.w,
+            self.cfg.h,
             dark_scale,
         );
-        if self.aq.vb_enabled {
+        if self.ctx.aq.vb_enabled {
             // Variance Boost: pick the representative 8x8 variance at the configured
             // octile and map it to a qindex delta off the frame base. ref_act (the
             // tile mean whole-SB log-variance) anchors the coarse side, matching
             // `av2/aq.rs::AqState::per_sb`.
             let mut subvars = [0f32; 64];
             let filled = aq_sb_subblock_variances(
-                &self.src[0],
-                self.w,
+                &self.cfg.src[0],
+                self.cfg.w,
                 sb_y,
                 sb_x,
-                self.w,
-                self.h,
+                self.cfg.w,
+                self.cfg.h,
                 &mut subvars,
             );
             if filled == 0 {
                 base_q
             } else {
-                let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.aq.vb_octile);
-                let var_scale = 1.0 / (1u32 << (2 * (self.bd - 8))) as f32;
+                let picked = crate::aq_common::sb_octile_variance(&mut subvars, self.ctx.aq.vb_octile);
+                let var_scale = 1.0 / (1u32 << (2 * (self.cfg.bd - 8))) as f32;
                 // Field-retune ramp: legacy constants at the near-lossless
                 // top, full retune from qindex 96 (see variance_boost_delta).
                 let mid_t = ((base_q as f32 - 48.0) / 48.0).clamp(0.0, 1.0);
                 let vb_delta = crate::aq_common::variance_boost_delta(
                     picked * var_scale,
-                    self.aq.ref_act,
-                    self.aq.ref_pick,
-                    self.aq.vb_strength,
-                    self.aq.vb_boost_only,
+                    self.ctx.aq.ref_act,
+                    self.ctx.aq.ref_pick,
+                    self.ctx.aq.vb_strength,
+                    self.ctx.aq.vb_boost_only,
                     mid_t,
                     0.0,
                 );
@@ -3933,23 +3743,23 @@ impl<'a> LossyTile<'a> {
                 } else {
                     delta
                 };
-                let delta = if delta < 0 && self.aq.base_shift > 0 {
+                let delta = if delta < 0 && self.ctx.aq.base_shift > 0 {
                     // Base-shift experiment: protection windows anchor to the
                     // PRE-shift base, so flat/dark SBs reach the effective q
                     // they had before the frame base rose. `delta` from the
                     // laws is a relative protection depth; measure it (and
                     // the clamp) from the original base, then re-express it
                     // relative to the shifted frame base.
-                    let orig = base_q - self.aq.base_shift;
-                    clamp_aq_delta_relative(orig, delta, self.bd) - self.aq.base_shift
+                    let orig = base_q - self.ctx.aq.base_shift;
+                    clamp_aq_delta_relative(orig, delta, self.cfg.bd) - self.ctx.aq.base_shift
                 } else {
-                    clamp_aq_delta_relative(base_q, delta, self.bd)
+                    clamp_aq_delta_relative(base_q, delta, self.cfg.bd)
                 };
                 (base_q + delta).clamp(1, 255)
             }
         } else {
-            let act = sb_activity(&self.src[0], self.w, sb_y, sb_x, self.w, self.h);
-            let vb_delta = aq_target_qidx(base_q, act, self.aq.ref_act) - base_q;
+            let act = sb_activity(&self.cfg.src[0], self.cfg.w, sb_y, sb_x, self.cfg.w, self.cfg.h);
+            let vb_delta = aq_target_qidx(base_q, act, self.ctx.aq.ref_act) - base_q;
             // Same combine as the VB path: dark protection can only deepen the
             // reduction, never override a coarsen with a smaller refine.
             let flat_boost = (-vb_delta).max(0);
@@ -3959,7 +3769,7 @@ impl<'a> LossyTile<'a> {
             } else {
                 vb_delta
             };
-            let delta = clamp_aq_delta_relative(base_q, delta, self.bd);
+            let delta = clamp_aq_delta_relative(base_q, delta, self.cfg.bd);
             (base_q + delta).clamp(1, 255)
         }
     }
@@ -3972,19 +3782,19 @@ impl<'a> LossyTile<'a> {
     /// consumes precomputed [`AqCell`]s via [`aq_begin_sb_cell`].
     #[cfg_attr(not(test), allow(dead_code))]
     fn aq_begin_sb(&mut self, sb_x: usize, sb_y: usize) {
-        if !self.aq.enabled {
+        if !self.ctx.aq.enabled {
             return;
         }
         let target = self.aq_sb_target(sb_x, sb_y);
-        let step = 1i32 << self.aq.res_log2;
-        let steps = (((target - self.aq.cur_qidx) as f32) / step as f32)
+        let step = 1i32 << self.ctx.aq.res_log2;
+        let steps = (((target - self.ctx.aq.cur_qidx) as f32) / step as f32)
             .fast_round()
             .clamp(-(AQ_MAX_STEPS as f32), AQ_MAX_STEPS as f32) as i32;
         // The decoder applies Clip3(1,255, cur + steps*step); mirror it exactly so
         // both sides agree on the new qindex even when the clamp bites.
-        let newq = (self.aq.cur_qidx + steps * step).clamp(1, 255);
+        let newq = (self.ctx.aq.cur_qidx + steps * step).clamp(1, 255);
         self.aq_begin_sb_cell(&AqCell {
-            prev: self.aq.cur_qidx as u8,
+            prev: self.ctx.aq.cur_qidx as u8,
             newq: newq as u8,
             steps,
         });
@@ -3997,14 +3807,14 @@ impl<'a> LossyTile<'a> {
     /// accumulator; the serial emit uses `.steps` for the `read_delta_qindex`
     /// token. Empty when AQ is off.
     fn precompute_aq_grid(&self) -> Vec<AqCell> {
-        if !self.aq.enabled {
+        if !self.ctx.aq.enabled {
             return Vec::new();
         }
-        let rows = self.h.div_ceil(64);
-        let cols = self.w.div_ceil(64);
+        let rows = self.cfg.h.div_ceil(64);
+        let cols = self.cfg.w.div_ceil(64);
         let mut grid = Vec::with_capacity(rows * cols);
-        let step = 1i32 << self.aq.res_log2;
-        let mut cur = self.aq.cur_qidx;
+        let step = 1i32 << self.ctx.aq.res_log2;
+        let mut cur = self.ctx.aq.cur_qidx;
         for r in 0..rows {
             for c in 0..cols {
                 let target = self.aq_sb_target(c * 64, r * 64);
@@ -4031,24 +3841,24 @@ impl<'a> LossyTile<'a> {
         // Install the precomputed raster-chain state ABSOLUTELY. Deriving from
         // the worker's own accumulator was worker-schedule-dependent wherever
         // the qindex clamp broke the shared step lattice (q99 corruption).
-        self.aq.prev_qidx = cell.prev as i32;
+        self.ctx.aq.prev_qidx = cell.prev as i32;
         let newq = cell.newq as i32;
-        self.aq.cur_qidx = newq;
-        self.aq.pending = cell.steps;
-        self.aq.read_deltas = true;
-        self.quant = Quant::new_with_qm(newq as u8, self.bd, self.quant.qm_level());
+        self.ctx.aq.cur_qidx = newq;
+        self.ctx.aq.pending = cell.steps;
+        self.ctx.aq.read_deltas = true;
+        self.ctx.quant = Quant::new_with_qm(newq as u8, self.cfg.bd, self.ctx.quant.qm_level());
         // The chroma-DC delta is a frame-level constant (DeltaQUDc, derived from
         // the frame base_q_idx and signaled once in the header). The decoder
         // forms the chroma-DC qindex as CurrentQIndex + DeltaQUDc, so apply the
         // frame-level delta to the AQ-adjusted qindex — not chroma_dc_delta(newq).
-        let frame_dc_delta = chroma_dc_delta(self.aq.base_q, self.chroma_sub());
-        let frame_ac_delta = chroma_ac_delta(self.aq.base_q, self.chroma_sub());
-        self.cquant = Quant::new_chroma_with_delta_qm(
+        let frame_dc_delta = chroma_dc_delta(self.ctx.aq.base_q, self.chroma_sub());
+        let frame_ac_delta = chroma_ac_delta(self.ctx.aq.base_q, self.chroma_sub());
+        self.ctx.cquant = Quant::new_chroma_with_delta_qm(
             newq as u8,
             frame_dc_delta,
             frame_ac_delta,
-            self.bd,
-            self.cquant.qm_level(),
+            self.cfg.bd,
+            self.ctx.cquant.qm_level(),
         );
     }
 
@@ -4057,19 +3867,19 @@ impl<'a> LossyTile<'a> {
     /// `CurrentQIndex` unchanged; the encoder must quantize the next SB from the
     /// same state.
     fn aq_cancel_skipped_sb(&mut self) {
-        if !self.aq.enabled || !self.aq.read_deltas {
+        if !self.ctx.aq.enabled || !self.ctx.aq.read_deltas {
             return;
         }
-        let q = self.aq.prev_qidx as u8;
-        self.aq.cur_qidx = self.aq.prev_qidx;
-        self.aq.pending = 0;
-        self.quant = Quant::new_with_qm(q, self.bd, self.quant.qm_level());
-        self.cquant = Quant::new_chroma_with_delta_qm(
+        let q = self.ctx.aq.prev_qidx as u8;
+        self.ctx.aq.cur_qidx = self.ctx.aq.prev_qidx;
+        self.ctx.aq.pending = 0;
+        self.ctx.quant = Quant::new_with_qm(q, self.cfg.bd, self.ctx.quant.qm_level());
+        self.ctx.cquant = Quant::new_chroma_with_delta_qm(
             q,
-            chroma_dc_delta(self.aq.base_q, self.chroma_sub()),
-            chroma_ac_delta(self.aq.base_q, self.chroma_sub()),
-            self.bd,
-            self.cquant.qm_level(),
+            chroma_dc_delta(self.ctx.aq.base_q, self.chroma_sub()),
+            chroma_ac_delta(self.ctx.aq.base_q, self.chroma_sub()),
+            self.cfg.bd,
+            self.ctx.cquant.qm_level(),
         );
     }
 
@@ -4093,8 +3903,8 @@ impl<'a> LossyTile<'a> {
         let (max_lw, max_lh) = (l2(w), l2(h));
         let cat = max_lw.max(max_lh) as usize - 1; // t_dim.max - 1 (max == max(lw, lh))
         let (bx4, by4) = (px / 4, py / 4);
-        let ctx = (self.l_tx[by4] >= max_lh) as usize + (self.a_tx[bx4] >= max_lw) as usize;
-        self.enc.encode_symbol(depth, &mut self.cdfs.txsz[cat][ctx]);
+        let ctx = (self.ctx.l_tx[by4] >= max_lh) as usize + (self.ctx.a_tx[bx4] >= max_lw) as usize;
+        self.ent.enc.encode_symbol(depth, &mut self.ent.cdfs.txsz[cat][ctx]);
         // Chosen TX dims: each depth step goes to `t_dim.sub` — the square of
         // the smaller dim for rects, then square halvings (floor TX_4X4).
         let (mut lw, mut lh) = (max_lw, max_lh);
@@ -4108,14 +3918,14 @@ impl<'a> LossyTile<'a> {
                 lh = lw;
             }
         }
-        self.a_tx[bx4..bx4 + (w / 4).max(1)].fill(lw);
-        self.l_tx[by4..by4 + (h / 4).max(1)].fill(lh);
+        self.ctx.a_tx[bx4..bx4 + (w / 4).max(1)].fill(lw);
+        self.ctx.l_tx[by4..by4 + (h / 4).max(1)].fill(lh);
     }
 
     /// TX context update for a BLOCK_4X4 (no `tx_depth` symbol; TX is 4x4).
     fn tx_ctx_update4(&mut self, px: usize, py: usize) {
-        self.a_tx[px / 4] = 0;
-        self.l_tx[py / 4] = 0;
+        self.ctx.a_tx[px / 4] = 0;
+        self.ctx.l_tx[py / 4] = 0;
     }
 
     /// Emit a block's skip flag, then the `read_cdef()` / `read_delta_qindex()`
@@ -4125,15 +3935,15 @@ impl<'a> LossyTile<'a> {
     /// the per-unit `cdef_idx` literal — at the SB's FIRST non-skip block, which
     /// is exactly when the decoder's `cdef_idx[r1][c1] == -1 && !skip` fires.
     fn code_skip_and_sb_tokens(&mut self, block_skip: bool, sctx: usize) {
-        self.enc
-            .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
-        if !block_skip && !self.cdef_point_marked {
-            self.cdef_point_marked = true;
-            self.enc.trace_cdef_mark();
+        self.ent.enc
+            .encode_symbol(block_skip as usize, &mut self.ent.cdfs.skip[sctx]);
+        if !block_skip && !self.ctx.cdef_point_marked {
+            self.ctx.cdef_point_marked = true;
+            self.ent.enc.trace_cdef_mark();
         }
         self.code_delta_q_if_armed();
-        if self.allow_intrabc {
-            self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+        if self.cfg.allow_intrabc {
+            self.ent.enc.encode_symbol(0, &mut self.ent.cdfs.intrabc);
         }
     }
 
@@ -4142,46 +3952,46 @@ impl<'a> LossyTile<'a> {
     /// so a skipped 64x64 block in a 64x64-superblock frame must not carry the
     /// otherwise-per-SB delta-Q symbol.
     fn code_skip_and_sb_tokens_64(&mut self, block_skip: bool, sctx: usize) {
-        self.enc
-            .encode_symbol(block_skip as usize, &mut self.cdfs.skip[sctx]);
+        self.ent.enc
+            .encode_symbol(block_skip as usize, &mut self.ent.cdfs.skip[sctx]);
         if block_skip {
             self.aq_cancel_skipped_sb();
-            if self.allow_intrabc {
-                self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+            if self.cfg.allow_intrabc {
+                self.ent.enc.encode_symbol(0, &mut self.ent.cdfs.intrabc);
             }
             return;
         }
-        if !self.cdef_point_marked {
-            self.cdef_point_marked = true;
-            self.enc.trace_cdef_mark();
+        if !self.ctx.cdef_point_marked {
+            self.ctx.cdef_point_marked = true;
+            self.ent.enc.trace_cdef_mark();
         }
         self.code_delta_q_if_armed();
-        if self.allow_intrabc {
-            self.enc.encode_symbol(0, &mut self.cdfs.intrabc);
+        if self.cfg.allow_intrabc {
+            self.ent.enc.encode_symbol(0, &mut self.ent.cdfs.intrabc);
         }
     }
 
     fn code_delta_q_if_armed(&mut self) {
-        if !self.aq.read_deltas {
+        if !self.ctx.aq.read_deltas {
             return;
         }
-        self.aq.read_deltas = false;
-        let m = self.aq.pending.unsigned_abs() as i32;
+        self.ctx.aq.read_deltas = false;
+        let m = self.ctx.aq.pending.unsigned_abs() as i32;
         const DELTA_Q_SMALL: usize = 3;
         if m < DELTA_Q_SMALL as i32 {
-            self.enc.encode_symbol(m as usize, &mut self.cdfs.delta_q);
+            self.ent.enc.encode_symbol(m as usize, &mut self.ent.cdfs.delta_q);
         } else {
-            self.enc
-                .encode_symbol(DELTA_Q_SMALL, &mut self.cdfs.delta_q);
+            self.ent.enc
+                .encode_symbol(DELTA_Q_SMALL, &mut self.ent.cdfs.delta_q);
             // m = abs_bits + (1 << rem) + 1, rem = floor(log2(m-1)) >= 1.
             let v = (m - 1) as u32;
             let rem = 31 - v.leading_zeros(); // floor(log2(v))
             let abs_bits = v - (1 << rem);
-            self.enc.encode_literal(rem - 1, 3); // delta_q_rem_bits (pre-increment)
-            self.enc.encode_literal(abs_bits, rem); // delta_q_abs_bits
+            self.ent.enc.encode_literal(rem - 1, 3); // delta_q_rem_bits (pre-increment)
+            self.ent.enc.encode_literal(abs_bits, rem); // delta_q_abs_bits
         }
         if m != 0 {
-            self.enc.encode_literal((self.aq.pending < 0) as u32, 1); // sign
+            self.ent.enc.encode_literal((self.ctx.aq.pending < 0) as u32, 1); // sign
         }
     }
 
@@ -4205,14 +4015,19 @@ impl<'a> LossyTile<'a> {
     /// -0.11 over the plain law (cumulative vs the luma lambda -0.38 / -0.47 /
     /// -0.41). 4:2:2 untested at 0.5 and kept at the plain law.
     #[inline]
+    /// Chroma `lambda_d` of the emitters (normalized-wSSE units per bit).
     fn emit_mlam_c(&self, px: usize, py: usize, dim: usize) -> f32 {
-        let scale = if self.ss420 { 0.5 } else { 1.0 };
-        self.mlam().min(self.mlam_c()) * scale * self.emit_scale(px, py, dim)
+        let scale = if self.cfg.is_420() {
+            crate::tuning::get().emit_mlam_c_420
+        } else {
+            1.0
+        };
+        self.lambda_d().min(self.lambda_d_c()) * scale * self.emit_scale(px, py, dim)
     }
 
-
+    /// Luma `lambda_d` of the emitters (normalized-wSSE units per bit).
     fn emit_mlam(&self, px: usize, py: usize, dim: usize) -> f32 {
-        self.mlam() * self.emit_scale(px, py, dim)
+        self.lambda_d() * self.emit_scale(px, py, dim)
     }
 
     fn emit_prdo(&self, px: usize, py: usize, dim: usize) -> f32 {
@@ -4224,21 +4039,27 @@ impl<'a> LossyTile<'a> {
     }
 
     pub(crate) fn var_over_qstep2(&self, px: usize, py: usize, dim: usize) -> f32 {
-        let bw = dim.min(self.w.saturating_sub(px));
-        let bh = dim.min(self.h.saturating_sub(py));
+        let bw = dim.min(self.cfg.w.saturating_sub(px));
+        let bh = dim.min(self.cfg.h.saturating_sub(py));
         if bw == 0 || bh == 0 {
             return f32::INFINITY;
         }
-        let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px, py, bw, bh);
+        let (sum, sum_sq) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px, py, bw, bh);
         let n = (bw * bh) as f32;
         let mean = sum as f32 / n;
         let var = (sum_sq as f32 / n - mean * mean).max(0.0);
-        let q = self.quant.ac_q() as f32;
+        let q = self.ctx.quant.ac_q() as f32;
         var / (q * q).max(1.0)
     }
 
+    /// Chroma is 4:4:4 (neither subsampled format, not monochrome).
+    #[inline]
+    fn ss444(&self) -> bool {
+        self.cfg.is_444()
+    }
+
     fn perceptual_rd_scale(&self, px: usize, py: usize, dim: usize) -> f32 {
-        let mut k = if !self.ss420 && !self.ss422 && !self.mono {
+        let mut k = if self.cfg.is_444() {
             prdo_k_444()
         } else {
             prdo_k()
@@ -4246,19 +4067,19 @@ impl<'a> LossyTile<'a> {
         if k == 0.0 {
             return 1.0;
         }
-        if self.ss422 {
-            let g = f_fmlaf(-top_ease(), top_ease_t(self.aq.base_q), 1.0);
+        if self.cfg.is_422() {
+            let g = f_fmlaf(-top_ease(), top_ease_t(self.ctx.aq.base_q), 1.0);
             k *= g;
             if k == 0.0 {
                 return 1.0;
             }
         }
-        if !self.ss422 && !self.mono {
+        if !self.cfg.is_422() && !self.cfg.is_mono() {
             const Q1: f32 = 100.0;
             const Q0: f32 = 50.0;
             const FADE_SCALE: f32 = 1.0 / (Q1 - Q0);
-            let mut t = ((self.aq.base_q as f32 - Q0) * FADE_SCALE).clamp(0.0, 1.0);
-            let floor = if self.ss420 { 0.4 } else { 0.0 };
+            let mut t = ((self.ctx.aq.base_q as f32 - Q0) * FADE_SCALE).clamp(0.0, 1.0);
+            let floor = if self.cfg.is_420() { 0.4 } else { 0.0 };
             t = f_fmlaf(1.0 - floor, t, floor);
             k *= t;
             if k == 0.0 {
@@ -4269,25 +4090,25 @@ impl<'a> LossyTile<'a> {
         // `local_ref_blend()`.
         let refa = {
             let a = local_ref_blend();
-            let g = self.aq.ref_act;
+            let g = self.ctx.aq.ref_act;
             if a == 0.0 {
                 g
             } else {
                 let sbx = (px & !63) as u32;
                 let sby = (py & !63) as u32;
-                let c = self.sb_act_cache.get();
+                let c = self.memo.sb_act_cache.get();
                 let sa = if c.0 == sbx && c.1 == sby {
                     c.2
                 } else {
                     let v = crate::coder::sb_activity(
-                        &self.src[0],
-                        self.w,
+                        &self.cfg.src[0],
+                        self.cfg.w,
                         sby as usize,
                         sbx as usize,
-                        self.w,
-                        self.h,
+                        self.cfg.w,
+                        self.cfg.h,
                     );
-                    self.sb_act_cache.set((sbx, sby, v));
+                    self.memo.sb_act_cache.set((sbx, sby, v));
                     v
                 };
                 g * (1.0 - a) + sa * a
@@ -4296,12 +4117,12 @@ impl<'a> LossyTile<'a> {
         if refa <= 0.0 {
             return 1.0;
         }
-        let bw = dim.min(self.w.saturating_sub(px));
-        let bh = dim.min(self.h.saturating_sub(py));
+        let bw = dim.min(self.cfg.w.saturating_sub(px));
+        let bh = dim.min(self.cfg.h.saturating_sub(py));
         if bw == 0 || bh == 0 {
             return 1.0;
         }
-        let (sum, sum_sq) = block_moments_i32(&self.src[0], self.w, px, py, bw, bh);
+        let (sum, sum_sq) = block_moments_i32(&self.cfg.src[0], self.cfg.w, px, py, bw, bh);
         let n = (bw * bh) as f32;
         let mean = sum as f32 / n;
         let var = (sum_sq as f32 / n - mean * mean).max(0.0);
@@ -4375,4 +4196,6 @@ mod tests {
         );
     }
 }
+
+
 
