@@ -10,13 +10,13 @@ maroontree = { path = "../" }
 img-parts = "0.4.2"
 yuv = "0.8.20"
 anyhow = "1.0.104"
-moxcms = { version = "0.9.1" }
+moxcms = { version = "0.9.2" }
 hpvcd = { version = "0.3.4", optional = true }
 fast_transpose = "0.2.7"
 thiserror = "2.0.21"
 hpvca = { version = "0.2.4", optional = true }
-jixel = "0.5.7"
-jhm17 = { git = "https://github.com/awxkee/jhm17", features = ["polish"] }
+jixel = "0.5.9"
+jhm17 = { version = "0.1.1", features = ["polish"] }
 jxl = "0.8.0"
 bytemuck = "1.25.2"
 garnetash = { version = "0.1.1", optional = true }
