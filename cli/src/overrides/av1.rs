@@ -37,6 +37,12 @@ impl EncoderOverride {
             }
             "quality" => cfg.quality = self.number(1, 100, "1..100")?,
             "alpha-quality" => cfg.alpha_quality = Some(self.number(1, 100, "1..100")?),
+            "gain-map-quality" => {
+                let quality = self.number(1, 100, "1..100")?;
+                if let Some(gain_map) = cfg.gain_map.as_mut() {
+                    gain_map.quality = Some(quality);
+                }
+            }
             "threads" => cfg.threads = self.threads()?,
             "speed" => {
                 cfg.speed = match self.value.as_str() {

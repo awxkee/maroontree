@@ -89,6 +89,7 @@ pub(crate) fn encode_av1(
     if let Some(quality) = args.alpha_quality {
         cfg = cfg.with_alpha_quality(quality);
     }
+    cfg.gain_map = gain_map.filter(|_| !args.no_gain_map);
     for option in &args.overrides {
         option.apply_av1(&mut cfg).map_err(anyhow::Error::msg)?;
     }
@@ -99,7 +100,6 @@ pub(crate) fn encode_av1(
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
-    cfg.gain_map = gain_map.filter(|_| !args.no_gain_map);
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;

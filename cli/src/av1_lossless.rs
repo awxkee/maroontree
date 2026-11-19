@@ -79,6 +79,11 @@ pub(crate) fn encode_av1_lossless(
         .with_speed(args.speed.to_maroontreee())
         .with_updating_cdf(args.updating_cdf);
 
+    // A lossless base keeps its gain map at the base quality instead of
+    // the library's lower lossy default; `gain-map-quality` still wins.
+    cfg.gain_map = gain_map
+        .filter(|_| !args.no_gain_map)
+        .map(|gm| gm.with_quality(args.quality));
     for option in &args.overrides {
         option.apply_av1(&mut cfg).map_err(anyhow::Error::msg)?;
     }
@@ -89,7 +94,6 @@ pub(crate) fn encode_av1_lossless(
     if let Some(exif) = exif {
         cfg = cfg.with_exif(exif.to_vec());
     }
-    cfg.gain_map = gain_map.filter(|_| !args.no_gain_map);
 
     let gray = is_gray(color_type);
     let alpha = has_alpha_channel(color_type) && !args.no_alpha;

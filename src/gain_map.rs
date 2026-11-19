@@ -514,8 +514,7 @@ pub struct GainMap {
     /// ISO 21496-1 metadata describing how to apply the map.
     pub metadata: IsoGainMap,
     /// Quality of the gain map item (same scale as [`EncodeConfig::quality`]).
-    /// `None` inherits the base image's quality, like libavif's
-    /// `qualityGainMap` default.
+    /// `None` uses [`default_gain_map_quality`] of the base quality.
     pub quality: Option<u8>,
     /// Chroma subsampling of an RGB gain map (default 4:4:4). Ignored for gray
     /// maps, which are always coded monochrome.
@@ -676,6 +675,10 @@ fn encode_gray_map<T: Pixel>(
     q: u8,
     cfg: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    // A gain map is a fidelity plane: its error is HDR gain in stops, and the
+    // same error matters equally everywhere. The base image's perceptual AQ
+    // (variance boost, dark protection) and quantization matrices target the
+    // eye and only cost bits here.
     crate::encoder::encode_lossy_gray_obu(
         &img.packed_1(),
         img.bit_depth,
@@ -683,8 +686,8 @@ fn encode_gray_map<T: Pixel>(
         true,
         cfg.threads,
         cfg.speed,
-        cfg.adaptive_quant,
-        cfg.vb(q),
+        false,
+        crate::coder::VarianceBoost::off(),
         cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,
@@ -717,6 +720,15 @@ fn encode_rgb_map<T: Pixel>(
     )
 }
 
+/// Gain map quality used when [`GainMap::quality`] is `None`: the base
+/// quality minus [`GAIN_MAP_QUALITY_OFFSET`], at least 1.
+pub fn default_gain_map_quality(base_quality: u8) -> u8 {
+    base_quality.saturating_sub(GAIN_MAP_QUALITY_OFFSET).max(1)
+}
+
+/// How far below the base quality a gain map is coded by default.
+pub const GAIN_MAP_QUALITY_OFFSET: u8 = 20;
+
 /// Code the gain map attached to `cfg` with the base encode's tools (speed,
 /// threads, AQ, filters) at the gain map's own quality.
 pub(crate) fn encode_gain_map(
@@ -724,7 +736,9 @@ pub(crate) fn encode_gain_map(
     cfg: &EncodeConfig,
 ) -> Result<EncodedGainMap, EncodeError> {
     gm.validate()?;
-    let quality = gm.quality.unwrap_or(cfg.quality);
+    let quality = gm
+        .quality
+        .unwrap_or_else(|| default_gain_map_quality(cfg.quality));
     // Quality 100 maps to the lossless qindex 0 on the gray path only; keep
     // the gain map lossy (q 1 is visually lossless) so both paths agree.
     let q = crate::avif::quality_to_q(quality).max(1);
@@ -823,6 +837,14 @@ mod tests {
             .to_metadata()
             .unwrap();
         assert!(IsoGainMap::from_metadata(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn default_quality_sits_below_the_base() {
+        assert_eq!(default_gain_map_quality(80), 60);
+        assert_eq!(default_gain_map_quality(100), 80);
+        assert_eq!(default_gain_map_quality(20), 1);
+        assert_eq!(default_gain_map_quality(1), 1);
     }
 
     #[test]
