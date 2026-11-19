@@ -582,6 +582,8 @@ fn main() {
     let png_cicp = (!args.apply_icc)
         .then(|| read_png_cicp(&args.input))
         .flatten();
+    // A PNG cICP chunk overrides its iCCP profile; a codec's CICP does not.
+    let cicp_overrides_icc = png_cicp.is_some();
     #[cfg(feature = "heic")]
     let png_cicp = png_cicp.or(have_cicp.filter(|_| !args.apply_icc));
     if let Some(have_icc) = have_icc {
@@ -724,6 +726,7 @@ fn main() {
                     icc: icc_bytes.as_deref(),
                     exif: exif_bytes.as_deref(),
                     cicp: png_cicp,
+                    cicp_overrides_icc,
                     #[cfg(feature = "heic")]
                     gain_map: gain_map.as_ref(),
                 },

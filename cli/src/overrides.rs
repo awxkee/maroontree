@@ -79,6 +79,7 @@ av1 overrides (maroontree):
 
   quality (q)            1..100
   alpha-quality (qalpha) 1..100; 100 = lossless alpha (default: quality)
+  gain-map-quality (qgain) 1..100; HDR gain map quality (default: quality - 20)
   speed (s)             extraslow|slow|medium|fast
   threads (t)           nonnegative integer; 0 uses all available cores
   updating-cdf          boolean
@@ -213,6 +214,7 @@ impl FromStr for EncoderOverride {
             "c" => "chroma",
             "q" => "quality",
             "qalpha" => "alpha-quality",
+            "qgain" => "gain-map-quality",
             "s" => "speed",
             "t" | "num-threads" => "threads",
             "qm" => "qmatrix-level",

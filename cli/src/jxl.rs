@@ -370,6 +370,11 @@ pub(crate) struct JxlMetadata<'a> {
     pub icc: Option<&'a [u8]>,
     pub exif: Option<&'a [u8]>,
     pub cicp: Option<PngCicp>,
+    /// The CICP is the source's own color statement and wins over its ICC
+    /// profile (a PNG `cICP` chunk, by the PNG specification). Otherwise it
+    /// came from a codec (HEVC VUI), which states how the samples were coded,
+    /// and a profile describing a standard encoding wins.
+    pub cicp_overrides_icc: bool,
     #[cfg(feature = "heic")]
     pub gain_map: Option<&'a crate::gainmap::ParsedGainMap>,
 }
@@ -409,6 +414,23 @@ fn jxl_gain_map(gain_map: &crate::gainmap::ParsedGainMap, lossless: bool) -> jix
     .with_lossless(lossless)
 }
 
+/// The color encoding the source pixels are in, from its CICP or its ICC
+/// profile. iPhone HEICs signal BT.709 transfer in the HEVC VUI while their
+/// Display P3 profile, which viewers render with, has the sRGB curve:
+/// converting by the VUI brightens midtones ~12 levels, and the kept profile
+/// no longer matches the encoding, so jixel cannot write it as the enum.
+fn input_color_encoding(
+    metadata: &JxlMetadata<'_>,
+    icc_encoding: Option<(jixel::ColorEncoding, Option<f32>)>,
+) -> Option<(jixel::ColorEncoding, Option<f32>)> {
+    let cicp_encoding = metadata.cicp.and_then(color_encoding_from_cicp);
+    if metadata.cicp_overrides_icc {
+        cicp_encoding.or(icc_encoding)
+    } else {
+        icc_encoding.or(cicp_encoding)
+    }
+}
+
 pub(crate) fn encode_jxl(
     img: &DynamicImage,
     args: &Args,
@@ -440,8 +462,8 @@ pub(crate) fn encode_jxl(
         }
     }
 
-    let cicp_encoding = metadata.cicp.and_then(color_encoding_from_cicp);
-    let input_encoding = cicp_encoding.or_else(|| metadata.icc.and_then(color_encoding_from_icc));
+    let icc_encoding = metadata.icc.and_then(color_encoding_from_icc);
+    let input_encoding = input_color_encoding(&metadata, icc_encoding);
     if let Some((encoding, _)) = input_encoding {
         cfg = cfg.with_color_encoding(encoding);
     }
@@ -475,8 +497,12 @@ pub(crate) fn encode_jxl(
             cfg.color_encoding.primaries, cfg.color_encoding.transfer
         );
     }
-    // Keep the original profile even when its colors can be described structurally.
-    if let Some(icc) = metadata.icc {
+    // Signal recognized profiles as a color encoding in lossy XYB streams so
+    // libjxl can blend frames. Other modes can retain the original ICC bytes.
+    let use_color_enum = !cfg.lossless
+        && cfg.coding_transform == jixel::CodingTransform::Xyb
+        && icc_encoding.is_some();
+    if let Some(icc) = metadata.icc.filter(|_| !use_color_enum) {
         cfg = cfg.with_icc_profile(icc.to_vec());
     }
     if let Some(exif) = metadata.exif {
@@ -590,6 +616,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codec_cicp_yields_to_a_describable_profile() {
+        let icc: &'static [u8] = moxcms::ColorProfile::new_display_p3()
+            .encode()
+            .unwrap()
+            .leak();
+        // An iPhone HEIC: Display P3 primaries but BT.709 transfer in the VUI.
+        let vui = PngCicp {
+            color_primaries: 12,
+            transfer_function: 1,
+            matrix_coefficients: 0,
+            full_range: true,
+        };
+        let metadata = |cicp_overrides_icc: bool, icc: Option<&'static [u8]>| JxlMetadata {
+            cicp_overrides_icc,
+            icc,
+            exif: None,
+            cicp: Some(vui),
+            #[cfg(feature = "heic")]
+            gain_map: None,
+        };
+        let transfer = |m: &JxlMetadata<'_>| {
+            input_color_encoding(m, m.icc.and_then(color_encoding_from_icc))
+                .unwrap()
+                .0
+                .transfer
+        };
+        // From the codec: the profile's sRGB curve.
+        assert_eq!(
+            transfer(&metadata(false, Some(icc))),
+            jixel::TransferFunction::Srgb
+        );
+        // A PNG cICP chunk keeps its precedence.
+        assert_eq!(
+            transfer(&metadata(true, Some(icc))),
+            jixel::TransferFunction::Bt709
+        );
+        // No profile, or one that names no standard encoding: the CICP.
+        assert_eq!(
+            transfer(&metadata(false, None)),
+            jixel::TransferFunction::Bt709
+        );
+        let garbage: &'static [u8] = &[0u8; 64];
+        assert_eq!(
+            transfer(&metadata(false, Some(garbage))),
+            jixel::TransferFunction::Bt709
+        );
+    }
+    #[test]
     fn lossless_sixteen_bit_color_and_gray_alpha_preserve_source_samples() {
         for image in [
             DynamicImage::ImageRgb16(image::ImageBuffer::from_fn(5, 3, |x, y| {
@@ -625,6 +699,7 @@ mod tests {
                 image.color(),
                 Depth::D16,
                 JxlMetadata {
+                    cicp_overrides_icc: true,
                     icc: None,
                     exif: None,
                     cicp: None,
@@ -639,8 +714,8 @@ mod tests {
     }
 
     #[test]
-    fn preserves_icc_bytes_in_lossy_and_lossless_output() {
-        use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
+    fn icc_is_kept_lossless_and_stated_as_the_enum_when_lossy() {
+        use jxl::api::{Event, JxlColorEncoding, JxlDecoder, JxlDecoderOptions, JxlPrimaries};
 
         let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             8,
@@ -660,6 +735,7 @@ mod tests {
                 image.color(),
                 Depth::D8,
                 JxlMetadata {
+                    cicp_overrides_icc: true,
                     icc: Some(&icc),
                     exif: None,
                     cicp: None,
@@ -671,8 +747,22 @@ mod tests {
             let mut reader = BufReader::new(Cursor::new(output));
             let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
             jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info").unwrap();
-            assert!(matches!(decoder.embedded_color_profile(),
-                Some(JxlColorProfile::Icc(bytes)) if bytes == &icc));
+            if lossless {
+                // Lossless samples are in the profile's own space.
+                assert!(matches!(decoder.embedded_color_profile(),
+                    Some(JxlColorProfile::Icc(bytes)) if bytes == &icc));
+            } else {
+                // An XYB codestream states a standard profile as the enum,
+                // as libjxl does: an ICC-tagged XYB image cannot have its
+                // frames blended by libjxl.
+                assert!(matches!(
+                    decoder.embedded_color_profile(),
+                    Some(JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
+                        primaries: JxlPrimaries::SRGB,
+                        ..
+                    }))
+                ));
+            }
         }
     }
 
@@ -702,6 +792,7 @@ mod tests {
             image.color(),
             Depth::D8,
             JxlMetadata {
+                cicp_overrides_icc: true,
                 icc: None,
                 exif: None,
                 cicp: Some(PngCicp {
@@ -960,6 +1051,7 @@ mod tests {
                             primary.color(),
                             depth,
                             JxlMetadata {
+                                cicp_overrides_icc: true,
                                 icc: None,
                                 exif: None,
                                 cicp: None,
@@ -1051,6 +1143,7 @@ mod tests {
                     primary.color(),
                     Depth::D8,
                     JxlMetadata {
+                        cicp_overrides_icc: true,
                         icc: Some(&profile),
                         exif: Some(b"Exif\0\0test"),
                         cicp: None,
@@ -1067,7 +1160,7 @@ mod tests {
         }
 
         #[test]
-        fn lossy_p3_preserves_icc_and_uses_p3_for_input() {
+        fn lossy_p3_states_the_enum_and_uses_p3_for_input() {
             let primary = image::RgbImage::from_fn(8, 8, |x, y| {
                 image::Rgb([(x * 31) as u8, (y * 31) as u8, 128])
             });
@@ -1084,6 +1177,7 @@ mod tests {
                 image::ColorType::Rgb8,
                 Depth::D8,
                 JxlMetadata {
+                    cicp_overrides_icc: true,
                     icc: Some(&profile),
                     exif: None,
                     cicp: Some(cicp),
@@ -1094,7 +1188,6 @@ mod tests {
             let expected_config = jixel::EncodeConfig::default()
                 .with_quality(90.0)
                 .with_num_threads(1)
-                .with_icc_profile(profile.clone())
                 .with_color_encoding(jixel::ColorEncoding {
                     white_point: jixel::WhitePoint::D65,
                     primaries: jixel::Primaries::Smpte431,
@@ -1104,13 +1197,20 @@ mod tests {
             let reference = jixel::encode_image(primary.as_raw(), 8, 8, &expected_config).unwrap();
             assert_eq!(cli_output, reference);
             // Check the encoded profile through an independent decoder.
-            use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
+            use jxl::api::{Event, JxlColorEncoding, JxlDecoder, JxlDecoderOptions, JxlPrimaries};
             let mut reader = BufReader::new(Cursor::new(cli_output.clone()));
             let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
             jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info")
                 .expect("complete codestream must include color information");
-            assert!(matches!(decoder.embedded_color_profile(),
-                Some(JxlColorProfile::Icc(bytes)) if bytes == &profile));
+            // Display P3 is a standard encoding: the lossy codestream states
+            // it as the enum rather than carrying the profile.
+            assert!(matches!(
+                decoder.embedded_color_profile(),
+                Some(JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
+                    primaries: JxlPrimaries::P3,
+                    ..
+                }))
+            ));
             for cicp in [
                 None,
                 Some(PngCicp {
@@ -1126,6 +1226,7 @@ mod tests {
                     image::ColorType::Rgb8,
                     Depth::D8,
                     JxlMetadata {
+                        cicp_overrides_icc: true,
                         icc: Some(&profile),
                         exif: None,
                         cicp,
@@ -1144,12 +1245,12 @@ mod tests {
                 8,
                 &jixel::EncodeConfig::default()
                     .with_quality(90.0)
-                    .with_icc_profile(profile),
+                    .with_num_threads(1),
             )
             .unwrap();
             assert_ne!(
                 cli_output, srgb_input,
-                "attaching a P3 ICC alone does not set the input primaries"
+                "Display P3 and sRGB input must produce different codestreams"
             );
         }
 
@@ -1165,6 +1266,7 @@ mod tests {
                     primary.color(),
                     Depth::D8,
                     JxlMetadata {
+                        cicp_overrides_icc: true,
                         icc: None,
                         exif: None,
                         cicp: None,

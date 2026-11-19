@@ -104,6 +104,9 @@ pub use encoder::{
     encode_lossless_gray_obu, encode_lossless_obu, encode_lossless_with_alpha,
 };
 pub use err::EncodeError;
-pub use gain_map::{GainMap, GainMapFloats, GainMapImage, IsoGainMap};
+pub use gain_map::{
+    GAIN_MAP_QUALITY_OFFSET, GainMap, GainMapFloats, GainMapImage, IsoGainMap,
+    default_gain_map_quality,
+};
 pub use metadata::{ContentLightLevel, Metadata, Orientation};
 pub use pixel::{BitDepth, Pixel};
