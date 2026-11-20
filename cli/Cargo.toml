@@ -6,22 +6,25 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.7", features = ["string"] }
 image = "0.25.10"
+pic-scale = { version = "0.7.14", default-features = false, features = ["rdm", "sse", "avx"] }
+# The 1.1.0 source revision includes the ARM assembly header omitted from the crate archive.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "782dab2135ea64a057c097088a13eb8ed3cc3320", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 maroontree = { path = "../" }
 img-parts = "0.4.2"
-yuv = "0.8.20"
+yuv = { version = "0.8.20", features = ["ycgco_r_type"] }
 anyhow = "1.0.104"
 moxcms = { version = "0.9.2" }
-hpvcd = { version = "0.3.4", optional = true }
+hpvcd = { version = "0.3.6", optional = true }
 fast_transpose = "0.2.7"
 thiserror = "2.0.21"
 hpvca = { version = "0.2.4", optional = true }
 jixel = "0.5.9"
 jhm17 = { version = "0.1.1", features = ["polish"] }
-jxl = "0.8.0"
+jxl = { version = "0.8.0", features = ["brotli"] }
 bytemuck = "1.25.2"
 garnetash = { version = "0.1.1", optional = true }
 tealdust = "0.1.7"
-gainforge = { version = "0.5.1", default-features = false, features = ["uhdr"], optional = true }
+gainforge = { version = "0.5.1", default-features = false, features = ["uhdr"] }
 quick-xml = { version = "0.42.0", optional = true }
 kamadak-exif = { version = "0.6.2", optional = true }
 
@@ -30,5 +33,6 @@ toml = "1.2.1"
 
 [features]
 default = ["heic", "vvc"]
-heic = ["dep:hpvcd", "dep:hpvca", "dep:gainforge", "dep:quick-xml", "dep:kamadak-exif"]
+heic = ["dep:hpvcd", "dep:hpvca", "dep:quick-xml", "dep:kamadak-exif"]
 vvc = ["garnetash"]
+avif-asm = ["rav1d/asm"]

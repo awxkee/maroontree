@@ -107,8 +107,9 @@ pub(crate) fn encode_lossy_tilegroup(
     // Screen-content / IntraBC frame decision: a rate model over the frame's
     // texture mass, see `screen_frame_gate`. Measured whenever either consumer
     // is on: it also gates the text palette tools (`LossyTile::screen_frame`),
-    // so that half must not depend on `--no-intrabc`.
-    let gate = if !mono && (screen_content || intrabc_allowed) {
+    // so that half must not depend on `--no-intrabc`. The gate reads luma
+    // only, so 4:0:0 runs it too (mono IntraBC copies luma alone).
+    let gate = if screen_content || intrabc_allowed {
         screen_frame_gate(src, w8, h8, sub_x, sub_y, bd, base_q_idx, pool)
     } else {
         ScreenGate::default()
@@ -417,8 +418,8 @@ pub(crate) fn encode_lossy_tilegroup(
                 trace,
                 lr_unit.as_ref(),
                 cdef_replay.as_ref(),
-                w8,
-                h8,
+                disp_w,
+                disp_h,
                 updating_cdf,
             )
         });

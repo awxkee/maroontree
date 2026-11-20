@@ -77,7 +77,8 @@ struct TileCfg<'a> {
     h: usize,
     cw: usize, // chroma plane width (= w for 4:4:4, w/2 for 4:2:2 and 4:2:0)
     chroma: Chroma,
-    /// 4:0:0 with 16x16/32x32 leaves (see `VarianceBoost::mono_large`).
+    /// 4:0:0 fidelity profile: 16x16/32x32 leaves and the 4:2:2 luma laws
+    /// (see `VarianceBoost::mono_large`, `LossyTile::with_mono_large`).
     mono_large: bool,
     /// Frame-level U/V weight used by the shared-tree partition proxy.
     chroma_part_weight: f32,
@@ -114,10 +115,12 @@ struct TileCfg<'a> {
     /// restoration unit codes `use_wiener = 1` with these taps, delta-coded
     /// against the running reference `lr_ref_*` (spec 5.11.58).
     wiener: Option<crate::wiener::WienerUnit>,
-    /// Frame-absolute luma pixel origin of this tile and the full frame luma
-    /// dimensions. Loop-restoration units are frame-relative, so `read_lr` is
-    /// computed in frame coordinates even though the tile encodes locally.
-    /// (`0,0` and the tile's own size for a single-tile frame.)
+    /// Frame-absolute luma pixel origin of this tile and the DISPLAYED frame luma
+    /// dimensions (`FrameWidth` / `FrameHeight`, which size the decoder's LR
+    /// unit grid — not the 8-aligned coded size). Loop-restoration units are
+    /// frame-relative, so `read_lr` is computed in frame coordinates even though
+    /// the tile encodes locally. (`0,0` and the tile's own size for a
+    /// single-tile frame.)
     frame_x0: usize,
     frame_y0: usize,
     frame_w: usize,

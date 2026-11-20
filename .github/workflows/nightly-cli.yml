@@ -58,9 +58,25 @@ jobs:
       - name: Resolve dependencies
         run: cargo generate-lockfile
       - name: Test CLI
-        run: cargo test -p maroontree-cli --all-features --locked
+        run: cargo test -p maroontree-cli --locked
+      - name: Install NASM on Linux x86
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - name: Install NASM on Windows x86
+        if: runner.os == 'Windows' && runner.arch == 'X64'
+        shell: pwsh
+        run: |
+          choco install nasm --yes --no-progress
+          "$($env:SystemDrive)\Program Files\NASM" >> $env:GITHUB_PATH
+      - name: Install NASM on macOS x86
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        run: brew install nasm
+      - name: Test HDR routes with rav1d assembly
+        run: cargo test -p maroontree-cli --release --features avif-asm --locked --test hdr_conversion
       - name: Build release CLI
-        run: cargo build -p maroontree-cli --release --all-features --locked
+        run: cargo build -p maroontree-cli --release --features avif-asm --locked
       - name: Smoke test every encoder
         run: python .github/scripts/smoke-cli.py target/release/${{ matrix.executable }}
       - name: Package binary and resolved versions

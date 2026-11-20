@@ -27,14 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::Speed;
-use crate::avif::{
-    checked_buffer_size, finalize_color, finalize_with_alpha, make_av1c, validate_dims,
-};
+use crate::avif::{checked_buffer_size, finalize_color, finalize_with_alpha, validate_dims};
 use crate::color::Cicp;
 use crate::err::EncodeError;
 use crate::obu::temporal_delimiter;
 use crate::pixel::Pixel;
-use crate::{BitDepth, ChromaFormat, EncodeConfig, isobmff};
+use crate::{BitDepth, ChromaFormat, EncodeConfig};
 
 #[derive(Clone)]
 pub struct PlanarImage<T: Pixel> {
@@ -862,23 +860,17 @@ pub fn encode_lossless<T: Pixel>(
         cfg.speed,
         cfg.updating_cdf,
     )?;
-    let av1c = make_av1c(
-        &obu,
-        img.bit_depth.bits(),
+    let default_color_cfg = cfg
+        .color_encoding
+        .is_none()
+        .then(|| cfg.clone().with_cicp(effective_color));
+    finalize_color(
+        obu,
         img.width as u32,
         img.height as u32,
+        img.bit_depth.bits(),
         ChromaFormat::Yuv444,
-    );
-    isobmff::wrap_av1_image(
-        &obu,
-        img.width as u32,
-        img.height as u32,
-        img.bit_depth.bits(),
-        3,
-        &av1c,
-        Some(&effective_color),
-        cfg.icc.as_deref(),
-        &cfg.metadata,
+        default_color_cfg.as_ref().unwrap_or(cfg),
     )
 }
 

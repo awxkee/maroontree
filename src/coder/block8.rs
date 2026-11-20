@@ -37,6 +37,12 @@ fn outline_block8<R>(f: impl FnOnce() -> R) -> R {
 
 const JOINT_LUMA_BEAM: usize = 2;
 const JOINT_LARGE_BEAM: usize = 2;
+/// Fast grey 4:0:0: minimum nonzero 8x8 coefficients before the 4x4 TX split
+/// is tried (see `LossyTile::fast_grey`). Sparser blocks never repay it.
+const FAST_GREY_SPLIT4_MIN_NZ: usize = 8;
+/// Grey 4:0:0 photos: an 8x8 angle-delta candidate is trialled only when its
+/// SATD is within this factor of the current winner's prediction.
+const AD8_GREY_SATD_GATE: f32 = 1.1;
 
 #[derive(Clone)]
 struct Luma8BeamCandidate {
@@ -1108,8 +1114,26 @@ impl<'a> LossyTile<'a> {
                         ncand += 1;
                     }
                 }
+                // Grey 4:0:0 photos: an angle delta whose prediction is clearly
+                // worse (SATD) than the current winner's almost never wins after
+                // the transform, so it skips the DCT + trellis trial. Six grey
+                // images at Slow: -9% encode time for +0.14% bytes at equal
+                // SSIMULACRA2 (noise level); Medium -3% time, -0.2%. A tighter
+                // 1.0 costs +0.4% (+1.7% on synthetic content). The same gate on
+                // filter-intra candidates saved 2-3% for +0.6% and is not used.
+                let ad_gate = if self.cfg.is_mono() && !self.cfg.mono_large {
+                    self.k.rd.satd_sad_proxy(self.src_blk(0, px, py, 8, 8), &lpred_arr, 8) as f32
+                        * AD8_GREY_SATD_GATE
+                } else {
+                    f32::INFINITY
+                };
                 for (d, pred) in &cands[..ncand] {
                     let d = *d;
+                    if ad_gate.is_finite()
+                        && self.k.rd.satd_sad_proxy(self.src_blk(0, px, py, 8, 8), pred, 8) as f32 > ad_gate
+                    {
+                        continue;
+                    }
                     let mut resid = [0i32; 64];
                     self.k.rd
                         .residual_pred(&mut resid, pred, &self.cfg.src[0], self.cfg.w, px, py, 8, 8);
@@ -1187,50 +1211,60 @@ impl<'a> LossyTile<'a> {
         }
         let mut best_txtp_sse = best_dct_sse;
         let mut best_txtp_bits = best_dct_bits;
-        if self.cfg.speed.try_adst() {
+        let fast_grey = self.fast_grey();
+        if self.cfg.speed.try_adst() || fast_grey {
             let mut resid = [0i32; 64];
             self.k.rd
                 .residual_pred(&mut resid, &lpred_arr, &self.cfg.src[0], self.cfg.w, px, py, 8, 8);
             let (mut acf, atf) = self.k.dct.adst8x8_t(&resid, &self.ctx.quant);
-            trellis_optimize_ctx(
-                &mut acf,
-                &atf,
-                dcq,
-                acq,
-                &SCAN_8X8,
-                lam,
-                8,
-                8,
-                self.dcdf(),
-                1,
-                0,
-                &self.dcdf().eob_bin_64_l,
-                dc_sgn,
-                self.ctx.quant.qm_level(),
-                self.ctx.quant.qidx() as i32,
-            );
-            let rr = self.k.idct.iadst_dequant_8x8(&acf, &self.ctx.quant);
-            let asse = sse_recon::<64, 8>(&self.k.rd, &lpred_arr, &rr, self.src_blk(0, px, py, 8, 8), self.cfg.bd);
-            // Quality guard (see 16x16 ADST note): block low-q distortion-for-rate trades.
-            let base_rd = rd_cost_i64(best_dct_sse, mlam, best_dct_bits);
-            let bits_bound = (base_rd - asse as f32) / mlam;
-            let abits = self.luma_bits_bounded(
-                &acf,
-                &SCAN_8X8,
-                8,
-                px,
-                py,
-                best_mode,
-                ADST_ADST_TX8_IDX,
-                bits_bound,
-            );
-            let candidate_rd = rd_cost_i64(asse, mlam, abits);
-            if asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd
-            {
-                lcf = acf;
-                best_is_adst = true;
-                best_txtp_sse = asse;
-                best_txtp_bits = abits;
+            // Fast grey pre-screen: only pay for the ADST trellis when its
+            // coefficients are sparser (smaller L1) than the DCT winner's.
+            let adst_go = !fast_grey || {
+                let la: f32 = atf.iter().map(|v| v.abs()).sum();
+                let ld: f32 = ltf.iter().map(|v| v.abs()).sum();
+                la < ld
+            };
+            if adst_go {
+                trellis_optimize_ctx(
+                    &mut acf,
+                    &atf,
+                    dcq,
+                    acq,
+                    &SCAN_8X8,
+                    lam,
+                    8,
+                    8,
+                    self.dcdf(),
+                    1,
+                    0,
+                    &self.dcdf().eob_bin_64_l,
+                    dc_sgn,
+                    self.ctx.quant.qm_level(),
+                    self.ctx.quant.qidx() as i32,
+                );
+                let rr = self.k.idct.iadst_dequant_8x8(&acf, &self.ctx.quant);
+                let asse = sse_recon::<64, 8>(&self.k.rd, &lpred_arr, &rr, self.src_blk(0, px, py, 8, 8), self.cfg.bd);
+                // Quality guard (see 16x16 ADST note): block low-q distortion-for-rate trades.
+                let base_rd = rd_cost_i64(best_dct_sse, mlam, best_dct_bits);
+                let bits_bound = (base_rd - asse as f32) / mlam;
+                let abits = self.luma_bits_bounded(
+                    &acf,
+                    &SCAN_8X8,
+                    8,
+                    px,
+                    py,
+                    best_mode,
+                    ADST_ADST_TX8_IDX,
+                    bits_bound,
+                );
+                let candidate_rd = rd_cost_i64(asse, mlam, abits);
+                if asse <= best_dct_sse + self.tx_guard(best_dct_sse) && candidate_rd < base_rd
+                {
+                    lcf = acf;
+                    best_is_adst = true;
+                    best_txtp_sse = asse;
+                    best_txtp_bits = abits;
+                }
             }
         }
         // Per-block asymmetric-ADST refinement. Intra residual is anisotropic:
@@ -1369,7 +1403,8 @@ impl<'a> LossyTile<'a> {
         let mut best_is_txsplit4 = false;
         let mut s4_txtps = [1u8; 4];
         let mut s4_rec = [0u16; 64];
-        if self.cfg.speed.try_adst()
+        if (self.cfg.speed.try_adst()
+            || (fast_grey && lcf.iter().filter(|&&c| c != 0).count() >= FAST_GREY_SPLIT4_MIN_NZ))
             && best_palette.is_none()
             && best_filter_intra.is_none()
         {

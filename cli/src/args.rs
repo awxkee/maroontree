@@ -1,8 +1,10 @@
 use crate::{
-    Args, Chroma, Depth, Encoder, EncodingEffort, Qmatrix, basic_concurrency,
-    overrides::OverrideGroup, version,
+    Args, Chroma, Depth, Encoder, EncodingEffort, Qmatrix, basic_concurrency, hdr::HdrConversion,
+    overrides::OverrideGroup, raster::RasterFormat, version,
 };
-use clap::{Arg, ArgAction, ArgMatches, Command, error::ErrorKind, value_parser};
+use clap::{
+    Arg, ArgAction, ArgMatches, Command, error::ErrorKind, parser::ValueSource, value_parser,
+};
 use std::{ffi::OsString, path::PathBuf};
 
 fn command() -> Command {
@@ -30,6 +32,9 @@ fn command() -> Command {
             .value_parser(["444", "422", "420"]).help("Chroma subsampling [default: JPEG 444, others 422; lossless 444]"))
         .arg(Arg::new("depth").short('d').long("depth").value_name("DEPTH")
             .value_parser(["8", "10", "12", "16"]).help("Output bit depth; 16 is JXL-only [default: auto from source]"))
+        .arg(Arg::new("hdr-conversion").long("hdr-conversion").value_name("HDR")
+            .value_parser(["pq", "hlg", "gain-map"])
+            .help("Convert PQ, HLG, or an embedded gain map to the selected HDR representation"))
         .arg(Arg::new("threads").short('t').long("threads").value_name("N")
             .value_parser(value_parser!(usize)).default_value("0").help("Worker threads; 0 = all available cores"))
         .arg(Arg::new("speed").short('s').long("speed").value_name("SPEED")
@@ -191,6 +196,16 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
     // All JPEG output, including an explicit .jpg path, uses jhm17.
     if crate::raster::raster_output_format(&output) == Some(crate::raster::RasterFormat::Jpeg) {
         encoder = Encoder::Jpeg;
+    } else if matches.value_source("encoder") == Some(ValueSource::DefaultValue) {
+        let extension = output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        if crate::is_jxl_format(extension) {
+            encoder = Encoder::JpegXl;
+        } else if crate::is_heif_format(extension) {
+            encoder = Encoder::Hevc;
+        }
     }
     if encoder == Encoder::Hevc && !cfg!(feature = "heic") {
         return Err(command().error(
@@ -275,6 +290,14 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
         no_exif: matches.get_flag("no-exif"),
         no_icc: matches.get_flag("no-icc"),
         no_gain_map: false,
+        hdr_conversion: matches.get_one::<String>("hdr-conversion").map(|value| {
+            match value.as_str() {
+                "pq" => HdrConversion::ToPq,
+                "hlg" => HdrConversion::ToHlg,
+                "gain-map" => HdrConversion::ToGainMap,
+                _ => unreachable!(),
+            }
+        }),
         apply_icc: matches.get_flag("apply-icc"),
         verbose: matches.get_flag("verbose"),
         speed: match matches.get_one::<String>("speed").unwrap().as_str() {
@@ -343,7 +366,54 @@ fn args_from_matches(matches: &ArgMatches) -> Result<Args, clap::Error> {
             "16-bit output is supported only by JXL; use depth 8, 10, or 12 for this encoder",
         ));
     }
+    validate_hdr_conversion(&parsed)?;
     Ok(parsed)
+}
+
+fn validate_hdr_conversion(args: &Args) -> Result<(), clap::Error> {
+    let Some(conversion) = args.hdr_conversion else {
+        return Ok(());
+    };
+    let conflict = |message| command().error(ErrorKind::ArgumentConflict, message);
+    let raster = crate::raster::raster_output_format(&args.output);
+    match conversion {
+        HdrConversion::ToPq | HdrConversion::ToHlg => {
+            if raster == Some(RasterFormat::Jpeg)
+                || (raster.is_none() && args.encoder == Encoder::Jpeg)
+            {
+                return Err(conflict("JPEG output does not support PQ or HLG"));
+            }
+            if args.depth == Some(Depth::D8) {
+                return Err(conflict("PQ and HLG output require at least 10 bits"));
+            }
+        }
+        HdrConversion::ToGainMap => {
+            if raster.is_some()
+                || !matches!(args.encoder, Encoder::Av1 | Encoder::JpegXl | Encoder::Hevc)
+            {
+                return Err(conflict(
+                    "gain-map output requires AV1 AVIF, JPEG XL, or HEIC",
+                ));
+            }
+            if args.no_gain_map {
+                return Err(conflict(
+                    "gain-map conversion conflicts with gain-map=false",
+                ));
+            }
+        }
+    }
+    if args.apply_icc {
+        return Err(conflict("--hdr-conversion conflicts with --apply-icc"));
+    }
+    if args.overrides.iter().any(|option| {
+        matches!(
+            option.key(),
+            "color-encoding" | "primaries" | "transfer-function" | "white-point"
+        )
+    }) {
+        return Err(conflict("--hdr-conversion sets the output color encoding"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

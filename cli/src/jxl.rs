@@ -26,17 +26,22 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::gainmap::ParsedGainMap;
 use crate::{Args, Depth, PngCicp, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12};
 use image::DynamicImage;
-use jxl::api::{ExtraChannel, JxlColorProfile, JxlColorType, JxlDataFormat};
+use jxl::api::{
+    ExtraChannel, JxlAuxBoxType, JxlBitstreamInput, JxlColorEncoding, JxlColorProfile,
+    JxlColorType, JxlDataFormat, JxlPrimaries, JxlTransferFunction, JxlWhitePoint,
+};
 use std::fs;
+#[cfg(test)]
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum JxlError {
-    #[error("An error happened while decoding: heic`{0}`")]
+    #[error("JPEG XL decode failed: {0}")]
     Format(String),
     #[error("Cannot read file due to an error:`{0}`")]
     Io(String),
@@ -104,9 +109,21 @@ pub(crate) fn color_encoding_from_cicp(
 }
 
 fn color_encoding_from_icc(icc: &[u8]) -> Option<(jixel::ColorEncoding, Option<f32>)> {
+    let profile = moxcms::ColorProfile::new_from_slice(icc).ok()?;
+    let (mut encoding, intensity_target) =
+        color_encoding_from_cicp(cicp_from_matrix_icc(&profile)?)?;
+    encoding.rendering_intent = match profile.rendering_intent {
+        moxcms::RenderingIntent::Perceptual => jixel::RenderingIntent::Perceptual,
+        moxcms::RenderingIntent::RelativeColorimetric => jixel::RenderingIntent::Relative,
+        moxcms::RenderingIntent::Saturation => jixel::RenderingIntent::Saturation,
+        moxcms::RenderingIntent::AbsoluteColorimetric => jixel::RenderingIntent::Absolute,
+    };
+    Some((encoding, intensity_target))
+}
+
+fn cicp_from_matrix_icc(profile: &moxcms::ColorProfile) -> Option<PngCicp> {
     use moxcms::{ColorProfile, DataColorSpace, ToneReprCurve, TransferCharacteristics, Xyzd};
 
-    let profile = ColorProfile::new_from_slice(icc).ok()?;
     // Only matrix/TRC RGB profiles can be represented by this shortcut. A LUT
     // profile needs a CMS transform; its matrix tags need not describe its colors.
     if profile.color_space != DataColorSpace::Rgb
@@ -163,31 +180,76 @@ fn color_encoding_from_icc(icc: &[u8]) -> Option<(jixel::ColorEncoding, Option<f
                 })
             })
         })?;
-    let (mut encoding, intensity_target) = color_encoding_from_cicp(PngCicp {
+    Some(PngCicp {
         color_primaries: primaries,
         transfer_function: transfer,
         matrix_coefficients: 0,
         full_range: true,
-    })?;
-    encoding.rendering_intent = match profile.rendering_intent {
-        moxcms::RenderingIntent::Perceptual => jixel::RenderingIntent::Perceptual,
-        moxcms::RenderingIntent::RelativeColorimetric => jixel::RenderingIntent::Relative,
-        moxcms::RenderingIntent::Saturation => jixel::RenderingIntent::Saturation,
-        moxcms::RenderingIntent::AbsoluteColorimetric => jixel::RenderingIntent::Absolute,
-    };
-    Some((encoding, intensity_target))
+    })
 }
 
-pub(crate) fn decode_jxl(file: &PathBuf) -> Result<(DynamicImage, Option<Vec<u8>>), JxlError> {
+fn cicp_from_jxl_profile(profile: &JxlColorProfile) -> Option<PngCicp> {
+    let (color_primaries, transfer_function) = match profile {
+        JxlColorProfile::Icc(icc) => {
+            let profile = moxcms::ColorProfile::new_from_slice(icc).ok()?;
+            return cicp_from_matrix_icc(&profile);
+        }
+        JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
+            white_point,
+            primaries,
+            transfer_function,
+            ..
+        }) => {
+            let primaries = match (primaries, white_point) {
+                (JxlPrimaries::SRGB, JxlWhitePoint::D65) => 1,
+                (JxlPrimaries::BT2100, JxlWhitePoint::D65) => 9,
+                (JxlPrimaries::P3, JxlWhitePoint::DCI) => 11,
+                (JxlPrimaries::P3, JxlWhitePoint::D65) => 12,
+                _ => return None,
+            };
+            (primaries, transfer_function)
+        }
+        JxlColorProfile::Simple(JxlColorEncoding::GrayscaleColorSpace {
+            white_point: JxlWhitePoint::D65,
+            transfer_function,
+            ..
+        }) => (1, transfer_function),
+        _ => return None,
+    };
+    let transfer_function = match transfer_function {
+        JxlTransferFunction::BT709 => 1,
+        JxlTransferFunction::Linear => 8,
+        JxlTransferFunction::SRGB => 13,
+        JxlTransferFunction::PQ => 16,
+        JxlTransferFunction::DCI => 17,
+        JxlTransferFunction::HLG => 18,
+        JxlTransferFunction::Gamma(_) => return None,
+    };
+    Some(PngCicp {
+        color_primaries,
+        transfer_function,
+        matrix_coefficients: 0,
+        full_range: true,
+    })
+}
+
+pub(crate) struct DecodedJxl {
+    pub image: DynamicImage,
+    pub icc: Option<Vec<u8>>,
+    pub cicp: Option<PngCicp>,
+    pub gain_map: Option<ParsedGainMap>,
+}
+
+pub(crate) fn decode_jxl(file: &PathBuf, load_gain_map: bool) -> Result<DecodedJxl, JxlError> {
     let input_src = fs::read(file).map_err(|x| JxlError::Io(x.to_string()))?;
-    decode_jxl_bytes(input_src)
+    decode_jxl_bytes(&input_src, load_gain_map)
 }
 
 /// Drive the jxl 0.8 event decoder until `want` fires. `Complete` or a request
 /// for more input before that means the codestream ended early.
 fn jxl_advance_to(
     decoder: &mut jxl::api::JxlDecoder,
-    reader: &mut BufReader<Cursor<Vec<u8>>>,
+    reader: &mut dyn JxlBitstreamInput,
     want: jxl::api::Event,
     stage: &str,
 ) -> Result<(), JxlError> {
@@ -209,7 +271,7 @@ fn jxl_advance_to(
 /// Decode the current frame into `out`, returning once it is complete.
 fn jxl_decode_frame(
     decoder: &mut jxl::api::JxlDecoder,
-    reader: &mut BufReader<Cursor<Vec<u8>>>,
+    reader: &mut dyn JxlBitstreamInput,
     out: &mut [jxl::api::JxlOutputBuffer<'_>],
 ) -> Result<(), JxlError> {
     use jxl::api::Event;
@@ -227,13 +289,18 @@ fn jxl_decode_frame(
     }
 }
 
-fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>), JxlError> {
+fn decode_jxl_bytes(input_src: &[u8], load_gain_map: bool) -> Result<DecodedJxl, JxlError> {
     use jxl::api::{
         Endianness, Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
     };
 
-    let mut reader = BufReader::new(Cursor::new(input_src));
-    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut reader = input_src;
+    let mut options = JxlDecoderOptions::default();
+    if load_gain_map {
+        options.request_aux_boxes.push(JxlAuxBoxType::HDR_GAIN_MAP);
+    }
+    let mut decoder = JxlDecoder::new(options);
+    decoder.close_input();
     jxl_advance_to(&mut decoder, &mut reader, Event::BasicInfo, "basic_info")?;
 
     let info = decoder
@@ -259,9 +326,7 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
     };
 
     let color_data_format = Some(match bits {
-        0..=8 => JxlDataFormat::U8 {
-            bit_depth: bits as u8,
-        },
+        0..=8 => JxlDataFormat::U8 { bit_depth: 8 },
         9..=16 => JxlDataFormat::U16 {
             bit_depth: 16,
             endianness: Endianness::LittleEndian,
@@ -278,8 +343,15 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
             extra_channel_format: vec![None; info.extra_channels.len()],
         })
         .map_err(|x| JxlError::Format(format!("jxl pixel format: {x}")))?;
-    let output_profile = match decoder.output_color_profile() {
+    let output_profile = decoder.output_color_profile();
+    let cicp = output_profile.and_then(cicp_from_jxl_profile);
+    let icc = match output_profile {
         Some(JxlColorProfile::Icc(v)) => Some(v.to_vec()),
+        // Gain-map rendering also needs custom primaries and gamma curves
+        // that have no CICP equivalent.
+        Some(profile) if load_gain_map && cicp.is_none() => {
+            profile.try_as_icc().map(|profile| profile.into_owned())
+        }
         _ => None,
     };
 
@@ -363,7 +435,124 @@ fn decode_jxl_bytes(input_src: Vec<u8>) -> Result<(DynamicImage, Option<Vec<u8>>
         }
     };
 
-    Ok((image, output_profile))
+    let gain_map = if load_gain_map {
+        decode_jxl_gain_map(&mut decoder, &mut reader)?
+    } else {
+        None
+    };
+    Ok(DecodedJxl {
+        image,
+        icc,
+        cicp,
+        gain_map,
+    })
+}
+
+struct JxlGainMapBundle<'a> {
+    metadata: &'a [u8],
+    alternate_encoding: &'a [u8],
+    alternate_icc: &'a [u8],
+    codestream: &'a [u8],
+}
+
+fn parse_gain_map_bundle(data: &[u8]) -> Option<JxlGainMapBundle<'_>> {
+    let (0, data) = data.split_first()? else {
+        return None;
+    };
+    let (metadata_len, data) = data.split_first_chunk()?;
+    let (metadata, data) = data.split_at_checked(u16::from_be_bytes(*metadata_len) as usize)?;
+    let (&encoding_len, data) = data.split_first()?;
+    let (alternate_encoding, data) = data.split_at_checked(encoding_len as usize)?;
+    let (icc_len, data) = data.split_first_chunk()?;
+    let (alternate_icc, codestream) =
+        data.split_at_checked(usize::try_from(u32::from_be_bytes(*icc_len)).ok()?)?;
+    codestream
+        .starts_with(&[0xff, 0x0a])
+        .then_some(JxlGainMapBundle {
+            metadata,
+            alternate_encoding,
+            alternate_icc,
+            codestream,
+        })
+}
+
+fn decode_jxl_gain_map(
+    decoder: &mut jxl::api::JxlDecoder,
+    reader: &mut &[u8],
+) -> Result<Option<ParsedGainMap>, JxlError> {
+    use jxl::api::Event;
+
+    loop {
+        match decoder
+            .process(reader, None, None)
+            .map_err(|err| JxlError::Format(format!("jxl gain-map container: {err}")))?
+        {
+            Event::Complete => break,
+            Event::NeedMoreInput { .. } => {
+                return Err(JxlError::Format("truncated JXL gain-map container".into()));
+            }
+            _ => {}
+        }
+    }
+
+    let kind = JxlAuxBoxType::HDR_GAIN_MAP;
+    let (gain_box, trailing_data) = match (
+        decoder.aux_boxes(kind),
+        decoder.trailing_box().filter(|b| b.box_type() == kind),
+    ) {
+        ([gain_box], None) => (gain_box, &[][..]),
+        ([], Some(gain_box)) => (gain_box, *reader),
+        ([], None) => return Ok(None),
+        _ => return Err(JxlError::Format("multiple JXL gain-map boxes".into())),
+    };
+    let bytes = gain_box
+        .data(trailing_data)
+        .map_err(|err| JxlError::Format(format!("JXL gain-map box: {err}")))?;
+    let bundle = parse_gain_map_bundle(&bytes)
+        .ok_or_else(|| JxlError::Format("invalid JXL gain-map bundle".into()))?;
+
+    // The metadata parser expects at least the two versions and one flags byte.
+    if bundle.metadata.len() < 5 {
+        return Err(JxlError::Format("truncated JXL gain-map metadata".into()));
+    }
+    let metadata = gainforge::IsoGainMap::from_metadata(bundle.metadata)
+        .map_err(|err| JxlError::Format(format!("JXL gain-map metadata: {err:?}")))?;
+    let (alternate_cicp, alternate_icc) =
+        if bundle.alternate_encoding.is_empty() && bundle.alternate_icc.is_empty() {
+            (None, None)
+        } else {
+            let profile =
+                JxlColorProfile::from_raw_bytes(bundle.alternate_encoding, bundle.alternate_icc)
+                    .map_err(|err| {
+                        JxlError::Format(format!("JXL gain-map alternate color profile: {err}"))
+                    })?;
+            let cicp = cicp_from_jxl_profile(&profile);
+            let icc = match profile {
+                JxlColorProfile::Icc(icc) => Some(icc),
+                profile if cicp.is_none() => profile.try_as_icc().map(|icc| icc.into_owned()),
+                _ => None,
+            };
+            (cicp, icc)
+        };
+
+    let image = match decode_jxl_bytes(bundle.codestream, false)?.image {
+        image @ (DynamicImage::ImageLuma16(_) | DynamicImage::ImageRgb16(_)) => image,
+        image @ DynamicImage::ImageLuma8(_) => DynamicImage::ImageLuma16(image.into_luma16()),
+        image @ (DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgb32F(_)) => {
+            DynamicImage::ImageRgb16(image.into_rgb16())
+        }
+        _ => {
+            return Err(JxlError::Format(
+                "JXL gain map contains an alpha channel".into(),
+            ));
+        }
+    };
+    Ok(Some(ParsedGainMap {
+        image,
+        metadata,
+        alternate_cicp,
+        alternate_icc,
+    }))
 }
 
 pub(crate) struct JxlMetadata<'a> {
@@ -375,12 +564,10 @@ pub(crate) struct JxlMetadata<'a> {
     /// came from a codec (HEVC VUI), which states how the samples were coded,
     /// and a profile describing a standard encoding wins.
     pub cicp_overrides_icc: bool,
-    #[cfg(feature = "heic")]
-    pub gain_map: Option<&'a crate::gainmap::ParsedGainMap>,
+    pub gain_map: Option<&'a ParsedGainMap>,
 }
 
-#[cfg(feature = "heic")]
-fn jxl_gain_map(gain_map: &crate::gainmap::ParsedGainMap, lossless: bool) -> jixel::GainMap {
+fn jxl_gain_map(gain_map: &ParsedGainMap, lossless: bool) -> anyhow::Result<jixel::GainMap> {
     let m = gain_map.metadata;
     // The two crates expose separate ISO metadata types. Copy the rationals
     // exactly so encoding does not introduce another float conversion.
@@ -402,16 +589,36 @@ fn jxl_gain_map(gain_map: &crate::gainmap::ParsedGainMap, lossless: bool) -> jix
         backward_direction: m.backward_direction,
         use_base_color_space: m.use_base_color_space,
     };
-    jixel::GainMap::gray16(
-        gain_map.image.as_raw().clone(),
-        16,
-        gain_map.image.width() as usize,
-        gain_map.image.height() as usize,
-        metadata,
-    )
+    let width = gain_map.image.width() as usize;
+    let height = gain_map.image.height() as usize;
+    let map = match &gain_map.image {
+        DynamicImage::ImageLuma16(image) => {
+            jixel::GainMap::gray16(image.as_raw().clone(), 16, width, height, metadata)
+        }
+        DynamicImage::ImageRgb16(image) => {
+            jixel::GainMap::rgb16(image.as_raw().clone(), 16, width, height, metadata)
+        }
+        _ => anyhow::bail!("invalid JXL gain-map sample format"),
+    }
     // Samples already contain normalized logarithmic gains, with no OETF.
     .with_color_encoding(jixel::ColorEncoding::srgb_linear())
-    .with_lossless(lossless)
+    .with_lossless(lossless);
+    if let Some(icc) = &gain_map.alternate_icc {
+        Ok(map.with_alternate_icc_profile(icc.clone()))
+    } else if let Some(alternate) = gain_map
+        .alternate_cicp
+        .filter(|cicp| cicp.color_primaries != 2 || cicp.transfer_function != 2)
+    {
+        let (encoding, _) = color_encoding_from_cicp(PngCicp {
+            matrix_coefficients: 0,
+            full_range: true,
+            ..alternate
+        })
+        .ok_or_else(|| anyhow::anyhow!("unsupported JXL gain-map alternate color space"))?;
+        Ok(map.with_alternate_color_encoding(encoding))
+    } else {
+        Ok(map)
+    }
 }
 
 /// The color encoding the source pixels are in, from its CICP or its ICC
@@ -448,9 +655,8 @@ pub(crate) fn encode_jxl(
             crate::EncodingEffort::Medium => jixel::Speed::Medium,
             crate::EncodingEffort::Fast => jixel::Speed::Fast,
         });
-    #[cfg(feature = "heic")]
     if let Some(gain_map) = metadata.gain_map.filter(|_| !args.no_gain_map) {
-        cfg = cfg.with_gain_map(jxl_gain_map(gain_map, args.lossless));
+        cfg = cfg.with_gain_map(jxl_gain_map(gain_map, args.lossless)?);
         if args.verbose {
             eprintln!(
                 "gainmap: encoding {}×{} ISO 21496-1 map ({:.3} stops) in JXL jhgm{}",
@@ -633,7 +839,6 @@ mod tests {
             icc,
             exif: None,
             cicp: Some(vui),
-            #[cfg(feature = "heic")]
             gain_map: None,
         };
         let transfer = |m: &JxlMetadata<'_>| {
@@ -703,12 +908,11 @@ mod tests {
                     icc: None,
                     exif: None,
                     cicp: None,
-                    #[cfg(feature = "heic")]
                     gain_map: None,
                 },
             )
             .unwrap();
-            let decoded = decode_jxl_bytes(encoded).unwrap().0;
+            let decoded = decode_jxl_bytes(&encoded, false).unwrap().image;
             assert_eq!(decoded, image);
         }
     }
@@ -739,7 +943,6 @@ mod tests {
                     icc: Some(&icc),
                     exif: None,
                     cicp: None,
-                    #[cfg(feature = "heic")]
                     gain_map: None,
                 },
             )
@@ -801,7 +1004,6 @@ mod tests {
                     matrix_coefficients: 0,
                     full_range: true,
                 }),
-                #[cfg(feature = "heic")]
                 gain_map: None,
             },
         )
@@ -826,18 +1028,35 @@ mod tests {
 
     #[test]
     fn maps_png_rec2100_pq_cicp() {
-        let (encoding, intensity_target) = color_encoding_from_cicp(PngCicp {
+        let cicp = PngCicp {
             color_primaries: 9,
             transfer_function: 16,
             matrix_coefficients: 0,
             full_range: true,
-        })
-        .expect("BT.2100 PQ must be supported");
+        };
+        let (encoding, intensity_target) =
+            color_encoding_from_cicp(cicp).expect("BT.2100 PQ must be supported");
 
         assert_eq!(encoding.white_point, jixel::WhitePoint::D65);
         assert_eq!(encoding.primaries, jixel::Primaries::Bt2020);
         assert_eq!(encoding.transfer, jixel::TransferFunction::Smpte2084);
         assert_eq!(intensity_target, Some(10_000.0));
+
+        let samples = [10000, 35000, 60000].repeat(64);
+        for lossless in [true, false] {
+            let mut cfg = jixel::EncodeConfig::default()
+                .with_lossless(lossless)
+                .with_speed(jixel::Speed::Fast)
+                .with_num_threads(1)
+                .with_color_encoding(encoding);
+            cfg.intensity_target = intensity_target;
+            let encoded = jixel::encode_image_16bit(&samples, 8, 8, &cfg).unwrap();
+            let decoded = decode_jxl_bytes(&encoded, false).unwrap();
+            assert_eq!(decoded.cicp, Some(cicp));
+            if lossless {
+                assert_eq!(decoded.image.into_rgb16().as_raw(), &samples);
+            }
+        }
     }
 
     #[test]
@@ -949,7 +1168,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "heic")]
     mod gain_maps {
         use super::*;
         use crate::gainmap::ParsedGainMap;
@@ -969,6 +1187,7 @@ mod tests {
                 no_exif: false,
                 no_icc: false,
                 no_gain_map: false,
+                hdr_conversion: None,
                 apply_icc: false,
                 verbose: false,
                 speed: crate::EncodingEffort::Fast,
@@ -992,10 +1211,19 @@ mod tests {
             })
             .unwrap();
             ParsedGainMap {
-                image: image::ImageBuffer::from_raw(3, 2, vec![0, 10000, 30000, 65535, 42, 47000])
-                    .unwrap(),
+                image: DynamicImage::ImageLuma16(
+                    image::ImageBuffer::from_raw(3, 2, vec![0, 10000, 30000, 65535, 42, 47000])
+                        .unwrap(),
+                ),
                 metadata: gainforge::IsoGainMap::from_metadata(&metadata.to_metadata().unwrap())
                     .unwrap(),
+                alternate_cicp: Some(PngCicp {
+                    color_primaries: 9,
+                    transfer_function: 16,
+                    matrix_coefficients: 0,
+                    full_range: true,
+                }),
+                alternate_icc: None,
             }
         }
 
@@ -1017,18 +1245,6 @@ mod tests {
                 data = &data[size..];
             }
             None
-        }
-
-        fn gain_bundle(data: &[u8]) -> (gainforge::IsoGainMap, &[u8]) {
-            let bundle = box_payload(data, b"jhgm").expect("missing gain-map box");
-            assert_eq!(bundle[0], 0); // JxlGainMapBundle version
-            let metadata_end = 3 + u16::from_be_bytes(*bundle[1..].first_chunk().unwrap()) as usize;
-            let metadata = gainforge::IsoGainMap::from_metadata(&bundle[3..metadata_end]).unwrap();
-            let icc_offset = metadata_end + 1 + bundle[metadata_end] as usize;
-            let image_offset = icc_offset
-                + 4
-                + u32::from_be_bytes(*bundle[icc_offset..].first_chunk().unwrap()) as usize;
-            (metadata, &bundle[image_offset..])
         }
 
         #[test]
@@ -1059,7 +1275,9 @@ mod tests {
                             },
                         )
                         .unwrap();
-                        let (metadata, map_codestream) = gain_bundle(&encoded);
+                        let decoded = decode_jxl_bytes(&encoded, true).unwrap();
+                        let decoded_gain = decoded.gain_map.expect("missing gain-map box");
+                        let metadata = decoded_gain.metadata;
                         assert_eq!(metadata.map_min(), gain.metadata.map_min());
                         assert_eq!(metadata.map_max(), gain.metadata.map_max());
                         assert_eq!(metadata.gain_map_gamma(), gain.metadata.gain_map_gamma());
@@ -1084,16 +1302,13 @@ mod tests {
                             metadata.use_base_color_space,
                             gain.metadata.use_base_color_space
                         );
-                        let (decoded_gain, _) = decode_jxl_bytes(map_codestream.to_vec()).unwrap();
-                        assert_eq!(
-                            (decoded_gain.width(), decoded_gain.height()),
-                            gain.image.dimensions()
-                        );
+                        assert_eq!(decoded_gain.alternate_cicp, gain.alternate_cicp);
+                        assert_eq!(decoded_gain.image.width(), gain.image.width());
+                        assert_eq!(decoded_gain.image.height(), gain.image.height());
                         if lossless {
-                            assert_eq!(decoded_gain.into_luma16(), gain.image);
+                            assert_eq!(decoded_gain.image, gain.image);
                         }
-                        let (decoded_primary, _) = decode_jxl_bytes(encoded).unwrap();
-                        assert_eq!((decoded_primary.width(), decoded_primary.height()), (8, 8));
+                        assert_eq!((decoded.image.width(), decoded.image.height()), (8, 8));
                     }
                 }
             }
@@ -1106,7 +1321,7 @@ mod tests {
             gain.metadata.gain_map_max_d = [1_000_000; 3];
             gain.metadata.alternate_hdr_headroom_n = 1_234_567;
             gain.metadata.alternate_hdr_headroom_d = 1_000_000;
-            let encoded = jxl_gain_map(&gain, true);
+            let encoded = jxl_gain_map(&gain, true).unwrap();
             let parsed =
                 gainforge::IsoGainMap::from_metadata(&encoded.metadata.to_metadata().unwrap())
                     .unwrap();
@@ -1153,9 +1368,10 @@ mod tests {
                 .unwrap();
                 assert_eq!(box_payload(&encoded, b"jhgm").is_some(), map.is_some());
                 assert!(box_payload(&encoded, b"Exif").is_some());
-                let (decoded, icc) = decode_jxl_bytes(encoded).unwrap();
-                assert_eq!(decoded.to_rgb8(), primary.to_rgb8());
-                assert_eq!(icc.as_deref(), Some(profile.as_slice()));
+                let decoded = decode_jxl_bytes(&encoded, false).unwrap();
+                assert_eq!(decoded.image.to_rgb8(), primary.to_rgb8());
+                assert_eq!(decoded.icc.as_deref(), Some(profile.as_slice()));
+                assert!(decoded.gain_map.is_none());
             }
         }
 

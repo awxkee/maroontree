@@ -83,6 +83,10 @@ impl<'a> LossyTile<'a> {
 
     #[inline]
     fn commit_uv_mode(&mut self, px: usize, py: usize, w: usize, h: usize, mode: usize) {
+        if self.cfg.is_mono() {
+            // 4:0:0 keeps no UV mode context (the rows are empty).
+            return;
+        }
         let (bx4, by4) = (px / 4, py / 4);
         let (w4, h4) = (w.div_ceil(4), h.div_ceil(4));
         let a_end = (bx4 + w4).min(self.ctx.a_uv_mode.len());

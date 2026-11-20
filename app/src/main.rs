@@ -123,7 +123,6 @@ fn main() {
     // }
     /* let img = image::open("./assets/manhattan.png")
         .unwrap()
-        // .resize_exact(1600, 900, FilterType::Nearest)
         .to_rgb8();
     let pimg = PlanarImage::from_interleaved_rgb(
         img.width() as usize,

@@ -35,16 +35,19 @@ mod av1_lossy;
 mod av2_decode;
 mod av2_lossless;
 mod av2_lossy;
+mod avif_decode;
 mod box_walker;
-#[cfg(feature = "heic")]
 mod gainmap;
+mod hdr;
 #[cfg(feature = "heic")]
 mod heic;
+mod iso_tmap;
 mod jpeg;
 mod jxl;
 mod orientation;
 mod overrides;
 mod raster;
+mod resize;
 mod version;
 #[cfg(feature = "vvc")]
 mod vvc;
@@ -52,6 +55,7 @@ mod vvc;
 use crate::av1_lossy::encode_av1;
 use crate::av2_lossy::encode_av2;
 use crate::box_walker::{ImageContainer, detect_image_container};
+use crate::hdr::HdrConversion;
 use crate::jxl::{JxlMetadata, decode_jxl, encode_jxl};
 use image::{DynamicImage, Luma, Rgb, Rgba};
 use img_parts::{ImageEXIF, ImageICC, jpeg::Jpeg, png::Png, webp::WebP};
@@ -98,6 +102,7 @@ struct Args {
     no_exif: bool,
     no_icc: bool,
     no_gain_map: bool,
+    hdr_conversion: Option<HdrConversion>,
     apply_icc: bool,
     verbose: bool,
     speed: EncodingEffort,
@@ -446,17 +451,13 @@ fn is_jxl_format(fmt: &str) -> bool {
 struct LoadedImage {
     image: DynamicImage,
     icc: Option<Vec<u8>>,
-    #[cfg(feature = "heic")]
     cicp: Option<PngCicp>,
-    #[cfg(feature = "heic")]
     gain_map: Option<gainmap::ParsedGainMap>,
 }
 
-fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
+fn load_image(path: &PathBuf, load_gain_map: bool) -> LoadedImage {
     let mut have_icc: Option<Vec<u8>> = None;
-    #[cfg(feature = "heic")]
     let mut gain_map = None;
-    #[cfg(feature = "heic")]
     let mut have_cicp = None;
 
     let fmt = path
@@ -474,7 +475,7 @@ fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
         #[cfg(feature = "heic")]
         Some(_) if _image_container == ImageContainer::Heic => {
             use crate::heic::decode_heic_file_url;
-            let decoded = decode_heic_file_url(path, _load_gain_map)
+            let decoded = decode_heic_file_url(path, load_gain_map)
                 .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
             have_icc = decoded.icc;
             have_cicp = decoded.cicp;
@@ -494,11 +495,18 @@ fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
                 .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())))
         }
 
+        Some(ref fmt) if _image_container == ImageContainer::Avif || is_avif_format(fmt) => {
+            return avif_decode::decode_avif_file(path, load_gain_map)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e:#}", path.display())));
+        }
+
         Some(fmt) if is_jxl_format(&fmt) => {
-            let (decoded, icc) = decode_jxl(path)
+            let decoded = decode_jxl(path, load_gain_map)
                 .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
-            have_icc = icc;
-            decoded
+            have_icc = decoded.icc;
+            have_cicp = decoded.cicp;
+            gain_map = decoded.gain_map;
+            decoded.image
         }
 
         _ => image::open(path)
@@ -508,19 +516,17 @@ fn load_image(path: &PathBuf, _load_gain_map: bool) -> LoadedImage {
     LoadedImage {
         image: img,
         icc: have_icc,
-        #[cfg(feature = "heic")]
         cicp: have_cicp,
-        #[cfg(feature = "heic")]
         gain_map,
     }
 }
 
 /// The source's HDR gain map as an AVIF gain map item, if it has one.
 fn avif_gain_map(
-    #[cfg(feature = "heic")] gain_map: Option<&gainmap::ParsedGainMap>,
+    gain_map: Option<&gainmap::ParsedGainMap>,
+    required: bool,
     verbose: bool,
 ) -> Option<maroontree::GainMap> {
-    #[cfg(feature = "heic")]
     if let Some(gain_map) = gain_map {
         match gainmap::avif_gain_map(gain_map) {
             Ok(avif) => {
@@ -534,33 +540,15 @@ fn avif_gain_map(
                 }
                 return Some(avif);
             }
+            Err(error) if required => die(format!("cannot encode AVIF gain map: {error:#}")),
             Err(error) => eprintln!("gainmap: skipping gain map: {error:#}"),
         }
     }
-    let _ = verbose;
     None
 }
 
-fn main() {
-    let args = args::parse_args();
-
-    // Raster output extensions take precedence over the selected encoder.
-    let raster_format = raster::raster_output_format(&args.output);
-    let LoadedImage {
-        image: img,
-        icc: have_icc,
-        #[cfg(feature = "heic")]
-            cicp: have_cicp,
-        #[cfg(feature = "heic")]
-        gain_map,
-    } = load_image(
-        &args.input,
-        matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
-            && !args.no_gain_map
-            && raster_format.is_none(),
-    );
-    let color_type = img.color();
-    let effective_depth = args.depth.unwrap_or(if args.encoder == Encoder::Jpeg {
+fn effective_depth(args: &Args, color_type: image::ColorType) -> Depth {
+    args.depth.unwrap_or(if args.encoder == Encoder::Jpeg {
         Depth::D8
     } else if is_16bit(color_type) {
         if args.encoder == Encoder::JpegXl {
@@ -570,32 +558,125 @@ fn main() {
         }
     } else {
         Depth::D8
-    });
+    })
+}
+
+fn source_hdr_cicp(cicp: Option<PngCicp>, icc: Option<&[u8]>) -> Option<PngCicp> {
+    if let Some(cicp) = cicp.filter(|cicp| hdr::is_hdr(*cicp)) {
+        return Some(cicp);
+    }
+    let profile = moxcms::ColorProfile::new_from_slice(icc?).ok()?;
+    let tag = profile.cicp?;
+    let cicp = PngCicp {
+        color_primaries: tag.color_primaries as u8,
+        transfer_function: tag.transfer_characteristics as u8,
+        matrix_coefficients: 0,
+        full_range: true,
+    };
+    hdr::is_hdr(cicp).then_some(cicp)
+}
+
+fn prepare_hdr(
+    mut source: LoadedImage,
+    args: &Args,
+    cicp_overrides_icc: bool,
+) -> anyhow::Result<LoadedImage> {
+    let source_icc = source.icc.as_deref().filter(|_| !cicp_overrides_icc);
+    if let Some(conversion @ (HdrConversion::ToPq | HdrConversion::ToHlg)) = args.hdr_conversion {
+        let output_cicp = match conversion {
+            HdrConversion::ToPq => hdr::PQ_CICP,
+            HdrConversion::ToHlg => hdr::HLG_CICP,
+            _ => unreachable!(),
+        };
+        source.image = if let Some(map) = source.gain_map.take() {
+            hdr::gain_map_to_hdr(&source.image, &map, source.cicp, source_icc, output_cicp)?
+        } else {
+            let cicp = source_hdr_cicp(source.cicp, source_icc).ok_or_else(|| {
+                anyhow::anyhow!("conversion requires a gain map or a PQ/HLG source")
+            })?;
+            hdr::convert_hdr(&source.image, cicp, output_cicp)?
+        };
+        source.cicp = Some(output_cicp);
+        source.icc = None;
+    } else if let Some(map) = &source.gain_map {
+        if !map.can_encode_with(args.encoder) {
+            if args.verbose {
+                eprintln!(
+                    "gainmap: rebuilding as a map supported by {:?}",
+                    args.encoder
+                );
+            }
+            let hdr_cicp = match (source.cicp, map.alternate_cicp) {
+                (base, _)
+                    if map.metadata.base_hdr_headroom()
+                        >= map.metadata.alternate_hdr_headroom() =>
+                {
+                    base
+                }
+                (_, alternate) => alternate,
+            };
+            let hdr_cicp = if hdr_cicp
+                .is_some_and(|cicp| cicp.transfer_function == hdr::HLG_CICP.transfer_function)
+            {
+                hdr::HLG_CICP
+            } else {
+                hdr::PQ_CICP
+            };
+            let rendered =
+                hdr::gain_map_to_hdr(&source.image, map, source.cicp, source_icc, hdr_cicp)?;
+            let (base, map) = hdr::hdr_to_gain_map(&rendered, hdr_cicp)?;
+            source.image = base;
+            source.gain_map = Some(map);
+            source.cicp = Some(hdr::SDR_CICP);
+            source.icc = None;
+        }
+    } else if args.hdr_conversion == Some(HdrConversion::ToGainMap) {
+        let cicp = source_hdr_cicp(source.cicp, source_icc).ok_or_else(|| {
+            anyhow::anyhow!("gain-map conversion requires a PQ/HLG source or an embedded gain map")
+        })?;
+        let (base, map) = hdr::hdr_to_gain_map(&source.image, cicp)?;
+        source.image = base;
+        source.gain_map = Some(map);
+        source.cicp = Some(hdr::SDR_CICP);
+        source.icc = None;
+    }
+    Ok(source)
+}
+
+fn main() {
+    let args = args::parse_args();
+
+    // Raster output extensions take precedence over the selected encoder.
+    let raster_format = raster::raster_output_format(&args.output);
+    let output_supports_gain_map =
+        matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
+            && raster_format.is_none();
+    let load_gain_map =
+        args.hdr_conversion.is_some() || (output_supports_gain_map && !args.no_gain_map);
+    let mut source = load_image(&args.input, load_gain_map);
 
     let exif_bytes = (!args.no_exif).then(|| read_exif(&args.input)).flatten();
-
-    let mut raw_icc = if args.apply_icc || !args.no_icc {
-        read_icc(&args.input)
-    } else {
-        None
-    };
+    if source.icc.is_none() && (args.apply_icc || !args.no_icc || load_gain_map) {
+        source.icc = read_icc(&args.input);
+    }
     let png_cicp = (!args.apply_icc)
         .then(|| read_png_cicp(&args.input))
         .flatten();
     // A PNG cICP chunk overrides its iCCP profile; a codec's CICP does not.
     let cicp_overrides_icc = png_cicp.is_some();
-    #[cfg(feature = "heic")]
-    let png_cicp = png_cicp.or(have_cicp.filter(|_| !args.apply_icc));
-    if let Some(have_icc) = have_icc {
-        raw_icc = Some(have_icc.to_vec());
-    }
+    source.cicp = png_cicp.or(source.cicp.filter(|_| !args.apply_icc));
+    let LoadedImage {
+        image: img,
+        icc: raw_icc,
+        cicp: output_cicp,
+        gain_map,
+    } = prepare_hdr(source, &args, cicp_overrides_icc)
+        .unwrap_or_else(|error| die(format!("HDR conversion failed: {error:#}")));
 
-    // Apply ICC profile to pixel data via moxcms, then discard the profile so
-    // it is not embedded in the output. The encoded image will be plain sRGB.
     let (img, icc_bytes) = if args.apply_icc {
         match raw_icc {
             Some(ref icc) => {
-                let converted = apply_icc_to_image(&img, effective_depth, icc)
+                let converted = apply_icc_to_image(&img, effective_depth(&args, img.color()), icc)
                     .unwrap_or_else(|e| die(format!("ICC apply failed: {e}")));
                 (converted, None)
             }
@@ -610,6 +691,8 @@ fn main() {
         // --no-icc just strips without converting
         (img, if args.no_icc { None } else { raw_icc })
     };
+    let color_type = img.color();
+    let effective_depth = effective_depth(&args, color_type);
 
     if args.verbose {
         eprintln!("encoder: {}", version::encoder(args.encoder));
@@ -625,7 +708,7 @@ fn main() {
             None if args.apply_icc => eprintln!("icc    : applied, not embedded"),
             None => eprintln!("icc    : none"),
         }
-        if let Some(cicp) = png_cicp {
+        if let Some(cicp) = output_cicp {
             eprintln!(
                 "cicp   : primaries={} transfer={} matrix={} full-range={}",
                 cicp.color_primaries,
@@ -662,7 +745,7 @@ fn main() {
             &args,
             icc_bytes.as_deref(),
             exif_bytes.as_deref(),
-            png_cicp,
+            output_cicp,
         )
         .unwrap_or_else(|e| die(format!("encode failed: {e}")))
     } else {
@@ -678,10 +761,10 @@ fn main() {
                 effective_depth,
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
-                png_cicp,
+                output_cicp,
                 avif_gain_map(
-                    #[cfg(feature = "heic")]
                     gain_map.as_ref(),
+                    args.hdr_conversion == Some(HdrConversion::ToGainMap),
                     args.verbose,
                 ),
             )
@@ -693,7 +776,7 @@ fn main() {
                 effective_depth,
                 icc_bytes.as_deref(),
                 exif_bytes.as_deref(),
-                png_cicp,
+                output_cicp,
             )
             .unwrap_or_else(|e| die(format!("encode failed: {e}"))),
             Encoder::Hevc => {
@@ -711,7 +794,7 @@ fn main() {
                         effective_depth,
                         icc_bytes.as_deref(),
                         exif_bytes.as_deref(),
-                        png_cicp,
+                        output_cicp,
                         gain_map.as_ref(),
                     )
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
@@ -725,9 +808,8 @@ fn main() {
                 JxlMetadata {
                     icc: icc_bytes.as_deref(),
                     exif: exif_bytes.as_deref(),
-                    cicp: png_cicp,
+                    cicp: output_cicp,
                     cicp_overrides_icc,
-                    #[cfg(feature = "heic")]
                     gain_map: gain_map.as_ref(),
                 },
             )
@@ -747,7 +829,7 @@ fn main() {
                         effective_depth,
                         icc_bytes.as_deref(),
                         exif_bytes.as_deref(),
-                        png_cicp,
+                        output_cicp,
                     )
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
                 }

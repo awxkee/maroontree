@@ -190,6 +190,20 @@ fn none16_top_bias_444() -> f32 {
     crate::tuning::get().none16_top_bias_444
 }
 
+/// Source variance (8-bit units) below which a grey 4:0:0 photo codes a
+/// 32x32 as one block; see `LossyTile::grey_flat32`.
+const GREY_FLAT32_VAR: f32 = 0.5;
+/// Luma laws fitted for grey 4:0:0 photos (8x8 leaves), which used to borrow
+/// the 4:4:4 operating point: trellis band tilt 1.2 -> 2.45 (the 4:2:2 value)
+/// and the mode lambda scaled by 0.85. Bytes at equal SSIMULACRA2, together:
+/// Slow -0.69% on three tuning images and -0.43% on five held out (four of
+/// five improve), Medium -0.57% (five of five), Fast -0.40%. Alone: tilt -0.43
+/// tuning / +0.02 held out, lambda -0.62 / -0.22. Flat around the optimum
+/// (lambda 0.7 and 0.55 are within 0.1%; 0.4 loses on kodak20). No effect
+/// found from: the 4:2:2 decision snapshot, the 4:2:2 or 4:2:0 mode-lambda
+/// operating point, trellis lambda +-15%, or the top-band ease.
+const GREY_BAND_TILT: f32 = 2.45;
+const GREY_MLAM_SCALE: f32 = 0.85;
 const SEAM_W_420: f32 = 0.0;
 const SEAM_W_422: f32 = 60.0;
 
@@ -1567,8 +1581,37 @@ impl<'a> LossyTile<'a> {
     }
 
     fn luma_mode_budget_eff(&self) -> usize {
+        if self.fast_grey() {
+            return 2;
+        }
         self.cfg.speed
             .luma_mode_budget(self.cfg.is_444())
+    }
+
+    /// Fast-tier gray 4:0:0 photo path (8x8 leaves). With no chroma and no
+    /// partition search, the plain Fast leaf.
+    /// Grey 4:0:0 photos: code a 32x32 as one block when its source is
+    /// uniform (variance below `GREY_FLAT32_VAR` in 8-bit units), decided
+    /// from the source alone with no child search. Photos otherwise keep 8x8
+    /// leaves because large leaves band on smooth gradients; a uniform block
+    /// has no gradient to lose. Measured at equal SSIMULACRA2 (Slow): solid-
+    /// background art -3.9%, a photo with a clear sky -1.1%, four other photos
+    /// within +-0.15%; Medium -0.8% on four images; time unchanged or -4%.
+    /// What did NOT work: a quantizer-relative threshold (var / q^2), which
+    /// admits noisy flats and costs +1..+4% at mid quality; 16x16 flats
+    /// (+1.7%); and Fast (-0.1% for +8% time, the 32x32 leaf search costs more
+    /// than the 8x8 leaves it replaces there).
+    pub(crate) fn grey_flat32(&self, px: usize, py: usize) -> bool {
+        if self.cfg.speed == Speed::Fast || px + 32 > self.cfg.w || py + 32 > self.cfg.h {
+            return false;
+        }
+        let var_scale = 1.0 / (1u32 << (2 * (self.cfg.bd - 8))) as f32;
+        self.luma_variance(px, py, 32, 32) * var_scale < GREY_FLAT32_VAR
+    }
+
+    #[inline]
+    pub(crate) fn fast_grey(&self) -> bool {
+        self.cfg.speed == Speed::Fast && self.cfg.is_mono() && !self.cfg.mono_large
     }
 
     /// 4:4:4 top-band ramp weight for the 32/64 NONE biases (0 outside).
@@ -1624,13 +1667,13 @@ impl<'a> LossyTile<'a> {
     }
 
     fn partition_signal_bits(&self) -> f32 {
-        if (self.cfg.is_420() || self.cfg.is_422()) && self.ctx.aq.enabled && !self.cfg.is_mono() && self.cfg.speed.at_least_slow()
+        if (self.cfg.is_420() || self.cfg.is_422() || self.cfg.mono_large) && self.ctx.aq.enabled && self.cfg.speed.at_least_slow()
         {
             let tu = crate::tuning::get();
-            let w = if self.cfg.is_422() {
-                tu.seam_w_422
-            } else {
+            let w = if self.cfg.is_420() {
                 tu.seam_w_420
+            } else {
+                tu.seam_w_422
             };
             let t = seam_t(self.ctx.aq.base_q, w);
             if t > 0.0 {
@@ -1795,7 +1838,11 @@ impl<'a> LossyTile<'a> {
     /// libaom SSIMULACRA2 rdmult weight for this frame (1.0 when tune is off).
     #[inline]
     fn tune_weight(&self) -> f32 {
-        mode_lambda_weight(self.cfg.base_q_idx, self.chroma_sub())
+        // The 4:0:0 fidelity profile takes the 4:2:2 operating point.
+        if self.cfg.is_mono() && !self.cfg.mono_large {
+            return mode_lambda_weight(self.cfg.base_q_idx, self.chroma_sub()) * GREY_MLAM_SCALE;
+        }
+        mode_lambda_weight(self.cfg.base_q_idx, if self.cfg.mono_large { 1 } else { self.chroma_sub() })
     }
 
     pub(crate) fn part_bl8_rate(&self, x8: usize, y8: usize, symbol: usize) -> f32 {
@@ -3074,7 +3121,7 @@ impl<'a> LossyTile<'a> {
             && !self.palette_exact(px, py, 16)
         {
             1.0 + (none16_top_bias_420() - 1.0) * seam_t(self.ctx.aq.base_q, SEAM_W_420)
-        } else if self.cfg.is_422() && self.ctx.aq.enabled && !self.cfg.is_mono() && self.cfg.speed.at_least_slow() {
+        } else if (self.cfg.is_422() || self.cfg.mono_large) && self.ctx.aq.enabled && self.cfg.speed.at_least_slow() {
             1.0 + (none16_top_bias_422() - 1.0) * seam_t(self.ctx.aq.base_q, SEAM_W_422)
         } else if selection_only_bias_444 {
             none16_top_bias_444()
@@ -3354,7 +3401,7 @@ impl<'a> LossyTile<'a> {
         };
         // IntraBC candidate: whole-16 exact-copy (all planes priced inside
         // rd_cost_intrabc, so no chroma_cost leg is added here).
-        let rd_ibc = if self.cfg.allow_intrabc && !self.cfg.is_mono() {
+        let rd_ibc = if self.cfg.allow_intrabc {
             self.rd_cost_intrabc(px, py, 16, thr, prdo)
                 .unwrap_or(f32::INFINITY)
         } else {
@@ -3593,6 +3640,34 @@ impl<'a> LossyTile<'a> {
             t.wsse_444
         };
         self.k.rd = rd.with_weighted_sse(wsse.then_some(t.wsse_scale));
+        self
+    }
+
+    /// Switch a 4:0:0 tile to the fidelity profile (no-op for other formats):
+    /// 16x16/32x32 leaves, and the 4:2:2 luma laws the large leaves were
+    /// measured with (band tilt, decision snapshot, mode lambda, NONE16 top
+    /// bias, partition seam drop, top ease). Must run before any coding.
+    fn with_mono_large(mut self, on: bool) -> Self {
+        if !on && self.cfg.is_mono() {
+            // Grey photos keep their 8x8 leaves but take the 4:2:2 band tilt
+            // (see `GREY_BAND_TILT`).
+            let q = self.cfg.base_q_idx;
+            let tilt = ramped_tilt(GREY_BAND_TILT, q, 0.4);
+            self.ent.cdfs = Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(tilt);
+            let mut c: Cdfs = (*self.model.dec_cdfs).clone();
+            c.band_tilt = tilt;
+            self.model.dec_cdfs = c.into();
+        }
+        if !on || !self.cfg.is_mono() {
+            return self;
+        }
+        self.cfg.mono_large = true;
+        let q = self.cfg.base_q_idx;
+        let tilt = ramped_tilt(2.45, q, 0.4);
+        self.ent.cdfs = Cdfs::new(crate::coef_q::qcat(q)).with_band_tilt(tilt);
+        let mut c = Cdfs::decision_snapshot_422(crate::coef_q::qcat(q));
+        c.band_tilt = tilt;
+        self.model.dec_cdfs = c.into();
         self
     }
 
@@ -4092,7 +4167,7 @@ impl<'a> LossyTile<'a> {
         if k == 0.0 {
             return 1.0;
         }
-        if self.cfg.is_422() {
+        if self.cfg.is_422() || self.cfg.mono_large {
             let g = f_fmlaf(-top_ease(), top_ease_t(self.ctx.aq.base_q), 1.0);
             k *= g;
             if k == 0.0 {
