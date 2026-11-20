@@ -100,6 +100,9 @@ pub(crate) struct VarianceBoost {
     /// leaves (bottom-up priced) plus the 4:2:2 luma laws, see
     /// `LossyTile::with_mono_large`.
     pub mono_large: bool,
+    /// The plane is an alpha mask (hard edges on flat fields), see
+    /// `LossyTile::mono_alpha`. Implies nothing unless `mono_large` is set.
+    pub mono_alpha: bool,
 }
 
 impl VarianceBoost {
@@ -114,6 +117,7 @@ impl VarianceBoost {
             base_shift: 0,
             qm: QmLevels::FLAT,
             mono_large: false,
+            mono_alpha: false,
         }
     }
 
@@ -127,6 +131,7 @@ impl VarianceBoost {
             base_shift: 0,
             qm: QmLevels::FLAT,
             mono_large: false,
+            mono_alpha: false,
         }
     }
 }

@@ -80,6 +80,9 @@ struct TileCfg<'a> {
     /// 4:0:0 fidelity profile: 16x16/32x32 leaves and the 4:2:2 luma laws
     /// (see `VarianceBoost::mono_large`, `LossyTile::with_mono_large`).
     mono_large: bool,
+    /// 4:0:0 alpha plane: Medium may descend below 16x16 and Fast searches
+    /// the full non-directional mode set (see `LossyTile::reduced_modes`).
+    mono_alpha: bool,
     /// Frame-level U/V weight used by the shared-tree partition proxy.
     chroma_part_weight: f32,
     allow_intrabc: bool,

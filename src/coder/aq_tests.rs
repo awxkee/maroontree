@@ -587,6 +587,7 @@ fn aq_grid_matches_serial() {
                     base_shift: 0,
                     qm: QmLevels::FLAT,
                     mono_large: false,
+                    mono_alpha: false,
                 };
                 t.enable_aq(base_q, ref_act, &vb);
                 t

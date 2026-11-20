@@ -203,6 +203,12 @@ const GREY_FLAT32_VAR: f32 = 0.5;
 /// found from: the 4:2:2 decision snapshot, the 4:2:2 or 4:2:0 mode-lambda
 /// operating point, trellis lambda +-15%, or the top-band ease.
 const GREY_BAND_TILT: f32 = 2.45;
+/// Alpha planes: scale on both the mode lambda and the trellis lambda. With
+/// 4x4 leaves on, ten planes at Slow vs the unscaled laws: -1.7% bytes at
+/// equal PSNR and -3.3% at equal SSIMULACRA2 (4x4 leaves alone -1.3 / -0.8).
+/// Mode lambda 0.5 is no better on PSNR and unstable per image; raising either
+/// lambda to 1.4 loses 0.4-0.6%. Band tilt 0 or 1.2 instead of 2.45: no effect.
+const ALPHA_LAMBDA_SCALE: f32 = 0.7;
 const GREY_MLAM_SCALE: f32 = 0.85;
 const SEAM_W_420: f32 = 0.0;
 const SEAM_W_422: f32 = 60.0;
@@ -359,6 +365,7 @@ impl<'a> LossyTile<'a> {
                 cw,
                 chroma,
                 mono_large: false,
+                mono_alpha: false,
                 chroma_part_weight: if mono {
                     0.0
                 } else {
@@ -1609,6 +1616,22 @@ impl<'a> LossyTile<'a> {
         self.luma_variance(px, py, 32, 32) * var_scale < GREY_FLAT32_VAR
     }
 
+    /// Whether this tile forbids the 16 -> 8 descent (the Medium floor).
+    /// Alpha planes are exempt: a mask is hard edges on flat fields, and a
+    /// 16x16 floor spends a whole block on every edge crossing.
+    #[inline]
+    pub(crate) fn min_size_16(&self) -> bool {
+        crate::tuning::min_size_16(self.cfg.speed) && !self.cfg.mono_alpha
+    }
+
+    /// Whether the leaf searches the reduced (Fast) non-directional mode set.
+    /// Alpha planes always search the full set: at Fast that is -18% bytes at
+    /// equal PSNR for +10% time (4 planes); on photo-like planes it is -1%.
+    #[inline]
+    pub(crate) fn reduced_modes(&self) -> bool {
+        self.cfg.speed.reduced_modes() && !self.cfg.mono_alpha
+    }
+
     #[inline]
     pub(crate) fn fast_grey(&self) -> bool {
         self.cfg.speed == Speed::Fast && self.cfg.is_mono() && !self.cfg.mono_large
@@ -1656,7 +1679,8 @@ impl<'a> LossyTile<'a> {
     /// from here.
     #[inline]
     fn trellis_lambda(&self) -> f32 {
-        trellis_lambda() * hbd_trellis_scale(self.cfg.chroma, self.cfg.bd, self.cfg.base_q_idx)
+        let l = trellis_lambda() * hbd_trellis_scale(self.cfg.chroma, self.cfg.bd, self.cfg.base_q_idx);
+        if self.cfg.mono_alpha { l * ALPHA_LAMBDA_SCALE } else { l }
     }
 
     fn top_band(&self) -> bool {
@@ -1842,7 +1866,8 @@ impl<'a> LossyTile<'a> {
         if self.cfg.is_mono() && !self.cfg.mono_large {
             return mode_lambda_weight(self.cfg.base_q_idx, self.chroma_sub()) * GREY_MLAM_SCALE;
         }
-        mode_lambda_weight(self.cfg.base_q_idx, if self.cfg.mono_large { 1 } else { self.chroma_sub() })
+        let w = mode_lambda_weight(self.cfg.base_q_idx, if self.cfg.mono_large { 1 } else { self.chroma_sub() });
+        if self.cfg.mono_alpha { w * ALPHA_LAMBDA_SCALE } else { w }
     }
 
     pub(crate) fn part_bl8_rate(&self, x8: usize, y8: usize, symbol: usize) -> f32 {
@@ -1858,7 +1883,10 @@ impl<'a> LossyTile<'a> {
     }
 
     fn prefer_8x8_none(&self, x8: usize, y8: usize, have_tr: bool, have_bl: bool) -> bool {
-        if self.cfg.is_mono() {
+        // 4:0:0 has no 4x4 partition leaves, except alpha planes: on mask
+        // edges they are -1.3% bytes at equal PSNR for ~2% time (ten planes),
+        // where grey photos got -0.2% for +29% time.
+        if self.cfg.is_mono() && !self.cfg.mono_alpha {
             return true;
         }
         let (px, py) = (x8 * 8, y8 * 8);
@@ -1872,7 +1900,7 @@ impl<'a> LossyTile<'a> {
         let prdo = self.perceptual_rd_scale(px, py, 8);
         let lam = self.trellis_lambda() * prdo;
         let mlam = self.mlam() * prdo;
-        let modes = if self.cfg.speed.reduced_modes() {
+        let modes = if self.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()
@@ -2074,7 +2102,7 @@ impl<'a> LossyTile<'a> {
             }
         }
         let (dcq, acq) = (self.ctx.quant.dc_q() as f32, self.ctx.quant.ac_q() as f32);
-        let modes = if self.cfg.speed.reduced_modes() {
+        let modes = if self.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()
@@ -3096,7 +3124,7 @@ impl<'a> LossyTile<'a> {
         // MUST be false when the min-size floor is on: the floor forces
         // `skip_split`, so also skipping NONE would leave BOTH legs at INFINITY
         // and no valid partition at this node.
-        let skip_none = !crate::tuning::min_size_16(self.cfg.speed)
+        let skip_none = !self.min_size_16()
             && match guided {
                 Some((m_none, m_split)) if gk > 0.0 => m_split * gk < m_none,
                 _ => false,
@@ -3150,7 +3178,7 @@ impl<'a> LossyTile<'a> {
         // Measured and rejected gates: a <=64-colour 16x16 histogram (photos
         // pass it too) and the moment-model SPLIT/NONE ratio (k=1 == no floor,
         // k=1.5 == floor).
-        let floor16 = crate::tuning::min_size_16(self.cfg.speed) && !self.cfg.screen_frame;
+        let floor16 = self.min_size_16() && !self.cfg.screen_frame;
         let skip_split = floor16
             || match guided {
                 Some((m_none, m_split))
@@ -3160,7 +3188,7 @@ impl<'a> LossyTile<'a> {
                 }
                 _ => false,
             };
-        let split4_ok = !self.cfg.is_mono();
+        let split4_ok = !self.cfg.is_mono() || self.cfg.mono_alpha;
         let best8 = |bx: usize, by: usize| -> f32 {
             let (cthr, clhb) = Self::child_edge_flags(bx - px, by - py, thr, lhb);
             let (htr8, hbl8) = self.leaf_edge_flags(bx, by, 8, cthr, clhb);

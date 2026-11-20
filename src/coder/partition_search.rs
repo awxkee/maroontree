@@ -4781,7 +4781,7 @@ impl<'a> LossyTile<'a> {
         let mut luma_beam: [Option<Luma16BeamCandidate>; JOINT_LARGE_BEAM] =
             std::array::from_fn(|_| None);
         let mut ltf = self.sbuf_f256(); // winner transform coeffs (f32, for winner-only RDOQ)
-        let modes = if self.cfg.speed.reduced_modes() {
+        let modes = if self.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()

@@ -725,7 +725,7 @@ impl<'a> LossyTile<'a> {
             std::array::from_fn(|_| None);
         let dc_sgn = self.dc_sign_ctx(0, px / 4, py / 4);
         let mut ltf = [0f32; 64]; // winner transform coeffs (f32, for winner-only RDOQ)
-        let modes = if self.cfg.speed.reduced_modes() {
+        let modes = if self.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()
