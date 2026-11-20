@@ -20,6 +20,26 @@ maroontree-cli -e jpeg -O 'jpeg:progressive=true,polish=trellis-greedy,polish-ju
 maroontree-cli -e jpeg --list-overrides
 ```
 
+### HDR conversion
+
+`--hdr-conversion pq` and `--hdr-conversion hlg` convert an embedded gain map or a PQ- or HLG-tagged image to BT.2020 PQ or HLG. PQ and HLG output use 10 bits or more. PNG output uses 16 bits.
+
+`--hdr-conversion gain-map` accepts PQ and HLG images and writes an SDR base with an embedded gain map. AV1 AVIF, JPEG XL, and HEIC support all three HDR representations as inputs and outputs. PQ- and HLG-tagged PNGs are also accepted as inputs. HEIC requires the `heic` build feature.
+
+Without `--hdr-conversion`, transcodes between the three formats preserve the source HDR representation. When a gain-map destination requires a different map, the CLI reconstructs the HDR image and generates a compatible map and SDR base. If you omit `--encoder`, the output extension selects the encoder.
+
+```sh
+maroontree-cli --hdr-conversion hlg photo-gain-map.avif photo-hlg.jxl
+maroontree-cli --hdr-conversion gain-map photo-hlg.jxl photo-gain-map.heic
+maroontree-cli --hdr-conversion pq photo-gain-map.heic photo-pq.avif
+```
+
+HLG conversion targets the BT.2100 1,000 cd/m² reference display. Highlights above that range are limited when converting to HLG. Gain-map conversion uses a 203 cd/m² reference white. [ITU-R BT.2100](https://www.itu.int/rec/R-REC-BT.2100-3-202502-I/en), [ITU-R BT.2408](https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2408-8-2024-PDF-E.pdf)
+
+### AVIF decoder builds
+
+The CLI's ISOBMFF reader extracts AVIF image items for rav1d. Default builds, including ordinary debug builds, use rav1d's Rust implementation. CLI release builds in CI enable `avif-asm`. To enable the same optimizations locally, run `cargo build -p maroontree-cli --release --features avif-asm`. Install NASM for x86 targets. [rav1d build instructions](https://github.com/memorysafety/rav1d/blob/main/README.md)
+
 ## License
 
 This project is licensed under either of

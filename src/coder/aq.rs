@@ -96,8 +96,9 @@ pub(crate) struct VarianceBoost {
     /// the AQ protection side anchors to `base_q - base_shift`.
     pub base_shift: i32,
     pub qm: QmLevels,
-    /// 4:0:0 alpha profile: allow 16x16/32x32 luma leaves (bottom-up priced).
-    /// Plain grey images keep the 8x8 leaves, which measured better there.
+    /// 4:0:0 fidelity profile (alpha planes, gain maps): 16x16/32x32 luma
+    /// leaves (bottom-up priced) plus the 4:2:2 luma laws, see
+    /// `LossyTile::with_mono_large`.
     pub mono_large: bool,
 }
 

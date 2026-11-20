@@ -299,19 +299,38 @@ impl<'a> LossyTile<'a> {
         thr: bool,
         lhb: bool,
     ) -> PartVerdict {
-        // Grey 4:0:0 keeps 8x8 leaves; the alpha profile (`mono_large`) runs a
-        // luma-only NONE vs SPLIT here (the rect32 legs have no mono emitter).
+        // Grey 4:0:0 keeps 8x8 leaves. The cost is a placeholder, as in
+        // fixed-partition mode below: mono has no whole-64 node and no trial
+        // levels, so every caller keeps only the partition. Pricing the split
+        // here ran four 16x16 mode searches per 32x32 for nothing (11-22% of
+        // grey encode time).
         if self.cfg.is_mono() && !self.cfg.mono_large {
-            let (px, py) = (x8 * 8, y8 * 8);
-            return PartVerdict::unmeasured(Part16::Split, self.rd_cost_split32(px, py, prdo, thr, lhb));
+            if self.grey_flat32(x8 * 8, y8 * 8) {
+                return PartVerdict::unmeasured(Part16::None, 0.0);
+            }
+            return PartVerdict::unmeasured(Part16::Split, 0.0);
         }
+        // The fidelity profile (`mono_large`) runs a luma-only NONE vs SPLIT
+        // (the rect32 legs have no mono emitter). NONE is priced like the color
+        // path below: the split-favoring bias plus its partition symbol (bare
+        // NONE over-merged textured 32x32s).
         if self.cfg.is_mono() && crate::tuning::fixed_size(self.cfg.speed) == 0 {
             let (px, py) = (x8 * 8, y8 * 8);
             let split = self.rd_cost_split32(px, py, prdo, thr, lhb);
             let none = known_none.unwrap_or_else(|| {
                 let (htr32, hbl32) = self.leaf_edge_flags(px, py, 32, thr, lhb);
                 self.rd_cost_none32(px, py, prdo, htr32, hbl32)
-            });
+            }) * self.none32_split_bias_at()
+                + rate_cost(self.mlam() * prdo, self.part_rate_bl(2, x8, y8, 0));
+            // Whole-32 IntraBC copy (luma-only skip copy at 4:0:0).
+            let ibc = if self.cfg.allow_intrabc {
+                self.rd_cost_intrabc(px, py, 32, thr, prdo).unwrap_or(f32::INFINITY)
+            } else {
+                f32::INFINITY
+            };
+            if ibc < none.min(split) {
+                return PartVerdict::unmeasured(Part16::Intrabc, ibc);
+            }
             return if none < split {
                 PartVerdict::unmeasured(Part16::None, none)
             } else {

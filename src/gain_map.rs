@@ -678,7 +678,10 @@ fn encode_gray_map<T: Pixel>(
     // A gain map is a fidelity plane: its error is HDR gain in stops, and the
     // same error matters equally everywhere. The base image's perceptual AQ
     // (variance boost, dark protection) and quantization matrices target the
-    // eye and only cost bits here.
+    // eye and only cost bits here. It takes the alpha-style large-leaf
+    // profile (16x16/32x32 leaves), which is judged by PSNR like this plane.
+    let mut vb = crate::coder::VarianceBoost::off();
+    vb.mono_large = true;
     crate::encoder::encode_lossy_gray_obu(
         &img.packed_1(),
         img.bit_depth,
@@ -687,7 +690,7 @@ fn encode_gray_map<T: Pixel>(
         cfg.threads,
         cfg.speed,
         false,
-        crate::coder::VarianceBoost::off(),
+        vb,
         cfg.cdef_enabled(),
         cfg.wiener,
         cfg.updating_cdf,

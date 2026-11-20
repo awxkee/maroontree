@@ -4770,6 +4770,57 @@ mod tests {
     }
 
     #[test]
+    fn lossy_intrabc_mono_decodes_and_uses_reconstruction() {
+        let Some(decoder) = dav1d() else {
+            return;
+        };
+        // 4:0:0 twin of the non-default-DV test: luma-only IntraBC copies
+        // (no chroma planes or UV contexts) must decode exactly as priced.
+        // Noise, not the 64-periodic ramp, so each copy has one source.
+        let (w, h) = (512usize, 64usize);
+        let mut plane = vec![0u16; w * h];
+        let mut state = 0x0400_1bc0u32;
+        for y in 0..h {
+            for x in 0..128 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                plane[y * w + x] = (state >> 24) as u16;
+            }
+            plane.copy_within(y * w + 3..y * w + 67, y * w + 384);
+            plane.copy_within(y * w + 64..y * w + 128, y * w + 448);
+        }
+        let _counters = crate::coder::EMIT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::coder::LOSSY_INTRABC_EMITTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let obu = crate::dispatch::encode_lossy_monochrome(
+            80,
+            8,
+            w,
+            h,
+            &plane,
+            true,
+            1,
+            crate::Speed::Slow,
+            false,
+            crate::coder::VarianceBoost::off(),
+            false,
+            false,
+            true,
+            true,
+            true,
+        );
+        let emitted = crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(emitted >= 2, "mono IntraBC emitted {emitted} blocks");
+        let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-mono");
+        assert!(decoded.len() >= w * h);
+        let luma = &decoded[..w * h];
+        for y in 0..h {
+            assert_eq!(&luma[y * w + 3..y * w + 67], &luma[y * w + 384..y * w + 448]);
+            assert_eq!(&luma[y * w + 64..y * w + 128], &luma[y * w + 448..y * w + 512]);
+        }
+    }
+
+    #[test]
     fn alpha_plane_lossy_profile_decodes_and_quality_100_is_lossless() {
         let Some(decoder) = dav1d() else {
             return;

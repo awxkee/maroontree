@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::gainmap::{ParsedGainMap, parse_apple_gain_map};
+use crate::iso_tmap::{self, ToneMap};
 use crate::orientation::apply_orientation;
 use crate::{
     Args, Chroma, Depth, EncodingEffort, has_alpha_channel, is_gray, scale16_to_10, scale16_to_12,
@@ -79,13 +80,31 @@ pub(crate) fn decode_heic_file_url(
     file: &PathBuf,
     load_gain_map: bool,
 ) -> Result<DecodedHeic, HeicError> {
-    let settings = hpvcd::HeicSettings::new().with_decode_gain_map(load_gain_map);
-    let dec = hpvcd::decode_heic_yuv_with_settings(
-        &fs::read(file).map_err(|x| HeicError::Io(x.to_string()))?,
-        &settings,
-    )
-    .map_err(|e| HeicError::Format(format!("hpvcd: {e}")))?;
-    let gain_map = dec.gain_map.as_ref().and_then(|gain| {
+    let bytes = fs::read(file).map_err(|x| HeicError::Io(x.to_string()))?;
+    decode_heic(bytes, load_gain_map)
+}
+
+fn decode_heic(mut bytes: Vec<u8>, load_gain_map: bool) -> Result<DecodedHeic, HeicError> {
+    let iso_gain_map = if load_gain_map {
+        match iso_tmap::read_tone_map(&bytes).and_then(|map| {
+            map.map(|map| decode_iso_gain_map(&mut bytes, map))
+                .transpose()
+        }) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("gainmap: cannot read HEIC ISO tone map: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let settings =
+        hpvcd::HeicSettings::new().with_decode_gain_map(load_gain_map && iso_gain_map.is_none());
+    let dec = hpvcd::decode_heic_yuv_with_settings(&bytes, &settings)
+        .map_err(|e| HeicError::Format(format!("hpvcd: {e}")))?;
+    let gain_map = iso_gain_map.or_else(|| {
+        let gain = dec.gain_map.as_ref()?;
         match parse_apple_gain_map(gain, dec.exif.as_deref()) {
             Ok(parsed) => Some(parsed),
             Err(error) => {
@@ -109,19 +128,46 @@ pub(crate) fn decode_heic_file_url(
     })
 }
 
+fn decode_iso_gain_map(bytes: &mut [u8], map: ToneMap) -> anyhow::Result<ParsedGainMap> {
+    // hpvcd exposes the primary image and legacy Apple auxiliaries. Select the
+    // item referenced by the ISO tone map as primary, keeping grid and image
+    // properties in place for hpvcd's HEIF decoder.
+    u16::try_from(map.gain_item)?;
+    let base_item = iso_tmap::set_primary_item(bytes, map.gain_item)?;
+    let settings = hpvcd::HeicSettings::new()
+        .with_decode_alpha(false)
+        .with_decode_gain_map(false);
+    let decoded = hpvcd::decode_heic_yuv_with_settings(bytes, &settings);
+    iso_tmap::set_primary_item(bytes, base_item)?;
+    let decoded = decoded?;
+    let image = heic_to_image(&decoded)?;
+    let image = if decoded.chroma == hpvcd::ChromaFormat::Monochrome {
+        DynamicImage::ImageLuma16(image.into_luma16())
+    } else {
+        DynamicImage::ImageRgb16(image.into_rgb16())
+    };
+    Ok(ParsedGainMap {
+        image,
+        metadata: map.metadata,
+        alternate_cicp: map.alternate_cicp,
+        alternate_icc: map.alternate_icc,
+    })
+}
+
 fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
     use hpvcd::{ChromaFormat, MatrixCoefficients};
     use yuv::{
-        YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, i010_alpha_to_rgba10,
-        i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12, i210_alpha_to_rgba10, i210_to_rgb10,
-        i212_alpha_to_rgba12, i212_to_rgb12, i410_alpha_to_rgba10, i410_to_rgb10,
-        i412_alpha_to_rgba12, i412_to_rgb12, icgc010_alpha_to_rgba10, icgc010_to_rgb10,
-        icgc012_alpha_to_rgba12, icgc012_to_rgb12, icgc210_alpha_to_rgba10, icgc210_to_rgb10,
-        icgc212_alpha_to_rgba12, icgc212_to_rgb12, icgc410_alpha_to_rgba10, icgc410_to_rgb10,
-        icgc412_alpha_to_rgba12, icgc412_to_rgb12, ycgco420_alpha_to_rgba, ycgco420_to_rgb,
-        ycgco422_alpha_to_rgba, ycgco422_to_rgb, ycgco444_alpha_to_rgba, ycgco444_to_rgb,
-        yuv420_alpha_to_rgba, yuv420_to_rgb, yuv422_alpha_to_rgba, yuv422_to_rgb,
-        yuv444_alpha_to_rgba, yuv444_to_rgb,
+        YuvPlanarImage, YuvPlanarImageWithAlpha, YuvRange, YuvStandardMatrix, gb10_alpha_to_rgba10,
+        gb10_to_rgb10, gb12_alpha_to_rgba12, gb12_to_rgb12, gbr_to_rgb, gbr_with_alpha_to_rgba,
+        i010_alpha_to_rgba10, i010_to_rgb10, i012_alpha_to_rgba12, i012_to_rgb12,
+        i210_alpha_to_rgba10, i210_to_rgb10, i212_alpha_to_rgba12, i212_to_rgb12,
+        i410_alpha_to_rgba10, i410_to_rgb10, i412_alpha_to_rgba12, i412_to_rgb12,
+        icgc010_alpha_to_rgba10, icgc010_to_rgb10, icgc012_alpha_to_rgba12, icgc012_to_rgb12,
+        icgc210_alpha_to_rgba10, icgc210_to_rgb10, icgc212_alpha_to_rgba12, icgc212_to_rgb12,
+        icgc410_alpha_to_rgba10, icgc410_to_rgb10, icgc412_alpha_to_rgba12, icgc412_to_rgb12,
+        ycgco420_alpha_to_rgba, ycgco420_to_rgb, ycgco422_alpha_to_rgba, ycgco422_to_rgb,
+        ycgco444_alpha_to_rgba, ycgco444_to_rgb, yuv420_alpha_to_rgba, yuv420_to_rgb,
+        yuv422_alpha_to_rgba, yuv422_to_rgb, yuv444_alpha_to_rgba, yuv444_to_rgb,
     };
 
     let w = u32::try_from(dec.width())
@@ -143,6 +189,10 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
     let mut matrix = YuvStandardMatrix::Bt601;
     let mut range = YuvRange::Limited;
     let mut is_ycgco = false;
+    let is_identity = dec
+        .color
+        .cicp
+        .is_some_and(|enc| enc.matrix == MatrixCoefficients::Identity);
     if let Some(enc) = &dec.color.cicp {
         matrix = match enc.matrix {
             MatrixCoefficients::Smpte170m => YuvStandardMatrix::Bt601,
@@ -168,6 +218,11 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
     if dec.chroma == ChromaFormat::Monochrome {
         return finish_monochrome(dec, w, h, high_bit, is_12);
     }
+    if is_identity && dec.chroma != ChromaFormat::Yuv444 {
+        return Err(HeicError::Format(
+            "identity matrix requires 4:4:4 chroma".into(),
+        ));
+    }
 
     let rgb_stride = w * 3;
     let rgba_stride = w * 4;
@@ -190,7 +245,7 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
         let cb_stride = plane_stride(cb)?;
         let cr_stride = plane_stride(cr)?;
 
-        if is_ycgco {
+        if is_ycgco || is_identity {
             if let Some(a) = dec.alpha.as_ref().and_then(|a| a.as_u16()) {
                 let yuva = YuvPlanarImageWithAlpha {
                     y_plane: y16,
@@ -205,15 +260,17 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
                     height: h,
                 };
                 let mut out = vec![0u16; (w * 4 * h) as usize];
-                match (sub_w, sub_h, is_12) {
-                    (2, 2, false) => icgc010_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
-                    (2, 1, false) => icgc210_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
-                    (_, _, false) => icgc410_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
-                    (2, 2, true) => icgc012_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
-                    (2, 1, true) => icgc212_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
-                    (_, _, true) => icgc412_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
+                match (is_identity, sub_w, sub_h, is_12) {
+                    (true, _, _, false) => gb10_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
+                    (true, _, _, true) => gb12_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
+                    (false, 2, 2, false) => icgc010_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
+                    (false, 2, 1, false) => icgc210_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
+                    (false, _, _, false) => icgc410_alpha_to_rgba10(&yuva, &mut out, w * 4, range),
+                    (false, 2, 2, true) => icgc012_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
+                    (false, 2, 1, true) => icgc212_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
+                    (false, _, _, true) => icgc412_alpha_to_rgba12(&yuva, &mut out, w * 4, range),
                 }
-                .map_err(|e| HeicError::Format(format!("icgc→rgba16: {e}")))?;
+                .map_err(|e| HeicError::Format(format!("HEIC planar RGB→rgba16: {e}")))?;
                 expand_to_16bit(&mut out, is_12);
                 rgba16_image(w, h, out)?
             } else {
@@ -228,15 +285,17 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
                     height: h,
                 };
                 let mut out = vec![0u16; (w * 3 * h) as usize];
-                match (sub_w, sub_h, is_12) {
-                    (2, 2, false) => icgc010_to_rgb10(&yuv, &mut out, w * 3, range),
-                    (2, 1, false) => icgc210_to_rgb10(&yuv, &mut out, w * 3, range),
-                    (_, _, false) => icgc410_to_rgb10(&yuv, &mut out, w * 3, range),
-                    (2, 2, true) => icgc012_to_rgb12(&yuv, &mut out, w * 3, range),
-                    (2, 1, true) => icgc212_to_rgb12(&yuv, &mut out, w * 3, range),
-                    (_, _, true) => icgc412_to_rgb12(&yuv, &mut out, w * 3, range),
+                match (is_identity, sub_w, sub_h, is_12) {
+                    (true, _, _, false) => gb10_to_rgb10(&yuv, &mut out, w * 3, range),
+                    (true, _, _, true) => gb12_to_rgb12(&yuv, &mut out, w * 3, range),
+                    (false, 2, 2, false) => icgc010_to_rgb10(&yuv, &mut out, w * 3, range),
+                    (false, 2, 1, false) => icgc210_to_rgb10(&yuv, &mut out, w * 3, range),
+                    (false, _, _, false) => icgc410_to_rgb10(&yuv, &mut out, w * 3, range),
+                    (false, 2, 2, true) => icgc012_to_rgb12(&yuv, &mut out, w * 3, range),
+                    (false, 2, 1, true) => icgc212_to_rgb12(&yuv, &mut out, w * 3, range),
+                    (false, _, _, true) => icgc412_to_rgb12(&yuv, &mut out, w * 3, range),
                 }
-                .map_err(|e| HeicError::Format(format!("icgc→rgb16: {e}")))?;
+                .map_err(|e| HeicError::Format(format!("HEIC planar RGB→rgb16: {e}")))?;
                 expand_to_16bit(&mut out, is_12);
                 rgb16_image(w, h, out)?
             }
@@ -309,7 +368,7 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
         let cb_stride = plane_stride(cb)?;
         let cr_stride = plane_stride(cr)?;
 
-        if is_ycgco {
+        if is_ycgco || is_identity {
             if let Some(a) = dec.alpha.as_ref().and_then(|a| a.as_u8()) {
                 let yuv = YuvPlanarImageWithAlpha {
                     y_plane: y8,
@@ -324,12 +383,13 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
                     height: h,
                 };
                 let mut rgba = vec![0u8; (rgba_stride * h) as usize];
-                match (sub_w, sub_h) {
-                    (2, 2) => ycgco420_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
-                    (2, 1) => ycgco422_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
+                match (is_identity, sub_w, sub_h) {
+                    (true, _, _) => gbr_with_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
+                    (false, 2, 2) => ycgco420_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
+                    (false, 2, 1) => ycgco422_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
                     _ => ycgco444_alpha_to_rgba(&yuv, &mut rgba, rgba_stride, range),
                 }
-                .map_err(|e| HeicError::Format(format!("ycgco→rgba: {e}")))?;
+                .map_err(|e| HeicError::Format(format!("HEIC planar RGB→rgba: {e}")))?;
                 rgba8_image(w, h, rgba)?
             } else {
                 let yuv = YuvPlanarImage {
@@ -343,12 +403,13 @@ fn heic_to_image(dec: &hpvcd::DecodedYuv) -> Result<DynamicImage, HeicError> {
                     height: h,
                 };
                 let mut rgb = vec![0u8; (rgb_stride * h) as usize];
-                match (sub_w, sub_h) {
-                    (2, 2) => ycgco420_to_rgb(&yuv, &mut rgb, rgb_stride, range),
-                    (2, 1) => ycgco422_to_rgb(&yuv, &mut rgb, rgb_stride, range),
+                match (is_identity, sub_w, sub_h) {
+                    (true, _, _) => gbr_to_rgb(&yuv, &mut rgb, rgb_stride, range),
+                    (false, 2, 2) => ycgco420_to_rgb(&yuv, &mut rgb, rgb_stride, range),
+                    (false, 2, 1) => ycgco422_to_rgb(&yuv, &mut rgb, rgb_stride, range),
                     _ => ycgco444_to_rgb(&yuv, &mut rgb, rgb_stride, range),
                 }
-                .map_err(|e| HeicError::Format(format!("ycgco→rgb: {e}")))?;
+                .map_err(|e| HeicError::Format(format!("HEIC planar RGB→rgb: {e}")))?;
                 rgb8_image(w, h, rgb)?
             }
         } else if let Some(a) = dec.alpha.as_ref().and_then(|a| a.as_u8()) {
@@ -423,7 +484,15 @@ fn rgba16_image(w: u32, h: u32, buf: Vec<u16>) -> Result<DynamicImage, HeicError
     ))
 }
 
-/// 4:0:0 monochrome: replicate the luma plane across R, G, B.
+/// Convert decoded monochrome luma to the same full-range domain as RGB.
+fn expand_luma_range(value: u16, depth: hpvcd::BitDepth) -> u16 {
+    let black = 16 << depth.minus8();
+    let span = 219 << depth.minus8();
+    let value = value.saturating_sub(black).min(span);
+    let scaled = u32::from(value) * u32::from(depth.max_val()) + u32::from(span / 2);
+    (scaled / u32::from(span)) as u16
+}
+
 fn finish_monochrome(
     dec: &hpvcd::DecodedYuv,
     w: u32,
@@ -431,12 +500,18 @@ fn finish_monochrome(
     high_bit: bool,
     is_12: bool,
 ) -> Result<DynamicImage, HeicError> {
+    let limited = dec.color.cicp.is_some_and(|cicp| !cicp.full_range);
     let img = if high_bit {
         let planes = dec
             .planes
             .as_u16()
             .ok_or_else(|| HeicError::Format("HEIC monochrome luma is not 10/12-bit".into()))?;
         let mut y = tight_plane(&planes.y);
+        if limited {
+            for sample in &mut y {
+                *sample = expand_luma_range(*sample, dec.bit_depth);
+            }
+        }
         if let Some(alpha) = dec.alpha.as_ref().and_then(|a| a.as_u16()) {
             let alpha = tight_plane(alpha);
             if y.len() != alpha.len() {
@@ -471,7 +546,12 @@ fn finish_monochrome(
             .planes
             .as_u8()
             .ok_or_else(|| HeicError::Format("HEIC monochrome luma is not 8-bit".into()))?;
-        let y = tight_plane(&planes.y);
+        let mut y = tight_plane(&planes.y);
+        if limited {
+            for sample in &mut y {
+                *sample = expand_luma_range(u16::from(*sample), dec.bit_depth) as u8;
+            }
+        }
         if let Some(alpha) = dec.alpha.as_ref().and_then(|a| a.as_u8()) {
             let alpha = tight_plane(alpha);
             if y.len() != alpha.len() {
@@ -610,7 +690,10 @@ pub(crate) fn encode_hevc(
                         heic.headroom.log2(),
                     );
                 }
-                cfg = cfg.with_gain_map(heic);
+                cfg = cfg.with_gain_map(heic.with_lossless(args.lossless));
+            }
+            Err(error) if args.hdr_conversion == Some(crate::HdrConversion::ToGainMap) => {
+                return Err(error.context("cannot encode HEIC gain map"));
             }
             Err(error) => eprintln!("gainmap: skipping gain map: {error:#}"),
         }
@@ -678,6 +761,74 @@ pub(crate) fn encode_hevc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_iso_heic_gain_map_without_apple_auxiliary_type() {
+        let hlg = crate::PngCicp {
+            color_primaries: 9,
+            transfer_function: 18,
+            matrix_coefficients: 0,
+            full_range: true,
+        };
+        let samples: Vec<_> = (0..16 * 16)
+            .map(|i| if i % 16 < 8 { 0 } else { 255 })
+            .collect();
+        let gain_map = hpvca::GainMap::gray8(samples, 16, 16, 4.0)
+            .with_alternate_color(hpvca::ColorMetadata::cicp(hpvca_cicp(hlg)))
+            .with_lossless(true);
+        let cfg = hpvca::EncodeConfig::new()
+            .with_threads(1)
+            .with_gain_map(gain_map)
+            .with_lossless(true)
+            .with_chroma(ChromaFormat::Yuv444);
+        let mut encoded = hpvca::encode_rgb(&[128; 32 * 32 * 3], 32, 32, &cfg).unwrap();
+        let urn = b"urn:com:apple:photo:2020:aux:hdrgainmap";
+        let offset = encoded.windows(urn.len()).position(|w| w == urn).unwrap();
+        encoded[offset] = b'x';
+
+        let image = decode_heic(encoded, true).unwrap();
+        assert_eq!((image.image.width(), image.image.height()), (32, 32));
+        let gain_map = image.gain_map.expect("ISO tone map is present");
+        assert_eq!(gain_map.alternate_cicp.unwrap().transfer_function, 18);
+        assert_eq!(gain_map.metadata.alternate_hdr_headroom(), 2.0);
+        let gain_map = gain_map.image.into_luma16();
+        assert_eq!(gain_map.dimensions(), (16, 16));
+        for row in gain_map.rows() {
+            for (i, sample) in row.enumerate() {
+                assert_eq!(sample.0[0], if i < 8 { 0 } else { u16::MAX });
+            }
+        }
+    }
+
+    #[test]
+    fn imports_full_range_samples_from_limited_range_hdr_heic() {
+        for transfer_function in [16, 18] {
+            let cicp = hpvca_cicp(crate::PngCicp {
+                color_primaries: 9,
+                transfer_function,
+                matrix_coefficients: 0,
+                full_range: true,
+            });
+            let cfg = hpvca::EncodeConfig::new()
+                .with_threads(1)
+                .with_lossless(true)
+                .with_cicp(hpvca::Cicp {
+                    full_range: false,
+                    ..cicp
+                });
+            let samples: Vec<_> = (0..16 * 16)
+                .map(|i| if i % 16 < 8 { 64 } else { 940 })
+                .collect();
+            let encoded = hpvca::encode_gray10(&samples, 16, 16, &cfg).unwrap();
+            let image = decode_heic(encoded, false).unwrap();
+            let cicp = image.cicp.unwrap();
+            assert_eq!(cicp.transfer_function, transfer_function);
+            assert!(cicp.full_range);
+            let image = image.image.into_luma16();
+            assert_eq!(image.get_pixel(0, 0).0[0], 0);
+            assert_eq!(image.get_pixel(8, 0).0[0], u16::MAX);
+        }
+    }
 
     #[test]
     fn grouped_heic_settings_reach_lossy_and_lossless_output() {

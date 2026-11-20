@@ -685,7 +685,9 @@ pub(crate) fn make_av1c(
     let (sub_x, sub_y) = match chroma {
         ChromaFormat::Yuv420 => (true, true),
         ChromaFormat::Yuv422 => (true, false),
-        ChromaFormat::Yuv444 | ChromaFormat::Monochrome => (false, false),
+        ChromaFormat::Yuv444 => (false, false),
+        // AV1 color_config infers both subsampling flags for monochrome.
+        ChromaFormat::Monochrome => (true, true),
     };
     isobmff::Av1cParams {
         seq_profile: av1_profile(bit_depth, chroma),

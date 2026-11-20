@@ -35,8 +35,40 @@ pub(crate) fn wiener_restore_icdf() -> Vec<u16> {
     icdf(&[11570])
 }
 
+/// Luma loop-restoration unit size (`lr_unit_shift = 0`, see `write_lr_params`).
+const LR_UNIT: usize = 64;
+
+/// The LR units the superblock at frame-absolute luma pixel `(x, y)` codes in
+/// `read_lr` (spec 5.11.57), as `(rows, cols)` unit-index ranges.
+///
+/// `frame_w` / `frame_h` must be the DISPLAYED frame size (`FrameWidth` /
+/// `FrameHeight`), not the 8-aligned coded size: the decoder sizes the unit
+/// grid with `count_units_in_frame(unitSize, FrameWidth)`, and a frame whose
+/// `(W + 32) / 64` differs from `(W8 + 32) / 64` (e.g. W = 2142, W8 = 2144)
+/// would otherwise get an extra unit column of symbols the decoder never reads.
+fn lr_sb_units(
+    frame_w: usize,
+    frame_h: usize,
+    x: usize,
+    y: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    const MI: usize = 4;
+    let count_units = |frame: usize| -> usize { 1.max((frame + (LR_UNIT >> 1)) / LR_UNIT) };
+    let unit_rows = count_units(frame_h);
+    let unit_cols = count_units(frame_w);
+    // Superblock position in 4x4 MI units (luma).
+    let (r, c) = (y / MI, x / MI);
+    let sb_mi = 64 / MI; // 64x64 superblocks
+    let urs = (r * MI).div_ceil(LR_UNIT);
+    let ure = unit_rows.min(((r + sb_mi) * MI).div_ceil(LR_UNIT));
+    let ucs = (c * MI).div_ceil(LR_UNIT);
+    let uce = unit_cols.min(((c + sb_mi) * MI).div_ceil(LR_UNIT));
+    (urs..ure.max(urs), ucs..uce.max(ucs))
+}
+
 /// `read_lr` symbols owed by the superblock at tile-local `(sb_x, sb_y)` (spec
-/// 5.11.57); geometry rationale on `LossyTile::emit_lr_sb`.
+/// 5.11.57); geometry rationale on `LossyTile::emit_lr_sb`. `frame_w` /
+/// `frame_h` are the displayed frame size (see [`lr_sb_units`]).
 #[allow(clippy::too_many_arguments)]
 fn emit_lr_sb_syms(
     enc: &mut OdEcEncoder,
@@ -51,23 +83,9 @@ fn emit_lr_sb_syms(
     sb_x: usize,
     sb_y: usize,
 ) {
-    const UNIT: usize = 64;
-    const MI: usize = 4;
-    let count_units = |frame: usize| -> usize { 1.max((frame + (UNIT >> 1)) / UNIT) };
-    let unit_rows = count_units(frame_h);
-    let unit_cols = count_units(frame_w);
-    // Frame-absolute superblock position in 4x4 MI units (luma).
-    let r = (frame_y0 + sb_y) / MI;
-    let c = (frame_x0 + sb_x) / MI;
-    let sb_mi = UNIT / MI; // 16
-    let urs = (r * MI).div_ceil(UNIT);
-    let ure = unit_rows.min(((r + sb_mi) * MI).div_ceil(UNIT));
-    let ucs = (c * MI).div_ceil(UNIT);
-    let uce = unit_cols.min(((c + sb_mi) * MI).div_ceil(UNIT));
-    for _ur in urs..ure {
-        for _uc in ucs..uce {
-            emit_lr_unit_syms(enc, wr_cdf, lr_ref_v, lr_ref_h, unit);
-        }
+    let (rows, cols) = lr_sb_units(frame_w, frame_h, frame_x0 + sb_x, frame_y0 + sb_y);
+    for _ in rows.flat_map(|_| cols.clone()) {
+        emit_lr_unit_syms(enc, wr_cdf, lr_ref_v, lr_ref_h, unit);
     }
 }
 
@@ -178,16 +196,19 @@ impl TileJob<'_> {
         .with_visible(disp.0.saturating_sub(r.x0), disp.1.saturating_sub(r.y0))
         .with_intrabc(self.allow_intrabc, ibc_index)
         .with_screen_content(self.screen_content)
-        .with_updating_cdf(self.updating_cdf);
-        tile.cfg.mono_large = self.chroma == Chroma::Mono && vb.mono_large;
+        .with_updating_cdf(self.updating_cdf)
+        // Screen and IntraBC frames take the large-leaf profile too: their
+        // copies and palettes live at the 16/32 levels.
+        .with_mono_large(vb.mono_large || self.screen_frame || self.allow_intrabc);
         tile.cfg.screen_frame = self.screen_frame;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
-        // origin and the full frame luma size so `read_lr` is computed in frame
-        // coordinates regardless of tiling.
+        // origin and the DISPLAYED frame luma size (the decoder's LR unit grid is
+        // counted on FrameWidth/FrameHeight, not the 8-aligned coded size) so
+        // `read_lr` is computed in frame coordinates regardless of tiling.
         tile.cfg.frame_x0 = r.x0;
         tile.cfg.frame_y0 = r.y0;
-        tile.cfg.frame_w = self.full_w;
-        tile.cfg.frame_h = self.full_h;
+        tile.cfg.frame_w = disp.0;
+        tile.cfg.frame_h = disp.1;
         tile.cfg.ibc_end4 = (
             (tile.cfg.w / 4).min(disp.0.div_ceil(4).saturating_sub(r.x0 / 4)),
             (tile.cfg.h / 4).min(disp.1.div_ceil(4).saturating_sub(r.y0 / 4)),
@@ -398,8 +419,8 @@ fn replay_tile_with_filters(
     trace: &crate::odec::SymbolTrace,
     lr: Option<&crate::wiener::WienerUnit>,
     cdef: Option<&CdefReplay>,
-    frame_w: usize,
-    frame_h: usize,
+    disp_w: usize,
+    disp_h: usize,
     updating_cdf: bool,
 ) -> Vec<u8> {
     let mut enc = OdEcEncoder::new().with_updating_cdf(updating_cdf);
@@ -418,8 +439,8 @@ fn replay_tile_with_filters(
                     unit,
                     r.x0,
                     r.y0,
-                    frame_w,
-                    frame_h,
+                    disp_w,
+                    disp_h,
                     sb_x,
                     sb_y,
                 );
@@ -455,5 +476,121 @@ pub(crate) fn resolve_threads(threads: usize) -> usize {
             .unwrap_or(1)
     } else {
         threads
+    }
+}
+
+#[cfg(test)]
+mod lr_tests {
+    use super::*;
+
+    /// Spec `count_units_in_frame(64, size)`.
+    fn spec_units(size: usize) -> usize {
+        1.max((size + 32) / 64)
+    }
+
+    /// Walk the 64x64 SB grid of the CODED (8-aligned) frame, as the tile loop
+    /// does, and collect every unit `read_lr` codes for the DISPLAYED size.
+    fn coded_units(disp_w: usize, disp_h: usize) -> Vec<(usize, usize)> {
+        let (w8, h8) = (disp_w.div_ceil(8) * 8, disp_h.div_ceil(8) * 8);
+        let mut units = Vec::new();
+        for y in (0..h8).step_by(64) {
+            for x in (0..w8).step_by(64) {
+                let (rows, cols) = lr_sb_units(disp_w, disp_h, x, y);
+                units.extend(rows.flat_map(|r| cols.clone().map(move |c| (r, c))));
+            }
+        }
+        units
+    }
+
+    #[test]
+    fn lr_units_cover_displayed_grid_exactly_once() {
+        // 2142x2856 = the Apple gain map that desynced dav1d/libaom: W8 = 2144
+        // gives 34 unit columns, FrameWidth = 2142 gives the decoder's 33.
+        // 94 / 671 / 1054 also cross the half-unit rounding when 8-aligned.
+        for (w, h) in [
+            (2142, 2856),
+            (94, 64),
+            (1054, 671),
+            (16, 16),
+            (64, 64),
+            (1088, 1024),
+            (2141, 31),
+        ] {
+            let units = coded_units(w, h);
+            let mut want = Vec::new();
+            for r in 0..spec_units(h) {
+                for c in 0..spec_units(w) {
+                    want.push((r, c));
+                }
+            }
+            let mut got = units.clone();
+            got.sort_unstable();
+            assert_eq!(got, want, "{w}x{h}: units not covered exactly once");
+        }
+        // The regression itself: the last SB column of the 2142-wide frame
+        // (x = 2112) owes no unit; the 33rd unit column is coded by x = 2048.
+        let (rows, cols) = lr_sb_units(2142, 2856, 2112, 0);
+        assert!(cols.is_empty(), "rows {rows:?} cols {cols:?}");
+        assert_eq!(lr_sb_units(2142, 2856, 2048, 0).1, 32..33);
+    }
+
+    #[test]
+    fn lr_replay_emits_spec_unit_count_for_unaligned_frames() {
+        // An empty trace makes the replay payload pure `read_lr` syntax, so it
+        // must equal exactly `unitRows * unitCols` units coded back to back.
+        let unit = crate::wiener::WienerUnit {
+            h: [0, 1, 3],
+            v: [-1, 2, 2],
+        };
+        // (displayed w, h, tile columns): includes a two-tile split so the
+        // frame-absolute origin of the second tile is exercised.
+        for (disp_w, disp_h, tiles) in [(94usize, 64usize, 1usize), (1054, 671, 2), (2142, 120, 1)]
+        {
+            let (w8, h8) = (disp_w.div_ceil(8) * 8, disp_h.div_ceil(8) * 8);
+            let split = if tiles == 2 { 512 } else { w8 };
+            let rects: Vec<TileRect> = [(0, split), (split, w8)]
+                .into_iter()
+                .filter(|&(a, b)| a < b)
+                .map(|(x0, x1)| TileRect {
+                    x0,
+                    y0: 0,
+                    tw: x1 - x0,
+                    th: h8,
+                    cx0: x0,
+                    cy0: 0,
+                    ctw: x1 - x0,
+                    cth: h8,
+                })
+                .collect();
+            for r in &rects {
+                let mut trace = crate::odec::SymbolTrace::default();
+                let sbs = r.tw.div_ceil(64) * r.th.div_ceil(64);
+                for _ in 0..sbs {
+                    trace.mark();
+                }
+                let got =
+                    replay_tile_with_filters(r, &trace, Some(&unit), None, disp_w, disp_h, true);
+
+                // Units this tile owns: columns whose SB (top-left corner) lies
+                // in the tile, all rows.
+                let tile_cols = (0..spec_units(disp_w))
+                    .filter(|&c| (r.x0..r.x0 + r.tw).contains(&(c * 64)))
+                    .count();
+                let n = tile_cols * spec_units(disp_h);
+                let mut enc = OdEcEncoder::new().with_updating_cdf(true);
+                let mut wr_cdf = wiener_restore_icdf();
+                let mut ref_v = crate::wiener::WIENER_TAPS_MID;
+                let mut ref_h = crate::wiener::WIENER_TAPS_MID;
+                for _ in 0..n {
+                    emit_lr_unit_syms(&mut enc, &mut wr_cdf, &mut ref_v, &mut ref_h, &unit);
+                }
+                assert_eq!(
+                    got,
+                    enc.done(),
+                    "{disp_w}x{disp_h} tile x0={}: replay must code {n} LR units",
+                    r.x0
+                );
+            }
+        }
     }
 }

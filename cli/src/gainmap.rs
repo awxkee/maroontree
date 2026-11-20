@@ -27,29 +27,79 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Import legacy Apple HEIF gain maps as ISO 21496-1 data. See
-//! `cli/APPLE_GAIN_MAP.md` for the format references and conversion contract.
+//! Normalize gain maps for HDR conversion and encoder input.
 
+#[cfg(feature = "heic")]
 use crate::orientation::apply_orientation;
-use anyhow::{Context, Result, bail, ensure};
-use gainforge::{IsoGainMap, TransferFunction};
+#[cfg(feature = "heic")]
+use anyhow::Context;
+use anyhow::{Result, bail, ensure};
+use gainforge::IsoGainMap;
+#[cfg(feature = "heic")]
+use gainforge::TransferFunction;
+#[cfg(feature = "heic")]
 use hpvcd::GainMapFrame;
-use image::{DynamicImage, ImageBuffer, Luma};
+use image::DynamicImage;
+#[cfg(feature = "heic")]
+use image::ImageBuffer;
+#[cfg(feature = "heic")]
 use quick_xml::events::Event;
+#[cfg(feature = "heic")]
 use quick_xml::name::{Namespace, ResolveResult};
+#[cfg(feature = "heic")]
 use quick_xml::reader::NsReader;
 
+#[cfg(feature = "heic")]
 const APPLE_NS: &str = "http://ns.apple.com/HDRGainMap/1.0/";
+#[cfg(feature = "heic")]
 const APPLE_MAKER_HEADER: &[u8] = b"Apple iOS\0\0\x01MM";
 
 /// Oriented, normalized logarithmic gain samples, without a color transfer
 /// function. Keep the converted samples at 16-bit precision for JXL encoding.
 #[derive(Debug)]
 pub(crate) struct ParsedGainMap {
-    pub image: ImageBuffer<Luma<u16>, Vec<u16>>,
+    /// Either `ImageLuma16` or `ImageRgb16`.
+    pub image: DynamicImage,
     pub metadata: IsoGainMap,
+    pub alternate_cicp: Option<crate::PngCicp>,
+    pub alternate_icc: Option<Vec<u8>>,
 }
 
+impl ParsedGainMap {
+    pub(crate) fn can_encode_with(&self, encoder: crate::Encoder) -> bool {
+        use crate::Encoder;
+        let metadata = &self.metadata;
+        match encoder {
+            Encoder::Av1 => !metadata.backward_direction,
+            Encoder::JpegXl => true,
+            Encoder::Hevc => {
+                let min = metadata.map_min();
+                let max = metadata.map_max();
+                let gamma = metadata.gain_map_gamma();
+                let headroom = max[0].exp2() as f32;
+                self.image.as_luma16().is_some()
+                    && metadata.use_base_color_space
+                    && !metadata.backward_direction
+                    && metadata.base_hdr_headroom() == 0.0
+                    && metadata.alternate_hdr_headroom() == max[0]
+                    && metadata.map_base_offset() == [0.0; 3]
+                    && metadata.map_alternate_offset() == [0.0; 3]
+                    && min == [min[0]; 3]
+                    && min[0].is_finite()
+                    && min[0] >= 0.0
+                    && max == [max[0]; 3]
+                    && headroom.is_finite()
+                    && headroom > 1.0
+                    && gamma == [gamma[0]; 3]
+                    && gamma[0].is_finite()
+                    && gamma[0] > 0.0
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "heic")]
 pub(crate) fn parse_apple_gain_map(
     gain: &GainMapFrame,
     base_exif: Option<&[u8]>,
@@ -118,14 +168,18 @@ pub(crate) fn parse_apple_gain_map(
     };
     let image = ImageBuffer::from_raw(width, height, samples)
         .context("Apple gain-map dimensions do not match its samples")?;
-    let image = apply_orientation(DynamicImage::ImageLuma16(image), gain.orientation).into_luma16();
-    Ok(ParsedGainMap { image, metadata })
+    let image = apply_orientation(DynamicImage::ImageLuma16(image), gain.orientation);
+    Ok(ParsedGainMap {
+        image,
+        metadata,
+        alternate_cicp: None,
+        alternate_icc: None,
+    })
 }
 
 /// AVIF gain map item for `gain_map`. libavif caps gain maps at 12 bits, so
-/// the 16-bit normalized gains are rounded to a 10-bit monochrome map (the
-/// Apple source maps are 8-bit, so nothing is lost). The rationals are copied
-/// exactly; an AVIF `tmap` cannot signal the Ultra HDR backward-direction flag.
+/// the 16-bit normalized gains are rounded to 10 bits. The rationals are copied
+/// exactly. An AVIF `tmap` cannot signal the Ultra HDR backward-direction flag.
 pub(crate) fn avif_gain_map(gain_map: &ParsedGainMap) -> Result<maroontree::GainMap> {
     let m = gain_map.metadata;
     ensure!(
@@ -149,19 +203,42 @@ pub(crate) fn avif_gain_map(gain_map: &ParsedGainMap) -> Result<maroontree::Gain
         alternate_hdr_headroom_d: m.alternate_hdr_headroom_d,
         use_base_color_space: m.use_base_color_space,
     };
-    let samples: Vec<u16> = gain_map
-        .image
-        .as_raw()
-        .iter()
-        .map(|&v| ((v as u32 * 1023 + 32767) / 65535) as u16)
-        .collect();
-    let image = maroontree::PlanarImage::from_luma(
+    let (width, height) = (
         gain_map.image.width() as usize,
         gain_map.image.height() as usize,
-        maroontree::BitDepth::Ten,
-        &samples,
-    )?;
-    Ok(maroontree::GainMap::gray16(image, metadata))
+    );
+    let scale = |samples: &[u16]| -> Vec<u16> {
+        samples
+            .iter()
+            .map(|&v| ((v as u32 * 1023 + 32767) / 65535) as u16)
+            .collect()
+    };
+    use maroontree::{BitDepth, GainMap, PlanarImage};
+    let mut map = match &gain_map.image {
+        DynamicImage::ImageLuma16(image) => GainMap::gray16(
+            PlanarImage::from_luma(width, height, BitDepth::Ten, &scale(image.as_raw()))?,
+            metadata,
+        ),
+        DynamicImage::ImageRgb16(image) => GainMap::rgb16(
+            PlanarImage::from_interleaved_rgb(
+                width,
+                height,
+                BitDepth::Ten,
+                &scale(image.as_raw()),
+            )?,
+            metadata,
+        ),
+        _ => bail!("unsupported gain-map sample format"),
+    };
+    if let Some(cicp) = gain_map.alternate_cicp {
+        map = map.with_alternate_cicp(
+            cicp.to_maroontree(maroontree::MatrixCoefficients::Identity, true),
+        );
+    }
+    if let Some(icc) = &gain_map.alternate_icc {
+        map = map.with_alternate_icc_profile(icc.clone());
+    }
+    Ok(map)
 }
 
 /// HEIC gain map for `gain_map`; hpvca writes it both as an Apple HDR gain
@@ -170,7 +247,12 @@ pub(crate) fn avif_gain_map(gain_map: &ParsedGainMap) -> Result<maroontree::Gain
 /// `2^max`: Rec.709-coded `(2^L - 1) / (headroom - 1)`. For an 8-bit Apple
 /// source this exactly inverts [`parse_apple_gain_map`]. Apple's form has no
 /// offsets (they are dropped) and cannot darken (gains below 1 clamp to 1).
+#[cfg(feature = "heic")]
 pub(crate) fn hevc_gain_map(gain_map: &ParsedGainMap) -> Result<hpvca::GainMap> {
+    let image = gain_map
+        .image
+        .as_luma16()
+        .context("HEIC requires a monochrome gain map")?;
     let m = gain_map.metadata;
     ensure!(
         !m.backward_direction,
@@ -190,20 +272,28 @@ pub(crate) fn hevc_gain_map(gain_map: &ParsedGainMap) -> Result<hpvca::GainMap> 
             ((TransferFunction::Rec709.gamma(linear as f32) * 255.0) + 0.5).clamp(0.0, 255.0) as u8
         })
         .collect();
-    let samples = gain_map
-        .image
-        .as_raw()
-        .iter()
-        .map(|&v| lookup[v as usize])
-        .collect();
-    Ok(hpvca::GainMap::gray8(
+    let samples = image.as_raw().iter().map(|&v| lookup[v as usize]).collect();
+    let mut map = hpvca::GainMap::gray8(
         samples,
         gain_map.image.width(),
         gain_map.image.height(),
         headroom as f32,
-    ))
+    );
+    let cicp = gain_map.alternate_cicp.map(|cicp| {
+        let mut cicp = crate::heic::hpvca_cicp(cicp);
+        cicp.matrix = hpvca::MatrixCoefficients::Identity;
+        cicp
+    });
+    if cicp.is_some() || gain_map.alternate_icc.is_some() {
+        map = map.with_alternate_color(hpvca::ColorMetadata {
+            cicp,
+            icc: gain_map.alternate_icc.clone(),
+        });
+    }
+    Ok(map)
 }
 
+#[cfg(feature = "heic")]
 fn apple_metadata(xmp: &[u8], base_exif: Option<&[u8]>) -> Result<IsoGainMap> {
     let headroom = apple_xmp_headroom(xmp)?;
     let stops = match headroom {
@@ -246,6 +336,7 @@ fn apple_metadata(xmp: &[u8], base_exif: Option<&[u8]>) -> Result<IsoGainMap> {
 
 /// Resolve namespace URIs, not a particular producer's choice of XML prefix.
 /// XMP permits scalar properties as either attributes or child elements.
+#[cfg(feature = "heic")]
 fn apple_xmp_headroom(xmp: &[u8]) -> Result<Option<f64>> {
     let mut reader = NsReader::from_reader(xmp);
     let mut version = None;
@@ -311,6 +402,7 @@ fn apple_xmp_headroom(xmp: &[u8]) -> Result<Option<f64>> {
         .transpose()
 }
 
+#[cfg(feature = "heic")]
 fn set_xmp_property(
     name: &str,
     value: String,
@@ -327,6 +419,7 @@ fn set_xmp_property(
     Ok(())
 }
 
+#[cfg(feature = "heic")]
 fn apple_exif_stops(exif: &[u8]) -> Result<f64> {
     // hpvcd strips the HEIF Exif item's four-byte offset. Apple payloads can
     // still include the JPEG-style Exif identifier before their TIFF header.
@@ -343,6 +436,7 @@ fn apple_exif_stops(exif: &[u8]) -> Result<f64> {
     apple_maker_stops(maker)
 }
 
+#[cfg(feature = "heic")]
 fn apple_maker_stops(maker: &[u8]) -> Result<f64> {
     ensure!(
         maker.starts_with(APPLE_MAKER_HEADER),
@@ -417,7 +511,7 @@ fn apple_maker_stops(maker: &[u8]) -> Result<f64> {
     Ok(stops.max(0.0))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heic"))]
 mod tests {
     use super::*;
 
@@ -616,9 +710,12 @@ mod tests {
         for depth in [8, 10, 12] {
             let mut gain = decoded_gain(depth);
             gain.color.cicp.as_mut().unwrap().full_range = true;
-            let parsed = parse_apple_gain_map(&gain, None).unwrap();
-            assert_eq!(parsed.image.dimensions(), (17, 16));
-            for (index, &sample) in parsed.image.as_raw().iter().enumerate() {
+            let parsed = parse_apple_gain_map(&gain, None)
+                .unwrap()
+                .image
+                .into_luma16();
+            assert_eq!(parsed.dimensions(), (17, 16));
+            for (index, &sample) in parsed.as_raw().iter().enumerate() {
                 let encoded = ((index % 256) << (depth - 8)) as f64 / ((1u32 << depth) - 1) as f64;
                 let linear = if encoded < 4.5 * 0.018053968510807 {
                     encoded / 4.5
@@ -629,7 +726,7 @@ mod tests {
                 let iso_multiplier = (sample as f64 / 65535.0 * 2.0).exp2();
                 assert!((iso_multiplier - apple_multiplier).abs() < 0.00005);
             }
-            assert_eq!(parsed.image.as_raw()[0], 0);
+            assert_eq!(parsed.as_raw()[0], 0);
         }
     }
 
@@ -653,12 +750,18 @@ mod tests {
     fn range_and_orientation_are_applied_to_gain_samples() {
         let mut gain = decoded_gain(8);
         gain.color.cicp.as_mut().unwrap().full_range = false;
-        let parsed = parse_apple_gain_map(&gain, None).unwrap();
-        assert_eq!(parsed.image.as_raw()[16], 0);
-        assert_eq!(parsed.image.as_raw()[235], 65535);
+        let parsed = parse_apple_gain_map(&gain, None)
+            .unwrap()
+            .image
+            .into_luma16();
+        assert_eq!(parsed.as_raw()[16], 0);
+        assert_eq!(parsed.as_raw()[235], 65535);
         gain.orientation = hpvcd::Orientation::Rotate90;
         let rotated = parse_apple_gain_map(&gain, None).unwrap();
-        assert_eq!(rotated.image, image::imageops::rotate90(&parsed.image));
+        assert_eq!(
+            rotated.image.into_luma16(),
+            image::imageops::rotate90(&parsed)
+        );
         gain.chroma = hpvcd::ChromaFormat::Yuv420;
         assert!(parse_apple_gain_map(&gain, None).is_err());
     }
