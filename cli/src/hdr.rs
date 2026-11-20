@@ -35,7 +35,7 @@ use gainforge::{IsoGainMap, TransferFunction};
 use image::{DynamicImage, ImageBuffer, Rgb, Rgb32FImage};
 use moxcms::{
     CicpColorPrimaries, CicpProfile, ColorProfile, DataColorSpace, Layout, MatrixCoefficients,
-    ToneReprCurve, TransferCharacteristics, TransformOptions, Vector3d,
+    ToneReprCurve, TransferCharacteristics, TransformOptions, Vector3f,
 };
 use std::borrow::Cow;
 
@@ -188,13 +188,12 @@ fn linear_rgb_from_cicp(
     let mut rgb = image.to_rgb32f();
     let normalize = |sample: f32| ((sample - black) / span).clamp(0.0, 1.0);
     if transfer == TransferCharacteristics::Hlg {
-        let to_bt2020 = profile.transform_matrix(&linear_profile(HLG_CICP.color_primaries)?);
+        let to_bt2020 = profile
+            .transform_matrix(&linear_profile(HLG_CICP.color_primaries)?)
+            .to_f32();
         for pixel in rgb.pixels_mut() {
             let scene = pixel.0.map(|sample| hlg_to_scene(normalize(sample)));
-            let scene_bt2020 = to_bt2020.mul_vector(Vector3d {
-                v: scene.map(f64::from),
-            });
-            let luminance = bt2020_luminance(scene_bt2020.v.map(|channel| channel as f32));
+            let luminance = bt2020_luminance(to_bt2020.mul_vector(Vector3f { v: scene }).v);
             let gain =
                 HLG_PEAK_RELATIVE_TO_SDR_WHITE * luminance.max(0.0).powf(HLG_SYSTEM_GAMMA - 1.0);
             pixel.0 = scene.map(|channel| gain * channel);
@@ -286,19 +285,19 @@ fn encoded_image(
 
 #[derive(Clone, Copy, PartialEq)]
 struct GainCurve {
-    min: f64,
-    max: f64,
-    gamma_inverse: f64,
-    base_offset: f64,
-    alternate_offset: f64,
+    min: f32,
+    max: f32,
+    gamma_inverse: f32,
+    base_offset: f32,
+    alternate_offset: f32,
 }
 
 fn gain_curves(metadata: &IsoGainMap) -> Result<[GainCurve; 3]> {
-    let min = metadata.map_min();
-    let max = metadata.map_max();
-    let gamma = metadata.gain_map_gamma();
-    let base_offset = metadata.map_base_offset();
-    let alternate_offset = metadata.map_alternate_offset();
+    let min = metadata.map_min().map(|v| v as f32);
+    let max = metadata.map_max().map(|v| v as f32);
+    let gamma = metadata.gain_map_gamma().map(|v| v as f32);
+    let base_offset = metadata.map_base_offset().map(|v| v as f32);
+    let alternate_offset = metadata.map_alternate_offset().map(|v| v as f32);
     for c in 0..3 {
         ensure!(
             min[c].is_finite()
@@ -308,6 +307,7 @@ fn gain_curves(metadata: &IsoGainMap) -> Result<[GainCurve; 3]> {
                 && max[c].exp2().is_finite()
                 && gamma[c].is_finite()
                 && gamma[c] > 0.0
+                && gamma[c].recip().is_finite()
                 && base_offset[c].is_finite()
                 && alternate_offset[c].is_finite(),
             "invalid gain map metadata for channel {c}"
@@ -373,8 +373,10 @@ pub(crate) fn gain_map_to_hdr(
         None => linear_rgb_from_cicp(image, cicp.unwrap_or(SRGB_CICP))?,
     };
     let math_profile = alternate_profile.as_ref().unwrap_or(&source_profile);
-    let to_math = source_profile.transform_matrix(math_profile);
-    let to_output = math_profile.transform_matrix(&linear_profile(output_cicp.color_primaries)?);
+    let to_math = source_profile.transform_matrix(math_profile).to_f32();
+    let to_output = math_profile
+        .transform_matrix(&linear_profile(output_cicp.color_primaries)?)
+        .to_f32();
     let map = if apply_gain {
         let source = &gain_map.image;
         let size = rgb.dimensions();
@@ -398,9 +400,7 @@ pub(crate) fn gain_map_to_hdr(
         None
     };
     let pixels = rgb.enumerate_pixels().map(|(x, y, rgb)| {
-        let mut linear = to_math.mul_vector(Vector3d {
-            v: rgb.0.map(f64::from),
-        });
+        let mut linear = to_math.mul_vector(Vector3f { v: rgb.0 });
         if let Some(map) = &map {
             let samples = match map.as_ref() {
                 DynamicImage::ImageLuma16(gray) => [gray.get_pixel(x, y).0[0]; 3],
@@ -408,12 +408,12 @@ pub(crate) fn gain_map_to_hdr(
                 _ => unreachable!(),
             };
             for (rgb, (curve, gain)) in linear.v.iter_mut().zip(curves.into_iter().zip(samples)) {
-                let gain = (gain as f64 / f64::from(u16::MAX)).powf(curve.gamma_inverse);
+                let gain = (gain as f32 / MAX_SAMPLE).powf(curve.gamma_inverse);
                 let stops = curve.min * (1.0 - gain) + curve.max * gain;
                 *rgb = (*rgb + curve.base_offset) * stops.exp2() - curve.alternate_offset;
             }
         }
-        encode(to_output.mul_vector(linear).v.map(|sample| sample as f32))
+        encode(to_output.mul_vector(linear).v)
     });
     encoded_image(image, pixels)
 }
@@ -436,17 +436,12 @@ pub(crate) fn convert_hdr(
         });
     }
     let (rgb, source_profile) = linear_rgb_from_cicp(image, source_cicp)?;
-    let to_output = source_profile.transform_matrix(&linear_profile(output_cicp.color_primaries)?);
-    let pixels = rgb.pixels().map(|pixel| {
-        encode(
-            to_output
-                .mul_vector(Vector3d {
-                    v: pixel.0.map(f64::from),
-                })
-                .v
-                .map(|channel| channel as f32),
-        )
-    });
+    let to_output = source_profile
+        .transform_matrix(&linear_profile(output_cicp.color_primaries)?)
+        .to_f32();
+    let pixels = rgb
+        .pixels()
+        .map(|pixel| encode(to_output.mul_vector(Vector3f { v: pixel.0 }).v));
     encoded_image(image, pixels)
 }
 
@@ -459,15 +454,15 @@ pub(crate) fn hdr_to_gain_map(
         "input does not signal a PQ or HLG transfer function"
     );
     let (mut rgb, source_profile) = linear_rgb_from_cicp(image, cicp)?;
-    let to_bt2020 = source_profile.transform_matrix(&linear_profile(SDR_CICP.color_primaries)?);
+    let to_bt2020 = source_profile
+        .transform_matrix(&linear_profile(SDR_CICP.color_primaries)?)
+        .to_f32();
     let mut peak = 0.0f32;
     for pixel in rgb.pixels_mut() {
         pixel.0 = to_bt2020
-            .mul_vector(Vector3d {
-                v: pixel.0.map(f64::from),
-            })
+            .mul_vector(Vector3f { v: pixel.0 })
             .v
-            .map(|sample| (sample as f32).max(0.0));
+            .map(|sample| sample.max(0.0));
         peak = peak.max(peak_channel(*pixel));
     }
 

@@ -4809,14 +4809,21 @@ mod tests {
             true,
             true,
         );
-        let emitted = crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        let emitted =
+            crate::coder::LOSSY_INTRABC_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(emitted >= 2, "mono IntraBC emitted {emitted} blocks");
         let decoded = decode_obu(&decoder, &obu, "lossy-intrabc-mono");
         assert!(decoded.len() >= w * h);
         let luma = &decoded[..w * h];
         for y in 0..h {
-            assert_eq!(&luma[y * w + 3..y * w + 67], &luma[y * w + 384..y * w + 448]);
-            assert_eq!(&luma[y * w + 64..y * w + 128], &luma[y * w + 448..y * w + 512]);
+            assert_eq!(
+                &luma[y * w + 3..y * w + 67],
+                &luma[y * w + 384..y * w + 448]
+            );
+            assert_eq!(
+                &luma[y * w + 64..y * w + 128],
+                &luma[y * w + 448..y * w + 512]
+            );
         }
     }
 
