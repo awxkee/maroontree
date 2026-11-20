@@ -488,6 +488,7 @@ impl EncodeConfig {
             crate::quant::QmLevels::FLAT
         };
         vb.mono_large = true;
+        vb.mono_alpha = true;
         encode_lossy_gray_obu(
             alpha,
             alpha.bit_depth,
@@ -497,7 +498,8 @@ impl EncodeConfig {
             self.speed,
             false,
             vb,
-            self.cdef_enabled(),
+            // CDEF at every tier: it cleans the ringing along mask edges
+            true,
             false,
             self.updating_cdf,
             false,

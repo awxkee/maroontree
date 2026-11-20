@@ -200,6 +200,7 @@ impl TileJob<'_> {
         // Screen and IntraBC frames take the large-leaf profile too: their
         // copies and palettes live at the 16/32 levels.
         .with_mono_large(vb.mono_large || self.screen_frame || self.allow_intrabc);
+        tile.cfg.mono_alpha = vb.mono_alpha && self.chroma == Chroma::Mono;
         tile.cfg.screen_frame = self.screen_frame;
         // Loop restoration is frame-relative: record this tile's frame-absolute luma
         // origin and the DISPLAYED frame luma size (the decoder's LR unit grid is

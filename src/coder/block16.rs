@@ -1857,7 +1857,7 @@ impl<'a> LossyTile<'a> {
         // refinement on the winner. ---
         let mlam = self.emit_mlam(x8 * 8, y8 * 8, 8);
         let full_set4 = !self.cfg.is_444();
-        let modes = if self.cfg.speed.reduced_modes() {
+        let modes = if self.reduced_modes() {
             fast_nd_modes()
         } else {
             nd_modes()

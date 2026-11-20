@@ -769,7 +769,7 @@ impl<'a> LossyTile<'a> {
                 return Part16::Intrabc;
             }
         }
-        let want_split = !self.cfg.is_mono() && !self.prefer_8x8_none(x8, y8, tr, bl);
+        let want_split = (!self.cfg.is_mono() || self.cfg.mono_alpha) && !self.prefer_8x8_none(x8, y8, tr, bl);
         if want_split {
             Part16::Split
         } else {
