@@ -447,7 +447,7 @@ fn frame_cdef(
     let lambda = if tun.cdef_lambda_d {
         frame_lambda_d(base_q_idx, bd, sub_x, sub_y)
     } else {
-        mode_lambda_q(dc_q(base_q_idx, bd) as f32)
+        mode_lambda_q(dc_q(base_q_idx, bd) as f32, bd)
     };
     let total_off: i64 = d_off.iter().sum();
     let cost_off = total_off as f32;

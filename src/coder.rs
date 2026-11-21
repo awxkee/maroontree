@@ -264,7 +264,8 @@ fn frame_lambda_d(base_q_idx: u8, bd: u8, sub_x: usize, sub_y: usize) -> f32 {
     } else {
         0
     };
-    mode_lambda_q(dc_q(base_q_idx, bd) as f32) * mode_lambda_weight(base_q_idx, sub) / K_PART_LAMBDA
+    mode_lambda_q(dc_q(base_q_idx, bd) as f32, bd) * mode_lambda_weight(base_q_idx, sub)
+        / K_PART_LAMBDA
 }
 
 /// TX-type guard tolerance (`Tuning::tx_guard_shift` / `_444`): the wSSE a

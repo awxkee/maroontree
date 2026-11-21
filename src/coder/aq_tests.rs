@@ -577,7 +577,7 @@ fn aq_grid_matches_serial() {
         for base_q in [60u8, 140, 220] {
             let mk = || {
                 let mut t = LossyTile::new(Chroma::I444, base_q, 8, w, h, &src, QmLevels::FLAT);
-                let ref_act = tile_ref_activity(&t.cfg.src[0], t.cfg.w, t.cfg.w, t.cfg.h);
+                let ref_act = tile_ref_activity(&t.cfg.src[0], t.cfg.w, t.cfg.w, t.cfg.h, t.cfg.bd);
                 let vb = VarianceBoost {
                     enabled: vb_enabled,
                     octile: 6,

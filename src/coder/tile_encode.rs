@@ -225,7 +225,7 @@ impl TileJob<'_> {
     /// (zero-mean deltas => ~rate-neutral). `None` when AQ is off.
     fn ref_activity(&self, tsrc: &[Vec<u16>; 3], r: &TileRect) -> Option<f32> {
         self.aq
-            .then(|| tile_ref_activity(&tsrc[0], r.tw, r.tw, r.th))
+            .then(|| tile_ref_activity(&tsrc[0], r.tw, r.tw, r.th, self.bd))
     }
 
     /// Whether decisions switch to the pilot-trained CDF snapshot. Only 4:4:4
