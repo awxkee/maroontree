@@ -1767,13 +1767,13 @@ impl<'a> LossyTile<'a> {
     /// [`K_PART_LAMBDA`] x [`Self::lambda_d`]; see the decision-metric
     /// unification plan (docs/decision-metric-unification-plan-2026-11-06.md).
     fn mlam(&self) -> f32 {
-        mode_lambda_q(self.ctx.quant.dc_q() as f32) * self.tune_weight()
+        mode_lambda_q(self.ctx.quant.dc_q() as f32, self.cfg.bd) * self.tune_weight()
     }
 
     /// As [`Self::mlam`] but for chroma planes (uses `self.cquant`).
     #[inline]
     fn mlam_c(&self) -> f32 {
-        mode_lambda_q(self.ctx.cquant.dc_q() as f32) * self.tune_weight()
+        mode_lambda_q(self.ctx.cquant.dc_q() as f32, self.cfg.bd) * self.tune_weight()
     }
 
     /// `lambda_d`: THE decision lambda, in normalized-wSSE units per bit.
@@ -3886,7 +3886,7 @@ impl<'a> LossyTile<'a> {
                 (base_q + delta).clamp(1, 255)
             }
         } else {
-            let act = sb_activity(&self.cfg.src[0], self.cfg.w, sb_y, sb_x, self.cfg.w, self.cfg.h);
+            let act = sb_activity(&self.cfg.src[0], self.cfg.w, sb_y, sb_x, self.cfg.w, self.cfg.h, self.cfg.bd);
             let vb_delta = aq_target_qidx(base_q, act, self.ctx.aq.ref_act) - base_q;
             // Same combine as the VB path: dark protection can only deepen the
             // reduction, never override a coarsen with a smaller refine.
@@ -4235,6 +4235,7 @@ impl<'a> LossyTile<'a> {
                         sbx as usize,
                         self.cfg.w,
                         self.cfg.h,
+                        self.cfg.bd,
                     );
                     self.memo.sb_act_cache.set((sbx, sby, v));
                     v
@@ -4254,7 +4255,7 @@ impl<'a> LossyTile<'a> {
         let n = (bw * bh) as f32;
         let mean = sum as f32 / n;
         let var = (sum_sq as f32 / n - mean * mean).max(0.0);
-        let act = dirty_log1pf(var);
+        let act = dirty_log1pf(var / (1u32 << (2 * (self.cfg.bd - 8))) as f32);
         let c = prdo_clamp();
         let exponent = (k * (act - refa)).clamp(-std::f32::consts::LN_2, std::f32::consts::LN_2);
         dirty_exp2f(exponent * std::f32::consts::LOG2_E).clamp(1.0 / c, prdo_upper_clamp())

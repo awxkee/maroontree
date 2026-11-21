@@ -277,9 +277,14 @@ pub(crate) const MODE_AOM_CALIB: f32 = 0.009005174719460433;
 /// `K_satd(q, format)` bridge on the proxy's luma side.
 pub(crate) const K_PART_LAMBDA: f32 = 2.775;
 
+/// `bd` normalizes the DC step fed to the KF multiplier back to the 8-bit
+/// scale: the `3.3 + 0.0015 q` law was fitted on 8-bit steps, and a native
+/// 10/12-bit step (4x / 16x) would inflate the lambda with bit depth
+/// (+7% mid band, +70% at the bottom at 10 bits; far more at 12).
 #[inline]
-pub(crate) fn mode_lambda_q(dc_q: f32) -> f32 {
-    MODE_AOM_CALIB * lambda_scale() * dc_q * dc_q * def_kf_rd_multiplier(dc_q)
+pub(crate) fn mode_lambda_q(dc_q: f32, bd: u8) -> f32 {
+    let dc_q8 = dc_q / (1u32 << (bd.max(8) - 8)) as f32;
+    MODE_AOM_CALIB * lambda_scale() * dc_q * dc_q * def_kf_rd_multiplier(dc_q8)
 }
 
 pub(crate) fn use_proxy_rate(speed: crate::avif::Speed) -> bool {
@@ -382,7 +387,7 @@ mod tests {
         let mut ratios = vec![];
         for q in (16u8..=240).step_by(8) {
             let dcq = dc_q(q, 8) as f32;
-            let lam = mode_lambda_q(dcq);
+            let lam = mode_lambda_q(dcq, 8);
             ratios.push(lam / aom_kf_rdmult(dcq));
         }
         let (lo, hi) = (
@@ -401,7 +406,7 @@ mod tests {
         let acq = ac_q(128, 8) as f32;
         let dcq = dc_q(128, 8) as f32;
         let legacy = MODE_LAMBDA0 * acq * acq;
-        assert!((mode_lambda_q(dcq) - legacy).abs() / legacy < 1e-6);
+        assert!((mode_lambda_q(dcq, 8) - legacy).abs() / legacy < 1e-6);
     }
 
     #[test]

@@ -144,6 +144,7 @@ pub(crate) fn sb_activity(
     sb_x: usize,
     width: usize,
     height: usize,
+    bd: u8,
 ) -> f32 {
     let h = height.saturating_sub(sb_y).min(64);
     let w = width.saturating_sub(sb_x).min(64);
@@ -154,15 +155,17 @@ pub(crate) fn sb_activity(
     let n = (h * w) as f32;
     let mean = sum as f32 / n;
     let var = (sum_sq as f32 / n - mean * mean).max(0.0);
-    dirty_log1pf(var)
+    // 8-bit variance scale at every depth: `log1p` is not scale-invariant,
+    // so a native 10/12-bit variance moves the flat-region floor.
+    dirty_log1pf(var / (1u32 << (2 * (bd.max(8) - 8))) as f32)
 }
 
-fn tile_ref_activity(yp: &[u16], pw: usize, w: usize, h: usize) -> f32 {
+fn tile_ref_activity(yp: &[u16], pw: usize, w: usize, h: usize, bd: u8) -> f32 {
     let mut sum = 0f32;
     let mut cnt = 0f32;
     for sb_y in (0..h).step_by(64) {
         for sb_x in (0..w).step_by(64) {
-            sum += sb_activity(yp, pw, sb_y, sb_x, w, h);
+            sum += sb_activity(yp, pw, sb_y, sb_x, w, h, bd);
             cnt += 1.0;
         }
     }
