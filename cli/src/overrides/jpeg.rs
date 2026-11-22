@@ -10,6 +10,7 @@ jpeg/jpg/jhm17 overrides (jhm17; polishing is opt-in through overrides):
   Syntax: -O 'jpeg:KEY=VALUE,KEY=VALUE,...' (repeatable)
 
   quality (q)            1..100 [default: 92]
+  gain-map-quality (qgain) 1..100; Ultra HDR gain-map JPEG [default: quality]
   chroma (c)             420|444|422 [default: 444]
   sampling-factor        444|440|441|422|420|421|411|410
   subsampling-method     average|nearest
@@ -62,7 +63,8 @@ Metadata and format:
   density-unit           aspect|dpi|dpcm
   icc/exif/apply-icc      boolean; same behavior as the common CLI flags
   depth                  auto|8; JPEG output is 8-bit and has no alpha
-  alpha/gain-map/lossless only false is supported
+  alpha/lossless         only false is supported
+  gain-map               boolean; an imported HDR gain map is written as Ultra HDR
   JPEG encoding is single-threaded. Groups and repeated flags apply in order;
   later values win. Polish requires RGB 420/444 and adds encoding time.";
 
@@ -79,10 +81,6 @@ impl EncoderOverride {
                 PipelineSetting::Alpha(true) => {
                     Err(self.invalid("alpha=false; JPEG has no alpha channel"))
                 }
-                PipelineSetting::GainMap(true) => {
-                    Err(self
-                        .invalid("gain-map=false; this JPEG backend does not encode HDR gain maps"))
-                }
                 PipelineSetting::Chroma(chroma) => {
                     cfg.sampling = match chroma {
                         crate::Chroma::C444 => SamplingFactor::R_4_4_4,
@@ -96,6 +94,7 @@ impl EncoderOverride {
         }
         match self.key.as_str() {
             "quality" => cfg.quality = self.number(1, 100, "1..100")?,
+            "gain-map-quality" => cfg.gain_map_quality = Some(self.number(1, 100, "1..100")?),
             "sampling" | "sampling-factor" => {
                 cfg.sampling = match self.value.as_str() {
                     "444" => SamplingFactor::R_4_4_4,

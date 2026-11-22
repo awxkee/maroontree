@@ -567,11 +567,44 @@ pub(crate) struct JxlMetadata<'a> {
     pub gain_map: Option<&'a ParsedGainMap>,
 }
 
+/// jixel <= 0.5.14 writes the draft ISO 21496-1 common-denominator form
+/// (flag bit 3) when every denominator matches, e.g. Apple maps (all 1e6).
+/// Final-syntax readers misparse it. Give one HDR headroom an equivalent
+/// rational with another denominator so the explicit form is written; the
+/// values are unchanged. Remove once jixel always writes explicit pairs.
+fn avoid_shared_denominator(m: &mut jixel::IsoGainMap) {
+    let d = m.base_hdr_headroom_d;
+    let shared = m.alternate_hdr_headroom_d == d
+        && [
+            m.gain_map_min_d,
+            m.gain_map_max_d,
+            m.gain_map_gamma_d,
+            m.base_offset_d,
+            m.alternate_offset_d,
+        ]
+        .iter()
+        .all(|ds| ds.iter().all(|&x| x == d));
+    if !shared {
+        return;
+    }
+    if m.base_hdr_headroom_n == 0 {
+        m.base_hdr_headroom_d = if d == 1 { 2 } else { 1 };
+    } else if let (Some(n), Some(d)) = (
+        m.alternate_hdr_headroom_n.checked_mul(2),
+        m.alternate_hdr_headroom_d.checked_mul(2),
+    ) {
+        (m.alternate_hdr_headroom_n, m.alternate_hdr_headroom_d) = (n, d);
+    } else if m.alternate_hdr_headroom_n % 2 == 0 && m.alternate_hdr_headroom_d % 2 == 0 {
+        m.alternate_hdr_headroom_n /= 2;
+        m.alternate_hdr_headroom_d /= 2;
+    }
+}
+
 fn jxl_gain_map(gain_map: &ParsedGainMap, lossless: bool) -> anyhow::Result<jixel::GainMap> {
     let m = gain_map.metadata;
     // The two crates expose separate ISO metadata types. Copy the rationals
     // exactly so encoding does not introduce another float conversion.
-    let metadata = jixel::IsoGainMap {
+    let mut metadata = jixel::IsoGainMap {
         gain_map_min_n: m.gain_map_min_n,
         gain_map_min_d: m.gain_map_min_d,
         gain_map_max_n: m.gain_map_max_n,
@@ -589,6 +622,7 @@ fn jxl_gain_map(gain_map: &ParsedGainMap, lossless: bool) -> anyhow::Result<jixe
         backward_direction: m.backward_direction,
         use_base_color_space: m.use_base_color_space,
     };
+    avoid_shared_denominator(&mut metadata);
     let width = gain_map.image.width() as usize;
     let height = gain_map.image.height() as usize;
     let map = match &gain_map.image {
@@ -1492,5 +1526,36 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn gain_map_metadata_is_written_in_final_iso_syntax() {
+        let mut m = jixel::IsoGainMap {
+            gain_map_min_n: [-3235; 3],
+            gain_map_min_d: [1_000_000; 3],
+            gain_map_max_n: [2_751_953; 3],
+            gain_map_max_d: [1_000_000; 3],
+            gain_map_gamma_n: [890_137; 3],
+            gain_map_gamma_d: [1_000_000; 3],
+            base_offset_n: [10; 3],
+            base_offset_d: [1_000_000; 3],
+            alternate_offset_n: [10; 3],
+            alternate_offset_d: [1_000_000; 3],
+            base_hdr_headroom_n: 0,
+            base_hdr_headroom_d: 1_000_000,
+            alternate_hdr_headroom_n: 2_751_953,
+            alternate_hdr_headroom_d: 1_000_000,
+            backward_direction: false,
+            use_base_color_space: true,
+        };
+        let before = m.to_floats();
+        avoid_shared_denominator(&mut m);
+        let bytes = m.to_metadata().unwrap();
+        assert_eq!(bytes[4], 0x40, "no draft common-denominator flag");
+        assert_eq!(bytes.len(), 5 + 16 + 40);
+        assert_eq!(m.to_floats(), before);
+        let parsed = gainforge::IsoGainMap::from_metadata(&bytes).unwrap();
+        assert_eq!(parsed.base_hdr_headroom(), 0.0);
+        assert!((parsed.alternate_hdr_headroom() - 2.751953).abs() < 1e-9);
     }
 }
