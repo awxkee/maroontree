@@ -48,6 +48,7 @@ mod orientation;
 mod overrides;
 mod raster;
 mod resize;
+mod uhdr;
 mod version;
 #[cfg(feature = "vvc")]
 mod vvc;
@@ -509,6 +510,20 @@ fn load_image(path: &PathBuf, load_gain_map: bool) -> LoadedImage {
             decoded.image
         }
 
+        Some(ref fmt) if matches!(fmt.as_str(), "jpg" | "jpeg") => {
+            let img = image::open(path)
+                .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
+            if load_gain_map {
+                let raw = std::fs::read(path)
+                    .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display())));
+                match uhdr::parse_uhdr_gain_map(&raw) {
+                    Ok(map) => gain_map = map,
+                    Err(error) => eprintln!("gainmap: ignoring Ultra HDR gain map: {error:#}"),
+                }
+            }
+            img
+        }
+
         _ => image::open(path)
             .unwrap_or_else(|e| die(format!("cannot open '{}': {e}", path.display()))),
     };
@@ -599,12 +614,16 @@ fn prepare_hdr(
         source.cicp = Some(output_cicp);
         source.icc = None;
     } else if let Some(map) = &source.gain_map {
-        if !map.can_encode_with(args.encoder) {
+        // A .jpg output path selects the JPEG writer whatever the encoder.
+        let encoder =
+            if raster::raster_output_format(&args.output) == Some(raster::RasterFormat::Jpeg) {
+                Encoder::Jpeg
+            } else {
+                args.encoder
+            };
+        if !map.can_encode_with(encoder) {
             if args.verbose {
-                eprintln!(
-                    "gainmap: rebuilding as a map supported by {:?}",
-                    args.encoder
-                );
+                eprintln!("gainmap: rebuilding as a map supported by {encoder:?}");
             }
             let hdr_cicp = match (source.cicp, map.alternate_cicp) {
                 (base, _)
@@ -648,9 +667,11 @@ fn main() {
 
     // Raster output extensions take precedence over the selected encoder.
     let raster_format = raster::raster_output_format(&args.output);
-    let output_supports_gain_map =
-        matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
-            && raster_format.is_none();
+    let jpeg_output = raster_format == Some(raster::RasterFormat::Jpeg)
+        || (raster_format.is_none() && args.encoder == Encoder::Jpeg);
+    let output_supports_gain_map = jpeg_output
+        || (matches!(args.encoder, Encoder::JpegXl | Encoder::Av1 | Encoder::Hevc)
+            && raster_format.is_none());
     let load_gain_map =
         args.hdr_conversion.is_some() || (output_supports_gain_map && !args.no_gain_map);
     let mut source = load_image(&args.input, load_gain_map);
@@ -738,12 +759,39 @@ fn main() {
 
     let t0 = Instant::now();
 
-    let avif_bytes = if let Some(rf) = raster_format {
+    // JPEG cannot signal CICP, so a non-sRGB base needs an ICC profile.
+    let jpeg_icc = if jpeg_output {
+        icc_bytes
+            .clone()
+            .or_else(|| output_cicp.and_then(jpeg::icc_for_cicp))
+    } else {
+        None
+    };
+    let uhdr_map = gain_map.as_ref().filter(|_| jpeg_output);
+    if let Some(map) = uhdr_map
+        && args.verbose
+    {
+        eprintln!(
+            "gainmap: encoding {}×{} ISO 21496-1 map ({:.3} stops) as Ultra HDR JPEG",
+            map.image.width(),
+            map.image.height(),
+            map.metadata.alternate_hdr_headroom(),
+        );
+    }
+
+    let avif_bytes = if let Some(map) = uhdr_map {
+        uhdr::encode_uhdr_jpeg(&img, &args, jpeg_icc.as_deref(), exif_bytes.as_deref(), map)
+            .unwrap_or_else(|e| die(format!("encode failed: {e:#}")))
+    } else if let Some(rf) = raster_format {
         raster::encode_raster(
             &img,
             rf,
             &args,
-            icc_bytes.as_deref(),
+            if rf == raster::RasterFormat::Jpeg {
+                jpeg_icc.as_deref()
+            } else {
+                icc_bytes.as_deref()
+            },
             exif_bytes.as_deref(),
             output_cicp,
         )
@@ -751,7 +799,7 @@ fn main() {
     } else {
         match args.encoder {
             Encoder::Jpeg => {
-                jpeg::encode_jpeg(&img, &args, icc_bytes.as_deref(), exif_bytes.as_deref())
+                jpeg::encode_jpeg(&img, &args, jpeg_icc.as_deref(), exif_bytes.as_deref())
                     .unwrap_or_else(|e| die(format!("encode failed: {e}")))
             }
             Encoder::Av1 => encode_av1(

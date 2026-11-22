@@ -1,4 +1,4 @@
-use crate::{Args, Chroma, EncodingEffort, is_gray};
+use crate::{Args, Chroma, EncodingEffort, PngCicp, is_gray};
 use image::DynamicImage;
 use jhm17::{
     ChromaSubsamplingMethod, Deadzone, PixelDensity, Polish, PolishOptions, ProgressiveMode,
@@ -26,6 +26,8 @@ pub(crate) struct JpegOptions {
     pub auto_chroma_scale: bool,
     pub polish: Polish,
     pub density: PixelDensity,
+    /// Quality of the Ultra HDR gain-map JPEG; `None` uses `quality`.
+    pub gain_map_quality: Option<u8>,
 }
 
 impl Default for JpegOptions {
@@ -53,6 +55,7 @@ impl Default for JpegOptions {
             auto_chroma_scale: true,
             polish: Polish::Off,
             density: PixelDensity::default(),
+            gain_map_quality: None,
         }
     }
 }
@@ -135,20 +138,34 @@ pub(crate) fn encode_jpeg(
     exif: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
     let options = JpegOptions::from_args(args).map_err(anyhow::Error::msg)?;
+    encode_jpeg_with(img, &options, args.verbose, |encoder| {
+        if let Some(icc) = icc {
+            encoder.add_icc_profile(icc)?;
+        }
+        if let Some(exif) = exif {
+            encoder.add_exif_metadata(exif.strip_prefix(b"Exif\0\0").unwrap_or(exif))?;
+        }
+        Ok(())
+    })
+}
+
+/// Encode `img` with `options`; `metadata` adds APP segments in the order
+/// they should appear in the file.
+pub(crate) fn encode_jpeg_with(
+    img: &DynamicImage,
+    options: &JpegOptions,
+    verbose: bool,
+    metadata: impl FnOnce(&mut jhm17::Encoder<&mut Vec<u8>>) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<u8>> {
     let width = u16::try_from(img.width())
         .map_err(|_| anyhow::anyhow!("JPEG width exceeds 65535 pixels"))?;
     let height = u16::try_from(img.height())
         .map_err(|_| anyhow::anyhow!("JPEG height exceeds 65535 pixels"))?;
     let mut output = Vec::new();
     let mut encoder = options.encoder(&mut output);
-    if let Some(icc) = icc {
-        encoder.add_icc_profile(icc)?;
-    }
-    if let Some(exif) = exif {
-        encoder.add_exif_metadata(exif.strip_prefix(b"Exif\0\0").unwrap_or(exif))?;
-    }
+    metadata(&mut encoder)?;
     let stats = std::sync::Arc::new(std::sync::Mutex::new(None));
-    if args.verbose {
+    if verbose {
         encoder.set_polish_stats_sink(stats.clone());
         eprintln!(
             "jpeg   : jhm17 quality={} sampling={:?} polish={:?}",
@@ -156,7 +173,7 @@ pub(crate) fn encode_jpeg(
         );
     }
     if is_gray(img.color()) {
-        if args.verbose && options.polish != Polish::Off {
+        if verbose && options.polish != Polish::Off {
             eprintln!(
                 "jpeg   : jhm17 polishing applies to RGB input; grayscale uses the configured quantizer"
             );
@@ -171,15 +188,34 @@ pub(crate) fn encode_jpeg(
         // JPEG has no alpha; RGB supports decoder-feedback polish when requested.
         encoder.encode(img.to_rgb8().as_raw(), width, height, jhm17::ColorType::Rgb)?;
     }
-    if args.verbose
-        && let Some(stats) = stats.lock().unwrap().as_ref()
-    {
+    if verbose && let Some(stats) = stats.lock().unwrap().as_ref() {
         eprintln!(
             "polish : {} evaluated, {} accepted, {} estimated bits",
             stats.evaluated, stats.accepted, stats.bits_delta
         );
     }
     Ok(output)
+}
+
+/// JPEG has no CICP signalling: describe non-sRGB colour (e.g. the BT.2020
+/// SDR base of a rebuilt gain map) with an ICC profile instead.
+pub(crate) fn icc_for_cicp(cicp: PngCicp) -> Option<Vec<u8>> {
+    use moxcms::{
+        CicpColorPrimaries, CicpProfile, ColorProfile, MatrixCoefficients, TransferCharacteristics,
+    };
+    if matches!(cicp.color_primaries, 1 | 2) && matches!(cicp.transfer_function, 2 | 13) {
+        return None;
+    }
+    let profile = CicpProfile {
+        color_primaries: CicpColorPrimaries::try_from(cicp.color_primaries).ok()?,
+        transfer_characteristics: TransferCharacteristics::try_from(cicp.transfer_function).ok()?,
+        matrix_coefficients: MatrixCoefficients::try_from(cicp.matrix_coefficients).ok()?,
+        full_range: cicp.full_range,
+    };
+    // Without chromaticities or a transfer curve the profile stays empty.
+    let profile = ColorProfile::new_from_cicp(profile);
+    profile.red_trc.as_ref()?;
+    profile.encode().ok()
 }
 
 #[cfg(test)]

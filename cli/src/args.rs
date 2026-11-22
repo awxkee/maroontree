@@ -388,11 +388,17 @@ fn validate_hdr_conversion(args: &Args) -> Result<(), clap::Error> {
             }
         }
         HdrConversion::ToGainMap => {
-            if raster.is_some()
-                || !matches!(args.encoder, Encoder::Av1 | Encoder::JpegXl | Encoder::Hevc)
-            {
+            let supported = match raster {
+                Some(RasterFormat::Jpeg) => true,
+                Some(_) => false,
+                None => matches!(
+                    args.encoder,
+                    Encoder::Av1 | Encoder::JpegXl | Encoder::Hevc | Encoder::Jpeg
+                ),
+            };
+            if !supported {
                 return Err(conflict(
-                    "gain-map output requires AV1 AVIF, JPEG XL, or HEIC",
+                    "gain-map output requires AV1 AVIF, JPEG XL, HEIC, or Ultra HDR JPEG",
                 ));
             }
             if args.no_gain_map {

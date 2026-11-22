@@ -71,6 +71,7 @@ impl ParsedGainMap {
         let metadata = &self.metadata;
         match encoder {
             Encoder::Av1 => !metadata.backward_direction,
+            Encoder::Jpeg => crate::uhdr::can_write(metadata),
             Encoder::JpegXl => true,
             Encoder::Hevc => {
                 let min = metadata.map_min();
