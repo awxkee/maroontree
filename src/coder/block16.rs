@@ -428,7 +428,7 @@ impl<'a> LossyTile<'a> {
             .enumerate()
         {
             let drow = &mut self.ctx.recon[0][(py + ry) * self.cfg.w + px..];
-            recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
+            self.k.rd.recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
         }
     }
 
@@ -495,7 +495,7 @@ impl<'a> LossyTile<'a> {
                     5 => self.k.idct.iidentity_dequant_16x16(lcf, &self.ctx.quant),
                     _ => self.k.idct.idct_dequant_16x16(lcf, &self.ctx.quant),
                 };
-                recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, (1 << self.cfg.bd) - 1);
             }
             let mut ac = self.sbuf_i256();
             self.k.intrapred
@@ -965,11 +965,11 @@ impl<'a> LossyTile<'a> {
                 if cfl_opt.is_some() || chosen_uv_16 != DC_PRED || uv_pal.is_some() {
                     // CfL and every non-DC mode store their per-pixel prediction in
                     // `cpred16`.
-                    recon_add_pred(drow, &cpred16[ci][ry * 16..], rrow, max);
+                    self.k.rd.recon_add_pred(drow, &cpred16[ci][ry * 16..], rrow, max);
                 } else {
                     // Plain DC chroma: use the scalar predictor directly so recon
                     // never depends on the CfL block having populated `cpred16`.
-                    recon_add_dc(drow, cpred[ci], rrow, max);
+                    self.k.rd.recon_add_dc(drow, cpred[ci], rrow, max);
                 }
             }
         }
@@ -1060,7 +1060,7 @@ impl<'a> LossyTile<'a> {
                     5 => self.k.idct.iidentity_dequant_16x16(lcf, &self.ctx.quant),
                     _ => self.k.idct.idct_dequant_16x16(lcf, &self.ctx.quant),
                 };
-                recon_add_pred(&mut luma_rec[..], lpred, &lrr, maxval);
+                self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr, maxval);
             }
             let mut ac = [0i32; 64];
             self.k.intrapred
@@ -1428,9 +1428,9 @@ impl<'a> LossyTile<'a> {
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.ctx.recon[plane][(cy + ry) * self.cfg.cw + cx..];
                 if use_nondc {
-                    recon_add_pred(&mut drow[..8], &sv_preds[ci][ry * 8..], rrow, maxval);
+                    self.k.rd.recon_add_pred(&mut drow[..8], &sv_preds[ci][ry * 8..], rrow, maxval);
                 } else {
-                    recon_add_dc(&mut drow[..8], dc_preds[ci], rrow, maxval);
+                    self.k.rd.recon_add_dc(&mut drow[..8], dc_preds[ci], rrow, maxval);
                 }
             }
         }
@@ -1521,7 +1521,7 @@ impl<'a> LossyTile<'a> {
                     5 => self.k.idct.iidentity_dequant_16x16(lcf, &self.ctx.quant),
                     _ => self.k.idct.idct_dequant_16x16(lcf, &self.ctx.quant),
                 };
-                recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, maxv);
+                self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, maxv);
             }
             let mut ac = [0i32; 128];
             self.k.intrapred
@@ -1786,7 +1786,7 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                 let drow = &mut self.ctx.recon[plane][(py + ry) * self.cfg.cw + cx..];
-                recon_add_pred(drow, &cpred_px[ci][ry * 8..], rrow, maxv);
+                self.k.rd.recon_add_pred(drow, &cpred_px[ci][ry * 8..], rrow, maxv);
             }
         }
     }
@@ -2065,7 +2065,7 @@ impl<'a> LossyTile<'a> {
                     _ => self.k.idct.idct_dequant_4x4(&lcf, &self.ctx.quant),
                 };
                 let mut luma_rec = [0u16; 16];
-                recon_add_pred(&mut luma_rec, &lpred, &lrr_cfl, maxv);
+                self.k.rd.recon_add_pred(&mut luma_rec, &lpred, &lrr_cfl, maxv);
                 let mut ac = [0i32; 16];
                 self.k.intrapred.cfl_ac_444(&luma_rec, 4, 4, &mut ac);
                 let steps = crate::tuning::get().cfl_alpha_rd_steps;
@@ -2255,7 +2255,7 @@ impl<'a> LossyTile<'a> {
         };
         for ry in 0..4 {
             let drow = &mut self.ctx.recon[0][(by + ry) * self.cfg.w + bx..];
-            recon_add_pred(&mut drow[..4], &lpred[ry * 4..], &lrr[ry * 4..], maxv);
+            self.k.rd.recon_add_pred(&mut drow[..4], &lpred[ry * 4..], &lrr[ry * 4..], maxv);
         }
 
         // chroma residual + reconstruction
@@ -2282,7 +2282,7 @@ impl<'a> LossyTile<'a> {
                 // cpred_px already holds the CfL prediction.
                 for ry in 0..4 {
                     let drow = &mut self.ctx.recon[plane][(chy + ry) * cstride + chx..];
-                    recon_add_pred(
+                    self.k.rd.recon_add_pred(
                         &mut drow[..4],
                         &cpred_px[ci][ry * 4..],
                         &rr[ry * 4..],

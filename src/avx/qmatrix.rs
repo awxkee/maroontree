@@ -38,6 +38,9 @@ pub(crate) fn apply_qmatrix_avx2(levels: &mut [i32], targets: &mut [f32], invers
     let (level_chunks, level_tail) = levels.as_chunks_mut::<8>();
     let (target_chunks, target_tail) = targets.as_chunks_mut::<8>();
     let (weight_chunks, weight_tail) = inverse_weights.as_chunks::<8>();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let half = _mm256_set1_ps(0.5);
+    let one = _mm256_set1_ps(1.0);
     for ((level, target), weights) in level_chunks
         .iter_mut()
         .zip(target_chunks)
@@ -51,7 +54,16 @@ pub(crate) fn apply_qmatrix_avx2(levels: &mut [i32], targets: &mut [f32], invers
             let weighted = _mm256_mul_ps(target_v, scales);
             _mm256_storeu_ps(target.as_mut_ptr(), weighted);
 
-            let rounded = _mm256_cvttps_epi32(_mm256_round_ps::<0x00>(weighted));
+            // Round half AWAY from zero, as the scalar `fast_round` and NEON
+            // `vcvtaq` do (nearest-even would send 2.5 to 2): truncate, then
+            // step one away from zero when the exact fraction reaches 0.5.
+            let truncated = _mm256_round_ps::<0x03>(weighted);
+            let fraction = _mm256_andnot_ps(sign_mask, _mm256_sub_ps(weighted, truncated));
+            let step = _mm256_and_ps(
+                _mm256_cmp_ps::<_CMP_GE_OQ>(fraction, half),
+                _mm256_or_ps(one, _mm256_and_ps(weighted, sign_mask)),
+            );
+            let rounded = _mm256_cvttps_epi32(_mm256_add_ps(truncated, step));
             _mm256_storeu_si256(level.as_mut_ptr().cast::<__m256i>(), rounded);
         }
     }

@@ -298,7 +298,7 @@ impl<'a> LossyTile<'a> {
         }
         let lrr = self.k.idct.idct_dequant_8x8(lcf, &self.ctx.quant);
         let mut luma_rec = [0u16; 64];
-        recon_add_pred(&mut luma_rec, lpred, &lrr, (1 << self.cfg.bd) - 1);
+        self.k.rd.recon_add_pred(&mut luma_rec, lpred, &lrr, (1 << self.cfg.bd) - 1);
         let (dcq, acq) = (self.ctx.cquant.dc_q() as f32, self.ctx.cquant.ac_q() as f32);
         let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
@@ -460,7 +460,7 @@ impl<'a> LossyTile<'a> {
         }
         let lrr = self.k.idct.idct_dequant_16x16(lcf, &self.ctx.quant);
         let mut luma_rec = self.sbuf_u256();
-        recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
+        self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
         let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
         let mlam = self.lambda_d_c() * prdo;
@@ -575,7 +575,7 @@ impl<'a> LossyTile<'a> {
         }
         let lrr = self.k.idct.idct_dequant_32x32(lcf, &self.ctx.quant);
         let mut luma_rec = self.sbuf_u1024();
-        recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
+        self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr, (1 << self.cfg.bd) - 1);
         let lam = self.trellis_lambda() * prdo;
         // wSSE decision joined to a `lambda_d` luma beam: `lambda_d_c`.
         let mlam = self.lambda_d_c() * prdo;
@@ -1533,7 +1533,7 @@ impl<'a> LossyTile<'a> {
                     self.k.idct.idct_dequant_8x8(&lcf, &self.ctx.quant)
                 };
                 let mut luma_rec = [0u16; 64];
-                recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(&mut luma_rec, &lpred_arr, &lrr_cfl, (1 << self.cfg.bd) - 1);
                 if best_is_txsplit4 {
                     luma_rec = s4_rec;
                 }
@@ -1969,7 +1969,7 @@ impl<'a> LossyTile<'a> {
                     self.k.idct.idct_dequant_8x8(&lcf, &self.ctx.quant)
                 };
                 let mut luma_rec = [0u16; 64];
-                recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.cfg.bd) - 1);
                 if best_is_txsplit4 {
                     luma_rec = s4_rec;
                 }
@@ -2391,7 +2391,7 @@ impl<'a> LossyTile<'a> {
                     self.k.idct.idct_dequant_8x8(&lcf, &self.ctx.quant)
                 };
                 let mut luma_rec = [0u16; 64];
-                recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(&mut luma_rec, &lpred_arr, &lrr, (1 << self.cfg.bd) - 1);
                 if best_is_txsplit4 {
                     luma_rec = s4_rec;
                 }
@@ -2935,7 +2935,7 @@ impl<'a> LossyTile<'a> {
                 .enumerate()
             {
                 let drow = &mut self.ctx.recon[0][(py + ry) * self.cfg.w + px..];
-                recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
             }
         }
 
@@ -2989,13 +2989,13 @@ impl<'a> LossyTile<'a> {
                     // search fires far more above q60, which is where this
                     // showed up as a quality collapse at unchanged size.
                     if use_cfl {
-                        recon_add_pred(&mut drow[..4], &cpred420[ci][ry * 4..], rrow, max);
+                        self.k.rd.recon_add_pred(&mut drow[..4], &cpred420[ci][ry * 4..], rrow, max);
                     } else if paeth420 {
-                        recon_add_pred(&mut drow[..4], &paeth_pred420[ci][ry * 4..], rrow, max);
+                        self.k.rd.recon_add_pred(&mut drow[..4], &paeth_pred420[ci][ry * 4..], rrow, max);
                     } else if chosen_uv_block == SMOOTH_V_PRED {
-                        recon_add_pred(&mut drow[..4], &sv_preds_420[ci][ry * 4..], rrow, max);
+                        self.k.rd.recon_add_pred(&mut drow[..4], &sv_preds_420[ci][ry * 4..], rrow, max);
                     } else {
-                        recon_add_dc(drow, cpred[ci], rrow, max);
+                        self.k.rd.recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             } else if self.cfg.is_422() {
@@ -3028,11 +3028,11 @@ impl<'a> LossyTile<'a> {
                 for (ry, rrow) in rr.as_chunks::<4>().0.iter().enumerate() {
                     let drow = &mut self.ctx.recon[plane][(py + ry) * self.cfg.cw + cx..];
                     if use_cfl {
-                        recon_add_pred(drow, &cpred422[ci][ry * 4..], rrow, max);
+                        self.k.rd.recon_add_pred(drow, &cpred422[ci][ry * 4..], rrow, max);
                     } else if paeth422 {
-                        recon_add_pred(drow, &paeth_pred422[ci][ry * 4..], rrow, max);
+                        self.k.rd.recon_add_pred(drow, &paeth_pred422[ci][ry * 4..], rrow, max);
                     } else {
-                        recon_add_dc(drow, cpred[ci], rrow, max);
+                        self.k.rd.recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             } else {
@@ -3075,14 +3075,14 @@ impl<'a> LossyTile<'a> {
                 for (ry, rrow) in rr.as_chunks::<8>().0.iter().enumerate() {
                     let drow = &mut self.ctx.recon[plane][(py + ry) * self.cfg.w + px..];
                     if use_cfl {
-                        recon_add_pred(drow, &cpred444[ci][ry * 8..], rrow, max);
+                        self.k.rd.recon_add_pred(drow, &cpred444[ci][ry * 8..], rrow, max);
                     } else if paeth {
-                        recon_add_pred(drow, &paeth_pred444[ci][ry * 8..], rrow, max);
+                        self.k.rd.recon_add_pred(drow, &paeth_pred444[ci][ry * 8..], rrow, max);
                     } else {
                         // Plain DC chroma: use the scalar predictor directly so the
                         // reconstruction never depends on the CfL evaluation block
                         // having populated `cpred444`.
-                        recon_add_dc(drow, cpred[ci], rrow, max);
+                        self.k.rd.recon_add_dc(drow, cpred[ci], rrow, max);
                     }
                 }
             }

@@ -347,6 +347,95 @@ pub(crate) fn reconstruct_avx2(
     }
 }
 
+/// One row of `clamp(pred + resid, 0, maxv)`; all three slices are equally long.
+#[target_feature(enable = "avx2")]
+pub(crate) fn recon_add_pred_avx2(dst: &mut [u16], pred: &[i32], resid: &[i32], maxv: i32) {
+    debug_assert!(dst.len() == pred.len() && dst.len() == resid.len());
+    debug_assert!((0..=0xffff).contains(&maxv));
+    // `packus` clamps below at zero, so only the upper bound is left.
+    let max16 = _mm256_set1_epi16(maxv as u16 as i16);
+    let max8 = _mm256_castsi256_si128(max16);
+
+    let (dst16, dst_tail) = dst.as_chunks_mut::<16>();
+    let (pred16, pred_tail) = pred.as_chunks::<16>();
+    let (resid16, resid_tail) = resid.as_chunks::<16>();
+    for ((d, p), r) in dst16.iter_mut().zip(pred16).zip(resid16) {
+        unsafe {
+            let (p, r) = (p.as_ptr().cast::<__m256i>(), r.as_ptr().cast::<__m256i>());
+            let lo = _mm256_add_epi32(_mm256_loadu_si256(p), _mm256_loadu_si256(r));
+            let hi = _mm256_add_epi32(_mm256_loadu_si256(p.add(1)), _mm256_loadu_si256(r.add(1)));
+            // `packus` works per 128-bit lane: restore the sample order.
+            let v = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(lo, hi));
+            _mm256_storeu_si256(d.as_mut_ptr().cast::<__m256i>(), _mm256_min_epu16(v, max16));
+        }
+    }
+
+    let (dst8, dst_tail) = dst_tail.as_chunks_mut::<8>();
+    let (pred8, pred_tail) = pred_tail.as_chunks::<8>();
+    let (resid8, resid_tail) = resid_tail.as_chunks::<8>();
+    for ((d, p), r) in dst8.iter_mut().zip(pred8).zip(resid8) {
+        let v = _mm256_add_epi32(load_i32x8(p), load_i32x8(r));
+        let v = _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        unsafe { _mm_storeu_si128(d.as_mut_ptr().cast::<__m128i>(), _mm_min_epu16(v, max8)) }
+    }
+
+    let (dst4, dst_tail) = dst_tail.as_chunks_mut::<4>();
+    let (pred4, pred_tail) = pred_tail.as_chunks::<4>();
+    let (resid4, resid_tail) = resid_tail.as_chunks::<4>();
+    for ((d, p), r) in dst4.iter_mut().zip(pred4).zip(resid4) {
+        let v = _mm_add_epi32(load_i32x4(p), load_i32x4(r));
+        let v = _mm_min_epu16(_mm_packus_epi32(v, v), max8);
+        unsafe { _mm_storel_epi64(d.as_mut_ptr().cast::<__m128i>(), v) }
+    }
+
+    for ((d, &p), &r) in dst_tail.iter_mut().zip(pred_tail).zip(resid_tail) {
+        *d = p.wrapping_add(r).clamp(0, maxv) as u16;
+    }
+}
+
+/// One row of `clamp(dc + resid, 0, maxv)`; both slices are equally long.
+#[target_feature(enable = "avx2")]
+pub(crate) fn recon_add_dc_avx2(dst: &mut [u16], dc: i32, resid: &[i32], maxv: i32) {
+    debug_assert!(dst.len() == resid.len());
+    debug_assert!((0..=0xffff).contains(&maxv));
+    let dc8 = _mm256_set1_epi32(dc);
+    let dc4 = _mm256_castsi256_si128(dc8);
+    let max16 = _mm256_set1_epi16(maxv as u16 as i16);
+    let max8 = _mm256_castsi256_si128(max16);
+
+    let (dst16, dst_tail) = dst.as_chunks_mut::<16>();
+    let (resid16, resid_tail) = resid.as_chunks::<16>();
+    for (d, r) in dst16.iter_mut().zip(resid16) {
+        unsafe {
+            let r = r.as_ptr().cast::<__m256i>();
+            let lo = _mm256_add_epi32(dc8, _mm256_loadu_si256(r));
+            let hi = _mm256_add_epi32(dc8, _mm256_loadu_si256(r.add(1)));
+            let v = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(lo, hi));
+            _mm256_storeu_si256(d.as_mut_ptr().cast::<__m256i>(), _mm256_min_epu16(v, max16));
+        }
+    }
+
+    let (dst8, dst_tail) = dst_tail.as_chunks_mut::<8>();
+    let (resid8, resid_tail) = resid_tail.as_chunks::<8>();
+    for (d, r) in dst8.iter_mut().zip(resid8) {
+        let v = _mm256_add_epi32(dc8, load_i32x8(r));
+        let v = _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        unsafe { _mm_storeu_si128(d.as_mut_ptr().cast::<__m128i>(), _mm_min_epu16(v, max8)) }
+    }
+
+    let (dst4, dst_tail) = dst_tail.as_chunks_mut::<4>();
+    let (resid4, resid_tail) = resid_tail.as_chunks::<4>();
+    for (d, r) in dst4.iter_mut().zip(resid4) {
+        let v = _mm_add_epi32(dc4, load_i32x4(r));
+        let v = _mm_min_epu16(_mm_packus_epi32(v, v), max8);
+        unsafe { _mm_storel_epi64(d.as_mut_ptr().cast::<__m128i>(), v) }
+    }
+
+    for (d, &r) in dst_tail.iter_mut().zip(resid_tail) {
+        *d = dc.wrapping_add(r).clamp(0, maxv) as u16;
+    }
+}
+
 #[target_feature(enable = "avx2")]
 pub(crate) fn sse_recon_avx2(
     pred: &[i32],
