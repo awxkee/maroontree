@@ -30,6 +30,10 @@
 type ResidualPredFn = fn(&mut [i32], &[i32], &[u16], usize, usize, usize, usize, usize);
 type ResidualDcFn = fn(&mut [i32], &[u16], usize, usize, usize, usize, usize, i32);
 type ReconstructFn = fn(&mut [u16], usize, &mut [u16], usize, &[i32], &[i32], usize, usize, i32);
+/// One row: `dst = clamp(pred + resid, 0, max)`, equally long slices.
+type ReconAddPredFn = fn(&mut [u16], &[i32], &[i32], i32);
+/// One row: `dst = clamp(dc + resid, 0, max)`, equally long slices.
+type ReconAddDcFn = fn(&mut [u16], i32, &[i32], i32);
 type SseReconFn = fn(&[i32], &[i32], &[u16], usize, usize, usize, usize, usize, i32) -> i64;
 type SseU16Fn = fn(&[u16], usize, usize, usize, &[u16], usize, usize, usize, usize, usize) -> i64;
 type SatdSadFn = fn(&[u16], usize, &[i32], usize, usize, usize) -> u64;
@@ -167,6 +171,8 @@ pub(crate) struct RdDispatch {
     residual_pred: ResidualPredFn,
     residual_dc: ResidualDcFn,
     reconstruct: ReconstructFn,
+    recon_add_pred: ReconAddPredFn,
+    recon_add_dc: ReconAddDcFn,
     sse_recon: SseReconFn,
     sse_u16: SseU16Fn,
     satd_sad: SatdSadFn,
@@ -188,6 +194,8 @@ impl RdDispatch {
             residual_pred: residual_pred_scalar,
             residual_dc: residual_dc_scalar,
             reconstruct: reconstruct_scalar,
+            recon_add_pred: recon_add_pred_scalar,
+            recon_add_dc: recon_add_dc_scalar,
             sse_recon: sse_recon_scalar,
             sse_u16: sse_u16_scalar,
             satd_sad: satd_sad_proxy_scalar,
@@ -286,6 +294,8 @@ impl RdDispatch {
             dispatch.residual_pred = residual_pred_neon_wrap;
             dispatch.residual_dc = residual_dc_neon_wrap;
             dispatch.reconstruct = reconstruct_neon_wrap;
+            dispatch.recon_add_pred = recon_add_pred_neon_wrap;
+            dispatch.recon_add_dc = recon_add_dc_neon_wrap;
             dispatch.sse_recon = sse_recon_neon_wrap;
             dispatch.sse_u16 = sse_u16_neon_wrap;
             dispatch.satd_sad = satd_sad_proxy_neon_wrap;
@@ -303,6 +313,8 @@ impl RdDispatch {
             dispatch.residual_pred = residual_pred_avx2_wrap;
             dispatch.residual_dc = residual_dc_avx2_wrap;
             dispatch.reconstruct = reconstruct_avx2_wrap;
+            dispatch.recon_add_pred = recon_add_pred_avx2_wrap;
+            dispatch.recon_add_dc = recon_add_dc_avx2_wrap;
             dispatch.sse_recon = sse_recon_avx2_wrap;
             dispatch.sse_u16 = sse_u16_avx2_wrap;
             dispatch.satd_sad = satd_sad_proxy_avx2_wrap;
@@ -415,6 +427,22 @@ impl RdDispatch {
                 (1i32 << bd) - 1,
             );
         }
+    }
+
+    /// `dst[i] = clamp(pred[i] + resid[i], 0, max)` over the shortest of the
+    /// three slices (one reconstructed row, or a whole packed block).
+    #[inline]
+    pub(crate) fn recon_add_pred(&self, dst: &mut [u16], pred: &[i32], resid: &[i32], max: i32) {
+        let n = dst.len().min(pred.len()).min(resid.len());
+        (self.recon_add_pred)(&mut dst[..n], &pred[..n], &resid[..n], max);
+    }
+
+    /// `dst[i] = clamp(dc + resid[i], 0, max)` over the shorter of the two
+    /// slices.
+    #[inline]
+    pub(crate) fn recon_add_dc(&self, dst: &mut [u16], dc: i32, resid: &[i32], max: i32) {
+        let n = dst.len().min(resid.len());
+        (self.recon_add_dc)(&mut dst[..n], dc, &resid[..n], max);
     }
 
     /// SSE of `clamp(pred + resid)` against the VISIBLE part of `src`.
@@ -777,6 +805,26 @@ fn residual_dc_neon_wrap(
     dc: i32,
 ) {
     unsafe { crate::neon::residual_dc_neon(dst, src, stride, px, py, w, h, dc) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn recon_add_pred_neon_wrap(dst: &mut [u16], pred: &[i32], resid: &[i32], maxv: i32) {
+    unsafe { crate::neon::recon_add_pred_neon(dst, pred, resid, maxv) }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn recon_add_dc_neon_wrap(dst: &mut [u16], dc: i32, resid: &[i32], maxv: i32) {
+    unsafe { crate::neon::recon_add_dc_neon(dst, dc, resid, maxv) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn recon_add_pred_avx2_wrap(dst: &mut [u16], pred: &[i32], resid: &[i32], maxv: i32) {
+    unsafe { crate::avx::recon_add_pred_avx2(dst, pred, resid, maxv) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+fn recon_add_dc_avx2_wrap(dst: &mut [u16], dc: i32, resid: &[i32], maxv: i32) {
+    unsafe { crate::avx::recon_add_dc_avx2(dst, dc, resid, maxv) }
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -1198,6 +1246,18 @@ pub(crate) fn reconstruct_scalar(
     }
 }
 
+pub(crate) fn recon_add_pred_scalar(dst: &mut [u16], pred: &[i32], resid: &[i32], max: i32) {
+    for ((d, &p), &r) in dst.iter_mut().zip(pred).zip(resid) {
+        *d = (p + r).clamp(0, max) as u16;
+    }
+}
+
+pub(crate) fn recon_add_dc_scalar(dst: &mut [u16], dc: i32, resid: &[i32], max: i32) {
+    for (d, &r) in dst.iter_mut().zip(resid) {
+        *d = (dc + r).clamp(0, max) as u16;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sse_recon_scalar(
     pred: &[i32],
@@ -1504,6 +1564,21 @@ mod satd_tests {
                     sse_recon_scalar(&pred, &resid, &src, stride, px, py, w, h, max),
                     "reconstruction SSE {w}x{h} bd={bd}"
                 );
+
+                for n in [0usize, 1, 3, 4, 5, 8, 12, 15, 16, 17, 31, 32, 33, 64] {
+                    let n = n.min(w * h);
+                    let mut want_row = vec![0xdead; n + 2];
+                    let mut got_row = want_row.clone();
+                    recon_add_pred_scalar(&mut want_row[..n], &pred, &resid, max);
+                    dispatch.recon_add_pred(&mut got_row[..n], &pred, &resid, max);
+                    assert_eq!(got_row, want_row, "row pred+resid n={n} bd={bd}");
+                    // A residual far out of range must still clamp at both ends.
+                    for row_dc in [0, dc & max, max, -70_000, 70_000] {
+                        recon_add_dc_scalar(&mut want_row[..n], row_dc, &resid, max);
+                        dispatch.recon_add_dc(&mut got_row[..n], row_dc, &resid, max);
+                        assert_eq!(got_row, want_row, "row dc+resid n={n} bd={bd} dc={row_dc}");
+                    }
+                }
 
                 let dst_stride = w + 5;
                 let mirror_stride = w + 3;

@@ -1273,18 +1273,6 @@ fn cfl_best_alpha_u16_scalar(
     cfl_best_alpha_strided(ac, ac_stride, src, src_stride, w, h, dc, bd)
 }
 
-pub(crate) fn recon_add_pred<P: Pel>(dst: &mut [P], pred: &[i32], resid: &[i32], max: i32) {
-    for ((d, &p), &r) in dst.iter_mut().zip(pred).zip(resid) {
-        *d = P::narrow((p + r).clamp(0, max));
-    }
-}
-
-pub(crate) fn recon_add_dc<P: Pel>(dst: &mut [P], dc: i32, resid: &[i32], max: i32) {
-    for (d, &r) in dst.iter_mut().zip(resid) {
-        *d = P::narrow((dc + r).clamp(0, max));
-    }
-}
-
 /// Test entry point for intra prediction with an explicit AV1 `angle_delta`.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]

@@ -291,6 +291,72 @@ pub(crate) fn reconstruct_neon(
     }
 }
 
+/// One row of `clamp(pred + resid, 0, maxv)`; all three slices are equally long.
+#[target_feature(enable = "neon")]
+pub(crate) fn recon_add_pred_neon(dst: &mut [u16], pred: &[i32], resid: &[i32], maxv: i32) {
+    debug_assert!(dst.len() == pred.len() && dst.len() == resid.len());
+    debug_assert!((0..=0xffff).contains(&maxv));
+    // `vqmovun` clamps below at zero, so only the upper bound is left.
+    let max8 = vdupq_n_u16(maxv as u16);
+    let max4 = vdup_n_u16(maxv as u16);
+
+    let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let (pred8, pred_tail) = pred.as_chunks::<8>();
+    let (resid8, resid_tail) = resid.as_chunks::<8>();
+    for ((d, p), r) in dst8.iter_mut().zip(pred8).zip(resid8) {
+        unsafe {
+            let lo = vaddq_s32(vld1q_s32(p.as_ptr()), vld1q_s32(r.as_ptr()));
+            let hi = vaddq_s32(vld1q_s32(p.as_ptr().add(4)), vld1q_s32(r.as_ptr().add(4)));
+            let v = vcombine_u16(vqmovun_s32(lo), vqmovun_s32(hi));
+            vst1q_u16(d.as_mut_ptr(), vminq_u16(v, max8));
+        }
+    }
+
+    let (dst4, dst_tail) = dst_tail.as_chunks_mut::<4>();
+    let (pred4, pred_tail) = pred_tail.as_chunks::<4>();
+    let (resid4, resid_tail) = resid_tail.as_chunks::<4>();
+    for ((d, p), r) in dst4.iter_mut().zip(pred4).zip(resid4) {
+        let v = vqmovun_s32(vaddq_s32(load_i32x4(p), load_i32x4(r)));
+        unsafe { vst1_u16(d.as_mut_ptr(), vmin_u16(v, max4)) }
+    }
+
+    for ((d, &p), &r) in dst_tail.iter_mut().zip(pred_tail).zip(resid_tail) {
+        *d = p.wrapping_add(r).clamp(0, maxv) as u16;
+    }
+}
+
+/// One row of `clamp(dc + resid, 0, maxv)`; both slices are equally long.
+#[target_feature(enable = "neon")]
+pub(crate) fn recon_add_dc_neon(dst: &mut [u16], dc: i32, resid: &[i32], maxv: i32) {
+    debug_assert!(dst.len() == resid.len());
+    debug_assert!((0..=0xffff).contains(&maxv));
+    let dc_v = vdupq_n_s32(dc);
+    let max8 = vdupq_n_u16(maxv as u16);
+    let max4 = vdup_n_u16(maxv as u16);
+
+    let (dst8, dst_tail) = dst.as_chunks_mut::<8>();
+    let (resid8, resid_tail) = resid.as_chunks::<8>();
+    for (d, r) in dst8.iter_mut().zip(resid8) {
+        unsafe {
+            let lo = vaddq_s32(dc_v, vld1q_s32(r.as_ptr()));
+            let hi = vaddq_s32(dc_v, vld1q_s32(r.as_ptr().add(4)));
+            let v = vcombine_u16(vqmovun_s32(lo), vqmovun_s32(hi));
+            vst1q_u16(d.as_mut_ptr(), vminq_u16(v, max8));
+        }
+    }
+
+    let (dst4, dst_tail) = dst_tail.as_chunks_mut::<4>();
+    let (resid4, resid_tail) = resid_tail.as_chunks::<4>();
+    for (d, r) in dst4.iter_mut().zip(resid4) {
+        let v = vqmovun_s32(vaddq_s32(dc_v, load_i32x4(r)));
+        unsafe { vst1_u16(d.as_mut_ptr(), vmin_u16(v, max4)) }
+    }
+
+    for (d, &r) in dst_tail.iter_mut().zip(resid_tail) {
+        *d = dc.wrapping_add(r).clamp(0, maxv) as u16;
+    }
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn sse_recon_neon(
     pred: &[i32],

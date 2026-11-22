@@ -1225,6 +1225,8 @@ fn cfl_alpha_candidates(
         bit_depth,
     );
     let mut luma_rec = [0i32; 16];
+    // Lossless planes are signed `i16` (samples may be negative), so this
+    // 4x4 fit stays on the generic scalar path: the SIMD kernels are `u16`.
     let mut src = [0i32; 16];
     for row in 0..4 {
         for x in 0..4 {

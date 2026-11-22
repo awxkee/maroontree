@@ -1540,7 +1540,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..16 {
                     let drow = &mut self.ctx.recon[0][(by + ry) * self.cfg.w + bx..];
-                    recon_add_pred(&mut drow[..16], &pred[ry * 16..], &rr[ry * 16..], maxv);
+                    self.k.rd.recon_add_pred(&mut drow[..16], &pred[ry * 16..], &rr[ry * 16..], maxv);
                 }
             }
             return;
@@ -1567,7 +1567,7 @@ impl<'a> LossyTile<'a> {
             .enumerate()
         {
             let drow = &mut self.ctx.recon[0][(py + ry) * self.cfg.w + px..];
-            recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
+            self.k.rd.recon_add_pred(drow, prow, rrow, (1 << self.cfg.bd) - 1);
         }
     }
 
@@ -1851,7 +1851,7 @@ impl<'a> LossyTile<'a> {
                 };
                 for ry in 0..ch {
                     let drow = &mut self.ctx.recon[plane][(cy + ry) * self.cfg.cw + cx..];
-                    recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
+                    self.k.rd.recon_add_dc(&mut drow[..cw], cpred[ci], &rr[ry * cw..], maxval);
                 }
             }
         }
@@ -2326,7 +2326,7 @@ impl<'a> LossyTile<'a> {
                 luma_rec.copy_from_slice(&rec[..]);
             } else {
                 let lrr_cfl = self.k.idct.idct_dequant_32x32(lcf, &self.ctx.quant);
-                recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, (1 << self.cfg.bd) - 1);
+                self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, (1 << self.cfg.bd) - 1);
             }
             let mut ac = self.sbuf_i1024();
             self.k.intrapred
@@ -2784,9 +2784,9 @@ impl<'a> LossyTile<'a> {
             for (ry, rrow) in crr.as_chunks::<32>().0.iter().enumerate() {
                 let drow = &mut self.ctx.recon[plane][(py + ry) * self.cfg.w + px..];
                 if chosen_uv_32 != DC_PRED || uv_pal32.is_some() || cfl_opt.is_some() {
-                    recon_add_pred(&mut drow[..32], &uv_pred[ci][ry * 32..], rrow, max);
+                    self.k.rd.recon_add_pred(&mut drow[..32], &uv_pred[ci][ry * 32..], rrow, max);
                 } else {
-                    recon_add_dc(&mut drow[..32], pred_dc[ci], rrow, max);
+                    self.k.rd.recon_add_dc(&mut drow[..32], pred_dc[ci], rrow, max);
                 }
             }
         }
@@ -2883,7 +2883,7 @@ impl<'a> LossyTile<'a> {
                 luma_rec.copy_from_slice(&rec[..]);
             } else {
                 let lrr = self.k.idct.idct_dequant_32x32(lcf, &self.ctx.quant);
-                recon_add_pred(&mut luma_rec[..], lpred, &lrr, maxval);
+                self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr, maxval);
             }
             let mut ac = self.sbuf_i256();
             self.k.intrapred
@@ -3181,9 +3181,9 @@ impl<'a> LossyTile<'a> {
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.ctx.recon[plane][(cy + ry) * self.cfg.cw + cx..];
                 if use_sv {
-                    recon_add_pred(&mut drow[..16], &sv_preds[ci][ry * 16..], rrow, maxval);
+                    self.k.rd.recon_add_pred(&mut drow[..16], &sv_preds[ci][ry * 16..], rrow, maxval);
                 } else {
-                    recon_add_dc(&mut drow[..16], dc_preds[ci], rrow, maxval);
+                    self.k.rd.recon_add_dc(&mut drow[..16], dc_preds[ci], rrow, maxval);
                 }
             }
         }
@@ -3257,7 +3257,7 @@ impl<'a> LossyTile<'a> {
             luma_rec.copy_from_slice(&rec[..]);
         } else {
             let lrr_cfl = self.k.idct.idct_dequant_32x32(lcf, &self.ctx.quant);
-            recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, maxv);
+            self.k.rd.recon_add_pred(&mut luma_rec[..], lpred, &lrr_cfl, maxv);
         }
         let mut ac = self.sbuf_i512();
         self.k.intrapred
@@ -3515,7 +3515,7 @@ impl<'a> LossyTile<'a> {
             };
             for (ry, rrow) in rr.as_chunks::<16>().0.iter().enumerate() {
                 let drow = &mut self.ctx.recon[plane][(py + ry) * self.cfg.cw + cx..];
-                recon_add_pred(drow, &cpred_px[ci][ry * 16..], rrow, maxv);
+                self.k.rd.recon_add_pred(drow, &cpred_px[ci][ry * 16..], rrow, maxv);
             }
         }
     }

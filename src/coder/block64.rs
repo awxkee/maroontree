@@ -1231,7 +1231,7 @@ impl<'a> LossyTile<'a> {
         self.ctx.l_coef[0][by4..by4 + n4].fill(res_ctx);
         for r in 0..size {
             let dst = &mut self.ctx.recon[0][(py + r) * self.cfg.w + px..][..size];
-            recon_add_pred(dst, &plan.lpred[r * size..], &plan.lrr[r * size..], maxv);
+            self.k.rd.recon_add_pred(dst, &plan.lpred[r * size..], &plan.lrr[r * size..], maxv);
         }
         // Chroma planes: derived DCT, recon = reference + residual.
         let (sx, sy) = (self.cfg.chroma.sub_x(), self.cfg.chroma.sub_y());
@@ -1265,7 +1265,7 @@ impl<'a> LossyTile<'a> {
             self.ctx.l_coef[plane][cby4..cby4 + cn4].fill(cres);
             for r in 0..chh {
                 let dst = &mut self.ctx.recon[plane][(cy + r) * self.cfg.cw + cx..][..cw];
-                recon_add_pred(dst, &plan.cpred[ci][r * cw..], &plan.crr[ci][r * cw..], maxv);
+                self.k.rd.recon_add_pred(dst, &plan.cpred[ci][r * cw..], &plan.crr[ci][r * cw..], maxv);
             }
         }
     }
@@ -1575,7 +1575,7 @@ impl<'a> LossyTile<'a> {
         );
         for row in 0..64 {
             let dst = &mut self.ctx.recon[0][(py + row) * self.cfg.w + px..][..64];
-            recon_add_pred(dst, &pred[row * 64..], &rr[row * 64..], maxv);
+            self.k.rd.recon_add_pred(dst, &pred[row * 64..], &rr[row * 64..], maxv);
         }
         r
     }
@@ -1787,7 +1787,7 @@ impl<'a> LossyTile<'a> {
                 self.ctx.l_coef[0][qby4..qby4 + 4].fill(res_ctx);
                 for ry in 0..16 {
                     let drow = &mut self.ctx.recon[0][(by + ry) * self.cfg.w + bx..];
-                    recon_add_pred(&mut drow[..16], &pred[ry * 16..], &rr[ry * 16..], maxv);
+                    self.k.rd.recon_add_pred(&mut drow[..16], &pred[ry * 16..], &rr[ry * 16..], maxv);
                 }
                 cf[ti * 256..ti * 256 + 256].copy_from_slice(&q[..]);
             }
@@ -1955,7 +1955,7 @@ impl<'a> LossyTile<'a> {
                 );
                 for row in 0..32 {
                     let dst = &mut self.ctx.recon[0][(by + row) * self.cfg.w + bx..][..32];
-                    recon_add_pred(dst, &pred[row * 32..], &rr[row * 32..], maxv);
+                    self.k.rd.recon_add_pred(dst, &pred[row * 32..], &rr[row * 32..], maxv);
                 }
             }
             if total < best.2 {
@@ -2067,7 +2067,7 @@ impl<'a> LossyTile<'a> {
             );
             for row in 0..32 {
                 let dst = &mut self.ctx.recon[0][(by + row) * self.cfg.w + bx..][..32];
-                recon_add_pred(dst, &pred[row * 32..], &rr[row * 32..], maxv);
+                self.k.rd.recon_add_pred(dst, &pred[row * 32..], &rr[row * 32..], maxv);
             }
         }
         total
@@ -2492,7 +2492,7 @@ impl<'a> LossyTile<'a> {
                 let rr = self.k.idct.idct_dequant_32x32(&cf, &self.ctx.quant);
                 for ry in 0..32 {
                     let drow = &mut self.ctx.recon[0][(by + ry) * self.cfg.w + bx..];
-                    recon_add_pred(&mut drow[..32], &pred[ry * 32..], &rr[ry * 32..], maxv);
+                    self.k.rd.recon_add_pred(&mut drow[..32], &pred[ry * 32..], &rr[ry * 32..], maxv);
                 }
                 *lcf[qi] = cf;
             }

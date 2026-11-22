@@ -282,7 +282,7 @@ impl<'a> LossyTile<'a> {
             .sse_recon(&pred[..n], &rr[..n], self.src_blk(plane, x, y, tw, th), self.cfg.bd);
         for ry in 0..th {
             let drow = &mut self.ctx.recon[plane][(y + ry) * self.cfg.cw + x..];
-            recon_add_pred(&mut drow[..tw], &pred[ry * tw..], &rr[ry * tw..], maxv);
+            self.k.rd.recon_add_pred(&mut drow[..tw], &pred[ry * tw..], &rr[ry * tw..], maxv);
         }
         sse
     }
@@ -615,7 +615,7 @@ impl<'a> LossyTile<'a> {
             );
             for ry in 0..32 {
                 let drow = &mut self.ctx.recon[0][(by + ry) * self.cfg.w + bx..];
-                recon_add_pred(&mut drow[..32], &pred[ry * 32..], &rr[ry * 32..], maxv);
+                self.k.rd.recon_add_pred(&mut drow[..32], &pred[ry * 32..], &rr[ry * 32..], maxv);
             }
             cf[si] = q;
         }
